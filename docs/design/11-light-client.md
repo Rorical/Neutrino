@@ -283,9 +283,9 @@ trie depth, ~30 nodes per proof.
 
 A light client *may* gossip-subscribe to:
 
-- `/neutrino/checkpoints/scale/1` — to receive new checkpoints+proofs as soon
+- `/neutrino/checkpoints/borsh/1` — to receive new checkpoints+proofs as soon
   as published (sub-second after recursive proof finalizes).
-- `/neutrino/finality_votes_precommit/scale/1` — to learn about a chunk that
+- `/neutrino/finality_votes_precommit/borsh/1` — to learn about a chunk that
   *will* be finalized before its recursive proof exists (soft confirmation).
 
 Subscribing to block-level gossip is unusual but not forbidden. For mobile

@@ -123,15 +123,10 @@ neutrino-light-client           = { path = "crates/light-client",           vers
 neutrino-rpc                    = { path = "crates/rpc",                    version = "0.1.0" }
 
 # External — pinned at major versions; cargo update controls minor/patch.
-# NOTE: parity-scale-codec 3.7.5 has a no_std bug — `impl DecodeWithMemTracking
-# for Arc<T>` in src/codec.rs references `Arc` without an `alloc::sync::Arc`
-# import, so it fails to compile for `riscv32im-unknown-none-elf` (or any
-# no_std target without `std`). 3.6.x lacks `__private` that the 3.7 derive
-# macros generate. Until upstream resolves this we keep 3.7 (which works on
-# host) and exclude the runtime-side crates from rv32im CI. See
-# https://github.com/paritytech/parity-scale-codec
-parity-scale-codec  = { version = "3.7",  default-features = false, features = ["derive"] }
-scale-info          = { version = "2.11", default-features = false, features = ["derive"] }
+# Canonical wire codec. Borsh is chosen over SCALE because its fixed-width
+# u32 length prefixes produce smaller, simpler in-circuit decoders for the
+# SP1 and Plonky3 backends. See docs/design/07-block-format.md.
+borsh               = { version = "1.5",  default-features = false, features = ["derive"] }
 
 blake3              = { version = "1.5",  default-features = false }
 sha2                = { version = "0.10", default-features = false }

@@ -4,10 +4,10 @@
 
 //! Shared runtime ABI numbers and wire types.
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
     ABI_VERSION, BlockHash, BlsSignature, Height, Seed, Slot, StateRoot, ValidatorIndex,
 };
-use parity_scale_codec::{Decode, Encode};
 
 /// Runtime ABI version implemented by this crate.
 pub const VERSION: u32 = ABI_VERSION;
@@ -47,7 +47,7 @@ pub mod status {
 }
 
 /// Per-block context supplied by the engine to the runtime.
-#[derive(Clone, Debug, Decode, Encode, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct BlockContext {
     /// Block slot.
     pub slot: Slot,

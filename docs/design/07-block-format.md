@@ -12,24 +12,37 @@ runtime to execute.
 
 ## 7.1 Encoding
 
-We use **SCALE** (Simple Concatenated Aggregate Little-Endian) via the
-`parity-scale-codec` crate.
+We use **borsh** (Binary Object Representation Serializer for Hashing) via
+the `borsh` crate.
 
-Why SCALE:
+Why borsh:
 
-- Compact, deterministic, well-specified.
-- Battle-tested in Polkadot/Substrate.
+- Deterministic, well-specified, blockchain-focused (used in production by
+  Solana and NEAR).
+- Fixed-width little-endian integers and `u32` length prefixes for
+  variable-length collections. No compact-int encoding. Variable-length
+  parsing is the single biggest constraint cost in a zk decoder, and borsh's
+  fixed-width prefixes are materially cheaper in-circuit than SCALE's
+  compact ints — important for the SP1 and Plonky3 backends in
+  [10-proof-system](10-proof-system.md).
+- `no_std` friendly via its own `borsh::io::{Read, Write}` traits; works on
+  `riscv32im-unknown-none-elf` without depending on `std::io`.
 - Rust derive macros make field-by-field encoding trivial and refactor-safe.
 - No reflection — types are encoded structurally; field order is part of the
   schema.
+
+Why not SCALE: SCALE's compact integer encoding for `Vec<T>` lengths is a
+small wire-size win but a real cost in in-circuit decoders. We don't need
+Polkadot wire compatibility, so the trade isn't worth it.
 
 Why not SSZ:
 
 - SSZ shines for in-place merkle proofs over consensus structures. Our
   Merkle-proof needs (state and history inclusion) are served by the binary
   sparse Merkle trie in [05-state-and-storage](05-state-and-storage.md).
-- We may add SSZ for light-client friendliness later. The `Codec` trait in the
-  `codec` crate isolates the choice (see [08-crate-layout](08-crate-layout.md)).
+- We may add SSZ for light-client friendliness later. The shared codec
+  re-exports in the `codec` crate isolate the choice (see
+  [08-crate-layout](08-crate-layout.md)).
 
 ---
 
@@ -103,7 +116,7 @@ pub struct Header {
     /// epoch). Engine bounds vs. local clock to reject far-future blocks.
     pub timestamp:          u64,
 
-    /// BLS signature by the proposer over the SCALE-encoded header excluding
+    /// BLS signature by the proposer over the borsh-encoded header excluding
     /// this field.
     pub signature:          [u8; 96],   // BLS G2 sig, compressed
 }
@@ -122,7 +135,7 @@ Header changes from v1 (original Gasper draft):
   root, so future DA schemes (erasure coding, sampling) can plug in.
 - **Kept** `runtime_extra` — runtime escape hatch.
 
-The header hash is `H(SCALE(header_without_signature))` where `H = BLAKE3`.
+The header hash is `H(borsh(header_without_signature))` where `H = BLAKE3`.
 The signature binds the proposer's BLS key to that hash.
 
 ---
@@ -174,7 +187,7 @@ pub struct FinalityVote {
     /// Bitmap of which validators in the active set signed.
     pub aggregation_bits: BitVec,
     pub data:             FinalityVoteData,
-    /// Aggregate BLS signature (G2) over the SCALE-encoded `data` with
+    /// Aggregate BLS signature (G2) over the borsh-encoded `data` with
     /// the per-phase domain tag.
     pub signature:        [u8; 96],
 }
@@ -403,7 +416,7 @@ heights `1..=CHUNK_SIZE`; checkpoint 0 is genesis. Empty slots create gaps in
 slot numbers, not block heights. Multi-winner slots create competing branches;
 only the canonical branch contributes a block at a height.
 
-The chunk's hash is `H(SCALE(chunk))`.
+The chunk's hash is `H(borsh(chunk))`.
 
 ---
 
@@ -511,7 +524,7 @@ pub struct RecursiveCheckpointProof {
 
 Public-input schemas are defined in [10-proof-system](10-proof-system.md). The
 `proof_bytes` field is treated as opaque outside the `ProofSystem`
-implementation. Field schemas are still SCALE-encoded so they survive
+implementation. Field schemas are still borsh-encoded so they survive
 codec evolution.
 
 Block proofs are **not** included in blocks — they are gossiped separately on

@@ -8,13 +8,13 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
     BitVec, BlockHash, BlsSignature, ChunkHash, Height, Slot, StateRoot, ValidatorIndex,
 };
-use parity_scale_codec::{Decode, Encode};
 
 /// Engine-canonical block header.
-#[derive(Clone, Debug, Decode, Encode, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct Header {
     /// Protocol version.
     pub version: u32,
@@ -53,7 +53,7 @@ pub struct Header {
 }
 
 /// Finality vote phase.
-#[derive(Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FinalityVotePhase {
     /// Tendermint prevote.
     Prevote,
@@ -62,7 +62,7 @@ pub enum FinalityVotePhase {
 }
 
 /// Finality vote message payload.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FinalityVoteData {
     /// Chunk being voted on.
     pub chunk_id: u64,
@@ -75,7 +75,7 @@ pub struct FinalityVoteData {
 }
 
 /// Aggregated finality vote.
-#[derive(Clone, Debug, Decode, Encode, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct FinalityVote {
     /// Validators whose signatures are included.
     pub aggregation_bits: BitVec,
@@ -86,7 +86,7 @@ pub struct FinalityVote {
 }
 
 /// Opaque block body scaffold.
-#[derive(Clone, Debug, Decode, Default, Encode, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Body {
     /// Runtime-defined transaction blobs.
     pub transactions: Vec<Vec<u8>>,

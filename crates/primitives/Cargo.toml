@@ -12,11 +12,11 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["blake3/std", "parity-scale-codec/std"]
+std = ["blake3/std", "borsh/std"]
 
 [dependencies]
-blake3             = { workspace = true }
-parity-scale-codec = { workspace = true }
+blake3 = { workspace = true }
+borsh  = { workspace = true }
 
 [lints]
 workspace = true

@@ -46,26 +46,26 @@ All structured as `/neutrino/<topic>/<format>/<version>`.
 
 | Topic                                          | Producer              | Subscribers          | Notes                                                       |
 |------------------------------------------------|-----------------------|----------------------|-------------------------------------------------------------|
-| `/neutrino/blocks/scale/1`                     | VRF-winning proposer  | All full nodes       | One message = one block (header + body).                    |
-| `/neutrino/txs/scale/1`                        | Anyone                | Block producers, indexers | Mempool gossip. Rate-limited.                          |
-| `/neutrino/slashing_evidence/scale/1`          | Anyone with evidence  | All nodes            | Eight objective slashing variants; included in next block.  |
+| `/neutrino/blocks/borsh/1`                     | VRF-winning proposer  | All full nodes       | One message = one block (header + body).                    |
+| `/neutrino/txs/borsh/1`                        | Anyone                | Block producers, indexers | Mempool gossip. Rate-limited.                          |
+| `/neutrino/slashing_evidence/borsh/1`          | Anyone with evidence  | All nodes            | Eight objective slashing variants; included in next block.  |
 
 ### Proof topics
 
 | Topic                                          | Producer            | Subscribers                          | Notes                                                       |
 |------------------------------------------------|---------------------|--------------------------------------|-------------------------------------------------------------|
-| `/neutrino/block_proofs/scale/1`               | BlockProver         | Validators, ChunkAggregators         | One per accepted block; required within `PROOF_WINDOW`.     |
-| `/neutrino/chunk_proofs/scale/1`               | ChunkAggregator     | Validators, CheckpointProvers        | One per chunk, after all 128 block proofs land.             |
-| `/neutrino/checkpoints/scale/1`                | CheckpointProver    | Light clients, validators, archives  | RecursiveCheckpointProof + its public-input Checkpoint.     |
-| `/neutrino/prover_bounty/scale/1`              | Engine consensus    | FallbackProvers                      | Announces blocks past deadline + bounty. Low rate.          |
+| `/neutrino/block_proofs/borsh/1`               | BlockProver         | Validators, ChunkAggregators         | One per accepted block; required within `PROOF_WINDOW`.     |
+| `/neutrino/chunk_proofs/borsh/1`               | ChunkAggregator     | Validators, CheckpointProvers        | One per chunk, after all 128 block proofs land.             |
+| `/neutrino/checkpoints/borsh/1`                | CheckpointProver    | Light clients, validators, archives  | RecursiveCheckpointProof + its public-input Checkpoint.     |
+| `/neutrino/prover_bounty/borsh/1`              | Engine consensus    | FallbackProvers                      | Announces blocks past deadline + bounty. Low rate.          |
 
 ### Finality topics
 
 | Topic                                                   | Producer            | Subscribers                            | Notes                                                       |
 |---------------------------------------------------------|---------------------|----------------------------------------|-------------------------------------------------------------|
-| `/neutrino/finality_votes_prevote/scale/1`              | Active validators   | Aggregators on the vote subnet         | Per chunk/round; phase = Prevote.                           |
-| `/neutrino/finality_votes_precommit/scale/1`            | Active validators   | Aggregators on the vote subnet         | Per chunk/round; phase = Precommit. Light clients may subscribe. |
-| `/neutrino/aggregate_finality_votes_<subnet>/scale/1`   | Vote aggregators    | All nodes                              | `VOTE_SUBNETS = 16` (smaller than v1's 64; vote tonnage is per-chunk, not per-slot). |
+| `/neutrino/finality_votes_prevote/borsh/1`              | Active validators   | Aggregators on the vote subnet         | Per chunk/round; phase = Prevote.                           |
+| `/neutrino/finality_votes_precommit/borsh/1`            | Active validators   | Aggregators on the vote subnet         | Per chunk/round; phase = Precommit. Light clients may subscribe. |
+| `/neutrino/aggregate_finality_votes_<subnet>/borsh/1`   | Vote aggregators    | All nodes                              | `VOTE_SUBNETS = 16` (smaller than v1's 64; vote tonnage is per-chunk, not per-slot). |
 
 We dropped the per-slot attestation topics from v1 (Gasper). Chunk-level
 finality reduces vote tonnage by `CHUNK_SIZE×` (~128×), so a single set of
@@ -98,7 +98,7 @@ Properties:
   `consensus-vrf::aggregator_committee`); they are not tied to subnet
   membership and may aggregate votes from any subnet they receive.
 
-A validator subscribes to `/neutrino/finality_votes_{prevote,precommit}/scale/1`
+A validator subscribes to `/neutrino/finality_votes_{prevote,precommit}/borsh/1`
 on the two subnets in `validator_subnets(self, chunk_id, seed)` for the chunk
 currently in BFT, and gossips its votes on the same subnets. Non-validator
 full nodes subscribe to all `aggregate_finality_votes_<subnet>` topics so
@@ -204,7 +204,7 @@ liveness.
 
 ## Wire format
 
-All gossiped and requested messages use the same **SCALE** codec the runtime
+All gossiped and requested messages use the same **borsh** codec the runtime
 uses internally (see [07-block-format](07-block-format.md)). This avoids
 double encoding and keeps the engine simple. Future migration to SSZ for
 merkle-proof-friendliness is on the table; we encapsulate the codec choice
@@ -256,7 +256,7 @@ are gated only by the proof system's verifier on receipt.
 ```
 
 A light client follows a strict subset: `Init → CheckpointBackfill →
-Following` (where Following = subscribe to `/neutrino/checkpoints/scale/1`
+Following` (where Following = subscribe to `/neutrino/checkpoints/borsh/1`
 and apply each new recursive proof).
 
 A snap-sync full node: `Init → CheckpointBackfill → HeaderBackfill →

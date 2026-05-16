@@ -31,3 +31,9 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+      - name: Build runtime-sdk (riscv32im-unknown-none-elf)
+        run: cargo build --locked -p neutrino-runtime-sdk --target riscv32im-unknown-none-elf
+
+      - name: Build default-runtime (riscv32im-unknown-none-elf)
+        run: cargo build --locked -p neutrino-default-runtime --target riscv32im-unknown-none-elf

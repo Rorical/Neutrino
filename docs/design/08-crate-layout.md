@@ -10,7 +10,7 @@ neutrino/
 ├── Cargo.toml                          # workspace
 ├── crates/
 │   ├── primitives/                     # shared, no_std
-│   ├── codec/                          # SCALE wrapper + bytes helpers
+│   ├── codec/                          # borsh wrapper + bytes helpers
 │   ├── crypto/                         # hashes, BLS, Ed25519, secp256k1
 │   ├── vrf/                            # BLS-VRF, threshold check, seed mix
 │   ├── trie/                           # binary sparse merkle trie
@@ -132,9 +132,9 @@ Plus `BitVec` and bounded `Bytes` newtype. `no_std + alloc`.
 
 ### `codec`
 
-Re-exports `parity-scale-codec` with project-wide defaults:
-`max_encoded_size` enforced on decode, byte-budget reader for streaming
-deserialization. A `Codec` trait abstracts SCALE vs (future) SSZ.
+Re-exports `borsh` with project-wide defaults: `DEFAULT_MAX_DECODE_BYTES`
+caps network-facing decoders. A `Codec` trait can later abstract borsh vs
+(future) SSZ if light-client friendliness motivates it.
 
 ### `crypto`
 
@@ -213,7 +213,7 @@ pub mod status {
     // ...
 }
 
-#[derive(Encode, Decode)]
+#[derive(BorshDeserialize, BorshSerialize)]
 pub struct BlockContext {
     pub slot:              Slot,
     pub height:            Height,
@@ -265,7 +265,7 @@ Targets `riscv32im-unknown-none-elf`. Provides syscall stubs and the
 ### `consensus-types`
 
 Header, Body, Block, Chunk, FinalityVote, FinalityCert, Checkpoint,
-SlashingEvidence, Deposit, VoluntaryExit — all the SCALE-encodable shapes
+SlashingEvidence, Deposit, VoluntaryExit — all the borsh-encodable shapes
 from [07-block-format](07-block-format.md).
 
 ### `consensus-vrf` (was `consensus-randao`)
@@ -363,9 +363,9 @@ The abstraction layer for block / chunk / recursive proofs.
 
 ```rust
 pub trait ProofSystem: Send + Sync + 'static {
-    type BlockProof:     Encode + Decode + Clone;
-    type ChunkProof:     Encode + Decode + Clone;
-    type RecursiveProof: Encode + Decode + Clone;
+    type BlockProof:     BorshSerialize + BorshDeserialize + Clone;
+    type ChunkProof:     BorshSerialize + BorshDeserialize + Clone;
+    type RecursiveProof: BorshSerialize + BorshDeserialize + Clone;
 
     fn prove_block(
         &self,

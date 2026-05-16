@@ -37,7 +37,7 @@
 
 | System | What we borrow | What we change |
 |---|---|---|
-| **Polkadot / Substrate** | Forkless runtime upgrades, runtime-as-blob model, Executive-style entrypoints (`initialize_block`, `apply_extrinsic`, `finalize_block`). | RV32IM instead of WASM. SCALE codec but our own schema. |
+| **Polkadot / Substrate** | Forkless runtime upgrades, runtime-as-blob model, Executive-style entrypoints (`initialize_block`, `apply_extrinsic`, `finalize_block`). | RV32IM instead of WASM. Borsh codec (chosen for cheaper in-circuit decoders) and our own schema. |
 | **Avalanche** | `ChainVM`-style interface (`build_block`, `verify_block`, `accept_block`, `reject_block`). | Consensus is BLS-VRF + chunk BFT, not Snow*. |
 | **Ethereum consensus** | Slot/epoch time model, BLS12-381 aggregation, slashing, weak-subjectivity bootstrap. | BLS-VRF leader election (not RANDAO). Finality at chunk granularity via 2-phase Tendermint BFT, not Gasper (LMD-GHOST + Casper-FFG). No per-slot attestations. |
 | **Tendermint / Cosmos** | Two-phase prevote / precommit BFT, deterministic 1-block finality logic. | Applied to **chunks** of 128 blocks, not single blocks; finality is gated on a valid zk proof of every covered block. |

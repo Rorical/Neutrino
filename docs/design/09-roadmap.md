@@ -76,7 +76,7 @@ recomputed value.
 
 ## M3 — Consensus types + VRF + fork choice (week 8–11)
 
-- `consensus-types`: every struct in doc 07 encoded with SCALE, including
+- `consensus-types`: every struct in doc 07 encoded with borsh, including
   `Header`, `Body`, `FinalityVote`, `Chunk`, `FinalityCert`, `Checkpoint`,
   and the three proof-artifact wrappers.
 - `consensus-vrf`: eligibility check per slot, public-seed folding from
@@ -204,7 +204,7 @@ verification cost in the millisecond range on a workstation.
 - First option: full in-circuit BLS verification of the finality cert.
   Fallback: separate signature proof if BLS in-circuit too expensive.
 - Final proof small enough to fit in the recursive_proofs RocksDB column
-  and to gossip cheaply on `/neutrino/checkpoints/scale/1`.
+  and to gossip cheaply on `/neutrino/checkpoints/borsh/1`.
 
 Exit criteria: end-to-end chain with real proofs at every layer; recursive
 proofs verify in single-digit milliseconds; light-client interface in doc
@@ -212,7 +212,7 @@ proofs verify in single-digit milliseconds; light-client interface in doc
 
 ## M11 — Fallback prover market (week 32–34)
 
-- `/neutrino/prover_bounty/scale/1` topic: engine announces blocks past
+- `/neutrino/prover_bounty/borsh/1` topic: engine announces blocks past
   `PROOF_WINDOW`.
 - Reward curve `R_fallback = R_proof * (1 + urgency)` with
   `urgency = (slots_past_deadline / SLOTS_PER_CHUNK) * 0.5`.

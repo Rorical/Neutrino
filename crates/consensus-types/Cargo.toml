@@ -12,11 +12,11 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["neutrino-primitives/std", "parity-scale-codec/std"]
+std = ["neutrino-primitives/std", "borsh/std"]
 
 [dependencies]
 neutrino-primitives = { workspace = true }
-parity-scale-codec  = { workspace = true }
+borsh               = { workspace = true }
 
 [lints]
 workspace = true

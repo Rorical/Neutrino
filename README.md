@@ -70,10 +70,13 @@ cargo fmt --all -- --check
 ```
 
 The `runtime-sdk` and `runtimes/neutrino-default-runtime` crates target
-`riscv32im-unknown-none-elf` and are excluded from default builds. They
-currently compile on the host target only; rv32im cross-builds are blocked on
-an upstream `parity-scale-codec` no_std issue and will land alongside real
-runtime code in M2–M3.
+`riscv32im-unknown-none-elf` and are excluded from default builds. CI builds
+both for that target explicitly:
+
+```
+cargo build -p neutrino-runtime-sdk --target riscv32im-unknown-none-elf
+cargo build -p neutrino-default-runtime --target riscv32im-unknown-none-elf
+```
 
 ## License
 

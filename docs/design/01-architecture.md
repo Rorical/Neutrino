@@ -68,7 +68,7 @@ VRF eval (sk, finalized_seed, slot) ───► am I a proposer for this slot?
 build block from mempool via runtime.build_block(...)
    │
    ▼
-sign header (BLS), gossip block on /neutrino/blocks/scale/1
+sign header (BLS), gossip block on /neutrino/blocks/borsh/1
    │
    ▼
 peers receive → engine.validate_header → runtime.execute_block
@@ -95,7 +95,7 @@ generates BlockProof: zk proof that
     (state_root_before, transactions_root) ─runtime─► state_root_after
    │
    ▼
-gossip BlockProof on /neutrino/block_proofs/scale/1
+gossip BlockProof on /neutrino/block_proofs/borsh/1
    │
    ▼
 every node verifies via ProofSystem::verify_block(public_inputs, proof_bytes)
@@ -110,7 +110,7 @@ gossip chunk_proof, attach to chunk                            slash spammer
    ▼
 when finalized chunk + finality cert + validator-set transition combine:
 recursive_proof = ProofSystem::recurse(prev_cp_proof, chunk_proof, finality_cert)
-gossip RecursiveCheckpointProof on /neutrino/checkpoints/scale/1
+gossip RecursiveCheckpointProof on /neutrino/checkpoints/borsh/1
 ```
 
 If a block's proof misses the window, the **fallback prover market** kicks in
@@ -125,7 +125,7 @@ chunk C becomes proof-ready (all 128 blocks Proven, chunk_proof valid)
    │
    ▼
 each active validator broadcasts FinalityVote {chunk_id, round, chunk_hash, phase=Prevote}
-on /neutrino/finality_votes_prevote/scale/1
+on /neutrino/finality_votes_prevote/borsh/1
    │
    ▼
 aggregator (VRF-selected per chunk) aggregates BLS sigs, includes in next block body

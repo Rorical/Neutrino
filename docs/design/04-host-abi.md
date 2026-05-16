@@ -91,7 +91,7 @@ contract across backends.
 |---|---|---|
 | 0x30 | `host_input(out_ptr, out_cap) -> len` | Get the scratch buffer that holds entrypoint inputs (e.g. the serialized block to execute). |
 | 0x31 | `host_output(ptr, len)` | Write the entrypoint's return value to the scratch buffer. |
-| 0x32 | `block_context_out(out_ptr, out_cap) -> len` | Engine-provided context: `slot, height, seed[32], parent_hash, parent_state_root, gas_limit, proposer_index, vrf_proof[96]`. The `seed` is the folded VRF outputs of the last finalized chunk (see `12-randomness.md`); the `vrf_proof` is the proposer's BLS-VRF for this slot. SCALE-encoded. |
+| 0x32 | `block_context_out(out_ptr, out_cap) -> len` | Engine-provided context: `slot, height, seed[32], parent_hash, parent_state_root, gas_limit, proposer_index, vrf_proof[96]`. The `seed` is the folded VRF outputs of the last finalized chunk (see `12-randomness.md`); the `vrf_proof` is the proposer's BLS-VRF for this slot. borsh-encoded. |
 
 ### 0x40–0x4F — Cryptography
 
@@ -191,7 +191,7 @@ A `neutrino-runtime-sdk` crate ships:
 
 - `extern "C"` stubs for every syscall above.
 - Macros to define entrypoints (`#[neutrino::entrypoint]`).
-- A SCALE-style codec for ergonomic encoding.
+- A borsh-derive-based codec for ergonomic encoding.
 - A panic handler that calls syscall 0x01.
 
 This lets a runtime author write idiomatic `no_std` Rust and compile to

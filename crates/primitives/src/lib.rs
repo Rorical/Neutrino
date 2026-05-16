@@ -13,7 +13,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use parity_scale_codec::{Decode, Encode, Error as CodecError, Input, Output};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 /// A 32-byte cryptographic digest.
 pub type Hash = [u8; 32];
@@ -242,20 +242,21 @@ impl<const MAX_LEN: usize> fmt::Debug for BoundedBytes<MAX_LEN> {
     }
 }
 
-impl<const MAX_LEN: usize> Encode for BoundedBytes<MAX_LEN> {
-    fn size_hint(&self) -> usize {
-        self.inner.size_hint()
-    }
-
-    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
-        self.inner.encode_to(dest);
+impl<const MAX_LEN: usize> BorshSerialize for BoundedBytes<MAX_LEN> {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        self.inner.serialize(writer)
     }
 }
 
-impl<const MAX_LEN: usize> Decode for BoundedBytes<MAX_LEN> {
-    fn decode<I: Input>(input: &mut I) -> Result<Self, CodecError> {
-        let bytes = Vec::<u8>::decode(input)?;
-        Self::new(bytes).map_err(|_| CodecError::from("bounded bytes exceed maximum length"))
+impl<const MAX_LEN: usize> BorshDeserialize for BoundedBytes<MAX_LEN> {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let bytes = Vec::<u8>::deserialize_reader(reader)?;
+        Self::new(bytes).map_err(|_| {
+            borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                "bounded bytes exceed maximum length",
+            )
+        })
     }
 }
 
@@ -365,23 +366,23 @@ impl fmt::Debug for BitVec {
     }
 }
 
-impl Encode for BitVec {
-    fn size_hint(&self) -> usize {
-        self.bit_len.size_hint() + self.bytes.size_hint()
-    }
-
-    fn encode_to<T: Output + ?Sized>(&self, dest: &mut T) {
-        self.bit_len.encode_to(dest);
-        self.bytes.encode_to(dest);
+impl BorshSerialize for BitVec {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        self.bit_len.serialize(writer)?;
+        self.bytes.serialize(writer)
     }
 }
 
-impl Decode for BitVec {
-    fn decode<I: Input>(input: &mut I) -> Result<Self, CodecError> {
-        let bit_len = u32::decode(input)?;
-        let bytes = Vec::<u8>::decode(input)?;
-        Self::from_bytes(bit_len, bytes)
-            .map_err(|_| CodecError::from("invalid bit-vector encoding"))
+impl BorshDeserialize for BitVec {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let bit_len = u32::deserialize_reader(reader)?;
+        let bytes = Vec::<u8>::deserialize_reader(reader)?;
+        Self::from_bytes(bit_len, bytes).map_err(|_| {
+            borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                "invalid bit-vector encoding",
+            )
+        })
     }
 }
 
@@ -390,7 +391,7 @@ fn bytes_for_bits(bit_len: u32) -> usize {
 }
 
 /// Supported state-trie hash algorithms.
-#[derive(Clone, Copy, Debug, Decode, Default, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum HashAlgorithm {
     /// BLAKE3, the M0 default and reference implementation.
     #[default]
@@ -402,7 +403,7 @@ pub enum HashAlgorithm {
 }
 
 /// Runtime version exposed by the runtime ABI and ELF metadata.
-#[derive(Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RuntimeVersion {
     /// Fixed-width runtime name.
     pub spec_name: [u8; 16],
@@ -426,7 +427,7 @@ impl Default for RuntimeVersion {
 }
 
 /// Validator identity and activation metadata from the active validator set.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Validator {
     /// BLS signing public key.
     pub pubkey: BlsPublicKey,
@@ -445,7 +446,7 @@ pub struct Validator {
 }
 
 /// Consensus timing and finality constants covered by the chain-spec hash.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConsensusParams {
     /// Slot duration in seconds.
     pub slot_duration_secs: u64,
@@ -505,7 +506,7 @@ impl Default for ConsensusParams {
 }
 
 /// Proof-market and proof-version constants covered by the chain-spec hash.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProofParams {
     /// Public-input proof-system version.
     pub proof_system_version: u32,
@@ -526,7 +527,7 @@ impl Default for ProofParams {
 }
 
 /// Storage/pruning constants covered by the chain-spec hash.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StateParams {
     /// Recent state retained by full/pruned nodes.
     pub keep_state_blocks: u64,
@@ -553,7 +554,7 @@ impl Default for StateParams {
 }
 
 /// Light-client constants covered by the chain-spec hash.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LightClientParams {
     /// Weak-subjectivity period in seconds.
     pub weak_subjectivity_period_secs: u64,
@@ -577,7 +578,7 @@ impl Default for LightClientParams {
 }
 
 /// Recursive-checkpoint public inputs stored at genesis and after finalized chunks.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Checkpoint {
     /// Chain identifier.
     pub chain_id: ChainId,
@@ -604,14 +605,14 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Computes `BLAKE3(SCALE(self))`.
+    /// Computes `BLAKE3(borsh(self))`.
     pub fn hash(&self) -> Hash {
-        blake3_256(&self.encode())
+        blake3_256(&borsh::to_vec(self).expect("borsh serialization of Checkpoint is infallible"))
     }
 }
 
 /// Canonical chain specification used for DB metadata and peer compatibility.
-#[derive(Clone, Debug, Decode, Encode, Eq, Hash, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChainSpec {
     /// Chain-spec schema version.
     pub spec_version: u32,
@@ -652,9 +653,9 @@ pub struct ChainSpec {
 }
 
 impl ChainSpec {
-    /// Computes `BLAKE3(SCALE(self))`, the canonical chain-spec hash.
+    /// Computes `BLAKE3(borsh(self))`, the canonical chain-spec hash.
     pub fn hash(&self) -> Hash {
-        blake3_256(&self.encode())
+        blake3_256(&borsh::to_vec(self).expect("borsh serialization of ChainSpec is infallible"))
     }
 
     /// Computes the canonical genesis checkpoint from the chain-spec fields.
@@ -674,7 +675,7 @@ impl ChainSpec {
         }
     }
 
-    /// Computes `BLAKE3(SCALE(genesis_checkpoint))`.
+    /// Computes `BLAKE3(borsh(genesis_checkpoint))`.
     pub fn genesis_checkpoint_hash(&self) -> Hash {
         self.genesis_checkpoint.hash()
     }
@@ -910,8 +911,8 @@ mod tests {
         bits.push(false);
         bits.push(true);
 
-        let encoded = bits.encode();
-        let decoded = BitVec::decode(&mut &encoded[..]).expect("valid bit vec decodes");
+        let encoded = borsh::to_vec(&bits).expect("borsh serialization succeeds");
+        let decoded = borsh::from_slice::<BitVec>(&encoded).expect("valid bit vec decodes");
         assert_eq!(decoded.get(0), Some(true));
         assert_eq!(decoded.get(1), Some(false));
         assert_eq!(decoded.get(2), Some(true));

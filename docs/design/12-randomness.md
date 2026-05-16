@@ -272,7 +272,7 @@ Canonical signed-message construction is always:
 signed_message = DOMAIN_<X> || chain_id_le || <message-specific fields>
 ```
 
-`message-specific fields` are SCALE-encoded except for fixed-size primitives
+`message-specific fields` are borsh-encoded except for fixed-size primitives
 (`u64`, `[u8; N]`), which are emitted little-endian raw to keep the in-circuit
 parser branch-free. Per-phase wrappings in `02-consensus.md` and
 `07-block-format.md` reference these constants instead of re-defining

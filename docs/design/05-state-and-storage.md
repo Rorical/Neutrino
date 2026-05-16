@@ -211,7 +211,7 @@ and consumed by `prover-block` if this node is proving this height.
 
 ### Witness wire layout
 
-SCALE-encoded, versioned, content-addressed:
+borsh-encoded, versioned, content-addressed:
 
 ```rust
 pub const WITNESS_MAGIC: [u8; 4] = *b"NTWN";   // "NeuTrino WitNess"
@@ -239,7 +239,7 @@ pub struct BlockWitness {
 ```
 
 Storage key is `block_hash`. The witness is content-validated on read: the
-verifier recomputes `BLAKE3(SCALE(BlockWitness))` and compares against
+verifier recomputes `BLAKE3(borsh(BlockWitness))` and compares against
 `witnesses_hash` (a sidecar small column) before handing it to the prover.
 `witness_version` and `abi_version` give the prover crate two independent
 levers when changing wire shape; both are surfaced as prover errors if they
@@ -343,7 +343,7 @@ The canonical in-process representation is
 `neutrino_primitives::chain_spec::ChainSpec`. JSON, TOML, CLI flags, and
 network bootnode manifests are only ingest formats: the engine normalizes them
 into that Rust type, validates it, and computes
-`chain_spec_hash = BLAKE3(SCALE(ChainSpec))`. Peer handshakes and local DB
+`chain_spec_hash = BLAKE3(borsh(ChainSpec))`. Peer handshakes and local DB
 metadata compare that hash; if it differs, the node refuses to start or connect.
 
 On first run, the engine calls `runtime.init_genesis(&genesis_state)`, gets

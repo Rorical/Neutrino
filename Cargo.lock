@@ -2295,6 +2295,7 @@ dependencies = [
  "neutrino-consensus-types",
  "neutrino-crypto",
  "neutrino-primitives",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

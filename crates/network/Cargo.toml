@@ -24,6 +24,7 @@ libp2p = { version = "0.56.0", features = ["tokio", "gossipsub", "request-respon
 neutrino-consensus-types.workspace = true
 neutrino-crypto.workspace = true
 neutrino-primitives.workspace = true
+thiserror.workspace = true
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 

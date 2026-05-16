@@ -2,26 +2,19 @@
 #![allow(clippy::doc_markdown)]
 #![warn(missing_docs)]
 
-//! Networking scaffold for gossip topics and sync protocols.
+//! Networking stack for Neutrino consensus and execution gossip.
+//!
+//! The crate exposes a libp2p-based [`service::NetworkService`] with a
+//! composed [`behaviour::NeutrinoBehaviour`] that wires up the discovery
+//! (Kademlia), pub/sub (Gossipsub), and connection-keepalive (identify +
+//! ping) layers described in `docs/design/06-networking.md`. Topic strings
+//! and per-topic size caps live in [`topic`].
 
 /// Core libp2p behaviour composition for Neutrino.
 pub mod behaviour;
 /// The main networking service driving the swarm event loop.
 pub mod service;
+/// Canonical gossip topic registry.
+pub mod topic;
 
-/// Stable gossip topic identifiers.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Topic {
-    /// Block gossip topic.
-    Blocks,
-    /// Block proof gossip topic.
-    BlockProofs,
-    /// Chunk proof gossip topic.
-    ChunkProofs,
-    /// Recursive checkpoint gossip topic.
-    Checkpoints,
-    /// Finality vote gossip topic.
-    FinalityVotes,
-    /// Transaction gossip topic.
-    Transactions,
-}
+pub use topic::Topic;

@@ -536,6 +536,7 @@ name = "neutrino-trie"
 version = "0.1.0"
 dependencies = [
  "neutrino-primitives",
+ "rand",
 ]
 
 [[package]]

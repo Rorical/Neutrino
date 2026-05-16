@@ -77,6 +77,10 @@ enum TrieNode {
   to halve in-circuit hashing cost — selectable per deployment).
 - `value_hash` is the hash of the stored value, not the value itself; the
   value lives in a separate `state_values` column to keep the trie compact.
+- Raw runtime keys are converted to trie bit paths as
+  `key_len_u32_le || key_bytes`, then interpreted MSB-first. The fixed-width
+  length prefix lets the trie support arbitrary byte keys, including cases
+  where one raw key is a prefix of another.
 - Empty trie has root `[0; 32]`.
 
 ### Storage layout (RocksDB columns)

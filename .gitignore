@@ -1,6 +1,7 @@
 # Cargo / Rust
 /target/
 **/target/
+/target-rv32/
 **/*.rs.bk
 *.pdb
 Cargo.lock.bak

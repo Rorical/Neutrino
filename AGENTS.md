@@ -32,6 +32,18 @@ Run all six before claiming "green". `runtime-sdk` and
 and only build for the rv32im target; a host `cargo build` will silently
 skip them.
 
+`runtime-host` carries a `build.rs` that nests a `cargo build -p
+neutrino-default-runtime --target riscv32im-unknown-none-elf` into
+`target-rv32/` (a sibling of the workspace `target/`, gitignored). The
+ELF path is exposed to the integration test in
+`crates/runtime-host/tests/block_lifecycle.rs` through the
+`NEUTRINO_DEFAULT_RUNTIME_ELF` env var. The nested build runs with a
+cleared environment so the host-side feature resolver does not
+contaminate the rv32im build (specifically, inheriting cargo's outer
+build env makes borsh fail with missing `HashMap`/`HashSet` paths). If
+the rv32im target is not installed, set
+`CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1` and the test gracefully skips.
+
 Run a single test: `cargo test --locked -p neutrino-crypto bls::tests::sign_verify_roundtrip`.
 
 ## Lint posture
@@ -54,7 +66,9 @@ Run a single test: `cargo test --locked -p neutrino-crypto bls::tests::sign_veri
   (often 8 lines in `lib.rs`); do not assume an empty crate is a bug.
   As of this writing the crates with real code are:
   `primitives`, `codec`, `crypto`, `vrf`, `trie`, `storage`,
-  `runtime-abi`, `consensus-types`. Everything else is a marker
+  `runtime-abi`, `consensus-types`, `proof-system`, `vm-rv32im`,
+  `runtime-host`, `runtime-sdk`, `runtime-sdk-macros`, and
+  `runtimes/neutrino-default-runtime`. Everything else is a marker
   `struct`/`enum` awaiting its milestone.
 - Build order is vertical, milestone by milestone, defined in
   `docs/design/09-roadmap.md` (M0…M15). Don't reach ahead into

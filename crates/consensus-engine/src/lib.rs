@@ -12,6 +12,7 @@
 
 pub mod block_state;
 pub mod body;
+pub mod checkpoint;
 pub mod clock;
 pub mod engine;
 pub mod error;
@@ -27,6 +28,7 @@ pub use block_state::{BlockState, InvalidTransition};
 pub use body::{
     BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots, encode_runtime_body,
 };
+pub use checkpoint::{CheckpointError, CheckpointOutcome};
 pub use clock::SlotClock;
 pub use engine::Engine;
 pub use error::EngineError;

@@ -265,6 +265,18 @@ impl<DB: Database> Engine<DB> {
         // so through the chain store pointer.
         let _ = finalized_head;
     }
+
+    /// Advance the in-memory checkpoint pointers after recursive
+    /// checkpoint persistence. Crate-internal — the checkpoint
+    /// module is the only legitimate caller.
+    pub(crate) const fn update_checkpoint_pointers(
+        &mut self,
+        checkpoint_index: CheckpointIndex,
+        next_finalized_seed: Seed,
+    ) {
+        self.latest_checkpoint_index = checkpoint_index;
+        self.finalized_seed = next_finalized_seed;
+    }
 }
 
 #[cfg(test)]

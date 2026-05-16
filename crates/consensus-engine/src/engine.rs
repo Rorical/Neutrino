@@ -8,6 +8,7 @@ use neutrino_primitives::{
     BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot,
 };
 use neutrino_storage::Database;
+use neutrino_trie::Trie;
 
 use crate::clock::SlotClock;
 use crate::error::EngineError;
@@ -25,6 +26,7 @@ pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
     store: ChainStore<DB>,
     clock: SlotClock,
+    state: Trie,
     head_height: Height,
     head_hash: BlockHash,
     head_state_root: StateRoot,
@@ -71,6 +73,7 @@ impl<DB: Database> Engine<DB> {
             finalized_seed: chain_spec.genesis_seed,
             latest_finalized_chunk_id: None,
             latest_checkpoint_index: 0,
+            state: Trie::new(),
             chain_spec,
             store,
             clock,
@@ -136,6 +139,11 @@ impl<DB: Database> Engine<DB> {
             chain_spec.consensus.slot_duration_secs,
         );
 
+        // M5 does not persist trie nodes yet, so `open()` always starts
+        // with an empty in-memory trie. Re-opening past genesis is
+        // expected to be paired with a replay loop that re-applies
+        // every block; the deterministic-replay test in M5 Phase H
+        // exercises that path.
         Ok(Self {
             head_height,
             head_hash,
@@ -143,6 +151,7 @@ impl<DB: Database> Engine<DB> {
             finalized_seed: chain_spec.genesis_seed,
             latest_finalized_chunk_id,
             latest_checkpoint_index,
+            state: Trie::new(),
             chain_spec,
             store,
             clock,
@@ -217,6 +226,27 @@ impl<DB: Database> Engine<DB> {
     #[must_use]
     pub fn chain_spec_hash(&self) -> Hash {
         self.chain_spec.hash()
+    }
+
+    /// Mutable reference to the in-memory state trie. Crate-internal
+    /// because callers must swap the trie out into an [`Overlay`]
+    /// during block execution and restore it afterwards.
+    pub(crate) const fn state_mut_internal(&mut self) -> &mut Trie {
+        &mut self.state
+    }
+
+    /// Advance the in-memory head pointers after a block has been
+    /// produced and persisted. Crate-internal — block production is
+    /// the only legitimate caller.
+    pub(crate) const fn update_head_internal(
+        &mut self,
+        height: Height,
+        hash: BlockHash,
+        state_root: StateRoot,
+    ) {
+        self.head_height = height;
+        self.head_hash = hash;
+        self.head_state_root = state_root;
     }
 }
 

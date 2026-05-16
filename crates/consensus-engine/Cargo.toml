@@ -9,6 +9,7 @@ repository    = { workspace = true }
 homepage      = { workspace = true }
 documentation = { workspace = true }
 publish       = { workspace = true }
+build         = "build.rs"
 
 [features]
 default = ["std"]
@@ -21,9 +22,20 @@ std = [
 [dependencies]
 neutrino-primitives       = { workspace = true }
 neutrino-consensus-types  = { workspace = true }
+neutrino-consensus-vrf    = { workspace = true }
+neutrino-crypto           = { workspace = true }
+neutrino-mempool          = { workspace = true }
+neutrino-runtime-abi      = { workspace = true }
+neutrino-runtime-host     = { workspace = true }
 neutrino-storage          = { workspace = true }
+neutrino-trie             = { workspace = true }
+neutrino-vrf              = { workspace = true }
 borsh                     = { workspace = true }
 thiserror                 = { workspace = true }
+
+[dev-dependencies]
+neutrino-proof-system     = { workspace = true }
+rand                      = { workspace = true }
 
 [lints]
 workspace = true

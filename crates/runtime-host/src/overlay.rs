@@ -138,6 +138,16 @@ impl Overlay {
         }
         Ok(self.base.root())
     }
+
+    /// Consume the overlay and return the underlying [`Trie`].
+    ///
+    /// Useful for callers (e.g. the consensus engine) that build a
+    /// fresh overlay per block and need to thread the live state trie
+    /// across calls without cloning.
+    #[must_use]
+    pub fn into_base(self) -> Trie {
+        self.base
+    }
 }
 
 #[cfg(test)]
@@ -242,5 +252,17 @@ mod tests {
         let mut overlay = Overlay::empty();
         let root = overlay.commit().unwrap();
         assert_eq!(root, neutrino_trie::EMPTY_TRIE_ROOT);
+    }
+
+    #[test]
+    fn into_base_recovers_the_committed_trie() {
+        let mut overlay = Overlay::empty();
+        overlay.put(b"k1".to_vec(), b"v1".to_vec());
+        overlay.put(b"k2".to_vec(), b"v2".to_vec());
+        let new_root = overlay.commit().expect("commit");
+        let trie = overlay.into_base();
+        assert_eq!(trie.root(), new_root);
+        assert_eq!(trie.get(b"k1"), Some(b"v1".to_vec()));
+        assert_eq!(trie.get(b"k2"), Some(b"v2".to_vec()));
     }
 }

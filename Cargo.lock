@@ -588,8 +588,17 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "neutrino-consensus-types",
+ "neutrino-consensus-vrf",
+ "neutrino-crypto",
+ "neutrino-mempool",
  "neutrino-primitives",
+ "neutrino-proof-system",
+ "neutrino-runtime-abi",
+ "neutrino-runtime-host",
  "neutrino-storage",
+ "neutrino-trie",
+ "neutrino-vrf",
+ "rand",
  "thiserror",
 ]
 

@@ -66,9 +66,10 @@ Run a single test: `cargo test --locked -p neutrino-crypto bls::tests::sign_veri
   (often 8 lines in `lib.rs`); do not assume an empty crate is a bug.
   As of this writing the crates with real code are:
   `primitives`, `codec`, `crypto`, `vrf`, `trie`, `storage`,
-  `runtime-abi`, `consensus-types`, `proof-system`, `vm-rv32im`,
-  `runtime-host`, `runtime-sdk`, `runtime-sdk-macros`, and
-  `runtimes/neutrino-default-runtime`. Everything else is a marker
+  `runtime-abi`, `consensus-types`, `consensus-vrf`,
+  `consensus-fork-choice`, `consensus-chunk-bft`, `proof-system`,
+  `vm-rv32im`, `runtime-host`, `runtime-sdk`, `runtime-sdk-macros`,
+  and `runtimes/neutrino-default-runtime`. Everything else is a marker
   `struct`/`enum` awaiting its milestone.
 - Build order is vertical, milestone by milestone, defined in
   `docs/design/09-roadmap.md` (M0…M15). Don't reach ahead into

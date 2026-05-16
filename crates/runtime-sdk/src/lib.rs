@@ -26,6 +26,9 @@
 pub mod syscalls;
 
 #[cfg(target_arch = "riscv32")]
+mod allocator;
+
+#[cfg(target_arch = "riscv32")]
 mod panic;
 
 #[cfg(target_arch = "riscv32")]

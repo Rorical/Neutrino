@@ -17,6 +17,10 @@ const ET_EXEC: u16 = 2;
 const EM_RISCV: u16 = 0xF3;
 const PT_LOAD: u32 = 1;
 const PT_NULL: u32 = 0;
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
+const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 
 /// Result of parsing an ELF.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +92,19 @@ pub fn parse_elf(elf_bytes: &[u8]) -> Result<LoadedElf, String> {
             elf_bytes[offset + 3],
         ]);
 
-        if p_type == PT_NULL {
+        // We only place PT_LOAD segments into guest memory; PT_NULL is
+        // a documented no-op, and GNU's auxiliary PT types (stack
+        // flags, relro, eh_frame, property) are pure metadata that
+        // every real toolchain emits and that this static-only loader
+        // cannot act on. Treat them all as silently-skipped so the
+        // loader accepts the unmodified output of `rustc + rust-lld`
+        // for `riscv32im-unknown-none-elf`.
+        if p_type == PT_NULL
+            || p_type == PT_GNU_STACK
+            || p_type == PT_GNU_RELRO
+            || p_type == PT_GNU_EH_FRAME
+            || p_type == PT_GNU_PROPERTY
+        {
             continue;
         }
 
@@ -416,5 +432,83 @@ mod tests {
         let result = parse_elf(&elf).unwrap();
         assert_eq!(result.entry, 0xDEAD);
         assert!(result.segments.is_empty());
+    }
+
+    /// `rust-lld` emits a `PT_GNU_STACK` header on every binary; the
+    /// loader must skip it (and the other GNU informational PT types)
+    /// instead of rejecting the ELF.
+    fn build_elf32_with_gnu_pt(entry: u32, segments: &[(u32, u32, u32, u32, u32, u32)]) -> Vec<u8> {
+        let phoff: u32 = 52;
+        let phnum: u16 = u16::try_from(segments.len()).unwrap();
+        let mut elf = vec![0u8; 52 + segments.len() * 32];
+
+        elf[0..4].copy_from_slice(&ELF_MAGIC);
+        elf[4] = ELFCLASS32;
+        elf[5] = ELFDATA2LSB;
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
+        elf[24..28].copy_from_slice(&entry.to_le_bytes());
+        elf[28..32].copy_from_slice(&phoff.to_le_bytes());
+        elf[44..46].copy_from_slice(&phnum.to_le_bytes());
+
+        for (i, &(p_type, vaddr, offset, filesz, memsz, flags)) in segments.iter().enumerate() {
+            let base = 52 + i * 32;
+            elf[base..base + 4].copy_from_slice(&p_type.to_le_bytes());
+            elf[base + 4..base + 8].copy_from_slice(&offset.to_le_bytes());
+            elf[base + 8..base + 12].copy_from_slice(&vaddr.to_le_bytes());
+            elf[base + 16..base + 20].copy_from_slice(&filesz.to_le_bytes());
+            elf[base + 20..base + 24].copy_from_slice(&memsz.to_le_bytes());
+            elf[base + 24..base + 28].copy_from_slice(&flags.to_le_bytes());
+        }
+
+        elf
+    }
+
+    #[test]
+    fn skip_pt_gnu_stack() {
+        // `rust-lld` always emits a PT_GNU_STACK as the last program
+        // header. The PT_LOAD here uses `(offset, filesz)=(0, 0)` so
+        // the synthetic ELF fits in the bytes the builder allocated.
+        let elf = build_elf32_with_gnu_pt(
+            0x1000,
+            &[
+                (PT_LOAD, 0x1000, 0, 0, 0x100, 0x5),
+                (PT_GNU_STACK, 0, 0, 0, 0, 6),
+            ],
+        );
+        let result = parse_elf(&elf).expect("PT_GNU_STACK should be skipped");
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.segments[0].vaddr, 0x1000);
+    }
+
+    #[test]
+    fn skip_other_gnu_pt_types() {
+        for gnu_type in [PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_PROPERTY] {
+            let elf = build_elf32_with_gnu_pt(
+                0x2000,
+                &[
+                    (PT_LOAD, 0x2000, 0, 0, 0x100, 0x5),
+                    (gnu_type, 0, 0, 0, 0, 0),
+                ],
+            );
+            let result = parse_elf(&elf)
+                .unwrap_or_else(|_| panic!("PT type {gnu_type:#x} should be skipped"));
+            assert_eq!(result.segments.len(), 1);
+        }
+    }
+
+    #[test]
+    fn reject_unknown_pt_type() {
+        // Any non-PT_LOAD, non-GNU-aux PT type should still be
+        // rejected explicitly to keep the loader honest about
+        // unrecognised input.
+        let elf = build_elf32_with_gnu_pt(
+            0x1000,
+            &[
+                (PT_LOAD, 0x1000, 0, 0, 0x100, 0x5),
+                (0xFFFF_FFFF, 0, 0, 0, 0, 0),
+            ],
+        );
+        assert!(parse_elf(&elf).is_err());
     }
 }

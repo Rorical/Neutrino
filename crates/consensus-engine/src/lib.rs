@@ -10,6 +10,7 @@
 //! finality cert, checkpoint, recursive proof, validator-set snapshot) to a
 //! column-family [`Database`](neutrino_storage::Database).
 
+pub mod block_state;
 pub mod body;
 pub mod clock;
 pub mod engine;
@@ -17,9 +18,11 @@ pub mod error;
 pub mod merkle;
 pub mod produce;
 pub mod proposer;
+pub mod prove;
 pub mod store;
 pub mod validator_set;
 
+pub use block_state::{BlockState, InvalidTransition};
 pub use body::{
     BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots, encode_runtime_body,
 };
@@ -29,6 +32,7 @@ pub use error::EngineError;
 pub use merkle::{EMPTY_MERKLE_ROOT, hash_leaf, merkle_root, merkle_root_of_hashes};
 pub use produce::{ProductionConfig, ProductionError, ProductionOutcome};
 pub use proposer::ProposerKey;
+pub use prove::{ProveError, ProveOutcome};
 pub use store::{ChainStore, StoreError, ValidatorSetSnapshot, keys, pointers};
 pub use validator_set::validator_set_root;
 

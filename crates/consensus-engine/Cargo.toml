@@ -25,6 +25,7 @@ neutrino-consensus-types  = { workspace = true }
 neutrino-consensus-vrf    = { workspace = true }
 neutrino-crypto           = { workspace = true }
 neutrino-mempool          = { workspace = true }
+neutrino-proof-system     = { workspace = true }
 neutrino-runtime-abi      = { workspace = true }
 neutrino-runtime-host     = { workspace = true }
 neutrino-storage          = { workspace = true }
@@ -34,7 +35,6 @@ borsh                     = { workspace = true }
 thiserror                 = { workspace = true }
 
 [dev-dependencies]
-neutrino-proof-system     = { workspace = true }
 rand                      = { workspace = true }
 
 [lints]

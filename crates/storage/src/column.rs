@@ -20,6 +20,8 @@ pub enum Column {
     Chunks,
     /// Per-block proof artifacts, keyed by block hash.
     BlockProofs,
+    /// Per-block consensus FSM state, keyed by block hash.
+    BlockStates,
     /// Per-chunk proof artifacts, keyed by chunk id.
     ChunkProofs,
     /// Recursive checkpoints, keyed by checkpoint index.
@@ -41,7 +43,7 @@ pub enum Column {
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 17] = [
+pub const ALL_COLUMNS: [Column; 18] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -50,6 +52,7 @@ pub const ALL_COLUMNS: [Column; 17] = [
     Column::HeaderBySlot,
     Column::Chunks,
     Column::BlockProofs,
+    Column::BlockStates,
     Column::ChunkProofs,
     Column::Checkpoints,
     Column::RecursiveProofs,
@@ -74,6 +77,7 @@ impl Column {
             Self::HeaderBySlot => "header_by_slot",
             Self::Chunks => "chunks",
             Self::BlockProofs => "block_proofs",
+            Self::BlockStates => "block_states",
             Self::ChunkProofs => "chunk_proofs",
             Self::Checkpoints => "checkpoints",
             Self::RecursiveProofs => "recursive_proofs",
@@ -93,7 +97,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 17);
+        assert_eq!(ALL_COLUMNS.len(), 18);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -103,7 +107,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 17] = [
+        let names: [&str; 18] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -112,6 +116,7 @@ mod tests {
             "header_by_slot",
             "chunks",
             "block_proofs",
+            "block_states",
             "chunk_proofs",
             "checkpoints",
             "recursive_proofs",

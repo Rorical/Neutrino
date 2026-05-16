@@ -12,6 +12,8 @@ use neutrino_primitives::{
 };
 use neutrino_storage::{Column, Database};
 
+use crate::block_state::BlockState;
+
 use super::{StoreError, keys, pointers};
 
 extern crate alloc;
@@ -191,6 +193,30 @@ impl<DB: Database> ChainStore<DB> {
         hash: &BlockHash,
     ) -> Result<Option<BlockProof>, StoreError<DB::Error>> {
         self.get_decoded(Column::BlockProofs, &keys::hash_key(hash))
+    }
+
+    // ---------- Block FSM state ----------
+
+    /// Persist the mock-proof FSM state for `hash`.
+    ///
+    /// Per-block state is tracked in [`Column::BlockStates`] so the
+    /// 1000-slot M5 replay test can assert every block walks
+    /// `BlockProduced → PendingProof → Proven → ChunkProven →
+    /// Finalized → Checkpointed`.
+    pub fn put_block_state(
+        &mut self,
+        hash: &BlockHash,
+        state: BlockState,
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.put_encoded(Column::BlockStates, &keys::hash_key(hash), &state)
+    }
+
+    /// Read the mock-proof FSM state for `hash`.
+    pub fn get_block_state(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<Option<BlockState>, StoreError<DB::Error>> {
+        self.get_decoded(Column::BlockStates, &keys::hash_key(hash))
     }
 
     // ---------- Chunks ----------
@@ -577,6 +603,55 @@ mod tests {
         };
         store.put_block_proof(&hash, &proof).expect("put");
         assert_eq!(store.get_block_proof(&hash).expect("get"), Some(proof));
+    }
+
+    #[test]
+    fn block_state_roundtrips_and_overwrites() {
+        let mut store = ChainStore::new(MemoryDatabase::new());
+        let hash = h(77);
+        assert_eq!(store.get_block_state(&hash).expect("get"), None);
+
+        store
+            .put_block_state(&hash, BlockState::BlockProduced)
+            .expect("put");
+        assert_eq!(
+            store.get_block_state(&hash).expect("get"),
+            Some(BlockState::BlockProduced),
+        );
+
+        store
+            .put_block_state(&hash, BlockState::PendingProof)
+            .expect("put");
+        assert_eq!(
+            store.get_block_state(&hash).expect("get"),
+            Some(BlockState::PendingProof),
+        );
+
+        store
+            .put_block_state(&hash, BlockState::Proven)
+            .expect("put");
+        assert_eq!(
+            store.get_block_state(&hash).expect("get"),
+            Some(BlockState::Proven),
+        );
+    }
+
+    #[test]
+    fn block_states_are_per_hash() {
+        let mut store = ChainStore::new(MemoryDatabase::new());
+        let a = h(101);
+        let b = h(102);
+        store
+            .put_block_state(&a, BlockState::Proven)
+            .expect("put a");
+        store
+            .put_block_state(&b, BlockState::BlockProduced)
+            .expect("put b");
+        assert_eq!(store.get_block_state(&a).unwrap(), Some(BlockState::Proven));
+        assert_eq!(
+            store.get_block_state(&b).unwrap(),
+            Some(BlockState::BlockProduced),
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use neutrino_runtime_host::{BlockError, BlockOutcome, Overlay, run_block};
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
+use crate::block_state::BlockState;
 use crate::body::{
     BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots, encode_runtime_body,
 };
@@ -186,6 +187,8 @@ impl<DB: Database> Engine<DB> {
 
         self.store_mut().put_header(&block.header)?;
         self.store_mut().put_body(&block_hash, &block.body)?;
+        self.store_mut()
+            .put_block_state(&block_hash, BlockState::BlockProduced)?;
         self.store_mut().put_tip(block_hash)?;
 
         self.update_head_internal(height, block_hash, outcome.state_root_after);

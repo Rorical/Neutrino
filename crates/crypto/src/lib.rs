@@ -1,50 +1,41 @@
-#![cfg_attr(not(feature = "std"), no_std)]
+//! Neutrino cryptographic primitives.
+//!
+//! This crate wraps battle-tested implementations of the signature schemes
+//! and hash functions consensus, networking, and the runtime ABI need:
+//!
+//! * **Hashes.** BLAKE3 (canonical, re-exported from `primitives`),
+//!   SHA-256, Keccak-256.
+//! * **Ed25519.** libp2p peer identity, generic message signing.
+//! * **secp256k1 ECDSA.** Cross-chain bridge compatibility, EIP-712-style
+//!   use. Signatures are 65-byte recoverable (`r || s || v`).
+//! * **BLS12-381 (min-pk, POP scheme).** Consensus-critical proposer
+//!   signatures, finality-vote aggregation, deposit proofs-of-possession,
+//!   and the BLS-VRF building block consumed by the [`vrf`] crate.
+//!
+//! All consensus-critical signatures bind a 16-byte `DOMAIN_*` tag and the
+//! chain ID into the signed message; this crate exposes the raw primitive
+//! and the higher-level consensus crates handle the canonical message
+//! construction described in [`docs/design/12-randomness.md`]
+//! ("Canonical domain tags").
+//!
+//! [`vrf`]: https://docs.rs/neutrino-vrf
+//! [`docs/design/12-randomness.md`]: https://github.com/Rorical/Neutrino/blob/main/docs/design/12-randomness.md
+
 #![deny(unsafe_code)]
 #![allow(clippy::doc_markdown)]
 
-//! Cryptographic hash wrappers shared by consensus crates.
-//!
-//! `blake3_256` is the canonical chain-spec/witness hash and lives in
-//! `neutrino-primitives` because primitives must be able to compute its own
-//! identity hash. This crate re-exports it alongside `sha256` and
-//! `keccak256`, which are needed by BLS hash-to-curve and EVM-compatible
-//! runtimes respectively.
+pub mod bls;
+pub mod ed25519;
+mod error;
+pub mod hash;
+pub mod secp256k1;
 
-pub use neutrino_primitives::{Hash, blake3_256};
+pub use error::CryptoError;
+pub use hash::{blake3_256, keccak256, sha256};
 
-use sha2::{Digest, Sha256};
-use tiny_keccak::{Hasher, Keccak};
-
-/// Computes SHA-256.
-pub fn sha256(input: &[u8]) -> Hash {
-    let digest = Sha256::digest(input);
-    let mut output = [0_u8; 32];
-    output.copy_from_slice(&digest);
-    output
-}
-
-/// Computes Keccak-256.
-pub fn keccak256(input: &[u8]) -> Hash {
-    let mut output = [0_u8; 32];
-    let mut hasher = Keccak::v256();
-    hasher.update(input);
-    hasher.finalize(&mut output);
-    output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blake3_matches_primitives_implementation() {
-        let input = b"neutrino";
-        assert_eq!(blake3_256(input), neutrino_primitives::blake3_256(input));
-    }
-
-    #[test]
-    fn sha256_and_keccak256_produce_distinct_digests() {
-        let input = b"neutrino";
-        assert_ne!(sha256(input), keccak256(input));
-    }
-}
+// Re-export raw byte aliases so downstream crates can write
+// `crypto::BlsPublicKey` without depending on `primitives` directly.
+pub use neutrino_primitives::{
+    BlsPublicKey, BlsSignature, Ed25519PublicKey, Ed25519Signature, Hash, Secp256k1PublicKey,
+    Secp256k1Signature,
+};

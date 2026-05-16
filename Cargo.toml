@@ -133,12 +133,12 @@ sha2                = { version = "0.10", default-features = false }
 tiny-keccak         = { version = "2.0",  features = ["keccak"] }
 
 blst                = { version = "0.3" }
-ed25519-dalek       = { version = "2.1",  default-features = false, features = ["zeroize"] }
-k256                = { version = "0.13", default-features = false, features = ["ecdsa"] }
+ed25519-dalek       = { version = "2.1",  default-features = false, features = ["zeroize", "rand_core", "alloc"] }
+k256                = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
 
 subtle              = { version = "2.6",  default-features = false }
-zeroize             = { version = "1.8",  default-features = false }
-rand_core           = { version = "0.6",  default-features = false }
+zeroize             = { version = "1.8",  default-features = false, features = ["derive"] }
+rand_core           = { version = "0.6",  default-features = false, features = ["getrandom"] }
 rand                = { version = "0.8" }
 
 thiserror           = { version = "2.0" }

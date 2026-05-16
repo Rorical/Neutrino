@@ -40,6 +40,165 @@ pub use status::{Status, UnknownStatus};
 /// whose [`RuntimeVersion::abi_version`] does not match.
 pub const VERSION: u32 = ABI_VERSION;
 
+/// Runtime symbol used by the host to run a single transaction
+/// admission check.
+pub const VALIDATE_TX_ENTRYPOINT: &str = "_neutrino_validate_tx";
+
+/// Byte length of the fixed transaction-validity result returned by
+/// [`VALIDATE_TX_ENTRYPOINT`].
+pub const TX_VALIDITY_ENCODED_LEN: usize = 12;
+
+/// Runtime-defined transaction validity code returned to the host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxValidationCode {
+    /// The transaction is valid against the supplied state root.
+    Valid,
+    /// The transaction bytes are malformed or truncated.
+    Malformed,
+    /// A transaction signature failed verification.
+    BadSignature,
+    /// The transaction nonce does not match account state.
+    NonceMismatch,
+    /// The sender or stake account lacks the required balance.
+    InsufficientBalance,
+    /// The transaction attempts an operation reserved to another owner.
+    Unauthorized,
+    /// The transaction type tag is not recognised by this runtime.
+    UnknownType,
+    /// Runtime state could not be read in the expected format.
+    StateReadFailed,
+}
+
+impl TxValidationCode {
+    /// Convert the validation code into its stable ABI integer.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::Valid => 0,
+            Self::Malformed => 1,
+            Self::BadSignature => 2,
+            Self::NonceMismatch => 3,
+            Self::InsufficientBalance => 4,
+            Self::Unauthorized => 5,
+            Self::UnknownType => 6,
+            Self::StateReadFailed => 7,
+        }
+    }
+
+    /// Convert a stable ABI integer back into a validation code.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Valid),
+            1 => Some(Self::Malformed),
+            2 => Some(Self::BadSignature),
+            3 => Some(Self::NonceMismatch),
+            4 => Some(Self::InsufficientBalance),
+            5 => Some(Self::Unauthorized),
+            6 => Some(Self::UnknownType),
+            7 => Some(Self::StateReadFailed),
+            _ => None,
+        }
+    }
+
+    /// `true` when this code admits the transaction into a block or mempool.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
+}
+
+/// Result returned by a runtime transaction-admission entrypoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxValidity {
+    /// Validity code produced by the runtime.
+    pub code: TxValidationCode,
+    /// Runtime-defined mempool priority. Higher values drain first.
+    pub priority: u64,
+}
+
+impl TxValidity {
+    /// Construct an admitted transaction result.
+    #[must_use]
+    pub const fn valid(priority: u64) -> Self {
+        Self {
+            code: TxValidationCode::Valid,
+            priority,
+        }
+    }
+
+    /// Construct a rejected transaction result.
+    #[must_use]
+    pub const fn invalid(code: TxValidationCode) -> Self {
+        Self { code, priority: 0 }
+    }
+
+    /// `true` when this result admits the transaction.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.code.is_valid()
+    }
+
+    /// Encode this result as `code:u32 || priority:u64`, both little-endian.
+    #[must_use]
+    pub const fn encode(self) -> [u8; TX_VALIDITY_ENCODED_LEN] {
+        let code = self.code.as_u32().to_le_bytes();
+        let priority = self.priority.to_le_bytes();
+        [
+            code[0],
+            code[1],
+            code[2],
+            code[3],
+            priority[0],
+            priority[1],
+            priority[2],
+            priority[3],
+            priority[4],
+            priority[5],
+            priority[6],
+            priority[7],
+        ]
+    }
+
+    /// Decode a fixed-width runtime validity result.
+    pub fn decode(bytes: &[u8]) -> Result<Self, TxValidityDecodeError> {
+        if bytes.len() != TX_VALIDITY_ENCODED_LEN {
+            return Err(TxValidityDecodeError::WrongLength {
+                actual: bytes.len(),
+            });
+        }
+        let code_raw = u32::from_le_bytes(
+            bytes[..4]
+                .try_into()
+                .expect("length checked for validation code"),
+        );
+        let Some(code) = TxValidationCode::from_u32(code_raw) else {
+            return Err(TxValidityDecodeError::UnknownCode { code: code_raw });
+        };
+        let priority = u64::from_le_bytes(
+            bytes[4..]
+                .try_into()
+                .expect("length checked for validation priority"),
+        );
+        Ok(Self { code, priority })
+    }
+}
+
+/// Errors while decoding a transaction-validity result from the runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TxValidityDecodeError {
+    /// The output length did not match [`TX_VALIDITY_ENCODED_LEN`].
+    WrongLength {
+        /// Actual number of bytes returned by the runtime.
+        actual: usize,
+    },
+    /// The runtime returned an unknown validation code.
+    UnknownCode {
+        /// Raw code returned by the runtime.
+        code: u32,
+    },
+}
+
 /// Borsh-encoded per-block context handed to every entrypoint via the
 /// [`syscall::block::CONTEXT_OUT`] syscall.
 ///
@@ -108,5 +267,23 @@ mod tests {
         let version = default_runtime_version();
         assert_eq!(version.abi_version, VERSION);
         assert_eq!(version.abi_version, ABI_VERSION);
+    }
+
+    #[test]
+    fn transaction_validity_round_trips_fixed_encoding() {
+        let validity = TxValidity::valid(42);
+        let encoded = validity.encode();
+        assert_eq!(encoded.len(), TX_VALIDITY_ENCODED_LEN);
+        assert_eq!(TxValidity::decode(&encoded).unwrap(), validity);
+    }
+
+    #[test]
+    fn transaction_validity_rejects_unknown_code() {
+        let mut encoded = TxValidity::invalid(TxValidationCode::BadSignature).encode();
+        encoded[..4].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(
+            TxValidity::decode(&encoded),
+            Err(TxValidityDecodeError::UnknownCode { code: 99 })
+        );
     }
 }

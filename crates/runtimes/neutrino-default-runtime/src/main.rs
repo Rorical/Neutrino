@@ -67,7 +67,8 @@
 //! On exit the staked balance is returned to the owner and the stake
 //! account is deleted.
 
-use neutrino_runtime_sdk::{entrypoint, syscalls};
+use neutrino_runtime_abi::{TX_VALIDITY_ENCODED_LEN, TxValidationCode, TxValidity};
+use neutrino_runtime_sdk::{entrypoint, syscalls, tx_validation_entrypoint};
 
 /// ABI status code mirrored from `neutrino_runtime_abi::status`.
 const STATUS_OK: u32 = 0;
@@ -199,12 +200,9 @@ fn write_account(pubkey: &[u8; ACC_KEY_LEN], account: &Account) {
     );
 }
 
-/// Verify an Ed25519 signature and abort on failure.
-fn verify_sig(msg_ptr: u32, msg_len: u32, sig_ptr: u32, pub_ptr: u32) {
-    let verified = syscalls::verify_ed25519(msg_ptr, msg_len, sig_ptr, pub_ptr);
-    if verified == 0 {
-        syscalls::abort(ABORT_SIGNATURE);
-    }
+/// Return whether an Ed25519 signature is valid.
+fn sig_is_valid(msg_ptr: u32, msg_len: u32, sig_ptr: u32, pub_ptr: u32) -> bool {
+    syscalls::verify_ed25519(msg_ptr, msg_len, sig_ptr, pub_ptr) != 0
 }
 
 /// Write a 32-byte BLAKE3 hash of `input` to `out`.
@@ -304,11 +302,39 @@ fn update_validator_set(op: u8, bls_pk: &[u8; BLS_KEY_LEN], new_stake: u64) {
     );
 }
 
-/// Verify and apply a single transfer transaction.
-fn process_transfer(txn: &[u8]) {
+/// Validate a single transfer transaction against current state.
+fn validate_transfer(txn: &[u8]) -> TxValidationCode {
     if txn.len() < XFR_SIG_OFF + SIG_LEN {
-        syscalls::abort(ABORT_BAD_TXN_TYPE);
+        return TxValidationCode::Malformed;
     }
+    let from: [u8; ACC_KEY_LEN] = txn[XFR_FROM_OFF..XFR_TO_OFF]
+        .try_into()
+        .expect("32-byte from");
+    let amount = read_u64_le(txn, XFR_AMOUNT_OFF);
+    let nonce = read_u64_le(txn, XFR_NONCE_OFF);
+
+    if !sig_is_valid(
+        txn[..XFR_SIG_OFF].as_ptr() as u32,
+        XFR_MSG_LEN as u32,
+        txn[XFR_SIG_OFF..XFR_SIG_OFF + SIG_LEN].as_ptr() as u32,
+        from.as_ptr() as u32,
+    ) {
+        return TxValidationCode::BadSignature;
+    }
+
+    let sender = read_account(&from);
+    if sender.nonce != nonce {
+        return TxValidationCode::NonceMismatch;
+    }
+    if sender.balance < amount {
+        return TxValidationCode::InsufficientBalance;
+    }
+
+    TxValidationCode::Valid
+}
+
+/// Apply a transfer already accepted by [`validate_transfer`].
+fn apply_transfer(txn: &[u8]) {
     let from: [u8; ACC_KEY_LEN] = txn[XFR_FROM_OFF..XFR_TO_OFF]
         .try_into()
         .expect("32-byte from");
@@ -316,23 +342,8 @@ fn process_transfer(txn: &[u8]) {
         .try_into()
         .expect("32-byte to");
     let amount = read_u64_le(txn, XFR_AMOUNT_OFF);
-    let nonce = read_u64_le(txn, XFR_NONCE_OFF);
-
-    verify_sig(
-        txn[..XFR_SIG_OFF].as_ptr() as u32,
-        XFR_MSG_LEN as u32,
-        txn[XFR_SIG_OFF..XFR_SIG_OFF + SIG_LEN].as_ptr() as u32,
-        from.as_ptr() as u32,
-    );
 
     let mut sender = read_account(&from);
-    if sender.nonce != nonce {
-        syscalls::abort(ABORT_NONCE);
-    }
-    if sender.balance < amount {
-        syscalls::abort(ABORT_UNDERFLOW);
-    }
-
     let mut receiver = read_account(&to);
 
     sender.balance = sender.balance.wrapping_sub(amount);
@@ -343,10 +354,10 @@ fn process_transfer(txn: &[u8]) {
     write_account(&to, &receiver);
 }
 
-/// Verify and apply a single stake transaction.
-fn process_stake(txn: &[u8]) {
+/// Validate a single stake transaction against current state.
+fn validate_stake(txn: &[u8]) -> TxValidationCode {
     if txn.len() < STK_SIG_OFF + SIG_LEN {
-        syscalls::abort(ABORT_BAD_TXN_TYPE);
+        return TxValidationCode::Malformed;
     }
     let from: [u8; ACC_KEY_LEN] = txn[STK_FROM_OFF..STK_BLS_OFF]
         .try_into()
@@ -357,27 +368,45 @@ fn process_stake(txn: &[u8]) {
     let amount = read_u64_le(txn, STK_AMOUNT_OFF);
     let nonce = read_u64_le(txn, STK_NONCE_OFF);
 
-    verify_sig(
+    if !sig_is_valid(
         txn[..STK_SIG_OFF].as_ptr() as u32,
         STK_MSG_LEN as u32,
         txn[STK_SIG_OFF..STK_SIG_OFF + SIG_LEN].as_ptr() as u32,
         from.as_ptr() as u32,
-    );
+    ) {
+        return TxValidationCode::BadSignature;
+    }
 
-    let mut sender = read_account(&from);
+    let sender = read_account(&from);
     if sender.nonce != nonce {
-        syscalls::abort(ABORT_NONCE);
+        return TxValidationCode::NonceMismatch;
     }
     if sender.balance < amount {
-        syscalls::abort(ABORT_UNDERFLOW);
+        return TxValidationCode::InsufficientBalance;
     }
 
+    let stk = read_stake_account(&bls_pk);
+    if stk.owner != [0u8; ACC_KEY_LEN] && stk.owner != from {
+        return TxValidationCode::Unauthorized;
+    }
+
+    TxValidationCode::Valid
+}
+
+/// Apply a stake already accepted by [`validate_stake`].
+fn apply_stake(txn: &[u8]) {
+    let from: [u8; ACC_KEY_LEN] = txn[STK_FROM_OFF..STK_BLS_OFF]
+        .try_into()
+        .expect("32-byte from");
+    let bls_pk: [u8; BLS_KEY_LEN] = txn[STK_BLS_OFF..STK_AMOUNT_OFF]
+        .try_into()
+        .expect("48-byte bls");
+    let amount = read_u64_le(txn, STK_AMOUNT_OFF);
+
+    let mut sender = read_account(&from);
     let mut stk = read_stake_account(&bls_pk);
     if stk.owner == [0u8; ACC_KEY_LEN] {
         stk.owner = from;
-    }
-    if stk.owner != from {
-        syscalls::abort(ABORT_UNDERFLOW);
     }
 
     sender.balance = sender.balance.wrapping_sub(amount);
@@ -389,10 +418,10 @@ fn process_stake(txn: &[u8]) {
     update_validator_set(TX_STAKE, &bls_pk, stk.staked);
 }
 
-/// Verify and apply a single unstake transaction.
-fn process_unstake(txn: &[u8]) {
+/// Validate a single unstake transaction against current state.
+fn validate_unstake(txn: &[u8]) -> TxValidationCode {
     if txn.len() < STK_SIG_OFF + SIG_LEN {
-        syscalls::abort(ABORT_BAD_TXN_TYPE);
+        return TxValidationCode::Malformed;
     }
     let from: [u8; ACC_KEY_LEN] = txn[STK_FROM_OFF..STK_BLS_OFF]
         .try_into()
@@ -403,25 +432,43 @@ fn process_unstake(txn: &[u8]) {
     let amount = read_u64_le(txn, STK_AMOUNT_OFF);
     let nonce = read_u64_le(txn, STK_NONCE_OFF);
 
-    verify_sig(
+    if !sig_is_valid(
         txn[..STK_SIG_OFF].as_ptr() as u32,
         STK_MSG_LEN as u32,
         txn[STK_SIG_OFF..STK_SIG_OFF + SIG_LEN].as_ptr() as u32,
         from.as_ptr() as u32,
-    );
-
-    let mut sender = read_account(&from);
-    if sender.nonce != nonce {
-        syscalls::abort(ABORT_NONCE);
+    ) {
+        return TxValidationCode::BadSignature;
     }
 
-    let mut stk = read_stake_account(&bls_pk);
+    let sender = read_account(&from);
+    if sender.nonce != nonce {
+        return TxValidationCode::NonceMismatch;
+    }
+
+    let stk = read_stake_account(&bls_pk);
     if stk.owner != from {
-        syscalls::abort(ABORT_UNDERFLOW);
+        return TxValidationCode::Unauthorized;
     }
     if stk.staked < amount {
-        syscalls::abort(ABORT_UNDERFLOW);
+        return TxValidationCode::InsufficientBalance;
     }
+
+    TxValidationCode::Valid
+}
+
+/// Apply an unstake already accepted by [`validate_unstake`].
+fn apply_unstake(txn: &[u8]) {
+    let from: [u8; ACC_KEY_LEN] = txn[STK_FROM_OFF..STK_BLS_OFF]
+        .try_into()
+        .expect("32-byte from");
+    let bls_pk: [u8; BLS_KEY_LEN] = txn[STK_BLS_OFF..STK_AMOUNT_OFF]
+        .try_into()
+        .expect("48-byte bls");
+    let amount = read_u64_le(txn, STK_AMOUNT_OFF);
+
+    let mut sender = read_account(&from);
+    let mut stk = read_stake_account(&bls_pk);
 
     sender.balance = sender.balance.wrapping_add(amount);
     sender.nonce += 1;
@@ -437,22 +484,29 @@ fn process_unstake(txn: &[u8]) {
     }
 }
 
-/// Verify and apply a single deposit transaction.
+/// Validate a single deposit transaction against current state.
+fn validate_deposit(txn: &[u8]) -> TxValidationCode {
+    if txn.len() < DEP_AMOUNT_OFF + 8 {
+        return TxValidationCode::Malformed;
+    }
+    let amount = read_u64_le(txn, DEP_AMOUNT_OFF);
+
+    if amount == 0 {
+        return TxValidationCode::InsufficientBalance;
+    }
+
+    TxValidationCode::Valid
+}
+
+/// Apply a single deposit transaction.
 ///
 /// Engine-verified: the BLS proof-of-possession is validated at block
 /// proposal time. The runtime unconditionally credits the stake account.
-fn process_deposit(txn: &[u8]) {
-    if txn.len() < DEP_AMOUNT_OFF + 8 {
-        syscalls::abort(ABORT_BAD_TXN_TYPE);
-    }
+fn apply_deposit(txn: &[u8]) {
     let bls_pk: [u8; BLS_KEY_LEN] = txn[DEP_BLS_OFF..DEP_AMOUNT_OFF]
         .try_into()
         .expect("48-byte bls");
     let amount = read_u64_le(txn, DEP_AMOUNT_OFF);
-
-    if amount == 0 {
-        syscalls::abort(ABORT_UNDERFLOW);
-    }
 
     let mut stk = read_stake_account(&bls_pk);
     stk.staked = stk.staked.wrapping_add(amount);
@@ -460,14 +514,10 @@ fn process_deposit(txn: &[u8]) {
     update_validator_set(TX_DEPOSIT, &bls_pk, stk.staked);
 }
 
-/// Verify and apply a single voluntary-exit transaction.
-///
-/// The engine surfaces this only after verifying the validator's
-/// BLS exit signature externally. The runtime unconditionally returns
-/// the staked balance to the owner and deletes the stake account.
-fn process_exit(txn: &[u8]) {
+/// Validate a single voluntary-exit transaction against current state.
+fn validate_exit(txn: &[u8]) -> TxValidationCode {
     if txn.len() < EXT_BLS_OFF + BLS_KEY_LEN {
-        syscalls::abort(ABORT_BAD_TXN_TYPE);
+        return TxValidationCode::Malformed;
     }
     let bls_pk: [u8; BLS_KEY_LEN] = txn[EXT_BLS_OFF..EXT_BLS_OFF + BLS_KEY_LEN]
         .try_into()
@@ -475,8 +525,23 @@ fn process_exit(txn: &[u8]) {
 
     let stk = read_stake_account(&bls_pk);
     if stk.staked == 0 {
-        syscalls::abort(ABORT_UNDERFLOW);
+        return TxValidationCode::InsufficientBalance;
     }
+
+    TxValidationCode::Valid
+}
+
+/// Apply a single voluntary-exit transaction.
+///
+/// The engine surfaces this only after verifying the validator's
+/// BLS exit signature externally. The runtime unconditionally returns
+/// the staked balance to the owner and deletes the stake account.
+fn apply_exit(txn: &[u8]) {
+    let bls_pk: [u8; BLS_KEY_LEN] = txn[EXT_BLS_OFF..EXT_BLS_OFF + BLS_KEY_LEN]
+        .try_into()
+        .expect("48-byte bls");
+
+    let stk = read_stake_account(&bls_pk);
 
     // Return the staked balance to the owner.
     if stk.owner != [0u8; ACC_KEY_LEN] {
@@ -487,6 +552,76 @@ fn process_exit(txn: &[u8]) {
 
     delete_stake_account(&bls_pk);
     update_validator_set(TX_EXIT, &bls_pk, 0);
+}
+
+/// Validate one runtime-defined transaction without applying it.
+fn transaction_validity(txn: &[u8]) -> TxValidationCode {
+    if txn.is_empty() {
+        return TxValidationCode::Malformed;
+    }
+    match txn[0] {
+        TX_TRANSFER => validate_transfer(txn),
+        TX_STAKE => validate_stake(txn),
+        TX_UNSTAKE => validate_unstake(txn),
+        TX_DEPOSIT => validate_deposit(txn),
+        TX_EXIT => validate_exit(txn),
+        _other => TxValidationCode::UnknownType,
+    }
+}
+
+/// Convert validation failures into the legacy block-abort code space.
+fn abort_for_validation_code(code: TxValidationCode) -> ! {
+    match code {
+        TxValidationCode::Valid => syscalls::abort(0),
+        TxValidationCode::BadSignature => syscalls::abort(ABORT_SIGNATURE),
+        TxValidationCode::NonceMismatch => syscalls::abort(ABORT_NONCE),
+        TxValidationCode::InsufficientBalance | TxValidationCode::Unauthorized => {
+            syscalls::abort(ABORT_UNDERFLOW)
+        }
+        TxValidationCode::Malformed | TxValidationCode::UnknownType => {
+            syscalls::abort(ABORT_BAD_TXN_TYPE)
+        }
+        TxValidationCode::StateReadFailed => syscalls::abort(ABORT_OVERLONG_READ),
+    }
+}
+
+/// Validate and apply one transaction from a block body.
+fn process_transaction(txn: &[u8]) {
+    let code = transaction_validity(txn);
+    if !code.is_valid() {
+        abort_for_validation_code(code);
+    }
+    match txn[0] {
+        TX_TRANSFER => apply_transfer(txn),
+        TX_STAKE => apply_stake(txn),
+        TX_UNSTAKE => apply_unstake(txn),
+        TX_DEPOSIT => apply_deposit(txn),
+        TX_EXIT => apply_exit(txn),
+        _other => syscalls::abort(ABORT_BAD_TXN_TYPE),
+    }
+}
+
+/// Write transaction validation output to the host scratch buffer.
+fn write_tx_validity(code: TxValidationCode) {
+    let validity = if code.is_valid() {
+        TxValidity::valid(0)
+    } else {
+        TxValidity::invalid(code)
+    };
+    let encoded = validity.encode();
+    syscalls::host_output(encoded.as_ptr() as u32, TX_VALIDITY_ENCODED_LEN as u32);
+}
+
+#[tx_validation_entrypoint]
+fn validate_transaction() {
+    let mut txn = [0u8; BODY_BUF];
+    let (input_status, input_len) = syscalls::host_input(txn.as_mut_ptr() as u32, BODY_BUF as u32);
+    let code = match input_status {
+        STATUS_OK => transaction_validity(&txn[..input_len as usize]),
+        STATUS_NOT_FOUND => TxValidationCode::Malformed,
+        _other => TxValidationCode::Malformed,
+    };
+    write_tx_validity(code);
 }
 
 /// Fixed trie key for the per-block counter. This key is written on
@@ -560,14 +695,7 @@ fn execute_block() {
                 off += txn_len;
                 continue;
             }
-            match txn[0] {
-                TX_TRANSFER => process_transfer(txn),
-                TX_STAKE => process_stake(txn),
-                TX_UNSTAKE => process_unstake(txn),
-                TX_DEPOSIT => process_deposit(txn),
-                TX_EXIT => process_exit(txn),
-                _other => syscalls::abort(ABORT_BAD_TXN_TYPE),
-            }
+            process_transaction(txn);
             off += txn_len;
         }
     }

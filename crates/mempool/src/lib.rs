@@ -5,14 +5,10 @@
 //! Bounded, deterministic transaction mempool.
 //!
 //! The mempool is opaque to transaction contents. Callers (RPC, the
-//! consensus engine) own validation: the mempool only ensures
-//! transactions are unique by their BLAKE3 hash, that the pool does
-//! not exceed a caller-supplied byte budget, and that retrieval order
-//! is FIFO and deterministic across runs.
-//!
-//! M5 leaves the priority dimension trivial: insertion order is the
-//! priority. Later milestones can add a fee dimension and replace the
-//! internal queue without breaking the surface API.
+//! consensus engine) can supply a validation predicate, typically
+//! backed by `neutrino_runtime_host::validate_transaction`. The pool
+//! itself enforces uniqueness by BLAKE3 hash, a caller-supplied byte
+//! budget, and deterministic priority ordering with FIFO ties.
 
 extern crate alloc;
 

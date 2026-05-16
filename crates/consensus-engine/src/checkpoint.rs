@@ -22,6 +22,7 @@ use neutrino_vrf::fold_seed;
 use crate::block_state::BlockState;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::merkle::merkle_root_of_hashes;
 use crate::store::StoreError;
 
 extern crate alloc;
@@ -69,6 +70,8 @@ pub enum CheckpointError<E> {
     /// The previous recursive proof is missing while attempting a
     /// non-genesis recursion.
     MissingPreviousRecursiveProof(CheckpointIndex),
+    /// The previous checkpoint record is missing while constructing the next one.
+    MissingPreviousCheckpoint(CheckpointIndex),
     /// The genesis checkpoint pointer is missing or non-canonical.
     MissingGenesisCheckpoint,
     /// Backend recursive-proof generation failed.
@@ -117,6 +120,9 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for CheckpointError<E> {
             ),
             Self::MissingPreviousRecursiveProof(index) => {
                 write!(f, "previous recursive proof at index {index} is missing")
+            }
+            Self::MissingPreviousCheckpoint(index) => {
+                write!(f, "previous checkpoint at index {index} is missing")
             }
             Self::MissingGenesisCheckpoint => f.write_str("genesis checkpoint is not persisted"),
             Self::Backend(err) => write!(f, "proof backend error: {err:?}"),
@@ -195,18 +201,25 @@ impl<DB: Database> Engine<DB> {
         let vrf_proofs = self.collect_chunk_vrf_proofs(&chunk)?;
 
         let new_index = self.latest_checkpoint_index().saturating_add(1);
-        let start_block_hash = self.checkpoint_start_block_hash(&chunk)?;
+        let previous_checkpoint_index = self.latest_checkpoint_index();
+        let previous_checkpoint = self
+            .store()
+            .get_checkpoint(previous_checkpoint_index)?
+            .ok_or(CheckpointError::MissingPreviousCheckpoint(
+                previous_checkpoint_index,
+            ))?;
+        let history_root = self.checkpoint_history_root(chunk_id)?;
         let checkpoint = Checkpoint {
             chain_id: self.chain_spec().chain_id,
             index: new_index,
-            start_height: chunk.start_height,
+            start_height: previous_checkpoint.end_height,
             end_height: chunk.end_height,
-            start_block_hash,
+            start_block_hash: previous_checkpoint.end_block_hash,
             end_block_hash: chunk.end_block_hash,
-            start_state_root: chunk.start_state_root,
+            start_state_root: previous_checkpoint.end_state_root,
             end_state_root: chunk.end_state_root,
             end_validator_set_root: chunk.next_validator_set_root,
-            history_root: ZERO_HASH,
+            history_root,
             proof_system_version: self.chain_spec().proof.proof_system_version,
         };
 
@@ -310,21 +323,21 @@ impl<DB: Database> Engine<DB> {
         Ok(proofs)
     }
 
-    /// Returns the block hash preceding the chunk's start height,
-    /// falling back to the genesis block hash for chunk-0.
-    fn checkpoint_start_block_hash(
+    fn checkpoint_history_root(
         &self,
-        chunk: &Chunk,
-    ) -> Result<BlockHash, CheckpointError<DB::Error>> {
-        if chunk.start_height <= 1 {
-            return Ok(self.chain_spec().genesis_block_hash);
+        chunk_id: ChunkId,
+    ) -> Result<Hash, CheckpointError<DB::Error>> {
+        let capacity = usize::try_from(chunk_id.saturating_add(1))
+            .expect("chunk id fits usize on supported targets");
+        let mut chunk_hashes = Vec::with_capacity(capacity);
+        for covered_chunk_id in 0..=chunk_id {
+            let chunk = self
+                .store()
+                .get_chunk(covered_chunk_id)?
+                .ok_or(CheckpointError::MissingChunk(covered_chunk_id))?;
+            chunk_hashes.push(chunk.hash());
         }
-        let prev_height = chunk.start_height - 1;
-        let parent_hash = self
-            .store()
-            .get_block_hash_by_height(prev_height)?
-            .ok_or(CheckpointError::MissingBlock { hash: ZERO_HASH })?;
-        Ok(parent_hash)
+        Ok(merkle_root_of_hashes(&chunk_hashes))
     }
 
     fn produce_recursive_proof<PS: ProofSystem>(

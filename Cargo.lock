@@ -566,6 +566,14 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "neutrino-cli"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "neutrino-consensus-engine",
+ "neutrino-consensus-types",
+ "neutrino-primitives",
+ "neutrino-proof-system",
+ "neutrino-storage",
+]
 
 [[package]]
 name = "neutrino-codec"
@@ -651,6 +659,7 @@ dependencies = [
 name = "neutrino-default-runtime"
 version = "0.1.0"
 dependencies = [
+ "neutrino-runtime-abi",
  "neutrino-runtime-sdk",
 ]
 

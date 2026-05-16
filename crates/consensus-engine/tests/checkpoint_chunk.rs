@@ -12,12 +12,13 @@
 use std::fs;
 
 use neutrino_consensus_engine::{
-    BlockState, CheckpointError, Engine, ProductionConfig, ProposerKey, validator_set_root,
+    BlockState, CheckpointError, Engine, ProductionConfig, ProposerKey, merkle_root_of_hashes,
+    validator_set_root,
 };
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{MockProofSystem, MockRecursiveProof, ProofSystem};
 use neutrino_storage::MemoryDatabase;
@@ -51,7 +52,7 @@ fn validators_from(proposer: &ProposerKey) -> Vec<Validator> {
     }]
 }
 
-fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
+fn chain_spec(validators: Vec<Validator>, runtime_code_hash: [u8; 32]) -> ChainSpec {
     let consensus = ConsensusParams {
         chunk_size: TEST_CHUNK_SIZE,
         ..ConsensusParams::default()
@@ -83,7 +84,7 @@ fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xBB; 32],
+        runtime_code_hash,
         genesis_seed: [0xCC; 32],
         genesis_state_root,
         genesis_block_hash,
@@ -152,7 +153,7 @@ fn checkpoint_chunk_walks_fsm_to_checkpointed_and_persists_everything() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -175,7 +176,7 @@ fn checkpoint_chunk_walks_fsm_to_checkpointed_and_persists_everything() {
 
     // Checkpoint shape.
     assert_eq!(outcome.checkpoint.index, 1);
-    assert_eq!(outcome.checkpoint.start_height, 1);
+    assert_eq!(outcome.checkpoint.start_height, 0);
     assert_eq!(outcome.checkpoint.end_height, TEST_CHUNK_SIZE);
     assert_eq!(outcome.checkpoint.start_block_hash, spec.genesis_block_hash,);
     assert_eq!(
@@ -193,6 +194,13 @@ fn checkpoint_chunk_walks_fsm_to_checkpointed_and_persists_everything() {
         spec.proof.proof_system_version,
     );
     assert_eq!(outcome.checkpoint_hash, outcome.checkpoint.hash());
+    let chunk_0_hash = engine
+        .store()
+        .get_chunk(0)
+        .expect("get chunk")
+        .expect("chunk persisted")
+        .hash();
+    assert_eq!(outcome.checkpoint.history_root, chunk_0_hash);
 
     // Recursive proof persisted and decodable.
     let store = engine.store();
@@ -251,7 +259,7 @@ fn checkpoint_chunk_rejects_chunk_that_is_not_finalized() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -280,7 +288,7 @@ fn checkpoint_chunk_rejects_out_of_order_chunk_id() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -322,7 +330,7 @@ fn two_consecutive_checkpoints_chain_via_previous_recursive_proof() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -344,12 +352,28 @@ fn two_consecutive_checkpoints_chain_via_previous_recursive_proof() {
 
     // The second checkpoint covers heights starting where the first
     // left off.
-    assert_eq!(cp_1.checkpoint.start_height, cp_0.checkpoint.end_height + 1,);
+    assert_eq!(cp_1.checkpoint.start_height, cp_0.checkpoint.end_height,);
 
     // State roots chain through.
     assert_eq!(
         cp_1.checkpoint.start_state_root,
         cp_0.checkpoint.end_state_root
+    );
+
+    let chunk_hashes: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|chunk_id| {
+            engine
+                .store()
+                .get_chunk(chunk_id)
+                .expect("get chunk")
+                .expect("chunk persisted")
+                .hash()
+        })
+        .collect();
+    assert_eq!(
+        cp_1.checkpoint.history_root,
+        merkle_root_of_hashes(&chunk_hashes)
     );
 
     // Latest checkpoint index = 2.

@@ -10,7 +10,9 @@ use core::mem;
 
 use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_consensus_vrf::{VrfError, total_active_stake};
-use neutrino_primitives::{BlockHash, BlsSignature, Height, Slot, StateRoot, ZERO_HASH};
+use neutrino_primitives::{
+    BlockHash, BlsSignature, Hash, Height, Slot, StateRoot, ZERO_HASH, blake3_256,
+};
 use neutrino_runtime_abi::BlockContext;
 use neutrino_runtime_host::{BlockError, BlockOutcome, Overlay, run_block};
 use neutrino_storage::Database;
@@ -45,6 +47,25 @@ pub enum ProductionError<E> {
     BodyEncode(BodyEncodeError),
     /// Runtime execution failed.
     Runtime(BlockError),
+    /// The supplied runtime ELF does not match the chain-spec runtime code hash.
+    RuntimeCodeHashMismatch {
+        /// Runtime hash committed by the chain spec.
+        expected: Hash,
+        /// Runtime hash computed from the supplied ELF bytes.
+        actual: Hash,
+    },
+    /// The proposer key does not match the validator pubkey at its declared index.
+    ProposerKeyMismatch {
+        /// Validator index the proposer key declared.
+        index: u32,
+    },
+    /// The requested slot does not advance past the current head slot.
+    NonMonotonicSlot {
+        /// Slot of the current head block, or genesis slot 0.
+        parent_slot: Slot,
+        /// Slot requested for the new block.
+        requested: Slot,
+    },
 }
 
 impl<E: fmt::Display + fmt::Debug> fmt::Display for ProductionError<E> {
@@ -62,6 +83,20 @@ impl<E: fmt::Display + fmt::Debug> fmt::Display for ProductionError<E> {
             Self::HeightOverflow => f.write_str("block height counter overflowed"),
             Self::BodyEncode(e) => write!(f, "body encode failed: {e}"),
             Self::Runtime(e) => write!(f, "runtime execution failed: {e:?}"),
+            Self::RuntimeCodeHashMismatch { expected, actual } => write!(
+                f,
+                "runtime ELF hash mismatch: expected {expected:?}, computed {actual:?}"
+            ),
+            Self::ProposerKeyMismatch { index } => {
+                write!(f, "proposer key does not match validator at index {index}")
+            }
+            Self::NonMonotonicSlot {
+                parent_slot,
+                requested,
+            } => write!(
+                f,
+                "slot {requested} must be greater than current head slot {parent_slot}"
+            ),
         }
     }
 }
@@ -133,6 +168,24 @@ impl<DB: Database> Engine<DB> {
         body: Body,
         gas_limit: u64,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
+        let actual_runtime_hash = blake3_256(cfg.runtime_elf);
+        let expected_runtime_hash = self.chain_spec().runtime_code_hash;
+        if actual_runtime_hash != expected_runtime_hash {
+            return Err(ProductionError::RuntimeCodeHashMismatch {
+                expected: expected_runtime_hash,
+                actual: actual_runtime_hash,
+            });
+        }
+
+        let parent_hash = self.head_hash();
+        let parent_slot = self.head_slot(parent_hash)?;
+        if slot <= parent_slot {
+            return Err(ProductionError::NonMonotonicSlot {
+                parent_slot,
+                requested: slot,
+            });
+        }
+
         let Some(eligibility) = self.evaluate_eligibility(slot, cfg.proposer)? else {
             return Ok(None);
         };
@@ -141,7 +194,6 @@ impl<DB: Database> Engine<DB> {
             .head_height()
             .checked_add(1)
             .ok_or(ProductionError::HeightOverflow)?;
-        let parent_hash = self.head_hash();
         let parent_state_root = self.head_state_root();
 
         let encoded_body = encode_runtime_body(&body)?;
@@ -158,13 +210,19 @@ impl<DB: Database> Engine<DB> {
 
         let trie = mem::take(self.state_mut_internal());
         let mut overlay = Overlay::new(trie);
-        let outcome = run_block(
+        let outcome = match run_block(
             cfg.runtime_elf,
             &ctx,
             encoded_body.clone(),
             &mut overlay,
             gas_limit,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                *self.state_mut_internal() = overlay.into_base();
+                return Err(ProductionError::Runtime(err));
+            }
+        };
         *self.state_mut_internal() = overlay.into_base();
 
         let roots = compute_body_roots(&body, &encoded_body);
@@ -220,6 +278,9 @@ impl<DB: Database> Engine<DB> {
             return Err(ProductionError::NotEligible(VrfError::SlashedValidator));
         }
         let total_stake = total_active_stake(active_set).map_err(ProductionError::NotEligible)?;
+        if validator.pubkey != *proposer.public_key_bytes() {
+            return Err(ProductionError::ProposerKeyMismatch { index });
+        }
 
         let seed = self.finalized_seed();
         let chain_id = self.chain_spec().chain_id;
@@ -237,6 +298,17 @@ impl<DB: Database> Engine<DB> {
         Ok(Some(ProposerEligibility {
             vrf_proof: vrf_proof.to_bytes(),
         }))
+    }
+
+    fn head_slot(&self, head_hash: BlockHash) -> Result<Slot, ProductionError<DB::Error>> {
+        if head_hash == self.chain_spec().genesis_block_hash {
+            return Ok(0);
+        }
+        let header = self
+            .store()
+            .get_header(&head_hash)?
+            .ok_or(EngineError::NotInitialised)?;
+        Ok(header.slot)
     }
 }
 

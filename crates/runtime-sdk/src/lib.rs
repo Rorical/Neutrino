@@ -34,7 +34,7 @@ mod panic;
 #[cfg(target_arch = "riscv32")]
 mod start;
 
-pub use neutrino_runtime_sdk_macros::entrypoint;
+pub use neutrino_runtime_sdk_macros::{entrypoint, tx_validation_entrypoint};
 
 /// Re-export of the ABI version expected by this SDK.
 pub const ABI_VERSION: u32 = neutrino_runtime_abi::VERSION;

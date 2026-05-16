@@ -139,6 +139,15 @@ impl Overlay {
         Ok(self.base.root())
     }
 
+    /// Drop all staged mutations without touching the underlying trie.
+    ///
+    /// Used by read-only runtime entrypoints, such as transaction
+    /// validation, so even a misbehaving runtime cannot leak tentative
+    /// writes into the caller's state view.
+    pub fn discard(&mut self) {
+        self.dirty.clear();
+    }
+
     /// Consume the overlay and return the underlying [`Trie`].
     ///
     /// Useful for callers (e.g. the consensus engine) that build a

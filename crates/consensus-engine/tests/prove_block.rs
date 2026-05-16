@@ -20,7 +20,7 @@ use neutrino_consensus_engine::{
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{MockBlockProof, MockProofSystem, ProofSystem};
 use neutrino_storage::MemoryDatabase;
@@ -52,7 +52,7 @@ fn validators_from(proposer: &ProposerKey) -> Vec<Validator> {
     }]
 }
 
-fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
+fn chain_spec(validators: Vec<Validator>, runtime_code_hash: [u8; 32]) -> ChainSpec {
     let proof = ProofParams::default();
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash = [0xAA; 32];
@@ -77,7 +77,7 @@ fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xBB; 32],
+        runtime_code_hash,
         genesis_seed: [0xCC; 32],
         genesis_state_root,
         genesis_block_hash,
@@ -121,7 +121,7 @@ fn produced_block_starts_in_block_produced_state() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
 
     let outcome = produce_one_block(&mut engine, &proposer, &elf, 1);
@@ -143,7 +143,7 @@ fn prove_block_walks_fsm_to_proven_and_persists_proof() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
 
     let produced = produce_one_block(&mut engine, &proposer, &elf, 1);
@@ -216,7 +216,7 @@ fn prove_block_rejects_already_proven_block() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let produced = produce_one_block(&mut engine, &proposer, &elf, 1);
 
@@ -239,7 +239,7 @@ fn prove_block_rejects_already_proven_block() {
 #[test]
 fn prove_block_rejects_unknown_block_hash() {
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), [0xBB; 32]);
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
 
     let mock = MockProofSystem::new();
@@ -258,7 +258,7 @@ fn prove_block_chains_state_roots_across_consecutive_blocks() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
 
     let first = produce_one_block(&mut engine, &proposer, &elf, 1);
@@ -300,7 +300,7 @@ fn prove_block_is_callable_after_external_pending_proof_write() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let produced = produce_one_block(&mut engine, &proposer, &elf, 1);
 

@@ -73,6 +73,50 @@ pub fn entrypoint(args: TokenStream, input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Marks a function as the runtime's single-transaction validation entrypoint.
+///
+/// The macro keeps the user function intact and additionally emits a
+/// `#[unsafe(no_mangle)] pub unsafe extern "C" fn _neutrino_validate_tx()`
+/// wrapper. The host can jump directly to that symbol to validate one raw
+/// transaction against a supplied state root without applying a block.
+///
+/// Constraints match [`entrypoint`]: the annotated function must take no
+/// arguments, return `()`, be non-`async`, non-`unsafe`, and non-generic.
+#[proc_macro_attribute]
+pub fn tx_validation_entrypoint(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new_spanned(
+            TokenStream2::from(args),
+            "#[tx_validation_entrypoint] does not accept attribute arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let user_fn = parse_macro_input!(input as ItemFn);
+
+    if let Err(err) = validate_entrypoint(&user_fn) {
+        return err.to_compile_error().into();
+    }
+
+    let user_name = &user_fn.sig.ident;
+    let expanded = quote! {
+        #user_fn
+
+        #[cfg(target_arch = "riscv32")]
+        #[unsafe(no_mangle)]
+        #[unsafe(link_section = ".text.neutrino_entry")]
+        #[allow(unsafe_code)]
+        #[doc(hidden)]
+        pub unsafe extern "C" fn _neutrino_validate_tx() {
+            #user_name();
+            ::neutrino_runtime_sdk::abort(0)
+        }
+    };
+
+    expanded.into()
+}
+
 pub(crate) fn validate_entrypoint(item: &ItemFn) -> Result<(), Error> {
     if !item.sig.inputs.is_empty() {
         return Err(Error::new(

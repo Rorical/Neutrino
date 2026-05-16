@@ -24,6 +24,7 @@ SECTIONS
     .text :
     {
         KEEP(*(.text.init))
+        KEEP(*(.text.neutrino_entry))
         *(.text .text.*)
         . = ALIGN(4);
     } > ROM

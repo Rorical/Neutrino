@@ -18,7 +18,7 @@ use neutrino_consensus_engine::{
 use neutrino_consensus_types::{Body, FinalityVotePhase};
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{MockBlockProof, MockChunkProof, MockProofSystem, ProofSystem};
 use neutrino_storage::MemoryDatabase;
@@ -51,7 +51,7 @@ fn validators_from(proposer: &ProposerKey) -> Vec<Validator> {
     }]
 }
 
-fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
+fn chain_spec(validators: Vec<Validator>, runtime_code_hash: [u8; 32]) -> ChainSpec {
     let consensus = ConsensusParams {
         chunk_size: TEST_CHUNK_SIZE,
         ..ConsensusParams::default()
@@ -83,7 +83,7 @@ fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xBB; 32],
+        runtime_code_hash,
         genesis_seed: [0xCC; 32],
         genesis_state_root,
         genesis_block_hash,
@@ -152,7 +152,7 @@ fn finalize_chunk_walks_fsm_and_persists_everything() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -242,7 +242,7 @@ fn finality_cert_aggregates_single_validator_quorum() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -277,7 +277,7 @@ fn finalize_chunk_rejects_out_of_order_chunk_id() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -321,7 +321,7 @@ fn finalize_chunk_rejects_missing_block_in_range() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -344,7 +344,7 @@ fn finalize_chunk_rejects_block_not_yet_proven() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -394,6 +394,86 @@ fn finalize_chunk_rejects_block_not_yet_proven() {
 }
 
 #[test]
+fn finalize_chunk_rejects_broken_parent_link() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping end-to-end test.");
+        return;
+    };
+
+    let proposer = make_proposer();
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let proof_system = MockProofSystem::new();
+
+    for slot in 1..=TEST_CHUNK_SIZE {
+        produce_and_prove(&mut engine, &proposer, &elf, proof_system, slot);
+    }
+
+    let mut header = engine
+        .store()
+        .get_header_by_height(2)
+        .expect("get header")
+        .expect("header present");
+    header.parent_hash = [0xFE; 32];
+    engine
+        .store_mut()
+        .put_header(&header)
+        .expect("overwrite header");
+
+    let err = engine
+        .finalize_chunk(0, &[], &proof_system, &proposer)
+        .expect_err("broken parent link should fail finalize");
+    assert!(matches!(
+        err,
+        FinalizeError::ParentHashMismatch { height: 2, .. }
+    ));
+}
+
+#[test]
+fn finalize_chunk_rejects_block_proof_with_noncanonical_public_inputs() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping end-to-end test.");
+        return;
+    };
+
+    let proposer = make_proposer();
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let proof_system = MockProofSystem::new();
+
+    let mut hashes = Vec::new();
+    for slot in 1..=TEST_CHUNK_SIZE {
+        hashes.push(produce_and_prove(
+            &mut engine,
+            &proposer,
+            &elf,
+            proof_system,
+            slot,
+        ));
+    }
+
+    let hash = hashes[0];
+    let mut proof = engine
+        .store()
+        .get_block_proof(&hash)
+        .expect("get proof")
+        .expect("proof present");
+    proof.public_inputs.state_root_after = [0xEF; 32];
+    engine
+        .store_mut()
+        .put_block_proof(&hash, &proof)
+        .expect("overwrite proof");
+
+    let err = engine
+        .finalize_chunk(0, &[], &proof_system, &proposer)
+        .expect_err("noncanonical block proof inputs should fail finalize");
+    assert!(matches!(
+        err,
+        FinalizeError::BlockProofPublicInputsMismatch { hash: got } if got == hash
+    ));
+}
+
+#[test]
 fn two_consecutive_chunks_finalize_and_chain_state_roots() {
     let Some(elf) = read_elf() else {
         eprintln!("{ELF_ENV} not set; skipping end-to-end test.");
@@ -401,7 +481,7 @@ fn two_consecutive_chunks_finalize_and_chain_state_roots() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 

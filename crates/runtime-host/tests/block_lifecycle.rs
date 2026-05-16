@@ -23,8 +23,10 @@ use neutrino_primitives::{
     BlsPublicKey, Ed25519PublicKey, Ed25519Signature, StateRoot, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{BlockPublicInputs, MockProofSystem, ProofError, ProofSystem};
-use neutrino_runtime_abi::BlockContext;
-use neutrino_runtime_host::{BlockError, Overlay, VALIDATOR_SET_KEY, run_block};
+use neutrino_runtime_abi::{BlockContext, TxValidationCode};
+use neutrino_runtime_host::{
+    BlockError, Overlay, VALIDATOR_SET_KEY, run_block, validate_transaction,
+};
 use neutrino_trie::Trie;
 use rand::SeedableRng;
 
@@ -368,6 +370,78 @@ fn body_from_txns(txns: &[Vec<u8>]) -> Vec<u8> {
         body.extend_from_slice(txn);
     }
     body
+}
+
+#[test]
+fn runtime_validates_single_transaction_without_mutating_state() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping tx-validation test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(43);
+    let sk_sender = SecretKey::generate(&mut rng);
+    let pk_sender = sk_sender.public_key().to_bytes();
+    let pk_receiver = SecretKey::generate(&mut rng).public_key().to_bytes();
+
+    let mut header = Vec::with_capacity(81);
+    header.push(TX_TRANSFER);
+    header.extend_from_slice(&pk_sender);
+    header.extend_from_slice(&pk_receiver);
+    header.extend_from_slice(&25u64.to_le_bytes());
+    header.extend_from_slice(&0u64.to_le_bytes());
+    let tx = make_transfer_body(pk_sender, pk_receiver, 25, 0, sk_sender.sign(&header));
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_sender.to_vec(), make_account_value(100, 0));
+    overlay.commit().expect("seed sender");
+    let root_before = overlay.current_root();
+    let ctx = make_block_ctx(1, root_before);
+
+    let validity = validate_transaction(&elf, &ctx, &tx, &mut overlay, 5_000_000)
+        .expect("single tx validates");
+    assert_eq!(validity.code, TxValidationCode::Valid);
+    assert_eq!(validity.priority, 0);
+    assert_eq!(overlay.current_root(), root_before);
+    assert_eq!(overlay.get(&pk_sender), Some(make_account_value(100, 0)));
+    assert_eq!(overlay.get(&pk_receiver), None);
+    assert_eq!(overlay.get(COUNTER_KEY), None);
+}
+
+#[test]
+fn runtime_validation_reports_same_signature_failure_as_block_execution() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping tx-validation failure test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(44);
+    let sk_sender = SecretKey::generate(&mut rng);
+    let pk_sender = sk_sender.public_key().to_bytes();
+    let pk_receiver = SecretKey::generate(&mut rng).public_key().to_bytes();
+
+    let mut header = Vec::with_capacity(81);
+    header.push(TX_TRANSFER);
+    header.extend_from_slice(&pk_sender);
+    header.extend_from_slice(&pk_receiver);
+    header.extend_from_slice(&25u64.to_le_bytes());
+    header.extend_from_slice(&0u64.to_le_bytes());
+    let mut sig = sk_sender.sign(&header);
+    sig[0] ^= 0x80;
+    let tx = make_transfer_body(pk_sender, pk_receiver, 25, 0, sig);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_sender.to_vec(), make_account_value(100, 0));
+    overlay.commit().expect("seed sender");
+    let ctx = make_block_ctx(1, overlay.current_root());
+
+    let validity = validate_transaction(&elf, &ctx, &tx, &mut overlay, 5_000_000)
+        .expect("validation returns rejection");
+    assert_eq!(validity.code, TxValidationCode::BadSignature);
+
+    let block_err = run_block(&elf, &ctx, body_from_txns(&[tx]), &mut overlay, 5_000_000)
+        .expect_err("block execution rejects same tx");
+    assert_eq!(block_err, BlockError::AbortedWithCode(ABORT_SIGNATURE));
 }
 
 const fn bls_pk(byte: u8) -> BlsPublicKey {

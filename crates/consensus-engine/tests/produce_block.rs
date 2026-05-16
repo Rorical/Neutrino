@@ -22,12 +22,12 @@
 use std::fs;
 
 use neutrino_consensus_engine::{
-    Engine, ProductionConfig, ProductionOutcome, ProposerKey, validator_set_root,
+    Engine, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, validator_set_root,
 };
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_storage::MemoryDatabase;
 
@@ -58,7 +58,7 @@ fn validators_from(proposer: &ProposerKey) -> Vec<Validator> {
     }]
 }
 
-fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
+fn chain_spec(validators: Vec<Validator>, runtime_code_hash: [u8; 32]) -> ChainSpec {
     let proof = ProofParams::default();
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash = [0xAA; 32];
@@ -83,7 +83,7 @@ fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xBB; 32],
+        runtime_code_hash,
         genesis_seed: [0xCC; 32],
         genesis_state_root,
         genesis_block_hash,
@@ -131,7 +131,7 @@ fn engine_produces_block_drives_runtime_and_persists() {
 
     let proposer = make_proposer();
     let validators = validators_from(&proposer);
-    let spec = chain_spec(validators);
+    let spec = chain_spec(validators, blake3_256(&elf));
 
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
     assert_eq!(engine.head_height(), 0);
@@ -188,7 +188,7 @@ fn engine_produces_two_consecutive_blocks_with_chained_state() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
 
     let first = run_one_block(&mut engine, &proposer, &elf, 1);
@@ -221,10 +221,143 @@ fn produced_block_hash_matches_header_hash() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
 
     let outcome = run_one_block(&mut engine, &proposer, &elf, 1);
     assert_eq!(outcome.block.hash(), outcome.block_hash);
     assert_eq!(outcome.block.header.hash(), outcome.block_hash);
+}
+
+#[test]
+fn production_rejects_runtime_elf_hash_mismatch() {
+    let Some(elf) = read_elf() else {
+        eprintln!(
+            "{ELF_ENV} not set or ELF unreadable; skipping end-to-end test. \
+              Remove CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1 to enable."
+        );
+        return;
+    };
+
+    let proposer = make_proposer();
+    let spec = chain_spec(validators_from(&proposer), [0xBB; 32]);
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let cfg = ProductionConfig {
+        runtime_elf: &elf,
+        proposer: &proposer,
+    };
+
+    let err = engine
+        .try_produce_block(
+            1,
+            cfg,
+            Body::default(),
+            engine.chain_spec().genesis_gas_limit,
+        )
+        .expect_err("runtime hash mismatch should fail");
+    assert!(matches!(
+        err,
+        ProductionError::RuntimeCodeHashMismatch { .. }
+    ));
+}
+
+#[test]
+fn production_rejects_proposer_key_that_does_not_match_validator_index() {
+    let Some(elf) = read_elf() else {
+        eprintln!(
+            "{ELF_ENV} not set or ELF unreadable; skipping end-to-end test. \
+              Remove CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1 to enable."
+        );
+        return;
+    };
+
+    let proposer = make_proposer();
+    let wrong_proposer = ProposerKey::from_ikm(&[0x44; 32], 0).expect("derive wrong proposer");
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let cfg = ProductionConfig {
+        runtime_elf: &elf,
+        proposer: &wrong_proposer,
+    };
+
+    let err = engine
+        .try_produce_block(
+            1,
+            cfg,
+            Body::default(),
+            engine.chain_spec().genesis_gas_limit,
+        )
+        .expect_err("wrong proposer key should fail");
+    assert!(matches!(
+        err,
+        ProductionError::ProposerKeyMismatch { index: 0 }
+    ));
+}
+
+#[test]
+fn production_rejects_duplicate_or_rewound_slot() {
+    let Some(elf) = read_elf() else {
+        eprintln!(
+            "{ELF_ENV} not set or ELF unreadable; skipping end-to-end test. \
+              Remove CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1 to enable."
+        );
+        return;
+    };
+
+    let proposer = make_proposer();
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let first = run_one_block(&mut engine, &proposer, &elf, 1);
+    assert_eq!(engine.head_hash(), first.block_hash);
+
+    let cfg = ProductionConfig {
+        runtime_elf: &elf,
+        proposer: &proposer,
+    };
+    let err = engine
+        .try_produce_block(
+            1,
+            cfg,
+            Body::default(),
+            engine.chain_spec().genesis_gas_limit,
+        )
+        .expect_err("duplicate slot should fail");
+    assert!(matches!(
+        err,
+        ProductionError::NonMonotonicSlot {
+            parent_slot: 1,
+            requested: 1
+        }
+    ));
+}
+
+#[test]
+fn runtime_error_does_not_drop_live_state_trie() {
+    let Some(elf) = read_elf() else {
+        eprintln!(
+            "{ELF_ENV} not set or ELF unreadable; skipping end-to-end test. \
+              Remove CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1 to enable."
+        );
+        return;
+    };
+
+    let proposer = make_proposer();
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+
+    let first = run_one_block(&mut engine, &proposer, &elf, 1);
+    let cfg = ProductionConfig {
+        runtime_elf: &elf,
+        proposer: &proposer,
+    };
+    let err = engine
+        .try_produce_block(2, cfg, Body::default(), 0)
+        .expect_err("zero gas should fail runtime execution");
+    assert!(matches!(err, ProductionError::Runtime(_)));
+    assert_eq!(engine.head_hash(), first.block_hash);
+    assert_eq!(engine.head_state_root(), first.state_root_after);
+
+    let second = run_one_block(&mut engine, &proposer, &elf, 2);
+    assert_ne!(second.state_root_after, first.state_root_after);
+    assert_eq!(second.block.header.parent_hash, first.block_hash);
 }

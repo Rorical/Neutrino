@@ -12,10 +12,11 @@
 
 use alloc::vec::Vec;
 
+use borsh::BorshSerialize;
 use neutrino_consensus_types::{Body, Header};
-use neutrino_primitives::Hash;
+use neutrino_primitives::{Hash, blake3_256};
 
-use crate::merkle::merkle_root;
+use crate::merkle::{merkle_root, merkle_root_of_hashes};
 
 extern crate alloc;
 
@@ -101,15 +102,15 @@ pub struct BodyRoots {
     /// Root over `body.deposits || body.voluntary_exits` in that order.
     pub validator_ops_root: Hash,
     /// Per-block DA commitment. For M5 we hash the encoded transactions
-    /// payload; production builds will replace this with a real
-    /// DA-layer commitment.
+    /// payload plus all non-transaction body lanes. Production builds
+    /// can replace this with a real DA-layer commitment.
     pub da_root: Hash,
 }
 
 /// Derive the five header roots from a body. Empty lanes use
 /// [`crate::merkle::EMPTY_MERKLE_ROOT`].
 #[must_use]
-pub fn compute_body_roots(body: &Body, encoded_runtime_body: &[u8]) -> BodyRoots {
+pub fn compute_body_roots(body: &Body, _encoded_runtime_body: &[u8]) -> BodyRoots {
     let mut ops: Vec<Vec<u8>> =
         Vec::with_capacity(body.deposits.len() + body.voluntary_exits.len());
     for deposit in &body.deposits {
@@ -123,8 +124,27 @@ pub fn compute_body_roots(body: &Body, encoded_runtime_body: &[u8]) -> BodyRoots
         votes_root: merkle_root(&body.finality_votes),
         slashings_root: merkle_root(&body.slashings),
         validator_ops_root: merkle_root(&ops),
-        da_root: neutrino_primitives::blake3_256(encoded_runtime_body),
+        da_root: full_body_da_root(body),
     }
+}
+
+fn full_body_da_root(body: &Body) -> Hash {
+    let leaves = [
+        lane_leaf(0, &body.transactions),
+        lane_leaf(1, &body.finality_votes),
+        lane_leaf(2, &body.slashings),
+        lane_leaf(3, &body.deposits),
+        lane_leaf(4, &body.voluntary_exits),
+    ];
+    merkle_root_of_hashes(&leaves)
+}
+
+fn lane_leaf<T: BorshSerialize>(tag: u8, lane: &T) -> Hash {
+    let lane_bytes = borsh::to_vec(lane).expect("body lane serialization is infallible");
+    let mut bytes = Vec::with_capacity(1 + lane_bytes.len());
+    bytes.push(tag);
+    bytes.extend_from_slice(&lane_bytes);
+    blake3_256(&bytes)
 }
 
 /// Apply the computed body roots to `header`, overwriting any prior
@@ -141,7 +161,7 @@ pub const fn apply_body_roots(header: &mut Header, roots: &BodyRoots) {
 mod tests {
     use super::*;
     use crate::merkle::EMPTY_MERKLE_ROOT;
-    use neutrino_consensus_types::Body;
+    use neutrino_consensus_types::{Body, FinalityVote, FinalityVoteData, FinalityVotePhase};
 
     #[test]
     fn empty_body_encodes_to_empty_bytes() {
@@ -215,5 +235,38 @@ mod tests {
         let roots_a = compute_body_roots(&body_a, &encoded_a);
         let roots_b = compute_body_roots(&body_b, &encoded_b);
         assert_ne!(roots_a.transactions_root, roots_b.transactions_root);
+    }
+
+    #[test]
+    fn da_root_commits_to_finality_vote_lane() {
+        let body_a = Body {
+            transactions: vec![vec![1, 2, 3]],
+            ..Body::default()
+        };
+        let body_b = Body {
+            finality_votes: vec![FinalityVote {
+                aggregation_bits: {
+                    let mut bits = neutrino_primitives::BitVec::default();
+                    bits.push(true);
+                    bits
+                },
+                data: FinalityVoteData {
+                    chunk_id: 1,
+                    round: 0,
+                    chunk_hash: [7; 32],
+                    phase: FinalityVotePhase::Prevote,
+                },
+                signature: [9; 96],
+            }],
+            ..body_a.clone()
+        };
+
+        let encoded_a = encode_runtime_body(&body_a).expect("a");
+        let encoded_b = encode_runtime_body(&body_b).expect("b");
+        assert_eq!(encoded_a, encoded_b);
+
+        let roots_a = compute_body_roots(&body_a, &encoded_a);
+        let roots_b = compute_body_roots(&body_b, &encoded_b);
+        assert_ne!(roots_a.da_root, roots_b.da_root);
     }
 }

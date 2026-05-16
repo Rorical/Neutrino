@@ -17,15 +17,18 @@
 use std::fs;
 
 use neutrino_consensus_engine::{
-    BlockState, Engine, ProductionConfig, ProposerKey, validator_set_root,
+    BlockState, Engine, FinalizeError, ProductionConfig, ProposerKey, ProveError,
+    validator_set_root,
 };
-use neutrino_consensus_types::Body;
+use neutrino_consensus_types::{BlockProofPublicInputs, Body, ChunkProofPublicInputs};
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, Hash, Height,
     LightClientParams, ProofParams, RuntimeVersion, Seed, StateParams, StateRoot, Validator,
-    ZERO_HASH,
+    ZERO_HASH, blake3_256,
 };
-use neutrino_proof_system::MockProofSystem;
+use neutrino_proof_system::{
+    MockBlockProof, MockChunkProof, MockProofSystem, MockRecursiveProof, ProofError, ProofSystem,
+};
 use neutrino_storage::MemoryDatabase;
 
 const ELF_ENV: &str = "NEUTRINO_DEFAULT_RUNTIME_ELF";
@@ -36,6 +39,64 @@ const TOTAL_SLOTS: u64 = 1000;
 /// Chunk size chosen so `TOTAL_SLOTS` divides evenly by it.
 const CHUNK_SIZE: u64 = 125;
 const TOTAL_CHUNKS: u64 = TOTAL_SLOTS / CHUNK_SIZE;
+
+#[derive(Clone, Copy, Debug)]
+struct FailingBlockProofSystem;
+
+impl ProofSystem for FailingBlockProofSystem {
+    type BlockProof = MockBlockProof;
+    type ChunkProof = MockChunkProof;
+    type RecursiveProof = MockRecursiveProof;
+
+    fn prove_block(
+        &self,
+        _witness: &[u8],
+        _public_inputs: &BlockProofPublicInputs,
+    ) -> Result<Self::BlockProof, ProofError> {
+        Err(ProofError::InvalidWitness)
+    }
+
+    fn verify_block(
+        &self,
+        _proof: &Self::BlockProof,
+        _public_inputs: &BlockProofPublicInputs,
+    ) -> Result<(), ProofError> {
+        Err(ProofError::BackendRejected)
+    }
+
+    fn prove_chunk(
+        &self,
+        _block_proofs: &[Self::BlockProof],
+        _public_inputs: &ChunkProofPublicInputs,
+    ) -> Result<Self::ChunkProof, ProofError> {
+        Err(ProofError::BackendRejected)
+    }
+
+    fn verify_chunk(
+        &self,
+        _proof: &Self::ChunkProof,
+        _public_inputs: &ChunkProofPublicInputs,
+    ) -> Result<(), ProofError> {
+        Err(ProofError::BackendRejected)
+    }
+
+    fn prove_recursive(
+        &self,
+        _previous: Option<&Self::RecursiveProof>,
+        _chunk_proof: &Self::ChunkProof,
+        _public_inputs: &neutrino_consensus_types::RecursiveProofPublicInputs,
+    ) -> Result<Self::RecursiveProof, ProofError> {
+        Err(ProofError::BackendRejected)
+    }
+
+    fn verify_recursive(
+        &self,
+        _proof: &Self::RecursiveProof,
+        _public_inputs: &neutrino_consensus_types::RecursiveProofPublicInputs,
+    ) -> Result<(), ProofError> {
+        Err(ProofError::BackendRejected)
+    }
+}
 
 fn read_elf() -> Option<Vec<u8>> {
     let path = option_env!("NEUTRINO_DEFAULT_RUNTIME_ELF")?;
@@ -62,7 +123,7 @@ fn validators_from(proposer: &ProposerKey) -> Vec<Validator> {
     }]
 }
 
-fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
+fn chain_spec(validators: Vec<Validator>, runtime_code_hash: [u8; 32]) -> ChainSpec {
     let consensus = ConsensusParams {
         chunk_size: CHUNK_SIZE,
         ..ConsensusParams::default()
@@ -94,7 +155,7 @@ fn chain_spec(validators: Vec<Validator>) -> ChainSpec {
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xBB; 32],
+        runtime_code_hash,
         genesis_seed: [0xCC; 32],
         genesis_state_root,
         genesis_block_hash,
@@ -125,7 +186,7 @@ struct RunSummary {
 /// completing every FSM transition for every block.
 fn run_chain(elf: &[u8]) -> RunSummary {
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
+    let spec = chain_spec(validators_from(&proposer), blake3_256(elf));
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
 
@@ -180,6 +241,75 @@ fn run_chain(elf: &[u8]) -> RunSummary {
     }
 }
 
+fn produce_and_prove_with_fsm_checks(
+    engine: &mut Engine<MemoryDatabase>,
+    proposer: &ProposerKey,
+    elf: &[u8],
+    proof_system: MockProofSystem,
+    slot: u64,
+) -> [u8; 32] {
+    let cfg = ProductionConfig {
+        runtime_elf: elf,
+        proposer,
+    };
+    let produced = engine
+        .try_produce_block(
+            slot,
+            cfg,
+            Body::default(),
+            engine.chain_spec().genesis_gas_limit,
+        )
+        .expect("produce ok")
+        .expect("eligibility");
+    assert_eq!(
+        engine
+            .store()
+            .get_block_state(&produced.block_hash)
+            .unwrap(),
+        Some(BlockState::BlockProduced),
+    );
+
+    let err = engine
+        .prove_block(&produced.block_hash, &[], &FailingBlockProofSystem)
+        .expect_err("failing prover leaves block pending");
+    assert!(matches!(
+        err,
+        ProveError::Backend(ProofError::InvalidWitness)
+    ));
+    assert_eq!(
+        engine
+            .store()
+            .get_block_state(&produced.block_hash)
+            .unwrap(),
+        Some(BlockState::PendingProof),
+    );
+
+    engine
+        .prove_block(&produced.block_hash, &[], &proof_system)
+        .expect("prove ok");
+    assert_eq!(
+        engine
+            .store()
+            .get_block_state(&produced.block_hash)
+            .unwrap(),
+        Some(BlockState::Proven),
+    );
+    produced.block_hash
+}
+
+fn assert_block_states(
+    engine: &Engine<MemoryDatabase>,
+    block_hashes: &[[u8; 32]],
+    expected: BlockState,
+) {
+    for hash in block_hashes {
+        assert_eq!(
+            engine.store().get_block_state(hash).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
 #[test]
 fn full_fsm_walks_every_state_for_every_block_in_1000_slots() {
     let Some(elf) = read_elf() else {
@@ -188,77 +318,46 @@ fn full_fsm_walks_every_state_for_every_block_in_1000_slots() {
     };
 
     let proposer = make_proposer();
-    let spec = chain_spec(validators_from(&proposer));
-    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
     let proof_system = MockProofSystem::new();
+    let bad_voter = ProposerKey::from_ikm(&[0x55; 32], 1).expect("derive bad voter");
 
     let mut block_hashes = Vec::with_capacity(usize::try_from(TOTAL_SLOTS).unwrap());
     for chunk_id in 0..TOTAL_CHUNKS {
         let start_slot = chunk_id * CHUNK_SIZE + 1;
         let end_slot = (chunk_id + 1) * CHUNK_SIZE;
+        let mut chunk_block_hashes = Vec::with_capacity(usize::try_from(CHUNK_SIZE).unwrap());
 
-        // Inspect intermediate FSM states at one block per chunk.
-        let mut probe_hash = None;
         for slot in start_slot..=end_slot {
-            let cfg = ProductionConfig {
-                runtime_elf: &elf,
-                proposer: &proposer,
-            };
-            let produced = engine
-                .try_produce_block(
-                    slot,
-                    cfg,
-                    Body::default(),
-                    engine.chain_spec().genesis_gas_limit,
-                )
-                .expect("produce ok")
-                .expect("eligibility");
-            if slot == start_slot {
-                probe_hash = Some(produced.block_hash);
-                assert_eq!(
-                    engine
-                        .store()
-                        .get_block_state(&produced.block_hash)
-                        .unwrap(),
-                    Some(BlockState::BlockProduced),
-                );
-            }
-            block_hashes.push(produced.block_hash);
-            engine
-                .prove_block(&produced.block_hash, &[], &proof_system)
-                .expect("prove ok");
-            if slot == start_slot {
-                assert_eq!(
-                    engine
-                        .store()
-                        .get_block_state(&probe_hash.unwrap())
-                        .unwrap(),
-                    Some(BlockState::Proven),
-                );
-            }
+            let block_hash =
+                produce_and_prove_with_fsm_checks(&mut engine, &proposer, &elf, proof_system, slot);
+            block_hashes.push(block_hash);
+            chunk_block_hashes.push(block_hash);
         }
+
+        let db_before_finality = engine.store().db().clone();
+        let mut stalled_engine =
+            Engine::open(spec.clone(), db_before_finality).expect("open stalled clone");
+        let err = stalled_engine
+            .finalize_chunk(chunk_id, &[], &proof_system, &bad_voter)
+            .expect_err("bad finality voter leaves chunk proof staged");
+        assert!(matches!(err, FinalizeError::Bft(_)));
+        assert_block_states(
+            &stalled_engine,
+            &chunk_block_hashes,
+            BlockState::ChunkProven,
+        );
 
         engine
             .finalize_chunk(chunk_id, &[], &proof_system, &proposer)
             .expect("finalize ok");
-        assert_eq!(
-            engine
-                .store()
-                .get_block_state(&probe_hash.unwrap())
-                .unwrap(),
-            Some(BlockState::Finalized),
-        );
+        assert_block_states(&engine, &chunk_block_hashes, BlockState::Finalized);
 
         engine
             .checkpoint_chunk(chunk_id, &[], &proof_system)
             .expect("checkpoint ok");
-        assert_eq!(
-            engine
-                .store()
-                .get_block_state(&probe_hash.unwrap())
-                .unwrap(),
-            Some(BlockState::Checkpointed),
-        );
+        assert_block_states(&engine, &chunk_block_hashes, BlockState::Checkpointed);
     }
 
     // Every block in every chunk must end in Checkpointed.

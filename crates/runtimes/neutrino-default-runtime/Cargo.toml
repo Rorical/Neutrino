@@ -19,6 +19,7 @@ name = "neutrino-default-runtime"
 path = "src/main.rs"
 
 [dependencies]
+neutrino-runtime-abi = { workspace = true, default-features = false }
 neutrino-runtime-sdk = { workspace = true, default-features = false }
 
 [lints]

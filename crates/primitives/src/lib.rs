@@ -584,15 +584,16 @@ pub struct Checkpoint {
     pub chain_id: ChainId,
     /// Recursive checkpoint index.
     pub index: CheckpointIndex,
-    /// First covered canonical block height.
+    /// Previous checkpoint boundary height. For checkpoint `n > 0`, the
+    /// covered chunk starts at `start_height + 1`; genesis uses zero.
     pub start_height: Height,
     /// Last covered canonical block height.
     pub end_height: Height,
-    /// First covered block hash, or zero at genesis.
+    /// Previous checkpoint boundary block hash, or zero at genesis.
     pub start_block_hash: BlockHash,
     /// Last covered block hash.
     pub end_block_hash: BlockHash,
-    /// State root before the covered range, or zero at genesis.
+    /// Previous checkpoint boundary state root, or zero at genesis.
     pub start_state_root: StateRoot,
     /// State root after the covered range.
     pub end_state_root: StateRoot,

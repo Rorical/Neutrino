@@ -7,7 +7,9 @@
 //! [`BlockError`].
 
 use neutrino_primitives::StateRoot;
-use neutrino_runtime_abi::BlockContext;
+use neutrino_runtime_abi::{
+    BlockContext, TxValidity, TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
+};
 use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::executor;
 use neutrino_vm_rv32im::loader::load_elf_into_memory;
@@ -81,6 +83,50 @@ pub enum BlockError {
     OutOfGas,
     /// Trie commit failed.
     CommitFailed(neutrino_trie::TrieError),
+    /// A named runtime entrypoint was not present in the ELF symbol table.
+    MissingEntrypoint {
+        /// Entrypoint symbol name the host attempted to run.
+        name: &'static str,
+    },
+}
+
+/// Failure modes for single-transaction runtime validation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TransactionValidationError {
+    /// The runtime failed before returning a validity result.
+    Runtime(BlockError),
+    /// The runtime returned bytes that do not match the ABI encoding.
+    Decode(TxValidityDecodeError),
+}
+
+impl From<BlockError> for TransactionValidationError {
+    fn from(value: BlockError) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeEntryPoint {
+    ElfHeader,
+    Symbol(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateMode {
+    Commit,
+    Discard,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RuntimeRunOutcome {
+    state_root_before: StateRoot,
+    state_root_after: StateRoot,
+    next_validator_set_root: Option<StateRoot>,
+    halt: Halt,
+    gas_used: u64,
+    gas_limit: u64,
+    output: Vec<u8>,
+    logs: Vec<EmittedLog>,
 }
 
 /// Drive a single block execution end-to-end.
@@ -102,11 +148,70 @@ pub fn run_block(
     overlay: &mut Overlay,
     gas_limit: u64,
 ) -> Result<BlockOutcome, BlockError> {
+    let outcome = run_runtime_entrypoint(
+        elf,
+        RuntimeEntryPoint::ElfHeader,
+        block_ctx,
+        input,
+        overlay,
+        gas_limit,
+        StateMode::Commit,
+    )?;
+    Ok(BlockOutcome {
+        state_root_before: outcome.state_root_before,
+        state_root_after: outcome.state_root_after,
+        next_validator_set_root: outcome.next_validator_set_root,
+        halt: outcome.halt,
+        gas_used: outcome.gas_used,
+        gas_limit: outcome.gas_limit,
+        output: outcome.output,
+        logs: outcome.logs,
+    })
+}
+
+/// Validate one raw transaction against the state exposed by `overlay`.
+///
+/// The host jumps directly to [`VALIDATE_TX_ENTRYPOINT`] and passes `tx`
+/// through the scratch input buffer. Runtime writes are discarded even if
+/// the guest attempts them; transaction validation is an admission check,
+/// not a state transition.
+pub fn validate_transaction(
+    elf: &[u8],
+    block_ctx: &BlockContext,
+    tx: &[u8],
+    overlay: &mut Overlay,
+    gas_limit: u64,
+) -> Result<TxValidity, TransactionValidationError> {
+    let outcome = run_runtime_entrypoint(
+        elf,
+        RuntimeEntryPoint::Symbol(VALIDATE_TX_ENTRYPOINT),
+        block_ctx,
+        tx.to_vec(),
+        overlay,
+        gas_limit,
+        StateMode::Discard,
+    )?;
+    TxValidity::decode(&outcome.output).map_err(TransactionValidationError::Decode)
+}
+
+fn run_runtime_entrypoint(
+    elf: &[u8],
+    entrypoint: RuntimeEntryPoint,
+    block_ctx: &BlockContext,
+    input: Vec<u8>,
+    overlay: &mut Overlay,
+    gas_limit: u64,
+    state_mode: StateMode,
+) -> Result<RuntimeRunOutcome, BlockError> {
     let state_root_before = overlay.base_root();
 
     // Load the ELF into a fresh guest memory.
     let mut memory = Memory::new(DEFAULT_MEMORY_BUDGET);
-    let entry = load_elf_into_memory(elf, &mut memory).map_err(BlockError::LoadElf)?;
+    let default_entry = load_elf_into_memory(elf, &mut memory).map_err(BlockError::LoadElf)?;
+    let entry = match entrypoint {
+        RuntimeEntryPoint::ElfHeader => default_entry,
+        RuntimeEntryPoint::Symbol(name) => find_elf_symbol(elf, name)?,
+    };
 
     // Add a stack region above the ELF's mapped segments. The
     // default-runtime's link script already places `_stack_top` inside
@@ -158,7 +263,13 @@ pub fn run_block(
 
     // Commit the overlay; this is the only step that mutates the
     // underlying trie.
-    let state_root_after = overlay.commit().map_err(BlockError::CommitFailed)?;
+    let state_root_after = match state_mode {
+        StateMode::Commit => overlay.commit().map_err(BlockError::CommitFailed)?,
+        StateMode::Discard => {
+            overlay.discard();
+            overlay.current_root()
+        }
+    };
 
     // The runtime is contractually required to write a 32-byte
     // accumulator at `VALIDATOR_SET_KEY` whenever validator-set state
@@ -169,7 +280,7 @@ pub fn run_block(
         .get(VALIDATOR_SET_KEY)
         .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
 
-    Ok(BlockOutcome {
+    Ok(RuntimeRunOutcome {
         state_root_before,
         state_root_after,
         next_validator_set_root,
@@ -179,4 +290,133 @@ pub fn run_block(
         output,
         logs,
     })
+}
+
+const fn invalid_elf() -> BlockError {
+    BlockError::LoadElf(Trap::InvalidInstruction)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let raw: [u8; 2] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u16::from_le_bytes(raw))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let raw: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SectionHeader {
+    kind: u32,
+    offset: usize,
+    size: usize,
+    link: usize,
+    entsize: usize,
+}
+
+fn section_header(
+    elf: &[u8],
+    section_offset: usize,
+    section_size: usize,
+    index: usize,
+) -> Result<SectionHeader, BlockError> {
+    let start = section_offset
+        .checked_add(index.checked_mul(section_size).ok_or_else(invalid_elf)?)
+        .ok_or_else(invalid_elf)?;
+    let min_end = start.checked_add(40).ok_or_else(invalid_elf)?;
+    if section_size < 40 || min_end > elf.len() {
+        return Err(invalid_elf());
+    }
+    Ok(SectionHeader {
+        kind: read_u32(elf, start + 4).ok_or_else(invalid_elf)?,
+        offset: usize::try_from(read_u32(elf, start + 16).ok_or_else(invalid_elf)?)
+            .map_err(|_| invalid_elf())?,
+        size: usize::try_from(read_u32(elf, start + 20).ok_or_else(invalid_elf)?)
+            .map_err(|_| invalid_elf())?,
+        link: usize::try_from(read_u32(elf, start + 24).ok_or_else(invalid_elf)?)
+            .map_err(|_| invalid_elf())?,
+        entsize: usize::try_from(read_u32(elf, start + 36).ok_or_else(invalid_elf)?)
+            .map_err(|_| invalid_elf())?,
+    })
+}
+
+fn section_data<'a>(elf: &'a [u8], section: &SectionHeader) -> Result<&'a [u8], BlockError> {
+    let end = section
+        .offset
+        .checked_add(section.size)
+        .ok_or_else(invalid_elf)?;
+    elf.get(section.offset..end).ok_or_else(invalid_elf)
+}
+
+fn symbol_name(strtab: &[u8], offset: usize) -> Option<&str> {
+    let rest = strtab.get(offset..)?;
+    let len = rest.iter().position(|byte| *byte == 0)?;
+    core::str::from_utf8(&rest[..len]).ok()
+}
+
+fn find_elf_symbol(elf: &[u8], name: &'static str) -> Result<u32, BlockError> {
+    const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+    const ELFCLASS32: u8 = 1;
+    const ELFDATA2LSB: u8 = 1;
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_DYNSYM: u32 = 11;
+
+    if elf.len() < 52
+        || elf.get(0..4) != Some(ELF_MAGIC.as_slice())
+        || elf.get(4) != Some(&ELFCLASS32)
+        || elf.get(5) != Some(&ELFDATA2LSB)
+    {
+        return Err(invalid_elf());
+    }
+
+    let section_offset =
+        usize::try_from(read_u32(elf, 32).ok_or_else(invalid_elf)?).map_err(|_| invalid_elf())?;
+    let section_size = usize::from(read_u16(elf, 46).ok_or_else(invalid_elf)?);
+    let section_count = usize::from(read_u16(elf, 48).ok_or_else(invalid_elf)?);
+
+    for index in 0..section_count {
+        let section = section_header(elf, section_offset, section_size, index)?;
+        if section.kind != SHT_SYMTAB && section.kind != SHT_DYNSYM {
+            continue;
+        }
+        if section.entsize < 16 || section.link >= section_count {
+            return Err(invalid_elf());
+        }
+
+        let strtab_header = section_header(elf, section_offset, section_size, section.link)?;
+        let strtab = section_data(elf, &strtab_header)?;
+        let symbol_count = section.size / section.entsize;
+
+        for symbol_index in 0..symbol_count {
+            let symbol_offset = section
+                .offset
+                .checked_add(
+                    symbol_index
+                        .checked_mul(section.entsize)
+                        .ok_or_else(invalid_elf)?,
+                )
+                .ok_or_else(invalid_elf)?;
+            let symbol_end = symbol_offset.checked_add(16).ok_or_else(invalid_elf)?;
+            if symbol_end > elf.len() {
+                return Err(invalid_elf());
+            }
+
+            let name_offset =
+                usize::try_from(read_u32(elf, symbol_offset).ok_or_else(invalid_elf)?)
+                    .map_err(|_| invalid_elf())?;
+            let value = read_u32(elf, symbol_offset + 4).ok_or_else(invalid_elf)?;
+            let section_index = read_u16(elf, symbol_offset + 14).ok_or_else(invalid_elf)?;
+            if section_index == 0 {
+                continue;
+            }
+            if symbol_name(strtab, name_offset) == Some(name) {
+                return Ok(value);
+            }
+        }
+    }
+
+    Err(BlockError::MissingEntrypoint { name })
 }

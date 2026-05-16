@@ -11,8 +11,9 @@ use core::fmt;
 
 use neutrino_consensus_chunk_bft::{BftError, ChunkBft, FinalizationStatus};
 use neutrino_consensus_types::{
-    BlockProof as WireBlockProof, Chunk, ChunkProof as WireChunkProof, ChunkProofPublicInputs,
-    FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase, Header,
+    BlockProof as WireBlockProof, BlockProofPublicInputs, Chunk, ChunkProof as WireChunkProof,
+    ChunkProofPublicInputs, FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase,
+    Header,
 };
 use neutrino_primitives::{
     BitVec, BlockHash, ChunkHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH,
@@ -65,6 +66,20 @@ pub enum FinalizeError<E> {
         /// Parent hash that should have been present.
         parent_hash: BlockHash,
     },
+    /// A covered block does not extend the previous covered block.
+    ParentHashMismatch {
+        /// Height whose parent link was invalid.
+        height: Height,
+        /// Parent hash required by the previous block in the chunk.
+        expected: BlockHash,
+        /// Parent hash carried by the header at `height`.
+        actual: BlockHash,
+    },
+    /// A persisted block proof does not bind the canonical header data.
+    BlockProofPublicInputsMismatch {
+        /// Block hash whose proof inputs did not match the header.
+        hash: BlockHash,
+    },
     /// Chunk size from the chain spec overflowed when computing the
     /// covered height range.
     HeightRangeOverflow,
@@ -108,6 +123,18 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for FinalizeError<E> {
             Self::MissingParentHeader { parent_hash } => {
                 write!(f, "parent header {parent_hash:?} is missing")
             }
+            Self::ParentHashMismatch {
+                height,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "block at height {height} has parent {actual:?}, expected {expected:?}"
+            ),
+            Self::BlockProofPublicInputsMismatch { hash } => write!(
+                f,
+                "block proof for {hash:?} does not match canonical header public inputs"
+            ),
             Self::HeightRangeOverflow => f.write_str("chunk height range overflowed u64"),
             Self::EmptyActiveSet => {
                 f.write_str("active validator set has no positive unslashed stake")
@@ -185,7 +212,7 @@ impl<DB: Database> Engine<DB> {
         let chunk_size = self.chain_spec().consensus.chunk_size;
         let (start_height, end_height) = chunk_range(chunk_id, chunk_size)?;
 
-        let inputs = self.collect_chunk_inputs::<PS>(start_height, end_height)?;
+        let inputs = self.collect_chunk_inputs::<PS>(start_height, end_height, proof_system)?;
         let (chunk, wire_chunk_proof, public_inputs) = self.assemble_chunk_and_proof::<PS>(
             chunk_id,
             start_height,
@@ -256,6 +283,7 @@ impl<DB: Database> Engine<DB> {
         &self,
         start_height: Height,
         end_height: Height,
+        proof_system: &PS,
     ) -> Result<ChunkInputs<PS>, FinalizeError<DB::Error>> {
         let capacity = usize::try_from(end_height - start_height + 1)
             .map_err(|_| FinalizeError::HeightRangeOverflow)?;
@@ -267,6 +295,7 @@ impl<DB: Database> Engine<DB> {
             vrf_leaves: Vec::with_capacity(capacity),
             da_leaves: Vec::with_capacity(capacity),
         };
+        let mut expected_parent = None;
 
         for height in start_height..=end_height {
             let header = self
@@ -274,6 +303,15 @@ impl<DB: Database> Engine<DB> {
                 .get_header_by_height(height)?
                 .ok_or(FinalizeError::MissingBlock { height })?;
             let hash = header.hash();
+            if let Some(expected) = expected_parent {
+                if header.parent_hash != expected {
+                    return Err(FinalizeError::ParentHashMismatch {
+                        height,
+                        expected,
+                        actual: header.parent_hash,
+                    });
+                }
+            }
             let state =
                 self.store()
                     .get_block_state(&hash)?
@@ -291,6 +329,16 @@ impl<DB: Database> Engine<DB> {
                 .ok_or(FinalizeError::MissingBlockProof { hash })?;
             let backend_proof: PS::BlockProof =
                 borsh::from_slice(&wire_proof.proof_bytes).map_err(FinalizeError::Codec)?;
+            let state_root_before = self.chunk_parent_state_root(&header)?;
+            let expected_public_inputs =
+                self.block_public_inputs_for_chunk(&header, state_root_before, &hash);
+            if wire_proof.height != header.height
+                || wire_proof.block_hash != hash
+                || wire_proof.public_inputs != expected_public_inputs
+            {
+                return Err(FinalizeError::BlockProofPublicInputsMismatch { hash });
+            }
+            proof_system.verify_block(&backend_proof, &wire_proof.public_inputs)?;
 
             inputs
                 .block_proof_leaves
@@ -300,6 +348,7 @@ impl<DB: Database> Engine<DB> {
             inputs.block_hashes.push(hash);
             inputs.headers.push(header);
             inputs.block_proofs.push(backend_proof);
+            expected_parent = Some(hash);
         }
 
         Ok(inputs)
@@ -346,6 +395,7 @@ impl<DB: Database> Engine<DB> {
         };
 
         let backend_chunk_proof = proof_system.prove_chunk(&inputs.block_proofs, &public_inputs)?;
+        proof_system.verify_chunk(&backend_chunk_proof, &public_inputs)?;
         let chunk_proof_bytes = borsh::to_vec(&backend_chunk_proof)?;
 
         let chunk = Chunk {
@@ -387,6 +437,27 @@ impl<DB: Database> Engine<DB> {
             },
         )?;
         Ok(parent.state_root)
+    }
+
+    const fn block_public_inputs_for_chunk(
+        &self,
+        header: &Header,
+        state_root_before: StateRoot,
+        block_hash: &BlockHash,
+    ) -> BlockProofPublicInputs {
+        BlockProofPublicInputs {
+            chain_id: self.chain_spec().chain_id,
+            height: header.height,
+            parent_block_hash: header.parent_hash,
+            block_hash: *block_hash,
+            state_root_before,
+            state_root_after: header.state_root,
+            transactions_root: header.transactions_root,
+            receipt_root: ZERO_HASH,
+            da_root: header.da_root,
+            vm_code_hash: self.chain_spec().runtime_code_hash,
+            abi_version: self.chain_spec().runtime_version.abi_version,
+        }
     }
 
     /// Synthesize the single-validator prevote + precommit and drive

@@ -44,6 +44,18 @@ fn main() {
         .join("runtimes")
         .join(DEFAULT_RUNTIME_PKG);
     println!("cargo:rerun-if-changed={}", runtime_dir.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("crates").join("runtime-abi").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("crates").join("runtime-sdk").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("crates").join("runtime-sdk-macros").display()
+    );
     println!("cargo:rerun-if-env-changed=CARGO_NEUTRINO_SKIP_RUNTIME_BUILD");
 
     if env::var_os("CARGO_NEUTRINO_SKIP_RUNTIME_BUILD").is_some() {

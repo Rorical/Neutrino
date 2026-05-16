@@ -1,4 +1,4 @@
-//! Bounded FIFO mempool keyed by transaction hash.
+//! Bounded deterministic priority mempool keyed by transaction hash.
 
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
@@ -17,6 +17,9 @@ pub struct MempoolEntry {
     pub hash: Hash,
     /// Opaque transaction bytes. The mempool does not interpret them.
     pub bytes: Vec<u8>,
+    /// Higher values are drained before lower values. Equal priority
+    /// transactions retain FIFO ordering.
+    pub priority: u64,
 }
 
 /// Insertion failure modes.
@@ -28,6 +31,8 @@ pub enum InsertError {
     CapacityExceeded,
     /// A single transaction is larger than the entire pool capacity.
     TooLarge,
+    /// Caller-supplied validation rejected the transaction bytes.
+    RejectedByValidator,
 }
 
 impl fmt::Display for InsertError {
@@ -36,6 +41,7 @@ impl fmt::Display for InsertError {
             Self::Duplicate => f.write_str("duplicate transaction hash"),
             Self::CapacityExceeded => f.write_str("mempool capacity exceeded"),
             Self::TooLarge => f.write_str("transaction exceeds mempool capacity"),
+            Self::RejectedByValidator => f.write_str("transaction rejected by validator"),
         }
     }
 }
@@ -43,15 +49,16 @@ impl fmt::Display for InsertError {
 #[cfg(feature = "std")]
 impl std::error::Error for InsertError {}
 
-/// Bounded FIFO mempool keyed by transaction hash.
+/// Bounded deterministic priority mempool keyed by transaction hash.
 ///
 /// # Determinism
 ///
-/// Insertion order is fully observable; [`Mempool::drain_up_to`] and
-/// [`Mempool::iter`] always yield transactions in the order they were
-/// inserted. Two mempools that received the same `insert` calls in the
-/// same order are byte-for-byte identical, which is what the engine
-/// relies on for deterministic block production and replay.
+/// Priority order is fully observable; [`Mempool::drain_up_to`] and
+/// [`Mempool::iter`] yield higher priority transactions first and keep
+/// FIFO ordering among equal priorities. Two mempools that received the
+/// same insert calls in the same order are byte-for-byte identical,
+/// which is what the engine relies on for deterministic block
+/// production and replay.
 ///
 /// # Capacity policy
 ///
@@ -112,12 +119,50 @@ impl Mempool {
         self.by_hash.contains(hash)
     }
 
-    /// Insert `bytes` as a new transaction.
+    /// Insert `bytes` as a new zero-priority transaction.
     ///
     /// Returns the BLAKE3 hash on success. Fails when the same hash is
     /// already buffered, the transaction is by itself larger than the
     /// pool, or the pool is too full to accept it.
     pub fn insert(&mut self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
+        self.insert_with_priority(bytes, 0)
+    }
+
+    /// Insert `bytes` as a new transaction with explicit priority.
+    ///
+    /// Higher priority entries drain first; entries with the same
+    /// priority retain insertion order.
+    pub fn insert_with_priority(
+        &mut self,
+        bytes: Vec<u8>,
+        priority: u64,
+    ) -> Result<Hash, InsertError> {
+        self.insert_with_priority_validated(bytes, priority, |_| true)
+    }
+
+    /// Insert `bytes` only if `validate` accepts them.
+    ///
+    /// This is the M5 seam for runtime-backed transaction validation.
+    /// The mempool remains opaque to transaction semantics; RPC or the
+    /// engine can pass a closure that calls
+    /// `neutrino_runtime_host::validate_transaction`.
+    pub fn insert_validated<F>(&mut self, bytes: Vec<u8>, validate: F) -> Result<Hash, InsertError>
+    where
+        F: FnOnce(&[u8]) -> bool,
+    {
+        self.insert_with_priority_validated(bytes, 0, validate)
+    }
+
+    /// Insert `bytes` with priority only if `validate` accepts them.
+    pub fn insert_with_priority_validated<F>(
+        &mut self,
+        bytes: Vec<u8>,
+        priority: u64,
+        validate: F,
+    ) -> Result<Hash, InsertError>
+    where
+        F: FnOnce(&[u8]) -> bool,
+    {
         if bytes.len() > self.capacity_bytes {
             return Err(InsertError::TooLarge);
         }
@@ -129,17 +174,32 @@ impl Mempool {
         if new_total > self.capacity_bytes {
             return Err(InsertError::CapacityExceeded);
         }
+        if !validate(&bytes) {
+            return Err(InsertError::RejectedByValidator);
+        }
         self.total_bytes = new_total;
         self.by_hash.insert(hash);
-        self.txs.push_back(MempoolEntry { hash, bytes });
+        let insert_at = self
+            .txs
+            .iter()
+            .position(|entry| priority > entry.priority)
+            .unwrap_or(self.txs.len());
+        self.txs.insert(
+            insert_at,
+            MempoolEntry {
+                hash,
+                bytes,
+                priority,
+            },
+        );
         Ok(hash)
     }
 
     /// Remove and return the transaction with `hash`, if present.
     ///
-    /// Removal is `O(n)` because the pool keeps strict FIFO order; M5
-    /// removal volume (one block per slot) is small enough that linear
-    /// scans are not worth optimising away.
+    /// Removal is `O(n)` because the pool keeps priority order in a
+    /// contiguous queue; M5 removal volume (one block per slot) is
+    /// small enough that linear scans are not worth optimising away.
     pub fn remove(&mut self, hash: &Hash) -> Option<MempoolEntry> {
         if !self.by_hash.remove(hash) {
             return None;
@@ -150,13 +210,13 @@ impl Mempool {
         Some(entry)
     }
 
-    /// Drain the oldest transactions whose cumulative byte size does
-    /// not exceed `byte_limit`.
+    /// Drain the highest-priority transactions whose cumulative byte
+    /// size does not exceed `byte_limit`.
     ///
-    /// Returns FIFO-ordered entries. Stops at the first transaction
-    /// that would push the cumulative size past `byte_limit` and leaves
-    /// it (and every later entry) in the pool. A `byte_limit` of zero
-    /// returns an empty vector without touching the pool.
+    /// Stops at the first transaction that would push the cumulative
+    /// size past `byte_limit` and leaves it (and every later entry) in
+    /// the pool. A `byte_limit` of zero returns an empty vector without
+    /// touching the pool.
     pub fn drain_up_to(&mut self, byte_limit: usize) -> Vec<MempoolEntry> {
         let mut taken = Vec::new();
         let mut accumulated: usize = 0;
@@ -178,7 +238,7 @@ impl Mempool {
         taken
     }
 
-    /// Iterate buffered transactions in FIFO (oldest first) order.
+    /// Iterate buffered transactions in drain order.
     pub fn iter(&self) -> impl Iterator<Item = &MempoolEntry> {
         self.txs.iter()
     }
@@ -211,6 +271,41 @@ mod tests {
         assert!(pool.contains(&expected));
         assert_eq!(pool.len(), 1);
         assert_eq!(pool.total_bytes(), 32);
+        assert_eq!(pool.iter().next().expect("entry").priority, 0);
+    }
+
+    #[test]
+    fn explicit_priority_drains_highest_first_with_fifo_ties() {
+        let mut pool = Mempool::new(1024);
+        let low = pool.insert_with_priority(tx(1, 8), 1).unwrap();
+        let high_a = pool.insert_with_priority(tx(2, 8), 9).unwrap();
+        let mid = pool.insert_with_priority(tx(3, 8), 5).unwrap();
+        let high_b = pool.insert_with_priority(tx(4, 8), 9).unwrap();
+
+        let order: Vec<_> = pool.iter().map(|entry| entry.hash).collect();
+        assert_eq!(order, vec![high_a, high_b, mid, low]);
+
+        let drained: Vec<_> = pool
+            .drain_up_to(usize::MAX)
+            .into_iter()
+            .map(|entry| entry.hash)
+            .collect();
+        assert_eq!(drained, vec![high_a, high_b, mid, low]);
+    }
+
+    #[test]
+    fn validation_hook_can_reject_before_mutation() {
+        let mut pool = Mempool::new(1024);
+        let rejected = pool.insert_validated(tx(1, 8), |bytes| bytes[0] != 1);
+        assert_eq!(rejected, Err(InsertError::RejectedByValidator));
+        assert!(pool.is_empty());
+        assert_eq!(pool.total_bytes(), 0);
+
+        let accepted = pool
+            .insert_with_priority_validated(tx(2, 8), 7, |bytes| bytes[0] == 2)
+            .expect("accepted");
+        assert!(pool.contains(&accepted));
+        assert_eq!(pool.iter().next().expect("entry").priority, 7);
     }
 
     #[test]

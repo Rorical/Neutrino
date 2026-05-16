@@ -194,7 +194,18 @@ fn make_transfer_body(
     txn.extend_from_slice(&amount.to_le_bytes());
     txn.extend_from_slice(&nonce.to_le_bytes());
     txn.extend_from_slice(&sig);
+    txn
+}
 
+/// Build a single-lane body from one transfer (backward compat wrapper).
+fn single_transfer_body(
+    from_pk: Ed25519PublicKey,
+    to_pk: Ed25519PublicKey,
+    amount: u64,
+    nonce: u64,
+    sig: Ed25519Signature,
+) -> Vec<u8> {
+    let txn = make_transfer_body(from_pk, to_pk, amount, nonce, sig);
     let mut body = Vec::with_capacity(4 + 4 + txn.len());
     body.extend_from_slice(&1u32.to_le_bytes());
     body.extend_from_slice(
@@ -252,7 +263,7 @@ fn transfer_updates_accounts_and_state_root() {
     txn_header.extend_from_slice(&amount.to_le_bytes());
     txn_header.extend_from_slice(&nonce.to_le_bytes());
     let sig = sk_sender.sign(&txn_header);
-    let body = make_transfer_body(pk_sender, pk_receiver, amount, nonce, sig);
+    let body = single_transfer_body(pk_sender, pk_receiver, amount, nonce, sig);
 
     // Pre-seed the sender with an initial balance.
     let mut overlay = Overlay::empty();
@@ -645,4 +656,178 @@ fn deposit_credits_stake_account_and_exit_returns_to_owner() {
         0,
     );
     assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
+}
+
+// -------- M4D comprehensive integration test -------------------------------
+
+#[test]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+fn multi_lane_body_exercises_all_transaction_types() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping multi-lane integration test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+    let sk_a = SecretKey::generate(&mut rng);
+    let sk_b = SecretKey::generate(&mut rng);
+    let sk_c = SecretKey::generate(&mut rng);
+    let pk_a = sk_a.public_key().to_bytes();
+    let pk_b = sk_b.public_key().to_bytes();
+    let pk_c = sk_c.public_key().to_bytes();
+    let bls1 = bls_pk(1);
+    let bls2 = bls_pk(2);
+
+    // Initial state: a=1000, b=500, c=0.
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_a.to_vec(), make_account_value(1000, 0));
+    overlay.put(pk_b.to_vec(), make_account_value(500, 0));
+    overlay.commit().expect("seed");
+
+    // ---- Block 1: transfer a→c 100, stake a→bls1 200 ----
+    let mut h1a = Vec::with_capacity(81);
+    h1a.push(TX_TRANSFER);
+    h1a.extend_from_slice(&pk_a);
+    h1a.extend_from_slice(&pk_c);
+    h1a.extend_from_slice(&100u64.to_le_bytes());
+    h1a.extend_from_slice(&0u64.to_le_bytes());
+    let sig_1a = sk_a.sign(&h1a);
+
+    let mut h1b = Vec::with_capacity(97);
+    h1b.push(TX_STAKE);
+    h1b.extend_from_slice(&pk_a);
+    h1b.extend_from_slice(&bls1);
+    h1b.extend_from_slice(&200u64.to_le_bytes());
+    h1b.extend_from_slice(&1u64.to_le_bytes());
+    let sig_1b = sk_a.sign(&h1b);
+
+    let body1 = body_from_txns(&[
+        make_transfer_body(pk_a, pk_c, 100, 0, sig_1a),
+        make_stake_txn(pk_a, bls1, 200, 1, TX_STAKE, sig_1b),
+    ]);
+
+    let _out1 = {
+        let root = overlay.base_root();
+        run_block(
+            &elf,
+            &make_block_ctx(1, root),
+            body1,
+            &mut overlay,
+            10_000_000,
+        )
+        .expect("block 1")
+    };
+    assert_eq!(overlay.get(&pk_a), Some(make_account_value(700, 2))); // 1000-100-200
+    assert_eq!(overlay.get(&pk_c), Some(make_account_value(100, 0)));
+    assert_eq!(
+        overlay.get(&stk_key(&bls1)),
+        Some(make_stake_value(200, pk_a))
+    );
+
+    // ---- Block 2: transfer b→c 50, deposit bls2 300, stake b→bls2 100 ----
+    let mut h2a = Vec::with_capacity(81);
+    h2a.push(TX_TRANSFER);
+    h2a.extend_from_slice(&pk_b);
+    h2a.extend_from_slice(&pk_c);
+    h2a.extend_from_slice(&50u64.to_le_bytes());
+    h2a.extend_from_slice(&0u64.to_le_bytes());
+    let sig_2a = sk_b.sign(&h2a);
+
+    let dep2b = make_deposit_txn(bls2, 300, [0u8; DEP_POP_LEN]);
+
+    let mut h2c = Vec::with_capacity(97);
+    h2c.push(TX_STAKE);
+    h2c.extend_from_slice(&pk_b);
+    h2c.extend_from_slice(&bls2);
+    h2c.extend_from_slice(&100u64.to_le_bytes());
+    h2c.extend_from_slice(&1u64.to_le_bytes());
+    let sig_2c = sk_b.sign(&h2c);
+
+    let body2 = body_from_txns(&[
+        make_transfer_body(pk_b, pk_c, 50, 0, sig_2a),
+        dep2b,
+        make_stake_txn(pk_b, bls2, 100, 1, TX_STAKE, sig_2c),
+    ]);
+
+    let out2 = {
+        let root = overlay.base_root();
+        run_block(
+            &elf,
+            &make_block_ctx(2, root),
+            body2,
+            &mut overlay,
+            10_000_000,
+        )
+        .expect("block 2")
+    };
+    assert_eq!(overlay.get(&pk_b), Some(make_account_value(350, 2))); // 500-50-100
+    assert_eq!(overlay.get(&pk_c), Some(make_account_value(150, 0))); // 100+50
+    assert_eq!(
+        overlay.get(&stk_key(&bls2)),
+        Some(make_stake_value(400, pk_b))
+    ); // 300+100
+
+    // ---- Block 3: unstake a←bls1 50, exit bls1 ----
+    let mut h3a = Vec::with_capacity(97);
+    h3a.push(TX_UNSTAKE);
+    h3a.extend_from_slice(&pk_a);
+    h3a.extend_from_slice(&bls1);
+    h3a.extend_from_slice(&50u64.to_le_bytes());
+    h3a.extend_from_slice(&2u64.to_le_bytes());
+    let sig_3a = sk_a.sign(&h3a);
+
+    let exit3b = make_exit_txn(bls1);
+
+    let body3 = body_from_txns(&[
+        make_stake_txn(pk_a, bls1, 50, 2, TX_UNSTAKE, sig_3a),
+        exit3b,
+    ]);
+
+    let out3 = {
+        let root = overlay.base_root();
+        run_block(
+            &elf,
+            &make_block_ctx(3, root),
+            body3,
+            &mut overlay,
+            10_000_000,
+        )
+        .expect("block 3")
+    };
+    // a: 700 + 50 + 150 (returned from exit) = 900, nonce 2→3.
+    assert_eq!(overlay.get(&pk_a), Some(make_account_value(900, 3)));
+    // bls1 deleted.
+    assert_eq!(overlay.get(&stk_key(&bls1)), None);
+
+    // VS hash chain deterministic over 3 blocks.
+    let mut vs = [0u8; 32];
+    let mut expected_vs = |op: u8, bls: BlsPublicKey, stake: u64| {
+        vs = compute_vs_hash(&vs, op, &bls, stake);
+        vs
+    };
+    // Block 1: stake bls1 200.
+    let _ = expected_vs(TX_STAKE, bls1, 200);
+    // Block 2: deposit bls2 300, then stake bls2 400.
+    let _ = expected_vs(TX_DEPOSIT, bls2, 300);
+    let _ = expected_vs(TX_STAKE, bls2, 400);
+    // Block 3: unstake bls1 150, then exit bls1 0.
+    let _ = expected_vs(TX_UNSTAKE, bls1, 150);
+    let _ = expected_vs(TX_EXIT, bls1, 0);
+    assert_eq!(overlay.get(VS_KEY), Some(vs.to_vec()));
+
+    // b and bls2 untouched by block 3.
+    assert_eq!(overlay.get(&pk_b), Some(make_account_value(350, 2)));
+    assert_eq!(
+        overlay.get(&stk_key(&bls2)),
+        Some(make_stake_value(400, pk_b))
+    );
+
+    // Counter incremented across all 3 blocks.
+    assert_eq!(overlay.get(COUNTER_KEY), Some(3u64.to_le_bytes().to_vec()));
+
+    // Mock proof round trip for the final block.
+    let mock = MockProofSystem::new();
+    let public = block_public_inputs(3, out2.state_root_after, out3.state_root_after);
+    let proof = mock.prove_block(&[], &public).expect("prove");
+    mock.verify_block(&proof, &public).expect("verify");
 }

@@ -106,9 +106,6 @@ const STK_MSG_LEN: usize = 97;
 /// Byte ranges within a deposit.
 const DEP_BLS_OFF: usize = 1;
 const DEP_AMOUNT_OFF: usize = 49;
-const DEP_POP_OFF: usize = 57;
-const DEP_POP_LEN: usize = 96;
-
 /// Byte ranges within a voluntary exit.
 const EXT_BLS_OFF: usize = 1;
 

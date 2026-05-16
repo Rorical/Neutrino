@@ -546,7 +546,10 @@ version = "0.1.0"
 name = "neutrino-vrf"
 version = "0.1.0"
 dependencies = [
+ "neutrino-crypto",
  "neutrino-primitives",
+ "rand",
+ "sha2",
 ]
 
 [[package]]

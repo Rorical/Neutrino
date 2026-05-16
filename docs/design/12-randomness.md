@@ -34,7 +34,7 @@ cryptographic verifier covers both.
 
 ## BLS uniqueness as a VRF
 
-A BLS signature is **deterministic** in the standard "min-pk, augmented"
+A BLS signature is **deterministic** in the standard "min-pk, proof-of-possession"
 scheme: given a fixed secret key and message, there is exactly one valid
 signature. That uniqueness is exactly what a VRF needs.
 
@@ -181,7 +181,7 @@ folds:
 
 1. The proposer was a member of the active validator set.
 2. `vrf_proof` is a valid BLS signature by that proposer over
-   `("NEUTRINO_VRF" || chain_id || finalized_seed || slot)`.
+   `(DOMAIN_VRF || chain_id_le || finalized_seed || slot_le)`.
 3. `vrf_output := SHA-256(vrf_proof)` satisfies the stake-weighted
    threshold inequality.
 

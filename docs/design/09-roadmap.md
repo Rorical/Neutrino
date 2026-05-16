@@ -36,10 +36,13 @@ property tests including stake-weighted eligibility.
 
 ## M1 — RV32IM interpreter (week 3–6)
 
-- `vm-rv32im`: full RV32I + M decoder and interpreter.
+- `vm-rv32im`: full RV32I + M decoder and interpreter, spec-conforming
+  DIV/REM (non-trapping on `/0` and signed overflow, per RISC-V "M"
+  v2.0).
 - ELF32 RISC-V loader (static, no relocations, permission bits enforced).
 - Memory regions, traps (`OutOfGas`, `MemoryFault`, `InvalidInstruction`,
-  `ExplicitAbort`, `DivisionByZero`, `StackOverflow`).
+  `InstructionAddressMisaligned`, `ExplicitAbort`, `StackOverflow`,
+  `HostError`).
 - Gas metering against the cost table from doc 03.
 - **Witness-recording mode** (feature-gated): every memory and state read
   captured into a deterministic witness buffer for later use by the prover

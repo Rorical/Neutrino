@@ -229,13 +229,41 @@ The runtime aborts with a typed reason:
 ```rust
 pub enum Trap {
     OutOfGas,
-    MemoryFault { addr: u32, access: AccessKind },
-    InvalidInstruction { pc: u32 },
-    ExplicitAbort { code: u32 },        // from ECALL `abort`
-    DivisionByZero { pc: u32 },         // already spec-defined in RV; we still want to surface
+    MemoryFault { addr: u32 },                  // OOB, permission, or misaligned data
+    InvalidInstruction,                         // undecodable / reserved bit pattern
+    InstructionAddressMisaligned { addr: u32 }, // JAL/JALR target or PC not 4-byte aligned
+    ExplicitAbort { code: u32 },                // from ECALL `abort`
     StackOverflow,
+    HostError { code: u32 },                    // host syscall failed
 }
 ```
+
+Notable spec-conforming **non-traps**:
+
+- `DIV[U] / 0` returns `0xFFFF_FFFF`; `REM[U] / 0` returns the dividend.
+  RISC-V "M" extension (chapter 12) explicitly defines these as
+  non-trapping. The rationale is recorded in the spec itself: keeping
+  arithmetic trap-free avoids the only standard-ISA arithmetic exception
+  and lets language frontends emit an explicit pre-check only when their
+  language semantics demand one.
+- Signed overflow `i32::MIN / -1` returns `i32::MIN` for DIV and `0` for
+  REM, also non-trapping.
+
+EEI choices that deviate from the loosest reading of the spec:
+
+- **Misaligned data accesses are forbidden.** LH/SH require 2-byte
+  alignment, LW/SW require 4-byte alignment. The spec leaves this to the
+  execution environment; we forbid misalignment so the proof witness can
+  encode each access as `(addr, size)` without per-byte striping.
+- **Instruction-fetch alignment surfaces a dedicated trap.** The PC must
+  be 4-byte aligned (no `C` extension); JAL/JALR check their computed
+  target before redirecting PC.
+- **EBREAK halts as `Halt::ExplicitAbort { code: 2 }`** rather than
+  invoking a debugger. This is the convention for the embedded RV32IM VM
+  and is documented in `04-host-abi.md`.
+- **ECALL always terminates execution.** The host returns a `Halt` or
+  `Trap`; PC is not advanced. A multi-syscall model would require the
+  host returning a continuation, which is not in scope for M1.
 
 When `execute_block` traps, the block is **invalid**. State changes from the
 trapped block are discarded (overlay rollback). The proposer that built it can

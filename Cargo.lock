@@ -585,6 +585,11 @@ version = "0.1.0"
 [[package]]
 name = "neutrino-consensus-fork-choice"
 version = "0.1.0"
+dependencies = [
+ "neutrino-consensus-types",
+ "neutrino-primitives",
+ "sha2",
+]
 
 [[package]]
 name = "neutrino-consensus-types"

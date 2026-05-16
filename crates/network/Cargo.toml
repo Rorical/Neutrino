@@ -16,3 +16,13 @@ std = []
 
 [lints]
 workspace = true
+
+[dependencies]
+borsh.workspace = true
+futures = "0.3.32"
+libp2p = { version = "0.56.0", features = ["tokio", "gossipsub", "request-response", "identify", "kad", "yamux", "noise", "tcp", "quic", "macros"] }
+neutrino-consensus-types.workspace = true
+neutrino-crypto.workspace = true
+neutrino-primitives.workspace = true
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"

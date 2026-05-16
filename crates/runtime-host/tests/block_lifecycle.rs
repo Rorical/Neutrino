@@ -24,7 +24,7 @@ use neutrino_primitives::{
 };
 use neutrino_proof_system::{BlockPublicInputs, MockProofSystem, ProofError, ProofSystem};
 use neutrino_runtime_abi::BlockContext;
-use neutrino_runtime_host::{Overlay, run_block};
+use neutrino_runtime_host::{BlockError, Overlay, VALIDATOR_SET_KEY, run_block};
 use neutrino_trie::Trie;
 use rand::SeedableRng;
 
@@ -830,4 +830,386 @@ fn multi_lane_body_exercises_all_transaction_types() {
     let public = block_public_inputs(3, out2.state_root_after, out3.state_root_after);
     let proof = mock.prove_block(&[], &public).expect("prove");
     mock.verify_block(&proof, &public).expect("verify");
+}
+
+// -------- Negative-path tests (M4 audit) -----------------------------------
+
+/// ABI abort codes the runtime can return. Mirrored from
+/// `crates/runtimes/neutrino-default-runtime/src/main.rs`.
+const ABORT_SIGNATURE: u32 = 1;
+const ABORT_NONCE: u32 = 2;
+const ABORT_UNDERFLOW: u32 = 3;
+const ABORT_BAD_TXN_TYPE: u32 = 4;
+const ABORT_BODY_OVERFLOW: u32 = 6;
+
+/// Sign-then-tamper a transfer so the Ed25519 verifier rejects it.
+#[test]
+fn transfer_with_bad_signature_aborts_with_signature_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping bad-sig test.");
+        return;
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+    let sk = SecretKey::generate(&mut rng);
+    let pk_from = sk.public_key().to_bytes();
+    let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
+
+    let mut hdr = Vec::with_capacity(81);
+    hdr.push(TX_TRANSFER);
+    hdr.extend_from_slice(&pk_from);
+    hdr.extend_from_slice(&pk_to);
+    hdr.extend_from_slice(&10u64.to_le_bytes());
+    hdr.extend_from_slice(&0u64.to_le_bytes());
+    let mut sig = sk.sign(&hdr);
+    sig[0] ^= 0xFF; // flip a byte; signature now invalid
+
+    let body = single_transfer_body(pk_from, pk_to, 10, 0, sig);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_from.to_vec(), make_account_value(1000, 0));
+    overlay.commit().expect("seed");
+
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("bad signature must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_SIGNATURE));
+}
+
+#[test]
+fn transfer_with_wrong_nonce_aborts_with_nonce_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping bad-nonce test.");
+        return;
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+    let sk = SecretKey::generate(&mut rng);
+    let pk_from = sk.public_key().to_bytes();
+    let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
+
+    let bad_nonce = 7u64; // sender's recorded nonce is 0
+    let mut hdr = Vec::with_capacity(81);
+    hdr.push(TX_TRANSFER);
+    hdr.extend_from_slice(&pk_from);
+    hdr.extend_from_slice(&pk_to);
+    hdr.extend_from_slice(&10u64.to_le_bytes());
+    hdr.extend_from_slice(&bad_nonce.to_le_bytes());
+    let sig = sk.sign(&hdr);
+    let body = single_transfer_body(pk_from, pk_to, 10, bad_nonce, sig);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_from.to_vec(), make_account_value(1000, 0));
+    overlay.commit().expect("seed");
+
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("wrong nonce must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_NONCE));
+}
+
+#[test]
+fn transfer_with_insufficient_balance_aborts_with_underflow_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping underflow test.");
+        return;
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    let sk = SecretKey::generate(&mut rng);
+    let pk_from = sk.public_key().to_bytes();
+    let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
+
+    let mut hdr = Vec::with_capacity(81);
+    hdr.push(TX_TRANSFER);
+    hdr.extend_from_slice(&pk_from);
+    hdr.extend_from_slice(&pk_to);
+    hdr.extend_from_slice(&1_000_000u64.to_le_bytes()); // way more than seed
+    hdr.extend_from_slice(&0u64.to_le_bytes());
+    let sig = sk.sign(&hdr);
+    let body = single_transfer_body(pk_from, pk_to, 1_000_000, 0, sig);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_from.to_vec(), make_account_value(10, 0));
+    overlay.commit().expect("seed");
+
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("underflow must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_UNDERFLOW));
+}
+
+#[test]
+fn unknown_transaction_type_aborts_with_bad_type_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping bad-type test.");
+        return;
+    };
+    // type tag 0xFF is not in the recognised set
+    let txn = vec![0xFF_u8, 0x00, 0x01, 0x02];
+    let body = body_from_txns(&[txn]);
+
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("unknown txn type must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_BAD_TXN_TYPE));
+}
+
+#[test]
+fn stake_by_wrong_owner_aborts_with_underflow_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping wrong-owner stake test.");
+        return;
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+    let sk_real = SecretKey::generate(&mut rng);
+    let sk_attacker = SecretKey::generate(&mut rng);
+    let pk_real = sk_real.public_key().to_bytes();
+    let pk_attacker = sk_attacker.public_key().to_bytes();
+    let bls = bls_pk(0xAB);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_real.to_vec(), make_account_value(1000, 0));
+    overlay.put(pk_attacker.to_vec(), make_account_value(1000, 0));
+    // Real owner stakes first so the stake account binds to pk_real.
+    let mut hdr0 = Vec::with_capacity(97);
+    hdr0.push(TX_STAKE);
+    hdr0.extend_from_slice(&pk_real);
+    hdr0.extend_from_slice(&bls);
+    hdr0.extend_from_slice(&100u64.to_le_bytes());
+    hdr0.extend_from_slice(&0u64.to_le_bytes());
+    let body0 = body_from_txns(&[make_stake_txn(
+        pk_real,
+        bls,
+        100,
+        0,
+        TX_STAKE,
+        sk_real.sign(&hdr0),
+    )]);
+    overlay.commit().expect("seed");
+    let ctx0 = make_block_ctx(1, overlay.base_root());
+    run_block(&elf, &ctx0, body0, &mut overlay, 5_000_000).expect("real stake");
+
+    // Attacker now tries to stake into the same BLS key.
+    let mut hdr1 = Vec::with_capacity(97);
+    hdr1.push(TX_STAKE);
+    hdr1.extend_from_slice(&pk_attacker);
+    hdr1.extend_from_slice(&bls);
+    hdr1.extend_from_slice(&50u64.to_le_bytes());
+    hdr1.extend_from_slice(&0u64.to_le_bytes());
+    let body1 = body_from_txns(&[make_stake_txn(
+        pk_attacker,
+        bls,
+        50,
+        0,
+        TX_STAKE,
+        sk_attacker.sign(&hdr1),
+    )]);
+    let ctx1 = make_block_ctx(2, overlay.base_root());
+    let err = run_block(&elf, &ctx1, body1, &mut overlay, 5_000_000)
+        .expect_err("wrong owner must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_UNDERFLOW));
+}
+
+#[test]
+fn zero_amount_deposit_aborts_with_underflow_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping zero-deposit test.");
+        return;
+    };
+    let deposit = make_deposit_txn(bls_pk(0xCC), 0, [0u8; DEP_POP_LEN]);
+    let body = body_from_txns(&[deposit]);
+
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("zero deposit must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_UNDERFLOW));
+}
+
+#[test]
+fn exit_on_unknown_validator_aborts_with_underflow_code() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping unknown-exit test.");
+        return;
+    };
+    let exit = make_exit_txn(bls_pk(0xDD));
+    let body = body_from_txns(&[exit]);
+
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("exit on unknown validator must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_UNDERFLOW));
+}
+
+#[test]
+fn body_larger_than_runtime_buffer_aborts_cleanly() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping body-overflow test.");
+        return;
+    };
+    // Runtime input buffer is 4 KiB; ship 8 KiB of arbitrary bytes.
+    // The runtime must abort rather than parse the zero-initialised
+    // stack region as if it held the engine's body.
+    let body = vec![0xAB_u8; 8 * 1024];
+
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let err = run_block(&elf, &ctx, body, &mut overlay, 5_000_000)
+        .expect_err("oversized body must trap the block");
+    assert_eq!(err, BlockError::AbortedWithCode(ABORT_BODY_OVERFLOW));
+}
+
+// -------- next_validator_set_root exposure tests (M4 audit) -----------------
+
+#[test]
+fn empty_block_reports_no_validator_set_root() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping vs-root absent test.");
+        return;
+    };
+
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let outcome = run_block(&elf, &ctx, Vec::new(), &mut overlay, 5_000_000).expect("empty block");
+    assert!(
+        outcome.next_validator_set_root.is_none(),
+        "an empty block never wrote vs:active"
+    );
+}
+
+#[test]
+fn transfer_only_block_reports_no_validator_set_root() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping vs-root transfer-only test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let sk = SecretKey::generate(&mut rng);
+    let pk_from = sk.public_key().to_bytes();
+    let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
+
+    let mut hdr = Vec::with_capacity(81);
+    hdr.push(TX_TRANSFER);
+    hdr.extend_from_slice(&pk_from);
+    hdr.extend_from_slice(&pk_to);
+    hdr.extend_from_slice(&10u64.to_le_bytes());
+    hdr.extend_from_slice(&0u64.to_le_bytes());
+    let sig = sk.sign(&hdr);
+    let body = single_transfer_body(pk_from, pk_to, 10, 0, sig);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_from.to_vec(), make_account_value(100, 0));
+    overlay.commit().expect("seed");
+
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let outcome = run_block(&elf, &ctx, body, &mut overlay, 5_000_000).expect("transfer block");
+    assert!(
+        outcome.next_validator_set_root.is_none(),
+        "transfers must not touch vs:active"
+    );
+}
+
+#[test]
+fn stake_block_exposes_next_validator_set_root_in_outcome() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping vs-root exposure test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(22);
+    let sk = SecretKey::generate(&mut rng);
+    let pk_owner = sk.public_key().to_bytes();
+    let bls = bls_pk(7);
+
+    let mut hdr = Vec::with_capacity(97);
+    hdr.push(TX_STAKE);
+    hdr.extend_from_slice(&pk_owner);
+    hdr.extend_from_slice(&bls);
+    hdr.extend_from_slice(&200u64.to_le_bytes());
+    hdr.extend_from_slice(&0u64.to_le_bytes());
+    let body = body_from_txns(&[make_stake_txn(
+        pk_owner,
+        bls,
+        200,
+        0,
+        TX_STAKE,
+        sk.sign(&hdr),
+    )]);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_owner.to_vec(), make_account_value(1000, 0));
+    overlay.commit().expect("seed");
+
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let outcome = run_block(&elf, &ctx, body, &mut overlay, 5_000_000).expect("stake block");
+
+    let expected = compute_vs_hash(&[0u8; 32], TX_STAKE, &bls, 200);
+    assert_eq!(
+        outcome.next_validator_set_root,
+        Some(expected),
+        "stake block must surface the live vs:active accumulator",
+    );
+    // BlockOutcome and direct overlay read must agree.
+    assert_eq!(
+        overlay
+            .get(VALIDATOR_SET_KEY)
+            .map(|v| { <[u8; 32]>::try_from(v.as_slice()).expect("32-byte vs hash") }),
+        outcome.next_validator_set_root,
+    );
+}
+
+#[test]
+fn validator_set_root_carries_through_non_validator_blocks() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping vs-root carry test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(33);
+    let sk = SecretKey::generate(&mut rng);
+    let pk_owner = sk.public_key().to_bytes();
+    let pk_recv = SecretKey::generate(&mut rng).public_key().to_bytes();
+    let bls = bls_pk(9);
+
+    // Block 1: stake — vs:active becomes non-empty.
+    let mut hdr1 = Vec::with_capacity(97);
+    hdr1.push(TX_STAKE);
+    hdr1.extend_from_slice(&pk_owner);
+    hdr1.extend_from_slice(&bls);
+    hdr1.extend_from_slice(&100u64.to_le_bytes());
+    hdr1.extend_from_slice(&0u64.to_le_bytes());
+    let body1 = body_from_txns(&[make_stake_txn(
+        pk_owner,
+        bls,
+        100,
+        0,
+        TX_STAKE,
+        sk.sign(&hdr1),
+    )]);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_owner.to_vec(), make_account_value(1000, 0));
+    overlay.commit().expect("seed");
+
+    let ctx1 = make_block_ctx(1, overlay.base_root());
+    let out1 = run_block(&elf, &ctx1, body1, &mut overlay, 5_000_000).expect("stake");
+    let vs_after_stake = out1.next_validator_set_root.expect("stake exposes vs root");
+
+    // Block 2: pure transfer — vs:active is untouched but still present.
+    let mut hdr2 = Vec::with_capacity(81);
+    hdr2.push(TX_TRANSFER);
+    hdr2.extend_from_slice(&pk_owner);
+    hdr2.extend_from_slice(&pk_recv);
+    hdr2.extend_from_slice(&5u64.to_le_bytes());
+    hdr2.extend_from_slice(&1u64.to_le_bytes());
+    let body2 = single_transfer_body(pk_owner, pk_recv, 5, 1, sk.sign(&hdr2));
+
+    let ctx2 = make_block_ctx(2, out1.state_root_after);
+    let out2 = run_block(&elf, &ctx2, body2, &mut overlay, 5_000_000).expect("transfer");
+    assert_eq!(
+        out2.next_validator_set_root,
+        Some(vs_after_stake),
+        "transfer must surface the carried-over vs:active value",
+    );
 }

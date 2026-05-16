@@ -47,31 +47,31 @@
 //! Key `b"vs:active"`, value = 32-byte BLAKE3 chain:
 //! `BLAKE3(prev || op_byte || bls_pk || new_stake)`. Read by the
 //! engine at chunk boundaries.
+//!
+//! ## Deposit (153 bytes; type 0x03)
+//!
+//! | Offset | Size | Field |
+//! |--------|------|-------|
+//! | 0      | 1    | type tag (0x03) |
+//! | 1      | 48   | BLS validator pubkey |
+//! | 49     | 8    | amount (u64 LE) |
+//! | 57     | 96   | BLS proof-of-possession sig over pubkey bytes |
+//!
+//! ## Voluntary exit (49 bytes; type 0x04)
+//!
+//! | Offset | Size | Field |
+//! |--------|------|-------|
+//! | 0      | 1    | type tag (0x04) |
+//! | 1      | 48   | BLS validator pubkey |
+//!
+//! On exit the staked balance is returned to the owner and the stake
+//! account is deleted.
 
 use neutrino_runtime_sdk::{entrypoint, syscalls};
 
 /// ABI status code mirrored from `neutrino_runtime_abi::status`.
 const STATUS_OK: u32 = 0;
 const STATUS_NOT_FOUND: u32 = 3;
-
-// ## Deposit (153 bytes; type 0x03)
-//
-// | Offset | Size | Field |
-// |--------|------|-------|
-// | 0      | 1    | type tag (0x03) |
-// | 1      | 48   | BLS validator pubkey |
-// | 49     | 8    | amount (u64 LE) |
-// | 57     | 96   | BLS proof-of-possession sig over pubkey bytes |
-//
-// ## Voluntary exit (49 bytes; type 0x04)
-//
-// | Offset | Size | Field |
-// |--------|------|-------|
-// | 0      | 1    | type tag (0x04) |
-// | 1      | 48   | BLS validator pubkey |
-//
-// On exit the staked balance is returned to the owner and the stake
-// account is deleted.
 
 /// Transaction type tag: a signed token transfer.
 const TX_TRANSFER: u8 = 0x00;
@@ -137,6 +137,10 @@ const ABORT_UNDERFLOW: u32 = 3;
 const ABORT_BAD_TXN_TYPE: u32 = 4;
 /// ABI abort code for an over-length state read (state format mismatch).
 const ABORT_OVERLONG_READ: u32 = 5;
+/// ABI abort code when the engine-supplied body exceeds the runtime's
+/// fixed input buffer. The runtime refuses to silently truncate; the
+/// engine MUST keep individual block bodies under [`BODY_BUF`] bytes.
+const ABORT_BODY_OVERFLOW: u32 = 6;
 
 /// In-memory account record.
 struct Account {
@@ -528,7 +532,16 @@ fn execute_block() {
     // --- Body parsing (fixed-format, no alloc) ---
     let mut body = [0u8; BODY_BUF];
     let body_ptr = body.as_mut_ptr() as u32;
-    let body_len = syscalls::host_input(body_ptr, BODY_BUF as u32) as usize;
+    let (input_status, input_len) = syscalls::host_input(body_ptr, BODY_BUF as u32);
+    let body_len = match input_status {
+        STATUS_OK => input_len as usize,
+        STATUS_NOT_FOUND => 0,
+        // Anything else (notably `BufferTooSmall`) means the engine
+        // shipped a body the runtime can't safely parse. Abort
+        // rather than parse zero-initialised stack memory as if it
+        // were transactions.
+        _ => syscalls::abort(ABORT_BODY_OVERFLOW),
+    };
 
     if body_len >= 4 {
         let tx_count = read_u32_le(&body, 0) as usize;

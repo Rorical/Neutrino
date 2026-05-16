@@ -62,6 +62,13 @@ pub enum Trap {
         /// Abort code from the syscall.
         code: u32,
     },
+    /// Runtime called the `panic` syscall. The panic message (if any)
+    /// is captured in the host dispatcher's `panic_msg` slot rather
+    /// than carried in the trap so this enum stays `Copy`.
+    ///
+    /// Distinct from `ExplicitAbort { code: 1 }` to keep the runtime's
+    /// abort-code namespace free of host-reserved values.
+    Panic,
     /// Stack pointer overflowed into unmapped guard page.
     StackOverflow,
     /// Host syscall returned an error.

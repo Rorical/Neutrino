@@ -30,7 +30,7 @@ pub mod overlay;
 pub mod pointer;
 pub mod scratch;
 
-pub use block_runner::{BlockError, BlockOutcome, run_block};
+pub use block_runner::{BlockError, BlockOutcome, VALIDATOR_SET_KEY, run_block};
 pub use host::{DispatchingHost, EmittedLog};
 pub use overlay::{Overlay, OverlayEntry};
 pub use scratch::Scratch;

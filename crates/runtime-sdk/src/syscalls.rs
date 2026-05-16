@@ -186,21 +186,15 @@ pub fn state_root(out_ptr: u32) {
 
 /// Copies the engine-provided entrypoint input scratch buffer.
 ///
-/// Returns the number of bytes written.
+/// Returns `(status, len)` where `len` is the number of bytes written
+/// on [`Status::Ok`](neutrino_runtime_abi::Status::Ok) or the full
+/// input size on
+/// [`Status::BufferTooSmall`](neutrino_runtime_abi::Status::BufferTooSmall).
+/// The runtime MUST check the status before reading the buffer; on
+/// `BufferTooSmall` zero bytes were written.
 #[inline]
-pub fn host_input(out_ptr: u32, out_cap: u32) -> u32 {
-    let written: u32;
-    // SAFETY: ECALL writes the status in `a0` and the byte count in `a1`.
-    unsafe {
-        asm!(
-            "ecall",
-            inlateout("a0") out_ptr => _,
-            inlateout("a1") out_cap => written,
-            in("a7") syscall::block::HOST_INPUT,
-            options(nostack),
-        );
-    }
-    written
+pub fn host_input(out_ptr: u32, out_cap: u32) -> (u32, u32) {
+    ecall2_in_2_out(syscall::block::HOST_INPUT, out_ptr, out_cap)
 }
 
 /// Writes the entrypoint's return value into the host scratch buffer.

@@ -28,6 +28,11 @@ pub const DEFAULT_STACK_SIZE: u32 = 16 * 1024;
 /// allocating absurd amounts in tests.
 pub const DEFAULT_MEMORY_BUDGET: u32 = 4 * 1024 * 1024;
 
+/// Convention key the runtime writes its active validator-set
+/// accumulator under. The engine reads this at chunk boundaries to
+/// derive the next-chunk validator-set commitment.
+pub const VALIDATOR_SET_KEY: &[u8] = b"vs:active";
+
 /// Successful block execution outcome. Carries the new state root, the
 /// halt reason, gas accounting, runtime output bytes, and any logs.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -37,6 +42,11 @@ pub struct BlockOutcome {
     pub state_root_before: StateRoot,
     /// State root after committing the overlay.
     pub state_root_after: StateRoot,
+    /// Active validator-set commitment the runtime published at
+    /// [`VALIDATOR_SET_KEY`], or `None` if the runtime has never
+    /// written that key (e.g. genesis-empty trie). The engine carries
+    /// this through to the next chunk's `next_validator_set_root`.
+    pub next_validator_set_root: Option<StateRoot>,
     /// Reason the runtime halted (always a [`Halt`]; traps surface as
     /// [`BlockError`] instead).
     pub halt: Halt,
@@ -132,7 +142,7 @@ pub fn run_block(
 
     let halt = match result {
         Ok(h) => h,
-        Err(Trap::ExplicitAbort { code: 1 }) => return Err(BlockError::Panicked(panic_msg)),
+        Err(Trap::Panic) => return Err(BlockError::Panicked(panic_msg)),
         Err(Trap::ExplicitAbort { code }) => return Err(BlockError::AbortedWithCode(code)),
         Err(Trap::OutOfGas) => return Err(BlockError::OutOfGas),
         Err(trap) => return Err(BlockError::Trap(trap)),
@@ -150,9 +160,19 @@ pub fn run_block(
     // underlying trie.
     let state_root_after = overlay.commit().map_err(BlockError::CommitFailed)?;
 
+    // The runtime is contractually required to write a 32-byte
+    // accumulator at `VALIDATOR_SET_KEY` whenever validator-set state
+    // changes. Surface the post-commit value so the engine can stamp
+    // it into the next chunk's `next_validator_set_root` without
+    // peeking into runtime-internal keys.
+    let next_validator_set_root = overlay
+        .get(VALIDATOR_SET_KEY)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
+
     Ok(BlockOutcome {
         state_root_before,
         state_root_after,
+        next_validator_set_root,
         halt,
         gas_used,
         gas_limit,

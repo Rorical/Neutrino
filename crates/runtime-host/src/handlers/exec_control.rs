@@ -33,8 +33,8 @@ pub fn abort(cpu: &mut Cpu) -> Result<Option<Halt>, Trap> {
 ///
 /// Captures the runtime-provided message (if any) into the dispatcher
 /// so the engine can surface it on rejection, then traps with
-/// [`Trap::ExplicitAbort`] (`code = 1`). Always an invalid block;
-/// runtimes use `abort` for clean exits.
+/// [`Trap::Panic`]. Always an invalid block; runtimes use `abort`
+/// for clean exits.
 pub fn panic(
     cpu: &mut Cpu,
     memory: &mut Memory,
@@ -47,7 +47,7 @@ pub fn panic(
     // buffer we still want to trap with the panic semantics, so we
     // swallow read errors and store an empty message.
     host.panic_msg = Some(pointer::read_bytes(memory, msg_ptr, msg_len).unwrap_or_default());
-    Err(Trap::ExplicitAbort { code: 1 })
+    Err(Trap::Panic)
 }
 
 /// `gas_remaining() -> u64` — `0x02`.

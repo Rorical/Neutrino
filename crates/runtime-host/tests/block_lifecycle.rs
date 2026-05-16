@@ -520,3 +520,129 @@ fn full_unstake_clears_stake_account_and_vs_hash() {
     let vs2 = compute_vs_hash(&vs1, TX_UNSTAKE, &bls1, 0);
     assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
 }
+
+// -------- M4C deposit / exit helpers & test ---------------------------------
+
+const TX_DEPOSIT: u8 = 0x03;
+const TX_EXIT: u8 = 0x04;
+const DEP_POP_LEN: usize = 96;
+
+fn make_deposit_txn(bls_pk: BlsPublicKey, amount: u64, pop: [u8; DEP_POP_LEN]) -> Vec<u8> {
+    let mut txn = Vec::with_capacity(1 + 48 + 8 + 96);
+    txn.push(TX_DEPOSIT);
+    txn.extend_from_slice(&bls_pk);
+    txn.extend_from_slice(&amount.to_le_bytes());
+    txn.extend_from_slice(&pop);
+    txn
+}
+
+fn make_exit_txn(bls_pk: BlsPublicKey) -> Vec<u8> {
+    let mut txn = Vec::with_capacity(1 + 48);
+    txn.push(TX_EXIT);
+    txn.extend_from_slice(&bls_pk);
+    txn
+}
+
+#[test]
+fn deposit_credits_stake_account_and_exit_returns_to_owner() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping deposit/exit test.");
+        return;
+    };
+
+    // Generate Ed25519 owner. Deposit uses a raw BLS pubkey (no keygen
+    // needed — the runtime trusts engine-side POP verification).
+    let mut rng = rand::rngs::StdRng::seed_from_u64(55);
+    let ed_sk = SecretKey::generate(&mut rng);
+    let ed_pubkey = ed_sk.public_key().to_bytes();
+    let bls_pk = bls_pk(1);
+
+    // ---- Block 1: deposit 400 (POP bytes are opaque to the runtime) ----
+    let deposit_txn = make_deposit_txn(bls_pk, 400, [0u8; DEP_POP_LEN]);
+    let body1 = body_from_txns(&[deposit_txn]);
+
+    let mut overlay = Overlay::empty();
+    let root_before = overlay.base_root();
+    let _out1 = run_block(
+        &elf,
+        &make_block_ctx(1, root_before),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("deposit");
+
+    // Stake account credited despite no Ed25519 owner.
+    assert_eq!(
+        overlay.get(&stk_key(&bls_pk)),
+        Some(make_stake_value(400, [0u8; 32]))
+    );
+    let vs1 = compute_vs_hash(&[0u8; 32], TX_DEPOSIT, &bls_pk, 400);
+    assert_eq!(overlay.get(VS_KEY), Some(vs1.to_vec()));
+
+    // ---- Stake some Ed25519-owned coins so exit can return them ----
+    let mut hdr = Vec::with_capacity(97);
+    hdr.push(TX_STAKE);
+    hdr.extend_from_slice(&ed_pubkey);
+    hdr.extend_from_slice(&bls_pk);
+    hdr.extend_from_slice(&200u64.to_le_bytes());
+    hdr.extend_from_slice(&0u64.to_le_bytes());
+    let body2 = body_from_txns(&[make_stake_txn(
+        ed_pubkey,
+        bls_pk,
+        200,
+        0,
+        TX_STAKE,
+        ed_sk.sign(&hdr),
+    )]);
+
+    // Seed owner with enough balance to stake.
+    overlay.put(ed_pubkey.to_vec(), make_account_value(500, 0));
+    overlay.commit().expect("seed");
+
+    let root2 = overlay.base_root();
+    let out2 = run_block(
+        &elf,
+        &make_block_ctx(2, root2),
+        body2,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("stake");
+    assert_ne!(out2.state_root_after, root2);
+    // Stake account: 400 deposit + 200 stake = 600 total.
+    assert_eq!(
+        overlay.get(&stk_key(&bls_pk)),
+        Some(make_stake_value(600, ed_pubkey))
+    );
+    // Owner: 500 - 200 = 300.
+    assert_eq!(overlay.get(&ed_pubkey), Some(make_account_value(300, 1)));
+
+    // ---- Block 3: voluntary exit ----
+    let exit_txn = make_exit_txn(bls_pk);
+    let body3 = body_from_txns(&[exit_txn]);
+
+    let root3 = out2.state_root_after;
+    let out3 = run_block(
+        &elf,
+        &make_block_ctx(3, root3),
+        body3,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("exit");
+    assert_ne!(out3.state_root_after, root3);
+
+    // Stake account deleted.
+    assert_eq!(overlay.get(&stk_key(&bls_pk)), None);
+    // Owner gets back the full 600 staked.
+    assert_eq!(overlay.get(&ed_pubkey), Some(make_account_value(900, 1)));
+    // VS hash records zero-stake exit.
+    let vs2 = compute_vs_hash(
+        &compute_vs_hash(&vs1, TX_STAKE, &bls_pk, 600),
+        TX_EXIT,
+        &bls_pk,
+        0,
+    );
+    assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
+}

@@ -54,12 +54,35 @@ use neutrino_runtime_sdk::{entrypoint, syscalls};
 const STATUS_OK: u32 = 0;
 const STATUS_NOT_FOUND: u32 = 3;
 
+// ## Deposit (153 bytes; type 0x03)
+//
+// | Offset | Size | Field |
+// |--------|------|-------|
+// | 0      | 1    | type tag (0x03) |
+// | 1      | 48   | BLS validator pubkey |
+// | 49     | 8    | amount (u64 LE) |
+// | 57     | 96   | BLS proof-of-possession sig over pubkey bytes |
+//
+// ## Voluntary exit (49 bytes; type 0x04)
+//
+// | Offset | Size | Field |
+// |--------|------|-------|
+// | 0      | 1    | type tag (0x04) |
+// | 1      | 48   | BLS validator pubkey |
+//
+// On exit the staked balance is returned to the owner and the stake
+// account is deleted.
+
 /// Transaction type tag: a signed token transfer.
 const TX_TRANSFER: u8 = 0x00;
 /// Transaction type tag: stake with a validator BLS key.
 const TX_STAKE: u8 = 0x01;
 /// Transaction type tag: unstake from a validator BLS key.
 const TX_UNSTAKE: u8 = 0x02;
+/// Transaction type tag: engine-provided validator deposit (BLS POP).
+const TX_DEPOSIT: u8 = 0x03;
+/// Transaction type tag: engine-provided voluntary exit.
+const TX_EXIT: u8 = 0x04;
 
 /// Byte ranges within a transfer.
 const XFR_FROM_OFF: usize = 1;
@@ -79,6 +102,15 @@ const STK_NONCE_OFF: usize = 89;
 const STK_SIG_OFF: usize = 97;
 /// Signed payload: type tag + from + bls_pk + amount + nonce.
 const STK_MSG_LEN: usize = 97;
+
+/// Byte ranges within a deposit.
+const DEP_BLS_OFF: usize = 1;
+const DEP_AMOUNT_OFF: usize = 49;
+const DEP_POP_OFF: usize = 57;
+const DEP_POP_LEN: usize = 96;
+
+/// Byte ranges within a voluntary exit.
+const EXT_BLS_OFF: usize = 1;
 
 /// Maximum host-input body bytes the runtime will attempt to read.
 const BODY_BUF: usize = 4096;
@@ -340,7 +372,7 @@ fn process_stake(txn: &[u8]) {
     }
 
     let mut stk = read_stake_account(&bls_pk);
-    if stk.staked == 0 {
+    if stk.owner == [0u8; ACC_KEY_LEN] {
         stk.owner = from;
     }
     if stk.owner != from {
@@ -402,6 +434,58 @@ fn process_unstake(txn: &[u8]) {
         write_stake_account(&bls_pk, &stk);
         update_validator_set(TX_UNSTAKE, &bls_pk, stk.staked);
     }
+}
+
+/// Verify and apply a single deposit transaction.
+///
+/// Engine-verified: the BLS proof-of-possession is validated at block
+/// proposal time. The runtime unconditionally credits the stake account.
+fn process_deposit(txn: &[u8]) {
+    if txn.len() < DEP_AMOUNT_OFF + 8 {
+        syscalls::abort(ABORT_BAD_TXN_TYPE);
+    }
+    let bls_pk: [u8; BLS_KEY_LEN] = txn[DEP_BLS_OFF..DEP_AMOUNT_OFF]
+        .try_into()
+        .expect("48-byte bls");
+    let amount = read_u64_le(txn, DEP_AMOUNT_OFF);
+
+    if amount == 0 {
+        syscalls::abort(ABORT_UNDERFLOW);
+    }
+
+    let mut stk = read_stake_account(&bls_pk);
+    stk.staked = stk.staked.wrapping_add(amount);
+    write_stake_account(&bls_pk, &stk);
+    update_validator_set(TX_DEPOSIT, &bls_pk, stk.staked);
+}
+
+/// Verify and apply a single voluntary-exit transaction.
+///
+/// The engine surfaces this only after verifying the validator's
+/// BLS exit signature externally. The runtime unconditionally returns
+/// the staked balance to the owner and deletes the stake account.
+fn process_exit(txn: &[u8]) {
+    if txn.len() < EXT_BLS_OFF + BLS_KEY_LEN {
+        syscalls::abort(ABORT_BAD_TXN_TYPE);
+    }
+    let bls_pk: [u8; BLS_KEY_LEN] = txn[EXT_BLS_OFF..EXT_BLS_OFF + BLS_KEY_LEN]
+        .try_into()
+        .expect("48-byte bls");
+
+    let stk = read_stake_account(&bls_pk);
+    if stk.staked == 0 {
+        syscalls::abort(ABORT_UNDERFLOW);
+    }
+
+    // Return the staked balance to the owner.
+    if stk.owner != [0u8; ACC_KEY_LEN] {
+        let mut owner = read_account(&stk.owner);
+        owner.balance = owner.balance.wrapping_add(stk.staked);
+        write_account(&stk.owner, &owner);
+    }
+
+    delete_stake_account(&bls_pk);
+    update_validator_set(TX_EXIT, &bls_pk, 0);
 }
 
 /// Fixed trie key for the per-block counter. This key is written on
@@ -470,6 +554,8 @@ fn execute_block() {
                 TX_TRANSFER => process_transfer(txn),
                 TX_STAKE => process_stake(txn),
                 TX_UNSTAKE => process_unstake(txn),
+                TX_DEPOSIT => process_deposit(txn),
+                TX_EXIT => process_exit(txn),
                 _other => syscalls::abort(ABORT_BAD_TXN_TYPE),
             }
             off += txn_len;

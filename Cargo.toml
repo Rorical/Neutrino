@@ -1,0 +1,176 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/primitives",
+    "crates/codec",
+    "crates/crypto",
+    "crates/vrf",
+    "crates/trie",
+    "crates/storage",
+    "crates/runtime-abi",
+    "crates/vm-rv32im",
+    "crates/runtime-host",
+    "crates/runtime-sdk",
+    "crates/consensus-types",
+    "crates/consensus-vrf",
+    "crates/consensus-fork-choice",
+    "crates/consensus-chunk-bft",
+    "crates/proof-system",
+    "crates/prover-block",
+    "crates/prover-chunk",
+    "crates/prover-checkpoint",
+    "crates/consensus-engine",
+    "crates/network",
+    "crates/mempool",
+    "crates/light-client",
+    "crates/rpc",
+    "crates/node",
+    "crates/cli",
+    "crates/runtimes/neutrino-default-runtime",
+]
+
+# `runtime-sdk` and `neutrino-default-runtime` target `riscv32im-unknown-none-elf`
+# and are excluded from default host-target builds. Build them explicitly:
+#   cargo build -p neutrino-runtime-sdk --target riscv32im-unknown-none-elf
+#   cargo build -p neutrino-default-runtime --target riscv32im-unknown-none-elf
+default-members = [
+    "crates/primitives",
+    "crates/codec",
+    "crates/crypto",
+    "crates/vrf",
+    "crates/trie",
+    "crates/storage",
+    "crates/runtime-abi",
+    "crates/vm-rv32im",
+    "crates/runtime-host",
+    "crates/consensus-types",
+    "crates/consensus-vrf",
+    "crates/consensus-fork-choice",
+    "crates/consensus-chunk-bft",
+    "crates/proof-system",
+    "crates/prover-block",
+    "crates/prover-chunk",
+    "crates/prover-checkpoint",
+    "crates/consensus-engine",
+    "crates/network",
+    "crates/mempool",
+    "crates/light-client",
+    "crates/rpc",
+    "crates/node",
+    "crates/cli",
+]
+
+[workspace.package]
+version       = "0.1.0"
+edition       = "2024"
+rust-version  = "1.85"
+authors       = ["The Neutrino Authors"]
+license       = "MIT OR Apache-2.0"
+repository    = "https://github.com/anomalyco/neutrino"
+homepage      = "https://github.com/anomalyco/neutrino"
+documentation = "https://github.com/anomalyco/neutrino"
+readme        = "README.md"
+publish       = false
+
+[workspace.lints.rust]
+# Treat anything that hints at undefined behaviour, accidental unsafety,
+# or stale code as an error in CI. Local devs can still iterate freely.
+unsafe_op_in_unsafe_fn      = "deny"
+unreachable_pub             = "warn"
+missing_docs                = "warn"
+rust_2018_idioms            = { level = "warn", priority = -1 }
+rust_2024_compatibility     = { level = "warn", priority = -1 }
+unused_must_use             = "deny"
+
+[workspace.lints.clippy]
+# Pedantic-ish but not painful. We tighten further inside each crate if needed.
+all                         = { level = "warn", priority = -1 }
+pedantic                    = { level = "warn", priority = -1 }
+nursery                     = { level = "warn", priority = -1 }
+cargo                       = { level = "warn", priority = -1 }
+# Exceptions that are noisy and low-signal for a young codebase.
+module_name_repetitions     = "allow"
+must_use_candidate          = "allow"
+missing_errors_doc          = "allow"
+missing_panics_doc          = "allow"
+multiple_crate_versions     = "allow"
+cargo_common_metadata       = "allow"
+
+[workspace.dependencies]
+# In-tree crates — declared here so every dependent uses the same path.
+neutrino-primitives             = { path = "crates/primitives",             version = "0.1.0", default-features = false }
+neutrino-codec                  = { path = "crates/codec",                  version = "0.1.0", default-features = false }
+neutrino-crypto                 = { path = "crates/crypto",                 version = "0.1.0", default-features = false }
+neutrino-vrf                    = { path = "crates/vrf",                    version = "0.1.0", default-features = false }
+neutrino-trie                   = { path = "crates/trie",                   version = "0.1.0", default-features = false }
+neutrino-storage                = { path = "crates/storage",                version = "0.1.0" }
+neutrino-runtime-abi            = { path = "crates/runtime-abi",            version = "0.1.0", default-features = false }
+neutrino-vm-rv32im              = { path = "crates/vm-rv32im",              version = "0.1.0" }
+neutrino-runtime-host           = { path = "crates/runtime-host",           version = "0.1.0" }
+neutrino-runtime-sdk            = { path = "crates/runtime-sdk",            version = "0.1.0", default-features = false }
+neutrino-consensus-types        = { path = "crates/consensus-types",        version = "0.1.0", default-features = false }
+neutrino-consensus-vrf          = { path = "crates/consensus-vrf",          version = "0.1.0" }
+neutrino-consensus-fork-choice  = { path = "crates/consensus-fork-choice",  version = "0.1.0" }
+neutrino-consensus-chunk-bft    = { path = "crates/consensus-chunk-bft",    version = "0.1.0" }
+neutrino-proof-system           = { path = "crates/proof-system",           version = "0.1.0", default-features = false }
+neutrino-prover-block           = { path = "crates/prover-block",           version = "0.1.0" }
+neutrino-prover-chunk           = { path = "crates/prover-chunk",           version = "0.1.0" }
+neutrino-prover-checkpoint      = { path = "crates/prover-checkpoint",      version = "0.1.0" }
+neutrino-consensus-engine       = { path = "crates/consensus-engine",       version = "0.1.0" }
+neutrino-network                = { path = "crates/network",                version = "0.1.0" }
+neutrino-mempool                = { path = "crates/mempool",                version = "0.1.0" }
+neutrino-light-client           = { path = "crates/light-client",           version = "0.1.0", default-features = false }
+neutrino-rpc                    = { path = "crates/rpc",                    version = "0.1.0" }
+
+# External — pinned at major versions; cargo update controls minor/patch.
+# NOTE: parity-scale-codec 3.7.5 has a no_std bug — `impl DecodeWithMemTracking
+# for Arc<T>` in src/codec.rs references `Arc` without an `alloc::sync::Arc`
+# import, so it fails to compile for `riscv32im-unknown-none-elf` (or any
+# no_std target without `std`). 3.6.x lacks `__private` that the 3.7 derive
+# macros generate. Until upstream resolves this we keep 3.7 (which works on
+# host) and exclude the runtime-side crates from rv32im CI. See
+# https://github.com/paritytech/parity-scale-codec
+parity-scale-codec  = { version = "3.7",  default-features = false, features = ["derive"] }
+scale-info          = { version = "2.11", default-features = false, features = ["derive"] }
+
+blake3              = { version = "1.5",  default-features = false }
+sha2                = { version = "0.10", default-features = false }
+tiny-keccak         = { version = "2.0",  features = ["keccak"] }
+
+blst                = { version = "0.3" }
+ed25519-dalek       = { version = "2.1",  default-features = false, features = ["zeroize"] }
+k256                = { version = "0.13", default-features = false, features = ["ecdsa"] }
+
+subtle              = { version = "2.6",  default-features = false }
+zeroize             = { version = "1.8",  default-features = false }
+rand_core           = { version = "0.6",  default-features = false }
+rand                = { version = "0.8" }
+
+thiserror           = { version = "2.0" }
+hex                 = { version = "0.4",  default-features = false, features = ["alloc"] }
+
+# Test-only.
+proptest            = { version = "1.6" }
+proptest-derive     = { version = "0.5" }
+
+[profile.dev]
+opt-level     = 0
+debug         = true
+overflow-checks = true
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = "line-tables-only"
+panic         = "abort"
+overflow-checks = true
+
+[profile.bench]
+inherits = "release"
+debug    = "line-tables-only"
+
+[profile.ci]
+inherits     = "release"
+debug-assertions = true
+overflow-checks  = true

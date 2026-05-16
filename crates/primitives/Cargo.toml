@@ -1,0 +1,22 @@
+[package]
+name          = "neutrino-primitives"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+authors       = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+documentation = { workspace = true }
+publish       = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["blake3/std", "parity-scale-codec/std"]
+
+[dependencies]
+blake3             = { workspace = true }
+parity-scale-codec = { workspace = true }
+
+[lints]
+workspace = true

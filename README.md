@@ -53,6 +53,31 @@ witness to a zk prover, so every executed block produces a verifiable proof.
 
 ## Status
 
-Pre-implementation. The repository currently holds design documents only. See
-the [roadmap](docs/design/09-roadmap.md) for the planned build order
+**Milestone M0 — workspace scaffold.** The Cargo workspace and CI are in
+place, the `neutrino-primitives` crate is implemented (canonical `ChainSpec`,
+hashing, validation, domain tags, defaults), and every other crate exists as
+a compileable stub awaiting its milestone. See the
+[roadmap](docs/design/09-roadmap.md) for the planned build order
 (~40 weeks to public testnet).
+
+### Building
+
+```
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+The `runtime-sdk` and `runtimes/neutrino-default-runtime` crates target
+`riscv32im-unknown-none-elf` and are excluded from default builds. They
+currently compile on the host target only; rv32im cross-builds are blocked on
+an upstream `parity-scale-codec` no_std issue and will land alongside real
+runtime code in M2–M3.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Contributions submitted for
+inclusion in the work shall be dual-licensed as above, without any additional
+terms or conditions.

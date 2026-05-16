@@ -1,0 +1,38 @@
+# Cargo / Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# We DO commit Cargo.lock for the workspace root (it's a binary workspace).
+# Library crates do not get their own lockfiles.
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local environment overrides
+/.env
+/.env.local
+/config/local.toml
+
+# Coverage / profiling
+*.profraw
+*.profdata
+lcov.info
+/coverage/
+
+# Build artifacts that should not be checked in
+/dist/
+/build/
+/out/
+
+# OS / scratch
+*.tmp
+*.log
+nohup.out

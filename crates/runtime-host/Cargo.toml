@@ -25,6 +25,7 @@ borsh                  = { workspace = true }
 
 [dev-dependencies]
 neutrino-proof-system  = { workspace = true }
+rand                   = { workspace = true }
 
 [lints]
 workspace = true

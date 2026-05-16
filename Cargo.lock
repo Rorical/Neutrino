@@ -705,6 +705,7 @@ dependencies = [
  "neutrino-runtime-abi",
  "neutrino-trie",
  "neutrino-vm-rv32im",
+ "rand",
 ]
 
 [[package]]

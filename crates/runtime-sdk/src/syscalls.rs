@@ -190,12 +190,12 @@ pub fn state_root(out_ptr: u32) {
 #[inline]
 pub fn host_input(out_ptr: u32, out_cap: u32) -> u32 {
     let written: u32;
-    // SAFETY: ECALL writes the byte count in `a0`.
+    // SAFETY: ECALL writes the status in `a0` and the byte count in `a1`.
     unsafe {
         asm!(
             "ecall",
-            inlateout("a0") out_ptr => written,
-            in("a1") out_cap,
+            inlateout("a0") out_ptr => _,
+            inlateout("a1") out_cap => written,
             in("a7") syscall::block::HOST_INPUT,
             options(nostack),
         );

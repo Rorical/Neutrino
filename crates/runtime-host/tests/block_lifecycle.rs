@@ -18,11 +18,13 @@
 
 use std::fs;
 
-use neutrino_primitives::{StateRoot, ZERO_HASH};
+use neutrino_crypto::ed25519::SecretKey;
+use neutrino_primitives::{Ed25519PublicKey, Ed25519Signature, StateRoot, ZERO_HASH};
 use neutrino_proof_system::{BlockPublicInputs, MockProofSystem, ProofError, ProofSystem};
 use neutrino_runtime_abi::BlockContext;
 use neutrino_runtime_host::{Overlay, run_block};
 use neutrino_trie::Trie;
+use rand::SeedableRng;
 
 const COUNTER_KEY: &[u8] = b"counter";
 const ELF_ENV: &str = "NEUTRINO_DEFAULT_RUNTIME_ELF";
@@ -162,4 +164,135 @@ fn deterministic_replay_yields_same_state_root() {
     let r1 = run(1);
     let r2 = run(1);
     assert_eq!(r1, r2, "two identical blocks must produce the same root");
+}
+
+// -------- M4A transfer helpers & test ---------------------------------------
+
+const ACC_VALUE_LEN: usize = 16;
+const TX_TRANSFER: u8 = 0x00;
+
+fn make_account_value(balance: u64, nonce: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(ACC_VALUE_LEN);
+    buf.extend_from_slice(&balance.to_le_bytes());
+    buf.extend_from_slice(&nonce.to_le_bytes());
+    buf
+}
+
+fn make_transfer_body(
+    from_pk: Ed25519PublicKey,
+    to_pk: Ed25519PublicKey,
+    amount: u64,
+    nonce: u64,
+    sig: Ed25519Signature,
+) -> Vec<u8> {
+    let mut txn = Vec::with_capacity(145);
+    txn.push(TX_TRANSFER);
+    txn.extend_from_slice(&from_pk);
+    txn.extend_from_slice(&to_pk);
+    txn.extend_from_slice(&amount.to_le_bytes());
+    txn.extend_from_slice(&nonce.to_le_bytes());
+    txn.extend_from_slice(&sig);
+
+    let mut body = Vec::with_capacity(4 + 4 + txn.len());
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(
+        &u32::try_from(txn.len())
+            .expect("txn len fits u32")
+            .to_le_bytes(),
+    );
+    body.extend_from_slice(&txn);
+    body
+}
+
+fn read_balance(trie: &Trie, pubkey: &Ed25519PublicKey) -> u64 {
+    match trie.get(pubkey) {
+        Some(bytes) if bytes.len() >= 8 => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8]);
+            u64::from_le_bytes(buf)
+        }
+        _ => 0,
+    }
+}
+
+fn read_nonce(trie: &Trie, pubkey: &Ed25519PublicKey) -> u64 {
+    match trie.get(pubkey) {
+        Some(bytes) if bytes.len() >= 16 => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[8..16]);
+            u64::from_le_bytes(buf)
+        }
+        _ => 0,
+    }
+}
+
+#[test]
+fn transfer_updates_accounts_and_state_root() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping transfer test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let sk_sender = SecretKey::generate(&mut rng);
+    let sk_receiver = SecretKey::generate(&mut rng);
+    let pk_sender = sk_sender.public_key().to_bytes();
+    let pk_receiver = sk_receiver.public_key().to_bytes();
+
+    let amount = 314u64;
+    let nonce = 0u64;
+
+    // Build the transfer bytes on the host side.
+    let mut txn_header = Vec::with_capacity(81);
+    txn_header.push(TX_TRANSFER);
+    txn_header.extend_from_slice(&pk_sender);
+    txn_header.extend_from_slice(&pk_receiver);
+    txn_header.extend_from_slice(&amount.to_le_bytes());
+    txn_header.extend_from_slice(&nonce.to_le_bytes());
+    let sig = sk_sender.sign(&txn_header);
+    let body = make_transfer_body(pk_sender, pk_receiver, amount, nonce, sig);
+
+    // Pre-seed the sender with an initial balance.
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_sender.to_vec(), make_account_value(1000, 0));
+    overlay.commit().expect("commit seed");
+
+    let root_before = overlay.base_root();
+    let ctx = make_block_ctx(1, root_before);
+    let outcome =
+        run_block(&elf, &ctx, body, &mut overlay, 5_000_000).expect("transfer block succeeds");
+
+    assert_ne!(outcome.state_root_after, root_before);
+    assert!(outcome.gas_used > 0);
+
+    // Counter incremented.
+    assert_eq!(overlay.get(COUNTER_KEY), Some(1u64.to_le_bytes().to_vec()));
+
+    // Sender: 1000 - 314 = 686, nonce 0 -> 1.
+    assert_eq!(overlay.get(&pk_sender), Some(make_account_value(686, 1)));
+    // Receiver: 0 + 314 = 314, nonce unchanged (0).
+    assert_eq!(overlay.get(&pk_receiver), Some(make_account_value(314, 0)));
+
+    // Double-check via independent trie.
+    let mut verifier: Trie = Trie::new();
+    verifier
+        .insert(COUNTER_KEY, 1u64.to_le_bytes().to_vec())
+        .expect("counter");
+    verifier
+        .insert(&pk_sender, make_account_value(686, 1))
+        .expect("sender");
+    verifier
+        .insert(&pk_receiver, make_account_value(314, 0))
+        .expect("receiver");
+    assert_eq!(verifier.root(), outcome.state_root_after);
+    assert_eq!(read_balance(&verifier, &pk_sender), 686);
+    assert_eq!(read_nonce(&verifier, &pk_sender), 1);
+    assert_eq!(read_balance(&verifier, &pk_receiver), 314);
+    assert_eq!(read_nonce(&verifier, &pk_receiver), 0);
+
+    // Mock proof round trip.
+    let mock = MockProofSystem::new();
+    let public = block_public_inputs(1, root_before, outcome.state_root_after);
+    let proof = mock.prove_block(&[], &public).expect("prove");
+    mock.verify_block(&proof, &public).expect("verify");
 }

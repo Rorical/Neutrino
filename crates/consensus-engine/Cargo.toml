@@ -21,6 +21,7 @@ std = [
 
 [dependencies]
 neutrino-primitives       = { workspace = true }
+neutrino-consensus-chunk-bft = { workspace = true }
 neutrino-consensus-types  = { workspace = true }
 neutrino-consensus-vrf    = { workspace = true }
 neutrino-crypto           = { workspace = true }

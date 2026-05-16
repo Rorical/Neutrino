@@ -248,6 +248,23 @@ impl<DB: Database> Engine<DB> {
         self.head_hash = hash;
         self.head_state_root = state_root;
     }
+
+    /// Advance the in-memory finalization pointers after chunk
+    /// finalization has persisted everything. Crate-internal — the
+    /// finalize module is the only legitimate caller.
+    pub(crate) const fn update_finalization_pointers(
+        &mut self,
+        chunk_id: ChunkId,
+        finalized_head: BlockHash,
+    ) {
+        self.latest_finalized_chunk_id = Some(chunk_id);
+        // Keep the head hash unchanged here: M5 single-node finalizes
+        // chunks ending at heights below the current production head,
+        // so head_hash is the most recently produced block, not the
+        // finalized end. Callers reading the finalized_head must do
+        // so through the chain store pointer.
+        let _ = finalized_head;
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub mod body;
 pub mod clock;
 pub mod engine;
 pub mod error;
+pub mod finalize;
 pub mod merkle;
 pub mod produce;
 pub mod proposer;
@@ -29,6 +30,7 @@ pub use body::{
 pub use clock::SlotClock;
 pub use engine::Engine;
 pub use error::EngineError;
+pub use finalize::{FinalizeError, FinalizeOutcome};
 pub use merkle::{EMPTY_MERKLE_ROOT, hash_leaf, merkle_root, merkle_root_of_hashes};
 pub use produce::{ProductionConfig, ProductionError, ProductionOutcome};
 pub use proposer::ProposerKey;

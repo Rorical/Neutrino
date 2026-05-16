@@ -587,6 +587,7 @@ name = "neutrino-consensus-engine"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "neutrino-consensus-chunk-bft",
  "neutrino-consensus-types",
  "neutrino-consensus-vrf",
  "neutrino-crypto",

@@ -331,7 +331,12 @@ pub fn execute(
                 let syscall_code = cpu.read(17);
                 let ecall_gas = crate::host::ecall_base_gas(syscall_code);
                 *gas_remaining = gas_remaining.checked_sub(ecall_gas).ok_or(Trap::OutOfGas)?;
-                return host.ecall(cpu, memory, syscall_code);
+                match host.ecall(cpu, memory, gas_remaining, syscall_code)? {
+                    Some(halt) => return Ok(halt),
+                    None => {
+                        cpu.pc = next_pc;
+                    }
+                }
             }
             Instruction::Ebreak => {
                 return Ok(Halt::ExplicitAbort { code: 2 });
@@ -357,6 +362,7 @@ mod tests {
     use crate::host::NoopHost;
     use crate::instruction::encode_test;
     use crate::memory::{Memory, Permissions};
+    use alloc::vec;
 
     fn setup() -> (Cpu, Memory, NoopHost) {
         let mut cpu = Cpu::new();
@@ -1309,5 +1315,175 @@ mod tests {
         assert_eq!(cpu1.regs, cpu2.regs);
         assert_eq!(cpu1.pc, cpu2.pc);
         assert_eq!(gas1, gas2);
+    }
+
+    /// Test host that records every `ECALL` it observes and lets the
+    /// caller script the per-call response.
+    struct ScriptedHost {
+        /// Responses delivered in order, one per call.
+        responses: alloc::vec::Vec<Result<Option<Halt>, Trap>>,
+        /// Optional per-call extra gas charge, one per call.
+        extra_gas: alloc::vec::Vec<u64>,
+        /// Number of dispatches observed so far.
+        calls: usize,
+    }
+
+    impl crate::host::HostInterface for ScriptedHost {
+        fn ecall(
+            &mut self,
+            _cpu: &mut Cpu,
+            _memory: &mut Memory,
+            gas_remaining: &mut u64,
+            _code: u32,
+        ) -> Result<Option<Halt>, Trap> {
+            let i = self.calls;
+            self.calls += 1;
+            if let Some(extra) = self.extra_gas.get(i).copied() {
+                *gas_remaining = gas_remaining.checked_sub(extra).ok_or(Trap::OutOfGas)?;
+            }
+            self.responses[i]
+        }
+    }
+
+    #[test]
+    fn ecall_continues_when_host_returns_none() {
+        // ECALL at 0x1000 (host returns None → continue) then ADDI sets x1=42.
+        let (mut cpu, mut mem, _) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        store_insn(
+            &mut mem,
+            0x1004,
+            encode_test(&Instruction::Addi {
+                rd: 1,
+                rs1: 0,
+                imm: 42,
+            }),
+        );
+        store_insn(&mut mem, 0x1008, encode_test(&Instruction::Ebreak));
+        let mut host = ScriptedHost {
+            responses: vec![Ok(None)],
+            extra_gas: vec![],
+            calls: 0,
+        };
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Ok(Halt::ExplicitAbort { code: 2 }));
+        assert_eq!(cpu.read(1), 42);
+        assert_eq!(host.calls, 1);
+    }
+
+    #[test]
+    fn ecall_halts_when_host_returns_some_halt() {
+        let (mut cpu, mut mem, _) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        store_insn(
+            &mut mem,
+            0x1004,
+            encode_test(&Instruction::Addi {
+                rd: 1,
+                rs1: 0,
+                imm: 42,
+            }),
+        );
+        let mut host = ScriptedHost {
+            responses: vec![Ok(Some(Halt::ExplicitAbort { code: 7 }))],
+            extra_gas: vec![],
+            calls: 0,
+        };
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Ok(Halt::ExplicitAbort { code: 7 }));
+        // PC should be left pointing at the ECALL instruction (host halted there).
+        assert_eq!(cpu.pc, 0x1000);
+        // x1 must not have been touched; control never reached the ADDI.
+        assert_eq!(cpu.read(1), 0);
+    }
+
+    #[test]
+    fn ecall_propagates_host_trap() {
+        let (mut cpu, mut mem, _) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        let mut host = ScriptedHost {
+            responses: vec![Err(Trap::HostError { code: 0x99 })],
+            extra_gas: vec![],
+            calls: 0,
+        };
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Err(Trap::HostError { code: 0x99 }));
+    }
+
+    #[test]
+    fn ecall_host_can_charge_extra_gas() {
+        let (mut cpu, mut mem, _) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        store_insn(&mut mem, 0x1004, encode_test(&Instruction::Ebreak));
+        let mut host = ScriptedHost {
+            responses: vec![Ok(None)],
+            extra_gas: vec![50],
+            calls: 0,
+        };
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Ok(Halt::ExplicitAbort { code: 2 }));
+        // 100 - 1 (ECALL fetch) - 10 (ECALL base) - 50 (host extra) - 1 (EBREAK fetch).
+        assert_eq!(gas, 38);
+    }
+
+    #[test]
+    fn ecall_host_out_of_gas_traps() {
+        let (mut cpu, mut mem, _) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        let mut host = ScriptedHost {
+            responses: vec![Ok(None)],
+            extra_gas: vec![1_000_000],
+            calls: 0,
+        };
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Err(Trap::OutOfGas));
+    }
+
+    #[test]
+    fn ecall_multiple_continues_then_halt() {
+        let (mut cpu, mut mem, _) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        store_insn(&mut mem, 0x1004, encode_test(&Instruction::Ecall));
+        store_insn(&mut mem, 0x1008, encode_test(&Instruction::Ecall));
+        let mut host = ScriptedHost {
+            responses: vec![
+                Ok(None),
+                Ok(None),
+                Ok(Some(Halt::ExplicitAbort { code: 11 })),
+            ],
+            extra_gas: vec![],
+            calls: 0,
+        };
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Ok(Halt::ExplicitAbort { code: 11 }));
+        assert_eq!(host.calls, 3);
+        assert_eq!(cpu.pc, 0x1008);
+    }
+
+    #[test]
+    fn noop_host_abort_returns_halt_not_trap() {
+        // NoopHost now yields a clean Halt for code 0/1 rather than a Trap.
+        let (mut cpu, mut mem, mut host) = setup();
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        // a7 starts at 0 → NoopHost maps to ExplicitAbort{0}.
+        assert_eq!(result, Ok(Halt::ExplicitAbort { code: 0 }));
+    }
+
+    #[test]
+    fn noop_host_unknown_code_traps() {
+        let (mut cpu, mut mem, mut host) = setup();
+        cpu.write(17, 0xDEAD_BEEF); // a7
+        store_insn(&mut mem, 0x1000, encode_test(&Instruction::Ecall));
+        let mut gas = 100;
+        let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
+        assert_eq!(result, Err(Trap::HostError { code: 0xDEAD_BEEF }));
     }
 }

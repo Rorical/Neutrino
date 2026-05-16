@@ -2,21 +2,32 @@
 #![deny(unsafe_code)]
 #![allow(clippy::doc_markdown)]
 
-//! Proof-system abstraction scaffold.
+//! Proof-system trait and backends.
+//!
+//! The crate defines [`ProofSystem`], the single trait every backend
+//! implements: block, chunk, and recursive proofs each with `prove`
+//! and `verify` methods, all bound to typed [`public_inputs`].
+//! Public inputs are the consensus-critical commitments every prover
+//! and verifier must agree on — backends differ only in the
+//! cryptographic content of the proof bytes.
+//!
+//! The [`mock`] backend is the M2 implementation. It hashes the
+//! borsh-encoded public inputs under a per-layer domain tag and is
+//! the stand-in until M8/M9/M10 plug in SP1, Plonky3, and the
+//! Plonky3-to-SNARK wrapper. Real backends share the same `ProofSystem`
+//! seam.
 
-/// Verification failure from a proof backend.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ProofError {
-    /// Proof bytes were malformed.
-    MalformedProof,
-    /// Public inputs did not match the proof.
-    PublicInputMismatch,
-    /// Backend verification failed.
-    BackendRejected,
-}
+extern crate alloc;
 
-/// Minimal verifier trait for opaque proof bytes.
-pub trait ProofVerifier {
-    /// Verifies opaque public inputs and proof bytes.
-    fn verify(public_inputs: &[u8], proof: &[u8]) -> Result<(), ProofError>;
-}
+pub mod error;
+pub mod mock;
+pub mod public_inputs;
+pub mod system;
+
+pub use error::ProofError;
+pub use mock::{
+    MOCK_BLOCK_DOMAIN, MOCK_CHUNK_DOMAIN, MOCK_RECURSIVE_DOMAIN, MockBlockProof, MockChunkProof,
+    MockProofSystem, MockRecursiveProof,
+};
+pub use public_inputs::{BlockPublicInputs, ChunkPublicInputs, RecursivePublicInputs};
+pub use system::ProofSystem;

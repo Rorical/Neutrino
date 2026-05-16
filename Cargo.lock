@@ -648,6 +648,10 @@ dependencies = [
 [[package]]
 name = "neutrino-proof-system"
 version = "0.1.0"
+dependencies = [
+ "borsh",
+ "neutrino-primitives",
+]
 
 [[package]]
 name = "neutrino-prover-block"

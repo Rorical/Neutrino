@@ -1,7 +1,13 @@
 #![deny(unsafe_code)]
 #![allow(clippy::doc_markdown)]
+#![warn(missing_docs)]
 
 //! Networking scaffold for gossip topics and sync protocols.
+
+/// Core libp2p behaviour composition for Neutrino.
+pub mod behaviour;
+/// The main networking service driving the swarm event loop.
+pub mod service;
 
 /// Stable gossip topic identifiers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

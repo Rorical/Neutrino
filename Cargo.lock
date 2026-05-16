@@ -650,6 +650,7 @@ name = "neutrino-proof-system"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "neutrino-consensus-types",
  "neutrino-primitives",
 ]
 

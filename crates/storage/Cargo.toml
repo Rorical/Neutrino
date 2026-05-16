@@ -13,6 +13,10 @@ publish       = { workspace = true }
 [features]
 default = ["std"]
 std = []
+rocksdb = ["std", "dep:rocksdb"]
+
+[dependencies]
+rocksdb = { workspace = true, optional = true }
 
 [lints]
 workspace = true

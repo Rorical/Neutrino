@@ -2,36 +2,31 @@
 #![deny(unsafe_code)]
 #![allow(clippy::doc_markdown)]
 
-//! Storage traits for column-family databases.
+//! Column-family storage backends for Neutrino.
+//!
+//! The crate exposes one small [`Database`] trait, an atomic [`Batch`]
+//! write type, a fast in-memory backend for tests and dev harnesses, and
+//! a feature-gated RocksDB backend for persistent nodes.
 
 extern crate alloc;
 
+mod batch;
+mod column;
+mod memory;
+
+#[cfg(feature = "rocksdb")]
+mod rocks;
+
+pub use batch::{Batch, BatchOp};
+pub use column::{ALL_COLUMNS, Column};
+pub use memory::MemoryDatabase;
+
+#[cfg(feature = "rocksdb")]
+pub use rocks::{RocksDbDatabase, RocksDbError};
+
 use alloc::vec::Vec;
 
-/// Named storage column.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Column {
-    /// Authenticated trie nodes.
-    TrieNodes,
-    /// Content-addressed state values.
-    StateValues,
-    /// Block bodies.
-    Blocks,
-    /// Block headers.
-    Headers,
-    /// Finalized chunks.
-    Chunks,
-    /// Proof artifacts.
-    Proofs,
-    /// Recursive checkpoints.
-    Checkpoints,
-    /// Execution witnesses.
-    Witnesses,
-    /// Node-local metadata.
-    Meta,
-}
-
-/// Minimal key-value database interface.
+/// Minimal column-family key-value database interface.
 pub trait Database {
     /// Backend-specific error type.
     type Error;
@@ -42,6 +37,13 @@ pub trait Database {
     /// Writes a value by column and key.
     fn put(&mut self, column: Column, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
 
-    /// Deletes a value by column and key.
+    /// Deletes a value by column and key. Deleting a missing key is a
+    /// no-op.
     fn delete(&mut self, column: Column, key: &[u8]) -> Result<(), Self::Error>;
+
+    /// Applies every operation in `batch` atomically. If this returns
+    /// an error, callers must assume none of the operations became
+    /// visible. Backends that cannot provide that guarantee should not
+    /// implement this trait.
+    fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error>;
 }

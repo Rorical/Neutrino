@@ -105,10 +105,12 @@ enum TrieNode {
 | `mempool`             | tx hash                      | tx bytes + meta                    | Best-effort; not consensus.                                                                    |
 | `meta`                | constants                    | DB version, chain spec hash, ...   |                                                                                                |
 
-We start with **RocksDB** via the `rocksdb` crate. A `Database` trait abstracts
-the column-family API so `parity-db` can be swapped in later if benchmarks
-favor it — `parity-db` is purpose-built for blockchain state and has better
-small-value performance, but RocksDB is the safer default.
+The `storage` crate starts with a fast `MemoryDatabase` backend for unit tests,
+dev harnesses, and deterministic protocol bring-up. Persistent nodes use
+**RocksDB** via the `rocksdb` crate behind the same `Database` trait. The trait
+abstracts the column-family API so `parity-db` can be swapped in later if
+benchmarks favor it — `parity-db` is purpose-built for blockchain state and has
+better small-value performance, but RocksDB is the safer default.
 
 ### Refcounting and pruning
 
@@ -188,7 +190,8 @@ enum OverlayEntry {
 - `state_write(k, v)` only mutates the overlay. Writes do not need recording —
   the verifier recomputes the post-state from inputs.
 - On success, the engine **applies** the overlay: walks the changes, computes
-  the new root, writes new nodes to RocksDB in a single atomic batch.
+  the new root, writes new nodes through `Database::write_batch` in one atomic
+  batch.
 - On trap, the overlay is dropped — zero rollback work. The witness is also
   dropped; failed executions produce no proof artifacts.
 

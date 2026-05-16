@@ -53,8 +53,8 @@ Run a single test: `cargo test --locked -p neutrino-crypto bls::tests::sign_veri
 - Workspace of 26 crates under `crates/`. Most are still scaffold-only
   (often 8 lines in `lib.rs`); do not assume an empty crate is a bug.
   As of this writing the crates with real code are:
-  `primitives`, `codec`, `crypto`, `vrf`, `trie`, `storage` (trait +
-  `Column` enum), `runtime-abi`, `consensus-types`. Everything else is a marker
+  `primitives`, `codec`, `crypto`, `vrf`, `trie`, `storage`,
+  `runtime-abi`, `consensus-types`. Everything else is a marker
   `struct`/`enum` awaiting its milestone.
 - Build order is vertical, milestone by milestone, defined in
   `docs/design/09-roadmap.md` (M0…M15). Don't reach ahead into

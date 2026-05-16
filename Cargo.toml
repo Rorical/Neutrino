@@ -140,6 +140,7 @@ subtle              = { version = "2.6",  default-features = false }
 zeroize             = { version = "1.8",  default-features = false, features = ["derive"] }
 rand_core           = { version = "0.6",  default-features = false, features = ["getrandom"] }
 rand                = { version = "0.8" }
+rocksdb             = { version = "0.22", default-features = false }
 
 thiserror           = { version = "2.0" }
 hex                 = { version = "0.4",  default-features = false, features = ["alloc"] }

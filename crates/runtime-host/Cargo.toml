@@ -14,5 +14,13 @@ publish       = { workspace = true }
 default = ["std"]
 std = []
 
+[dependencies]
+neutrino-primitives    = { workspace = true }
+neutrino-runtime-abi   = { workspace = true }
+neutrino-vm-rv32im     = { workspace = true }
+neutrino-trie          = { workspace = true }
+neutrino-crypto        = { workspace = true }
+borsh                  = { workspace = true }
+
 [lints]
 workspace = true

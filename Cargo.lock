@@ -680,6 +680,14 @@ dependencies = [
 [[package]]
 name = "neutrino-runtime-host"
 version = "0.1.0"
+dependencies = [
+ "borsh",
+ "neutrino-crypto",
+ "neutrino-primitives",
+ "neutrino-runtime-abi",
+ "neutrino-trie",
+ "neutrino-vm-rv32im",
+]
 
 [[package]]
 name = "neutrino-runtime-sdk"

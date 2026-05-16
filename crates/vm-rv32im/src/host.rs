@@ -80,9 +80,12 @@ impl HostInterface for NoopHost {
 
 /// Flat gas cost charged by the executor before dispatching an `ECALL`.
 ///
-/// Per-syscall costs (memory I/O, hashing, signature verification, …)
-/// are charged inside the host handler against the same counter, using
-/// the schedule defined in `runtime-abi`.
+/// Returns zero by design. The full per-syscall cost (memory I/O,
+/// hashing, signature verification, …) is charged inside the host
+/// handler against the same counter using the schedule defined in
+/// `runtime-abi::gas`. A non-zero base here would double-charge every
+/// syscall and silently desynchronise the host gas accounting from the
+/// table published in `docs/design/04-host-abi.md`.
 pub fn ecall_base_gas(_code: u32) -> u64 {
-    10
+    0
 }

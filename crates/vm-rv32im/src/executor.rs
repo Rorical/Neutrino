@@ -1426,8 +1426,8 @@ mod tests {
         let mut gas = 100;
         let result = execute(&mut cpu, &mut mem, &mut host, &mut gas, 10);
         assert_eq!(result, Ok(Halt::ExplicitAbort { code: 2 }));
-        // 100 - 1 (ECALL fetch) - 10 (ECALL base) - 50 (host extra) - 1 (EBREAK fetch).
-        assert_eq!(gas, 38);
+        // 100 - 1 (ECALL fetch) - 0 (ECALL base) - 50 (host extra) - 1 (EBREAK fetch).
+        assert_eq!(gas, 48);
     }
 
     #[test]

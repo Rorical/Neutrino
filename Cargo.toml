@@ -11,6 +11,7 @@ members = [
     "crates/vm-rv32im",
     "crates/runtime-host",
     "crates/runtime-sdk",
+    "crates/runtime-sdk-macros",
     "crates/consensus-types",
     "crates/consensus-vrf",
     "crates/consensus-fork-choice",
@@ -43,6 +44,7 @@ default-members = [
     "crates/runtime-abi",
     "crates/vm-rv32im",
     "crates/runtime-host",
+    "crates/runtime-sdk-macros",
     "crates/consensus-types",
     "crates/consensus-vrf",
     "crates/consensus-fork-choice",
@@ -108,6 +110,7 @@ neutrino-runtime-abi            = { path = "crates/runtime-abi",            vers
 neutrino-vm-rv32im              = { path = "crates/vm-rv32im",              version = "0.1.0" }
 neutrino-runtime-host           = { path = "crates/runtime-host",           version = "0.1.0" }
 neutrino-runtime-sdk            = { path = "crates/runtime-sdk",            version = "0.1.0", default-features = false }
+neutrino-runtime-sdk-macros     = { path = "crates/runtime-sdk-macros",     version = "0.1.0" }
 neutrino-consensus-types        = { path = "crates/consensus-types",        version = "0.1.0", default-features = false }
 neutrino-consensus-vrf          = { path = "crates/consensus-vrf",          version = "0.1.0" }
 neutrino-consensus-fork-choice  = { path = "crates/consensus-fork-choice",  version = "0.1.0" }
@@ -144,6 +147,11 @@ rocksdb             = { version = "0.22", default-features = false }
 
 thiserror           = { version = "2.0" }
 hex                 = { version = "0.4",  default-features = false, features = ["alloc"] }
+
+# Proc-macro plumbing used by neutrino-runtime-sdk-macros.
+proc-macro2         = { version = "1.0" }
+quote               = { version = "1.0" }
+syn                 = { version = "2.0",  features = ["full"] }
 
 # Test-only.
 proptest            = { version = "1.6" }

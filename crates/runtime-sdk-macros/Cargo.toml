@@ -1,5 +1,5 @@
 [package]
-name          = "neutrino-runtime-sdk"
+name          = "neutrino-runtime-sdk-macros"
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -10,12 +10,13 @@ homepage      = { workspace = true }
 documentation = { workspace = true }
 publish       = { workspace = true }
 
-[features]
-default = []
+[lib]
+proc-macro = true
 
 [dependencies]
-neutrino-runtime-abi        = { workspace = true, default-features = false }
-neutrino-runtime-sdk-macros = { workspace = true }
+proc-macro2 = { workspace = true }
+quote       = { workspace = true }
+syn         = { workspace = true }
 
 [lints]
 workspace = true

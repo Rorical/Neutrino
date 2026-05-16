@@ -686,6 +686,16 @@ name = "neutrino-runtime-sdk"
 version = "0.1.0"
 dependencies = [
  "neutrino-runtime-abi",
+ "neutrino-runtime-sdk-macros",
+]
+
+[[package]]
+name = "neutrino-runtime-sdk-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

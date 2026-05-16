@@ -318,16 +318,17 @@ What the client does *not* trust:
 
 ## 11.6 Liveness alerts and stalls
 
-If `now() - st.last_verified_at > LIGHT_CLIENT_STALE_THRESHOLD * SLOT_DURATION` the
+If `now() - st.last_verified_at > LIGHT_CLIENT_STALE_THRESHOLD_SECS` the
 client should warn the user that the chain may be stalled. This is *not* a
 proof of stall — the local clock could be wrong, the client could be
 network-partitioned, or the chain could be in a legitimate prover-bottleneck
 condition (see 10-proof-system.md §safety vs liveness).
 
-Default `LIGHT_CLIENT_STALE_THRESHOLD = 4 * CHUNK_SIZE`, i.e. four chunks'
-worth of slots. This is intentionally longer than the node-level
-`FINALITY_STALL_THRESHOLD`, because light clients should warn users about
-staleness without declaring a consensus fault. Tunable per-deployment.
+Default `LIGHT_CLIENT_STALE_THRESHOLD_SECS = 4 * CHUNK_SIZE * SLOT_DURATION`
+= 4 chunks' worth of wall-clock time (≈ 34 min at defaults). This is
+intentionally longer than the node-level `FINALITY_STALL_THRESHOLD`, because
+light clients should warn users about staleness without declaring a consensus
+fault. Tunable per-deployment.
 
 The client should also surface "stale but provable" state — when the chain is
 producing blocks but recursive checkpoints are lagging, the user can still see
@@ -449,7 +450,7 @@ It lives in the `light-client` crate (see updated 08-crate-layout.md).
 |---|---|---|
 | `WEAK_SUBJECTIVITY_PERIOD` | 2 weeks | Tied to validator withdrawal delay |
 | `ANCHOR_INTERVAL` | 1024 checkpoints | Only if external anchors used |
-| `LIGHT_CLIENT_STALE_THRESHOLD` | 4 chunks | User-facing stale-checkpoint alert threshold |
+| `LIGHT_CLIENT_STALE_THRESHOLD_SECS` | `4 * CHUNK_SIZE * SLOT_DURATION` | User-facing stale-checkpoint alert threshold, in seconds |
 | `EXPECTED_PROOF_VERSION` | 1 | Bump on circuit upgrade |
 
 These belong in `ChainSpec` and are part of the client's compiled-in

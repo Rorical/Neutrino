@@ -511,10 +511,17 @@ prover collect.
 A simple working scheme:
 
 ```
-R_fallback = R_proof * (1 + urgency)
-urgency    = (slots_past_deadline / SLOTS_PER_CHUNK) * fallback_premium
-fallback_premium = 0.5    // tunable
+R_fallback       = R_proof * (1 + urgency)
+urgency          = (slots_past_deadline / SLOT_BUDGET_PER_CHUNK) * fallback_premium
+SLOT_BUDGET_PER_CHUNK = CHUNK_SIZE   // upper bound on slots a chunk consumes
+                                     // when every slot is filled; "ideal" length
+fallback_premium = 0.5               // tunable
 ```
+
+`SLOT_BUDGET_PER_CHUNK` is the *ideal* (no-empty-slot) slot count for a chunk.
+Real chunks may take longer if slots are empty; using the ideal as the
+denominator makes urgency monotonic and predictable regardless of empty-slot
+rate.
 
 The fallback bounty grows with urgency, but the proposer's loss
 (`P_missed_proof + R_block forfeited if block excluded`) dominates the
@@ -605,10 +612,14 @@ configuration, not a silent shift.
 ```
 PROOF_WINDOW             = 8 slots
 CHUNK_SIZE               = 128 blocks
+SLOT_BUDGET_PER_CHUNK    = 128 slots         (= CHUNK_SIZE; no-empty-slot ideal)
 CHUNK_TIMEOUT            = 16 slots
 FINALITY_STALL_THRESHOLD = 64 slots after chunk timeout
 EXPECTED_PROVE_LATENCY   = (depends on backend; bench at M8)
 FALLBACK_PREMIUM         = 0.5
+PROOF_SYSTEM_VERSION     = 1                 (bumped on circuit upgrade; bound
+                                              into every recursive proof's
+                                              public inputs)
 ```
 
 These become `ChainSpec` constants and are covered by the chain-spec hash once

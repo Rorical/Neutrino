@@ -39,10 +39,14 @@ scheme: given a fixed secret key and message, there is exactly one valid
 signature. That uniqueness is exactly what a VRF needs.
 
 ```
-vrf_message_i = "NEUTRINO_VRF" || chain_id || finalized_seed || slot
+vrf_message_i = DOMAIN_VRF || chain_id_le || finalized_seed || slot_le
 vrf_proof_i   = BLS_sign(sk_i, vrf_message_i)
 vrf_output_i  = SHA-256(vrf_proof_i)
 ```
+
+Where `DOMAIN_VRF` is the fixed 16-byte ASCII tag defined in
+"Canonical domain tags" below, `chain_id_le` and `slot_le` are little-endian
+encodings of `u64`, and `||` denotes byte concatenation.
 
 - `vrf_proof_i` is 96 bytes (G2 compressed). Anyone with `pk_i` can verify it.
 - `vrf_output_i` is 32 bytes. It is used as the eligibility decision input.
@@ -244,11 +248,41 @@ first post-genesis chunk; from then on, the mix is self-sustaining.
 | Verifier crypto in recursion | BLS + curve | Edwards25519 + curve | **BLS only** |
 | Last-revealer bias | 1 bit | 1 bit | **1 bit (deferred VDF)** |
 
+## Canonical domain tags
+
+All consensus-critical BLS signatures bind a fixed-length ASCII domain tag
+into the signed message. Tags are exactly 16 bytes, right-padded with `0x00`,
+chosen for in-circuit ergonomics (one limb on a 128-bit-friendly field, no
+length prefix needed). The constants live in `runtime-abi` and `crypto` so
+they are visible to both the engine and the runtime SDK without duplication.
+
+| Constant                 | Bytes (hex)                                                                 | Used for                                              |
+|--------------------------|------------------------------------------------------------------------------|-------------------------------------------------------|
+| `DOMAIN_VRF`             | `4e4555 5452 494e 4f5f 5652 465f 5631 00` (`b"NEUTRINO_VRF_V1\0"`)          | BLS-VRF eval/verify                                   |
+| `DOMAIN_PROPOSER_SIG`    | `b"NEUTRINO_PROPOSE"`                                                       | Block header proposer signature                       |
+| `DOMAIN_PREVOTE`         | `b"NEUTRINO_PREVOTE"`                                                       | Finality prevote                                      |
+| `DOMAIN_PRECOMMIT`       | `b"NEUTRINO_PRECOMM"`                                                       | Finality precommit                                    |
+| `DOMAIN_DEPOSIT_POP`     | `b"NEUTRINO_DEP_POP"`                                                       | Validator deposit proof-of-possession                 |
+| `DOMAIN_VOLUNTARY_EXIT`  | `b"NEUTRINO_VEXIT00"`                                                       | Voluntary-exit signature                              |
+| `DOMAIN_AGG_PROOF`       | `b"NEUTRINO_AGGPRF0"`                                                       | (post-v1) chunk-aggregator attestation                |
+
+Canonical signed-message construction is always:
+
+```
+signed_message = DOMAIN_<X> || chain_id_le || <message-specific fields>
+```
+
+`message-specific fields` are SCALE-encoded except for fixed-size primitives
+(`u64`, `[u8; N]`), which are emitted little-endian raw to keep the in-circuit
+parser branch-free. Per-phase wrappings in `02-consensus.md` and
+`07-block-format.md` reference these constants instead of re-defining
+strings.
+
 ## Tunable parameters
 
 ```
 EXPECTED_PROPOSERS_PER_SLOT      = 1.0      (fixed-point rational default)
-VRF_DOMAIN                       = "NEUTRINO_VRF"
+VRF_DOMAIN                       = DOMAIN_VRF  (16 bytes, see table above)
 SEED_UPDATE_FN                   = SHA-256
 GENESIS_SEED_SOURCE              = ChainSpec.genesis_seed
 ```

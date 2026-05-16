@@ -45,6 +45,25 @@ Constraints:
 - Single static binary — no dynamic linking, no relocations after load.
 - Required ELF symbols (entrypoints) named per the ABI in [04-host-abi](04-host-abi.md).
 
+### `vm_code_hash` — canonical runtime identity
+
+```
+vm_code_hash = BLAKE3(canonical_elf_bytes)
+```
+
+Where `canonical_elf_bytes` is the byte stream stored on-chain at the
+well-known state key `RUNTIME_CODE_KEY` (defined by the runtime; e.g.
+`b"\x00neutrino/runtime_code"` for the reference runtime). The same byte
+stream is what `runtime.init_genesis` was loaded from at chain birth, and
+what a future runtime-upgrade transaction would overwrite atomically.
+
+The engine recomputes `vm_code_hash` whenever it loads or re-loads a runtime,
+caches it next to the decoded ELF, and uses it as a public input to every
+block proof at that height (see [10-proof-system](10-proof-system.md) and
+[07-block-format](07-block-format.md)). A runtime does **not** need to know
+its own hash from inside the sandbox — the engine binds the value to the
+proof's public inputs externally.
+
 ## Memory model
 
 Linear flat 32-bit address space, divided into typed regions:

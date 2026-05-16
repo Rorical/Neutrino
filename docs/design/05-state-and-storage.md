@@ -209,6 +209,42 @@ Computed deterministically from the overlay's final contents. The header's
 it and rejects mismatches. The witness is stored in the `witnesses` column
 and consumed by `prover-block` if this node is proving this height.
 
+### Witness wire layout
+
+SCALE-encoded, versioned, content-addressed:
+
+```rust
+pub const WITNESS_MAGIC: [u8; 4] = *b"NTWN";   // "NeuTrino WitNess"
+
+pub struct BlockWitness {
+    pub magic:              [u8; 4],          // = WITNESS_MAGIC
+    pub witness_version:    u16,              // bump on layout change
+    pub abi_version:        u32,              // engine ABI at recording time
+    pub vm_code_hash:       [u8; 32],         // runtime ELF identity (see 03)
+    pub block_hash:         [u8; 32],         // self-identifying
+    pub parent_state_root:  [u8; 32],
+    pub post_state_root:    [u8; 32],
+    pub transactions_root:  [u8; 32],
+    pub block_context:      BlockContext,     // canonical 7.x-encoded
+    /// Body bytes the runtime saw. Provers need this to re-execute.
+    pub body_bytes:         Vec<u8>,
+    /// Trie nodes that served any state read, addressed by node hash.
+    /// Encoding: Vec<(node_hash[32], node_bytes)>. Order is the order in
+    /// which the host first observed each node during execution (stable
+    /// across honest re-runs).
+    pub state_nodes:        Vec<(StateRoot, Vec<u8>)>,
+    /// Values read, addressed by value hash. Same shape and ordering rule.
+    pub state_values:       Vec<(StateRoot, Vec<u8>)>,
+}
+```
+
+Storage key is `block_hash`. The witness is content-validated on read: the
+verifier recomputes `BLAKE3(SCALE(BlockWitness))` and compares against
+`witnesses_hash` (a sidecar small column) before handing it to the prover.
+`witness_version` and `abi_version` give the prover crate two independent
+levers when changing wire shape; both are surfaced as prover errors if they
+mismatch the verifier's compiled expectation.
+
 ## Sync modes
 
 The chain now supports four sync modes; the right choice depends on what the
@@ -279,11 +315,36 @@ A `ChainSpec` JSON file (engine-side) declares:
   hash or MPC ceremony transcript)
 - `genesis_block_hash` (the header hash of the genesis block, for trustless
   agreement)
-- `genesis_checkpoint` (Checkpoint with `index = 0`, all start/end fields
-  zero or genesis values, accepted as base case of the recursion)
+- `genesis_checkpoint` — accepted as the base case of the recursion. Field
+  values (`index = 0` always; all heights are 0 because no blocks have been
+  produced yet):
+  ```
+  Checkpoint {
+      chain_id:                 ChainSpec.chain_id,
+      index:                    0,
+      start_height:             0,
+      end_height:               0,
+      start_block_hash:         [0; 32],
+      end_block_hash:           ChainSpec.genesis_block_hash,
+      start_state_root:         [0; 32],
+      end_state_root:           <runtime.init_genesis(genesis_state)>,
+      end_validator_set_root:   <BLAKE3 merkle root of initial validator set>,
+      history_root:             [0; 32],
+      proof_system_version:     ChainSpec.proof_system_version,
+  }
+  ```
+  Recursive proof for index 0 is absent; clients accept this checkpoint by
+  matching its hash against `ChainSpec.genesis_checkpoint_hash`.
 - consensus params (slot duration = 4 s, epoch length = 32, chunk size = 128,
   proof window = 8, expected proposers per slot = 1.0)
 - initial validator set (Vec<{pubkey, withdrawal_credentials, stake}>)
+
+The canonical in-process representation is
+`neutrino_primitives::chain_spec::ChainSpec`. JSON, TOML, CLI flags, and
+network bootnode manifests are only ingest formats: the engine normalizes them
+into that Rust type, validates it, and computes
+`chain_spec_hash = BLAKE3(SCALE(ChainSpec))`. Peer handshakes and local DB
+metadata compare that hash; if it differs, the node refuses to start or connect.
 
 On first run, the engine calls `runtime.init_genesis(&genesis_state)`, gets
 back the initial state root, writes the genesis block, and stores
@@ -298,4 +359,4 @@ chain back to this base case.
 | `PRUNING_DELAY`        | 2 checkpoints      | Extra margin before deleting pruning-eligible data.                            |
 | `WITNESS_RETENTION`    | 1 chunk past prove | Beyond this, witness deletable; needed only if you want to re-prove.           |
 | `SNAPSHOT_INTERVAL`    | 1024 checkpoints   | How often to publish a state-snapshot bundle.                                  |
-| `STATE_TRIE_HASH`      | BLAKE3             | Per-deployment override (SP1 may prefer SHA-256 in-circuit; Plonky3 Poseidon). |
+| `STATE_TRIE_HASH`      | BLAKE3             | M0 default and reference implementation. SP1 may prefer SHA-256 in-circuit and Plonky3 Poseidon; both are post-M0 overrides under the same `Hasher` trait. |

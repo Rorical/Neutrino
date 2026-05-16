@@ -65,11 +65,44 @@ All structured as `/neutrino/<topic>/<format>/<version>`.
 |---------------------------------------------------------|---------------------|----------------------------------------|-------------------------------------------------------------|
 | `/neutrino/finality_votes_prevote/scale/1`              | Active validators   | Aggregators on the vote subnet         | Per chunk/round; phase = Prevote.                           |
 | `/neutrino/finality_votes_precommit/scale/1`            | Active validators   | Aggregators on the vote subnet         | Per chunk/round; phase = Precommit. Light clients may subscribe. |
-| `/neutrino/aggregate_finality_votes_<subnet>/scale/1`   | Vote aggregators    | All nodes                              | 16 subnets (smaller than v1's 64; vote tonnage is per-chunk, not per-slot). |
+| `/neutrino/aggregate_finality_votes_<subnet>/scale/1`   | Vote aggregators    | All nodes                              | `VOTE_SUBNETS = 16` (smaller than v1's 64; vote tonnage is per-chunk, not per-slot). |
 
 We dropped the per-slot attestation topics from v1 (Gasper). Chunk-level
 finality reduces vote tonnage by `CHUNK_SIZE×` (~128×), so a single set of
 finality-vote subnets suffices.
+
+### Vote subnet membership
+
+`VOTE_SUBNETS = 16` is a ChainSpec constant. Each active validator publishes
+finality votes on a deterministic subset of subnets:
+
+```
+fn validator_subnets(validator_index: ValidatorIndex,
+                     chunk_id:        u64,
+                     finalized_seed:  &[u8; 32]) -> Vec<u8> {
+    // Two stable subnets per validator, rotated per chunk to spread load.
+    let perm_seed = SHA-256(finalized_seed || chunk_id_le);
+    let base = u32_le(SHA-256(perm_seed || validator_index_le)[..4]);
+    let s0 = (base       % VOTE_SUBNETS as u32) as u8;
+    let s1 = (base.wrapping_add(VOTE_SUBNETS as u32 / 2)
+                    % VOTE_SUBNETS as u32) as u8;
+    vec![s0, s1]
+}
+```
+
+Properties:
+- **Stable per chunk.** Subnet topology only shuffles at chunk boundaries, so
+  gossip mesh churn is bounded.
+- **Even load.** Each subnet expects `2 * |active| / VOTE_SUBNETS` validators.
+- **Aggregator independence.** Aggregators are VRF-selected per chunk (see
+  `consensus-vrf::aggregator_committee`); they are not tied to subnet
+  membership and may aggregate votes from any subnet they receive.
+
+A validator subscribes to `/neutrino/finality_votes_{prevote,precommit}/scale/1`
+on the two subnets in `validator_subnets(self, chunk_id, seed)` for the chunk
+currently in BFT, and gossips its votes on the same subnets. Non-validator
+full nodes subscribe to all `aggregate_finality_votes_<subnet>` topics so
+they observe the aggregate output.
 
 ## Gossipsub configuration
 

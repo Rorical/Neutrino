@@ -154,6 +154,12 @@ implementation lives in tests.
 
 ```rust
 pub trait Runtime: Send + Sync {
+    /// Returns (spec_name, spec_version, impl_version, abi_version). The
+    /// engine refuses to instantiate a runtime whose `abi_version` does not
+    /// match the host build. Mirrors syscall `0x04` and ELF symbol
+    /// `_neutrino_runtime_version` (see 04-host-abi).
+    fn runtime_version(&self) -> RuntimeVersion;
+
     /// Genesis. Produce the initial state root from a runtime-defined spec.
     fn init_genesis(&self, spec: &[u8]) -> Result<StateRoot, RuntimeError>;
 
@@ -214,6 +220,29 @@ pub struct BlockOutcome {
     pub witness:        Option<WitnessHandle>,
     // ^^ Some when execution was run in proving mode. Opaque handle the
     //    prover-block crate consumes to generate the block proof.
+}
+
+pub struct BuiltBlock {
+    /// The full header, ready for the proposer to sign and gossip. The
+    /// runtime is responsible for filling `state_root`, `transactions_root`,
+    /// `votes_root`, `slashings_root`, `validator_ops_root`, `da_root`,
+    /// `runtime_extra`, `gas_used`, and `gas_limit`. The engine fills
+    /// `version`, `height`, `slot`, `parent_hash`, `proposer_index`,
+    /// `vrf_proof`, `timestamp`, and `signature` either before or after the
+    /// runtime call as appropriate.
+    pub header: Header,
+    /// The block body, opaque to the engine except for the precomputed roots
+    /// stored in the header.
+    pub body: Body,
+    /// Same outcome the engine receives from execute_block on import.
+    pub outcome: BlockOutcome,
+}
+
+pub struct RuntimeVersion {
+    pub spec_name:    [u8; 16],    // ASCII, right-padded with zeros
+    pub spec_version: u32,
+    pub impl_version: u32,
+    pub abi_version:  u32,
 }
 ```
 

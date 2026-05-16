@@ -61,7 +61,7 @@ Numbers are stable across the v1 ABI. Reserved ranges leave room.
 | 0x12 | `state_delete(key_ptr, key_len)` | Stage a deletion. |
 | 0x13 | `state_exists(key_ptr, key_len) -> bool` | Cheaper than read when value not needed. |
 | 0x14 | `state_next_key(prefix_ptr, prefix_len, after_ptr, after_len, out_ptr, out_cap)` | Iterate keys with prefix; for cursored access. |
-| 0x15 | `state_root() -> 32 bytes` | Returns current overlay root. Forces a recompute if dirty; gas-charged. |
+| 0x15 | `state_root() -> 32 bytes` | Returns current overlay root. Forces a recompute if dirty; gas charged proportional to dirty-leaf count (see "Gas cost table" below). |
 
 State writes go into a per-block **overlay**; if the runtime aborts, the
 overlay is discarded. On success, the overlay is committed to the underlying
@@ -110,6 +110,39 @@ and (for hash and BLS) we want a single canonical implementation across nodes.
 
 Gas costs reflect underlying work (e.g. hashing is ~1 gas/byte; BLS verify is
 ~150_000 gas).
+
+## Gas cost table (v1 draft)
+
+These are starting values; M1 will calibrate them against the interpreter and
+M8 will re-calibrate against the SP1 prover cost model. All values are
+deterministic, included in `ChainSpec`, and frozen per release.
+
+| Syscall                              | Base gas | Per-byte / per-item |
+|--------------------------------------|----------|---------------------|
+| `abort`, `panic`                      | 0        | —                   |
+| `gas_remaining`, `gas_charge`         | 10       | —                   |
+| `runtime_version_out`                 | 50       | —                   |
+| `state_read`                          | 500      | + 1 / output byte   |
+| `state_write`                         | 1_000    | + 1 / value byte    |
+| `state_delete`                        | 800      | —                   |
+| `state_exists`                        | 200      | —                   |
+| `state_next_key`                      | 700      | + 1 / output byte   |
+| `state_root` (idempotent)             | 100      | —                   |
+| `state_root` (dirty; per dirty leaf)  | 100      | + 200 / dirty leaf  |
+| `host_input`, `host_output`           | 50       | + 1 / byte          |
+| `block_context_out`                   | 100      | —                   |
+| `hash_sha256`, `hash_blake3`          | 100      | + 1 / byte          |
+| `hash_keccak256`                      | 200      | + 3 / byte          |
+| `verify_ed25519`                      | 30_000   | —                   |
+| `verify_secp256k1`                    | 25_000   | —                   |
+| `verify_bls` (single)                 | 150_000  | —                   |
+| `verify_bls_aggregate`                | 100_000  | + 50_000 / pubkey   |
+| `emit_log`                            | 200      | + 1 / byte          |
+| `debug_print`                         | 0        | (dev only)          |
+
+"Dirty leaf" for `state_root` is the count of staged writes / deletes in the
+overlay at the time of the call. Calling `state_root` repeatedly without
+intervening writes is the idempotent (cheap) variant.
 
 ### 0x50–0x5F — Logging / events
 

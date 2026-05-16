@@ -180,11 +180,14 @@ pub struct FinalityVote {
 }
 ```
 
-Domain tags for signing:
-- Prevote: `"NEUTRINO_PREVOTE" || chain_id || chunk_id || round`
-- Precommit: `"NEUTRINO_PRECOMMIT" || chain_id || chunk_id || round`
+Domain tags for signing (16-byte ASCII constants; see
+[12-randomness §Canonical domain tags](12-randomness.md)):
 
-This prevents cross-phase replay.
+- Prevote:   `DOMAIN_PREVOTE   || chain_id_le || chunk_id_le || round_le || chunk_hash`
+- Precommit: `DOMAIN_PRECOMMIT || chain_id_le || chunk_id_le || round_le || chunk_hash`
+
+All integer fields are little-endian raw bytes (u64, u32). This prevents
+cross-phase, cross-chunk, cross-chain, and cross-round replay.
 
 A block proposer may include multiple votes per chunk/round (different
 aggregator groups across the validator set). The consensus engine is

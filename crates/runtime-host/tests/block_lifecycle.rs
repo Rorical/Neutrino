@@ -19,7 +19,9 @@
 use std::fs;
 
 use neutrino_crypto::ed25519::SecretKey;
-use neutrino_primitives::{Ed25519PublicKey, Ed25519Signature, StateRoot, ZERO_HASH};
+use neutrino_primitives::{
+    BlsPublicKey, Ed25519PublicKey, Ed25519Signature, StateRoot, ZERO_HASH, blake3_256,
+};
 use neutrino_proof_system::{BlockPublicInputs, MockProofSystem, ProofError, ProofSystem};
 use neutrino_runtime_abi::BlockContext;
 use neutrino_runtime_host::{Overlay, run_block};
@@ -295,4 +297,226 @@ fn transfer_updates_accounts_and_state_root() {
     let public = block_public_inputs(1, root_before, outcome.state_root_after);
     let proof = mock.prove_block(&[], &public).expect("prove");
     mock.verify_block(&proof, &public).expect("verify");
+}
+
+// -------- M4B stake / unstake helpers & test ---------------------------------
+
+const TX_STAKE: u8 = 0x01;
+const TX_UNSTAKE: u8 = 0x02;
+
+const BLS_KEY_LEN: usize = 48;
+const STK_PREFIX: &[u8] = b"stk:";
+const STK_VALUE_LEN: usize = 40;
+const VS_KEY: &[u8] = b"vs:active";
+
+fn stk_key(bls_pk: &BlsPublicKey) -> Vec<u8> {
+    let mut key = Vec::with_capacity(STK_PREFIX.len() + BLS_KEY_LEN);
+    key.extend_from_slice(STK_PREFIX);
+    key.extend_from_slice(bls_pk);
+    key
+}
+
+fn make_stake_value(staked: u64, owner: Ed25519PublicKey) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(STK_VALUE_LEN);
+    buf.extend_from_slice(&staked.to_le_bytes());
+    buf.extend_from_slice(&owner);
+    buf
+}
+
+fn make_stake_txn(
+    owner_pk: Ed25519PublicKey,
+    bls_pk: BlsPublicKey,
+    amount: u64,
+    nonce: u64,
+    ty: u8,
+    sig: Ed25519Signature,
+) -> Vec<u8> {
+    let mut txn = Vec::with_capacity(161);
+    txn.push(ty);
+    txn.extend_from_slice(&owner_pk);
+    txn.extend_from_slice(&bls_pk);
+    txn.extend_from_slice(&amount.to_le_bytes());
+    txn.extend_from_slice(&nonce.to_le_bytes());
+    txn.extend_from_slice(&sig);
+    txn
+}
+
+fn body_from_txns(txns: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4);
+    body.extend_from_slice(
+        &u32::try_from(txns.len())
+            .expect("txn count fits u32")
+            .to_le_bytes(),
+    );
+    for txn in txns {
+        body.extend_from_slice(
+            &u32::try_from(txn.len())
+                .expect("txn len fits u32")
+                .to_le_bytes(),
+        );
+        body.extend_from_slice(txn);
+    }
+    body
+}
+
+const fn bls_pk(byte: u8) -> BlsPublicKey {
+    [byte; BLS_KEY_LEN]
+}
+
+fn compute_vs_hash(prev: &[u8; 32], op: u8, bls_pk: &BlsPublicKey, new_stake: u64) -> [u8; 32] {
+    let mut input = Vec::with_capacity(32 + 1 + BLS_KEY_LEN + 8);
+    input.extend_from_slice(prev);
+    input.push(op);
+    input.extend_from_slice(bls_pk);
+    input.extend_from_slice(&new_stake.to_le_bytes());
+    blake3_256(&input)
+}
+
+#[test]
+fn stake_and_unstake_update_validator_set() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping stake test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+    let sk_owner = SecretKey::generate(&mut rng);
+    let pk_owner = sk_owner.public_key().to_bytes();
+    let bls1 = bls_pk(1);
+
+    // Seed the owner with an initial balance.
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_owner.to_vec(), make_account_value(1000, 0));
+    overlay.commit().expect("commit seed");
+
+    // ---- Block 1: stake 300 ----
+    let mut txn_hdr_1 = Vec::with_capacity(97);
+    txn_hdr_1.push(TX_STAKE);
+    txn_hdr_1.extend_from_slice(&pk_owner);
+    txn_hdr_1.extend_from_slice(&bls1);
+    txn_hdr_1.extend_from_slice(&300u64.to_le_bytes());
+    txn_hdr_1.extend_from_slice(&0u64.to_le_bytes());
+    let sig1 = sk_owner.sign(&txn_hdr_1);
+    let body1 = body_from_txns(&[make_stake_txn(pk_owner, bls1, 300, 0, TX_STAKE, sig1)]);
+
+    let root_before = overlay.base_root();
+    let ctx1 = make_block_ctx(1, root_before);
+    let out1 =
+        run_block(&elf, &ctx1, body1, &mut overlay, 5_000_000).expect("stake block succeeds");
+
+    assert_ne!(out1.state_root_after, root_before);
+    // Owner balance: 1000 - 300 = 700, nonce 0 -> 1.
+    assert_eq!(overlay.get(&pk_owner), Some(make_account_value(700, 1)));
+    // Stake account: 300 staked, owner confirmed.
+    assert_eq!(
+        overlay.get(&stk_key(&bls1)),
+        Some(make_stake_value(300, pk_owner))
+    );
+    // VS accumulator: BLAKE3(ZERO || 0x01 || bls1 || 300).
+    let vs1 = compute_vs_hash(&[0u8; 32], TX_STAKE, &bls1, 300);
+    assert_eq!(overlay.get(VS_KEY), Some(vs1.to_vec()));
+
+    // ---- Block 2: unstake 100 ----
+    let mut txn_hdr_2 = Vec::with_capacity(97);
+    txn_hdr_2.push(TX_UNSTAKE);
+    txn_hdr_2.extend_from_slice(&pk_owner);
+    txn_hdr_2.extend_from_slice(&bls1);
+    txn_hdr_2.extend_from_slice(&100u64.to_le_bytes());
+    txn_hdr_2.extend_from_slice(&1u64.to_le_bytes());
+    let sig2 = sk_owner.sign(&txn_hdr_2);
+    let body2 = body_from_txns(&[make_stake_txn(pk_owner, bls1, 100, 1, TX_UNSTAKE, sig2)]);
+
+    let ctx2 = make_block_ctx(2, out1.state_root_after);
+    let out2 =
+        run_block(&elf, &ctx2, body2, &mut overlay, 5_000_000).expect("unstake block succeeds");
+
+    assert_ne!(out2.state_root_after, out1.state_root_after);
+    // Owner balance: 700 + 100 = 800, nonce 1 -> 2.
+    assert_eq!(overlay.get(&pk_owner), Some(make_account_value(800, 2)));
+    // Stake account: 300 - 100 = 200 remaining.
+    assert_eq!(
+        overlay.get(&stk_key(&bls1)),
+        Some(make_stake_value(200, pk_owner))
+    );
+    // VS accumulator: BLAKE3(vs1 || 0x02 || bls1 || 200).
+    let vs2 = compute_vs_hash(&vs1, TX_UNSTAKE, &bls1, 200);
+    assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
+
+    // Mock proof round trip for block 2.
+    let mock = MockProofSystem::new();
+    let public = block_public_inputs(2, out1.state_root_after, out2.state_root_after);
+    let proof = mock.prove_block(&[], &public).expect("prove");
+    mock.verify_block(&proof, &public).expect("verify");
+}
+
+#[test]
+fn full_unstake_clears_stake_account_and_vs_hash() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping full unstake test.");
+        return;
+    };
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+    let sk_owner = SecretKey::generate(&mut rng);
+    let pk_owner = sk_owner.public_key().to_bytes();
+    let bls1 = bls_pk(2);
+
+    let mut overlay = Overlay::empty();
+    overlay.put(pk_owner.to_vec(), make_account_value(500, 0));
+    overlay.commit().expect("commit seed");
+
+    // Stake 500 (full balance).
+    let mut hdr1 = Vec::with_capacity(97);
+    hdr1.push(TX_STAKE);
+    hdr1.extend_from_slice(&pk_owner);
+    hdr1.extend_from_slice(&bls1);
+    hdr1.extend_from_slice(&500u64.to_le_bytes());
+    hdr1.extend_from_slice(&0u64.to_le_bytes());
+    let body1 = body_from_txns(&[make_stake_txn(
+        pk_owner,
+        bls1,
+        500,
+        0,
+        TX_STAKE,
+        sk_owner.sign(&hdr1),
+    )]);
+
+    let root_before = overlay.base_root();
+    let out1 = run_block(
+        &elf,
+        &make_block_ctx(1, root_before),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("stake");
+
+    let vs1 = compute_vs_hash(&[0u8; 32], TX_STAKE, &bls1, 500);
+
+    // Fully unstake 500.
+    let mut hdr2 = Vec::with_capacity(97);
+    hdr2.push(TX_UNSTAKE);
+    hdr2.extend_from_slice(&pk_owner);
+    hdr2.extend_from_slice(&bls1);
+    hdr2.extend_from_slice(&500u64.to_le_bytes());
+    hdr2.extend_from_slice(&1u64.to_le_bytes());
+    let body2 = body_from_txns(&[make_stake_txn(
+        pk_owner,
+        bls1,
+        500,
+        1,
+        TX_UNSTAKE,
+        sk_owner.sign(&hdr2),
+    )]);
+
+    let ctx2 = make_block_ctx(2, out1.state_root_after);
+    let _out2 = run_block(&elf, &ctx2, body2, &mut overlay, 5_000_000).expect("full unstake");
+
+    // Owner balance back to 500, nonce 0->1->2.
+    assert_eq!(overlay.get(&pk_owner), Some(make_account_value(500, 2)));
+    // Stake account deleted.
+    assert_eq!(overlay.get(&stk_key(&bls1)), None);
+    // VS accumulator updated with 0 stake.
+    let vs2 = compute_vs_hash(&vs1, TX_UNSTAKE, &bls1, 0);
+    assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
 }

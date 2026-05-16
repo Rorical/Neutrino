@@ -597,6 +597,13 @@ dependencies = [
 [[package]]
 name = "neutrino-consensus-vrf"
 version = "0.1.0"
+dependencies = [
+ "neutrino-consensus-types",
+ "neutrino-crypto",
+ "neutrino-primitives",
+ "neutrino-vrf",
+ "rand",
+]
 
 [[package]]
 name = "neutrino-crypto"

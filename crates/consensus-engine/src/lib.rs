@@ -10,9 +10,17 @@
 //! finality cert, checkpoint, recursive proof, validator-set snapshot) to a
 //! column-family [`Database`](neutrino_storage::Database).
 
+pub mod clock;
+pub mod engine;
+pub mod error;
 pub mod store;
+pub mod validator_set;
 
-pub use store::{ChainStore, StoreError, keys};
+pub use clock::SlotClock;
+pub use engine::Engine;
+pub use error::EngineError;
+pub use store::{ChainStore, StoreError, ValidatorSetSnapshot, keys, pointers};
+pub use validator_set::validator_set_root;
 
 /// Engine lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

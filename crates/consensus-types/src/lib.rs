@@ -827,14 +827,19 @@ mod tests {
             proof_bytes: vec![78, 79],
         };
 
+        let (saved_block, saved_chunk, saved_recursive) = (
+            block_proof.clone(),
+            chunk_proof.clone(),
+            recursive_proof.clone(),
+        );
         let encoded =
-            to_vec(&(block_proof, chunk_proof, recursive_proof)).expect("proofs serialize");
+            to_vec(&(saved_block, saved_chunk, saved_recursive)).expect("proofs serialize");
         let decoded: (BlockProof, ChunkProof, RecursiveCheckpointProof) =
             from_slice(&encoded).expect("proofs deserialize");
 
-        assert_eq!(decoded.0.height, 2);
-        assert_eq!(decoded.1.chunk_id, 3);
-        assert_eq!(decoded.2.checkpoint_hash, checkpoint().hash());
+        assert_eq!(decoded.0, block_proof);
+        assert_eq!(decoded.1, chunk_proof);
+        assert_eq!(decoded.2, recursive_proof);
         assert_ne!(decoded.2.checkpoint_hash, ZERO_HASH);
     }
 }

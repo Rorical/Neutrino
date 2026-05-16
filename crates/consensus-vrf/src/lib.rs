@@ -580,8 +580,7 @@ mod tests {
     fn verify_proposer_rejects_zero_stake_and_bad_key() {
         let sk = secret_key(9);
         let (proof, _) = neutrino_vrf::eval(&sk, CHAIN_ID, &SEED, SLOT);
-        let mut bad_key = sk.public_key().to_bytes();
-        bad_key[0] ^= 0x80;
+        let bad_key: BlsPublicKey = [0x00; 48];
 
         assert_eq!(
             verify_proposer(ProposerClaim {

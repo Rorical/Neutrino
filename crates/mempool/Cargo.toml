@@ -12,7 +12,10 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = []
+std = ["neutrino-primitives/std"]
+
+[dependencies]
+neutrino-primitives = { workspace = true }
 
 [lints]
 workspace = true

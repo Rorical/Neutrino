@@ -17,8 +17,14 @@ pub mod behaviour;
 pub mod rpc;
 /// The main networking service driving the swarm event loop.
 pub mod service;
+/// Sync state machine implementing doc 06's `Init → ... → Following` flow.
+pub mod sync;
 /// Canonical gossip topic registry.
 pub mod topic;
 
 pub use rpc::{RpcInboundId, RpcProtocol, RpcRequest, RpcResponse};
+pub use sync::{
+    LocalProgress, SyncBatchSizes, SyncCommand, SyncEvent, SyncMachine, SyncMode, SyncStallReason,
+    SyncState,
+};
 pub use topic::Topic;

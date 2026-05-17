@@ -1,15 +1,18 @@
 //! Request/response RPC for Neutrino, per doc 06 §"Request/response protocols".
 //!
-//! Implements the **core** RPC family every full node supports:
+//! Implements the **core** RPC family every full node supports, plus the two
+//! recursive-proof endpoints the sync FSM needs for `CheckpointBackfill`:
 //!
-//! | Protocol id                          | Request → Response                  |
-//! |--------------------------------------|-------------------------------------|
-//! | `/neutrino/req/status/1`             | [`Status`] → [`Status`]             |
-//! | `/neutrino/req/metadata/1`           | [`MetadataRequest`] → [`Metadata`]  |
-//! | `/neutrino/req/ping/1`               | [`PingPayload`] → [`PingPayload`]   |
-//! | `/neutrino/req/blocks_by_range/1`    | [`BlocksByRangeRequest`] → [`BlocksByRangeResponse`] |
-//! | `/neutrino/req/blocks_by_root/1`     | [`BlocksByRootRequest`]  → [`BlocksByRootResponse`]  |
-//! | `/neutrino/req/state_by_root/1`      | [`StateByRootRequest`]   → [`StateByRootResponse`]   |
+//! | Protocol id                                | Request → Response                                       |
+//! |--------------------------------------------|----------------------------------------------------------|
+//! | `/neutrino/req/status/1`                   | [`Status`] → [`Status`]                                  |
+//! | `/neutrino/req/metadata/1`                 | [`MetadataRequest`] → [`Metadata`]                       |
+//! | `/neutrino/req/ping/1`                     | [`PingPayload`] → [`PingPayload`]                        |
+//! | `/neutrino/req/blocks_by_range/1`          | [`BlocksByRangeRequest`] → [`BlocksByRangeResponse`]     |
+//! | `/neutrino/req/blocks_by_root/1`           | [`BlocksByRootRequest`]  → [`BlocksByRootResponse`]      |
+//! | `/neutrino/req/state_by_root/1`            | [`StateByRootRequest`]   → [`StateByRootResponse`]       |
+//! | `/neutrino/req/recursive_proof_latest/1`   | [`RecursiveProofLatestRequest`] → [`RecursiveProofLatestResponse`]   |
+//! | `/neutrino/req/recursive_proof_by_index/1` | [`RecursiveProofByIndexRequest`] → [`RecursiveProofByIndexResponse`] |
 //!
 //! Every request and response is canonically encoded with `borsh`, matching
 //! the wire format used by gossip and on-disk consensus types.
@@ -24,8 +27,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use core::marker::PhantomData;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{StreamProtocol, request_response};
-use neutrino_consensus_types::Block;
-use neutrino_primitives::{BlockHash, ChainId, CheckpointIndex, Hash, Height, Slot, StateRoot};
+use neutrino_consensus_types::{Block, RecursiveCheckpointProof};
+use neutrino_primitives::{
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, Hash, Height, Slot, StateRoot,
+};
 use std::io;
 use thiserror::Error;
 
@@ -41,6 +46,10 @@ pub const PROTOCOL_BLOCKS_BY_RANGE: &str = "/neutrino/req/blocks_by_range/1";
 pub const PROTOCOL_BLOCKS_BY_ROOT: &str = "/neutrino/req/blocks_by_root/1";
 /// `StateByRoot` RPC protocol id.
 pub const PROTOCOL_STATE_BY_ROOT: &str = "/neutrino/req/state_by_root/1";
+/// `RecursiveProofLatest` RPC protocol id.
+pub const PROTOCOL_RECURSIVE_PROOF_LATEST: &str = "/neutrino/req/recursive_proof_latest/1";
+/// `RecursiveProofByIndex` RPC protocol id.
+pub const PROTOCOL_RECURSIVE_PROOF_BY_INDEX: &str = "/neutrino/req/recursive_proof_by_index/1";
 
 /// Default maximum request payload size in bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
@@ -55,6 +64,11 @@ pub const DEFAULT_MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_BLOCKS_PER_RESPONSE: u64 = 16;
 /// Maximum number of paths queried in a single `StateByRoot` request.
 pub const MAX_STATE_PATHS_PER_REQUEST: u64 = 256;
+/// Maximum number of recursive checkpoint proofs returned in one batch.
+///
+/// Each recursive proof is small (≤ 64 KiB per doc 06), so a higher batch
+/// size is safe than for block payloads.
+pub const MAX_RECURSIVE_PROOFS_PER_RESPONSE: u64 = 64;
 
 /// Identifies one of the core RPC protocols defined by doc 06.
 ///
@@ -74,6 +88,10 @@ pub enum RpcProtocol {
     BlocksByRoot,
     /// Doc 06 `/neutrino/req/state_by_root/1`.
     StateByRoot,
+    /// Doc 06 `/neutrino/req/recursive_proof_latest/1`.
+    RecursiveProofLatest,
+    /// Doc 06 `/neutrino/req/recursive_proof_by_index/1`.
+    RecursiveProofByIndex,
 }
 
 impl RpcProtocol {
@@ -87,6 +105,8 @@ impl RpcProtocol {
             Self::BlocksByRange => PROTOCOL_BLOCKS_BY_RANGE,
             Self::BlocksByRoot => PROTOCOL_BLOCKS_BY_ROOT,
             Self::StateByRoot => PROTOCOL_STATE_BY_ROOT,
+            Self::RecursiveProofLatest => PROTOCOL_RECURSIVE_PROOF_LATEST,
+            Self::RecursiveProofByIndex => PROTOCOL_RECURSIVE_PROOF_BY_INDEX,
         }
     }
 
@@ -101,7 +121,7 @@ impl RpcProtocol {
 ///
 /// Used by peers to detect chain mismatches and as input to the sync FSM
 /// described in doc 06 §"Sync state machine".
-#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Status {
     /// Chain identifier; mismatching peers should be disconnected.
     pub chain_id: ChainId,
@@ -219,6 +239,41 @@ pub struct StateByRootResponse {
     pub nodes: Vec<Vec<u8>>,
 }
 
+/// `RecursiveProofLatest` request: fetch the peer's latest recursive checkpoint.
+///
+/// Cheap query used by light clients on bootstrap and by full nodes on
+/// initial peer handshake to learn how far the peer has advanced.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecursiveProofLatestRequest;
+
+/// `RecursiveProofLatest` response carrying the peer's latest checkpoint
+/// and its recursive proof.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct RecursiveProofLatestResponse {
+    /// Latest checkpoint the peer has finalized and proven.
+    pub checkpoint: Checkpoint,
+    /// Recursive proof binding the entire chain history.
+    pub recursive_proof: RecursiveCheckpointProof,
+}
+
+/// `RecursiveProofByIndex` request: fetch a contiguous range of recursive
+/// checkpoints starting at `start_index` for `count` entries.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct RecursiveProofByIndexRequest {
+    /// First checkpoint index to include.
+    pub start_index: CheckpointIndex,
+    /// Number of checkpoints to include; clamped to
+    /// [`MAX_RECURSIVE_PROOFS_PER_RESPONSE`].
+    pub count: u64,
+}
+
+/// `RecursiveProofByIndex` response carrying recursive checkpoint proofs.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecursiveProofByIndexResponse {
+    /// Recursive checkpoint proofs in ascending index order.
+    pub items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
+}
+
 /// Host-facing umbrella request enum used by the command surface.
 ///
 /// Never serialized to the wire — each variant maps to a different
@@ -237,6 +292,10 @@ pub enum RpcRequest {
     BlocksByRoot(BlocksByRootRequest),
     /// State trie node fetch.
     StateByRoot(StateByRootRequest),
+    /// Latest recursive checkpoint fetch.
+    RecursiveProofLatest(RecursiveProofLatestRequest),
+    /// Range of recursive checkpoint proofs by index.
+    RecursiveProofByIndex(RecursiveProofByIndexRequest),
 }
 
 impl RpcRequest {
@@ -250,11 +309,17 @@ impl RpcRequest {
             Self::BlocksByRange(_) => RpcProtocol::BlocksByRange,
             Self::BlocksByRoot(_) => RpcProtocol::BlocksByRoot,
             Self::StateByRoot(_) => RpcProtocol::StateByRoot,
+            Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
+            Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
         }
     }
 }
 
 /// Host-facing umbrella response enum used by the event surface.
+///
+/// [`RecursiveProofLatestResponse`] inlines a full [`Checkpoint`] and a
+/// [`RecursiveCheckpointProof`] (~520 bytes); it is boxed here so the enum
+/// stays small and equally cheap to move regardless of variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RpcResponse {
     /// Status handshake reply.
@@ -269,6 +334,10 @@ pub enum RpcResponse {
     BlocksByRoot(BlocksByRootResponse),
     /// `StateByRoot` reply.
     StateByRoot(StateByRootResponse),
+    /// `RecursiveProofLatest` reply (boxed to keep the enum compact).
+    RecursiveProofLatest(Box<RecursiveProofLatestResponse>),
+    /// `RecursiveProofByIndex` reply.
+    RecursiveProofByIndex(RecursiveProofByIndexResponse),
 }
 
 impl RpcResponse {
@@ -282,6 +351,8 @@ impl RpcResponse {
             Self::BlocksByRange(_) => RpcProtocol::BlocksByRange,
             Self::BlocksByRoot(_) => RpcProtocol::BlocksByRoot,
             Self::StateByRoot(_) => RpcProtocol::StateByRoot,
+            Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
+            Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
         }
     }
 }
@@ -444,6 +515,12 @@ pub type BlocksByRangeCodec = BorshCodec<BlocksByRangeRequest, BlocksByRangeResp
 pub type BlocksByRootCodec = BorshCodec<BlocksByRootRequest, BlocksByRootResponse>;
 /// Codec for the `StateByRoot` RPC.
 pub type StateByRootCodec = BorshCodec<StateByRootRequest, StateByRootResponse>;
+/// Codec for the `RecursiveProofLatest` RPC.
+pub type RecursiveProofLatestCodec =
+    BorshCodec<RecursiveProofLatestRequest, RecursiveProofLatestResponse>;
+/// Codec for the `RecursiveProofByIndex` RPC.
+pub type RecursiveProofByIndexCodec =
+    BorshCodec<RecursiveProofByIndexRequest, RecursiveProofByIndexResponse>;
 
 /// Behaviour type for the Status RPC.
 pub type StatusBehaviour = request_response::Behaviour<StatusCodec>;
@@ -457,6 +534,10 @@ pub type BlocksByRangeBehaviour = request_response::Behaviour<BlocksByRangeCodec
 pub type BlocksByRootBehaviour = request_response::Behaviour<BlocksByRootCodec>;
 /// Behaviour type for the `StateByRoot` RPC.
 pub type StateByRootBehaviour = request_response::Behaviour<StateByRootCodec>;
+/// Behaviour type for the `RecursiveProofLatest` RPC.
+pub type RecursiveProofLatestBehaviour = request_response::Behaviour<RecursiveProofLatestCodec>;
+/// Behaviour type for the `RecursiveProofByIndex` RPC.
+pub type RecursiveProofByIndexBehaviour = request_response::Behaviour<RecursiveProofByIndexCodec>;
 
 #[cfg(test)]
 mod tests {
@@ -516,6 +597,14 @@ mod tests {
             RpcProtocol::StateByRoot.protocol_id(),
             "/neutrino/req/state_by_root/1"
         );
+        assert_eq!(
+            RpcProtocol::RecursiveProofLatest.protocol_id(),
+            "/neutrino/req/recursive_proof_latest/1"
+        );
+        assert_eq!(
+            RpcProtocol::RecursiveProofByIndex.protocol_id(),
+            "/neutrino/req/recursive_proof_by_index/1"
+        );
     }
 
     #[test]
@@ -556,10 +645,51 @@ mod tests {
                 }),
                 RpcProtocol::StateByRoot,
             ),
+            (
+                RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest),
+                RpcProtocol::RecursiveProofLatest,
+            ),
+            (
+                RpcRequest::RecursiveProofByIndex(RecursiveProofByIndexRequest {
+                    start_index: 0,
+                    count: 1,
+                }),
+                RpcProtocol::RecursiveProofByIndex,
+            ),
         ];
         for (req, expected) in cases {
             assert_eq!(req.protocol(), expected);
         }
+    }
+
+    #[test]
+    fn recursive_proof_response_round_trips() {
+        let checkpoint = Checkpoint {
+            chain_id: 1,
+            index: 7,
+            start_height: 0,
+            end_height: 128,
+            start_block_hash: [0; 32],
+            end_block_hash: [1; 32],
+            start_state_root: [0; 32],
+            end_state_root: [2; 32],
+            end_validator_set_root: [3; 32],
+            history_root: [4; 32],
+            proof_system_version: 1,
+        };
+        let proof = RecursiveCheckpointProof {
+            checkpoint_index: checkpoint.index,
+            checkpoint_hash: checkpoint.hash(),
+            public_inputs: checkpoint.clone(),
+            proof_bytes: vec![0x10, 0x20, 0x30],
+        };
+        let resp = RecursiveProofLatestResponse {
+            checkpoint,
+            recursive_proof: proof,
+        };
+        let bytes = to_vec(&resp).unwrap();
+        let decoded: RecursiveProofLatestResponse = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, resp);
     }
 
     #[test]
@@ -626,7 +756,7 @@ mod tests {
 
         let (mut a, mut b) = Endpoint::pair(1024, 1024);
         codec
-            .write_request(&protocol, &mut a, req.clone())
+            .write_request(&protocol, &mut a, req)
             .await
             .expect("write request");
         a.close().await.unwrap();

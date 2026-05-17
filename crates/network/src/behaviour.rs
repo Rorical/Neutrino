@@ -2,7 +2,8 @@
 
 use crate::rpc::{
     BlocksByRangeBehaviour, BlocksByRootBehaviour, MetadataBehaviour, PingBehaviour,
-    StateByRootBehaviour, StatusBehaviour,
+    RecursiveProofByIndexBehaviour, RecursiveProofLatestBehaviour, StateByRootBehaviour,
+    StatusBehaviour,
 };
 use libp2p::{
     connection_limits, gossipsub, identify,
@@ -19,9 +20,11 @@ use libp2p::{
 /// - [`identify::Behaviour`] — protocol negotiation and listen-addr exchange.
 /// - [`ping::Behaviour`] — keepalive and RTT estimation.
 /// - [`connection_limits::Behaviour`] — DoS resistance via hard caps.
-/// - Six `request_response::Behaviour` instances, one per doc 06 core RPC
-///   (`status`, `metadata`, `ping` reply, `blocks_by_range`, `blocks_by_root`,
-///   `state_by_root`).
+/// - Eight `request_response::Behaviour` instances, one per RPC: the six
+///   core protocols (`status`, `metadata`, `ping` reply, `blocks_by_range`,
+///   `blocks_by_root`, `state_by_root`) plus the two recursive-proof
+///   retrieval endpoints needed by the sync FSM
+///   (`recursive_proof_latest`, `recursive_proof_by_index`).
 #[derive(NetworkBehaviour)]
 pub struct NeutrinoBehaviour {
     /// Connection limits to prevent resource exhaustion.
@@ -46,4 +49,8 @@ pub struct NeutrinoBehaviour {
     pub rpc_blocks_by_root: BlocksByRootBehaviour,
     /// `/neutrino/req/state_by_root/1` request/response.
     pub rpc_state_by_root: StateByRootBehaviour,
+    /// `/neutrino/req/recursive_proof_latest/1` request/response.
+    pub rpc_recursive_proof_latest: RecursiveProofLatestBehaviour,
+    /// `/neutrino/req/recursive_proof_by_index/1` request/response.
+    pub rpc_recursive_proof_by_index: RecursiveProofByIndexBehaviour,
 }

@@ -25,8 +25,9 @@
 use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::rpc::{
     self, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec, BlocksByRootResponse,
-    MetadataCodec, PingCodec, RpcError, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
-    StateByRootCodec, StateByRootResponse, StatusCodec,
+    MetadataCodec, PingCodec, RecursiveProofByIndexCodec, RecursiveProofByIndexResponse,
+    RecursiveProofLatestCodec, RecursiveProofLatestResponse, RpcError, RpcInboundId, RpcProtocol,
+    RpcRequest, RpcResponse, StateByRootCodec, StateByRootResponse, StatusCodec,
 };
 use crate::topic::Topic;
 use futures::StreamExt;
@@ -193,6 +194,10 @@ struct RpcDispatch {
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_state_by_root:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_recursive_proof_latest:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_recursive_proof_by_index:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
 
     inbound_status: HashMap<u64, ResponseChannel<rpc::Status>>,
     inbound_metadata: HashMap<u64, ResponseChannel<rpc::Metadata>>,
@@ -200,6 +205,8 @@ struct RpcDispatch {
     inbound_blocks_by_range: HashMap<u64, ResponseChannel<BlocksByRangeResponse>>,
     inbound_blocks_by_root: HashMap<u64, ResponseChannel<BlocksByRootResponse>>,
     inbound_state_by_root: HashMap<u64, ResponseChannel<StateByRootResponse>>,
+    inbound_recursive_proof_latest: HashMap<u64, ResponseChannel<RecursiveProofLatestResponse>>,
+    inbound_recursive_proof_by_index: HashMap<u64, ResponseChannel<RecursiveProofByIndexResponse>>,
 }
 
 impl RpcDispatch {
@@ -222,6 +229,10 @@ impl RpcDispatch {
             RpcProtocol::BlocksByRange => self.pending_blocks_by_range.insert(id, tx),
             RpcProtocol::BlocksByRoot => self.pending_blocks_by_root.insert(id, tx),
             RpcProtocol::StateByRoot => self.pending_state_by_root.insert(id, tx),
+            RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.insert(id, tx),
+            RpcProtocol::RecursiveProofByIndex => {
+                self.pending_recursive_proof_by_index.insert(id, tx)
+            }
         };
     }
 
@@ -237,6 +248,8 @@ impl RpcDispatch {
             RpcProtocol::BlocksByRange => self.pending_blocks_by_range.remove(&id),
             RpcProtocol::BlocksByRoot => self.pending_blocks_by_root.remove(&id),
             RpcProtocol::StateByRoot => self.pending_state_by_root.remove(&id),
+            RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.remove(&id),
+            RpcProtocol::RecursiveProofByIndex => self.pending_recursive_proof_by_index.remove(&id),
         }
     }
 }
@@ -413,6 +426,12 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcStateByRoot(ev)) => {
                 self.handle_rpc_state_by_root(ev).await;
             }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcRecursiveProofLatest(ev)) => {
+                self.handle_rpc_recursive_proof_latest(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcRecursiveProofByIndex(ev)) => {
+                self.handle_rpc_recursive_proof_by_index(ev).await;
+            }
             _ => {}
         }
     }
@@ -481,6 +500,12 @@ impl NetworkService {
             }
             RpcRequest::BlocksByRoot(req) => behaviour.rpc_blocks_by_root.send_request(&peer, req),
             RpcRequest::StateByRoot(req) => behaviour.rpc_state_by_root.send_request(&peer, req),
+            RpcRequest::RecursiveProofLatest(req) => behaviour
+                .rpc_recursive_proof_latest
+                .send_request(&peer, req),
+            RpcRequest::RecursiveProofByIndex(req) => behaviour
+                .rpc_recursive_proof_by_index
+                .send_request(&peer, req),
         };
         self.rpc.record_outbound(protocol, id, response_tx);
     }
@@ -542,6 +567,27 @@ impl NetworkService {
                         .send_response(chan, payload)
                         .is_ok()
                 }),
+            (RpcProtocol::RecursiveProofLatest, RpcResponse::RecursiveProofLatest(payload)) => self
+                .rpc
+                .inbound_recursive_proof_latest
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_recursive_proof_latest
+                        .send_response(chan, *payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::RecursiveProofByIndex, RpcResponse::RecursiveProofByIndex(payload)) => {
+                self.rpc
+                    .inbound_recursive_proof_by_index
+                    .remove(&inbound_id.raw)
+                    .is_some_and(|chan| {
+                        behaviour
+                            .rpc_recursive_proof_by_index
+                            .send_response(chan, payload)
+                            .is_ok()
+                    })
+            }
             _ => false,
         };
 
@@ -835,6 +881,119 @@ impl NetworkService {
         }
     }
 
+    async fn handle_rpc_recursive_proof_latest(
+        &mut self,
+        ev: request_response::Event<rpc::RecursiveProofLatestRequest, RecursiveProofLatestResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::RecursiveProofLatest);
+                self.rpc
+                    .inbound_recursive_proof_latest
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::RecursiveProofLatest(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::RecursiveProofLatest, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::RecursiveProofLatest(Box::new(response))));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(
+                RpcProtocol::RecursiveProofLatest,
+                request_id,
+                &error,
+            ),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on RecursiveProofLatest RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_recursive_proof_by_index(
+        &mut self,
+        ev: request_response::Event<
+            rpc::RecursiveProofByIndexRequest,
+            RecursiveProofByIndexResponse,
+        >,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::RecursiveProofByIndex);
+                self.rpc
+                    .inbound_recursive_proof_by_index
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::RecursiveProofByIndex(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::RecursiveProofByIndex, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::RecursiveProofByIndex(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(
+                RpcProtocol::RecursiveProofByIndex,
+                request_id,
+                &error,
+            ),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on RecursiveProofByIndex RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn complete_outbound_failure(
         &mut self,
         protocol: RpcProtocol,
@@ -885,6 +1044,8 @@ fn build_behaviour(
         rpc_blocks_by_range: build_rpc_blocks_by_range(),
         rpc_blocks_by_root: build_rpc_blocks_by_root(),
         rpc_state_by_root: build_rpc_state_by_root(),
+        rpc_recursive_proof_latest: build_rpc_recursive_proof_latest(),
+        rpc_recursive_proof_by_index: build_rpc_recursive_proof_by_index(),
     })
 }
 
@@ -997,6 +1158,28 @@ fn build_rpc_state_by_root() -> rpc::StateByRootBehaviour {
         StateByRootCodec::default(),
         [(
             RpcProtocol::StateByRoot.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_recursive_proof_latest() -> rpc::RecursiveProofLatestBehaviour {
+    request_response::Behaviour::with_codec(
+        RecursiveProofLatestCodec::default(),
+        [(
+            RpcProtocol::RecursiveProofLatest.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_recursive_proof_by_index() -> rpc::RecursiveProofByIndexBehaviour {
+    request_response::Behaviour::with_codec(
+        RecursiveProofByIndexCodec::default(),
+        [(
+            RpcProtocol::RecursiveProofByIndex.stream_protocol(),
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
@@ -1319,7 +1502,7 @@ mod tests {
             head_slot: 100,
             head_height: 99,
         };
-        let canned_b_clone = canned_b_status.clone();
+        let canned_b_clone = canned_b_status;
         let cmd_tx_b_clone = cmd_tx_b.clone();
         tokio::spawn(async move {
             while let Some(ev) = event_rx_b.recv().await {
@@ -1332,7 +1515,7 @@ mod tests {
                     cmd_tx_b_clone
                         .send(NetworkCommand::SendRpcResponse {
                             inbound_id,
-                            response: RpcResponse::Status(canned_b_clone.clone()),
+                            response: RpcResponse::Status(canned_b_clone),
                         })
                         .await
                         .ok();

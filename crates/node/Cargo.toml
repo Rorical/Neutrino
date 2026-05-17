@@ -22,15 +22,21 @@ name = "neutrino-node"
 path = "src/main.rs"
 
 [dependencies]
-async-trait                 = "0.1.89"
-borsh.workspace             = true
-neutrino-consensus-types.workspace = true
-neutrino-network.workspace  = true
-neutrino-primitives.workspace = true
-neutrino-sync.workspace     = true
-serde                       = { version = "1.0", features = ["derive"] }
-thiserror.workspace         = true
-tokio                       = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }
-toml                        = "0.8.20"
-tracing                     = "0.1.44"
-tracing-subscriber          = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+async-trait                       = "0.1.89"
+borsh.workspace                   = true
+neutrino-consensus-engine.workspace = true
+neutrino-consensus-types.workspace  = true
+neutrino-network.workspace        = true
+neutrino-primitives.workspace     = true
+neutrino-proof-system.workspace   = true
+neutrino-storage.workspace        = true
+neutrino-sync.workspace           = true
+serde                             = { version = "1.0", features = ["derive"] }
+thiserror.workspace               = true
+tokio                             = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }
+toml                              = "0.8.20"
+tracing                           = "0.1.44"
+tracing-subscriber                = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["full", "test-util"] }

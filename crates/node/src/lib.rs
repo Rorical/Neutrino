@@ -24,9 +24,11 @@
 //! - JSON-RPC / metrics endpoints.
 
 pub mod backend;
+pub mod chain_backend;
 pub mod config;
 pub mod runner;
 
 pub use backend::StubSyncBackend;
+pub use chain_backend::ChainBackend;
 pub use config::{NodeConfig, NodeRole};
 pub use runner::{NodeError, run};

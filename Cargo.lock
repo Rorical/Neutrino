@@ -2329,9 +2329,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
+ "neutrino-consensus-engine",
  "neutrino-consensus-types",
  "neutrino-network",
  "neutrino-primitives",
+ "neutrino-proof-system",
+ "neutrino-storage",
  "neutrino-sync",
  "serde",
  "thiserror 2.0.18",

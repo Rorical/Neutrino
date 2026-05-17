@@ -63,6 +63,12 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/neutrino-node /usr/local/bin/neutrino-node
 COPY --from=builder /usr/local/bin/neutrino-default-runtime /usr/local/lib/neutrino-default-runtime
 
+# Persistent state directory. `data_dir` in the node config points
+# here, and docker-compose mounts a named volume on top so restarts
+# resume from disk instead of replaying genesis.
+RUN mkdir -p /var/lib/neutrino \
+    && chown neutrino:neutrino /var/lib/neutrino
+
 USER neutrino
 WORKDIR /home/neutrino
 

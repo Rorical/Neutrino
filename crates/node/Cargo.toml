@@ -29,8 +29,9 @@ neutrino-consensus-types.workspace  = true
 neutrino-network.workspace        = true
 neutrino-primitives.workspace     = true
 neutrino-proof-system.workspace   = true
-neutrino-storage.workspace        = true
+neutrino-storage                  = { workspace = true, features = ["rocksdb"] }
 neutrino-sync.workspace           = true
+neutrino-trie.workspace           = true
 serde                             = { version = "1.0", features = ["derive"] }
 thiserror.workspace               = true
 tokio                             = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }

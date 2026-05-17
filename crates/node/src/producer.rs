@@ -10,11 +10,11 @@ use neutrino_consensus_engine::{ProductionError, ProposerKey};
 use neutrino_network::Topic;
 use neutrino_network::service::NetworkCommand;
 use neutrino_proof_system::MockProofSystem;
-use neutrino_storage::MemoryDatabase;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::chain_backend::ChainBackend;
+use crate::db::NodeDb;
 
 /// Configuration for local validator block production.
 pub(crate) struct BlockProducerConfig {
@@ -31,7 +31,7 @@ pub(crate) struct BlockProducerConfig {
 /// Run validator production until the network command channel closes or the
 /// task is aborted during node shutdown.
 pub(crate) async fn run_block_producer(
-    backend: Arc<ChainBackend<MemoryDatabase, MockProofSystem>>,
+    backend: Arc<ChainBackend<NodeDb, MockProofSystem>>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
     config: BlockProducerConfig,
 ) {
@@ -66,7 +66,7 @@ pub(crate) async fn run_block_producer(
 }
 
 async fn attempt_slot(
-    backend: &ChainBackend<MemoryDatabase, MockProofSystem>,
+    backend: &ChainBackend<NodeDb, MockProofSystem>,
     cmd_tx: &mpsc::Sender<NetworkCommand>,
     config: &BlockProducerConfig,
     slot: u64,
@@ -132,12 +132,105 @@ async fn attempt_slot(
                 hash = ?outcome.block_hash,
                 "produced and published block"
             );
+
+            // Close every chunk whose final height the new head has
+            // just reached. Crossing one boundary per slot is the
+            // common case (single-validator); the loop handles the
+            // rare overlap where multiple boundaries get reached in a
+            // single production step.
+            close_due_chunks(backend, cmd_tx, &config.proposer, slot).await;
         }
         Ok(None) => debug!(slot, "validator not eligible for slot"),
         Err(ProductionError::NonMonotonicSlot { parent_slot, .. }) => {
             debug!(slot, parent_slot, "slot already covered by local head");
         }
         Err(err) => warn!(slot, error = %err, "block production failed"),
+    }
+}
+
+/// Close every chunk whose end-height the local head has reached but
+/// has not yet been finalized + checkpointed. The producer drives this
+/// loop because chunk finality requires a validator's BLS signature.
+async fn close_due_chunks(
+    backend: &ChainBackend<NodeDb, MockProofSystem>,
+    cmd_tx: &mpsc::Sender<NetworkCommand>,
+    proposer: &ProposerKey,
+    slot: u64,
+) {
+    let chunk_size = backend.chunk_size().max(1);
+    loop {
+        let head_height = backend.head_height();
+        let Some(next_chunk_id) = backend.next_chunk_to_close() else {
+            return;
+        };
+        let chunk_end_height = next_chunk_id.saturating_add(1).saturating_mul(chunk_size);
+        if head_height < chunk_end_height {
+            return;
+        }
+        let finalize_outcome = match backend.finalize_chunk(next_chunk_id, proposer) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                warn!(slot, chunk_id = next_chunk_id, error = %err, "chunk finalization failed");
+                return;
+            }
+        };
+        let chunk_proof_bytes = match to_vec(&finalize_outcome.chunk_proof) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(slot, error = %err, "failed to encode chunk proof");
+                return;
+            }
+        };
+        if cmd_tx
+            .send(NetworkCommand::Publish {
+                topic: Topic::ChunkProofs,
+                data: chunk_proof_bytes,
+            })
+            .await
+            .is_err()
+        {
+            warn!(
+                slot,
+                "network command channel closed; stopping chunk proof publication"
+            );
+            return;
+        }
+
+        let checkpoint_outcome = match backend.checkpoint_chunk(next_chunk_id) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                warn!(slot, chunk_id = next_chunk_id, error = %err, "chunk checkpoint failed");
+                return;
+            }
+        };
+        let recursive_bytes = match to_vec(&checkpoint_outcome.recursive_proof) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(slot, error = %err, "failed to encode recursive proof");
+                return;
+            }
+        };
+        if cmd_tx
+            .send(NetworkCommand::Publish {
+                topic: Topic::Checkpoints,
+                data: recursive_bytes,
+            })
+            .await
+            .is_err()
+        {
+            warn!(
+                slot,
+                "network command channel closed; stopping checkpoint publication"
+            );
+            return;
+        }
+        info!(
+            slot,
+            chunk_id = next_chunk_id,
+            end_height = finalize_outcome.chunk.end_height,
+            checkpoint_index = checkpoint_outcome.checkpoint.index,
+            "closed chunk and published recursive checkpoint"
+        );
     }
 }
 

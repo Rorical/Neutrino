@@ -15,5 +15,5 @@ mod error;
 pub mod keys;
 pub mod pointers;
 
-pub use chain_store::{ChainStore, ValidatorSetSnapshot};
+pub use chain_store::{ChainStore, ContentAddressedEntries, ValidatorSetSnapshot};
 pub use error::StoreError;

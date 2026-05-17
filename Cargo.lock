@@ -2336,6 +2336,7 @@ dependencies = [
  "neutrino-proof-system",
  "neutrino-storage",
  "neutrino-sync",
+ "neutrino-trie",
  "serde",
  "thiserror 2.0.18",
  "tokio",

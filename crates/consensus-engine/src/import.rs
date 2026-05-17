@@ -259,6 +259,11 @@ impl<DB: Database> Engine<DB> {
             .put_block_state(&hash, BlockState::BlockProduced)?;
         self.store_mut().put_tip(hash)?;
         self.update_head_internal(block.header.height, hash, block.header.state_root);
+        // Followers do not re-execute (M8 territory) so this drains an
+        // empty trie buffer in practice. Producers replaying gossipped
+        // blocks could still have queued writes, so the call is
+        // unconditional.
+        self.flush_trie_to_store()?;
 
         Ok(ImportBlockOutcome {
             block_hash: hash,
@@ -398,6 +403,7 @@ impl<DB: Database> Engine<DB> {
         // VRF-eligibility decisions on the sync path because the joiner
         // never produces blocks until it reaches Following.
         self.update_checkpoint_pointers(proof.checkpoint_index, self.finalized_seed());
+        self.persist_finalized_seed()?;
 
         Ok(ImportRecursiveProofOutcome {
             checkpoint_index: proof.checkpoint_index,

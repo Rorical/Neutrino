@@ -21,8 +21,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use neutrino_consensus_engine::{
-    Engine, ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey,
-    ProveError, ProveOutcome,
+    CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome, ImportError,
+    ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
 };
 use neutrino_consensus_types::{Block, BlockProof, Body, RecursiveCheckpointProof};
 use neutrino_network::rpc::{
@@ -40,7 +40,7 @@ use neutrino_sync::{
     CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
     SyncBackendError,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
@@ -121,6 +121,64 @@ where
         self.with_engine_mut(|e| e.prove_block(block_hash, &[], &self.proof_system))
     }
 
+    /// Finalize chunk `chunk_id` against the local engine state.
+    ///
+    /// Required for the producer's per-chunk close loop. Returns the
+    /// engine [`FinalizeOutcome`] so the caller can persist + gossip
+    /// the resulting chunk proof.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any [`FinalizeError`] variant raised by
+    /// [`Engine::finalize_chunk`].
+    pub fn finalize_chunk(
+        &self,
+        chunk_id: u64,
+        voter: &ProposerKey,
+    ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
+        self.with_engine_mut(|e| e.finalize_chunk(chunk_id, &[], &self.proof_system, voter))
+    }
+
+    /// Fold chunk `chunk_id` into a recursive checkpoint.
+    ///
+    /// Called immediately after [`Self::finalize_chunk`] so the
+    /// producer can publish both artifacts in lock-step.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any [`CheckpointError`] variant raised by
+    /// [`Engine::checkpoint_chunk`].
+    pub fn checkpoint_chunk(
+        &self,
+        chunk_id: u64,
+    ) -> Result<CheckpointOutcome, CheckpointError<DB::Error>> {
+        self.with_engine_mut(|e| e.checkpoint_chunk(chunk_id, &[], &self.proof_system))
+    }
+
+    /// Current head height, snapshotted under the engine mutex.
+    pub fn head_height(&self) -> neutrino_primitives::Height {
+        self.with_engine(neutrino_consensus_engine::Engine::head_height)
+    }
+
+    /// Chunk size declared by the active chain spec. Used by the
+    /// producer to detect chunk boundaries from the head height.
+    pub fn chunk_size(&self) -> u64 {
+        self.with_engine(|e| e.chain_spec().consensus.chunk_size)
+    }
+
+    /// Next chunk id the local engine is ready to finalize.
+    ///
+    /// `Some(0)` immediately after genesis; `Some(latest + 1)` after
+    /// at least one chunk has finalized; `None` only if the
+    /// `latest_finalized_chunk_id` pointer overflows `u64`, which is
+    /// effectively unreachable.
+    pub fn next_chunk_to_close(&self) -> Option<u64> {
+        self.with_engine(|e| {
+            e.latest_finalized_chunk_id()
+                .map_or(Some(0), |latest| latest.checked_add(1))
+        })
+    }
+
     fn contiguous_proven_height(e: &Engine<DB>) -> Height {
         let mut height = 0;
         for candidate in 1..=e.head_height() {
@@ -133,6 +191,93 @@ where
             height = candidate;
         }
         height
+    }
+
+    /// Highest contiguous block height for which a body is persisted.
+    ///
+    /// Used by the sync FSM's `BodyBackfill` (Archive-mode only) to
+    /// avoid auto-skipping when the local store has had no bodies
+    /// written. Producers and full nodes that always persist bodies
+    /// inline return the same value as [`Engine::head_height`].
+    fn contiguous_body_height(e: &Engine<DB>) -> Height {
+        let mut height = 0;
+        for candidate in 1..=e.head_height() {
+            let Ok(Some(hash)) = e.store().get_block_hash_by_height(candidate) else {
+                break;
+            };
+            let Ok(Some(_body)) = e.store().get_body(&hash) else {
+                break;
+            };
+            height = candidate;
+        }
+        height
+    }
+
+    /// Persist a full state dump received during snap-sync. Verifies
+    /// the reconstructed trie root before persisting the bytes, so a
+    /// malicious peer cannot poison the local state column with
+    /// uncorrelated entries.
+    fn import_full_state_dump(
+        &self,
+        root: StateRoot,
+        nodes: Vec<Vec<u8>>,
+        values: Vec<Vec<u8>>,
+    ) -> Result<StateProgress, SyncBackendError> {
+        use neutrino_primitives::blake3_256;
+        use neutrino_trie::TRIE_NODE_DOMAIN;
+
+        // Verify each node's bytes hash to the content-address its
+        // peers stored it under. The trie's `Hasher` prepends a
+        // 16-byte domain tag before hashing the encoded node.
+        let mut hashed_nodes: Vec<(neutrino_primitives::Hash, Vec<u8>)> =
+            Vec::with_capacity(nodes.len());
+        for bytes in nodes {
+            let mut buf = Vec::with_capacity(TRIE_NODE_DOMAIN.len() + bytes.len());
+            buf.extend_from_slice(&TRIE_NODE_DOMAIN);
+            buf.extend_from_slice(&bytes);
+            hashed_nodes.push((blake3_256(&buf), bytes));
+        }
+        let mut hashed_values: Vec<(neutrino_primitives::Hash, Vec<u8>)> =
+            Vec::with_capacity(values.len());
+        for bytes in values {
+            let hash = blake3_256(&bytes);
+            hashed_values.push((hash, bytes));
+        }
+
+        // Rebuild the trie and confirm the root matches before
+        // touching any storage.
+        let reconstructed: neutrino_trie::Trie = neutrino_trie::Trie::from_persisted(
+            root,
+            hashed_nodes.iter().cloned(),
+            hashed_values.iter().cloned(),
+        );
+        if reconstructed.root() != root {
+            return Err(SyncBackendError::Rejected(format!(
+                "reconstructed state root {:?} does not match requested {:?}",
+                reconstructed.root(),
+                root
+            )));
+        }
+
+        self.with_engine_mut(|e| -> Result<(), SyncBackendError> {
+            for (hash, bytes) in &hashed_nodes {
+                e.store_mut()
+                    .put_trie_node(hash, bytes)
+                    .map_err(Self::map_store_err)?;
+            }
+            for (hash, bytes) in &hashed_values {
+                e.store_mut()
+                    .put_state_value(hash, bytes)
+                    .map_err(Self::map_store_err)?;
+            }
+            e.replace_state_with_reconstructed(reconstructed);
+            Ok(())
+        })?;
+
+        Ok(StateProgress {
+            root_complete: true,
+            next_paths: vec![],
+        })
     }
 
     fn with_engine<R>(&self, f: impl FnOnce(&Engine<DB>) -> R) -> R {
@@ -152,6 +297,9 @@ where
     fn map_import_err(err: ImportError<DB::Error>) -> SyncBackendError {
         match err {
             ImportError::Store(e) => SyncBackendError::Storage(e.to_string()),
+            ImportError::HeightMismatch { .. }
+            | ImportError::ParentMismatch { .. }
+            | ImportError::UnknownBlock(_) => SyncBackendError::ChainBehind(err.to_string()),
             other => SyncBackendError::Rejected(other.to_string()),
         }
     }
@@ -224,7 +372,7 @@ where
                 head_block_hash: head_hash,
                 head_slot,
                 proven_height: Self::contiguous_proven_height(e),
-                body_height: e.head_height(),
+                body_height: Self::contiguous_body_height(e),
             }
         })
     }
@@ -324,12 +472,35 @@ where
         })
     }
 
-    async fn state_nodes(&self, _root: StateRoot, _paths: &[Vec<u8>]) -> StateByRootResponse {
-        // The engine does not yet persist its in-memory state trie nodes
-        // into the database; until M8 wires that up, every node serving
-        // a StateByRoot query returns an empty payload.
-        debug!("state_nodes requested but trie persistence is not yet implemented");
-        StateByRootResponse::default()
+    async fn state_nodes(&self, root: StateRoot, _paths: &[Vec<u8>]) -> StateByRootResponse {
+        // M6 nodes serve a full dump of the persisted trie when the
+        // requested root matches the local head's state root. Real
+        // path-walking + per-path streaming arrives with M12 snap
+        // sync; for the M6 default runtime (a counter at a fixed
+        // key) the entire state easily fits in one RPC.
+        self.with_engine(|e| {
+            if e.head_state_root() != root {
+                debug!(
+                    requested = ?root,
+                    local = ?e.head_state_root(),
+                    "state_nodes request does not match local head root; returning empty"
+                );
+                return StateByRootResponse::default();
+            }
+            let nodes = e
+                .store()
+                .iter_trie_nodes()
+                .ok()
+                .map(|entries| entries.into_iter().map(|(_, bytes)| bytes).collect())
+                .unwrap_or_default();
+            let values = e
+                .store()
+                .iter_state_values()
+                .ok()
+                .map(|entries| entries.into_iter().map(|(_, bytes)| bytes).collect())
+                .unwrap_or_default();
+            StateByRootResponse { nodes, values }
+        })
     }
 
     async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse {
@@ -423,18 +594,23 @@ where
 
     async fn import_state_nodes(
         &self,
-        _root: StateRoot,
+        root: StateRoot,
         _paths: Vec<Vec<u8>>,
-        _nodes: Vec<Vec<u8>>,
+        nodes: Vec<Vec<u8>>,
+        values: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError> {
-        // Same caveat as `state_nodes` above: trie reconstruction is not
-        // yet wired through the engine. Return a complete-but-empty
-        // signal so the FSM does not stall mid-`StateFetch` during tests.
-        warn!("import_state_nodes received data; trie reconstruction is not yet implemented");
-        Ok(StateProgress {
-            root_complete: true,
-            next_paths: vec![],
-        })
+        // The genesis state root is empty, so peers serving it return
+        // an empty payload. Treat that as "nothing to import" rather
+        // than a failure so the FSM can advance straight into
+        // ProofBackfill.
+        if root == ZERO_HASH {
+            return Ok(StateProgress {
+                root_complete: true,
+                next_paths: vec![],
+            });
+        }
+
+        self.import_full_state_dump(root, nodes, values)
     }
 
     async fn verify_and_import_block_proofs(

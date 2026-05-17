@@ -106,6 +106,19 @@ pub struct ChainSpecFile {
     /// in use.
     #[serde(default)]
     pub runtime_code_hash_hex: Option<String>,
+    /// Optional override for [`ConsensusParams::slot_duration_secs`].
+    ///
+    /// Used by integration tests that need shorter slots to exercise
+    /// chunk-close and checkpointing within their wall-clock budget.
+    #[serde(default)]
+    pub slot_duration_secs: Option<u64>,
+    /// Optional override for [`ConsensusParams::chunk_size`].
+    ///
+    /// When set, also overrides
+    /// [`ProofParams::slot_budget_per_chunk`] to the same value so the
+    /// canonical chain-spec validator keeps the two in lock-step.
+    #[serde(default)]
+    pub chunk_size: Option<u64>,
     /// Optional free-form metadata (≤ 256 bytes).
     #[serde(default)]
     pub metadata: Option<String>,
@@ -190,11 +203,19 @@ impl ChainSpecFile {
             });
         }
 
-        let proof_params = ProofParams::default();
-        let consensus = ConsensusParams::default();
+        let mut proof_params = ProofParams::default();
+        let mut consensus = ConsensusParams::default();
         let state = StateParams::default();
         let light_client = LightClientParams::default();
         let runtime_version = RuntimeVersion::default();
+
+        if let Some(slot_duration_secs) = self.slot_duration_secs {
+            consensus.slot_duration_secs = slot_duration_secs;
+        }
+        if let Some(chunk_size) = self.chunk_size {
+            consensus.chunk_size = chunk_size;
+            proof_params.slot_budget_per_chunk = chunk_size;
+        }
 
         let genesis_validator_set_root =
             neutrino_consensus_engine::validator_set::validator_set_root(&validators);

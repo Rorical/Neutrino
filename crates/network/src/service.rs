@@ -144,6 +144,15 @@ pub enum NetworkCommand {
         /// Response payload; must match the inbound protocol.
         response: RpcResponse,
     },
+    /// Read the gossipsub peer scores for every currently-known peer.
+    ///
+    /// Returns a snapshot keyed by `PeerId`. Scores reflect the live
+    /// strict-scoring parameters configured at service start (see
+    /// `build_peer_score_config`).
+    QueryPeerScores {
+        /// One-shot reply channel with `(peer, score)` pairs.
+        response_tx: oneshot::Sender<Vec<(PeerId, f64)>>,
+    },
 }
 
 impl core::fmt::Debug for NetworkCommand {
@@ -175,6 +184,7 @@ impl core::fmt::Debug for NetworkCommand {
                 .field("inbound_id", inbound_id)
                 .field("protocol", &response.protocol())
                 .finish(),
+            Self::QueryPeerScores { .. } => f.debug_struct("QueryPeerScores").finish(),
         }
     }
 }
@@ -511,6 +521,16 @@ impl NetworkService {
                 inbound_id,
                 response,
             } => self.dispatch_outbound_response(inbound_id, response),
+            NetworkCommand::QueryPeerScores { response_tx } => {
+                let gossipsub = &self.swarm.behaviour().gossipsub;
+                let mut snapshot = Vec::new();
+                for peer in gossipsub.all_peers().map(|(peer_id, _)| *peer_id) {
+                    if let Some(score) = gossipsub.peer_score(&peer) {
+                        snapshot.push((peer, score));
+                    }
+                }
+                let _ = response_tx.send(snapshot);
+            }
         }
     }
 
@@ -1315,13 +1335,54 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
         .build()
         .map_err(|e| NetworkError::GossipsubConfig(e.to_string()))?;
 
-    let behaviour = gossipsub::Behaviour::new(
+    let mut behaviour = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(local_key.clone()),
         config,
     )
     .map_err(|e| NetworkError::GossipsubBehaviour(e.to_string()))?;
 
+    let (params, thresholds) = build_peer_score_config();
+    behaviour
+        .with_peer_score(params, thresholds)
+        .map_err(NetworkError::GossipsubBehaviour)?;
+
     Ok(behaviour)
+}
+
+/// Peer-score parameters used in gossipsub v1.1 strict scoring mode.
+///
+/// Doc 06 calls for strict scoring; this baseline starts with topic-
+/// neutral weights so badly behaved peers (slow mesh delivery, invalid
+/// messages, repeated misbehaviour) accumulate negative score and get
+/// pruned from the mesh by gossipsub's internal heartbeat. Per-topic
+/// weight tuning lands with the M7 validator-set work; until then the
+/// global parameters provide the Sybil-resistance floor.
+fn build_peer_score_config() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
+    let params = gossipsub::PeerScoreParams {
+        // Penalise invalid messages strongly so misbehaving peers fall
+        // below `graylist_threshold` quickly.
+        behaviour_penalty_weight: -10.0,
+        behaviour_penalty_threshold: 6.0,
+        behaviour_penalty_decay: 0.5,
+        // Default decay interval matches the gossipsub heartbeat
+        // cadence; keeps score reactive without thrashing.
+        decay_interval: Duration::from_secs(1),
+        decay_to_zero: 0.01,
+        retain_score: Duration::from_secs(60),
+        // Empty per-topic map: every topic uses the defaults until
+        // M7 ships weighted topic tuning.
+        ..gossipsub::PeerScoreParams::default()
+    };
+
+    let thresholds = gossipsub::PeerScoreThresholds {
+        gossip_threshold: -10.0,
+        publish_threshold: -50.0,
+        graylist_threshold: -80.0,
+        accept_px_threshold: 10.0,
+        opportunistic_graft_threshold: 20.0,
+    };
+
+    (params, thresholds)
 }
 
 /// Build the Kademlia behaviour with the Neutrino DHT protocol name.

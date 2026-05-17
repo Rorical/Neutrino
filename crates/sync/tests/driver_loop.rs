@@ -193,6 +193,7 @@ impl SyncBackend for MockBackend {
         _root: StateRoot,
         _paths: Vec<Vec<u8>>,
         _nodes: Vec<Vec<u8>>,
+        _values: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError> {
         Ok(StateProgress {
             root_complete: true,

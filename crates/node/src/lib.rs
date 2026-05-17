@@ -26,6 +26,7 @@ pub mod backend;
 pub mod chain_backend;
 pub mod chain_spec;
 pub mod config;
+pub mod db;
 pub(crate) mod producer;
 pub mod runner;
 
@@ -33,4 +34,5 @@ pub use backend::StubSyncBackend;
 pub use chain_backend::ChainBackend;
 pub use chain_spec::{ChainSpecError, ChainSpecFile, ValidatorEntry};
 pub use config::{NodeConfig, NodeRole};
+pub use db::{NodeDb, NodeDbError};
 pub use runner::{NodeError, run};

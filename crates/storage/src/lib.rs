@@ -26,6 +26,14 @@ pub use rocks::{RocksDbDatabase, RocksDbError};
 
 use alloc::vec::Vec;
 
+/// Snapshot type returned by [`Database::iter_column`].
+///
+/// A list of owned `(key, value)` byte pairs. Factored into a type
+/// alias because clippy flags the nested
+/// `Result<Vec<(Vec<u8>, Vec<u8>)>, _>` shape as overly complex when
+/// used inline.
+pub type ColumnSnapshot = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Minimal column-family key-value database interface.
 pub trait Database {
     /// Backend-specific error type.
@@ -46,4 +54,13 @@ pub trait Database {
     /// visible. Backends that cannot provide that guarantee should not
     /// implement this trait.
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error>;
+
+    /// Snapshot every `(key, value)` pair currently stored in `column`.
+    ///
+    /// Ordering is implementation-defined; callers wanting numeric
+    /// iteration over big-endian keys can sort the result. The pairs
+    /// are returned by value so backends can read them lazily without
+    /// keeping internal iterators alive across other database
+    /// operations.
+    fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error>;
 }

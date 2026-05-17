@@ -41,7 +41,9 @@ pub use merkle::{EMPTY_MERKLE_ROOT, hash_leaf, merkle_root, merkle_root_of_hashe
 pub use produce::{ProductionConfig, ProductionError, ProductionOutcome};
 pub use proposer::ProposerKey;
 pub use prove::{ProveError, ProveOutcome};
-pub use store::{ChainStore, StoreError, ValidatorSetSnapshot, keys, pointers};
+pub use store::{
+    ChainStore, ContentAddressedEntries, StoreError, ValidatorSetSnapshot, keys, pointers,
+};
 pub use validator_set::validator_set_root;
 
 /// Engine lifecycle state.

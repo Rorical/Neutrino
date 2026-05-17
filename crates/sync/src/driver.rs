@@ -14,6 +14,7 @@
 //!
 //! [`NetworkService`]: neutrino_network::service::NetworkService
 
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use core::time::Duration;
 
@@ -29,7 +30,7 @@ use neutrino_primitives::StateRoot;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::backend::{HeadersImported, SyncBackend};
+use crate::backend::{HeadersImported, SyncBackend, SyncBackendError};
 use crate::error::SyncDriverError;
 
 /// Construction-time options for [`SyncDriver`].
@@ -59,6 +60,10 @@ pub struct SyncDriver {
     event_rx: mpsc::Receiver<NetworkEvent>,
     outbound_rx: mpsc::Receiver<OutboundOutcome>,
     outbound_tx: mpsc::Sender<OutboundOutcome>,
+    /// Peers currently connected. Used to re-handshake every known
+    /// peer after a sync FSM reset (e.g. when gossip arrives that the
+    /// local chain cannot extend).
+    connected_peers: BTreeSet<neutrino_network::PeerId>,
 }
 
 impl SyncDriver {
@@ -80,6 +85,7 @@ impl SyncDriver {
             event_rx,
             outbound_rx,
             outbound_tx,
+            connected_peers: BTreeSet::new(),
         }
     }
 
@@ -119,11 +125,13 @@ impl SyncDriver {
         match event {
             NetworkEvent::PeerConnected(peer) => {
                 debug!(%peer, "peer connected, dispatching FSM event");
+                self.connected_peers.insert(peer);
                 let cmds = self.fsm.on_event(SyncEvent::PeerConnected(peer));
                 self.dispatch_sync_commands(cmds).await;
             }
             NetworkEvent::PeerDisconnected(peer) => {
                 debug!(%peer, "peer disconnected");
+                self.connected_peers.remove(&peer);
                 let cmds = self.fsm.on_event(SyncEvent::PeerDisconnected(peer));
                 self.dispatch_sync_commands(cmds).await;
             }
@@ -143,9 +151,26 @@ impl SyncDriver {
         }
     }
 
+    /// Force the FSM back to `Init` and re-handshake every still-known
+    /// peer so the next [`rpc::Status`] response can advance into
+    /// HeaderBackfill again.
+    async fn reset_and_rehandshake(&mut self) {
+        let cmds = self.fsm.on_event(SyncEvent::Reset);
+        self.dispatch_sync_commands(cmds).await;
+        let peers: Vec<_> = self.connected_peers.iter().copied().collect();
+        for peer in peers {
+            let cmds = self.fsm.on_event(SyncEvent::PeerConnected(peer));
+            self.dispatch_sync_commands(cmds).await;
+        }
+    }
+
     async fn handle_gossip(&mut self, topic: Topic, data: Vec<u8>) {
         if topic == Topic::BlockProofs {
             self.handle_block_proof_gossip(data).await;
+            return;
+        }
+        if topic == Topic::Checkpoints {
+            self.handle_checkpoint_gossip(data).await;
             return;
         }
         if topic != Topic::Blocks {
@@ -182,6 +207,18 @@ impl SyncDriver {
                 });
                 self.dispatch_sync_commands(cmds).await;
             }
+            Err(SyncBackendError::ChainBehind(reason)) => {
+                // Live gossip arrived ahead of our head: the local
+                // chain skipped at least one block (e.g. transient
+                // gossip drop). Reset the FSM and re-handshake every
+                // known peer so the next Status response re-enters
+                // HeaderBackfill and pulls the missing range via RPC.
+                warn!(
+                    %reason,
+                    "gossipped block does not extend local head; resyncing"
+                );
+                self.reset_and_rehandshake().await;
+            }
             Err(err) => {
                 warn!(?err, "rejecting gossipped block");
             }
@@ -204,6 +241,43 @@ impl SyncDriver {
         {
             Ok(_) => debug!(height, "imported gossipped block proof"),
             Err(err) => warn!(height, ?err, "rejecting gossipped block proof"),
+        }
+    }
+
+    async fn handle_checkpoint_gossip(&mut self, data: Vec<u8>) {
+        let proof =
+            match borsh::from_slice::<neutrino_consensus_types::RecursiveCheckpointProof>(&data) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "failed to decode gossipped recursive checkpoint; dropping"
+                    );
+                    return;
+                }
+            };
+        let checkpoint = proof.public_inputs.clone();
+        match self
+            .backend
+            .verify_and_import_checkpoints(vec![(checkpoint, proof)])
+            .await
+        {
+            Ok(cp) => {
+                info!(
+                    new_finalized_index = cp.new_finalized_index,
+                    new_finalized_height = cp.new_finalized_height,
+                    "imported gossipped recursive checkpoint"
+                );
+                let cmds = self.fsm.on_event(SyncEvent::CheckpointsAdvanced {
+                    new_finalized_index: cp.new_finalized_index,
+                    new_finalized_hash: cp.new_finalized_hash,
+                    new_finalized_state_root: cp.new_finalized_state_root,
+                    new_finalized_height: cp.new_finalized_height,
+                    new_finalized_block_hash: cp.new_finalized_block_hash,
+                });
+                self.dispatch_sync_commands(cmds).await;
+            }
+            Err(err) => warn!(?err, "rejecting gossipped recursive checkpoint"),
         }
     }
 
@@ -479,8 +553,14 @@ impl SyncDriver {
                 response,
             } => match response {
                 Ok(RpcResponse::StateByRoot(payload)) => {
-                    self.handle_state_nodes_response(peer, state_root, paths, payload.nodes)
-                        .await;
+                    self.handle_state_nodes_response(
+                        peer,
+                        state_root,
+                        paths,
+                        payload.nodes,
+                        payload.values,
+                    )
+                    .await;
                 }
                 Ok(other) => warn!(?other, "unexpected response type for StateByRoot RPC"),
                 Err(err) => {
@@ -652,10 +732,11 @@ impl SyncDriver {
         state_root: StateRoot,
         paths: Vec<Vec<u8>>,
         nodes: Vec<Vec<u8>>,
+        values: Vec<Vec<u8>>,
     ) {
         match self
             .backend
-            .import_state_nodes(state_root, paths, nodes)
+            .import_state_nodes(state_root, paths, nodes, values)
             .await
         {
             Ok(progress) => {

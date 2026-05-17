@@ -30,10 +30,19 @@ use crate::proof::{Proof, ProofStep, ProofTerminal};
 
 /// Binary sparse Merkle trie parameterised by hash function. Defaults
 /// to [`Blake3Hasher`].
+///
+/// The trie buffers every newly produced node and value in
+/// `pending_nodes` / `pending_values` so callers wanting persistence
+/// (the consensus engine) can drain just the deltas after each block.
+/// Drained entries are not removed from the in-memory map; the buffers
+/// only describe what is *new since the last drain*, mirroring the
+/// content-addressed RocksDB columns the engine writes them to.
 #[derive(Clone, Debug)]
 pub struct Trie<H: Hasher = Blake3Hasher> {
     nodes: BTreeMap<Hash, Vec<u8>>,
     values: BTreeMap<Hash, Vec<u8>>,
+    pending_nodes: Vec<(Hash, Vec<u8>)>,
+    pending_values: Vec<(Hash, Vec<u8>)>,
     root: Hash,
     _phantom: PhantomData<H>,
 }
@@ -43,6 +52,8 @@ impl<H: Hasher> Default for Trie<H> {
         Self {
             nodes: BTreeMap::new(),
             values: BTreeMap::new(),
+            pending_nodes: Vec::new(),
+            pending_values: Vec::new(),
             root: ZERO_HASH,
             _phantom: PhantomData,
         }
@@ -75,6 +86,52 @@ impl<H: Hasher> Trie<H> {
     #[must_use]
     pub fn value_count(&self) -> usize {
         self.values.len()
+    }
+
+    /// Drain every trie-node `(hash, bytes)` pair produced since the
+    /// previous call.
+    ///
+    /// Used by the consensus engine to persist the delta into the
+    /// `TrieNodes` storage column without re-writing the entire
+    /// content-addressed node store on every block.
+    pub fn drain_pending_nodes(&mut self) -> Vec<(Hash, Vec<u8>)> {
+        core::mem::take(&mut self.pending_nodes)
+    }
+
+    /// Drain every state-value `(hash, bytes)` pair newly inserted
+    /// since the previous call. See [`Trie::drain_pending_nodes`] for
+    /// rationale.
+    pub fn drain_pending_values(&mut self) -> Vec<(Hash, Vec<u8>)> {
+        core::mem::take(&mut self.pending_values)
+    }
+
+    /// Rebuild a trie from persisted state.
+    ///
+    /// `root` is the previously committed trie root; `nodes` and
+    /// `values` are the full content-addressed contents of the
+    /// `TrieNodes` and `StateValues` storage columns. No
+    /// `pending_nodes` / `pending_values` are recorded because the
+    /// persisted entries are, by definition, already on disk.
+    ///
+    /// The constructor performs no integrity check beyond storing
+    /// every pair as-is: a node whose hash does not match its bytes
+    /// will surface as a panic at the next [`Trie::get`] / [`Trie::prove`]
+    /// call. Callers wanting strong guarantees should hash-check the
+    /// pairs against their keys before passing them in.
+    #[must_use]
+    pub fn from_persisted(
+        root: Hash,
+        nodes: impl IntoIterator<Item = (Hash, Vec<u8>)>,
+        values: impl IntoIterator<Item = (Hash, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            nodes: nodes.into_iter().collect(),
+            values: values.into_iter().collect(),
+            pending_nodes: Vec::new(),
+            pending_values: Vec::new(),
+            root,
+            _phantom: PhantomData,
+        }
     }
 
     /// Read the value bytes for `key`. Returns `None` for keys not in
@@ -132,7 +189,9 @@ impl<H: Hasher> Trie<H> {
     pub fn insert(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), TrieError> {
         let path = BitPath::for_key(key);
         let value_hash = H::hash_value(&value);
-        self.values.insert(value_hash, value);
+        if self.values.insert(value_hash, value.clone()).is_none() {
+            self.pending_values.push((value_hash, value));
+        }
         let new_root = self.insert_at(self.root, &path, value_hash)?;
         self.root = new_root;
         Ok(())
@@ -227,7 +286,9 @@ impl<H: Hasher> Trie<H> {
     fn store_node(&mut self, node: &Node) -> Hash {
         let encoded = node.encode();
         let hash = H::hash_node(&encoded);
-        self.nodes.insert(hash, encoded);
+        if self.nodes.insert(hash, encoded.clone()).is_none() {
+            self.pending_nodes.push((hash, encoded));
+        }
         hash
     }
 
@@ -789,6 +850,52 @@ mod tests {
             proof.verify::<Blake3Hasher>(&trie.root(), b"alpha"),
             Err(ProofError::BranchBitMismatch)
         );
+    }
+
+    #[test]
+    fn drain_pending_returns_new_entries_and_then_empties() {
+        let mut trie = TestTrie::new();
+        assert!(trie.drain_pending_nodes().is_empty());
+        assert!(trie.drain_pending_values().is_empty());
+
+        trie.insert(b"a", b"1".to_vec()).expect("insert");
+        let nodes = trie.drain_pending_nodes();
+        let values = trie.drain_pending_values();
+        assert!(!nodes.is_empty(), "insert must produce at least one node");
+        assert!(!values.is_empty(), "insert must produce at least one value");
+        // Second drain returns nothing because no new writes happened.
+        assert!(trie.drain_pending_nodes().is_empty());
+        assert!(trie.drain_pending_values().is_empty());
+
+        // Re-inserting an identical value-byte does not record a new
+        // value, since the value hash already lives in the value store.
+        trie.insert(b"a", b"1".to_vec()).expect("re-insert");
+        assert!(
+            trie.drain_pending_values().is_empty(),
+            "duplicate value should not be queued for persistence"
+        );
+    }
+
+    #[test]
+    fn from_persisted_roundtrips_reads_and_proofs() {
+        let mut original = TestTrie::new();
+        insert_many(
+            &mut original,
+            &[(b"alice", b"100"), (b"bob", b"50"), (b"carol", b"75")],
+        );
+        let root = original.root();
+        let nodes = original.drain_pending_nodes();
+        let values = original.drain_pending_values();
+
+        let reopened = TestTrie::from_persisted(root, nodes, values);
+        assert_eq!(reopened.root(), root);
+        assert_eq!(reopened.get(b"alice"), Some(b"100".to_vec()));
+        assert_eq!(reopened.get(b"bob"), Some(b"50".to_vec()));
+        assert_eq!(reopened.get(b"carol"), Some(b"75".to_vec()));
+        reopened
+            .prove(b"bob")
+            .verify_inclusion::<Blake3Hasher>(&root, b"bob", b"50")
+            .expect("inclusion in reopened trie");
     }
 
     #[test]

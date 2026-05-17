@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use crate::{Batch, BatchOp, Column, Database};
+use crate::{Batch, BatchOp, Column, ColumnSnapshot, Database};
 
 /// In-memory column-family database used by tests, dev harnesses, and
 /// early single-node bring-up.
@@ -88,6 +88,12 @@ impl Database for MemoryDatabase {
         }
         *self = next;
         Ok(())
+    }
+
+    fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
+        Ok(self.columns.get(&column).map_or_else(Vec::new, |values| {
+            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        }))
     }
 }
 

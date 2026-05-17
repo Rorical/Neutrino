@@ -14,7 +14,7 @@ use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::{ChainSpec, Hash, ZERO_HASH, blake3_256};
 use neutrino_proof_system::MockProofSystem;
-use neutrino_storage::MemoryDatabase;
+use neutrino_storage::Database;
 use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -24,6 +24,7 @@ use crate::backend::StubSyncBackend;
 use crate::chain_backend::ChainBackend;
 use crate::chain_spec::{ChainSpecError, ChainSpecFile, decode_hex_exact};
 use crate::config::{NodeConfig, NodeRole};
+use crate::db::{NodeDb, NodeDbError};
 use crate::producer::{BlockProducerConfig, run_block_producer};
 
 /// Errors returned by [`run`].
@@ -70,6 +71,18 @@ pub enum NodeError {
     /// Driver loop failed.
     #[error("sync driver error: {0}")]
     Driver(#[from] neutrino_sync::SyncDriverError),
+    /// Database backend failed to open or operate on its data directory.
+    #[error("storage error: {0}")]
+    Storage(#[from] NodeDbError),
+    /// `data_dir` could not be created on disk.
+    #[error("failed to create data directory `{path}`: {source}")]
+    DataDir {
+        /// Configured data directory.
+        path: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// Generic I/O surface (signal hookup, config read, ...).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -141,7 +154,7 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
 
     // Select the sync backend.
     let mut producer_job: Option<(
-        Arc<ChainBackend<MemoryDatabase, MockProofSystem>>,
+        Arc<ChainBackend<NodeDb, MockProofSystem>>,
         BlockProducerConfig,
     )> = None;
     let backend: Arc<dyn SyncBackend> = if let Some(path) = &config.chain_spec_path {
@@ -157,12 +170,13 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         }
         let production_config =
             build_block_producer_config(&config, &chain_spec, runtime_elf.as_deref())?;
-        let engine = Engine::genesis(chain_spec, MemoryDatabase::new())
-            .map_err(|err| NodeError::Engine(err.to_string()))?;
+        let db = open_node_db(&config)?;
+        let engine = open_or_initialise_engine(db, chain_spec)?;
         let proof_system = MockProofSystem::new();
         info!(
             chain_id = config.chain_id,
             backend = "ChainBackend",
+            head_height = engine.head_height(),
             "using real engine backend"
         );
         let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
@@ -235,6 +249,50 @@ fn topic_from_name(name: &str) -> Option<Topic> {
         .iter()
         .copied()
         .find(|t| t.protocol_string() == name)
+}
+
+fn open_node_db(config: &NodeConfig) -> Result<NodeDb, NodeError> {
+    let Some(path) = &config.data_dir else {
+        info!(
+            backend = "memory",
+            "no data_dir configured; using in-memory backend"
+        );
+        return Ok(NodeDb::memory());
+    };
+    std::fs::create_dir_all(path).map_err(|source| NodeError::DataDir {
+        path: path.display().to_string(),
+        source,
+    })?;
+    info!(backend = "rocksdb", path = %path.display(), "opened persistent data directory");
+    Ok(NodeDb::open_rocks(path)?)
+}
+
+fn open_or_initialise_engine(
+    db: NodeDb,
+    chain_spec: ChainSpec,
+) -> Result<Engine<NodeDb>, NodeError> {
+    let already_initialised = db
+        .get(
+            neutrino_storage::Column::Meta,
+            neutrino_consensus_engine::pointers::CHAIN_SPEC_HASH,
+        )
+        .map_err(NodeError::Storage)?
+        .is_some();
+    if already_initialised {
+        let engine =
+            Engine::open(chain_spec, db).map_err(|err| NodeError::Engine(err.to_string()))?;
+        info!(
+            head_height = engine.head_height(),
+            latest_checkpoint_index = engine.latest_checkpoint_index(),
+            "engine resumed from persistent state"
+        );
+        Ok(engine)
+    } else {
+        let engine =
+            Engine::genesis(chain_spec, db).map_err(|err| NodeError::Engine(err.to_string()))?;
+        info!("engine initialised at genesis");
+        Ok(engine)
+    }
 }
 
 fn load_runtime_elf(config: &NodeConfig) -> Result<Option<Vec<u8>>, NodeError> {

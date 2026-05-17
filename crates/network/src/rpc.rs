@@ -256,11 +256,22 @@ pub struct StateByRootRequest {
     pub paths: Vec<Vec<u8>>,
 }
 
-/// `StateByRoot` response carrying trie node payloads.
+/// `StateByRoot` response carrying trie node payloads and any state
+/// values referenced by leaf nodes covered by the response.
+///
+/// M6 nodes serve a one-shot dump of the entire local state when the
+/// requested `state_root` matches their head; the receiver rebuilds
+/// the trie locally and re-derives the root. Real path-based walking
+/// arrives with the M12 snap-sync slice.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateByRootResponse {
-    /// Trie node bytes in the same order as the requested paths.
+    /// Trie node bytes. Each entry is the canonical encoding of one
+    /// `neutrino_trie::Node`; the hash of the bytes equals the
+    /// content-addressed key the local engine stores them under.
     pub nodes: Vec<Vec<u8>>,
+    /// State value bytes referenced by `value_hash` fields inside
+    /// leaf nodes of `nodes`.
+    pub values: Vec<Vec<u8>>,
 }
 
 /// `BlockProofByHash` request: fetch specific block proofs by block hash.

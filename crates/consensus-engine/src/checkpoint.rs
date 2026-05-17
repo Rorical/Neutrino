@@ -243,6 +243,10 @@ impl<DB: Database> Engine<DB> {
             .put_recursive_proof(new_index, &wire_recursive_proof)?;
         self.store_mut().put_latest_checkpoint_index(new_index)?;
         self.update_checkpoint_pointers(new_index, next_finalized_seed);
+        // The new seed must survive restart: otherwise `Engine::open`
+        // would fall back to the genesis seed and forks every running
+        // chain after chunk 0.
+        self.persist_finalized_seed()?;
 
         let checkpoint_hash = checkpoint.hash();
         Ok(CheckpointOutcome {

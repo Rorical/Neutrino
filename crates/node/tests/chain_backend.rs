@@ -230,7 +230,12 @@ async fn duplicate_gossip_block_is_rejected_as_chain_extension_mismatch() {
         .expect_err("second import must fail");
     // The first import advanced head to 1, so the duplicate now looks
     // like a non-extending block (height = 1, but expected is 2).
-    assert!(matches!(err, neutrino_sync::SyncBackendError::Rejected(_)));
+    // `HeightMismatch` and `ParentMismatch` now surface as
+    // `ChainBehind` so the driver can trigger a HeaderBackfill resync.
+    assert!(matches!(
+        err,
+        neutrino_sync::SyncBackendError::ChainBehind(_)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

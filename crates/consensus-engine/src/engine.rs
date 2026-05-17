@@ -12,7 +12,7 @@ use neutrino_trie::Trie;
 
 use crate::clock::SlotClock;
 use crate::error::EngineError;
-use crate::store::{ChainStore, pointers};
+use crate::store::{ChainStore, StoreError, pointers};
 
 /// Engine state machine combining a chain store, slot clock, and the
 /// running head pointers.
@@ -60,23 +60,27 @@ impl<DB: Database> Engine<DB> {
         store.put_tip(chain_spec.genesis_block_hash)?;
         store.put_finalized_head(chain_spec.genesis_block_hash)?;
         store.put_latest_checkpoint_index(0)?;
+        store.put_finalized_seed(chain_spec.genesis_seed)?;
 
         let clock = SlotClock::new(
             chain_spec.genesis_time,
             chain_spec.consensus.slot_duration_secs,
         );
 
+        let genesis_block_hash = chain_spec.genesis_block_hash;
+        let genesis_state_root = chain_spec.genesis_state_root;
+        let genesis_seed = chain_spec.genesis_seed;
         Ok(Self {
-            head_height: 0,
-            head_hash: chain_spec.genesis_block_hash,
-            head_state_root: chain_spec.genesis_state_root,
-            finalized_seed: chain_spec.genesis_seed,
-            latest_finalized_chunk_id: None,
-            latest_checkpoint_index: 0,
-            state: Trie::new(),
             chain_spec,
             store,
             clock,
+            state: Trie::new(),
+            head_height: 0,
+            head_hash: genesis_block_hash,
+            head_state_root: genesis_state_root,
+            finalized_seed: genesis_seed,
+            latest_finalized_chunk_id: None,
+            latest_checkpoint_index: 0,
         })
     }
 
@@ -129,33 +133,67 @@ impl<DB: Database> Engine<DB> {
             (header.height, header.state_root)
         };
 
-        // The finalized seed is the genesis seed at boot; later phases
-        // (chunk finalization) overwrite it. M5 reload is replay-only
-        // so we re-derive from the chain spec; a future phase will
-        // store the seed alongside the latest checkpoint.
+        // Restart resume must observe whatever VRF seed the last
+        // checkpoint folded; falling back to the genesis seed would
+        // silently fork the chain after the first chunk-close.
+        let finalized_seed = store
+            .get_finalized_seed()?
+            .unwrap_or(chain_spec.genesis_seed);
         let _ = finalized_head;
+
         let clock = SlotClock::new(
             chain_spec.genesis_time,
             chain_spec.consensus.slot_duration_secs,
         );
 
-        // M5 does not persist trie nodes yet, so `open()` always starts
-        // with an empty in-memory trie. Re-opening past genesis is
-        // expected to be paired with a replay loop that re-applies
-        // every block; the deterministic-replay test in M5 Phase H
-        // exercises that path.
+        // Rehydrate the state trie from the persisted content-
+        // addressed columns so producers resume with the same root
+        // their head header committed to. Followers that never ran
+        // the runtime have empty `TrieNodes` / `StateValues` columns
+        // and end up with an empty trie, which matches the behaviour
+        // of `Engine::import_block` (which does not yet re-execute).
+        let trie_nodes = store.iter_trie_nodes()?;
+        let state_values = store.iter_state_values()?;
+        let state = Trie::from_persisted(head_state_root, trie_nodes, state_values);
+
         Ok(Self {
-            head_height,
-            head_hash,
-            head_state_root,
-            finalized_seed: chain_spec.genesis_seed,
-            latest_finalized_chunk_id,
-            latest_checkpoint_index,
-            state: Trie::new(),
             chain_spec,
             store,
             clock,
+            state,
+            head_height,
+            head_hash,
+            head_state_root,
+            finalized_seed,
+            latest_finalized_chunk_id,
+            latest_checkpoint_index,
         })
+    }
+
+    /// Persist trie nodes and state values produced since the previous
+    /// flush.
+    ///
+    /// Idempotent: a no-op when no inserts/removes have run since the
+    /// last call. Block production calls this after the head pointer
+    /// advances; the chunk-close path calls it again after applying
+    /// recursive checkpoint side effects.
+    pub fn flush_trie_to_store(&mut self) -> Result<(), StoreError<DB::Error>> {
+        let pending_nodes = self.state.drain_pending_nodes();
+        let pending_values = self.state.drain_pending_values();
+        for (hash, bytes) in pending_nodes {
+            self.store.put_trie_node(&hash, &bytes)?;
+        }
+        for (hash, bytes) in pending_values {
+            self.store.put_state_value(&hash, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the active VRF seed. Called after each chunk-close
+    /// advance so [`Engine::open`] resumes against the same VRF
+    /// eligibility surface the live node was producing under.
+    pub fn persist_finalized_seed(&mut self) -> Result<(), StoreError<DB::Error>> {
+        self.store.put_finalized_seed(self.finalized_seed)
     }
 
     /// Borrow the active chain spec.
@@ -228,11 +266,38 @@ impl<DB: Database> Engine<DB> {
         self.chain_spec.hash()
     }
 
+    /// Read-only view of the in-memory state trie. Primarily a test
+    /// hook: callers querying state in production should go through
+    /// the runtime, not the engine. The returned trie reflects the
+    /// post-execution root recorded in `head_state_root`.
+    #[must_use]
+    pub const fn state(&self) -> &Trie {
+        &self.state
+    }
+
     /// Mutable reference to the in-memory state trie. Crate-internal
     /// because callers must swap the trie out into an [`Overlay`]
     /// during block execution and restore it afterwards.
     pub(crate) const fn state_mut_internal(&mut self) -> &mut Trie {
         &mut self.state
+    }
+
+    /// Replace the in-memory state trie with one rebuilt from a peer's
+    /// `StateByRoot` response.
+    ///
+    /// Callers must have already verified that
+    /// `reconstructed.root() == self.head_state_root()`; the engine
+    /// re-asserts the invariant defensively and panics on mismatch.
+    /// Used by the snap-sync `StateFetch` path so producers that
+    /// joined late can run the runtime against a populated trie
+    /// instead of an empty one.
+    pub fn replace_state_with_reconstructed(&mut self, reconstructed: Trie) {
+        assert_eq!(
+            reconstructed.root(),
+            self.head_state_root,
+            "snap-sync trie root must match the committed head_state_root"
+        );
+        self.state = reconstructed;
     }
 
     /// Advance the in-memory head pointers after a block has been
@@ -410,8 +475,72 @@ mod tests {
         assert_eq!(reopened.head_hash(), engine.head_hash());
         assert_eq!(reopened.head_height(), engine.head_height());
         assert_eq!(reopened.head_state_root(), engine.head_state_root());
+        assert_eq!(reopened.finalized_seed(), engine.finalized_seed());
         assert_eq!(reopened.latest_checkpoint_index(), 0);
         assert_eq!(reopened.latest_finalized_chunk_id(), None);
+    }
+
+    #[test]
+    fn open_rehydrates_finalized_seed_advanced_by_a_chunk_close() {
+        // Restart-resume must observe the same VRF seed the live node
+        // was producing under: returning to the genesis seed would
+        // silently fork the chain after the first chunk-close.
+        let spec = chain_spec();
+        let db = MemoryDatabase::new();
+        let mut engine = Engine::genesis(spec, db).expect("genesis");
+
+        let new_seed: Seed = [0x99; 32];
+        engine.update_checkpoint_pointers(1, new_seed);
+        // Mirror what `checkpoint_chunk` does at the storage layer so
+        // `Engine::open` can rehydrate the same pointers we set.
+        engine
+            .store_mut()
+            .put_latest_checkpoint_index(1)
+            .expect("persist checkpoint index");
+        engine.persist_finalized_seed().expect("persist seed");
+
+        let saved_db = engine.store().db().clone();
+        let spec = chain_spec();
+        drop(engine);
+        let reopened = Engine::open(spec, saved_db).expect("reopen");
+        assert_eq!(reopened.finalized_seed(), new_seed);
+        assert_eq!(reopened.latest_checkpoint_index(), 1);
+    }
+
+    #[test]
+    fn open_rehydrates_persisted_trie_nodes_and_values() {
+        // The engine flushes new trie nodes/values to dedicated
+        // RocksDB columns; `Engine::open` rebuilds the in-memory trie
+        // from those columns so producers resume against the live
+        // root they last committed to. This test exercises the flush
+        // + reload path end-to-end without depending on the runtime
+        // (which has its own integration coverage).
+        let spec = chain_spec();
+        let db = MemoryDatabase::new();
+        let mut engine = Engine::genesis(spec, db).expect("genesis");
+
+        engine
+            .state_mut_internal()
+            .insert(b"alice", b"100".to_vec())
+            .expect("insert alice");
+        engine
+            .state_mut_internal()
+            .insert(b"bob", b"50".to_vec())
+            .expect("insert bob");
+        let trie_root_before = engine.state_mut_internal().root();
+        engine.flush_trie_to_store().expect("flush trie");
+
+        // Walk the persisted columns and reconstruct the trie just
+        // like `Engine::open` does, without going through the engine
+        // head_state_root machinery (that path is covered by the
+        // existing replay tests).
+        let nodes = engine.store().iter_trie_nodes().expect("iter nodes");
+        let values = engine.store().iter_state_values().expect("iter values");
+        let reopened_trie: neutrino_trie::Trie =
+            neutrino_trie::Trie::from_persisted(trie_root_before, nodes, values);
+        assert_eq!(reopened_trie.root(), trie_root_before);
+        assert_eq!(reopened_trie.get(b"alice"), Some(b"100".to_vec()));
+        assert_eq!(reopened_trie.get(b"bob"), Some(b"50".to_vec()));
     }
 
     #[test]

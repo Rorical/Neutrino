@@ -11,6 +11,13 @@ genesis_time = 1700000000
 
 genesis_gas_limit = 30000000
 
+# Shorter slot duration + smaller chunks keep the smoke test bounded:
+# at 1 s/slot and 8-block chunks the smoke test can observe multiple
+# chunk closes (and the seed advancing) inside a few minutes instead
+# of the production defaults' ~9 minutes per chunk.
+slot_duration_secs = 1
+chunk_size = 8
+
 genesis_block_hash_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 genesis_seed_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # The runtime code hash is derived by each node from runtime_elf_path so

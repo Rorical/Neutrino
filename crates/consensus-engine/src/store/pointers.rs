@@ -13,6 +13,14 @@ pub const LATEST_FINALIZED_CHUNK_ID: &[u8] = b"latest_chunk_id";
 /// Highest checkpoint index (genesis is 0).
 pub const LATEST_CHECKPOINT_INDEX: &[u8] = b"latest_ckpt_index";
 
+/// Current VRF seed folded over the latest finalized chunk.
+///
+/// Persisted so restarts after one or more chunks have closed resume
+/// against the same VRF eligibility surface they were producing under;
+/// without it [`Engine::open`] would re-derive the genesis seed and
+/// silently fork.
+pub const FINALIZED_SEED: &[u8] = b"finalized_seed";
+
 /// BLAKE3 hash of the borsh-encoded chain spec.
 pub const CHAIN_SPEC_HASH: &[u8] = b"chain_spec_hash";
 

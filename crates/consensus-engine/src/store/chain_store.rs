@@ -8,7 +8,7 @@ use neutrino_consensus_types::{
     BlockProof, Body, Chunk, ChunkProof, FinalityCert, Header, RecursiveCheckpointProof,
 };
 use neutrino_primitives::{
-    BlockHash, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, Validator,
+    BlockHash, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Seed, Slot, Validator,
 };
 use neutrino_storage::{Column, Database};
 
@@ -24,6 +24,14 @@ extern crate alloc;
 /// a given checkpoint index; consumers can re-derive the validator-set
 /// Merkle root over `(pubkey, stake, status)` from this list.
 pub type ValidatorSetSnapshot = Vec<Validator>;
+
+/// Iteration result for the trie-node and state-value columns.
+///
+/// A list of `(content_hash, bytes)` pairs returned by
+/// [`ChainStore::iter_trie_nodes`] / [`ChainStore::iter_state_values`].
+/// Factored into a type alias so the public signatures do not trip
+/// clippy::type_complexity.
+pub type ContentAddressedEntries = Vec<(Hash, Vec<u8>)>;
 
 /// Typed access layer over a column-family
 /// [`Database`](neutrino_storage::Database) for the consensus engine.
@@ -397,6 +405,68 @@ impl<DB: Database> ChainStore<DB> {
                 .ok()
                 .map(u64::from_be_bytes)
         }))
+    }
+
+    /// Write the currently active VRF seed.
+    ///
+    /// Persistence keeps [`Engine::open`](crate::Engine::open) aligned
+    /// with the live finalized state after every checkpoint advances
+    /// the seed; see `pointers::FINALIZED_SEED` for the rationale.
+    pub fn put_finalized_seed(&mut self, seed: Seed) -> Result<(), StoreError<DB::Error>> {
+        self.put_raw(Column::Finalized, pointers::FINALIZED_SEED, &seed)
+    }
+
+    /// Read the currently active VRF seed.
+    pub fn get_finalized_seed(&self) -> Result<Option<Seed>, StoreError<DB::Error>> {
+        let raw = self.get_raw(Column::Finalized, pointers::FINALIZED_SEED)?;
+        Ok(raw.and_then(|bytes| Seed::try_from(bytes.as_slice()).ok()))
+    }
+
+    /// Iterate every persisted `(hash, bytes)` pair in
+    /// [`Column::TrieNodes`]. Used by `Engine::open` to rehydrate the
+    /// runtime state trie after restart.
+    pub fn iter_trie_nodes(&self) -> Result<ContentAddressedEntries, StoreError<DB::Error>> {
+        self.iter_hashed_column(Column::TrieNodes)
+    }
+
+    /// Iterate every persisted `(hash, bytes)` pair in
+    /// [`Column::StateValues`]. Companion to [`Self::iter_trie_nodes`].
+    pub fn iter_state_values(&self) -> Result<ContentAddressedEntries, StoreError<DB::Error>> {
+        self.iter_hashed_column(Column::StateValues)
+    }
+
+    /// Write a single trie node `(hash, bytes)` pair to
+    /// [`Column::TrieNodes`].
+    pub fn put_trie_node(
+        &mut self,
+        hash: &Hash,
+        bytes: &[u8],
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.put_raw(Column::TrieNodes, hash, bytes)
+    }
+
+    /// Write a single state value `(hash, bytes)` pair to
+    /// [`Column::StateValues`].
+    pub fn put_state_value(
+        &mut self,
+        hash: &Hash,
+        bytes: &[u8],
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.put_raw(Column::StateValues, hash, bytes)
+    }
+
+    fn iter_hashed_column(
+        &self,
+        column: Column,
+    ) -> Result<ContentAddressedEntries, StoreError<DB::Error>> {
+        let mut out = Vec::new();
+        for (key, value) in self.db.iter_column(column).map_err(StoreError::Database)? {
+            let Ok(hash) = Hash::try_from(key.as_slice()) else {
+                continue;
+            };
+            out.push((hash, value));
+        }
+        Ok(out)
     }
 
     // ---------- Meta ----------

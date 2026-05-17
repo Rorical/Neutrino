@@ -2,8 +2,9 @@
 #
 # Four nodes on a private bridge network. `node1` acts as the bootnode
 # (its container hostname is dialable by name on the user-defined bridge).
-# All nodes share an identical chain spec and run the real ChainBackend
-# against an in-memory database (no persistent storage yet).
+# All nodes share an identical chain spec, run the real `ChainBackend`,
+# and persist their state under `/var/lib/neutrino` so the smoke test
+# can stop one node and restart it from on-disk state.
 #
 # What this proves today:
 # - The binary starts cleanly under Docker.
@@ -11,10 +12,13 @@
 # - Peers discover each other through the configured bootnode.
 # - Chain-spec hash matching succeeds during the status handshake.
 # - Topic subscriptions complete on all three nodes.
-# - node1 produces runtime-backed blocks and block proofs.
-# - node2/node3 import live gossipped blocks.
+# - node1 produces runtime-backed blocks, proves them, finalizes
+#   chunks, and gossips recursive checkpoints.
+# - node2/node3 import live gossipped blocks and checkpoints.
 # - node4 starts late and syncs from genesis through HeaderBackfill,
 #   StateFetch, ProofBackfill, and Following.
+# - node2 survives a stop + restart against its on-disk state without
+#   re-bootstrapping from genesis.
 
 services:
   node1:
@@ -30,6 +34,7 @@ services:
     volumes:
       - ./configs/node1.toml:/etc/neutrino/config.toml:ro
       - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
+      - node1-data:/var/lib/neutrino
     ports:
       - "30301:30303/tcp"
     healthcheck:
@@ -48,6 +53,7 @@ services:
     volumes:
       - ./configs/node2.toml:/etc/neutrino/config.toml:ro
       - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
+      - node2-data:/var/lib/neutrino
     ports:
       - "30302:30303/tcp"
     depends_on:
@@ -69,6 +75,7 @@ services:
     volumes:
       - ./configs/node3.toml:/etc/neutrino/config.toml:ro
       - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
+      - node3-data:/var/lib/neutrino
     ports:
       - "30303:30303/tcp"
     depends_on:
@@ -90,6 +97,7 @@ services:
     volumes:
       - ./configs/node4.toml:/etc/neutrino/config.toml:ro
       - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
+      - node4-data:/var/lib/neutrino
     ports:
       - "30304:30303/tcp"
     depends_on:
@@ -104,3 +112,9 @@ services:
 networks:
   neutrino-m6:
     driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:

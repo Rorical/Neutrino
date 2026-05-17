@@ -4,9 +4,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use std::path::Path;
 
-use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
+use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch};
 
-use crate::{ALL_COLUMNS, Batch, BatchOp, Column, Database};
+use crate::{ALL_COLUMNS, Batch, BatchOp, Column, ColumnSnapshot, Database};
 
 /// Error returned by [`RocksDbDatabase`].
 #[derive(Debug)]
@@ -39,6 +39,15 @@ impl From<rocksdb::Error> for RocksDbError {
 /// Persistent RocksDB storage backend.
 pub struct RocksDbDatabase {
     db: DB,
+}
+
+impl fmt::Debug for RocksDbDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `rocksdb::DB` does not implement `Debug` and exposing its
+        // internals would not be useful anyway; a stable opaque label
+        // keeps consumers like the node `Debug` derives happy.
+        f.debug_struct("RocksDbDatabase").finish_non_exhaustive()
+    }
 }
 
 impl RocksDbDatabase {
@@ -96,6 +105,16 @@ impl Database for RocksDbDatabase {
             }
         }
         self.db.write(write_batch).map_err(Into::into)
+    }
+
+    fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
+        let cf = self.cf(column)?;
+        let mut out = Vec::new();
+        for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (key, value) = entry?;
+            out.push((key.into_vec(), value.into_vec()));
+        }
+        Ok(out)
     }
 }
 

@@ -5,5 +5,6 @@ listen = ["/ip4/0.0.0.0/tcp/30303"]
 bootnodes = []
 chain_spec_path = "/etc/neutrino/chain-spec.toml"
 runtime_elf_path = "/usr/local/lib/neutrino-default-runtime"
+data_dir = "/var/lib/neutrino"
 proposer_ikm_hex = "4242424242424242424242424242424242424242424242424242424242424242"
 proposer_index = 0

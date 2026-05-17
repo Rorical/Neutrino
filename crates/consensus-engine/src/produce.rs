@@ -250,6 +250,10 @@ impl<DB: Database> Engine<DB> {
         self.store_mut().put_tip(block_hash)?;
 
         self.update_head_internal(height, block_hash, outcome.state_root_after);
+        // Producers own the canonical state trie; persist whatever
+        // nodes/values the runtime just emitted so a restart resumes
+        // at the same trie root the new head commits to.
+        self.flush_trie_to_store()?;
 
         Ok(Some(ProductionOutcome {
             block,

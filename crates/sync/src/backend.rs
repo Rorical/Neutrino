@@ -30,6 +30,15 @@ pub enum SyncBackendError {
     /// Backend was asked for data it does not yet have.
     #[error("not available: {0}")]
     NotAvailable(String),
+    /// Peer data could not be imported because the local chain is
+    /// missing an earlier link.
+    ///
+    /// Distinct from [`Self::Rejected`] so the driver can reset the
+    /// sync FSM into `HeaderBackfill` instead of treating the message
+    /// as malicious. Surfaced by `verify_and_import_gossip_block`
+    /// when the incoming header does not extend the local head.
+    #[error("local chain is behind peer: {0}")]
+    ChainBehind(String),
 }
 
 /// Result of importing a batch of recursive checkpoint proofs.
@@ -140,14 +149,21 @@ pub trait SyncBackend: Send + Sync + 'static {
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError>;
 
-    /// Persist the supplied trie nodes under `root`, then report which
-    /// child paths the driver should fetch next (driver-controlled trie
-    /// walk).
+    /// Persist the supplied trie nodes (and the state values their
+    /// leaves reference) under `root`, then report which child paths
+    /// the driver should fetch next (driver-controlled trie walk).
+    ///
+    /// `values` carries the contents of every leaf node in `nodes`;
+    /// the M6 backend rebuilds the trie locally from this combined
+    /// payload and rejects the import when the reconstructed root
+    /// differs from `root`. M12 will replace this single-shot call
+    /// with a per-path streaming variant.
     async fn import_state_nodes(
         &self,
         root: StateRoot,
         paths: Vec<Vec<u8>>,
         nodes: Vec<Vec<u8>>,
+        values: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError>;
 
     /// Verify each block proof, then persist all accepted proofs.

@@ -127,6 +127,13 @@ const STK_VALUE_LEN: usize = 40;
 /// Validator-set accumulator key.
 const VS_KEY: &[u8] = b"vs:active";
 const VS_VALUE_LEN: usize = 32;
+/// Validator-set registry key — stores concatenated 48-byte BLS
+/// pubkeys of every active validator.
+const VS_REG_KEY: &[u8] = b"vs:reg";
+/// Validator-set snapshot key — stores the full serialised set.
+const VS_SNAP_KEY: &[u8] = b"vs:snapshot";
+/// Maximum validator count the runtime can represent.
+const MAX_VALIDATORS: usize = 32;
 
 /// ABI abort code surfaced on a failed Ed25519 signature check.
 const ABORT_SIGNATURE: u32 = 1;
@@ -299,6 +306,138 @@ fn update_validator_set(op: u8, bls_pk: &[u8; BLS_KEY_LEN], new_stake: u64) {
         VS_KEY.len() as u32,
         out.as_ptr() as u32,
         VS_VALUE_LEN as u32,
+    );
+
+    // Also maintain the registry and snapshot for engine consumption.
+    update_registry_and_snapshot(bls_pk, new_stake);
+}
+
+/// Read the raw registry bytes from `vs:reg`. Returns the number
+/// of 48-byte entries read into `buf`.
+fn reg_read(buf: &mut [u8; MAX_VALIDATORS * BLS_KEY_LEN]) -> usize {
+    let (status, len) = syscalls::state_read(
+        VS_REG_KEY.as_ptr() as u32,
+        VS_REG_KEY.len() as u32,
+        buf.as_mut_ptr() as u32,
+        buf.len() as u32,
+    );
+    if status != STATUS_OK && status != STATUS_NOT_FOUND {
+        syscalls::abort(status);
+    }
+    (len as usize).min(buf.len()) / BLS_KEY_LEN
+}
+
+/// Write `count` 48-byte entries from `buf` to `vs:reg`.
+fn reg_write(buf: &[u8; MAX_VALIDATORS * BLS_KEY_LEN], count: usize) {
+    syscalls::state_write(
+        VS_REG_KEY.as_ptr() as u32,
+        VS_REG_KEY.len() as u32,
+        buf.as_ptr() as u32,
+        (count * BLS_KEY_LEN) as u32,
+    );
+}
+
+/// Find `pk` in the registry, returning its index or `None`.
+fn reg_find(
+    buf: &[u8; MAX_VALIDATORS * BLS_KEY_LEN],
+    count: usize,
+    pk: &[u8; BLS_KEY_LEN],
+) -> Option<usize> {
+    for i in 0..count {
+        let off = i * BLS_KEY_LEN;
+        if buf[off..off + BLS_KEY_LEN] == *pk {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Insert `pk` into the registry (sorted). Panics via abort if full.
+fn reg_insert(
+    buf: &mut [u8; MAX_VALIDATORS * BLS_KEY_LEN],
+    count: usize,
+    pk: &[u8; BLS_KEY_LEN],
+) -> usize {
+    if count >= MAX_VALIDATORS {
+        syscalls::abort(ABORT_OVERLONG_READ);
+    }
+    // Find insertion point for sorted order.
+    let mut pos = count;
+    for i in 0..count {
+        let off = i * BLS_KEY_LEN;
+        if pk < buf[off..off + BLS_KEY_LEN].try_into().expect("48") {
+            pos = i;
+            break;
+        }
+    }
+    // Shift right by moving elements one-by-one from the end.
+    if pos < count {
+        for i in (pos..count).rev() {
+            let (dst_start, src_start) = ((i + 1) * BLS_KEY_LEN, i * BLS_KEY_LEN);
+            // Copy through a stack temp to avoid aliasing borrows.
+            let mut tmp = [0u8; BLS_KEY_LEN];
+            tmp.copy_from_slice(&buf[src_start..src_start + BLS_KEY_LEN]);
+            buf[dst_start..dst_start + BLS_KEY_LEN].copy_from_slice(&tmp);
+        }
+    }
+    let ent = pos * BLS_KEY_LEN;
+    buf[ent..ent + BLS_KEY_LEN].copy_from_slice(pk);
+    pos
+}
+
+/// Remove entry at `index` from the registry.
+fn reg_remove(buf: &mut [u8; MAX_VALIDATORS * BLS_KEY_LEN], count: usize, index: usize) {
+    if index >= count {
+        return;
+    }
+    for i in index..count.saturating_sub(1) {
+        let src_start = (i + 1) * BLS_KEY_LEN;
+        let dst_start = i * BLS_KEY_LEN;
+        let mut tmp = [0u8; BLS_KEY_LEN];
+        tmp.copy_from_slice(&buf[src_start..src_start + BLS_KEY_LEN]);
+        buf[dst_start..dst_start + BLS_KEY_LEN].copy_from_slice(&tmp);
+    }
+}
+
+/// Update the registry and rebuild the snapshot in one pass.
+fn update_registry_and_snapshot(bls_pk: &[u8; BLS_KEY_LEN], new_stake: u64) {
+    let mut reg_buf = [0u8; MAX_VALIDATORS * BLS_KEY_LEN];
+    let mut count = reg_read(&mut reg_buf);
+
+    let active = new_stake != 0;
+    match (reg_find(&reg_buf, count, bls_pk), active) {
+        (Some(_), true) => {} // already present, no-op
+        (Some(pos), false) => {
+            reg_remove(&mut reg_buf, count, pos);
+            count = count.saturating_sub(1);
+        }
+        (None, true) => {
+            reg_insert(&mut reg_buf, count, bls_pk);
+            count = count.saturating_add(1);
+        }
+        (None, false) => {} // not present, not becoming active
+    }
+    reg_write(&reg_buf, count);
+
+    // Rebuild vs:snapshot.
+    let mut snap = [0u8; 4 + MAX_VALIDATORS * 57];
+    snap[..4].copy_from_slice(&(count as u32).to_le_bytes());
+    for i in 0..count {
+        let pk: [u8; BLS_KEY_LEN] = reg_buf[i * BLS_KEY_LEN..(i + 1) * BLS_KEY_LEN]
+            .try_into()
+            .expect("48-byte bls");
+        let stk = read_stake_account(&pk);
+        let off = 4 + i * 57;
+        snap[off..off + BLS_KEY_LEN].copy_from_slice(&pk);
+        snap[off + 48..off + 56].copy_from_slice(&stk.staked.to_le_bytes());
+        snap[off + 56] = u8::from(stk.staked == 0);
+    }
+    let snap_len = 4 + count * 57;
+    syscalls::state_write(
+        VS_SNAP_KEY.as_ptr() as u32,
+        VS_SNAP_KEY.len() as u32,
+        snap.as_ptr() as u32,
+        snap_len as u32,
     );
 }
 

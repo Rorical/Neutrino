@@ -6,7 +6,7 @@
 //! completion, and packages the result into a [`BlockOutcome`] or
 //! [`BlockError`].
 
-use neutrino_primitives::StateRoot;
+use neutrino_primitives::{StateRoot, Validator};
 use neutrino_runtime_abi::{
     BlockContext, TxValidity, TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
 };
@@ -35,6 +35,18 @@ pub const DEFAULT_MEMORY_BUDGET: u32 = 4 * 1024 * 1024;
 /// derive the next-chunk validator-set commitment.
 pub const VALIDATOR_SET_KEY: &[u8] = b"vs:active";
 
+/// Convention key the runtime writes the full validator-set snapshot
+/// under. The host reads this after every block execution and surfaces
+/// it through [`BlockOutcome::next_validator_set`] so the engine can
+/// recompute proposer eligibility, BFT quorum weighting, and the
+/// canonical validator-set root from the live list.
+#[allow(clippy::too_long_first_doc_paragraph)]
+pub const VS_SNAPSHOT_KEY: &[u8] = b"vs:snapshot";
+
+/// Per-validator encoding length in the `vs:snapshot` value:
+/// `pubkey(48) || effective_stake(8 LE) || slashed(1)`.
+const VS_SNAPSHOT_ENTRY_LEN: usize = 48 + 8 + 1;
+
 /// Successful block execution outcome. Carries the new state root, the
 /// halt reason, gas accounting, runtime output bytes, and any logs.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -49,6 +61,12 @@ pub struct BlockOutcome {
     /// written that key (e.g. genesis-empty trie). The engine carries
     /// this through to the next chunk's `next_validator_set_root`.
     pub next_validator_set_root: Option<StateRoot>,
+    /// Full active validator set the runtime published at
+    /// [`VS_SNAPSHOT_KEY`], or `None` when the set did not change in
+    /// this block. The engine uses this list (not
+    /// `chain_spec().initial_validators`) for proposer eligibility,
+    /// BFT quorum weighting, and deriving the canonical root.
+    pub next_validator_set: Option<Vec<Validator>>,
     /// Reason the runtime halted (always a [`Halt`]; traps surface as
     /// [`BlockError`] instead).
     pub halt: Halt,
@@ -122,6 +140,7 @@ struct RuntimeRunOutcome {
     state_root_before: StateRoot,
     state_root_after: StateRoot,
     next_validator_set_root: Option<StateRoot>,
+    next_validator_set: Option<Vec<Validator>>,
     halt: Halt,
     gas_used: u64,
     gas_limit: u64,
@@ -161,6 +180,7 @@ pub fn run_block(
         state_root_before: outcome.state_root_before,
         state_root_after: outcome.state_root_after,
         next_validator_set_root: outcome.next_validator_set_root,
+        next_validator_set: outcome.next_validator_set,
         halt: outcome.halt,
         gas_used: outcome.gas_used,
         gas_limit: outcome.gas_limit,
@@ -280,16 +300,58 @@ fn run_runtime_entrypoint(
         .get(VALIDATOR_SET_KEY)
         .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
 
+    // The runtime is also contractually required to write the full
+    // validator list at `VS_SNAPSHOT_KEY` whenever the set changes.
+    let next_validator_set = overlay
+        .get(VS_SNAPSHOT_KEY)
+        .and_then(|bytes| decode_validator_snapshot(&bytes));
+
     Ok(RuntimeRunOutcome {
         state_root_before,
         state_root_after,
         next_validator_set_root,
+        next_validator_set,
         halt,
         gas_used,
         gas_limit,
         output,
         logs,
     })
+}
+
+/// Decode the runtime's `vs:snapshot` value into a `Vec<Validator>`.
+///
+/// Encoding: `count: u32 LE` then for each entry:
+/// `pubkey(48) || effective_stake(8 LE) || slashed(1)`.
+/// Total entry length is [`VS_SNAPSHOT_ENTRY_LEN`] (57 bytes).
+/// Returns `None` when the bytes are too short or `count` entries
+/// would exceed the buffer length.
+fn decode_validator_snapshot(raw: &[u8]) -> Option<Vec<Validator>> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(raw[..4].try_into().ok()?) as usize;
+    let expected = 4_usize.checked_add(count.checked_mul(VS_SNAPSHOT_ENTRY_LEN)?)?;
+    if raw.len() < expected {
+        return None;
+    }
+    let mut validators = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 4 + i * VS_SNAPSHOT_ENTRY_LEN;
+        let pubkey: [u8; 48] = raw[off..off + 48].try_into().ok()?;
+        let effective_stake = u64::from_le_bytes(raw[off + 48..off + 56].try_into().ok()?);
+        let slashed = raw[off + 56] != 0;
+        validators.push(Validator {
+            pubkey,
+            withdrawal_credentials: [0; 32],
+            effective_stake,
+            slashed,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        });
+    }
+    Some(validators)
 }
 
 const fn invalid_elf() -> BlockError {

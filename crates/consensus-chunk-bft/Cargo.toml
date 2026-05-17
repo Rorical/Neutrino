@@ -12,10 +12,11 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["neutrino-consensus-types/std", "neutrino-primitives/std"]
+std = ["neutrino-consensus-types/std", "neutrino-crypto", "neutrino-primitives/std"]
 
 [dependencies]
 neutrino-consensus-types = { workspace = true }
+neutrino-crypto          = { workspace = true, optional = true }
 neutrino-primitives      = { workspace = true }
 
 [lints]

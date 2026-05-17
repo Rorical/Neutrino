@@ -407,6 +407,30 @@ impl<DB: Database> ChainStore<DB> {
         }))
     }
 
+    /// Write the latest validator-set snapshot index.
+    pub fn put_latest_validator_set_index(
+        &mut self,
+        index: CheckpointIndex,
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.put_raw(
+            Column::Finalized,
+            pointers::LATEST_VALIDATOR_SET_INDEX,
+            &keys::checkpoint_index_key(index),
+        )
+    }
+
+    /// Read the latest validator-set snapshot index.
+    pub fn get_latest_validator_set_index(
+        &self,
+    ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
+        let raw = self.get_raw(Column::Finalized, pointers::LATEST_VALIDATOR_SET_INDEX)?;
+        Ok(raw.and_then(|b| {
+            <[u8; 8]>::try_from(b.as_slice())
+                .ok()
+                .map(u64::from_be_bytes)
+        }))
+    }
+
     /// Write the currently active VRF seed.
     ///
     /// Persistence keeps [`Engine::open`](crate::Engine::open) aligned

@@ -5,7 +5,7 @@
 //! reuse this struct via additional `impl` blocks).
 
 use neutrino_primitives::{
-    BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot,
+    BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot, Validator,
 };
 use neutrino_storage::Database;
 use neutrino_trie::Trie;
@@ -33,6 +33,7 @@ pub struct Engine<DB: Database> {
     finalized_seed: Seed,
     latest_finalized_chunk_id: Option<ChunkId>,
     latest_checkpoint_index: CheckpointIndex,
+    active_validator_set: Vec<Validator>,
 }
 
 impl<DB: Database> Engine<DB> {
@@ -70,6 +71,7 @@ impl<DB: Database> Engine<DB> {
         let genesis_block_hash = chain_spec.genesis_block_hash;
         let genesis_state_root = chain_spec.genesis_state_root;
         let genesis_seed = chain_spec.genesis_seed;
+        let active_validator_set = chain_spec.initial_validators.clone();
         Ok(Self {
             chain_spec,
             store,
@@ -81,6 +83,7 @@ impl<DB: Database> Engine<DB> {
             finalized_seed: genesis_seed,
             latest_finalized_chunk_id: None,
             latest_checkpoint_index: 0,
+            active_validator_set,
         })
     }
 
@@ -156,6 +159,15 @@ impl<DB: Database> Engine<DB> {
         let state_values = store.iter_state_values()?;
         let state = Trie::from_persisted(head_state_root, trie_nodes, state_values);
 
+        // Rehydrate the latest validator-set snapshot so producers
+        // resume with the correct active set for eligibility and BFT
+        // quorum weighting. Falls back to `initial_validators` when
+        // no snapshot beyond genesis has been persisted.
+        let active_index = store.get_latest_validator_set_index()?.unwrap_or(0);
+        let active_validator_set = store
+            .get_validator_set_snapshot(active_index)?
+            .unwrap_or_else(|| chain_spec.initial_validators.clone());
+
         Ok(Self {
             chain_spec,
             store,
@@ -167,6 +179,7 @@ impl<DB: Database> Engine<DB> {
             finalized_seed,
             latest_finalized_chunk_id,
             latest_checkpoint_index,
+            active_validator_set,
         })
     }
 
@@ -240,6 +253,29 @@ impl<DB: Database> Engine<DB> {
     #[must_use]
     pub const fn head_state_root(&self) -> StateRoot {
         self.head_state_root
+    }
+
+    /// The active validator set currently driving proposer eligibility
+    /// and BFT quorum weighting.
+    #[must_use]
+    pub fn active_validator_set(&self) -> &[Validator] {
+        &self.active_validator_set
+    }
+
+    /// Replace the active validator set. Called by block production
+    /// when a block commits a new set.
+    pub(crate) fn set_active_validator_set(&mut self, set: Vec<Validator>) {
+        self.active_validator_set = set;
+    }
+
+    /// Latest persisted validator-set snapshot index.
+    #[must_use]
+    pub(crate) fn latest_validator_set_index(&self) -> CheckpointIndex {
+        self.store
+            .get_latest_validator_set_index()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     /// Finalized seed currently used to evaluate VRF eligibility.

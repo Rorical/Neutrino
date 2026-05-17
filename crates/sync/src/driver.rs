@@ -356,11 +356,7 @@ impl SyncDriver {
                 Some(RpcResponse::Status(self.backend.local_status().await))
             }
             RpcRequest::Metadata(MetadataRequest) => {
-                // Stage 5 sends a minimal stub. Real role/subnet
-                // advertising arrives with M7 multi-validator.
-                Some(RpcResponse::Metadata(
-                    neutrino_network::rpc::Metadata::default(),
-                ))
+                Some(RpcResponse::Metadata(self.backend.local_metadata().await))
             }
             RpcRequest::Ping(p) => Some(RpcResponse::Ping(p)),
             RpcRequest::BlocksByRange(BlocksByRangeRequest {

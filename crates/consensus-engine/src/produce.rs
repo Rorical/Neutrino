@@ -11,7 +11,7 @@ use core::mem;
 use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_consensus_vrf::{VrfError, total_active_stake};
 use neutrino_primitives::{
-    BlockHash, BlsSignature, Hash, Height, Slot, StateRoot, ZERO_HASH, blake3_256,
+    BlockHash, BlsSignature, Hash, Height, Slot, StateRoot, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_runtime_abi::BlockContext;
 use neutrino_runtime_host::{BlockError, BlockOutcome, Overlay, run_block};
@@ -154,6 +154,9 @@ pub struct ProductionOutcome {
     /// if any. Forwarded into `header.runtime_extra` and surfaced
     /// here for chunk-level consumers in later phases.
     pub next_validator_set_root: Option<StateRoot>,
+    /// Full active validator set when the runtime changed it in this
+    /// block, `None` otherwise.
+    pub next_validator_set: Option<Vec<Validator>>,
 }
 
 impl<DB: Database> Engine<DB> {
@@ -197,8 +200,7 @@ impl<DB: Database> Engine<DB> {
             .ok_or(ProductionError::HeightOverflow)?;
         let parent_state_root = self.head_state_root();
 
-        let encoded_body =
-            encode_runtime_body_with_validators(&body, &self.chain_spec().initial_validators)?;
+        let encoded_body = encode_runtime_body_with_validators(&body, self.active_validator_set())?;
         let ctx = BlockContext {
             slot,
             height,
@@ -229,6 +231,7 @@ impl<DB: Database> Engine<DB> {
 
         let roots = compute_body_roots(&body, &encoded_body);
         let timestamp = self.clock().timestamp_for(slot);
+        let next_validator_set_root = compute_next_validator_set_root(&outcome);
         let header = seal_header(
             self.chain_spec().chain_id,
             cfg.proposer,
@@ -240,6 +243,7 @@ impl<DB: Database> Engine<DB> {
             &roots,
             timestamp,
             gas_limit,
+            next_validator_set_root,
         );
 
         let block = Block { header, body };
@@ -257,12 +261,24 @@ impl<DB: Database> Engine<DB> {
         // at the same trie root the new head commits to.
         self.flush_trie_to_store()?;
 
+        // If the runtime produced a new validator set, persist it and
+        // adopt it as the active set for the next block.
+        if let Some(new_set) = &outcome.next_validator_set {
+            let next_idx = self.latest_validator_set_index().saturating_add(1);
+            self.store_mut()
+                .put_validator_set_snapshot(next_idx, new_set)?;
+            self.store_mut().put_latest_validator_set_index(next_idx)?;
+            self.set_active_validator_set(new_set.clone());
+        }
+        let next_validator_set_root = compute_next_validator_set_root(&outcome);
+
         Ok(Some(ProductionOutcome {
             block,
             block_hash,
             state_root_after: outcome.state_root_after,
             gas_used: outcome.gas_used,
-            next_validator_set_root: outcome.next_validator_set_root,
+            next_validator_set_root,
+            next_validator_set: outcome.next_validator_set,
         }))
     }
 
@@ -271,7 +287,7 @@ impl<DB: Database> Engine<DB> {
         slot: Slot,
         proposer: &ProposerKey,
     ) -> Result<Option<ProposerEligibility>, ProductionError<DB::Error>> {
-        let active_set = &self.chain_spec().initial_validators;
+        let active_set = self.active_validator_set();
         let index = proposer.validator_index();
         let position = usize::try_from(index).expect("u32 fits usize on supported targets");
         let validator = active_set
@@ -330,6 +346,7 @@ fn seal_header(
     roots: &BodyRoots,
     timestamp: u64,
     gas_limit: u64,
+    next_validator_set_root: Option<StateRoot>,
 ) -> Header {
     let mut header = Header {
         version: 1,
@@ -344,7 +361,7 @@ fn seal_header(
         slashings_root: ZERO_HASH,
         validator_ops_root: ZERO_HASH,
         da_root: ZERO_HASH,
-        runtime_extra: outcome.next_validator_set_root.unwrap_or(ZERO_HASH),
+        runtime_extra: next_validator_set_root.unwrap_or(ZERO_HASH),
         gas_used: outcome.gas_used,
         gas_limit,
         timestamp,
@@ -359,4 +376,20 @@ fn seal_header(
 #[derive(Clone, Copy, Debug)]
 struct ProposerEligibility {
     vrf_proof: BlsSignature,
+}
+
+/// Derive the next-validator-set root from the block outcome.
+///
+/// When the runtime published a full snapshot, compute
+/// `validator_set_root` from the concrete list, which matches what
+/// the engine will use for eligibility and BFT. When no snapshot is
+/// present, fall back to the accumulator root the runtime wrote at
+/// `vs:active`.
+fn compute_next_validator_set_root(outcome: &BlockOutcome) -> Option<StateRoot> {
+    outcome
+        .next_validator_set
+        .as_ref()
+        .map_or(outcome.next_validator_set_root, |set| {
+            Some(crate::validator_set::validator_set_root(set))
+        })
 }

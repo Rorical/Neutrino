@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use neutrino_consensus_types::{Block, BlockProof, RecursiveCheckpointProof};
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
-    RecursiveProofLatestResponse, StateByRootResponse, Status,
+    BlocksByRootResponse, ChunkProofByIdResponse, Metadata, RecursiveProofByIndexResponse,
+    RecursiveProofLatestResponse, StateByRootResponse, Status, role_flags,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
@@ -93,6 +93,15 @@ pub struct ProofsImported {
 pub trait SyncBackend: Send + Sync + 'static {
     /// Build a [`Status`] payload reflecting the local chain head.
     async fn local_status(&self) -> Status;
+
+    /// Build a [`Metadata`] payload advertising local peer capabilities.
+    async fn local_metadata(&self) -> Metadata {
+        Metadata {
+            seq_number: 0,
+            vote_subnet_bits: 0,
+            role_flags: role_flags::FULL_NODE,
+        }
+    }
 
     /// Build a [`LocalProgress`] snapshot for the sync FSM.
     async fn local_progress(&self) -> LocalProgress;

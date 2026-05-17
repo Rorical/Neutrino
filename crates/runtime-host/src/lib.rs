@@ -31,8 +31,8 @@ pub mod pointer;
 pub mod scratch;
 
 pub use block_runner::{
-    BlockError, BlockOutcome, TransactionValidationError, VALIDATOR_SET_KEY, run_block,
-    validate_transaction,
+    BlockError, BlockOutcome, TransactionValidationError, VALIDATOR_SET_KEY, VS_SNAPSHOT_KEY,
+    run_block, validate_transaction,
 };
 pub use host::{DispatchingHost, EmittedLog};
 pub use overlay::{Overlay, OverlayEntry};

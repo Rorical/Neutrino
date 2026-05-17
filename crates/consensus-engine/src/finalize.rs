@@ -371,7 +371,12 @@ impl<DB: Database> Engine<DB> {
         let start_block_hash = *inputs.block_hashes.first().expect("non-empty hashes");
         let end_block_hash = *inputs.block_hashes.last().expect("non-empty hashes");
 
-        let active_validator_set_root = self.chain_spec().genesis_validator_set_root;
+        let previous_checkpoint_index = self.latest_checkpoint_index();
+        let previous = self
+            .store()
+            .get_checkpoint(previous_checkpoint_index)?
+            .ok_or_else(|| FinalizeError::Engine(EngineError::NotInitialised))?;
+        let active_validator_set_root = previous.end_validator_set_root;
         let next_validator_set_root = if last_header.runtime_extra == ZERO_HASH {
             active_validator_set_root
         } else {
@@ -469,7 +474,7 @@ impl<DB: Database> Engine<DB> {
         voter: &ProposerKey,
         active_validator_set_root: Hash,
     ) -> Result<FinalityCert, FinalizeError<DB::Error>> {
-        let active_set = self.chain_spec().initial_validators.clone();
+        let active_set = self.active_validator_set().to_vec();
         if active_set.is_empty() {
             return Err(FinalizeError::EmptyActiveSet);
         }

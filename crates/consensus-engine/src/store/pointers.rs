@@ -21,6 +21,12 @@ pub const LATEST_CHECKPOINT_INDEX: &[u8] = b"latest_ckpt_index";
 /// silently fork.
 pub const FINALIZED_SEED: &[u8] = b"finalized_seed";
 
+/// Index of the currently active validator-set snapshot.
+///
+/// Persisted so restarts resume with the correct active validator list
+/// for proposer eligibility and BFT quorum weighting.
+pub const LATEST_VALIDATOR_SET_INDEX: &[u8] = b"latest_vs_idx";
+
 /// BLAKE3 hash of the borsh-encoded chain spec.
 pub const CHAIN_SPEC_HASH: &[u8] = b"chain_spec_hash";
 

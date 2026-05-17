@@ -17,7 +17,7 @@ use core::fmt;
 use neutrino_consensus_types::{
     AggregatedVote, Chunk, FinalityCert, FinalityVote, FinalityVotePhase,
 };
-use neutrino_primitives::{Hash, Validator};
+use neutrino_primitives::{BitVec, BlsSignature, Hash, Validator};
 
 /// Result of attempting to finalize a chunk round.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -47,6 +47,10 @@ pub enum BftError {
     InvalidAggregationBits,
     /// No unslashed positive stake was represented by the vote bits.
     EmptyVote,
+    /// Aggregating BLS signatures from disjoint partial votes failed.
+    InvalidAggregateSignature,
+    /// Signature aggregation is unavailable without the `std` feature.
+    SignatureAggregationUnavailable,
     /// The chunk's active validator-set root does not match the previous checkpoint.
     ValidatorSetRootMismatch,
 }
@@ -64,6 +68,10 @@ impl fmt::Display for BftError {
                 f.write_str("aggregation bits do not match active validator set")
             }
             Self::EmptyVote => f.write_str("finality vote carries no active stake"),
+            Self::InvalidAggregateSignature => f.write_str("invalid aggregate vote signature"),
+            Self::SignatureAggregationUnavailable => {
+                f.write_str("signature aggregation requires the std feature")
+            }
             Self::ValidatorSetRootMismatch => {
                 f.write_str("active validator-set root does not match previous checkpoint")
             }
@@ -77,31 +85,55 @@ impl std::error::Error for BftError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VoteAccumulator {
     phase: FinalityVotePhase,
-    best_vote: Option<FinalityVote>,
-    best_stake: u64,
+    aggregate: Option<AggregatedVote>,
+    aggregate_stake: u64,
 }
 
 impl VoteAccumulator {
     const fn new(phase: FinalityVotePhase) -> Self {
         Self {
             phase,
-            best_vote: None,
-            best_stake: 0,
+            aggregate: None,
+            aggregate_stake: 0,
         }
     }
 
-    fn record(&mut self, vote: FinalityVote, stake: u64) {
-        if stake > self.best_stake {
-            self.best_vote = Some(vote);
-            self.best_stake = stake;
+    fn record(&mut self, vote: FinalityVote, stake: u64) -> Result<(), BftError> {
+        let incoming = AggregatedVote {
+            aggregation_bits: vote.aggregation_bits,
+            signature: vote.signature,
+        };
+        match &mut self.aggregate {
+            None => {
+                self.aggregate = Some(incoming);
+                self.aggregate_stake = stake;
+            }
+            Some(existing)
+                if bit_vecs_are_disjoint(
+                    &existing.aggregation_bits,
+                    &incoming.aggregation_bits,
+                ) =>
+            {
+                existing.signature =
+                    aggregate_vote_signatures(existing.signature, incoming.signature)?;
+                existing.aggregation_bits =
+                    union_bit_vecs(&existing.aggregation_bits, &incoming.aggregation_bits);
+                self.aggregate_stake = self
+                    .aggregate_stake
+                    .checked_add(stake)
+                    .ok_or(BftError::StakeOverflow)?;
+            }
+            Some(_) if stake > self.aggregate_stake => {
+                self.aggregate = Some(incoming);
+                self.aggregate_stake = stake;
+            }
+            Some(_) => {}
         }
+        Ok(())
     }
 
     fn aggregate(&self) -> Option<AggregatedVote> {
-        self.best_vote.as_ref().map(|vote| AggregatedVote {
-            aggregation_bits: vote.aggregation_bits.clone(),
-            signature: vote.signature,
-        })
+        self.aggregate.clone()
     }
 }
 
@@ -200,12 +232,12 @@ impl ChunkBft {
         }
         if chunk_proof_valid
             && quorum_reached(
-                self.prevotes.best_stake,
+                self.prevotes.aggregate_stake,
                 self.total_stake,
                 self.prevote_quorum,
             )
             && quorum_reached(
-                self.precommits.best_stake,
+                self.precommits.aggregate_stake,
                 self.total_stake,
                 self.precommit_quorum,
             )
@@ -251,8 +283,8 @@ impl ChunkBft {
         self.validate_vote_target(&vote, expected_phase)?;
         let stake = vote_stake(&self.active_set, &vote)?;
         match expected_phase {
-            FinalityVotePhase::Prevote => self.prevotes.record(vote, stake),
-            FinalityVotePhase::Precommit => self.precommits.record(vote, stake),
+            FinalityVotePhase::Prevote => self.prevotes.record(vote, stake)?,
+            FinalityVotePhase::Precommit => self.precommits.record(vote, stake)?,
         }
         Ok(())
     }
@@ -338,6 +370,47 @@ fn quorum_reached(stake: u64, total_stake: u64, (numerator, denominator): (u64, 
     u128::from(stake) * u128::from(denominator) >= u128::from(total_stake) * u128::from(numerator)
 }
 
+fn bit_vecs_are_disjoint(left: &BitVec, right: &BitVec) -> bool {
+    debug_assert_eq!(left.bit_len(), right.bit_len());
+    for index in 0..left.bit_len() {
+        if left.get(index).unwrap_or(false) && right.get(index).unwrap_or(false) {
+            return false;
+        }
+    }
+    true
+}
+
+fn union_bit_vecs(left: &BitVec, right: &BitVec) -> BitVec {
+    debug_assert_eq!(left.bit_len(), right.bit_len());
+    let mut out = BitVec::default();
+    for index in 0..left.bit_len() {
+        out.push(left.get(index).unwrap_or(false) || right.get(index).unwrap_or(false));
+    }
+    out
+}
+
+#[cfg(feature = "std")]
+fn aggregate_vote_signatures(
+    left: BlsSignature,
+    right: BlsSignature,
+) -> Result<BlsSignature, BftError> {
+    let left = neutrino_crypto::bls::Signature::from_bytes(&left)
+        .map_err(|_| BftError::InvalidAggregateSignature)?;
+    let right = neutrino_crypto::bls::Signature::from_bytes(&right)
+        .map_err(|_| BftError::InvalidAggregateSignature)?;
+    neutrino_crypto::bls::aggregate_signatures(&[&left, &right])
+        .map(|signature| signature.to_bytes())
+        .map_err(|_| BftError::InvalidAggregateSignature)
+}
+
+#[cfg(not(feature = "std"))]
+fn aggregate_vote_signatures(
+    _left: BlsSignature,
+    _right: BlsSignature,
+) -> Result<BlsSignature, BftError> {
+    Err(BftError::SignatureAggregationUnavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +476,33 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
+    fn test_secret_key(byte: u8) -> neutrino_crypto::bls::SecretKey {
+        neutrino_crypto::bls::SecretKey::key_gen(&[byte; 32], &[]).expect("valid test key")
+    }
+
+    #[cfg(feature = "std")]
+    const fn vote_message(phase: FinalityVotePhase) -> &'static [u8] {
+        match phase {
+            FinalityVotePhase::Prevote => b"test prevote aggregate message",
+            FinalityVotePhase::Precommit => b"test precommit aggregate message",
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn signed_vote(
+        phase: FinalityVotePhase,
+        round: u32,
+        bits: BitVec,
+        key_byte: u8,
+    ) -> FinalityVote {
+        let mut vote = vote(phase, round, bits);
+        vote.signature = test_secret_key(key_byte)
+            .sign(vote_message(phase))
+            .to_bytes();
+        vote
+    }
+
     fn make_bft() -> ChunkBft {
         let chunk = chunk();
         ChunkBft::new(
@@ -438,6 +538,68 @@ mod tests {
         assert_eq!(cert.chunk_id, chunk().chunk_id);
         assert_eq!(cert.round, 0);
         assert_eq!(cert.chunk_hash, chunk().hash());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn combines_disjoint_partial_votes_to_reach_quorum() {
+        let mut bft = make_bft();
+        bft.add_prevote(signed_vote(
+            FinalityVotePhase::Prevote,
+            0,
+            bits(&[true, false, false]),
+            1,
+        ))
+        .expect("first prevote");
+        bft.add_precommit(signed_vote(
+            FinalityVotePhase::Precommit,
+            0,
+            bits(&[true, false, false]),
+            3,
+        ))
+        .expect("first precommit");
+        assert_eq!(
+            bft.finalization_status(true, chunk().active_validator_set_root),
+            Ok(FinalizationStatus::Pending),
+        );
+
+        bft.add_prevote(signed_vote(
+            FinalityVotePhase::Prevote,
+            0,
+            bits(&[false, true, false]),
+            2,
+        ))
+        .expect("second prevote");
+        bft.add_precommit(signed_vote(
+            FinalityVotePhase::Precommit,
+            0,
+            bits(&[false, true, false]),
+            4,
+        ))
+        .expect("second precommit");
+
+        let cert = bft
+            .try_finalize(true, chunk().active_validator_set_root)
+            .expect("try finalize")
+            .expect("finalized");
+
+        assert_eq!(cert.prevote.aggregation_bits.bit_len(), 3);
+        assert_eq!(cert.prevote.aggregation_bits.get(0), Some(true));
+        assert_eq!(cert.prevote.aggregation_bits.get(1), Some(true));
+        assert_eq!(cert.prevote.aggregation_bits.get(2), Some(false));
+
+        let sig = neutrino_crypto::bls::Signature::from_bytes(&cert.prevote.signature)
+            .expect("combined signature decodes");
+        let key_1 = test_secret_key(1);
+        let key_2 = test_secret_key(2);
+        let pk_1 = key_1.public_key();
+        let pk_2 = key_2.public_key();
+        neutrino_crypto::bls::fast_aggregate_verify(
+            &[&pk_1, &pk_2],
+            vote_message(FinalityVotePhase::Prevote),
+            &sig,
+        )
+        .expect("combined signature verifies");
     }
 
     #[test]

@@ -20,9 +20,9 @@ use neutrino_network::PeerId;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
+    BlocksByRootResponse, ChunkProofByIdResponse, MetadataRequest, RecursiveProofByIndexResponse,
     RecursiveProofLatestResponse, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
-    StateByRootResponse, Status,
+    StateByRootResponse, Status, role_flags,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::LocalProgress;
@@ -347,6 +347,58 @@ async fn inbound_status_request_is_served_from_backend() {
         } => {
             assert_eq!(id, inbound_id);
             assert!(matches!(response, RpcResponse::Status(s) if s == local_status));
+        }
+        other => panic!("expected SendRpcResponse, got {other:?}"),
+    }
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn inbound_metadata_request_advertises_full_node_role() {
+    let backend = MockBackend::default();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress {
+            chain_id: 1,
+            chain_spec_hash: [0; 32],
+            ..LocalProgress::default()
+        },
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    let inbound_id = RpcInboundId {
+        protocol: RpcProtocol::Metadata,
+        raw: 2,
+    };
+    event_tx
+        .send(NetworkEvent::RpcRequestReceived {
+            peer: random_peer(),
+            inbound_id,
+            request: RpcRequest::Metadata(MetadataRequest),
+        })
+        .await
+        .unwrap();
+
+    let cmd = timeout(Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("a command")
+        .expect("channel open");
+    match cmd {
+        NetworkCommand::SendRpcResponse {
+            inbound_id: id,
+            response,
+        } => {
+            assert_eq!(id, inbound_id);
+            assert!(
+                matches!(response, RpcResponse::Metadata(meta) if meta.role_flags == role_flags::FULL_NODE)
+            );
         }
         other => panic!("expected SendRpcResponse, got {other:?}"),
     }

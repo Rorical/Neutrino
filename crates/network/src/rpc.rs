@@ -121,7 +121,7 @@ impl RpcProtocol {
 ///
 /// Used by peers to detect chain mismatches and as input to the sync FSM
 /// described in doc 06 §"Sync state machine".
-#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Status {
     /// Chain identifier; mismatching peers should be disconnected.
     pub chain_id: ChainId,

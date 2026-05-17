@@ -22,6 +22,8 @@ pub mod sync;
 /// Canonical gossip topic registry.
 pub mod topic;
 
+pub use libp2p;
+pub use libp2p::{Multiaddr, PeerId};
 pub use rpc::{RpcInboundId, RpcProtocol, RpcRequest, RpcResponse};
 pub use sync::{
     LocalProgress, SyncBatchSizes, SyncCommand, SyncEvent, SyncMachine, SyncMode, SyncStallReason,

@@ -22,6 +22,7 @@ members = [
     "crates/prover-checkpoint",
     "crates/consensus-engine",
     "crates/network",
+    "crates/sync",
     "crates/mempool",
     "crates/light-client",
     "crates/rpc",
@@ -55,6 +56,7 @@ default-members = [
     "crates/prover-checkpoint",
     "crates/consensus-engine",
     "crates/network",
+    "crates/sync",
     "crates/mempool",
     "crates/light-client",
     "crates/rpc",
@@ -121,6 +123,7 @@ neutrino-prover-chunk           = { path = "crates/prover-chunk",           vers
 neutrino-prover-checkpoint      = { path = "crates/prover-checkpoint",      version = "0.1.0" }
 neutrino-consensus-engine       = { path = "crates/consensus-engine",       version = "0.1.0" }
 neutrino-network                = { path = "crates/network",                version = "0.1.0" }
+neutrino-sync                   = { path = "crates/sync",                   version = "0.1.0" }
 neutrino-mempool                = { path = "crates/mempool",                version = "0.1.0" }
 neutrino-light-client           = { path = "crates/light-client",           version = "0.1.0", default-features = false }
 neutrino-rpc                    = { path = "crates/rpc",                    version = "0.1.0" }

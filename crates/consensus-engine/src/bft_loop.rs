@@ -1,0 +1,739 @@
+//! Live multi-validator chunk-BFT driver.
+//!
+//! [`crate::finalize`] runs the chunk-BFT module against a single
+//! synthesized vote so an M5 single-node deployment can drive a chunk
+//! to `Finalized` without a network. M7 widens that surface so the
+//! engine can ingest real prevote/precommit gossip from peers and
+//! emit its own signed votes back onto the wire.
+//!
+//! The flow is:
+//!
+//! 1. After every block proof imports, the caller asks the engine
+//!    whether the chunk covering that block is now proof-ready
+//!    ([`Engine::assemble_chunk`](crate::Engine::assemble_chunk)).
+//! 2. Once a chunk is ready the caller calls
+//!    [`Engine::open_bft_session`](crate::Engine::open_bft_session).
+//!    If the engine has been configured with a local voter via
+//!    [`Engine::set_local_voter`](crate::Engine::set_local_voter), the
+//!    session records that validator's own prevote and surfaces a
+//!    [`BftAction::BroadcastPrevote`] for the caller to gossip.
+//! 3. Peer votes flow through
+//!    [`Engine::observe_finality_vote`](crate::Engine::observe_finality_vote)
+//!    which routes them to the matching session. When the 2/3 prevote
+//!    quorum first crosses, the local validator's precommit is
+//!    recorded and a [`BftAction::BroadcastPrecommit`] is emitted.
+//!    When the 2/3 precommit quorum crosses, the session emits a
+//!    [`BftAction::QuorumReached`] and the caller can drive
+//!    [`Engine::finalize_chunk`](crate::Engine::finalize_chunk) which
+//!    consumes the session's accumulated cert instead of synthesizing
+//!    a single-validator vote.
+//!
+//! The session deliberately does not own the network. Every external
+//! effect is funnelled through [`BftAction`]; the engine remains a
+//! pure state machine that can be unit-tested without spinning up
+//! libp2p.
+
+use alloc::vec::Vec;
+use core::fmt;
+
+use neutrino_consensus_chunk_bft::{BftError, ChunkBft};
+use neutrino_consensus_types::{Chunk, FinalityVote, FinalityVoteData, FinalityVotePhase};
+use neutrino_primitives::{BitVec, ChainId, ChunkHash, ChunkId};
+use neutrino_storage::Database;
+
+use crate::engine::Engine;
+use crate::error::EngineError;
+use crate::proposer::ProposerKey;
+use crate::store::StoreError;
+
+extern crate alloc;
+
+/// Progress of the local validator's own signed votes inside one
+/// BFT session. Monotonic: once `Precommitted`, the session never
+/// retraces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalVoteProgress {
+    /// Local validator has not yet recorded its prevote (or no local
+    /// voter is configured).
+    Idle,
+    /// Local validator's prevote has been recorded; precommit pending.
+    Prevoted,
+    /// Local validator's precommit has been recorded.
+    Precommitted,
+}
+
+/// Progress of the *peer* quorum-stake totals observed by the local
+/// chunk-BFT accumulator. Monotonic across the lifetime of a
+/// session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerQuorumProgress {
+    /// Less than 2/3 prevote stake accumulated so far.
+    BelowPrevote,
+    /// 2/3 prevote stake observed; precommit quorum still pending.
+    PrevoteQuorumObserved,
+    /// 2/3 precommit stake observed — finalisation is unlocked.
+    PrecommitQuorumObserved,
+}
+
+/// Per-chunk BFT state combining the [`ChunkBft`] accumulator with
+/// the local validator's participation bookkeeping.
+#[derive(Debug)]
+pub struct BftSession {
+    chunk_id: ChunkId,
+    chunk_hash: ChunkHash,
+    bft: ChunkBft,
+    local: LocalVoteProgress,
+    peer_quorum: PeerQuorumProgress,
+}
+
+impl BftSession {
+    /// Chunk id this session votes on.
+    #[must_use]
+    pub const fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+
+    /// Canonical chunk hash bound by every vote in this session.
+    #[must_use]
+    pub const fn chunk_hash(&self) -> ChunkHash {
+        self.chunk_hash
+    }
+
+    /// Whether the local validator has recorded its own prevote.
+    #[must_use]
+    pub const fn local_prevoted(&self) -> bool {
+        matches!(
+            self.local,
+            LocalVoteProgress::Prevoted | LocalVoteProgress::Precommitted
+        )
+    }
+
+    /// Whether the local validator has recorded its own precommit.
+    #[must_use]
+    pub const fn local_precommitted(&self) -> bool {
+        matches!(self.local, LocalVoteProgress::Precommitted)
+    }
+
+    /// Whether the 2/3 prevote quorum has been observed at least once.
+    #[must_use]
+    pub const fn prevote_quorum_observed(&self) -> bool {
+        matches!(
+            self.peer_quorum,
+            PeerQuorumProgress::PrevoteQuorumObserved | PeerQuorumProgress::PrecommitQuorumObserved
+        )
+    }
+
+    /// Whether the 2/3 precommit quorum has been observed at least once.
+    /// The engine surfaces this as the trigger to call
+    /// [`Engine::finalize_chunk`](crate::Engine::finalize_chunk).
+    #[must_use]
+    pub const fn precommit_quorum_observed(&self) -> bool {
+        matches!(
+            self.peer_quorum,
+            PeerQuorumProgress::PrecommitQuorumObserved
+        )
+    }
+
+    /// Borrow the underlying [`ChunkBft`] accumulator. Finalisation
+    /// reads the accumulated aggregate votes through this handle.
+    #[must_use]
+    pub const fn chunk_bft(&self) -> &ChunkBft {
+        &self.bft
+    }
+}
+
+/// External effect the engine wants the caller to perform after a
+/// BFT-loop ingest.
+///
+/// The caller is the node-level chain backend / sync driver. It owns
+/// the network handle and is responsible for borsh-encoding the vote
+/// and publishing on the matching gossip topic, or invoking
+/// [`Engine::finalize_chunk`](crate::Engine::finalize_chunk) on the
+/// quorum signal.
+#[derive(Clone, Debug)]
+pub enum BftAction {
+    /// Publish the carried finality vote on
+    /// `Topic::FinalityVotesPrevote`.
+    BroadcastPrevote(FinalityVote),
+    /// Publish the carried finality vote on
+    /// `Topic::FinalityVotesPrecommit`.
+    BroadcastPrecommit(FinalityVote),
+    /// The 2/3 precommit quorum has been reached for this chunk.
+    /// Caller should invoke
+    /// [`Engine::finalize_chunk`](crate::Engine::finalize_chunk).
+    QuorumReached(ChunkId),
+}
+
+/// Failures while driving the live BFT loop.
+#[derive(Debug)]
+pub enum BftLoopError<E> {
+    /// The underlying chunk-BFT accumulator rejected the vote.
+    Bft(BftError),
+    /// Engine storage / bookkeeping failure.
+    Engine(EngineError<E>),
+    /// `open_bft_session` was called twice for the same chunk id.
+    SessionAlreadyOpen {
+        /// Chunk id that already has a live session.
+        chunk_id: ChunkId,
+    },
+    /// `observe_finality_vote` was called for a chunk that has no
+    /// session and is not in scope to open one.
+    NoSessionForChunk {
+        /// Chunk id named by the orphan vote.
+        chunk_id: ChunkId,
+    },
+    /// The active validator set has no positive unslashed stake.
+    EmptyActiveSet,
+}
+
+impl<E: fmt::Display> fmt::Display for BftLoopError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bft(err) => write!(f, "chunk-BFT: {err}"),
+            Self::Engine(err) => write!(f, "engine error: {err}"),
+            Self::SessionAlreadyOpen { chunk_id } => {
+                write!(f, "BFT session for chunk {chunk_id} already open")
+            }
+            Self::NoSessionForChunk { chunk_id } => {
+                write!(f, "no BFT session for chunk {chunk_id}")
+            }
+            Self::EmptyActiveSet => {
+                f.write_str("active validator set has no positive unslashed stake")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: fmt::Debug + fmt::Display> std::error::Error for BftLoopError<E> {}
+
+impl<E> From<BftError> for BftLoopError<E> {
+    fn from(value: BftError) -> Self {
+        Self::Bft(value)
+    }
+}
+
+impl<E> From<EngineError<E>> for BftLoopError<E> {
+    fn from(value: EngineError<E>) -> Self {
+        Self::Engine(value)
+    }
+}
+
+impl<E> From<StoreError<E>> for BftLoopError<E> {
+    fn from(value: StoreError<E>) -> Self {
+        Self::Engine(EngineError::Store(value))
+    }
+}
+
+impl<DB: Database> Engine<DB> {
+    /// Configure the local validator's BLS key used to sign prevotes
+    /// and precommits during live BFT rounds.
+    ///
+    /// Nodes that follow without voting can leave this unset; the
+    /// engine then opens BFT sessions purely to accumulate peer votes
+    /// and emits no [`BftAction::BroadcastPrevote`] /
+    /// [`BftAction::BroadcastPrecommit`] actions.
+    pub fn set_local_voter(&mut self, voter: ProposerKey) {
+        self.local_voter = Some(voter);
+    }
+
+    /// Borrow the configured local voter, if any.
+    #[must_use]
+    pub const fn local_voter(&self) -> Option<&ProposerKey> {
+        self.local_voter.as_ref()
+    }
+
+    /// Currently open BFT session for `chunk_id`, if any.
+    #[must_use]
+    pub fn bft_session(&self, chunk_id: ChunkId) -> Option<&BftSession> {
+        self.bft_sessions.get(&chunk_id)
+    }
+
+    /// Remove and return the BFT session for `chunk_id`. Used by the
+    /// finalize path after the accumulated cert has been persisted.
+    pub fn take_bft_session(&mut self, chunk_id: ChunkId) -> Option<BftSession> {
+        self.bft_sessions.remove(&chunk_id)
+    }
+
+    /// Open a fresh BFT session for `chunk` and, when a local voter is
+    /// configured, record and broadcast that validator's own prevote.
+    ///
+    /// Returns the [`BftAction`]s the caller should propagate to the
+    /// network. When the local validator's own prevote alone already
+    /// crosses the 2/3 prevote quorum (single-validator case), the
+    /// follow-on precommit and `QuorumReached` actions are returned
+    /// in the same call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BftLoopError::SessionAlreadyOpen`] if a session for
+    /// the same chunk id already exists, or any inner
+    /// [`ChunkBft`] / storage error.
+    pub fn open_bft_session(
+        &mut self,
+        chunk: Chunk,
+    ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
+        let chunk_id = chunk.chunk_id;
+        if self.bft_sessions.contains_key(&chunk_id) {
+            return Err(BftLoopError::SessionAlreadyOpen { chunk_id });
+        }
+        let chunk_hash = chunk.hash();
+        let active_validator_set_root = self.previous_validator_set_root()?;
+        let active_set = self.active_validator_set().to_vec();
+        if active_set.is_empty() {
+            return Err(BftLoopError::EmptyActiveSet);
+        }
+        let consensus = &self.chain_spec().consensus;
+        let bft = ChunkBft::with_quorum(
+            chunk,
+            0,
+            active_set,
+            active_validator_set_root,
+            (
+                consensus.bft_prevote_quorum_numerator,
+                consensus.bft_prevote_quorum_denominator,
+            ),
+            (
+                consensus.bft_precommit_quorum_numerator,
+                consensus.bft_precommit_quorum_denominator,
+            ),
+        )?;
+        let mut session = BftSession {
+            chunk_id,
+            chunk_hash,
+            bft,
+            local: LocalVoteProgress::Idle,
+            peer_quorum: PeerQuorumProgress::BelowPrevote,
+        };
+
+        let mut actions = Vec::new();
+        let chain_id = self.chain_spec().chain_id;
+        let active_set_len = session.bft.active_set_len();
+
+        if let Some(voter) = self.local_voter.as_ref() {
+            let prevote = build_local_vote(
+                chunk_id,
+                chunk_hash,
+                session.bft.round(),
+                FinalityVotePhase::Prevote,
+                chain_id,
+                voter,
+                active_set_len,
+            );
+            session.bft.add_prevote(prevote.clone())?;
+            session.local = LocalVoteProgress::Prevoted;
+            actions.push(BftAction::BroadcastPrevote(prevote));
+        }
+
+        recompute_quorum_transitions(
+            &mut session,
+            self.local_voter.as_ref(),
+            chain_id,
+            active_validator_set_root,
+            active_set_len,
+            &mut actions,
+        )?;
+
+        self.bft_sessions.insert(chunk_id, session);
+        Ok(actions)
+    }
+
+    /// Ingest a peer-supplied finality vote into the matching BFT
+    /// session.
+    ///
+    /// Returns the [`BftAction`]s the caller should propagate. When
+    /// the prevote quorum is freshly crossed and a local voter is
+    /// configured, a [`BftAction::BroadcastPrecommit`] is emitted.
+    /// When the precommit quorum is freshly crossed, a
+    /// [`BftAction::QuorumReached`] is emitted.
+    ///
+    /// Votes whose chunk id has no open session are silently dropped:
+    /// they arrived before the local node observed the corresponding
+    /// chunk become proof-ready. M7-C will add subnet buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns any inner [`ChunkBft`] error (wrong phase, wrong
+    /// target, malformed aggregation bits, etc.).
+    pub fn observe_finality_vote(
+        &mut self,
+        vote: FinalityVote,
+    ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
+        let chunk_id = vote.data.chunk_id;
+        if !self.bft_sessions.contains_key(&chunk_id) {
+            return Ok(Vec::new());
+        }
+        let chain_id = self.chain_spec().chain_id;
+        let active_validator_set_root = self.previous_validator_set_root()?;
+        let session = self
+            .bft_sessions
+            .get_mut(&chunk_id)
+            .expect("contains_key checked above");
+        let active_set_len = session.bft.active_set_len();
+        match vote.data.phase {
+            FinalityVotePhase::Prevote => session.bft.add_prevote(vote)?,
+            FinalityVotePhase::Precommit => session.bft.add_precommit(vote)?,
+        }
+        let mut actions = Vec::new();
+        recompute_quorum_transitions(
+            session,
+            self.local_voter.as_ref(),
+            chain_id,
+            active_validator_set_root,
+            active_set_len,
+            &mut actions,
+        )?;
+        Ok(actions)
+    }
+
+    /// Read the validator-set root committed by the previous
+    /// checkpoint. Every vote in the current BFT session must bind
+    /// this root so equivocations across a validator-set rotation
+    /// cannot finalize.
+    fn previous_validator_set_root(
+        &self,
+    ) -> Result<neutrino_primitives::Hash, BftLoopError<DB::Error>> {
+        let previous_index = self.latest_checkpoint_index();
+        let previous = self
+            .store()
+            .get_checkpoint(previous_index)?
+            .ok_or(BftLoopError::Engine(EngineError::NotInitialised))?;
+        Ok(previous.end_validator_set_root)
+    }
+}
+
+/// Inspect the session's freshly-updated quorum status and emit the
+/// follow-on actions (precommit broadcast, finalization signal) that
+/// just became newly applicable.
+fn recompute_quorum_transitions<E>(
+    session: &mut BftSession,
+    local_voter: Option<&ProposerKey>,
+    chain_id: ChainId,
+    active_validator_set_root: neutrino_primitives::Hash,
+    active_set_len: usize,
+    actions: &mut Vec<BftAction>,
+) -> Result<(), BftLoopError<E>> {
+    if matches!(session.peer_quorum, PeerQuorumProgress::BelowPrevote)
+        && session.bft.prevote_quorum_reached()
+    {
+        session.peer_quorum = PeerQuorumProgress::PrevoteQuorumObserved;
+        if let Some(voter) = local_voter
+            && !session.local_precommitted()
+        {
+            let precommit = build_local_vote(
+                session.chunk_id,
+                session.chunk_hash,
+                session.bft.round(),
+                FinalityVotePhase::Precommit,
+                chain_id,
+                voter,
+                active_set_len,
+            );
+            session.bft.add_precommit(precommit.clone())?;
+            session.local = LocalVoteProgress::Precommitted;
+            actions.push(BftAction::BroadcastPrecommit(precommit));
+        }
+    }
+    if matches!(
+        session.peer_quorum,
+        PeerQuorumProgress::PrevoteQuorumObserved
+    ) && session.bft.precommit_quorum_reached()
+        && session
+            .bft
+            .validator_set_root_matches(active_validator_set_root)
+    {
+        // Bind the same validator-set root the chunk committed; if
+        // they have drifted, leave the session below-quorum so the
+        // finalize path does not produce a cert that the verifier
+        // will reject.
+        session.peer_quorum = PeerQuorumProgress::PrecommitQuorumObserved;
+        actions.push(BftAction::QuorumReached(session.chunk_id));
+    }
+    Ok(())
+}
+
+/// Build and sign the local validator's vote for `(chunk_id, round,
+/// chunk_hash, phase)`.
+fn build_local_vote(
+    chunk_id: ChunkId,
+    chunk_hash: ChunkHash,
+    round: u32,
+    phase: FinalityVotePhase,
+    chain_id: ChainId,
+    voter: &ProposerKey,
+    active_set_len: usize,
+) -> FinalityVote {
+    let data = FinalityVoteData {
+        chunk_id,
+        round,
+        chunk_hash,
+        phase,
+    };
+    let signature = voter.sign_finality_vote(chain_id, &data);
+    let voter_index = voter.validator_index();
+    let voter_position = usize::try_from(voter_index).expect("u32 fits usize on supported targets");
+    let mut bits = BitVec::default();
+    for position in 0..active_set_len {
+        bits.push(position == voter_position);
+    }
+    FinalityVote {
+        aggregation_bits: bits,
+        data,
+        signature,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Engine;
+    use crate::validator_set::validator_set_root;
+    use neutrino_consensus_types::Chunk;
+    use neutrino_primitives::{
+        BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
+        LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    };
+    use neutrino_storage::MemoryDatabase;
+
+    fn proposer(seed: u8) -> ProposerKey {
+        ProposerKey::from_ikm(&[seed; 32], u32::from(seed)).expect("derive proposer")
+    }
+
+    fn validators_with_keys(n: u8) -> Vec<Validator> {
+        (0..n)
+            .map(|i| Validator {
+                pubkey: *proposer(i).public_key_bytes(),
+                withdrawal_credentials: [0x33; 32],
+                effective_stake: 32_000_000_000,
+                slashed: false,
+                activation_epoch: 0,
+                exit_epoch: u64::MAX,
+                last_active_chunk: 0,
+            })
+            .collect()
+    }
+
+    fn chain_spec_with(n: u8) -> ChainSpec {
+        let validators = validators_with_keys(n);
+        let proof = ProofParams::default();
+        let vs_root = validator_set_root(&validators);
+        let genesis_block_hash: BlockHash = [0xAA; 32];
+        let checkpoint = Checkpoint {
+            chain_id: 7,
+            index: 0,
+            start_height: 0,
+            end_height: 0,
+            start_block_hash: ZERO_HASH,
+            end_block_hash: genesis_block_hash,
+            start_state_root: ZERO_HASH,
+            end_state_root: ZERO_HASH,
+            end_validator_set_root: vs_root,
+            history_root: ZERO_HASH,
+            proof_system_version: proof.proof_system_version,
+        };
+        ChainSpec {
+            spec_version: CHAIN_SPEC_VERSION,
+            name: BoundedBytes::new(b"bft-loop-test".to_vec()).expect("name fits"),
+            chain_id: 7,
+            genesis_time: 1_700_000_000,
+            genesis_gas_limit: 30_000_000,
+            runtime_version: RuntimeVersion::default(),
+            runtime_code_hash: [0xCC; 32],
+            genesis_seed: [0xCC; 32],
+            genesis_state_root: ZERO_HASH,
+            genesis_block_hash,
+            genesis_validator_set_root: vs_root,
+            genesis_checkpoint: checkpoint,
+            consensus: ConsensusParams::default(),
+            proof,
+            state: StateParams::default(),
+            light_client: LightClientParams::default(),
+            initial_validators: validators,
+            metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
+        }
+    }
+
+    fn dummy_chunk(
+        chunk_id: ChunkId,
+        active_validator_set_root: neutrino_primitives::Hash,
+    ) -> Chunk {
+        Chunk {
+            chunk_id,
+            start_height: chunk_id.saturating_mul(1) + 1,
+            end_height: chunk_id.saturating_mul(1) + 1,
+            start_state_root: ZERO_HASH,
+            end_state_root: [0x77; 32],
+            start_block_hash: [0xAA; 32],
+            end_block_hash: [0xBB; 32],
+            block_hash_root: [0xCC; 32],
+            block_proof_root: [0xDD; 32],
+            vrf_proof_root: [0xEE; 32],
+            active_validator_set_root,
+            next_validator_set_root: active_validator_set_root,
+            da_root: [0x33; 32],
+        }
+    }
+
+    #[test]
+    fn single_validator_session_self_finalises_via_synthesized_quorum() {
+        let spec = chain_spec_with(1);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let actions = engine.open_bft_session(chunk).expect("open session");
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], BftAction::BroadcastPrevote(_)));
+        assert!(matches!(actions[1], BftAction::BroadcastPrecommit(_)));
+        assert!(matches!(actions[2], BftAction::QuorumReached(0)));
+        let session = engine.bft_session(0).expect("session present");
+        assert!(session.local_prevoted());
+        assert!(session.local_precommitted());
+        assert!(session.prevote_quorum_observed());
+        assert!(session.precommit_quorum_observed());
+    }
+
+    #[test]
+    fn three_validator_session_advances_on_peer_quorum() {
+        let spec = chain_spec_with(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let actions = engine
+            .open_bft_session(chunk.clone())
+            .expect("open session");
+        assert_eq!(actions.len(), 1, "only the local prevote until peers vote");
+        assert!(matches!(actions[0], BftAction::BroadcastPrevote(_)));
+        let session = engine.bft_session(0).expect("session present");
+        assert!(session.local_prevoted());
+        assert!(!session.prevote_quorum_observed());
+
+        // Feed v1's prevote — now we have 2/3 stake → emit precommit.
+        let v1_prevote = build_local_vote(
+            0,
+            chunk.hash(),
+            0,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        let actions = engine
+            .observe_finality_vote(v1_prevote)
+            .expect("ingest v1 prevote");
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], BftAction::BroadcastPrecommit(_)));
+        let session = engine.bft_session(0).expect("session present");
+        assert!(session.prevote_quorum_observed());
+        assert!(session.local_precommitted());
+        assert!(!session.precommit_quorum_observed());
+
+        // Feed v1's precommit — now 2/3 precommit stake → quorum reached.
+        let v1_precommit = build_local_vote(
+            0,
+            chunk.hash(),
+            0,
+            FinalityVotePhase::Precommit,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        let actions = engine
+            .observe_finality_vote(v1_precommit)
+            .expect("ingest v1 precommit");
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], BftAction::QuorumReached(0)));
+        let session = engine.bft_session(0).expect("session present");
+        assert!(session.precommit_quorum_observed());
+    }
+
+    #[test]
+    fn observe_drops_votes_for_unknown_chunks() {
+        let spec = chain_spec_with(2);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        let orphan_vote = build_local_vote(
+            99,
+            [0xAB; 32],
+            0,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(0),
+            2,
+        );
+        let actions = engine.observe_finality_vote(orphan_vote).expect("no error");
+        assert!(actions.is_empty(), "orphan votes are silently dropped");
+        assert!(engine.bft_session(99).is_none());
+    }
+
+    #[test]
+    fn opening_the_same_chunk_twice_errors() {
+        let spec = chain_spec_with(2);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        engine.open_bft_session(chunk.clone()).expect("first open");
+        let err = engine
+            .open_bft_session(chunk)
+            .expect_err("second open errors");
+        assert!(matches!(
+            err,
+            BftLoopError::SessionAlreadyOpen { chunk_id: 0 }
+        ));
+    }
+
+    #[test]
+    fn non_voter_session_only_accumulates_peer_votes() {
+        let spec = chain_spec_with(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        // No local_voter configured: this is a follower-only node.
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let actions = engine
+            .open_bft_session(chunk.clone())
+            .expect("open session");
+        assert!(
+            actions.is_empty(),
+            "follower-only nodes emit no votes on session open"
+        );
+
+        // Feed prevotes from v0 and v1 (2/3 stake) and precommits from
+        // v0 and v1; even without a local validator, the session must
+        // surface a QuorumReached action so the follower can persist
+        // the cert.
+        for index in 0_u8..2 {
+            let vote = build_local_vote(
+                0,
+                chunk.hash(),
+                0,
+                FinalityVotePhase::Prevote,
+                spec.chain_id,
+                &proposer(index),
+                3,
+            );
+            engine.observe_finality_vote(vote).expect("ingest prevote");
+        }
+        let mut quorum_seen = false;
+        for index in 0_u8..2 {
+            let vote = build_local_vote(
+                0,
+                chunk.hash(),
+                0,
+                FinalityVotePhase::Precommit,
+                spec.chain_id,
+                &proposer(index),
+                3,
+            );
+            let actions = engine
+                .observe_finality_vote(vote)
+                .expect("ingest precommit");
+            if actions
+                .iter()
+                .any(|a| matches!(a, BftAction::QuorumReached(0)))
+            {
+                quorum_seen = true;
+            }
+        }
+        assert!(
+            quorum_seen,
+            "follower must observe quorum once 2/3 precommit stake arrives"
+        );
+    }
+}

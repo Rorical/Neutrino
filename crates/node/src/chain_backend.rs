@@ -10,31 +10,41 @@
 //! (`build_block_body`) and the engine removes mined transactions after
 //! every successful local or peer-supplied block.
 //!
+//! When configured with [`ChainBackend::set_local_voter`] and a network
+//! publisher via [`ChainBackend::set_network_publisher`], the backend
+//! also drives the multi-validator chunk-BFT loop from
+//! [`neutrino_consensus_engine::bft_loop`]: opens a BFT session for
+//! every newly proof-ready chunk, broadcasts the local validator's
+//! signed votes, ingests peer votes, and triggers chunk finalization
+//! plus recursive checkpoint publication once the 2/3 precommit
+//! quorum is reached.
+//!
 //! What is **not** validated yet:
 //!
-//! - Header BLS signatures and VRF eligibility — deferred to M7 (real
-//!   validator set + BFT).
 //! - `state_root` re-execution — deferred to M8 when a real proof
 //!   backend ships.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use neutrino_consensus_engine::{
-    CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome, ImportError,
-    ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
+    BftAction, CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome,
+    ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError,
+    ProveOutcome,
 };
 use neutrino_consensus_types::{
     Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
     SlashingEvidence,
 };
 use neutrino_mempool::{InsertError, Mempool};
+use neutrino_network::Topic;
 use neutrino_network::rpc::{
     self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
     BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse,
     RecursiveProofByIndexResponse, RecursiveProofLatestResponse, StateByRootResponse, Status,
     WitnessByBlockResponse,
 };
+use neutrino_network::service::NetworkCommand;
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
     BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
@@ -52,7 +62,8 @@ use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
     SyncBackend, SyncBackendError,
 };
-use tracing::{debug, trace};
+use tokio::sync::mpsc;
+use tracing::{debug, trace, warn};
 
 /// Default mempool byte budget. Sized generously so the M6 default
 /// runtime's 4096-byte body buffer easily fits a handful of validated
@@ -82,6 +93,15 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     proof_system: P,
     mempool: Mutex<Mempool>,
     runtime_elf: Option<Vec<u8>>,
+    /// Channel used to publish gossip messages produced by the BFT
+    /// loop (prevotes, precommits, chunk proofs, recursive proofs).
+    /// `None` disables the BFT loop's broadcast side; the backend
+    /// still ingests peer votes into the engine but emits no traffic.
+    network_publisher: Mutex<Option<mpsc::Sender<NetworkCommand>>>,
+    /// Local validator key used to sign BFT votes and act as the
+    /// `voter` argument to [`Engine::finalize_chunk`]. Wrapped in an
+    /// [`Arc`] so async tasks can hold a snapshot without re-locking.
+    local_voter: Mutex<Option<Arc<ProposerKey>>>,
 }
 
 impl<DB, P> ChainBackend<DB, P>
@@ -97,6 +117,8 @@ where
             proof_system,
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             runtime_elf: None,
+            network_publisher: Mutex::new(None),
+            local_voter: Mutex::new(None),
         }
     }
 
@@ -117,7 +139,72 @@ where
             proof_system,
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             runtime_elf,
+            network_publisher: Mutex::new(None),
+            local_voter: Mutex::new(None),
         }
+    }
+
+    /// Enable the multi-validator chunk-BFT loop by installing the
+    /// network publisher used to gossip prevotes, precommits, chunk
+    /// proofs, and recursive checkpoint proofs.
+    ///
+    /// Without a publisher the engine still ingests peer votes into
+    /// [`Engine::observe_finality_vote`] but emits no broadcast
+    /// traffic. M5 single-node tests deliberately leave this unset.
+    pub fn set_network_publisher(&self, publisher: mpsc::Sender<NetworkCommand>) {
+        *self
+            .network_publisher
+            .lock()
+            .expect("ChainBackend network_publisher poisoned") = Some(publisher);
+    }
+
+    /// Install the local validator's BLS key used by the BFT loop to
+    /// sign prevotes / precommits. The same key is also passed as the
+    /// `voter` argument to [`Engine::finalize_chunk`] when the loop
+    /// finalises a chunk on a `QuorumReached` action.
+    ///
+    /// Calling this method enables the multi-validator BFT-driven
+    /// finalize path; leaving it unset keeps the M5 single-node
+    /// fallback (the producer calls [`Self::finalize_chunk`] manually
+    /// and the engine synthesises a single-validator vote).
+    pub fn set_local_voter(&self, voter: ProposerKey) {
+        self.with_engine_mut(|engine| engine.set_local_voter(voter.clone()));
+        *self
+            .local_voter
+            .lock()
+            .expect("ChainBackend local_voter poisoned") = Some(Arc::new(voter));
+    }
+
+    /// Local validator key, if [`Self::set_local_voter`] has been
+    /// called. Returned as an `Arc` snapshot so callers can release
+    /// the mutex immediately.
+    #[must_use]
+    pub fn local_voter(&self) -> Option<Arc<ProposerKey>> {
+        self.local_voter
+            .lock()
+            .expect("ChainBackend local_voter poisoned")
+            .clone()
+    }
+
+    /// Whether the BFT loop's broadcast side is enabled.
+    #[must_use]
+    pub fn bft_loop_enabled(&self) -> bool {
+        self.network_publisher
+            .lock()
+            .expect("ChainBackend network_publisher poisoned")
+            .is_some()
+            && self
+                .local_voter
+                .lock()
+                .expect("ChainBackend local_voter poisoned")
+                .is_some()
+    }
+
+    fn publisher_snapshot(&self) -> Option<mpsc::Sender<NetworkCommand>> {
+        self.network_publisher
+            .lock()
+            .expect("ChainBackend network_publisher poisoned")
+            .clone()
     }
 
     /// Local chain id; convenience helper for the node binary.
@@ -442,6 +529,150 @@ where
     fn with_engine_mut<R>(&self, f: impl FnOnce(&mut Engine<DB>) -> R) -> R {
         let mut guard = self.engine.lock().expect("ChainBackend mutex poisoned");
         f(&mut guard)
+    }
+
+    /// If `height` is the last block of a chunk that has not yet been
+    /// finalised and now has every block proof in place, open a BFT
+    /// session for it and broadcast any resulting actions.
+    ///
+    /// Called by every code path that imports or proves a block
+    /// proof (local production, gossip imports, RPC batches). Cheap
+    /// for off-boundary heights — returns immediately after a
+    /// modular check against the chain spec's `chunk_size`.
+    pub async fn maybe_open_bft_session_for_height(&self, height: Height) {
+        let chunk_size = self.chunk_size().max(1);
+        if height == 0 || height % chunk_size != 0 {
+            return;
+        }
+        let chunk_id = (height - 1) / chunk_size;
+        let already_finalised = self.with_engine(|e| {
+            e.latest_finalized_chunk_id()
+                .is_some_and(|latest| latest >= chunk_id)
+        });
+        if already_finalised {
+            return;
+        }
+        if self.with_engine(|e| e.bft_session(chunk_id).is_some()) {
+            return;
+        }
+        let chunk = match self.with_engine(|e| e.assemble_chunk(chunk_id)) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return,
+            Err(err) => {
+                debug!(chunk_id, ?err, "assemble_chunk for BFT session failed");
+                return;
+            }
+        };
+        let actions = match self.with_engine_mut(|e| e.open_bft_session(chunk)) {
+            Ok(actions) => actions,
+            Err(err) => {
+                debug!(chunk_id, ?err, "open_bft_session failed");
+                return;
+            }
+        };
+        self.handle_bft_actions(actions).await;
+    }
+
+    /// Drain a batch of [`BftAction`]s into network publishes and
+    /// chunk-finalisation triggers.
+    async fn handle_bft_actions(&self, actions: Vec<BftAction>) {
+        for action in actions {
+            match action {
+                BftAction::BroadcastPrevote(vote) => {
+                    self.publish_finality_vote(Topic::FinalityVotesPrevote, &vote)
+                        .await;
+                }
+                BftAction::BroadcastPrecommit(vote) => {
+                    self.publish_finality_vote(Topic::FinalityVotesPrecommit, &vote)
+                        .await;
+                }
+                BftAction::QuorumReached(chunk_id) => {
+                    self.handle_quorum_reached(chunk_id).await;
+                }
+            }
+        }
+    }
+
+    async fn publish_finality_vote(&self, topic: Topic, vote: &FinalityVote) {
+        let Some(publisher) = self.publisher_snapshot() else {
+            return;
+        };
+        let data = match borsh::to_vec(vote) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(?err, ?topic, "failed to encode finality vote for gossip");
+                return;
+            }
+        };
+        if let Err(err) = publisher
+            .send(NetworkCommand::Publish { topic, data })
+            .await
+        {
+            debug!(?err, ?topic, "BFT publish channel closed");
+        }
+    }
+
+    /// Drive [`Engine::finalize_chunk`] now that the BFT session for
+    /// `chunk_id` has reached its 2/3 precommit quorum, persist the
+    /// resulting chunk proof and recursive checkpoint, and gossip
+    /// both.
+    async fn handle_quorum_reached(&self, chunk_id: ChunkId) {
+        let Some(voter) = self.local_voter() else {
+            debug!(chunk_id, "QuorumReached but no local voter configured");
+            return;
+        };
+        let finalize_outcome = match self
+            .with_engine_mut(|e| e.finalize_chunk(chunk_id, &[], &self.proof_system, &voter))
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                warn!(chunk_id, error = %err, "chunk finalisation failed");
+                return;
+            }
+        };
+
+        if let Some(publisher) = self.publisher_snapshot() {
+            match borsh::to_vec(&finalize_outcome.chunk_proof) {
+                Ok(bytes) => {
+                    if let Err(err) = publisher
+                        .send(NetworkCommand::Publish {
+                            topic: Topic::ChunkProofs,
+                            data: bytes,
+                        })
+                        .await
+                    {
+                        debug!(?err, "chunk-proof publish channel closed");
+                    }
+                }
+                Err(err) => warn!(?err, "failed to encode chunk proof for gossip"),
+            }
+        }
+
+        let checkpoint_outcome =
+            match self.with_engine_mut(|e| e.checkpoint_chunk(chunk_id, &[], &self.proof_system)) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    warn!(chunk_id, error = %err, "chunk checkpoint failed");
+                    return;
+                }
+            };
+
+        if let Some(publisher) = self.publisher_snapshot() {
+            match borsh::to_vec(&checkpoint_outcome.recursive_proof) {
+                Ok(bytes) => {
+                    if let Err(err) = publisher
+                        .send(NetworkCommand::Publish {
+                            topic: Topic::Checkpoints,
+                            data: bytes,
+                        })
+                        .await
+                    {
+                        debug!(?err, "recursive-proof publish channel closed");
+                    }
+                }
+                Err(err) => warn!(?err, "failed to encode recursive proof for gossip"),
+            }
+        }
     }
 
     fn map_store_err<E: core::fmt::Display>(err: E) -> SyncBackendError {
@@ -798,6 +1029,7 @@ where
     ) -> Result<ProofsImported, SyncBackendError> {
         let mut expected_height = start;
         let mut last_height = None;
+        let mut imported_heights: Vec<Height> = Vec::new();
         for proof in proofs {
             if proof.height != expected_height {
                 return Err(SyncBackendError::Rejected(format!(
@@ -809,10 +1041,19 @@ where
                 .with_engine_mut(|e| e.import_block_proof(&proof, &self.proof_system))
                 .map_err(Self::map_import_err)?;
             last_height = Some(outcome.height);
+            imported_heights.push(outcome.height);
             expected_height = expected_height.saturating_add(1);
         }
         let new_proven_height = last_height
             .ok_or_else(|| SyncBackendError::Rejected("empty block proof batch".to_owned()))?;
+
+        // After every imported proof, check whether the chunk
+        // covering that height is now proof-ready and open a BFT
+        // session if so. Off-boundary heights are cheap to inspect.
+        for height in imported_heights {
+            self.maybe_open_bft_session_for_height(height).await;
+        }
+
         Ok(ProofsImported { new_proven_height })
     }
 
@@ -858,27 +1099,42 @@ where
     }
 
     async fn ingest_finality_vote(&self, vote: FinalityVote) {
-        // M6 lands the transport: decode succeeded, so we count the
-        // vote as a healthy gossip artifact. M7 will route this
-        // into the chunk-BFT state machine via a dedicated vote
-        // pool on this backend.
         trace!(
             chunk_id = vote.data.chunk_id,
             round = vote.data.round,
             ?vote.data.phase,
-            "received finality vote (deferred to M7 BFT loop)"
+            "received finality vote"
         );
+        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
+            Ok(actions) => actions,
+            Err(err) => {
+                debug!(?err, "engine rejected finality vote");
+                return;
+            }
+        };
+        self.handle_bft_actions(actions).await;
     }
 
     async fn ingest_aggregate_finality_vote(&self, subnet: u8, vote: FinalityVote) {
-        // Same as `ingest_finality_vote`: M7 wires subnet ingest.
+        // Aggregated votes carry the same payload as raw votes; for
+        // M7-A they take the same engine ingest path. M7-C will add
+        // per-subnet routing so partial-vote aggregators on one
+        // subnet do not redo work for another.
         trace!(
             subnet,
             chunk_id = vote.data.chunk_id,
             round = vote.data.round,
             ?vote.data.phase,
-            "received aggregate finality vote (deferred to M7 BFT loop)"
+            "received aggregate finality vote"
         );
+        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
+            Ok(actions) => actions,
+            Err(err) => {
+                debug!(?err, "engine rejected aggregate finality vote");
+                return;
+            }
+        };
+        self.handle_bft_actions(actions).await;
     }
 
     async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {

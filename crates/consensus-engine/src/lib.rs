@@ -10,6 +10,7 @@
 //! finality cert, checkpoint, recursive proof, validator-set snapshot) to a
 //! column-family [`Database`](neutrino_storage::Database).
 
+pub mod bft_loop;
 pub mod block_state;
 pub mod body;
 pub mod checkpoint;
@@ -26,6 +27,7 @@ pub mod signature;
 pub mod store;
 pub mod validator_set;
 
+pub use bft_loop::{BftAction, BftLoopError, BftSession};
 pub use block_state::{BlockState, InvalidTransition};
 pub use body::{
     BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots, encode_runtime_body,

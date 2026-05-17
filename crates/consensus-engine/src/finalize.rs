@@ -465,15 +465,21 @@ impl<DB: Database> Engine<DB> {
         }
     }
 
-    /// Synthesize the single-validator prevote + precommit and drive
-    /// the chunk-BFT module through one round.
+    /// Drive the chunk-BFT module through one round, either by
+    /// consuming a live multi-validator session opened by the M7 BFT
+    /// loop, or by synthesizing a single-validator vote when no
+    /// session exists (M5 single-node path).
     fn run_chunk_bft(
-        &self,
+        &mut self,
         chunk: &Chunk,
         chunk_hash: ChunkHash,
         voter: &ProposerKey,
         active_validator_set_root: Hash,
     ) -> Result<FinalityCert, FinalizeError<DB::Error>> {
+        if let Some(session) = self.bft_sessions.remove(&chunk.chunk_id) {
+            return finalize_from_session(&session, chunk_hash, active_validator_set_root);
+        }
+
         let active_set = self.active_validator_set().to_vec();
         if active_set.is_empty() {
             return Err(FinalizeError::EmptyActiveSet);
@@ -525,6 +531,129 @@ impl<DB: Database> Engine<DB> {
             .ok_or(FinalizeError::FinalizationStalled)?;
         Ok(cert)
     }
+
+    /// Attempt to assemble the canonical [`Chunk`] for `chunk_id` from
+    /// already-persisted block headers and proofs. Used by the live
+    /// BFT loop ([`crate::bft_loop`]) to decide when a chunk is ready
+    /// to vote on without paying the cost of generating the chunk
+    /// proof or re-verifying every block proof.
+    ///
+    /// Returns `Ok(None)` if any block in the range is missing, not
+    /// yet in [`BlockState::Proven`] or beyond, or has no persisted
+    /// block proof — i.e. the chunk is not yet proof-ready and no
+    /// BFT session should be opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinalizeError::HeightRangeOverflow`] if `chunk_id`
+    /// is too large to address; [`FinalizeError::ParentHashMismatch`]
+    /// if a block's `parent_hash` does not extend the previous block
+    /// in the chunk; or the engine's storage / chain-spec errors.
+    pub fn assemble_chunk(
+        &self,
+        chunk_id: ChunkId,
+    ) -> Result<Option<Chunk>, FinalizeError<DB::Error>> {
+        let chunk_size = self.chain_spec().consensus.chunk_size;
+        let (start_height, end_height) = chunk_range(chunk_id, chunk_size)?;
+
+        let mut headers: Vec<Header> = Vec::new();
+        let mut block_hashes: Vec<BlockHash> = Vec::new();
+        let mut block_proof_leaves: Vec<Hash> = Vec::new();
+        let mut vrf_leaves: Vec<Hash> = Vec::new();
+        let mut da_leaves: Vec<Hash> = Vec::new();
+        let mut expected_parent: Option<BlockHash> = None;
+
+        for height in start_height..=end_height {
+            let Some(header) = self.store().get_header_by_height(height)? else {
+                return Ok(None);
+            };
+            let hash = header.hash();
+            if let Some(expected) = expected_parent
+                && header.parent_hash != expected
+            {
+                return Err(FinalizeError::ParentHashMismatch {
+                    height,
+                    expected,
+                    actual: header.parent_hash,
+                });
+            }
+            let Some(state) = self.store().get_block_state(&hash)? else {
+                return Ok(None);
+            };
+            if !matches!(
+                state,
+                BlockState::Proven
+                    | BlockState::ChunkProven
+                    | BlockState::Finalized
+                    | BlockState::Checkpointed
+            ) {
+                return Ok(None);
+            }
+            let Some(wire_proof) = self.store().get_block_proof(&hash)? else {
+                return Ok(None);
+            };
+
+            block_proof_leaves.push(hash_leaf(&wire_proof_leaf_bytes(&wire_proof)));
+            vrf_leaves.push(hash_leaf(&header.vrf_proof));
+            da_leaves.push(hash_leaf(&header.da_root));
+            block_hashes.push(hash);
+            headers.push(header);
+            expected_parent = Some(hash);
+        }
+
+        let first_header = headers.first().expect("at least one header in chunk range");
+        let last_header = headers.last().expect("at least one header in chunk range");
+        let start_state_root = self.chunk_parent_state_root(first_header)?;
+        let start_block_hash = *block_hashes.first().expect("non-empty block hashes");
+        let end_block_hash = *block_hashes.last().expect("non-empty block hashes");
+
+        let previous_index = self.latest_checkpoint_index();
+        let previous = self
+            .store()
+            .get_checkpoint(previous_index)?
+            .ok_or_else(|| FinalizeError::Engine(EngineError::NotInitialised))?;
+        let active_validator_set_root = previous.end_validator_set_root;
+        let next_validator_set_root = if last_header.runtime_extra == ZERO_HASH {
+            active_validator_set_root
+        } else {
+            last_header.runtime_extra
+        };
+
+        Ok(Some(Chunk {
+            chunk_id,
+            start_height,
+            end_height,
+            start_state_root,
+            end_state_root: last_header.state_root,
+            start_block_hash,
+            end_block_hash,
+            block_hash_root: merkle_root_of_hashes(&block_hashes),
+            block_proof_root: merkle_root_of_hashes(&block_proof_leaves),
+            vrf_proof_root: merkle_root_of_hashes(&vrf_leaves),
+            active_validator_set_root,
+            next_validator_set_root,
+            da_root: merkle_root_of_hashes(&da_leaves),
+        }))
+    }
+}
+
+/// Read the accumulated cert from a live BFT session that has
+/// already reached its precommit quorum. The caller has already
+/// removed the session from the engine's session map; this function
+/// only borrows it.
+fn finalize_from_session<E>(
+    session: &crate::bft_loop::BftSession,
+    chunk_hash: ChunkHash,
+    active_validator_set_root: Hash,
+) -> Result<FinalityCert, FinalizeError<E>> {
+    if session.chunk_hash() != chunk_hash {
+        return Err(FinalizeError::FinalizationStalled);
+    }
+    let cert = session
+        .chunk_bft()
+        .try_finalize(true, active_validator_set_root)?
+        .ok_or(FinalizeError::FinalizationStalled)?;
+    Ok(cert)
 }
 
 /// Intermediate data collected while finalizing a chunk, ferried

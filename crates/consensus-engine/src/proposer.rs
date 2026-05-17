@@ -19,7 +19,12 @@ use neutrino_primitives::{
 extern crate alloc;
 
 /// Validator BLS key used to sign block headers and finality votes.
-#[derive(Debug)]
+///
+/// Cloning duplicates the underlying BLS secret-key material; both
+/// clones zeroise on drop. The chain backend and engine each hold
+/// their own clone so the BFT-loop driver can sign votes
+/// independently of the synchronous engine mutex.
+#[derive(Clone, Debug)]
 pub struct ProposerKey {
     secret_key: SecretKey,
     public_key_bytes: BlsPublicKey,

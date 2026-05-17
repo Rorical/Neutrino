@@ -4,15 +4,21 @@
 //! bootstrap (this file) and per-slot block production (later phases
 //! reuse this struct via additional `impl` blocks).
 
+use alloc::collections::BTreeMap;
+
 use neutrino_primitives::{
     BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot, Validator,
 };
 use neutrino_storage::Database;
 use neutrino_trie::Trie;
 
+use crate::bft_loop::BftSession;
 use crate::clock::SlotClock;
 use crate::error::EngineError;
+use crate::proposer::ProposerKey;
 use crate::store::{ChainStore, StoreError, pointers};
+
+extern crate alloc;
 
 /// Engine state machine combining a chain store, slot clock, and the
 /// running head pointers.
@@ -34,6 +40,12 @@ pub struct Engine<DB: Database> {
     latest_finalized_chunk_id: Option<ChunkId>,
     latest_checkpoint_index: CheckpointIndex,
     active_validator_set: Vec<Validator>,
+    /// Live chunk-BFT sessions keyed by chunk id, used by the M7
+    /// multi-validator finality loop. See [`crate::bft_loop`].
+    pub(crate) bft_sessions: BTreeMap<ChunkId, BftSession>,
+    /// Local validator key used by the BFT loop to sign prevotes and
+    /// precommits. Unset on non-voting nodes.
+    pub(crate) local_voter: Option<ProposerKey>,
 }
 
 impl<DB: Database> Engine<DB> {
@@ -84,6 +96,8 @@ impl<DB: Database> Engine<DB> {
             latest_finalized_chunk_id: None,
             latest_checkpoint_index: 0,
             active_validator_set,
+            bft_sessions: BTreeMap::new(),
+            local_voter: None,
         })
     }
 
@@ -180,6 +194,8 @@ impl<DB: Database> Engine<DB> {
             latest_finalized_chunk_id,
             latest_checkpoint_index,
             active_validator_set,
+            bft_sessions: BTreeMap::new(),
+            local_voter: None,
         })
     }
 

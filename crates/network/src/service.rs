@@ -1385,7 +1385,11 @@ impl NetworkService {
             request_response::Event::OutboundFailure {
                 request_id, error, ..
             } => {
-                self.complete_outbound_failure(RpcProtocol::FinalityCertByChunk, request_id, &error)
+                self.complete_outbound_failure(
+                    RpcProtocol::FinalityCertByChunk,
+                    request_id,
+                    &error,
+                );
             }
             request_response::Event::InboundFailure { error, .. } => {
                 warn!(?error, "inbound failure on FinalityCertByChunk RPC");

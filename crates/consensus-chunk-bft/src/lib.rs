@@ -202,6 +202,42 @@ impl ChunkBft {
         self.round
     }
 
+    /// Number of validators in the active set.
+    #[must_use]
+    pub fn active_set_len(&self) -> usize {
+        self.active_set.len()
+    }
+
+    /// Whether the carried active-validator-set root matches `root`.
+    /// Used by the live BFT loop to refuse surfacing a quorum that
+    /// would produce a cert the verifier later rejects.
+    #[must_use]
+    pub fn validator_set_root_matches(&self, root: Hash) -> bool {
+        self.active_validator_set_root == root
+    }
+
+    /// Whether the accumulated prevote stake currently meets the
+    /// configured 2/3 prevote quorum.
+    #[must_use]
+    pub fn prevote_quorum_reached(&self) -> bool {
+        quorum_reached(
+            self.prevotes.aggregate_stake,
+            self.total_stake,
+            self.prevote_quorum,
+        )
+    }
+
+    /// Whether the accumulated precommit stake currently meets the
+    /// configured 2/3 precommit quorum.
+    #[must_use]
+    pub fn precommit_quorum_reached(&self) -> bool {
+        quorum_reached(
+            self.precommits.aggregate_stake,
+            self.total_stake,
+            self.precommit_quorum,
+        )
+    }
+
     /// Adds an aggregated prevote for the current round.
     pub fn add_prevote(&mut self, vote: FinalityVote) -> Result<(), BftError> {
         self.add_vote(vote, FinalityVotePhase::Prevote)

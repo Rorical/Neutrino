@@ -138,8 +138,21 @@ impl SyncDriver {
             NetworkEvent::NewListenAddr(addr) => {
                 debug!(%addr, "node listening on new address");
             }
-            NetworkEvent::GossipMessage { topic, data, .. } => {
-                self.handle_gossip(topic, data).await;
+            NetworkEvent::GossipMessage {
+                topic,
+                data,
+                propagation_source,
+                message_id,
+            } => {
+                let verdict = self.handle_gossip(topic, data, propagation_source).await;
+                let _ = self
+                    .cmd_tx
+                    .send(NetworkCommand::ReportGossipValidation {
+                        message_id,
+                        propagation_source,
+                        acceptance: verdict,
+                    })
+                    .await;
             }
             NetworkEvent::RpcRequestReceived {
                 peer,
@@ -164,14 +177,31 @@ impl SyncDriver {
         }
     }
 
-    async fn handle_gossip(&mut self, topic: Topic, data: Vec<u8>) {
+    /// Dispatch one gossip message to the matching topic handler and
+    /// translate the outcome into a [`gossipsub::MessageAcceptance`] so
+    /// scoring can react to application-level adversaries.
+    ///
+    /// Verdicts: `Reject` for un-decodable or semantically-wrong
+    /// content (the peer sent garbage); `Ignore` for content the local
+    /// node simply does not need right now (e.g., a duplicate
+    /// gossipped block, or a block we are too behind to import);
+    /// `Accept` for content that was useful.
+    async fn handle_gossip(
+        &mut self,
+        topic: Topic,
+        data: Vec<u8>,
+        source: neutrino_network::PeerId,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
         if topic == Topic::BlockProofs {
-            self.handle_block_proof_gossip(data).await;
-            return;
+            return self.handle_block_proof_gossip(data).await;
         }
         if topic == Topic::Checkpoints {
-            self.handle_checkpoint_gossip(data).await;
-            return;
+            return self.handle_checkpoint_gossip(data).await;
+        }
+        if topic == Topic::Transactions {
+            self.backend.submit_transaction(data).await;
+            return MessageAcceptance::Accept;
         }
         if topic != Topic::Blocks {
             debug!(
@@ -179,13 +209,13 @@ impl SyncDriver {
                 len = data.len(),
                 "ignoring gossip for non-Blocks topic"
             );
-            return;
+            return MessageAcceptance::Ignore;
         }
         let block = match borsh::from_slice::<neutrino_consensus_types::Block>(&data) {
             Ok(b) => b,
             Err(err) => {
-                warn!(?err, "failed to decode gossipped block; dropping");
-                return;
+                warn!(?err, %source, "failed to decode gossipped block; rejecting");
+                return MessageAcceptance::Reject;
             }
         };
         match self.backend.verify_and_import_gossip_block(block).await {
@@ -206,6 +236,7 @@ impl SyncDriver {
                     new_head_slot,
                 });
                 self.dispatch_sync_commands(cmds).await;
+                MessageAcceptance::Accept
             }
             Err(SyncBackendError::ChainBehind(reason)) => {
                 // Live gossip arrived ahead of our head: the local
@@ -213,24 +244,31 @@ impl SyncDriver {
                 // gossip drop). Reset the FSM and re-handshake every
                 // known peer so the next Status response re-enters
                 // HeaderBackfill and pulls the missing range via RPC.
+                // The peer was honest, so the message is just `Ignore`.
                 warn!(
                     %reason,
                     "gossipped block does not extend local head; resyncing"
                 );
                 self.reset_and_rehandshake().await;
+                MessageAcceptance::Ignore
             }
             Err(err) => {
-                warn!(?err, "rejecting gossipped block");
+                warn!(?err, %source, "rejecting gossipped block");
+                MessageAcceptance::Reject
             }
         }
     }
 
-    async fn handle_block_proof_gossip(&self, data: Vec<u8>) {
+    async fn handle_block_proof_gossip(
+        &self,
+        data: Vec<u8>,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
         let proof = match borsh::from_slice::<neutrino_consensus_types::BlockProof>(&data) {
             Ok(p) => p,
             Err(err) => {
-                warn!(?err, "failed to decode gossipped block proof; dropping");
-                return;
+                warn!(?err, "failed to decode gossipped block proof; rejecting");
+                return MessageAcceptance::Reject;
             }
         };
         let height = proof.height;
@@ -239,21 +277,32 @@ impl SyncDriver {
             .verify_and_import_block_proofs(height, vec![proof])
             .await
         {
-            Ok(_) => debug!(height, "imported gossipped block proof"),
-            Err(err) => warn!(height, ?err, "rejecting gossipped block proof"),
+            Ok(_) => {
+                debug!(height, "imported gossipped block proof");
+                MessageAcceptance::Accept
+            }
+            Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
+            Err(err) => {
+                debug!(height, ?err, "ignoring gossipped block proof");
+                MessageAcceptance::Ignore
+            }
         }
     }
 
-    async fn handle_checkpoint_gossip(&mut self, data: Vec<u8>) {
+    async fn handle_checkpoint_gossip(
+        &mut self,
+        data: Vec<u8>,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
         let proof =
             match borsh::from_slice::<neutrino_consensus_types::RecursiveCheckpointProof>(&data) {
                 Ok(p) => p,
                 Err(err) => {
                     warn!(
                         ?err,
-                        "failed to decode gossipped recursive checkpoint; dropping"
+                        "failed to decode gossipped recursive checkpoint; rejecting"
                     );
-                    return;
+                    return MessageAcceptance::Reject;
                 }
             };
         let checkpoint = proof.public_inputs.clone();
@@ -276,8 +325,16 @@ impl SyncDriver {
                     new_finalized_block_hash: cp.new_finalized_block_hash,
                 });
                 self.dispatch_sync_commands(cmds).await;
+                MessageAcceptance::Accept
             }
-            Err(err) => warn!(?err, "rejecting gossipped recursive checkpoint"),
+            Err(SyncBackendError::Rejected(reason)) => {
+                warn!(%reason, "rejecting gossipped recursive checkpoint");
+                MessageAcceptance::Reject
+            }
+            Err(err) => {
+                debug!(?err, "ignoring gossipped recursive checkpoint");
+                MessageAcceptance::Ignore
+            }
         }
     }
 

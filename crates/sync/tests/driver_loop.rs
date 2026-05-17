@@ -388,6 +388,9 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
             propagation_source: random_peer(),
             topic: neutrino_network::Topic::Blocks,
             data: borsh::to_vec(&block).unwrap(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(
+                b"test-msg-id".to_vec(),
+            ),
         })
         .await
         .unwrap();

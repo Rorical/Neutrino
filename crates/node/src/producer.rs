@@ -75,7 +75,7 @@ async fn attempt_slot(
         return;
     }
 
-    match backend.try_produce_empty_block(slot, &config.proposer, &config.runtime_elf) {
+    match backend.try_produce_block(slot, &config.proposer, &config.runtime_elf) {
         Ok(Some(outcome)) => {
             let proof = match backend.prove_block(&outcome.block_hash) {
                 Ok(proof) => proof.block_proof,
@@ -130,6 +130,7 @@ async fn attempt_slot(
                 slot,
                 height = outcome.block.header.height,
                 hash = ?outcome.block_hash,
+                tx_count = outcome.block.body.transactions.len(),
                 "produced and published block"
             );
 

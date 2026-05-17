@@ -179,4 +179,13 @@ pub trait SyncBackend: Send + Sync + 'static {
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError>;
+
+    /// Admit a peer-supplied transaction (received via
+    /// `/neutrino/txs/borsh/1`) into the local mempool.
+    ///
+    /// Default impl drops the transaction; backends that maintain a
+    /// mempool override it to feed into validation + insertion.
+    /// Errors are intentionally not surfaced — duplicates and
+    /// capacity rejections are best-effort.
+    async fn submit_transaction(&self, _bytes: Vec<u8>) {}
 }

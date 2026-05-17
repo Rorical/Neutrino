@@ -78,6 +78,14 @@ pub struct NodeConfig {
     /// topics from `docs/design/06-networking.md`.
     #[serde(default)]
     pub subscribe_topics: Option<Vec<String>>,
+    /// When set, the node spawns a deterministic test-transaction
+    /// generator that publishes this many synthetic deposits per slot
+    /// on `/neutrino/txs/borsh/1`. Used by the integration smoke test
+    /// to exercise the full mempool path (gossip in -> admission ->
+    /// produced block) without a separate tx-submission RPC. Leave
+    /// unset on production nodes.
+    #[serde(default)]
+    pub inject_test_transactions_per_slot: Option<u32>,
 }
 
 impl NodeConfig {

@@ -1,11 +1,14 @@
 //! Real [`SyncBackend`] backed by a [`ChainStore`] + [`ProofSystem`].
 //!
-//! Replaces the [`StubSyncBackend`](crate::backend::StubSyncBackend) used in
-//! the bootstrap commit of M6 stage 5. Read methods serve directly from
-//! the chain store; write methods route through
-//! [`Engine::import_block`] and [`Engine::import_recursive_proof`] so
-//! every imported artifact is validated before persistence and the
+//! Read methods serve directly from the chain store; write methods route
+//! through [`Engine::import_block`] and [`Engine::import_recursive_proof`]
+//! so every imported artifact is validated before persistence and the
 //! engine's in-memory head pointers stay consistent.
+//!
+//! The backend also owns a bounded [`Mempool`] keyed by
+//! `Topic::Transactions` gossip. Producers drain it when building bodies
+//! (`build_block_body`) and the engine removes mined transactions after
+//! every successful local or peer-supplied block.
 //!
 //! What is **not** validated yet:
 //!
@@ -13,9 +16,10 @@
 //!   validator set + BFT).
 //! - `state_root` re-execution — deferred to M8 when a real proof
 //!   backend ships.
-//! - Trie reconstruction during `StateFetch` — `import_state_nodes`
-//!   currently rejects all requests because the engine's runtime
-//!   trie does not yet have a sync-time write path.
+//! - Per-tx state-conditional validation in the mempool — the M6
+//!   admission pass is syntactic (type tag + length + non-zero amount).
+//!   Real state-aware validation lands with M7 alongside the runtime
+//!   re-execute path.
 
 use std::sync::Mutex;
 
@@ -25,6 +29,7 @@ use neutrino_consensus_engine::{
     ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
 };
 use neutrino_consensus_types::{Block, BlockProof, Body, RecursiveCheckpointProof};
+use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::rpc::{
     self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
     BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
@@ -32,7 +37,8 @@ use neutrino_network::rpc::{
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Height, Slot, StateRoot, ZERO_HASH,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
+    ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::ProofSystem;
 use neutrino_storage::Database;
@@ -41,6 +47,19 @@ use neutrino_sync::{
     SyncBackendError,
 };
 use tracing::debug;
+
+/// Default mempool byte budget. Sized generously so the M6 default
+/// runtime's 4096-byte body buffer easily fits a handful of validated
+/// deposits per slot without rebuilding capacity tracking each tick.
+const DEFAULT_MEMPOOL_CAPACITY_BYTES: usize = 256 * 1024;
+
+/// Default per-block body budget the producer drains from the mempool.
+///
+/// The runtime ELF reads up to 4096 bytes from `host_input`; the
+/// producer leaves a small slack for the `tx_count` prefix and per-tx
+/// length headers so a borderline-full mempool never bumps a single
+/// drain past the runtime's buffer.
+const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 3_500;
 
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
@@ -55,6 +74,7 @@ use tracing::debug;
 pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Mutex<Engine<DB>>,
     proof_system: P,
+    mempool: Mutex<Mempool>,
 }
 
 impl<DB, P> ChainBackend<DB, P>
@@ -68,6 +88,7 @@ where
         Self {
             engine: Mutex::new(engine),
             proof_system,
+            mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
         }
     }
 
@@ -86,26 +107,99 @@ where
         })
     }
 
-    /// Try to produce an empty-body block for `slot` using the shared engine.
+    /// Try to produce a block for `slot` using the shared engine, draining
+    /// any mempool transactions that fit within the runtime's body budget.
+    ///
+    /// Returns the [`ProductionOutcome`] when the validator is eligible. The
+    /// consumed transactions are removed from the local mempool; on failure
+    /// they are restored so the next slot can retry them.
     ///
     /// # Errors
     ///
     /// Returns [`ProductionError`] when the runtime, proposer key, or engine
     /// state reject the production attempt.
-    pub fn try_produce_empty_block(
+    pub fn try_produce_block(
         &self,
         slot: Slot,
         proposer: &ProposerKey,
         runtime_elf: &[u8],
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
-        self.with_engine_mut(|e| {
+        let drained = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
+        let drained_hashes: Vec<Hash> = drained.iter().map(|tx| blake3_256(tx)).collect();
+        let body = Body {
+            transactions: drained.clone(),
+            ..Body::default()
+        };
+        let result = self.with_engine_mut(|e| {
             let gas_limit = e.chain_spec().genesis_gas_limit;
             let cfg = ProductionConfig {
                 runtime_elf,
                 proposer,
             };
-            e.try_produce_block(slot, cfg, Body::default(), gas_limit)
-        })
+            e.try_produce_block(slot, cfg, body, gas_limit)
+        });
+        match &result {
+            // On Ok(Some) the engine consumed the body — the drained
+            // transactions are now mined.
+            Ok(Some(_)) => {}
+            // On Ok(None) (not eligible) the engine did not touch the
+            // body; on Err the engine rejected. Return drained txs
+            // either way so the next slot can retry them.
+            Ok(None) | Err(_) => {
+                self.restore_to_mempool(drained);
+            }
+        }
+        let _ = drained_hashes; // hashes are only useful for log filtering today
+        result
+    }
+
+    /// Submit a peer-supplied transaction into the local mempool.
+    ///
+    /// Performs syntactic admission validation only (type-tag + length +
+    /// non-zero amount where applicable); state-conditional checks run
+    /// when the runtime executes the block. Duplicate or oversized txs
+    /// are silently dropped via [`InsertError`] return values.
+    pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
+        let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
+        pool.insert_validated(bytes, basic_tx_admission)
+    }
+
+    /// Drain up to `byte_budget` bytes of transactions from the mempool
+    /// in priority order. Returns the raw transaction bytes.
+    pub fn drain_mempool(&self, byte_budget: usize) -> Vec<Vec<u8>> {
+        let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
+        pool.drain_up_to(byte_budget)
+            .into_iter()
+            .map(|entry| entry.bytes)
+            .collect()
+    }
+
+    fn restore_to_mempool(&self, txs: Vec<Vec<u8>>) {
+        let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
+        for bytes in txs {
+            // Skip insert errors: duplicates and capacity rejections
+            // are both acceptable for restore — the original entry
+            // just stays out of the pool.
+            let _ = pool.insert_validated(bytes, basic_tx_admission);
+        }
+    }
+
+    /// Number of transactions currently buffered. Mostly useful for
+    /// metrics and the smoke test.
+    pub fn mempool_len(&self) -> usize {
+        let pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
+        pool.len()
+    }
+
+    fn forget_mined_transactions(&self, transactions: &[Vec<u8>]) {
+        if transactions.is_empty() {
+            return;
+        }
+        let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
+        for tx in transactions {
+            let hash = blake3_256(tx);
+            pool.remove(&hash);
+        }
     }
 
     /// Prove a block that is already stored in the wrapped engine.
@@ -583,6 +677,7 @@ where
             let outcome = self
                 .with_engine_mut(|e| e.import_block(&block))
                 .map_err(Self::map_import_err)?;
+            self.forget_mined_transactions(&block.body.transactions);
             last = Some(HeadersImported {
                 new_head_height: outcome.new_head_height,
                 new_head_hash: outcome.block_hash,
@@ -645,10 +740,45 @@ where
         let outcome = self
             .with_engine_mut(|e| e.import_block(&block))
             .map_err(Self::map_import_err)?;
+        self.forget_mined_transactions(&block.body.transactions);
         Ok(HeadersImported {
             new_head_height: outcome.new_head_height,
             new_head_hash: outcome.block_hash,
             new_head_slot: outcome.new_head_slot,
         })
     }
+
+    async fn submit_transaction(&self, bytes: Vec<u8>) {
+        match Self::submit_transaction(self, bytes) {
+            Ok(_) => {}
+            Err(err) => debug!(?err, "mempool admission rejected a gossipped transaction"),
+        }
+    }
+}
+
+/// Syntactic admission check for the M6 default-runtime transaction
+/// format. Accepts only `TX_DEPOSIT` (type tag `0x03`) with the
+/// canonical 153-byte layout and a non-zero amount.
+///
+/// Real state-conditional validation is M7 work; the runtime itself
+/// re-validates each transaction during block execution and will abort
+/// the block if a transient invariant fails (e.g. nonces drifting,
+/// balances going negative).
+fn basic_tx_admission(bytes: &[u8]) -> bool {
+    // TX_DEPOSIT layout: 1 (type) + 48 (BLS pubkey) + 8 (amount LE) +
+    // 96 (BLS POP signature) = 153 bytes total.
+    const TX_DEPOSIT: u8 = 0x03;
+    const TX_DEPOSIT_LEN: usize = 153;
+    const AMOUNT_OFFSET: usize = 49;
+    if bytes.len() != TX_DEPOSIT_LEN {
+        return false;
+    }
+    if bytes[0] != TX_DEPOSIT {
+        return false;
+    }
+    let Ok(amount_bytes): Result<[u8; 8], _> = bytes[AMOUNT_OFFSET..AMOUNT_OFFSET + 8].try_into()
+    else {
+        return false;
+    };
+    u64::from_le_bytes(amount_bytes) > 0
 }

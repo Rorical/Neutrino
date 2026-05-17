@@ -5,3 +5,9 @@ bootnodes = ["/dns4/node1/tcp/30303"]
 chain_spec_path = "/etc/neutrino/chain-spec.toml"
 runtime_elf_path = "/usr/local/lib/neutrino-default-runtime"
 data_dir = "/var/lib/neutrino"
+
+# Generates two synthetic deposit transactions per slot so the
+# smoke test can observe the full mempool path: gossip on
+# /neutrino/txs/borsh/1 -> node1 admission -> drained into a
+# produced block. The injector is a test-only feature.
+inject_test_transactions_per_slot = 2

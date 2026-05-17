@@ -20,7 +20,6 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::backend::StubSyncBackend;
 use crate::chain_backend::ChainBackend;
 use crate::chain_spec::{ChainSpecError, ChainSpecFile, decode_hex_exact};
 use crate::config::{NodeConfig, NodeRole};
@@ -152,51 +151,43 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    // Select the sync backend.
-    let mut producer_job: Option<(
+    // Every node now requires a `chain_spec_path`; the stub fallback
+    // from earlier M6 bring-up was removed once the persistent
+    // ChainBackend stabilised. Misconfigured deployments must fail
+    // loudly instead of silently running an unreachable chain.
+    let Some(chain_spec_path) = config.chain_spec_path.clone() else {
+        return Err(NodeError::ChainSpec(ChainSpecError::Validation(
+            "chain_spec_path is required; the stub backend was removed".to_owned(),
+        )));
+    };
+    let spec_file = ChainSpecFile::load_from_path(&chain_spec_path)?;
+    let runtime_elf = load_runtime_elf(&config)?;
+    let mut chain_spec = spec_file.to_chain_spec()?;
+    apply_runtime_hash(&mut chain_spec, &spec_file, runtime_elf.as_deref())?;
+    if chain_spec.chain_id != config.chain_id {
+        return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
+            "chain spec chain_id {} does not match node config chain_id {}",
+            chain_spec.chain_id, config.chain_id
+        ))));
+    }
+    let production_config =
+        build_block_producer_config(&config, &chain_spec, runtime_elf.as_deref())?;
+    let chain_spec_slot_duration = chain_spec.consensus.slot_duration_secs;
+    let db = open_node_db(&config)?;
+    let engine = open_or_initialise_engine(db, chain_spec)?;
+    let proof_system = MockProofSystem::new();
+    info!(
+        chain_id = config.chain_id,
+        backend = "ChainBackend",
+        head_height = engine.head_height(),
+        "using real engine backend"
+    );
+    let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
+    let producer_job: Option<(
         Arc<ChainBackend<NodeDb, MockProofSystem>>,
         BlockProducerConfig,
-    )> = None;
-    let backend: Arc<dyn SyncBackend> = if let Some(path) = &config.chain_spec_path {
-        let spec_file = ChainSpecFile::load_from_path(path)?;
-        let runtime_elf = load_runtime_elf(&config)?;
-        let mut chain_spec = spec_file.to_chain_spec()?;
-        apply_runtime_hash(&mut chain_spec, &spec_file, runtime_elf.as_deref())?;
-        if chain_spec.chain_id != config.chain_id {
-            return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
-                "chain spec chain_id {} does not match node config chain_id {}",
-                chain_spec.chain_id, config.chain_id
-            ))));
-        }
-        let production_config =
-            build_block_producer_config(&config, &chain_spec, runtime_elf.as_deref())?;
-        let db = open_node_db(&config)?;
-        let engine = open_or_initialise_engine(db, chain_spec)?;
-        let proof_system = MockProofSystem::new();
-        info!(
-            chain_id = config.chain_id,
-            backend = "ChainBackend",
-            head_height = engine.head_height(),
-            "using real engine backend"
-        );
-        let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
-        if let Some(production_config) = production_config {
-            producer_job = Some((Arc::clone(&concrete_backend), production_config));
-        }
-        concrete_backend
-    } else {
-        if config.role == NodeRole::Validator
-            && (config.runtime_elf_path.is_some() || config.proposer_ikm_hex.is_some())
-        {
-            warn!("chain_spec_path not set; ignoring validator production config");
-        }
-        info!(
-            chain_id = config.chain_id,
-            backend = "StubSyncBackend",
-            "chain_spec_path not set; using stub backend"
-        );
-        Arc::new(StubSyncBackend::new(config.chain_id))
-    };
+    )> = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
+    let backend: Arc<dyn SyncBackend> = concrete_backend;
 
     let local_progress = backend.local_progress().await;
     let driver_cfg = SyncDriverConfig {
@@ -218,6 +209,17 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
             production_config,
         ))
     });
+    let injector_handle = config.inject_test_transactions_per_slot.and_then(|count| {
+        if count == 0 {
+            return None;
+        }
+        let slot_duration = chain_spec_slot_duration;
+        Some(tokio::spawn(crate::tx_injector::run_tx_injector(
+            cmd_tx.clone(),
+            slot_duration,
+            count,
+        )))
+    });
 
     // Wait for shutdown signal.
     wait_for_shutdown().await?;
@@ -228,6 +230,9 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(handle) = producer_handle.as_ref() {
         handle.abort();
     }
+    if let Some(handle) = injector_handle.as_ref() {
+        handle.abort();
+    }
     drop(cmd_tx);
 
     // Give tasks a brief grace period to flush logs.
@@ -235,6 +240,9 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         let _ = network_handle.await;
         let _ = driver_handle.await;
         if let Some(handle) = producer_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = injector_handle {
             let _ = handle.await;
         }
     })

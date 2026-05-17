@@ -81,6 +81,12 @@ pub enum NetworkEvent {
     /// A node started listening on a new address.
     NewListenAddr(Multiaddr),
     /// A gossip message was received on a topic to which we are subscribed.
+    ///
+    /// The host MUST eventually return a verdict by sending
+    /// [`NetworkCommand::ReportGossipValidation`] referencing the
+    /// supplied `message_id`. Failing to do so leaves the message in
+    /// the gossipsub pipeline as "pending" forever — accepted-but-not-
+    /// forwarded — which silently breaks mesh propagation.
     GossipMessage {
         /// Peer that propagated the message to us (not necessarily the originator).
         propagation_source: PeerId,
@@ -88,6 +94,9 @@ pub enum NetworkEvent {
         topic: Topic,
         /// Raw message bytes (borsh-encoded payload).
         data: Vec<u8>,
+        /// Gossipsub message id; required to report a validation
+        /// result back into the scoring engine.
+        message_id: gossipsub::MessageId,
     },
     /// An inbound RPC request was received. The host must reply with
     /// [`NetworkCommand::SendRpcResponse`] referencing the provided
@@ -153,6 +162,21 @@ pub enum NetworkCommand {
         /// One-shot reply channel with `(peer, score)` pairs.
         response_tx: oneshot::Sender<Vec<(PeerId, f64)>>,
     },
+    /// Forward an application-level validation verdict back into
+    /// gossipsub so it can update peer scores.
+    ///
+    /// The driver invokes this after handling each
+    /// [`NetworkEvent::GossipMessage`]. Repeated `Reject` verdicts
+    /// against the same peer will eventually drive their score below
+    /// `graylist_threshold` and exclude them from the mesh.
+    ReportGossipValidation {
+        /// Identifier from the originating [`NetworkEvent::GossipMessage`].
+        message_id: gossipsub::MessageId,
+        /// Peer the message arrived through.
+        propagation_source: PeerId,
+        /// Verdict to record.
+        acceptance: gossipsub::MessageAcceptance,
+    },
 }
 
 impl core::fmt::Debug for NetworkCommand {
@@ -185,6 +209,16 @@ impl core::fmt::Debug for NetworkCommand {
                 .field("protocol", &response.protocol())
                 .finish(),
             Self::QueryPeerScores { .. } => f.debug_struct("QueryPeerScores").finish(),
+            Self::ReportGossipValidation {
+                message_id,
+                propagation_source,
+                acceptance,
+            } => f
+                .debug_struct("ReportGossipValidation")
+                .field("message_id", message_id)
+                .field("propagation_source", propagation_source)
+                .field("acceptance", &format_args!("{acceptance:?}"))
+                .finish(),
         }
     }
 }
@@ -414,7 +448,7 @@ impl NetworkService {
                 gossipsub::Event::Message {
                     propagation_source,
                     message,
-                    ..
+                    message_id,
                 },
             )) => {
                 let topic_str = message.topic.as_str().to_owned();
@@ -425,10 +459,23 @@ impl NetworkService {
                             propagation_source,
                             topic,
                             data: message.data,
+                            message_id,
                         })
                         .await;
                 } else {
-                    warn!(topic = %topic_str, "received gossip on unknown topic; dropping");
+                    warn!(topic = %topic_str, "received gossip on unknown topic; rejecting");
+                    // An unknown topic from a connected peer is a
+                    // protocol violation; drop the message and let the
+                    // scorer count it against them.
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .report_message_validation_result(
+                            &message_id,
+                            &propagation_source,
+                            gossipsub::MessageAcceptance::Reject,
+                        );
                 }
             }
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::Gossipsub(
@@ -530,6 +577,17 @@ impl NetworkService {
                     }
                 }
                 let _ = response_tx.send(snapshot);
+            }
+            NetworkCommand::ReportGossipValidation {
+                message_id,
+                propagation_source,
+                acceptance,
+            } => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .report_message_validation_result(&message_id, &propagation_source, acceptance);
             }
         }
     }
@@ -1325,7 +1383,13 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
         .max_transmit_size(global_max)
-        .duplicate_cache_time(Duration::from_secs(60));
+        .duplicate_cache_time(Duration::from_secs(60))
+        // Manual validation lets us forward an application-level
+        // verdict (`ReportGossipValidation`) back into peer scoring;
+        // without it, scoring only reacts to gossipsub-protocol-level
+        // misbehaviour and an application-level adversarial flooder
+        // never gets graylisted.
+        .validate_messages();
 
     for topic in Topic::STATIC {
         builder.set_topic_max_transmit_size(topic.to_ident().hash(), topic.max_transmit_size());
@@ -1351,16 +1415,22 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
 
 /// Peer-score parameters used in gossipsub v1.1 strict scoring mode.
 ///
-/// Doc 06 calls for strict scoring; this baseline starts with topic-
-/// neutral weights so badly behaved peers (slow mesh delivery, invalid
-/// messages, repeated misbehaviour) accumulate negative score and get
-/// pruned from the mesh by gossipsub's internal heartbeat. Per-topic
-/// weight tuning lands with the M7 validator-set work; until then the
-/// global parameters provide the Sybil-resistance floor.
+/// Doc 06 calls for strict scoring. Application-level invalid messages
+/// (decoded payload rejected by the host) carry a heavy per-topic
+/// penalty so a flooding adversary drops below `graylist_threshold`
+/// within a small number of `Reject` verdicts.
 fn build_peer_score_config() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
+    use std::collections::HashMap;
+
+    let mut topics: HashMap<libp2p::gossipsub::TopicHash, gossipsub::TopicScoreParams> =
+        HashMap::new();
+    for topic in Topic::STATIC {
+        topics.insert(topic.to_ident().hash(), build_topic_score_params());
+    }
+
     let params = gossipsub::PeerScoreParams {
-        // Penalise invalid messages strongly so misbehaving peers fall
-        // below `graylist_threshold` quickly.
+        topics,
+        topic_score_cap: 32.0,
         behaviour_penalty_weight: -10.0,
         behaviour_penalty_threshold: 6.0,
         behaviour_penalty_decay: 0.5,
@@ -1369,8 +1439,6 @@ fn build_peer_score_config() -> (gossipsub::PeerScoreParams, gossipsub::PeerScor
         decay_interval: Duration::from_secs(1),
         decay_to_zero: 0.01,
         retain_score: Duration::from_secs(60),
-        // Empty per-topic map: every topic uses the defaults until
-        // M7 ships weighted topic tuning.
         ..gossipsub::PeerScoreParams::default()
     };
 
@@ -1383,6 +1451,44 @@ fn build_peer_score_config() -> (gossipsub::PeerScoreParams, gossipsub::PeerScor
     };
 
     (params, thresholds)
+}
+
+/// Per-topic scoring parameters.
+///
+/// Zeroes out the positive components from libp2p's defaults
+/// (`time_in_mesh`, `first_message_deliveries`,
+/// `mesh_message_deliveries`) because M6 does not yet have meaningful
+/// signal to reward — every node forwards every message. Negative
+/// components stay active: a single confirmed `Reject` verdict on
+/// `invalid_message_deliveries` is enough to drop the source peer
+/// below `graylist_threshold`. M7 will reintroduce the positive
+/// components once the validator surface gives them real meaning.
+const fn build_topic_score_params() -> gossipsub::TopicScoreParams {
+    gossipsub::TopicScoreParams {
+        topic_weight: 1.0,
+        // Positive components zeroed: nothing about being in the mesh
+        // or delivering messages first should buoy a peer up until
+        // mesh participation actually means something.
+        time_in_mesh_weight: 0.0,
+        time_in_mesh_quantum: Duration::from_secs(1),
+        time_in_mesh_cap: 0.0,
+        first_message_deliveries_weight: 0.0,
+        first_message_deliveries_decay: 0.5,
+        first_message_deliveries_cap: 0.0,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_message_deliveries_decay: 0.5,
+        mesh_message_deliveries_cap: 0.0,
+        mesh_message_deliveries_threshold: 0.0,
+        mesh_message_deliveries_activation: Duration::from_secs(5),
+        mesh_message_deliveries_window: Duration::from_millis(10),
+        mesh_failure_penalty_weight: 0.0,
+        mesh_failure_penalty_decay: 0.5,
+        // Each rejected delivery contributes ~100 negative score under
+        // P_4. With the graylist threshold at -80, even one confirmed
+        // application-level reject pushes the source below it.
+        invalid_message_deliveries_weight: -100.0,
+        invalid_message_deliveries_decay: 0.99,
+    }
 }
 
 /// Build the Kademlia behaviour with the Neutrino DHT protocol name.
@@ -1874,5 +1980,154 @@ mod tests {
 
         let response = response.expect("Status RPC succeeded");
         assert!(matches!(response, RpcResponse::Status(s) if s == canned_b_status));
+    }
+
+    /// Adversarial gossipsub scoring: peer A publishes a payload that
+    /// the host application rejects. The victim B feeds back a
+    /// `MessageAcceptance::Reject` verdict via
+    /// `NetworkCommand::ReportGossipValidation`. With the per-topic
+    /// `invalid_message_deliveries_weight = -100.0` configured by
+    /// `build_topic_score_params`, even one confirmed reject drops A's
+    /// score below the `-80.0` graylist threshold, demonstrating that
+    /// scoring is wired end-to-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    async fn adversarial_peer_publishing_invalid_messages_is_graylisted() {
+        init_tracing();
+
+        let key_a = identity::Keypair::generate_ed25519();
+        let peer_a = PeerId::from(key_a.public());
+        let (cmd_tx_a, cmd_rx_a) = mpsc::channel::<NetworkCommand>(64);
+        let (event_tx_a, mut event_rx_a) = mpsc::channel::<NetworkEvent>(128);
+        let mut svc_a = NetworkService::new(key_a, cmd_rx_a, event_tx_a).unwrap();
+
+        let key_b = identity::Keypair::generate_ed25519();
+        let peer_b = PeerId::from(key_b.public());
+        let (cmd_tx_b, cmd_rx_b) = mpsc::channel::<NetworkCommand>(64);
+        let (event_tx_b, mut event_rx_b) = mpsc::channel::<NetworkEvent>(128);
+        let svc_b = NetworkService::new(key_b, cmd_rx_b, event_tx_b).unwrap();
+
+        svc_a
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        tokio::spawn(svc_a.run());
+        tokio::spawn(svc_b.run());
+
+        let addr_a = timeout(TokDuration::from_secs(5), async {
+            loop {
+                if let Some(NetworkEvent::NewListenAddr(addr)) = event_rx_a.recv().await {
+                    return addr;
+                }
+            }
+        })
+        .await
+        .expect("A listen addr");
+        cmd_tx_b.send(NetworkCommand::Dial(addr_a)).await.unwrap();
+
+        // Both ends see the connection.
+        timeout(TokDuration::from_secs(5), async {
+            let mut connected_a = false;
+            let mut connected_b = false;
+            loop {
+                tokio::select! {
+                    Some(ev) = event_rx_a.recv() => {
+                        if matches!(ev, NetworkEvent::PeerConnected(p) if p == peer_b) {
+                            connected_a = true;
+                        }
+                    }
+                    Some(ev) = event_rx_b.recv() => {
+                        if matches!(ev, NetworkEvent::PeerConnected(p) if p == peer_a) {
+                            connected_b = true;
+                        }
+                    }
+                }
+                if connected_a && connected_b {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection both ways");
+
+        // Subscribe both sides to the Blocks topic; wait for mesh GRAFT.
+        cmd_tx_a
+            .send(NetworkCommand::Subscribe(Topic::Blocks))
+            .await
+            .unwrap();
+        cmd_tx_b
+            .send(NetworkCommand::Subscribe(Topic::Blocks))
+            .await
+            .unwrap();
+        tokio::time::sleep(TokDuration::from_millis(2_500)).await;
+
+        // A publishes a payload that decodes to garbage at the
+        // application level. With manual validation enabled, the
+        // message stays "pending" until B reports a verdict.
+        let garbage: Vec<u8> = (0u16..256)
+            .map(|i| u8::try_from(i & 0xFF).expect("byte") ^ 0x5A)
+            .collect();
+        cmd_tx_a
+            .send(NetworkCommand::Publish {
+                topic: Topic::Blocks,
+                data: garbage.clone(),
+            })
+            .await
+            .unwrap();
+
+        // B receives, simulates application-level rejection, and feeds
+        // the verdict back into gossipsub.
+        let (msg_id, source) = timeout(TokDuration::from_secs(10), async {
+            loop {
+                if let Some(NetworkEvent::GossipMessage {
+                    propagation_source,
+                    topic,
+                    data,
+                    message_id,
+                }) = event_rx_b.recv().await
+                {
+                    if topic == Topic::Blocks && data == garbage {
+                        return (message_id, propagation_source);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("B received A's garbage payload");
+        assert_eq!(source, peer_a, "B must see A as the propagation source");
+        cmd_tx_b
+            .send(NetworkCommand::ReportGossipValidation {
+                message_id: msg_id,
+                propagation_source: source,
+                acceptance: gossipsub::MessageAcceptance::Reject,
+            })
+            .await
+            .unwrap();
+
+        // Give the scorer one decay interval to apply the penalty.
+        tokio::time::sleep(TokDuration::from_millis(1_500)).await;
+
+        let (score_tx, score_rx) = oneshot::channel();
+        cmd_tx_b
+            .send(NetworkCommand::QueryPeerScores {
+                response_tx: score_tx,
+            })
+            .await
+            .unwrap();
+        let scores = timeout(TokDuration::from_secs(2), score_rx)
+            .await
+            .expect("score response did not arrive")
+            .expect("score channel was not dropped");
+
+        let a_score = scores
+            .iter()
+            .find(|(p, _)| *p == peer_a)
+            .map(|(_, s)| *s)
+            .expect("B must have observed A in its score table");
+        // Graylist threshold is -80; per-topic invalid weight is -100.
+        // A single reject must therefore push A below the threshold.
+        assert!(
+            a_score <= -80.0,
+            "B's view of A's score should be graylisted (<= -80), got {a_score}"
+        );
     }
 }

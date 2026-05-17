@@ -22,15 +22,14 @@
 //! What this slice does **not** yet provide:
 //! - JSON-RPC / metrics endpoints.
 
-pub mod backend;
 pub mod chain_backend;
 pub mod chain_spec;
 pub mod config;
 pub mod db;
 pub(crate) mod producer;
 pub mod runner;
+pub(crate) mod tx_injector;
 
-pub use backend::StubSyncBackend;
 pub use chain_backend::ChainBackend;
 pub use chain_spec::{ChainSpecError, ChainSpecFile, ValidatorEntry};
 pub use config::{NodeConfig, NodeRole};

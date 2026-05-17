@@ -126,6 +126,32 @@ while :; do
     sleep 1
 done
 
+# Mempool path: node2 injects synthetic deposits, gossip carries
+# them to node1, node1 drains them into produced blocks. The
+# producer log line includes `tx_count=N` so we can verify at least
+# one block carried a non-zero count. tracing-subscriber wraps each
+# structured field in ANSI escape codes, so the regex strips them
+# before matching `tx_count=N`.
+echo "--- waiting for node1 to include gossipped transactions ---"
+TX_DEADLINE=$(( $(date +%s) + 30 ))
+while :; do
+    if [[ $(date +%s) -ge ${TX_DEADLINE} ]]; then
+        echo "timeout: node1 produced no block with mempool transactions" >&2
+        "${COMPOSE[@]}" -f docker-compose.yml logs --tail=200 node1 >&2 || true
+        "${COMPOSE[@]}" -f docker-compose.yml logs --tail=80 node2 >&2 || true
+        exit 1
+    fi
+    with_tx=$(docker logs neutrino-m6-node1 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep "produced and published block" \
+        | grep -cE 'tx_count=[1-9][0-9]*' || true)
+    if [[ ${with_tx} -ge 1 ]]; then
+        echo "  node1: ${with_tx} block(s) included mempool transactions"
+        break
+    fi
+    sleep 1
+done
+
 echo "--- verifying gossipped block import on followers ---"
 for node in node2 node3; do
     container="neutrino-m6-${node}"

@@ -14,8 +14,7 @@
 //! - TOML configuration loading ([`NodeConfig`]).
 //! - Network bring-up: keypair, listeners, bootnode dial-out,
 //!   topic subscriptions.
-//! - A real [`ChainBackend`] path selected by `chain_spec_path`, with a
-//!   stub fallback for network-only tests.
+//! - A real [`ChainBackend`] path selected by `chain_spec_path`.
 //! - Optional validator block production when runtime ELF and proposer
 //!   key material are configured.
 //!

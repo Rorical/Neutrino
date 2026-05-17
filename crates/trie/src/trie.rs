@@ -17,6 +17,7 @@
 //! * The empty trie has root [`crate::EMPTY_TRIE_ROOT`] (`[0; 32]`).
 
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
@@ -181,6 +182,21 @@ impl<H: Hasher> Trie<H> {
         }
     }
 
+    /// Return every raw runtime key currently present in the trie.
+    ///
+    /// Keys are reconstructed from leaf paths by removing the trie-internal
+    /// `u32::LE length || key` prefix used by [`Trie::insert`]. The returned
+    /// list is sorted lexicographically so callers can implement cursored
+    /// state iteration without depending on the Patricia node shape.
+    #[must_use]
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut keys = Vec::new();
+        let mut prefix = Vec::new();
+        self.collect_keys(self.root, &mut prefix, &mut keys);
+        keys.sort();
+        keys
+    }
+
     /// Insert (or overwrite) the value at `key`. Returns
     /// [`TrieError::PrefixCollision`] if a malformed internal path
     /// would create a prefix-colliding pair. Normal byte-string keys
@@ -281,6 +297,36 @@ impl<H: Hasher> Trie<H> {
             .get(hash)
             .expect("trie invariant: every reachable hash is in the node store");
         Node::decode(bytes).expect("trie invariant: stored node bytes are canonical")
+    }
+
+    fn collect_keys(&self, hash: Hash, prefix: &mut Vec<bool>, keys: &mut Vec<Vec<u8>>) {
+        if hash == ZERO_HASH {
+            return;
+        }
+        match self.fetch_node(&hash) {
+            Node::Leaf { key_suffix, .. } => {
+                let original_len = prefix.len();
+                append_bits(prefix, &key_suffix);
+                if let Some(key) = decode_raw_key(prefix) {
+                    keys.push(key);
+                }
+                prefix.truncate(original_len);
+            }
+            Node::Branch { left, right } => {
+                prefix.push(false);
+                self.collect_keys(left, prefix, keys);
+                prefix.pop();
+                prefix.push(true);
+                self.collect_keys(right, prefix, keys);
+                prefix.pop();
+            }
+            Node::Extension { prefix: ext, child } => {
+                let original_len = prefix.len();
+                append_bits(prefix, &ext);
+                self.collect_keys(child, prefix, keys);
+                prefix.truncate(original_len);
+            }
+        }
     }
 
     fn store_node(&mut self, node: &Node) -> Hash {
@@ -581,6 +627,29 @@ impl<H: Hasher> Trie<H> {
     }
 }
 
+fn append_bits(out: &mut Vec<bool>, path: &BitPath) {
+    for index in 0..path.bit_len() {
+        out.push(path.bit(index));
+    }
+}
+
+fn decode_raw_key(bits: &[bool]) -> Option<Vec<u8>> {
+    if bits.len() < 32 || bits.len() % 8 != 0 {
+        return None;
+    }
+    let mut encoded = vec![0_u8; bits.len() / 8];
+    for (index, bit) in bits.iter().copied().enumerate() {
+        if bit {
+            encoded[index / 8] |= 1 << (7 - (index % 8));
+        }
+    }
+    let key_len = usize::try_from(u32::from_le_bytes(encoded[..4].try_into().ok()?)).ok()?;
+    if encoded.len() != 4_usize.checked_add(key_len)? {
+        return None;
+    }
+    Some(encoded[4..].to_vec())
+}
+
 fn concat_bits(head: &BitPath, tail: &BitPath) -> BitPath {
     if head.is_empty() {
         return tail.clone();
@@ -656,6 +725,19 @@ mod tests {
         assert_eq!(trie.get(b"account:alice"), Some(b"100".to_vec()));
         assert_eq!(trie.get(b"account:bob"), None);
         assert_ne!(trie.root(), ZERO_HASH);
+    }
+
+    #[test]
+    fn keys_returns_raw_keys_in_lexicographic_order() {
+        let mut trie = TestTrie::new();
+        trie.insert(b"gamma", b"3".to_vec()).expect("insert");
+        trie.insert(b"alpha", b"1".to_vec()).expect("insert");
+        trie.insert(b"alphabet", b"2".to_vec()).expect("insert");
+
+        assert_eq!(
+            trie.keys(),
+            vec![b"alpha".to_vec(), b"alphabet".to_vec(), b"gamma".to_vec()]
+        );
     }
 
     #[test]

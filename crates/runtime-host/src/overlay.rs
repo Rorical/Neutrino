@@ -12,7 +12,7 @@
 //! length-prefix encoding handles prefix-free addressing internally
 //! (see `neutrino-trie` docs).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use neutrino_primitives::StateRoot;
 use neutrino_trie::Trie;
@@ -77,6 +77,53 @@ impl Overlay {
     #[must_use]
     pub fn dirty_count(&self) -> usize {
         self.dirty.len()
+    }
+
+    /// Return the next live key with `prefix` and lexicographically
+    /// greater than `after`.
+    ///
+    /// The view is overlay-aware: staged puts are included, staged
+    /// deletes are hidden, and committed trie keys are used for the
+    /// base ordering.
+    #[must_use]
+    pub fn next_key(&self, prefix: &[u8], after: &[u8]) -> Option<Vec<u8>> {
+        let mut keys: BTreeSet<Vec<u8>> = self.base.keys().into_iter().collect();
+        for (key, entry) in &self.dirty {
+            match entry {
+                OverlayEntry::Put(_) => {
+                    keys.insert(key.clone());
+                }
+                OverlayEntry::Delete => {
+                    keys.remove(key);
+                }
+            }
+        }
+        keys.into_iter()
+            .find(|key| key.starts_with(prefix) && (after.is_empty() || key.as_slice() > after))
+    }
+
+    /// Compute the trie root that would result from committing the
+    /// current dirty overlay, without mutating this overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying trie error if a staged put cannot be
+    /// inserted. Runtime byte keys are length-prefixed by the trie, so
+    /// valid runtime writes should not hit this path.
+    pub fn materialized_root(&self) -> Result<StateRoot, neutrino_trie::TrieError> {
+        if self.dirty.is_empty() {
+            return Ok(self.current_root());
+        }
+        let mut trie = self.base.clone();
+        for (key, entry) in &self.dirty {
+            match entry {
+                OverlayEntry::Put(value) => trie.insert(key, value.clone())?,
+                OverlayEntry::Delete => {
+                    trie.remove(key);
+                }
+            }
+        }
+        Ok(trie.root())
     }
 
     /// Read the overlay-aware value for `key`. `None` is returned for
@@ -254,6 +301,39 @@ mod tests {
         overlay.put(b"x".to_vec(), b"y".to_vec());
         assert_eq!(overlay.base_root(), captured);
         assert_eq!(overlay.current_root(), captured); // commit not called yet
+    }
+
+    #[test]
+    fn materialized_root_matches_commit_without_mutating_overlay() {
+        let mut committed = Overlay::new(populated_trie());
+        committed.put(b"gamma".to_vec(), b"3".to_vec());
+        committed.delete(b"alpha".to_vec());
+        let expected = committed.commit().unwrap();
+
+        let mut overlay = Overlay::new(populated_trie());
+        overlay.put(b"gamma".to_vec(), b"3".to_vec());
+        overlay.delete(b"alpha".to_vec());
+
+        assert_eq!(overlay.materialized_root().unwrap(), expected);
+        assert_eq!(overlay.dirty_count(), 2);
+        assert_eq!(overlay.get(b"gamma"), Some(b"3".to_vec()));
+        assert_eq!(overlay.get(b"alpha"), None);
+    }
+
+    #[test]
+    fn next_key_merges_base_puts_and_deletes() {
+        let mut overlay = Overlay::new(populated_trie());
+        overlay.put(b"aardvark".to_vec(), b"0".to_vec());
+        overlay.put(b"alphabet".to_vec(), b"3".to_vec());
+        overlay.delete(b"alpha".to_vec());
+
+        assert_eq!(overlay.next_key(b"a", b""), Some(b"aardvark".to_vec()));
+        assert_eq!(
+            overlay.next_key(b"a", b"aardvark"),
+            Some(b"alphabet".to_vec())
+        );
+        assert_eq!(overlay.next_key(b"a", b"alphabet"), None);
+        assert_eq!(overlay.next_key(b"b", b""), Some(b"beta".to_vec()));
     }
 
     #[test]

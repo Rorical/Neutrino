@@ -24,7 +24,7 @@ use std::fs;
 use neutrino_consensus_engine::{
     Engine, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, validator_set_root,
 };
-use neutrino_consensus_types::Body;
+use neutrino_consensus_types::{Body, Deposit, VoluntaryExit};
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
     ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, blake3_256,
@@ -104,19 +104,31 @@ fn run_one_block(
     elf: &[u8],
     slot: u64,
 ) -> ProductionOutcome {
+    run_one_block_with_body(engine, proposer, elf, slot, Body::default())
+}
+
+fn run_one_block_with_body(
+    engine: &mut Engine<MemoryDatabase>,
+    proposer: &ProposerKey,
+    elf: &[u8],
+    slot: u64,
+    body: Body,
+) -> ProductionOutcome {
     let cfg = ProductionConfig {
         runtime_elf: elf,
         proposer,
     };
     engine
-        .try_produce_block(
-            slot,
-            cfg,
-            Body::default(),
-            engine.chain_spec().genesis_gas_limit,
-        )
+        .try_produce_block(slot, cfg, body, engine.chain_spec().genesis_gas_limit)
         .expect("produce_block ok")
         .expect("validator should be elected on a single-validator chain")
+}
+
+fn stake_key(pubkey: &[u8; 48]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(52);
+    key.extend_from_slice(b"stk:");
+    key.extend_from_slice(pubkey);
+    key
 }
 
 #[test]
@@ -208,6 +220,51 @@ fn engine_produces_two_consecutive_blocks_with_chained_state() {
     assert!(store.get_header(&first.block_hash).unwrap().is_some());
     assert!(store.get_header(&second.block_hash).unwrap().is_some());
     assert_eq!(store.get_tip().expect("tip"), Some(second.block_hash));
+}
+
+#[test]
+fn production_executes_deposit_and_exit_body_lanes() {
+    let Some(elf) = read_elf() else {
+        eprintln!(
+            "{ELF_ENV} not set or ELF unreadable; skipping end-to-end test. \
+              Remove CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1 to enable."
+        );
+        return;
+    };
+
+    let proposer = make_proposer();
+    let validator_pubkey = *proposer.public_key_bytes();
+    let spec = chain_spec(validators_from(&proposer), blake3_256(&elf));
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+    let key = stake_key(&validator_pubkey);
+
+    let deposit = Body {
+        deposits: vec![Deposit {
+            pubkey: validator_pubkey,
+            withdrawal_credentials: [0x33; 32],
+            amount: 77,
+            signature: [0x44; 96],
+        }],
+        ..Body::default()
+    };
+    let first = run_one_block_with_body(&mut engine, &proposer, &elf, 1, deposit);
+    assert!(first.next_validator_set_root.is_some());
+    let mut expected_stake = Vec::with_capacity(40);
+    expected_stake.extend_from_slice(&77_u64.to_le_bytes());
+    expected_stake.extend_from_slice(&[0_u8; 32]);
+    assert_eq!(engine.state().get(&key), Some(expected_stake));
+
+    let exit = Body {
+        voluntary_exits: vec![VoluntaryExit {
+            validator_index: 0,
+            epoch: 0,
+            signature: [0x55; 96],
+        }],
+        ..Body::default()
+    };
+    let second = run_one_block_with_body(&mut engine, &proposer, &elf, 2, exit);
+    assert!(second.next_validator_set_root.is_some());
+    assert_eq!(engine.state().get(&key), None);
 }
 
 #[test]

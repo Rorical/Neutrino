@@ -144,20 +144,46 @@ pub fn exists(
 
 /// `state_next_key(prefix_ptr, prefix_len, after_ptr, after_len, out_ptr, out_cap) -> (status, written_len)` — `0x14`.
 ///
-/// Cursored iteration is not implemented for M2 — the reference trie
-/// does not yet expose ordered iteration and the default runtime does
-/// not exercise this syscall. The handler signals `NotFound` for every
-/// invocation so a future trie API can fill it in without an ABI bump.
+/// Returns the lexicographically next live key that starts with
+/// `prefix` and is greater than `after`. An empty `after` starts at the
+/// first matching key. On success the full key bytes are written to
+/// `out_ptr`; on `BufferTooSmall`, no partial key is copied and `a1`
+/// carries the required length.
 pub fn next_key(
     cpu: &mut Cpu,
-    _memory: &mut Memory,
-    _overlay: &Overlay,
+    memory: &mut Memory,
+    overlay: &Overlay,
     gas_remaining: &mut u64,
 ) -> Result<Option<Halt>, Trap> {
+    let prefix_ptr = cpu.read(10);
+    let prefix_len = cpu.read(11);
+    let after_ptr = cpu.read(12);
+    let after_len = cpu.read(13);
+    let out_ptr = cpu.read(14);
+    let out_cap = cpu.read(15);
+
+    let prefix = pointer::read_bytes(memory, prefix_ptr, prefix_len)?;
+    let after = pointer::read_bytes(memory, after_ptr, after_len)?;
+    let Some(next) = overlay.next_key(&prefix, &after) else {
+        *gas_remaining = gas_remaining
+            .checked_sub(gas::state_next_key(0))
+            .ok_or(Trap::OutOfGas)?;
+        set_status_pair(cpu, Status::NotFound, 0);
+        return Ok(None);
+    };
+
+    let full_len = u32::try_from(next.len()).unwrap_or(u32::MAX);
+    let written_len = full_len.min(out_cap);
     *gas_remaining = gas_remaining
-        .checked_sub(gas::state_next_key(0))
+        .checked_sub(gas::state_next_key(u64::from(written_len)))
         .ok_or(Trap::OutOfGas)?;
-    set_status_pair(cpu, Status::NotFound, 0);
+    if full_len > out_cap {
+        set_status_pair(cpu, Status::BufferTooSmall, full_len);
+        return Ok(None);
+    }
+
+    pointer::write_bytes(memory, out_ptr, &next)?;
+    set_status_pair(cpu, Status::Ok, full_len);
     Ok(None)
 }
 
@@ -167,10 +193,9 @@ pub fn next_key(
 /// Gas is `gas::state_root_idempotent` when the overlay has no staged
 /// mutations, otherwise `gas::state_root_dirty(dirty_count)`.
 ///
-/// M2 implementation note: the cost model expects this to materialize
-/// the new root by walking the dirty set; we commit-and-recover by
-/// snapshotting and re-applying, but the dirty count is what gets
-/// charged regardless.
+/// Dirty overlays are materialized against a cloned trie, so the syscall
+/// reports the post-commit root without committing or clearing staged
+/// writes.
 pub fn root(
     cpu: &mut Cpu,
     memory: &mut Memory,
@@ -186,12 +211,9 @@ pub fn root(
     };
     *gas_remaining = gas_remaining.checked_sub(cost).ok_or(Trap::OutOfGas)?;
 
-    // Idempotent variant only for now: report the base trie's root.
-    // Dirty-overlay root materialization is M2+: it requires a
-    // non-destructive "rehash dirty" path on the overlay, which the
-    // reference trie does not yet expose. The gas is still charged
-    // correctly so consensus accounting stays sound.
-    let root_bytes = overlay.current_root();
+    let root_bytes = overlay
+        .materialized_root()
+        .map_err(|_| Trap::HostError { code: 0x15 })?;
     pointer::write_bytes(memory, out_ptr, &root_bytes)?;
     Ok(None)
 }
@@ -341,6 +363,71 @@ mod tests {
         let _ = root(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
         let root_bytes = load_bytes(&mem, 0, 32);
         assert_eq!(&root_bytes[..], &[0u8; 32]);
+    }
+
+    #[test]
+    fn root_materializes_dirty_overlay_without_committing() {
+        let mut overlay = Overlay::empty();
+        overlay.put(b"key".to_vec(), b"value".to_vec());
+        let expected = overlay.materialized_root().unwrap();
+
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0);
+        let mut mem = rw_memory(64);
+        let mut gas = 10_000_u64;
+        let _ = root(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+
+        assert_eq!(load_bytes(&mem, 0, 32), expected.to_vec());
+        assert_eq!(overlay.dirty_count(), 1);
+        assert_eq!(overlay.current_root(), [0u8; 32]);
+    }
+
+    #[test]
+    fn next_key_returns_overlay_aware_cursor_result() {
+        let mut overlay = Overlay::empty();
+        overlay.put(b"acct:alice".to_vec(), b"1".to_vec());
+        overlay.put(b"acct:bob".to_vec(), b"2".to_vec());
+        overlay.put(b"other".to_vec(), b"3".to_vec());
+
+        let mut mem = rw_memory(256);
+        store_bytes(&mut mem, 0, b"acct:");
+        store_bytes(&mut mem, 32, b"acct:alice");
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0); // prefix_ptr
+        cpu.write(11, 5); // prefix_len
+        cpu.write(12, 32); // after_ptr
+        cpu.write(13, 10); // after_len
+        cpu.write(14, 100); // out_ptr
+        cpu.write(15, 32); // out_cap
+        let mut gas = 10_000_u64;
+
+        let _ = next_key(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+
+        assert_eq!(cpu.read(10), Status::Ok.as_u32());
+        assert_eq!(cpu.read(11), 8);
+        assert_eq!(load_bytes(&mem, 100, 8), b"acct:bob");
+    }
+
+    #[test]
+    fn next_key_reports_buffer_too_small() {
+        let mut overlay = Overlay::empty();
+        overlay.put(b"acct:alice".to_vec(), b"1".to_vec());
+
+        let mut mem = rw_memory(256);
+        store_bytes(&mut mem, 0, b"acct:");
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0);
+        cpu.write(11, 5);
+        cpu.write(12, 0);
+        cpu.write(13, 0);
+        cpu.write(14, 100);
+        cpu.write(15, 4);
+        let mut gas = 10_000_u64;
+
+        let _ = next_key(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+
+        assert_eq!(cpu.read(10), Status::BufferTooSmall.as_u32());
+        assert_eq!(cpu.read(11), 10);
     }
 
     #[test]

@@ -16,10 +16,6 @@
 //!   validator set + BFT).
 //! - `state_root` re-execution — deferred to M8 when a real proof
 //!   backend ships.
-//! - Per-tx state-conditional validation in the mempool — the M6
-//!   admission pass is syntactic (type tag + length + non-zero amount).
-//!   Real state-aware validation lands with M7 alongside the runtime
-//!   re-execute path.
 
 use std::sync::Mutex;
 
@@ -41,6 +37,8 @@ use neutrino_primitives::{
     ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::ProofSystem;
+use neutrino_runtime_abi::BlockContext;
+use neutrino_runtime_host::{Overlay, validate_transaction};
 use neutrino_storage::Database;
 use neutrino_sync::{
     CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
@@ -75,6 +73,7 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Mutex<Engine<DB>>,
     proof_system: P,
     mempool: Mutex<Mempool>,
+    runtime_elf: Option<Vec<u8>>,
 }
 
 impl<DB, P> ChainBackend<DB, P>
@@ -89,6 +88,27 @@ where
             engine: Mutex::new(engine),
             proof_system,
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
+            runtime_elf: None,
+        }
+    }
+
+    /// Wrap an engine and attach a runtime ELF for mempool admission.
+    ///
+    /// When `runtime_elf` is present, every submitted transaction is
+    /// checked by the runtime's `_neutrino_validate_tx` entrypoint
+    /// against the backend's current state before entering the mempool.
+    /// Without it, transaction admission rejects all gossipped
+    /// transactions rather than falling back to syntactic validation.
+    pub const fn new_with_runtime_elf(
+        engine: Engine<DB>,
+        proof_system: P,
+        runtime_elf: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            engine: Mutex::new(engine),
+            proof_system,
+            mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
+            runtime_elf,
         }
     }
 
@@ -155,13 +175,13 @@ where
 
     /// Submit a peer-supplied transaction into the local mempool.
     ///
-    /// Performs syntactic admission validation only (type-tag + length +
-    /// non-zero amount where applicable); state-conditional checks run
-    /// when the runtime executes the block. Duplicate or oversized txs
-    /// are silently dropped via [`InsertError`] return values.
+    /// Runs the runtime's transaction-validation entrypoint against the
+    /// current state before accepting bytes into the pool. Duplicate or
+    /// oversized txs are surfaced via [`InsertError`] return values.
     pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
+        let valid = self.runtime_validates_transaction(&bytes);
         let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
-        pool.insert_validated(bytes, basic_tx_admission)
+        pool.insert_validated(bytes, |_| valid)
     }
 
     /// Drain up to `byte_budget` bytes of transactions from the mempool
@@ -175,13 +195,45 @@ where
     }
 
     fn restore_to_mempool(&self, txs: Vec<Vec<u8>>) {
-        let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
         for bytes in txs {
             // Skip insert errors: duplicates and capacity rejections
             // are both acceptable for restore — the original entry
             // just stays out of the pool.
-            let _ = pool.insert_validated(bytes, basic_tx_admission);
+            let _ = self.submit_transaction(bytes);
         }
+    }
+
+    fn runtime_validates_transaction(&self, bytes: &[u8]) -> bool {
+        let Some(runtime_elf) = self.runtime_elf.as_deref() else {
+            debug!("runtime ELF unavailable; rejecting gossipped transaction");
+            return false;
+        };
+        self.with_engine(|engine| {
+            let ctx = BlockContext {
+                slot: 0,
+                height: engine.head_height().saturating_add(1),
+                seed: engine.finalized_seed(),
+                parent_hash: engine.head_hash(),
+                parent_state_root: engine.head_state_root(),
+                gas_limit: engine.chain_spec().genesis_gas_limit,
+                proposer_index: 0,
+                vrf_proof: [0; 96],
+            };
+            let mut overlay = Overlay::new(engine.state().clone());
+            match validate_transaction(
+                runtime_elf,
+                &ctx,
+                bytes,
+                &mut overlay,
+                engine.chain_spec().genesis_gas_limit,
+            ) {
+                Ok(validity) => validity.is_valid(),
+                Err(err) => {
+                    debug!(?err, "runtime rejected transaction validation attempt");
+                    false
+                }
+            }
+        })
     }
 
     /// Number of transactions currently buffered. Mostly useful for
@@ -754,31 +806,4 @@ where
             Err(err) => debug!(?err, "mempool admission rejected a gossipped transaction"),
         }
     }
-}
-
-/// Syntactic admission check for the M6 default-runtime transaction
-/// format. Accepts only `TX_DEPOSIT` (type tag `0x03`) with the
-/// canonical 153-byte layout and a non-zero amount.
-///
-/// Real state-conditional validation is M7 work; the runtime itself
-/// re-validates each transaction during block execution and will abort
-/// the block if a transient invariant fails (e.g. nonces drifting,
-/// balances going negative).
-fn basic_tx_admission(bytes: &[u8]) -> bool {
-    // TX_DEPOSIT layout: 1 (type) + 48 (BLS pubkey) + 8 (amount LE) +
-    // 96 (BLS POP signature) = 153 bytes total.
-    const TX_DEPOSIT: u8 = 0x03;
-    const TX_DEPOSIT_LEN: usize = 153;
-    const AMOUNT_OFFSET: usize = 49;
-    if bytes.len() != TX_DEPOSIT_LEN {
-        return false;
-    }
-    if bytes[0] != TX_DEPOSIT {
-        return false;
-    }
-    let Ok(amount_bytes): Result<[u8; 8], _> = bytes[AMOUNT_OFFSET..AMOUNT_OFFSET + 8].try_into()
-    else {
-        return false;
-    };
-    u64::from_le_bytes(amount_bytes) > 0
 }

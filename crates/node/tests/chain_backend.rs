@@ -10,6 +10,7 @@
 //! - the corresponding RPC read methods see what we just imported.
 
 use neutrino_consensus_engine::Engine;
+use neutrino_consensus_engine::body::compute_body_roots;
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_types::{Block, Body, Header, RecursiveCheckpointProof};
 use neutrino_node::ChainBackend;
@@ -92,6 +93,18 @@ const fn header(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 3
         timestamp: slot * 4,
         signature: [4; 96],
     }
+}
+
+fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> Block {
+    let body = Body::default();
+    let roots = compute_body_roots(&body, &[]);
+    let mut header = header(height, slot, parent, state_root);
+    header.transactions_root = roots.transactions_root;
+    header.votes_root = roots.votes_root;
+    header.slashings_root = roots.slashings_root;
+    header.validator_ops_root = roots.validator_ops_root;
+    header.da_root = roots.da_root;
+    Block { header, body }
 }
 
 fn build_recursive_proof(
@@ -177,10 +190,7 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
     let backend = ChainBackend::new(engine, MockProofSystem::new());
 
     let genesis_hash = backend.local_status().await.head_block_hash;
-    let b1 = Block {
-        header: header(1, 1, genesis_hash, [0x11; 32]),
-        body: Body::default(),
-    };
+    let b1 = block(1, 1, genesis_hash, [0x11; 32]);
     let imported = backend
         .verify_and_import_gossip_block(b1.clone())
         .await
@@ -216,10 +226,7 @@ async fn duplicate_gossip_block_is_rejected_as_chain_extension_mismatch() {
     let backend = ChainBackend::new(engine, MockProofSystem::new());
 
     let genesis_hash = backend.local_status().await.head_block_hash;
-    let b1 = Block {
-        header: header(1, 1, genesis_hash, [0x11; 32]),
-        body: Body::default(),
-    };
+    let b1 = block(1, 1, genesis_hash, [0x11; 32]);
     backend
         .verify_and_import_gossip_block(b1.clone())
         .await

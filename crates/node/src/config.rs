@@ -50,10 +50,8 @@ pub struct NodeConfig {
     /// Bootnode multiaddrs to dial on startup.
     #[serde(default)]
     pub bootnodes: Vec<String>,
-    /// Optional path to a `chain-spec.toml` file. When set, the node
-    /// bootstraps a real [`ChainSpec`]-backed engine via
-    /// [`ChainBackend`](crate::ChainBackend). When unset, the stub
-    /// backend is used.
+    /// Path to a `chain-spec.toml` file. The runner rejects configs that
+    /// leave this unset.
     #[serde(default)]
     pub chain_spec_path: Option<String>,
     /// Data directory for the chain database. Optional — when unset the

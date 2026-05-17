@@ -13,8 +13,8 @@
 use alloc::vec::Vec;
 
 use borsh::BorshSerialize;
-use neutrino_consensus_types::{Body, Header};
-use neutrino_primitives::{Hash, blake3_256};
+use neutrino_consensus_types::{Body, Deposit, Header, VoluntaryExit};
+use neutrino_primitives::{Hash, Validator, blake3_256};
 
 use crate::merkle::{merkle_root, merkle_root_of_hashes};
 
@@ -39,6 +39,11 @@ pub enum BodyEncodeError {
         /// Encoded payload size in bytes.
         size: usize,
     },
+    /// A voluntary exit referenced a validator index outside the active set.
+    UnknownValidatorIndex {
+        /// Referenced validator index.
+        index: u32,
+    },
 }
 
 impl core::fmt::Display for BodyEncodeError {
@@ -49,6 +54,12 @@ impl core::fmt::Display for BodyEncodeError {
             Self::PayloadTooLarge { size } => {
                 write!(f, "encoded body is {size} bytes, exceeds runtime budget")
             }
+            Self::UnknownValidatorIndex { index } => {
+                write!(
+                    f,
+                    "voluntary exit references unknown validator index {index}"
+                )
+            }
         }
     }
 }
@@ -56,23 +67,42 @@ impl core::fmt::Display for BodyEncodeError {
 #[cfg(feature = "std")]
 impl std::error::Error for BodyEncodeError {}
 
-/// Serialize the transaction lane of `body` into the runtime ABI
-/// byte format. Returns the bytes that the engine must hand to
+const TX_DEPOSIT: u8 = 0x03;
+const TX_EXIT: u8 = 0x04;
+
+/// Serialize `body` into the runtime ABI byte format without an active
+/// validator set.
+///
+/// This compatibility wrapper is suitable for bodies without voluntary
+/// exits. Producers should call [`encode_runtime_body_with_validators`]
+/// so exit lanes can be converted from validator indices to BLS public
+/// keys.
+pub fn encode_runtime_body(body: &Body) -> Result<Vec<u8>, BodyEncodeError> {
+    encode_runtime_body_with_validators(body, &[])
+}
+
+/// Serialize all runtime-visible body lanes into the runtime ABI byte
+/// format. Returns the bytes that the engine must hand to
 /// `run_block(... body_bytes ...)`.
 ///
-/// An empty transaction list returns an empty `Vec`. The runtime
-/// recognises an empty body and skips parsing, so we do not emit a
-/// `0_u32` count in that case (matches the M4 test fixtures).
-pub fn encode_runtime_body(body: &Body) -> Result<Vec<u8>, BodyEncodeError> {
-    if body.transactions.is_empty() {
+/// The runtime consumes a flat transaction list, so consensus body lanes
+/// are converted in this order: `transactions`, `deposits`, then
+/// `voluntary_exits`. An empty runtime-visible body returns an empty
+/// `Vec`; the runtime recognises that and skips parsing, so we do not
+/// emit a `0_u32` count.
+pub fn encode_runtime_body_with_validators(
+    body: &Body,
+    active_validators: &[Validator],
+) -> Result<Vec<u8>, BodyEncodeError> {
+    let runtime_txs = runtime_transactions(body, active_validators)?;
+    if runtime_txs.is_empty() {
         return Ok(Vec::new());
     }
     let count =
-        u32::try_from(body.transactions.len()).map_err(|_| BodyEncodeError::TooManyTransactions)?;
+        u32::try_from(runtime_txs.len()).map_err(|_| BodyEncodeError::TooManyTransactions)?;
 
     // Pre-size the output so we don't reallocate.
-    let total_len: usize = 4 + body
-        .transactions
+    let total_len: usize = 4 + runtime_txs
         .iter()
         .map(|t| 4_usize.saturating_add(t.len()))
         .sum::<usize>();
@@ -82,12 +112,58 @@ pub fn encode_runtime_body(body: &Body) -> Result<Vec<u8>, BodyEncodeError> {
 
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&count.to_le_bytes());
-    for tx in &body.transactions {
+    for tx in &runtime_txs {
         let len = u32::try_from(tx.len()).map_err(|_| BodyEncodeError::TransactionTooLarge)?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(tx);
     }
     Ok(out)
+}
+
+fn runtime_transactions(
+    body: &Body,
+    active_validators: &[Validator],
+) -> Result<Vec<Vec<u8>>, BodyEncodeError> {
+    let mut txs = Vec::with_capacity(
+        body.transactions.len() + body.deposits.len() + body.voluntary_exits.len(),
+    );
+    txs.extend(body.transactions.iter().cloned());
+    for deposit in &body.deposits {
+        txs.push(encode_deposit(deposit));
+    }
+    for exit in &body.voluntary_exits {
+        txs.push(encode_exit(exit, active_validators)?);
+    }
+    Ok(txs)
+}
+
+fn encode_deposit(deposit: &Deposit) -> Vec<u8> {
+    let mut tx = Vec::with_capacity(1 + 48 + 8 + 96);
+    tx.push(TX_DEPOSIT);
+    tx.extend_from_slice(&deposit.pubkey);
+    tx.extend_from_slice(&deposit.amount.to_le_bytes());
+    tx.extend_from_slice(&deposit.signature);
+    tx
+}
+
+fn encode_exit(
+    exit: &VoluntaryExit,
+    active_validators: &[Validator],
+) -> Result<Vec<u8>, BodyEncodeError> {
+    let index = usize::try_from(exit.validator_index).map_err(|_| {
+        BodyEncodeError::UnknownValidatorIndex {
+            index: exit.validator_index,
+        }
+    })?;
+    let validator = active_validators
+        .get(index)
+        .ok_or(BodyEncodeError::UnknownValidatorIndex {
+            index: exit.validator_index,
+        })?;
+    let mut tx = Vec::with_capacity(1 + validator.pubkey.len());
+    tx.push(TX_EXIT);
+    tx.extend_from_slice(&validator.pubkey);
+    Ok(tx)
 }
 
 /// Five header-level Merkle roots committed by the [`Header`].
@@ -161,7 +237,10 @@ pub const fn apply_body_roots(header: &mut Header, roots: &BodyRoots) {
 mod tests {
     use super::*;
     use crate::merkle::EMPTY_MERKLE_ROOT;
-    use neutrino_consensus_types::{Body, FinalityVote, FinalityVoteData, FinalityVotePhase};
+    use neutrino_consensus_types::{
+        Body, Deposit, FinalityVote, FinalityVoteData, FinalityVotePhase, VoluntaryExit,
+    };
+    use neutrino_primitives::Validator;
 
     #[test]
     fn empty_body_encodes_to_empty_bytes() {
@@ -193,6 +272,77 @@ mod tests {
         assert_eq!(&encoded[8..10], &[1, 2]);
         assert_eq!(&encoded[10..14], &3_u32.to_le_bytes());
         assert_eq!(&encoded[14..], &[3, 4, 5]);
+    }
+
+    #[test]
+    fn deposit_and_exit_lanes_are_runtime_transactions() {
+        let validator = Validator {
+            pubkey: [7; 48],
+            withdrawal_credentials: [8; 32],
+            effective_stake: 10,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        };
+        let body = Body {
+            transactions: vec![vec![0xAA]],
+            deposits: vec![Deposit {
+                pubkey: [1; 48],
+                withdrawal_credentials: [2; 32],
+                amount: 99,
+                signature: [3; 96],
+            }],
+            voluntary_exits: vec![VoluntaryExit {
+                validator_index: 0,
+                epoch: 4,
+                signature: [5; 96],
+            }],
+            ..Body::default()
+        };
+
+        let encoded = encode_runtime_body_with_validators(&body, &[validator]).expect("encode");
+
+        assert_eq!(&encoded[..4], &3_u32.to_le_bytes());
+        assert_eq!(&encoded[4..8], &1_u32.to_le_bytes());
+        assert_eq!(encoded[8], 0xAA);
+
+        let deposit_len_off = 9;
+        assert_eq!(
+            &encoded[deposit_len_off..deposit_len_off + 4],
+            &153_u32.to_le_bytes()
+        );
+        let deposit = &encoded[deposit_len_off + 4..deposit_len_off + 4 + 153];
+        assert_eq!(deposit[0], TX_DEPOSIT);
+        assert_eq!(&deposit[1..49], &[1; 48]);
+        assert_eq!(&deposit[49..57], &99_u64.to_le_bytes());
+        assert_eq!(&deposit[57..], &[3; 96]);
+
+        let exit_len_off = deposit_len_off + 4 + 153;
+        assert_eq!(
+            &encoded[exit_len_off..exit_len_off + 4],
+            &49_u32.to_le_bytes()
+        );
+        let exit = &encoded[exit_len_off + 4..exit_len_off + 4 + 49];
+        assert_eq!(exit[0], TX_EXIT);
+        assert_eq!(&exit[1..], &[7; 48]);
+    }
+
+    #[test]
+    fn exit_lane_rejects_unknown_validator_index() {
+        let body = Body {
+            voluntary_exits: vec![VoluntaryExit {
+                validator_index: 2,
+                epoch: 0,
+                signature: [0; 96],
+            }],
+            ..Body::default()
+        };
+
+        assert!(matches!(
+            encode_runtime_body_with_validators(&body, &[]),
+            Err(BodyEncodeError::UnknownValidatorIndex { index: 2 })
+        ));
     }
 
     #[test]

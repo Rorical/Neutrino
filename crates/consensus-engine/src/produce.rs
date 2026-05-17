@@ -20,7 +20,8 @@ use neutrino_vrf::eval;
 
 use crate::block_state::BlockState;
 use crate::body::{
-    BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots, encode_runtime_body,
+    BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots,
+    encode_runtime_body_with_validators,
 };
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -196,7 +197,8 @@ impl<DB: Database> Engine<DB> {
             .ok_or(ProductionError::HeightOverflow)?;
         let parent_state_root = self.head_state_root();
 
-        let encoded_body = encode_runtime_body(&body)?;
+        let encoded_body =
+            encode_runtime_body_with_validators(&body, &self.chain_spec().initial_validators)?;
         let ctx = BlockContext {
             slot,
             height,

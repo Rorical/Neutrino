@@ -11,8 +11,7 @@
 //!
 //! - Header chain continuity (`parent_hash` matches the local head,
 //!   `height` is exactly `head + 1`).
-//! - That the block's content hash matches the header's
-//!   `header.hash()` reconstruction.
+//! - That body Merkle roots match the header commitments.
 //! - Recursive checkpoint proofs verify under the supplied
 //!   [`ProofSystem`].
 //!
@@ -31,6 +30,7 @@ use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
 use crate::block_state::BlockState;
+use crate::body::{BodyRoots, compute_body_roots};
 use crate::engine::Engine;
 use crate::store::StoreError;
 
@@ -82,6 +82,13 @@ pub enum ImportError<E> {
     },
     /// Block proof references a block header that is not stored locally.
     UnknownBlock(BlockHash),
+    /// Body lane roots derived from the supplied body do not match the header.
+    BodyRootsMismatch {
+        /// Roots committed in the header.
+        header: Box<BodyRoots>,
+        /// Roots re-derived from the body.
+        computed: Box<BodyRoots>,
+    },
     /// Stored header's parent is required to reconstruct proof public inputs.
     MissingParentHeader {
         /// Parent hash that should have been present.
@@ -165,6 +172,10 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                 )
             }
             Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
+            Self::BodyRootsMismatch { header, computed } => write!(
+                f,
+                "block body roots mismatch: header {header:?}, computed {computed:?}"
+            ),
             Self::MissingParentHeader { parent_hash } => {
                 write!(f, "parent header {parent_hash:?} is missing")
             }
@@ -249,6 +260,21 @@ impl<DB: Database> Engine<DB> {
             return Err(ImportError::ParentMismatch {
                 expected: self.head_hash(),
                 actual: block.header.parent_hash,
+            });
+        }
+
+        let header_roots = BodyRoots {
+            transactions_root: block.header.transactions_root,
+            votes_root: block.header.votes_root,
+            slashings_root: block.header.slashings_root,
+            validator_ops_root: block.header.validator_ops_root,
+            da_root: block.header.da_root,
+        };
+        let computed_roots = compute_body_roots(&block.body, &[]);
+        if header_roots != computed_roots {
+            return Err(ImportError::BodyRootsMismatch {
+                header: Box::new(header_roots),
+                computed: Box::new(computed_roots),
             });
         }
 
@@ -533,16 +559,24 @@ mod tests {
         }
     }
 
+    fn block(height: Height, slot: Slot, parent: BlockHash, state_root: [u8; 32]) -> Block {
+        let body = Body::default();
+        let roots = compute_body_roots(&body, &[]);
+        let mut header = header(height, slot, parent, state_root);
+        header.transactions_root = roots.transactions_root;
+        header.votes_root = roots.votes_root;
+        header.slashings_root = roots.slashings_root;
+        header.validator_ops_root = roots.validator_ops_root;
+        header.da_root = roots.da_root;
+        Block { header, body }
+    }
+
     #[test]
     fn import_block_extends_local_head() {
         let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
 
         let genesis_hash = engine.head_hash();
-        let h1 = header(1, 1, genesis_hash, [5; 32]);
-        let block1 = Block {
-            header: h1,
-            body: Body::default(),
-        };
+        let block1 = block(1, 1, genesis_hash, [5; 32]);
 
         let outcome = engine
             .import_block(&block1)
@@ -553,11 +587,7 @@ mod tests {
         assert_eq!(engine.head_state_root(), [5; 32]);
 
         // Chain into block 2.
-        let h2 = header(2, 2, outcome.block_hash, [6; 32]);
-        let block2 = Block {
-            header: h2,
-            body: Body::default(),
-        };
+        let block2 = block(2, 2, outcome.block_hash, [6; 32]);
         let outcome = engine.import_block(&block2).expect("second extends first");
         assert_eq!(outcome.new_head_height, 2);
         assert_eq!(engine.head_hash(), block2.hash());
@@ -566,11 +596,7 @@ mod tests {
     #[test]
     fn import_block_rejects_wrong_parent() {
         let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
-        let bogus = header(1, 1, [0; 32], [5; 32]); // wrong parent
-        let block = Block {
-            header: bogus,
-            body: Body::default(),
-        };
+        let block = block(1, 1, [0; 32], [5; 32]); // wrong parent
         match engine.import_block(&block) {
             Err(ImportError::ParentMismatch { .. }) => {}
             other => panic!("expected ParentMismatch, got {other:?}"),
@@ -581,14 +607,22 @@ mod tests {
     #[test]
     fn import_block_rejects_skipped_height() {
         let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
-        let h = header(2, 2, engine.head_hash(), [5; 32]); // skips height 1
-        let block = Block {
-            header: h,
-            body: Body::default(),
-        };
+        let block = block(2, 2, engine.head_hash(), [5; 32]); // skips height 1
         match engine.import_block(&block) {
             Err(ImportError::HeightMismatch { .. }) => {}
             other => panic!("expected HeightMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_block_rejects_body_root_mismatch() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let mut block = block(1, 1, engine.head_hash(), [5; 32]);
+        block.body.transactions.push(vec![1, 2, 3]);
+
+        match engine.import_block(&block) {
+            Err(ImportError::BodyRootsMismatch { .. }) => {}
+            other => panic!("expected BodyRootsMismatch, got {other:?}"),
         }
     }
 

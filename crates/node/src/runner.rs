@@ -182,7 +182,11 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         head_height = engine.head_height(),
         "using real engine backend"
     );
-    let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
+    let concrete_backend = Arc::new(ChainBackend::new_with_runtime_elf(
+        engine,
+        proof_system,
+        runtime_elf.clone(),
+    ));
     let producer_job: Option<(
         Arc<ChainBackend<NodeDb, MockProofSystem>>,
         BlockProducerConfig,

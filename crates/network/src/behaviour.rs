@@ -1,5 +1,9 @@
 #![allow(missing_docs)]
 
+use crate::rpc::{
+    BlocksByRangeBehaviour, BlocksByRootBehaviour, MetadataBehaviour, PingBehaviour,
+    StateByRootBehaviour, StatusBehaviour,
+};
 use libp2p::{
     connection_limits, gossipsub, identify,
     kad::{self, store::MemoryStore},
@@ -15,6 +19,9 @@ use libp2p::{
 /// - [`identify::Behaviour`] — protocol negotiation and listen-addr exchange.
 /// - [`ping::Behaviour`] — keepalive and RTT estimation.
 /// - [`connection_limits::Behaviour`] — DoS resistance via hard caps.
+/// - Six `request_response::Behaviour` instances, one per doc 06 core RPC
+///   (`status`, `metadata`, `ping` reply, `blocks_by_range`, `blocks_by_root`,
+///   `state_by_root`).
 #[derive(NetworkBehaviour)]
 pub struct NeutrinoBehaviour {
     /// Connection limits to prevent resource exhaustion.
@@ -27,4 +34,16 @@ pub struct NeutrinoBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     /// Kademlia DHT for peer discovery.
     pub kademlia: kad::Behaviour<MemoryStore>,
+    /// `/neutrino/req/status/1` request/response.
+    pub rpc_status: StatusBehaviour,
+    /// `/neutrino/req/metadata/1` request/response.
+    pub rpc_metadata: MetadataBehaviour,
+    /// `/neutrino/req/ping/1` request/response.
+    pub rpc_ping: PingBehaviour,
+    /// `/neutrino/req/blocks_by_range/1` request/response.
+    pub rpc_blocks_by_range: BlocksByRangeBehaviour,
+    /// `/neutrino/req/blocks_by_root/1` request/response.
+    pub rpc_blocks_by_root: BlocksByRootBehaviour,
+    /// `/neutrino/req/state_by_root/1` request/response.
+    pub rpc_state_by_root: StateByRootBehaviour,
 }

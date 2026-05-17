@@ -4,16 +4,30 @@
 //! task. Callers communicate with it via a pair of `mpsc` channels:
 //!
 //! - [`NetworkCommand`] — outbound instructions from the host (dial,
-//!   subscribe, publish, ...).
+//!   subscribe, publish, send RPC request, send RPC response, ...).
 //! - [`NetworkEvent`] — inbound notifications to the host (peer events,
-//!   received gossip messages, ...).
+//!   received gossip messages, incoming RPC requests, ...).
 //!
 //! Gossipsub is configured to match `docs/design/06-networking.md`:
 //! mesh degree D = 8 (D_low = 6, D_high = 12), 700 ms heartbeat,
 //! six-heartbeat history window, strict validation, BLAKE3 message IDs,
 //! and per-topic byte caps from [`crate::topic::Topic::max_transmit_size`].
+//!
+//! Each of the six core request/response RPCs from doc 06 runs as its own
+//! [`libp2p::request_response::Behaviour`]; outbound and inbound state is
+//! tracked through `RpcDispatch` so callers see one unified
+//! [`NetworkCommand::SendRpcRequest`]/[`NetworkEvent::RpcRequestReceived`]
+//! API regardless of the protocol id. Outbound state is keyed by libp2p's
+//! own [`OutboundRequestId`] (one HashMap per protocol). Inbound state is
+//! keyed by a service-local monotonic `u64` because libp2p does not expose a
+//! public constructor for `InboundRequestId`.
 
 use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
+use crate::rpc::{
+    self, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec, BlocksByRootResponse,
+    MetadataCodec, PingCodec, RpcError, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
+    StateByRootCodec, StateByRootResponse, StatusCodec,
+};
 use crate::topic::Topic;
 use futures::StreamExt;
 use libp2p::{
@@ -23,17 +37,16 @@ use libp2p::{
     identity::Keypair,
     kad::{self, store::MemoryStore},
     noise, ping,
-    swarm::{SwarmEvent, behaviour::toggle::Toggle as _ToggleHint},
+    request_response::{
+        self, OutboundFailure, OutboundRequestId, ProtocolSupport, ResponseChannel,
+    },
+    swarm::SwarmEvent,
     tcp, yamux,
 };
 use neutrino_primitives::blake3_256;
-use std::{io, time::Duration};
-use tokio::sync::mpsc;
+use std::{collections::HashMap, io, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
-
-// silence unused-import lint for the trait-only ToggleHint placeholder
-#[allow(dead_code)]
-type _ToggleHintAlias = _ToggleHint<ping::Behaviour>;
 
 /// Errors returned when constructing or driving the network service.
 #[derive(Debug, thiserror::Error)]
@@ -70,10 +83,20 @@ pub enum NetworkEvent {
         /// Raw message bytes (borsh-encoded payload).
         data: Vec<u8>,
     },
+    /// An inbound RPC request was received. The host must reply with
+    /// [`NetworkCommand::SendRpcResponse`] referencing the provided
+    /// [`RpcInboundId`]; otherwise libp2p will time the request out.
+    RpcRequestReceived {
+        /// Peer that sent the request.
+        peer: PeerId,
+        /// Stable inbound id used to correlate the eventual response.
+        inbound_id: RpcInboundId,
+        /// Decoded request payload.
+        request: RpcRequest,
+    },
 }
 
 /// Commands the host sends to [`NetworkService`].
-#[derive(Debug)]
 pub enum NetworkCommand {
     /// Dial a multiaddress to attempt a new connection.
     Dial(Multiaddr),
@@ -95,6 +118,127 @@ pub enum NetworkCommand {
         /// Listen address for `peer`.
         address: Multiaddr,
     },
+    /// Send an RPC request to a connected peer.
+    ///
+    /// The result will be delivered to `response_tx`. If the peer is not
+    /// reachable, an error variant is returned.
+    SendRpcRequest {
+        /// Target peer.
+        peer: PeerId,
+        /// Request to send.
+        request: RpcRequest,
+        /// One-shot result channel.
+        response_tx: oneshot::Sender<Result<RpcResponse, RpcError>>,
+    },
+    /// Send an RPC response for a previously emitted
+    /// [`NetworkEvent::RpcRequestReceived`].
+    SendRpcResponse {
+        /// Inbound id returned in the event.
+        inbound_id: RpcInboundId,
+        /// Response payload; must match the inbound protocol.
+        response: RpcResponse,
+    },
+}
+
+impl core::fmt::Debug for NetworkCommand {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Dial(addr) => f.debug_tuple("Dial").field(addr).finish(),
+            Self::Subscribe(topic) => f.debug_tuple("Subscribe").field(topic).finish(),
+            Self::Unsubscribe(topic) => f.debug_tuple("Unsubscribe").field(topic).finish(),
+            Self::Publish { topic, data } => f
+                .debug_struct("Publish")
+                .field("topic", topic)
+                .field("data_len", &data.len())
+                .finish(),
+            Self::AddKademliaAddress { peer, address } => f
+                .debug_struct("AddKademliaAddress")
+                .field("peer", peer)
+                .field("address", address)
+                .finish(),
+            Self::SendRpcRequest { peer, request, .. } => f
+                .debug_struct("SendRpcRequest")
+                .field("peer", peer)
+                .field("protocol", &request.protocol())
+                .finish(),
+            Self::SendRpcResponse {
+                inbound_id,
+                response,
+            } => f
+                .debug_struct("SendRpcResponse")
+                .field("inbound_id", inbound_id)
+                .field("protocol", &response.protocol())
+                .finish(),
+        }
+    }
+}
+
+/// Tracks in-flight RPC state across the six independent
+/// `request_response::Behaviour` instances.
+///
+/// Outbound maps are keyed by libp2p's `OutboundRequestId`, which is unique
+/// per Behaviour. Inbound maps are keyed by a service-local monotonic id
+/// because libp2p does not expose a public constructor for
+/// `InboundRequestId`, so we cannot round-trip its id through the host API.
+#[derive(Default)]
+struct RpcDispatch {
+    next_inbound_raw: u64,
+
+    pending_status: HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_metadata: HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_ping: HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_blocks_by_range:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_blocks_by_root:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_state_by_root:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+
+    inbound_status: HashMap<u64, ResponseChannel<rpc::Status>>,
+    inbound_metadata: HashMap<u64, ResponseChannel<rpc::Metadata>>,
+    inbound_ping: HashMap<u64, ResponseChannel<rpc::PingPayload>>,
+    inbound_blocks_by_range: HashMap<u64, ResponseChannel<BlocksByRangeResponse>>,
+    inbound_blocks_by_root: HashMap<u64, ResponseChannel<BlocksByRootResponse>>,
+    inbound_state_by_root: HashMap<u64, ResponseChannel<StateByRootResponse>>,
+}
+
+impl RpcDispatch {
+    const fn next_inbound_id(&mut self, protocol: RpcProtocol) -> RpcInboundId {
+        let raw = self.next_inbound_raw;
+        self.next_inbound_raw = self.next_inbound_raw.wrapping_add(1);
+        RpcInboundId { protocol, raw }
+    }
+
+    fn record_outbound(
+        &mut self,
+        protocol: RpcProtocol,
+        id: OutboundRequestId,
+        tx: oneshot::Sender<Result<RpcResponse, RpcError>>,
+    ) {
+        match protocol {
+            RpcProtocol::Status => self.pending_status.insert(id, tx),
+            RpcProtocol::Metadata => self.pending_metadata.insert(id, tx),
+            RpcProtocol::Ping => self.pending_ping.insert(id, tx),
+            RpcProtocol::BlocksByRange => self.pending_blocks_by_range.insert(id, tx),
+            RpcProtocol::BlocksByRoot => self.pending_blocks_by_root.insert(id, tx),
+            RpcProtocol::StateByRoot => self.pending_state_by_root.insert(id, tx),
+        };
+    }
+
+    fn take_outbound(
+        &mut self,
+        protocol: RpcProtocol,
+        id: OutboundRequestId,
+    ) -> Option<oneshot::Sender<Result<RpcResponse, RpcError>>> {
+        match protocol {
+            RpcProtocol::Status => self.pending_status.remove(&id),
+            RpcProtocol::Metadata => self.pending_metadata.remove(&id),
+            RpcProtocol::Ping => self.pending_ping.remove(&id),
+            RpcProtocol::BlocksByRange => self.pending_blocks_by_range.remove(&id),
+            RpcProtocol::BlocksByRoot => self.pending_blocks_by_root.remove(&id),
+            RpcProtocol::StateByRoot => self.pending_state_by_root.remove(&id),
+        }
+    }
 }
 
 /// The libp2p driver task for Neutrino.
@@ -102,6 +246,7 @@ pub struct NetworkService {
     swarm: Swarm<NeutrinoBehaviour>,
     command_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
+    rpc: RpcDispatch,
 }
 
 impl NetworkService {
@@ -139,6 +284,7 @@ impl NetworkService {
             swarm,
             command_rx,
             event_tx,
+            rpc: RpcDispatch::default(),
         })
     }
 
@@ -172,7 +318,7 @@ impl NetworkService {
         }
     }
 
-    #[allow(clippy::needless_pass_by_ref_mut)] // Swarm is not Sync; require &mut
+    #[allow(clippy::needless_pass_by_ref_mut, clippy::too_many_lines)]
     async fn handle_swarm_event(&mut self, event: SwarmEvent<NeutrinoBehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -249,6 +395,24 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::Kademlia(event)) => {
                 debug!(?event, "kademlia event");
             }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcStatus(ev)) => {
+                self.handle_rpc_status(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcMetadata(ev)) => {
+                self.handle_rpc_metadata(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcPing(ev)) => {
+                self.handle_rpc_ping(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcBlocksByRange(ev)) => {
+                self.handle_rpc_blocks_by_range(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcBlocksByRoot(ev)) => {
+                self.handle_rpc_blocks_by_root(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcStateByRoot(ev)) => {
+                self.handle_rpc_state_by_root(ev).await;
+            }
             _ => {}
         }
     }
@@ -288,6 +452,399 @@ impl NetworkService {
                     .kademlia
                     .add_address(&peer, address);
             }
+            NetworkCommand::SendRpcRequest {
+                peer,
+                request,
+                response_tx,
+            } => self.dispatch_outbound_request(peer, request, response_tx),
+            NetworkCommand::SendRpcResponse {
+                inbound_id,
+                response,
+            } => self.dispatch_outbound_response(inbound_id, response),
+        }
+    }
+
+    fn dispatch_outbound_request(
+        &mut self,
+        peer: PeerId,
+        request: RpcRequest,
+        response_tx: oneshot::Sender<Result<RpcResponse, RpcError>>,
+    ) {
+        let protocol = request.protocol();
+        let behaviour = self.swarm.behaviour_mut();
+        let id = match request {
+            RpcRequest::Status(req) => behaviour.rpc_status.send_request(&peer, req),
+            RpcRequest::Metadata(req) => behaviour.rpc_metadata.send_request(&peer, req),
+            RpcRequest::Ping(req) => behaviour.rpc_ping.send_request(&peer, req),
+            RpcRequest::BlocksByRange(req) => {
+                behaviour.rpc_blocks_by_range.send_request(&peer, req)
+            }
+            RpcRequest::BlocksByRoot(req) => behaviour.rpc_blocks_by_root.send_request(&peer, req),
+            RpcRequest::StateByRoot(req) => behaviour.rpc_state_by_root.send_request(&peer, req),
+        };
+        self.rpc.record_outbound(protocol, id, response_tx);
+    }
+
+    fn dispatch_outbound_response(&mut self, inbound_id: RpcInboundId, response: RpcResponse) {
+        if response.protocol() != inbound_id.protocol {
+            warn!(
+                inbound = ?inbound_id,
+                response = ?response.protocol(),
+                "rejecting mismatched RPC response"
+            );
+            return;
+        }
+
+        let behaviour = self.swarm.behaviour_mut();
+        let delivered = match (inbound_id.protocol, response) {
+            (RpcProtocol::Status, RpcResponse::Status(payload)) => self
+                .rpc
+                .inbound_status
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| behaviour.rpc_status.send_response(chan, payload).is_ok()),
+            (RpcProtocol::Metadata, RpcResponse::Metadata(payload)) => self
+                .rpc
+                .inbound_metadata
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| behaviour.rpc_metadata.send_response(chan, payload).is_ok()),
+            (RpcProtocol::Ping, RpcResponse::Ping(payload)) => self
+                .rpc
+                .inbound_ping
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| behaviour.rpc_ping.send_response(chan, payload).is_ok()),
+            (RpcProtocol::BlocksByRange, RpcResponse::BlocksByRange(payload)) => self
+                .rpc
+                .inbound_blocks_by_range
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_blocks_by_range
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::BlocksByRoot, RpcResponse::BlocksByRoot(payload)) => self
+                .rpc
+                .inbound_blocks_by_root
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_blocks_by_root
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::StateByRoot, RpcResponse::StateByRoot(payload)) => self
+                .rpc
+                .inbound_state_by_root
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_state_by_root
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            _ => false,
+        };
+
+        if !delivered {
+            warn!(?inbound_id, "failed to deliver RPC response (timed out?)");
+        }
+    }
+
+    async fn handle_rpc_status(&mut self, ev: request_response::Event<rpc::Status, rpc::Status>) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Status);
+                self.rpc.inbound_status.insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::Status(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self.rpc.take_outbound(RpcProtocol::Status, request_id) {
+                    let _ = tx.send(Ok(RpcResponse::Status(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::Status, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on Status RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_metadata(
+        &mut self,
+        ev: request_response::Event<rpc::MetadataRequest, rpc::Metadata>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Metadata);
+                self.rpc.inbound_metadata.insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::Metadata(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self.rpc.take_outbound(RpcProtocol::Metadata, request_id) {
+                    let _ = tx.send(Ok(RpcResponse::Metadata(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::Metadata, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on Metadata RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_ping(
+        &mut self,
+        ev: request_response::Event<rpc::PingPayload, rpc::PingPayload>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Ping);
+                self.rpc.inbound_ping.insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::Ping(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self.rpc.take_outbound(RpcProtocol::Ping, request_id) {
+                    let _ = tx.send(Ok(RpcResponse::Ping(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::Ping, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on Ping RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_blocks_by_range(
+        &mut self,
+        ev: request_response::Event<rpc::BlocksByRangeRequest, BlocksByRangeResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlocksByRange);
+                self.rpc
+                    .inbound_blocks_by_range
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::BlocksByRange(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::BlocksByRange, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::BlocksByRange(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::BlocksByRange, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on BlocksByRange RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_blocks_by_root(
+        &mut self,
+        ev: request_response::Event<rpc::BlocksByRootRequest, BlocksByRootResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlocksByRoot);
+                self.rpc
+                    .inbound_blocks_by_root
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::BlocksByRoot(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::BlocksByRoot, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::BlocksByRoot(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::BlocksByRoot, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on BlocksByRoot RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_state_by_root(
+        &mut self,
+        ev: request_response::Event<rpc::StateByRootRequest, StateByRootResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::StateByRoot);
+                self.rpc
+                    .inbound_state_by_root
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::StateByRoot(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self.rpc.take_outbound(RpcProtocol::StateByRoot, request_id) {
+                    let _ = tx.send(Ok(RpcResponse::StateByRoot(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::StateByRoot, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on StateByRoot RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    fn complete_outbound_failure(
+        &mut self,
+        protocol: RpcProtocol,
+        request_id: OutboundRequestId,
+        error: &OutboundFailure,
+    ) {
+        if let Some(tx) = self.rpc.take_outbound(protocol, request_id) {
+            let _ = tx.send(Err(RpcError::Outbound(format!("{error:?}"))));
+        } else {
+            debug!(?protocol, ?error, "outbound failure for unknown request id");
         }
     }
 }
@@ -322,6 +879,12 @@ fn build_behaviour(
         ping,
         gossipsub,
         kademlia,
+        rpc_status: build_rpc_status(),
+        rpc_metadata: build_rpc_metadata(),
+        rpc_ping: build_rpc_ping(),
+        rpc_blocks_by_range: build_rpc_blocks_by_range(),
+        rpc_blocks_by_root: build_rpc_blocks_by_root(),
+        rpc_state_by_root: build_rpc_state_by_root(),
     })
 }
 
@@ -378,6 +941,66 @@ fn build_kademlia(local_peer_id: PeerId) -> kad::Behaviour<MemoryStore> {
     let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, config);
     kademlia.set_mode(Some(kad::Mode::Server));
     kademlia
+}
+
+fn build_rpc_status() -> rpc::StatusBehaviour {
+    request_response::Behaviour::with_codec(
+        StatusCodec::default(),
+        [(RpcProtocol::Status.stream_protocol(), ProtocolSupport::Full)],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_metadata() -> rpc::MetadataBehaviour {
+    request_response::Behaviour::with_codec(
+        MetadataCodec::default(),
+        [(
+            RpcProtocol::Metadata.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_ping() -> rpc::PingBehaviour {
+    request_response::Behaviour::with_codec(
+        PingCodec::default(),
+        [(RpcProtocol::Ping.stream_protocol(), ProtocolSupport::Full)],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_blocks_by_range() -> rpc::BlocksByRangeBehaviour {
+    request_response::Behaviour::with_codec(
+        BlocksByRangeCodec::default(),
+        [(
+            RpcProtocol::BlocksByRange.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_blocks_by_root() -> rpc::BlocksByRootBehaviour {
+    request_response::Behaviour::with_codec(
+        BlocksByRootCodec::default(),
+        [(
+            RpcProtocol::BlocksByRoot.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_state_by_root() -> rpc::StateByRootBehaviour {
+    request_response::Behaviour::with_codec(
+        StateByRootCodec::default(),
+        [(
+            RpcProtocol::StateByRoot.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
 }
 
 /// Parse a wire topic string back to a [`Topic`].
@@ -622,5 +1245,126 @@ mod tests {
 
         expect_gossip(&mut event_b, Topic::Blocks, &payload).await;
         expect_gossip(&mut event_c, Topic::Blocks, &payload).await;
+    }
+
+    /// End-to-end Status RPC: node A sends a Status request to node B; B's
+    /// host responds via [`NetworkCommand::SendRpcResponse`] using the
+    /// [`RpcInboundId`] carried by the inbound event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    async fn status_rpc_round_trip_between_two_nodes() {
+        init_tracing();
+
+        let key_a = identity::Keypair::generate_ed25519();
+        let peer_a = PeerId::from(key_a.public());
+        let (cmd_tx_a, cmd_rx_a) = mpsc::channel::<NetworkCommand>(16);
+        let (event_tx_a, mut event_rx_a) = mpsc::channel::<NetworkEvent>(64);
+        let mut svc_a = NetworkService::new(key_a, cmd_rx_a, event_tx_a).unwrap();
+
+        let key_b = identity::Keypair::generate_ed25519();
+        let peer_b = PeerId::from(key_b.public());
+        let (cmd_tx_b, cmd_rx_b) = mpsc::channel::<NetworkCommand>(16);
+        let (event_tx_b, mut event_rx_b) = mpsc::channel::<NetworkEvent>(64);
+        let svc_b = NetworkService::new(key_b, cmd_rx_b, event_tx_b).unwrap();
+
+        svc_a
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        tokio::spawn(svc_a.run());
+        tokio::spawn(svc_b.run());
+
+        let addr_a = timeout(TokDuration::from_secs(5), async {
+            loop {
+                if let Some(NetworkEvent::NewListenAddr(addr)) = event_rx_a.recv().await {
+                    return addr;
+                }
+            }
+        })
+        .await
+        .expect("A listen addr");
+        cmd_tx_b.send(NetworkCommand::Dial(addr_a)).await.unwrap();
+
+        // Wait for the connection on both sides.
+        timeout(TokDuration::from_secs(5), async {
+            let mut connected_a = false;
+            let mut connected_b = false;
+            loop {
+                tokio::select! {
+                    Some(ev) = event_rx_a.recv() => {
+                        if matches!(ev, NetworkEvent::PeerConnected(p) if p == peer_b) {
+                            connected_a = true;
+                        }
+                    }
+                    Some(ev) = event_rx_b.recv() => {
+                        if matches!(ev, NetworkEvent::PeerConnected(p) if p == peer_a) {
+                            connected_b = true;
+                        }
+                    }
+                }
+                if connected_a && connected_b {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection both ways");
+
+        // B's host loop: wait for an inbound Status RPC and reply with a
+        // distinguishable Status payload so we can assert on it from A.
+        let canned_b_status = rpc::Status {
+            chain_id: 7,
+            finalized_checkpoint_index: 42,
+            finalized_checkpoint_hash: [0xBB; 32],
+            head_block_hash: [0xCC; 32],
+            head_slot: 100,
+            head_height: 99,
+        };
+        let canned_b_clone = canned_b_status.clone();
+        let cmd_tx_b_clone = cmd_tx_b.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = event_rx_b.recv().await {
+                if let NetworkEvent::RpcRequestReceived {
+                    inbound_id,
+                    request: RpcRequest::Status(_),
+                    ..
+                } = ev
+                {
+                    cmd_tx_b_clone
+                        .send(NetworkCommand::SendRpcResponse {
+                            inbound_id,
+                            response: RpcResponse::Status(canned_b_clone.clone()),
+                        })
+                        .await
+                        .ok();
+                }
+            }
+        });
+
+        // A sends a Status request to B.
+        let a_status = rpc::Status {
+            chain_id: 7,
+            finalized_checkpoint_index: 5,
+            finalized_checkpoint_hash: [0xAA; 32],
+            head_block_hash: [0xDD; 32],
+            head_slot: 1,
+            head_height: 1,
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        cmd_tx_a
+            .send(NetworkCommand::SendRpcRequest {
+                peer: peer_b,
+                request: RpcRequest::Status(a_status),
+                response_tx: resp_tx,
+            })
+            .await
+            .unwrap();
+
+        let response = timeout(TokDuration::from_secs(10), resp_rx)
+            .await
+            .expect("RPC response did not arrive")
+            .expect("response_tx was not dropped");
+
+        let response = response.expect("Status RPC succeeded");
+        assert!(matches!(response, RpcResponse::Status(s) if s == canned_b_status));
     }
 }

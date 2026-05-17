@@ -10,6 +10,7 @@
 //! matching handler.
 
 use neutrino_runtime_abi::BlockContext;
+use neutrino_runtime_abi::status::Status;
 use neutrino_runtime_abi::syscall;
 use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::host::HostInterface;
@@ -45,10 +46,18 @@ pub struct DispatchingHost<'a> {
     pub logs: Vec<EmittedLog>,
     /// Optional runtime panic message captured via the `panic` syscall.
     pub panic_msg: Option<Vec<u8>>,
+    /// When `true`, every `state::WRITE` / `state::DELETE` syscall
+    /// returns [`Status::PermissionDenied`] without touching the
+    /// overlay. Read-only callers (queries) set this so a misbehaving
+    /// runtime cannot stage tentative mutations the host then has to
+    /// remember to discard. Logs and panics are still recorded; gas
+    /// is not consumed when the call is refused.
+    pub read_only: bool,
 }
 
 impl<'a> DispatchingHost<'a> {
-    /// Build a fresh dispatcher with empty logs / panic message.
+    /// Build a fresh dispatcher with empty logs / panic message and
+    /// the default (writable) state-access policy.
     #[must_use]
     pub const fn new(
         overlay: &'a mut Overlay,
@@ -61,8 +70,34 @@ impl<'a> DispatchingHost<'a> {
             scratch,
             logs: Vec::new(),
             panic_msg: None,
+            read_only: false,
         }
     }
+
+    /// Build a read-only dispatcher. State writes and deletes return
+    /// [`Status::PermissionDenied`]; reads behave normally.
+    #[must_use]
+    pub const fn new_read_only(
+        overlay: &'a mut Overlay,
+        ctx: &'a BlockContext,
+        scratch: &'a mut Scratch,
+    ) -> Self {
+        Self {
+            overlay,
+            ctx,
+            scratch,
+            logs: Vec::new(),
+            panic_msg: None,
+            read_only: true,
+        }
+    }
+}
+
+/// Write `Status::PermissionDenied` to `a0` and clear `a1`. Used to
+/// refuse mutating syscalls when [`DispatchingHost::read_only`] is set.
+fn refuse_with_permission_denied(cpu: &mut Cpu) {
+    cpu.write(10, Status::PermissionDenied.as_u32());
+    cpu.write(11, 0);
 }
 
 impl HostInterface for DispatchingHost<'_> {
@@ -88,10 +123,20 @@ impl HostInterface for DispatchingHost<'_> {
             // State access.
             syscall::state::READ => handlers::state::read(cpu, memory, self.overlay, gas_remaining),
             syscall::state::WRITE => {
-                handlers::state::write(cpu, memory, self.overlay, gas_remaining)
+                if self.read_only {
+                    refuse_with_permission_denied(cpu);
+                    Ok(None)
+                } else {
+                    handlers::state::write(cpu, memory, self.overlay, gas_remaining)
+                }
             }
             syscall::state::DELETE => {
-                handlers::state::delete(cpu, memory, self.overlay, gas_remaining)
+                if self.read_only {
+                    refuse_with_permission_denied(cpu);
+                    Ok(None)
+                } else {
+                    handlers::state::delete(cpu, memory, self.overlay, gas_remaining)
+                }
             }
             syscall::state::EXISTS => {
                 handlers::state::exists(cpu, memory, self.overlay, gas_remaining)
@@ -142,5 +187,143 @@ impl HostInterface for DispatchingHost<'_> {
             // Unknown syscall.
             _ => Err(Trap::HostError { code }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neutrino_runtime_abi::status::Status;
+    use neutrino_vm_rv32im::memory::{Memory, Permissions};
+
+    fn sample_ctx() -> BlockContext {
+        BlockContext {
+            slot: 1,
+            height: 1,
+            seed: [0; 32],
+            parent_hash: [0; 32],
+            parent_state_root: [0; 32],
+            gas_limit: 1_000_000,
+            proposer_index: 0,
+            vrf_proof: [0; 96],
+        }
+    }
+
+    fn rw_memory(len: u32) -> Memory {
+        let mut mem = Memory::new(len);
+        mem.add_region(0, len, Permissions::RW);
+        mem
+    }
+
+    fn store_bytes(mem: &mut Memory, addr: u32, bytes: &[u8]) {
+        for (i, &byte) in bytes.iter().enumerate() {
+            mem.store_u8(addr + u32::try_from(i).unwrap(), byte)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn read_only_host_refuses_state_write_with_permission_denied() {
+        let mut overlay = Overlay::empty();
+        let ctx = sample_ctx();
+        let mut scratch = Scratch::default();
+        let mut host = DispatchingHost::new_read_only(&mut overlay, &ctx, &mut scratch);
+
+        let mut mem = rw_memory(128);
+        store_bytes(&mut mem, 0, b"k"); // key bytes
+        store_bytes(&mut mem, 8, b"v"); // value bytes
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0); // key_ptr
+        cpu.write(11, 1); // key_len
+        cpu.write(12, 8); // val_ptr
+        cpu.write(13, 1); // val_len
+
+        let mut gas = 10_000_u64;
+        let result = host.ecall(&mut cpu, &mut mem, &mut gas, syscall::state::WRITE);
+
+        assert_eq!(result, Ok(None));
+        assert_eq!(cpu.read(10), Status::PermissionDenied.as_u32());
+        assert_eq!(cpu.read(11), 0);
+        // No gas should have been consumed by a refused syscall.
+        assert_eq!(gas, 10_000);
+        // Overlay must remain untouched.
+        assert!(!host.overlay.exists(b"k"));
+    }
+
+    #[test]
+    fn read_only_host_refuses_state_delete_with_permission_denied() {
+        let mut overlay = Overlay::empty();
+        overlay.put(b"k".to_vec(), b"v".to_vec());
+        // Commit so the delete would otherwise mutate the base trie.
+        overlay.commit().unwrap();
+
+        let ctx = sample_ctx();
+        let mut scratch = Scratch::default();
+        let mut host = DispatchingHost::new_read_only(&mut overlay, &ctx, &mut scratch);
+
+        let mut mem = rw_memory(64);
+        store_bytes(&mut mem, 0, b"k");
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0);
+        cpu.write(11, 1);
+
+        let mut gas = 10_000_u64;
+        let result = host.ecall(&mut cpu, &mut mem, &mut gas, syscall::state::DELETE);
+
+        assert_eq!(result, Ok(None));
+        assert_eq!(cpu.read(10), Status::PermissionDenied.as_u32());
+        assert_eq!(cpu.read(11), 0);
+        assert_eq!(gas, 10_000);
+        // The previously-committed value must still be visible.
+        assert!(host.overlay.exists(b"k"));
+    }
+
+    #[test]
+    fn read_only_host_allows_state_read_and_exists() {
+        let mut overlay = Overlay::empty();
+        overlay.put(b"k".to_vec(), b"hello".to_vec());
+        overlay.commit().unwrap();
+
+        let ctx = sample_ctx();
+        let mut scratch = Scratch::default();
+        let mut host = DispatchingHost::new_read_only(&mut overlay, &ctx, &mut scratch);
+
+        let mut mem = rw_memory(128);
+        store_bytes(&mut mem, 0, b"k");
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0); // key_ptr
+        cpu.write(11, 1); // key_len
+        cpu.write(12, 32); // out_ptr
+        cpu.write(13, 32); // out_cap
+
+        let mut gas = 10_000_u64;
+        let result = host.ecall(&mut cpu, &mut mem, &mut gas, syscall::state::READ);
+        assert_eq!(result, Ok(None));
+        assert_eq!(cpu.read(10), Status::Ok.as_u32());
+        assert_eq!(cpu.read(11), 5);
+    }
+
+    #[test]
+    fn writable_host_allows_state_write() {
+        let mut overlay = Overlay::empty();
+        let ctx = sample_ctx();
+        let mut scratch = Scratch::default();
+        let mut host = DispatchingHost::new(&mut overlay, &ctx, &mut scratch);
+
+        let mut mem = rw_memory(128);
+        store_bytes(&mut mem, 0, b"k");
+        store_bytes(&mut mem, 8, b"v");
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0);
+        cpu.write(11, 1);
+        cpu.write(12, 8);
+        cpu.write(13, 1);
+
+        let mut gas = 10_000_u64;
+        let result = host.ecall(&mut cpu, &mut mem, &mut gas, syscall::state::WRITE);
+
+        assert_eq!(result, Ok(None));
+        assert_eq!(cpu.read(10), Status::Ok.as_u32());
+        assert_eq!(host.overlay.get(b"k"), Some(b"v".to_vec()));
     }
 }

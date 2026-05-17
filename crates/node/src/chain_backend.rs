@@ -24,7 +24,7 @@ use neutrino_consensus_engine::{
     CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome, ImportError,
     ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
 };
-use neutrino_consensus_types::{Block, BlockProof, Body, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, BlockProof, Body, Header, RecursiveCheckpointProof};
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::rpc::{
     self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
@@ -34,11 +34,15 @@ use neutrino_network::rpc::{
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
     BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
-    ZERO_HASH, blake3_256,
+    Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::ProofSystem;
-use neutrino_runtime_abi::BlockContext;
-use neutrino_runtime_host::{Overlay, validate_transaction};
+use neutrino_rpc::{
+    BlockId, FinalizedInfo, HeadInfo, RpcBackend, RuntimeCallError, RuntimeCallResponse,
+    SubmitError as RpcSubmitError,
+};
+use neutrino_runtime_abi::{BlockContext, QueryRequest};
+use neutrino_runtime_host::{Overlay, QueryError, run_query, validate_transaction};
 use neutrino_storage::Database;
 use neutrino_sync::{
     CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
@@ -805,5 +809,212 @@ where
             Ok(_) => {}
             Err(err) => debug!(?err, "mempool admission rejected a gossipped transaction"),
         }
+    }
+}
+
+#[async_trait]
+impl<DB, P> RpcBackend for ChainBackend<DB, P>
+where
+    DB: Database + Send + 'static,
+    DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
+    P: ProofSystem + Send + Sync + 'static,
+{
+    fn chain_id(&self) -> ChainId {
+        Self::chain_id(self)
+    }
+
+    fn runtime_abi_version(&self) -> Option<u32> {
+        if self.runtime_elf.is_some() {
+            Some(neutrino_runtime_abi::VERSION)
+        } else {
+            None
+        }
+    }
+
+    fn runtime_available(&self) -> bool {
+        self.runtime_elf.is_some()
+    }
+
+    fn mempool_len(&self) -> usize {
+        Self::mempool_len(self)
+    }
+
+    async fn head(&self) -> HeadInfo {
+        self.with_engine(|engine| {
+            let hash = engine.head_hash();
+            let slot = engine
+                .store()
+                .get_header(&hash)
+                .ok()
+                .flatten()
+                .map_or(0, |h| h.slot);
+            HeadInfo {
+                height: engine.head_height(),
+                hash,
+                slot,
+                state_root: engine.head_state_root(),
+            }
+        })
+    }
+
+    async fn finalized(&self) -> FinalizedInfo {
+        self.with_engine(|engine| {
+            let index = engine.latest_checkpoint_index();
+            engine.store().get_checkpoint(index).ok().flatten().map_or(
+                FinalizedInfo {
+                    index: 0,
+                    block_hash: ZERO_HASH,
+                    height: 0,
+                    state_root: ZERO_HASH,
+                },
+                |cp| FinalizedInfo {
+                    index,
+                    block_hash: cp.end_block_hash,
+                    height: cp.end_height,
+                    state_root: cp.end_state_root,
+                },
+            )
+        })
+    }
+
+    async fn active_validator_set(&self) -> Vec<Validator> {
+        self.with_engine(|engine| engine.active_validator_set().to_vec())
+    }
+
+    async fn resolve_block_id(&self, id: &BlockId) -> Option<BlockHash> {
+        match id {
+            BlockId::Latest => Some(self.with_engine(neutrino_consensus_engine::Engine::head_hash)),
+            BlockId::Finalized => self.with_engine(|engine| {
+                let index = engine.latest_checkpoint_index();
+                engine
+                    .store()
+                    .get_checkpoint(index)
+                    .ok()
+                    .flatten()
+                    .map(|cp| cp.end_block_hash)
+            }),
+            BlockId::Hash(h) => {
+                self.with_engine(|engine| engine.store().get_header(h).ok().flatten().map(|_| *h))
+            }
+            BlockId::Height(h) => self
+                .with_engine(|engine| engine.store().get_block_hash_by_height(*h).ok().flatten()),
+        }
+    }
+
+    async fn header_by_hash(&self, hash: BlockHash) -> Option<Header> {
+        self.with_engine(|engine| engine.store().get_header(&hash).ok().flatten())
+    }
+
+    async fn header_by_height(&self, height: Height) -> Option<Header> {
+        self.with_engine(|engine| engine.store().get_header_by_height(height).ok().flatten())
+    }
+
+    async fn block_by_hash(&self, hash: BlockHash) -> Option<Block> {
+        self.with_engine(|engine| {
+            let header = engine.store().get_header(&hash).ok().flatten()?;
+            let body = engine
+                .store()
+                .get_body(&hash)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            Some(Block { header, body })
+        })
+    }
+
+    async fn block_by_height(&self, height: Height) -> Option<Block> {
+        self.with_engine(|engine| {
+            let header = engine.store().get_header_by_height(height).ok().flatten()?;
+            let hash = header.hash();
+            let body = engine
+                .store()
+                .get_body(&hash)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            Some(Block { header, body })
+        })
+    }
+
+    async fn storage_at(&self, key: &[u8], at: &BlockId) -> Option<Vec<u8>> {
+        // v1 supports only the live head trie. Resolving the trie for
+        // historical checkpoints requires reconstructing it from
+        // persisted nodes, which is M12 territory.
+        match at {
+            BlockId::Latest => self.with_engine(|engine| engine.state().get(key)),
+            BlockId::Finalized => {
+                // The local engine commits state inline, so the
+                // finalized state matches the head state for now.
+                // Once chunk-bounded execution lands this will need
+                // its own reconstructed trie.
+                self.with_engine(|engine| engine.state().get(key))
+            }
+            BlockId::Hash(_) | BlockId::Height(_) => None,
+        }
+    }
+
+    async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, RpcSubmitError> {
+        match Self::submit_transaction(self, bytes) {
+            Ok(hash) => Ok(hash),
+            Err(InsertError::Duplicate) => Err(RpcSubmitError::Duplicate),
+            Err(InsertError::CapacityExceeded) => Err(RpcSubmitError::Full),
+            Err(InsertError::TooLarge) => Err(RpcSubmitError::Rejected {
+                reason: "transaction exceeds mempool entry size limit".to_owned(),
+            }),
+            Err(InsertError::RejectedByValidator) => Err(RpcSubmitError::Rejected {
+                reason: "runtime admission check rejected transaction".to_owned(),
+            }),
+        }
+    }
+
+    async fn runtime_call(
+        &self,
+        method: String,
+        args: Vec<u8>,
+        at: &BlockId,
+    ) -> Result<RuntimeCallResponse, RuntimeCallError> {
+        let runtime_elf = self
+            .runtime_elf
+            .as_deref()
+            .ok_or(RuntimeCallError::RuntimeNotConfigured)?;
+        // Only head/finalized are supported in v1; both currently
+        // observe the same trie because the engine commits state
+        // inline. Historical hash/height queries are rejected.
+        match at {
+            BlockId::Latest | BlockId::Finalized => {}
+            BlockId::Hash(_) | BlockId::Height(_) => {
+                return Err(RuntimeCallError::HistoricalStateNotSupported);
+            }
+        }
+        self.with_engine(|engine| {
+            let ctx = BlockContext {
+                slot: 0,
+                height: engine.head_height(),
+                seed: engine.finalized_seed(),
+                parent_hash: engine.head_hash(),
+                parent_state_root: engine.head_state_root(),
+                gas_limit: engine.chain_spec().genesis_gas_limit,
+                proposer_index: 0,
+                vrf_proof: [0; 96],
+            };
+            let mut overlay = Overlay::new(engine.state().clone());
+            let request = QueryRequest { method, args };
+            run_query(
+                runtime_elf,
+                &ctx,
+                &request,
+                &mut overlay,
+                engine.chain_spec().genesis_gas_limit,
+            )
+            .map(|outcome| RuntimeCallResponse {
+                code: outcome.response.code,
+                payload: outcome.response.payload,
+                gas_used: outcome.gas_used,
+            })
+            .map_err(|err| match err {
+                QueryError::Runtime(rterr) => RuntimeCallError::Runtime(format!("{rterr:?}")),
+                QueryError::Decode(msg) => RuntimeCallError::Decode(msg),
+            })
+        })
     }
 }

@@ -14,6 +14,7 @@ use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::{ChainSpec, Hash, ZERO_HASH, blake3_256};
 use neutrino_proof_system::MockProofSystem;
+use neutrino_rpc::{RpcBackend, RpcStartError};
 use neutrino_storage::Database;
 use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
 use thiserror::Error;
@@ -85,6 +86,18 @@ pub enum NodeError {
     /// Generic I/O surface (signal hookup, config read, ...).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The configured RPC listen address could not be parsed.
+    #[error("rpc listen address `{addr}` is invalid: {source}")]
+    RpcListen {
+        /// Configured `host:port` string.
+        addr: String,
+        /// Parse error.
+        #[source]
+        source: std::net::AddrParseError,
+    },
+    /// Failed to start the JSON-RPC server.
+    #[error("rpc server failed to start: {0}")]
+    Rpc(#[from] RpcStartError),
 }
 
 /// Run the node until `SIGINT` or `SIGTERM` arrive.
@@ -191,6 +204,7 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         Arc<ChainBackend<NodeDb, MockProofSystem>>,
         BlockProducerConfig,
     )> = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
+    let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = concrete_backend;
 
     let local_progress = backend.local_progress().await;
@@ -225,6 +239,26 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         )))
     });
 
+    // Optional JSON-RPC server. Started after the engine is open so
+    // the very first request observes a consistent head.
+    let rpc_handle = if let Some(rpc_cfg) = config.rpc.as_ref() {
+        let runtime_cfg = rpc_cfg
+            .to_runtime_config()
+            .map_err(|source| NodeError::RpcListen {
+                addr: rpc_cfg.listen.clone(),
+                source,
+            })?;
+        let listen = runtime_cfg.listen;
+        let handle = neutrino_rpc::serve(Arc::clone(&rpc_backend), runtime_cfg).await?;
+        info!(%listen, "rpc server listening");
+        Some(handle)
+    } else {
+        info!("rpc disabled (no [rpc] section in node config)");
+        None
+    };
+    // Suppress the "unused" warning for nodes that never request RPC.
+    let _ = &rpc_backend;
+
     // Wait for shutdown signal.
     wait_for_shutdown().await?;
     info!("shutdown signal received");
@@ -237,6 +271,9 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(handle) = injector_handle.as_ref() {
         handle.abort();
     }
+    if let Some(handle) = rpc_handle.as_ref() {
+        let _ = handle.stop();
+    }
     drop(cmd_tx);
 
     // Give tasks a brief grace period to flush logs.
@@ -248,6 +285,9 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         }
         if let Some(handle) = injector_handle {
             let _ = handle.await;
+        }
+        if let Some(handle) = rpc_handle {
+            handle.stopped().await;
         }
     })
     .await;

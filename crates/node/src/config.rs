@@ -1,5 +1,6 @@
 //! TOML configuration for [`crate::run`].
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -84,6 +85,54 @@ pub struct NodeConfig {
     /// unset on production nodes.
     #[serde(default)]
     pub inject_test_transactions_per_slot: Option<u32>,
+    /// JSON-RPC server configuration. When omitted, no RPC listener
+    /// is started; the node still functions for consensus and gossip
+    /// but external observers have no read API.
+    #[serde(default)]
+    pub rpc: Option<RpcConfigToml>,
+}
+
+/// TOML-deserialisable mirror of [`neutrino_rpc::RpcConfig`].
+#[derive(Clone, Debug, Deserialize)]
+pub struct RpcConfigToml {
+    /// `host:port` to bind on. Examples: `"127.0.0.1:9933"` for
+    /// local-only, `"0.0.0.0:9933"` to listen on every interface.
+    pub listen: String,
+    /// Maximum concurrent connections. Defaults to `200`.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    /// Maximum size of a single request body in bytes. Defaults to
+    /// 10 MiB.
+    #[serde(default = "default_max_request_body_size")]
+    pub max_request_body_size: u32,
+    /// Maximum size of a single response body in bytes. Defaults to
+    /// 15 MiB.
+    #[serde(default = "default_max_response_body_size")]
+    pub max_response_body_size: u32,
+}
+
+const fn default_max_connections() -> u32 {
+    200
+}
+const fn default_max_request_body_size() -> u32 {
+    10 * 1024 * 1024
+}
+const fn default_max_response_body_size() -> u32 {
+    15 * 1024 * 1024
+}
+
+impl RpcConfigToml {
+    /// Parse the configured `listen` address into a [`SocketAddr`] and
+    /// build the runtime [`neutrino_rpc::RpcConfig`].
+    pub fn to_runtime_config(&self) -> Result<neutrino_rpc::RpcConfig, std::net::AddrParseError> {
+        let listen: SocketAddr = self.listen.parse()?;
+        Ok(neutrino_rpc::RpcConfig {
+            listen,
+            max_connections: self.max_connections,
+            max_request_body_size: self.max_request_body_size,
+            max_response_body_size: self.max_response_body_size,
+        })
+    }
 }
 
 impl NodeConfig {
@@ -125,5 +174,36 @@ proposer_index = 3
         );
         assert_eq!(cfg.proposer_index, Some(3));
         assert!(cfg.proposer_ikm_hex.is_some());
+    }
+
+    #[test]
+    fn parses_rpc_config_section() {
+        let cfg: NodeConfig = toml::from_str(
+            r#"
+chain_id = 1
+
+[rpc]
+listen = "127.0.0.1:9933"
+max_connections = 64
+"#,
+        )
+        .expect("parse node config with rpc");
+
+        let rpc = cfg.rpc.expect("rpc section present");
+        assert_eq!(rpc.listen, "127.0.0.1:9933");
+        assert_eq!(rpc.max_connections, 64);
+        // Defaults filled in for unspecified fields.
+        assert_eq!(rpc.max_request_body_size, 10 * 1024 * 1024);
+        assert_eq!(rpc.max_response_body_size, 15 * 1024 * 1024);
+
+        let runtime_cfg = rpc.to_runtime_config().expect("listen parses");
+        assert_eq!(runtime_cfg.listen.port(), 9933);
+        assert_eq!(runtime_cfg.max_connections, 64);
+    }
+
+    #[test]
+    fn rpc_config_omitted_means_no_rpc_listener() {
+        let cfg: NodeConfig = toml::from_str("chain_id = 1\n").expect("parse minimal config");
+        assert!(cfg.rpc.is_none());
     }
 }

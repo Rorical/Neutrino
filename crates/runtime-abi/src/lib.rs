@@ -13,6 +13,9 @@
 //! - Deterministic gas-cost helpers per syscall ([`gas`]).
 //! - The borsh-encoded per-block context handed to every entrypoint
 //!   ([`BlockContext`]).
+//! - The borsh-encoded read-only query request and response types
+//!   exchanged through the [`QUERY_ENTRYPOINT`] symbol
+//!   ([`QueryRequest`], [`QueryResponse`]).
 //!
 //! Everything in this crate is reachable by both the host (which charges
 //! gas and validates buffers) and the guest SDK (which emits the
@@ -20,9 +23,10 @@
 //! are consensus-critical and must not be changed without bumping
 //! [`ABI_VERSION`].
 
-#[cfg(test)]
 extern crate alloc;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
     ABI_VERSION, BlockHash, BlsSignature, Height, Seed, Slot, StateRoot, ValidatorIndex,
@@ -43,6 +47,19 @@ pub const VERSION: u32 = ABI_VERSION;
 /// Runtime symbol used by the host to run a single transaction
 /// admission check.
 pub const VALIDATE_TX_ENTRYPOINT: &str = "_neutrino_validate_tx";
+
+/// Runtime symbol used by the host to run a single read-only query.
+///
+/// The host invokes this with [`Status::PermissionDenied`] returned
+/// from every `state::WRITE` / `state::DELETE` syscall, and the state
+/// overlay is discarded after the call regardless of what the guest
+/// attempts to do.
+///
+/// The guest reads a [`QueryRequest`] from `host_input` and writes a
+/// [`QueryResponse`] to `host_output`. Both shapes are stable across
+/// minor ABI revisions; new query methods are added by the runtime
+/// without changing the wire envelope.
+pub const QUERY_ENTRYPOINT: &str = "_neutrino_query";
 
 /// Byte length of the fixed transaction-validity result returned by
 /// [`VALIDATE_TX_ENTRYPOINT`].
@@ -227,6 +244,101 @@ pub struct BlockContext {
     pub vrf_proof: BlsSignature,
 }
 
+/// Borsh-encoded read-only query request handed to [`QUERY_ENTRYPOINT`]
+/// through the runtime's `host_input` buffer.
+///
+/// The wire envelope is intentionally narrow: a runtime-defined method
+/// name plus opaque bytes. The method is a UTF-8 string so an EVM-style
+/// runtime can claim `eth_getBalance`, `eth_call`, etc.; non-EVM
+/// runtimes are free to choose any naming scheme. The argument bytes
+/// are encoded by the caller in whatever shape the chosen method
+/// expects (typically borsh, but the host is agnostic).
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct QueryRequest {
+    /// Runtime-defined method name (e.g. `"account_get"` or
+    /// `"eth_call"`).
+    pub method: String,
+    /// Opaque, method-defined argument payload.
+    pub args: Vec<u8>,
+}
+
+/// Borsh-encoded read-only query response written to `host_output`.
+///
+/// A successful query carries `code = 0` and the method's serialised
+/// result in `payload`. A failed query carries a non-zero runtime
+/// status; the value is consensus-irrelevant (queries never produce
+/// state) so runtimes are free to define their own status spaces, but
+/// the values listed in [`QueryStatus`] cover the common cases.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct QueryResponse {
+    /// Runtime-defined status code. `0` means success.
+    pub code: u32,
+    /// Method-defined result bytes on success, or an optional error
+    /// payload on failure.
+    pub payload: Vec<u8>,
+}
+
+impl QueryResponse {
+    /// Construct a successful response with the given payload.
+    #[must_use]
+    pub const fn ok(payload: Vec<u8>) -> Self {
+        Self {
+            code: QueryStatus::Ok.as_u32(),
+            payload,
+        }
+    }
+
+    /// Construct an error response with the given status code and
+    /// optional message bytes.
+    #[must_use]
+    pub fn err(status: QueryStatus, message: impl Into<Vec<u8>>) -> Self {
+        Self {
+            code: status.as_u32(),
+            payload: message.into(),
+        }
+    }
+
+    /// `true` when this response signals a successful query.
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        self.code == QueryStatus::Ok.as_u32()
+    }
+}
+
+/// Conventional status codes for [`QueryResponse::code`].
+///
+/// Runtimes are free to use additional codes >= `1024`; the values
+/// below `1024` are reserved for the canonical envelope. The host
+/// never inspects the value; it is interpreted by the RPC layer
+/// (or whatever consumes the response).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryStatus {
+    /// Successful query.
+    Ok,
+    /// Method name was not recognised by the runtime.
+    UnknownMethod,
+    /// Method recognised, but the argument bytes were malformed.
+    InvalidArguments,
+    /// The runtime returned an error specific to the method.
+    MethodError,
+    /// The host refused the call (e.g. write attempted during query).
+    PermissionDenied,
+}
+
+impl QueryStatus {
+    /// Stable wire encoding of the status.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::Ok => 0,
+            Self::UnknownMethod => 1,
+            Self::InvalidArguments => 2,
+            Self::MethodError => 3,
+            Self::PermissionDenied => 4,
+        }
+    }
+}
+
 /// Returns the [`RuntimeVersion`] this crate advertises by default. It
 /// reuses the canonical version constants from [`neutrino_primitives`]
 /// so the chain spec, the runtime ABI, and the SDK never drift.
@@ -238,7 +350,6 @@ pub fn default_runtime_version() -> RuntimeVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
 
     fn sample_block_context() -> BlockContext {
         BlockContext {
@@ -285,5 +396,42 @@ mod tests {
             TxValidity::decode(&encoded),
             Err(TxValidityDecodeError::UnknownCode { code: 99 })
         );
+    }
+
+    #[test]
+    fn query_request_round_trips_through_borsh() {
+        let req = QueryRequest {
+            method: "account_get".into(),
+            args: vec![1, 2, 3, 4],
+        };
+        let bytes = borsh::to_vec(&req).expect("encode");
+        let decoded: QueryRequest = borsh::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn query_response_round_trips_through_borsh() {
+        let resp = QueryResponse::ok(vec![9, 8, 7]);
+        let bytes = borsh::to_vec(&resp).expect("encode");
+        let decoded: QueryResponse = borsh::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, resp);
+        assert!(decoded.is_ok());
+    }
+
+    #[test]
+    fn query_status_codes_are_stable() {
+        assert_eq!(QueryStatus::Ok.as_u32(), 0);
+        assert_eq!(QueryStatus::UnknownMethod.as_u32(), 1);
+        assert_eq!(QueryStatus::InvalidArguments.as_u32(), 2);
+        assert_eq!(QueryStatus::MethodError.as_u32(), 3);
+        assert_eq!(QueryStatus::PermissionDenied.as_u32(), 4);
+    }
+
+    #[test]
+    fn query_response_err_carries_message_payload() {
+        let resp = QueryResponse::err(QueryStatus::UnknownMethod, b"no such method".to_vec());
+        assert_eq!(resp.code, QueryStatus::UnknownMethod.as_u32());
+        assert_eq!(resp.payload, b"no such method".to_vec());
+        assert!(!resp.is_ok());
     }
 }

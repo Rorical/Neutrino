@@ -67,8 +67,11 @@
 //! On exit the staked balance is returned to the owner and the stake
 //! account is deleted.
 
-use neutrino_runtime_abi::{TX_VALIDITY_ENCODED_LEN, TxValidationCode, TxValidity};
-use neutrino_runtime_sdk::{entrypoint, syscalls, tx_validation_entrypoint};
+use neutrino_runtime_abi::{QueryStatus, TX_VALIDITY_ENCODED_LEN, TxValidationCode, TxValidity};
+use neutrino_runtime_sdk::{
+    encode_query_response_header, entrypoint, parse_query_request, query_entrypoint, syscalls,
+    tx_validation_entrypoint,
+};
 
 /// ABI status code mirrored from `neutrino_runtime_abi::status`.
 const STATUS_OK: u32 = 0;
@@ -838,4 +841,126 @@ fn execute_block() {
             off += txn_len;
         }
     }
+}
+
+/// Maximum query input buffer in bytes. Borsh-encoded `QueryRequest`
+/// fits in ~256 bytes for all currently-supported methods, but
+/// generously oversize so adding a method that takes a larger argument
+/// does not silently truncate.
+const QUERY_INPUT_BUF: usize = 1024;
+/// Maximum query output buffer in bytes. The largest current response
+/// is the validator-set snapshot (~1.8 KiB at MAX_VALIDATORS=32), so
+/// reserve enough headroom for a snapshot plus the 8-byte response
+/// header and any future small methods.
+const QUERY_OUTPUT_BUF: usize = 4096;
+
+#[query_entrypoint]
+fn query() {
+    // Read the borsh request directly. We avoid the SDK's
+    // `query_dispatch` helper here because it requires the input
+    // buffer to outlive every borrow of method/args, which conflicts
+    // with the dispatcher closure-shape on no_std-without-alloc.
+    let mut input = [0u8; QUERY_INPUT_BUF];
+    let (in_status, in_len) =
+        syscalls::host_input(input.as_mut_ptr() as u32, QUERY_INPUT_BUF as u32);
+    let mut output = [0u8; QUERY_OUTPUT_BUF];
+
+    let (code, payload_len) = if in_status == STATUS_OK {
+        let len = (in_len as usize).min(QUERY_INPUT_BUF);
+        let payload = &input[..len];
+        match parse_query_request(payload) {
+            Ok((method, args)) => dispatch_query(method, args, &mut output[8..]),
+            Err(_) => (QueryStatus::InvalidArguments.as_u32(), 0),
+        }
+    } else {
+        (QueryStatus::InvalidArguments.as_u32(), 0)
+    };
+
+    let total = match encode_query_response_header(&mut output, code, payload_len) {
+        Ok(n) => n,
+        Err(_) => syscalls::abort(ABORT_OVERLONG_READ),
+    };
+    syscalls::host_output(output.as_ptr() as u32, total as u32);
+}
+
+/// Per-method dispatcher. Returns `(status, payload_len_written)`.
+fn dispatch_query(method: &str, args: &[u8], out: &mut [u8]) -> (u32, usize) {
+    match method.as_bytes() {
+        b"account_get" => query_account_get(args, out),
+        b"stake_get" => query_stake_get(args, out),
+        b"head_counter" => query_head_counter(args, out),
+        b"runtime_version" => query_runtime_version(args, out),
+        _ => (QueryStatus::UnknownMethod.as_u32(), 0),
+    }
+}
+
+/// `account_get(pubkey: 32 bytes) -> balance:u64 LE || nonce:u64 LE`.
+fn query_account_get(args: &[u8], out: &mut [u8]) -> (u32, usize) {
+    if args.len() != ACC_KEY_LEN {
+        return (QueryStatus::InvalidArguments.as_u32(), 0);
+    }
+    if out.len() < ACC_VALUE_LEN {
+        return (QueryStatus::MethodError.as_u32(), 0);
+    }
+    let pubkey: [u8; ACC_KEY_LEN] = args.try_into().expect("32-byte pubkey");
+    let account = read_account(&pubkey);
+    out[..8].copy_from_slice(&account.balance.to_le_bytes());
+    out[8..16].copy_from_slice(&account.nonce.to_le_bytes());
+    (QueryStatus::Ok.as_u32(), ACC_VALUE_LEN)
+}
+
+/// `stake_get(bls_pk: 48 bytes) -> staked:u64 LE || owner: 32 bytes`.
+fn query_stake_get(args: &[u8], out: &mut [u8]) -> (u32, usize) {
+    if args.len() != BLS_KEY_LEN {
+        return (QueryStatus::InvalidArguments.as_u32(), 0);
+    }
+    if out.len() < STK_VALUE_LEN {
+        return (QueryStatus::MethodError.as_u32(), 0);
+    }
+    let bls_pk: [u8; BLS_KEY_LEN] = args.try_into().expect("48-byte bls");
+    let stk = read_stake_account(&bls_pk);
+    out[..8].copy_from_slice(&stk.staked.to_le_bytes());
+    out[8..STK_VALUE_LEN].copy_from_slice(&stk.owner);
+    (QueryStatus::Ok.as_u32(), STK_VALUE_LEN)
+}
+
+/// `head_counter() -> u64 LE` — value of the per-block heartbeat
+/// counter at key `b"counter"`. Returns 0 if the key has never been
+/// written.
+fn query_head_counter(args: &[u8], out: &mut [u8]) -> (u32, usize) {
+    if !args.is_empty() {
+        return (QueryStatus::InvalidArguments.as_u32(), 0);
+    }
+    if out.len() < COUNTER_VALUE_LEN {
+        return (QueryStatus::MethodError.as_u32(), 0);
+    }
+    let mut value = [0u8; COUNTER_VALUE_LEN];
+    let (status, _len) = syscalls::state_read(
+        COUNTER_KEY.as_ptr() as u32,
+        COUNTER_KEY.len() as u32,
+        value.as_mut_ptr() as u32,
+        COUNTER_VALUE_LEN as u32,
+    );
+    if status == STATUS_OK {
+        out[..COUNTER_VALUE_LEN].copy_from_slice(&value);
+    } else {
+        // Not-found and any other status surface as a zeroed counter
+        // since the heartbeat is monotone non-decreasing.
+        out[..COUNTER_VALUE_LEN].fill(0);
+    }
+    (QueryStatus::Ok.as_u32(), COUNTER_VALUE_LEN)
+}
+
+/// `runtime_version() -> abi_version:u32 LE`. Useful for the RPC layer
+/// to assert the runtime exposes the expected ABI before issuing
+/// subsequent calls.
+fn query_runtime_version(args: &[u8], out: &mut [u8]) -> (u32, usize) {
+    if !args.is_empty() {
+        return (QueryStatus::InvalidArguments.as_u32(), 0);
+    }
+    if out.len() < 4 {
+        return (QueryStatus::MethodError.as_u32(), 0);
+    }
+    out[..4].copy_from_slice(&neutrino_runtime_sdk::ABI_VERSION.to_le_bytes());
+    (QueryStatus::Ok.as_u32(), 4)
 }

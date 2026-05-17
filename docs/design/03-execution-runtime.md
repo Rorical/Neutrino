@@ -96,16 +96,16 @@ guest-managed. Host functions receive arguments via `ECALL` (see
 The runtime exports the following symbols. The host resolves them by name from
 the ELF symbol table at load time.
 
-| Symbol | Purpose |
-|---|---|
-| `_neutrino_init` | Called once after loading. Lets the runtime self-register and report its ABI version. |
-| `_neutrino_init_genesis` | Build the initial state from a serialized genesis spec. |
-| `_neutrino_validate_header` | Header-only validity. Cheap pre-check. |
-| `_neutrino_validate_tx` | Mempool admission check. |
-| `_neutrino_build_block` | Author a block from candidate txs. |
-| `_neutrino_execute_block` | Apply a block, produce new state root. |
-| `_neutrino_query` | Read-only view function. |
-| `_neutrino_runtime_version` | Returns `(spec_name, spec_version, impl_version, abi_version)`. |
+| Symbol | Purpose | Status |
+|---|---|---|
+| `_neutrino_init` | Called once after loading. Lets the runtime self-register and report its ABI version. | not implemented |
+| `_neutrino_init_genesis` | Build the initial state from a serialized genesis spec. | not implemented |
+| `_neutrino_validate_header` | Header-only validity. Cheap pre-check. | not implemented |
+| `_neutrino_validate_tx` | Mempool admission check. | implemented |
+| `_neutrino_build_block` | Author a block from candidate txs. | not implemented (engine drains mempool host-side) |
+| `_neutrino_execute_block` | Apply a block, produce new state root. | implemented (ELF default entry) |
+| `_neutrino_query` | Read-only view function. Host invokes with `Status::PermissionDenied` returned from every `state::WRITE` / `state::DELETE`; overlay is discarded after the call. Used by the JSON-RPC `runtime_call` method to expose runtime-defined views (`account_get`, `eth_getBalance`, etc.) without per-runtime node-side code. | implemented |
+| `_neutrino_runtime_version` | Returns `(spec_name, spec_version, impl_version, abi_version)`. | not implemented (the `runtime_version` query method exposes the ABI version directly) |
 
 Inputs/outputs are passed via the **scratch buffer** mechanism in the ABI
 chapter: the host writes input bytes into a host-allocated region, the runtime

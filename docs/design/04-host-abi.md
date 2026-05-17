@@ -168,7 +168,9 @@ intervening writes is the idempotent (cheap) variant.
 1  BufferTooSmall          // a1 will hold required size
 2  InvalidArgument
 3  NotFound                // e.g. state_read of nonexistent key
-4  PermissionDenied        // e.g. write during query() call
+4  PermissionDenied        // returned by state::WRITE / state::DELETE
+                           // when DispatchingHost::read_only is set
+                           // (e.g. during a _neutrino_query call)
 5  OutOfGas                // also raises a trap right after
 6  InternalError           // never expected; indicates host bug
 ```

@@ -14,5 +14,22 @@ publish       = { workspace = true }
 default = ["std"]
 std = []
 
+[dependencies]
+neutrino-primitives       = { workspace = true }
+neutrino-consensus-types  = { workspace = true }
+neutrino-runtime-abi      = { workspace = true }
+async-trait               = { workspace = true }
+borsh                     = { workspace = true }
+hex                       = { workspace = true }
+jsonrpsee                 = { workspace = true }
+serde                     = { workspace = true }
+serde_json                = { workspace = true }
+thiserror                 = { workspace = true }
+tokio                     = { workspace = true }
+tracing                   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
+
 [lints]
 workspace = true

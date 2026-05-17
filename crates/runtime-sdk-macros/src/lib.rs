@@ -117,6 +117,59 @@ pub fn tx_validation_entrypoint(args: TokenStream, input: TokenStream) -> TokenS
     expanded.into()
 }
 
+/// Marks a function as the runtime's read-only query entrypoint.
+///
+/// The macro keeps the user function intact and additionally emits a
+/// `#[unsafe(no_mangle)] pub unsafe extern "C" fn _neutrino_query()`
+/// wrapper. The host invokes that symbol with a borsh-encoded
+/// `QueryRequest` in `host_input` and expects a borsh-encoded
+/// `QueryResponse` written via `host_output`. State writes and deletes
+/// are refused by the host with `Status::PermissionDenied`; the state
+/// overlay is discarded after the call regardless.
+///
+/// The wrapped function decodes the request, dispatches by method
+/// name, and writes the response — typically via
+/// [`neutrino_runtime_sdk::query_dispatch`] which handles the borsh
+/// envelope on the runtime author's behalf.
+///
+/// Constraints match [`entrypoint`]: the annotated function must take
+/// no arguments, return `()`, be non-`async`, non-`unsafe`, and
+/// non-generic.
+#[proc_macro_attribute]
+pub fn query_entrypoint(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new_spanned(
+            TokenStream2::from(args),
+            "#[query_entrypoint] does not accept attribute arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let user_fn = parse_macro_input!(input as ItemFn);
+
+    if let Err(err) = validate_entrypoint(&user_fn) {
+        return err.to_compile_error().into();
+    }
+
+    let user_name = &user_fn.sig.ident;
+    let expanded = quote! {
+        #user_fn
+
+        #[cfg(target_arch = "riscv32")]
+        #[unsafe(no_mangle)]
+        #[unsafe(link_section = ".text.neutrino_entry")]
+        #[allow(unsafe_code)]
+        #[doc(hidden)]
+        pub unsafe extern "C" fn _neutrino_query() {
+            #user_name();
+            ::neutrino_runtime_sdk::abort(0)
+        }
+    };
+
+    expanded.into()
+}
+
 pub(crate) fn validate_entrypoint(item: &ItemFn) -> Result<(), Error> {
     if !item.sig.inputs.is_empty() {
         return Err(Error::new(

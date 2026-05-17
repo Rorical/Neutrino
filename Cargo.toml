@@ -151,6 +151,15 @@ rocksdb             = { version = "0.22", default-features = false }
 thiserror           = { version = "2.0" }
 hex                 = { version = "0.4",  default-features = false, features = ["alloc"] }
 
+# JSON-RPC server for the user-facing RPC layer. Same library Substrate
+# and Reth use; supports HTTP and WebSocket on a single port.
+jsonrpsee           = { version = "0.24", default-features = false, features = ["server", "client", "macros"] }
+serde               = { version = "1.0",  features = ["derive"] }
+serde_json          = { version = "1.0" }
+async-trait         = { version = "0.1" }
+tokio               = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }
+tracing             = { version = "0.1" }
+
 # Proc-macro plumbing used by neutrino-runtime-sdk-macros.
 proc-macro2         = { version = "1.0" }
 quote               = { version = "1.0" }

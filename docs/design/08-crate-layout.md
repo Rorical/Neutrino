@@ -506,8 +506,30 @@ Compiles to native, WASM (`wasm-bindgen`), and mobile-friendly forms.
 
 ### `rpc`
 
-JSON-RPC: `get_block`, `submit_tx`, `get_validator`, `get_state`,
-`get_chunk`, `get_checkpoint_proof`, `subscribe_*`. gRPC can come later.
+JSON-RPC server built on `jsonrpsee` (HTTP + WebSocket on a single
+port). Three namespaces:
+
+- **`chain_*` / `system_*` / `state_getStorage` / `mempool_*`** — served
+  directly from the engine + mempool; chain-agnostic. Methods:
+  `system_chainId`, `system_health`, `system_version`, `chain_head`,
+  `chain_finalized`, `chain_getHeader`, `chain_getBlock`,
+  `chain_getValidatorSet`, `state_getStorage`,
+  `mempool_submitTransaction`, `mempool_status`.
+- **`runtime_call`** — proxied through the runtime's `_neutrino_query`
+  entrypoint. Takes a UTF-8 method name plus opaque bytes; the
+  runtime decides what to expose. The same call shape works for
+  every runtime; no node-side code changes when a new runtime ships
+  new methods.
+- **Facades** (out of scope; separate crate) — translate
+  flavour-specific JSON shapes (e.g. `eth_getBalance(address,
+  blockTag)`) into `runtime_call` invocations. An EVM-shaped runtime
+  that registers `eth_getBalance` inside its `_neutrino_query`
+  dispatcher is reachable end-to-end the moment the facade crate
+  exists.
+
+`gRPC` can come later. Subscriptions (`subscribe_*`) for new heads
+and logs are not yet implemented; they will live on top of an event
+index that is itself M14 work.
 
 ### `node`
 

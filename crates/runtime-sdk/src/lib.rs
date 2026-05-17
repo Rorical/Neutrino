@@ -34,7 +34,14 @@ mod panic;
 #[cfg(target_arch = "riscv32")]
 mod start;
 
-pub use neutrino_runtime_sdk_macros::{entrypoint, tx_validation_entrypoint};
+pub mod query;
+
+pub use neutrino_runtime_sdk_macros::{entrypoint, query_entrypoint, tx_validation_entrypoint};
+#[cfg(target_arch = "riscv32")]
+pub use query::query_dispatch;
+pub use query::{
+    QueryEncodeError, QueryParseError, encode_query_response_header, parse_query_request,
+};
 
 /// Re-export of the ABI version expected by this SDK.
 pub const ABI_VERSION: u32 = neutrino_runtime_abi::VERSION;

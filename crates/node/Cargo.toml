@@ -30,6 +30,7 @@ neutrino-mempool.workspace        = true
 neutrino-network.workspace        = true
 neutrino-primitives.workspace     = true
 neutrino-proof-system.workspace   = true
+neutrino-rpc.workspace            = true
 neutrino-runtime-abi.workspace    = true
 neutrino-runtime-host.workspace   = true
 neutrino-storage                  = { workspace = true, features = ["rocksdb"] }

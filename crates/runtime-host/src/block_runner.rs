@@ -8,7 +8,8 @@
 
 use neutrino_primitives::{StateRoot, Validator};
 use neutrino_runtime_abi::{
-    BlockContext, TxValidity, TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
+    BlockContext, QUERY_ENTRYPOINT, QueryRequest, QueryResponse, TxValidity, TxValidityDecodeError,
+    VALIDATE_TX_ENTRYPOINT,
 };
 use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::executor;
@@ -123,6 +124,37 @@ impl From<BlockError> for TransactionValidationError {
     }
 }
 
+/// Failure modes for [`run_query`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum QueryError {
+    /// The runtime failed before returning a response.
+    Runtime(BlockError),
+    /// The runtime returned bytes the host could not decode as a
+    /// borsh-encoded [`QueryResponse`].
+    Decode(String),
+}
+
+impl From<BlockError> for QueryError {
+    fn from(value: BlockError) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+/// Successful outcome of a [`run_query`] call. The state overlay is
+/// discarded regardless; only output bytes, logs, and gas accounting
+/// survive.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QueryOutcome {
+    /// Decoded response from the runtime.
+    pub response: QueryResponse,
+    /// Gas the query consumed.
+    pub gas_used: u64,
+    /// Gas the query was run with.
+    pub gas_limit: u64,
+    /// Logs the runtime emitted during the query.
+    pub logs: Vec<EmittedLog>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeEntryPoint {
     ElfHeader,
@@ -133,6 +165,12 @@ enum RuntimeEntryPoint {
 enum StateMode {
     Commit,
     Discard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostPolicy {
+    Writable,
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -175,6 +213,7 @@ pub fn run_block(
         overlay,
         gas_limit,
         StateMode::Commit,
+        HostPolicy::Writable,
     )?;
     Ok(BlockOutcome {
         state_root_before: outcome.state_root_before,
@@ -210,10 +249,60 @@ pub fn validate_transaction(
         overlay,
         gas_limit,
         StateMode::Discard,
+        // Validation has historically run writable so existing
+        // runtimes that stage tentative writes during admission still
+        // work. The overlay is dropped on `Discard`; permission
+        // enforcement is the responsibility of the caller (`run_query`
+        // sets it).
+        HostPolicy::Writable,
     )?;
     TxValidity::decode(&outcome.output).map_err(TransactionValidationError::Decode)
 }
 
+/// Invoke a runtime's read-only query entrypoint and decode the borsh
+/// [`QueryResponse`] it writes via `host_output`.
+///
+/// The host jumps directly to [`QUERY_ENTRYPOINT`] (`"_neutrino_query"`)
+/// and passes the borsh-encoded [`QueryRequest`] through the scratch
+/// input buffer. State mutations are refused by the host with
+/// [`Status::PermissionDenied`](neutrino_runtime_abi::status::Status::PermissionDenied)
+/// at the syscall layer; even if the runtime ignores that and the
+/// `state_*` calls succeed, the overlay is discarded after the call.
+///
+/// `overlay` must be constructed by the caller over the state root the
+/// query should observe. For "latest" semantics, build it over the head
+/// trie; for historical queries the caller is responsible for
+/// reconstructing a [`Trie`](neutrino_trie::Trie) at the requested root
+/// before building the overlay.
+pub fn run_query(
+    elf: &[u8],
+    block_ctx: &BlockContext,
+    request: &QueryRequest,
+    overlay: &mut Overlay,
+    gas_limit: u64,
+) -> Result<QueryOutcome, QueryError> {
+    let encoded = borsh::to_vec(request).map_err(|err| QueryError::Decode(err.to_string()))?;
+    let outcome = run_runtime_entrypoint(
+        elf,
+        RuntimeEntryPoint::Symbol(QUERY_ENTRYPOINT),
+        block_ctx,
+        encoded,
+        overlay,
+        gas_limit,
+        StateMode::Discard,
+        HostPolicy::ReadOnly,
+    )?;
+    let response: QueryResponse =
+        borsh::from_slice(&outcome.output).map_err(|err| QueryError::Decode(err.to_string()))?;
+    Ok(QueryOutcome {
+        response,
+        gas_used: outcome.gas_used,
+        gas_limit: outcome.gas_limit,
+        logs: outcome.logs,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_runtime_entrypoint(
     elf: &[u8],
     entrypoint: RuntimeEntryPoint,
@@ -222,6 +311,7 @@ fn run_runtime_entrypoint(
     overlay: &mut Overlay,
     gas_limit: u64,
     state_mode: StateMode,
+    host_policy: HostPolicy,
 ) -> Result<RuntimeRunOutcome, BlockError> {
     let state_root_before = overlay.base_root();
 
@@ -248,7 +338,10 @@ fn run_runtime_entrypoint(
 
     // Set up the dispatcher.
     let mut scratch = Scratch::with_input(input);
-    let mut host = DispatchingHost::new(overlay, block_ctx, &mut scratch);
+    let mut host = match host_policy {
+        HostPolicy::Writable => DispatchingHost::new(overlay, block_ctx, &mut scratch),
+        HostPolicy::ReadOnly => DispatchingHost::new_read_only(overlay, block_ctx, &mut scratch),
+    };
 
     // Run the interpreter.
     let mut gas_remaining: u64 = gas_limit;

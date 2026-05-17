@@ -1527,3 +1527,134 @@ fn query_runtime_decode_error_is_wrapped() {
     let err: QueryError = QueryError::Decode("synthetic".into());
     assert!(matches!(err, QueryError::Decode(_)));
 }
+
+// -------- M7-D.1 slashing-application tests ---------------------------------
+
+const TX_SLASH: u8 = 0x05;
+
+fn make_slash_txn(bls_pk: BlsPublicKey) -> Vec<u8> {
+    let mut txn = Vec::with_capacity(1 + BLS_KEY_LEN);
+    txn.push(TX_SLASH);
+    txn.extend_from_slice(&bls_pk);
+    txn
+}
+
+#[test]
+fn slash_transaction_decreases_stake_account_by_one_percent() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping slash test.");
+        return;
+    };
+
+    let bls = bls_pk(7);
+
+    // Block 1: deposit 1_000_000 so the validator has stake to slash.
+    let deposit = make_deposit_txn(bls, 1_000_000, [0u8; DEP_POP_LEN]);
+    let body1 = body_from_txns(&[deposit]);
+    let mut overlay = Overlay::empty();
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(1, overlay.base_root()),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("deposit");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(1_000_000, [0u8; 32]))
+    );
+
+    // Block 2: slash the validator. SLASH_PENALTY_BPS = 100 (1%);
+    // 1% of 1_000_000 = 10_000 deduction → 990_000 remaining.
+    let slash = make_slash_txn(bls);
+    let body2 = body_from_txns(&[slash]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(2, overlay.base_root()),
+        body2,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("slash");
+
+    let expected_after = 1_000_000_u64 - 10_000_u64;
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(expected_after, [0u8; 32]))
+    );
+
+    let vs1 = compute_vs_hash(&[0u8; 32], TX_DEPOSIT, &bls, 1_000_000);
+    let vs2 = compute_vs_hash(&vs1, TX_SLASH, &bls, expected_after);
+    assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
+}
+
+#[test]
+fn slashing_a_dust_validator_removes_them_from_the_active_set() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping slash-to-zero test.");
+        return;
+    };
+
+    let bls = bls_pk(8);
+
+    // Deposit 1 unit. 1% of 1 = 0, but the runtime floors the
+    // penalty to 1, so a single slash brings stake to zero and the
+    // validator is removed from the registry.
+    let deposit = make_deposit_txn(bls, 1, [0u8; DEP_POP_LEN]);
+    let body1 = body_from_txns(&[deposit]);
+    let mut overlay = Overlay::empty();
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(1, overlay.base_root()),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("deposit");
+
+    let slash = make_slash_txn(bls);
+    let body2 = body_from_txns(&[slash]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(2, overlay.base_root()),
+        body2,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("slash");
+
+    assert_eq!(overlay.get(&stk_key(&bls)), None);
+    // VS accumulator records the eviction with new_stake = 0.
+    let vs1 = compute_vs_hash(&[0u8; 32], TX_DEPOSIT, &bls, 1);
+    let vs2 = compute_vs_hash(&vs1, TX_SLASH, &bls, 0);
+    assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
+}
+
+#[test]
+fn slash_with_no_prior_stake_is_a_noop() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping slash-noop test.");
+        return;
+    };
+
+    let bls = bls_pk(9);
+    let mut overlay = Overlay::empty();
+
+    let slash = make_slash_txn(bls);
+    let body = body_from_txns(&[slash]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(1, overlay.base_root()),
+        body,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("slash noop");
+
+    assert_eq!(overlay.get(&stk_key(&bls)), None);
+    // VS accumulator must remain at the empty-seed value because the
+    // runtime short-circuits the update when there is nothing to
+    // deduct.
+    assert!(overlay.get(VS_KEY).is_none());
+}

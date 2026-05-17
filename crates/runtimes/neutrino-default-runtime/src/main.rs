@@ -87,6 +87,19 @@ const TX_UNSTAKE: u8 = 0x02;
 const TX_DEPOSIT: u8 = 0x03;
 /// Transaction type tag: engine-provided voluntary exit.
 const TX_EXIT: u8 = 0x04;
+/// Transaction type tag: engine-provided slashing application.
+///
+/// Format: `[0x05] || bls_pubkey (48 bytes)` (49 bytes total). The
+/// runtime deducts [`SLASH_PENALTY_BPS`] basis points of the
+/// validator's currently-staked amount and refreshes the
+/// validator-set snapshot the engine reads at chunk boundaries.
+const TX_SLASH: u8 = 0x05;
+
+/// Slashing penalty in basis points (1 bp = 0.01%). Applied to the
+/// offender's `staked` balance on every [`TX_SLASH`]. 100 bp = 1%
+/// matches the M7-B doc 02 §2.7 recommendation for the four
+/// "double-X" and "InvalidVrfClaim" objective conditions.
+const SLASH_PENALTY_BPS: u64 = 100;
 
 /// Byte ranges within a transfer.
 const XFR_FROM_OFF: usize = 1;
@@ -112,6 +125,10 @@ const DEP_BLS_OFF: usize = 1;
 const DEP_AMOUNT_OFF: usize = 49;
 /// Byte ranges within a voluntary exit.
 const EXT_BLS_OFF: usize = 1;
+/// Byte ranges within a slashing.
+const SLASH_BLS_OFF: usize = 1;
+/// Total wire size of a [`TX_SLASH`] transaction: type tag + BLS pubkey.
+const SLASH_TX_LEN: usize = 1 + BLS_KEY_LEN;
 
 /// Maximum host-input body bytes the runtime will attempt to read.
 const BODY_BUF: usize = 4096;
@@ -696,6 +713,42 @@ fn apply_exit(txn: &[u8]) {
     update_validator_set(TX_EXIT, &bls_pk, 0);
 }
 
+/// Validate a slashing transaction.
+///
+/// The engine has already re-verified the underlying
+/// [`SlashingEvidence`] cryptographically before turning it into
+/// this transaction (see `Engine::verify_slashing_evidence`), so
+/// the runtime only checks wire shape.
+fn validate_slash(txn: &[u8]) -> TxValidationCode {
+    if txn.len() < SLASH_TX_LEN {
+        return TxValidationCode::Malformed;
+    }
+    TxValidationCode::Valid
+}
+
+/// Apply a slashing transaction: deduct [`SLASH_PENALTY_BPS`] of
+/// the offender's current `staked` balance and refresh the
+/// validator-set snapshot. A validator whose stake reaches zero is
+/// removed from the registry.
+fn apply_slash(txn: &[u8]) {
+    let bls_pk: [u8; BLS_KEY_LEN] = txn[SLASH_BLS_OFF..SLASH_BLS_OFF + BLS_KEY_LEN]
+        .try_into()
+        .expect("48-byte bls");
+    let mut stk = read_stake_account(&bls_pk);
+    if stk.staked == 0 {
+        return;
+    }
+    let penalty = (stk.staked.saturating_mul(SLASH_PENALTY_BPS) / 10_000).max(1);
+    stk.staked = stk.staked.saturating_sub(penalty);
+    if stk.staked == 0 {
+        delete_stake_account(&bls_pk);
+        update_validator_set(TX_SLASH, &bls_pk, 0);
+    } else {
+        write_stake_account(&bls_pk, &stk);
+        update_validator_set(TX_SLASH, &bls_pk, stk.staked);
+    }
+}
+
 /// Validate one runtime-defined transaction without applying it.
 fn transaction_validity(txn: &[u8]) -> TxValidationCode {
     if txn.is_empty() {
@@ -707,6 +760,7 @@ fn transaction_validity(txn: &[u8]) -> TxValidationCode {
         TX_UNSTAKE => validate_unstake(txn),
         TX_DEPOSIT => validate_deposit(txn),
         TX_EXIT => validate_exit(txn),
+        TX_SLASH => validate_slash(txn),
         _other => TxValidationCode::UnknownType,
     }
 }
@@ -739,6 +793,7 @@ fn process_transaction(txn: &[u8]) {
         TX_UNSTAKE => apply_unstake(txn),
         TX_DEPOSIT => apply_deposit(txn),
         TX_EXIT => apply_exit(txn),
+        TX_SLASH => apply_slash(txn),
         _other => syscalls::abort(ABORT_BAD_TXN_TYPE),
     }
 }

@@ -13,8 +13,8 @@
 use alloc::vec::Vec;
 
 use borsh::BorshSerialize;
-use neutrino_consensus_types::{Body, Deposit, Header, VoluntaryExit};
-use neutrino_primitives::{Hash, Validator, blake3_256};
+use neutrino_consensus_types::{Body, Deposit, Header, SlashingEvidence, VoluntaryExit};
+use neutrino_primitives::{Hash, Validator, ValidatorIndex, blake3_256};
 
 use crate::merkle::{merkle_root, merkle_root_of_hashes};
 
@@ -69,6 +69,10 @@ impl std::error::Error for BodyEncodeError {}
 
 const TX_DEPOSIT: u8 = 0x03;
 const TX_EXIT: u8 = 0x04;
+/// Slashing-application transaction tag. Wire format is the same
+/// as the default runtime's `TX_SLASH`: type tag + 48-byte BLS
+/// pubkey of the offender.
+const TX_SLASH: u8 = 0x05;
 
 /// Serialize `body` into the runtime ABI byte format without an active
 /// validator set.
@@ -125,7 +129,10 @@ fn runtime_transactions(
     active_validators: &[Validator],
 ) -> Result<Vec<Vec<u8>>, BodyEncodeError> {
     let mut txs = Vec::with_capacity(
-        body.transactions.len() + body.deposits.len() + body.voluntary_exits.len(),
+        body.transactions.len()
+            + body.deposits.len()
+            + body.voluntary_exits.len()
+            + body.slashings.len(),
     );
     txs.extend(body.transactions.iter().cloned());
     for deposit in &body.deposits {
@@ -133,6 +140,11 @@ fn runtime_transactions(
     }
     for exit in &body.voluntary_exits {
         txs.push(encode_exit(exit, active_validators)?);
+    }
+    for evidence in &body.slashings {
+        if let Some(tx) = encode_slashing(evidence, active_validators)? {
+            txs.push(tx);
+        }
     }
     Ok(txs)
 }
@@ -164,6 +176,49 @@ fn encode_exit(
     tx.push(TX_EXIT);
     tx.extend_from_slice(&validator.pubkey);
     Ok(tx)
+}
+
+/// Encode a single slashing as a runtime [`TX_SLASH`] transaction by
+/// resolving the offender's index against the active validator set
+/// and emitting `[0x05] || validator.pubkey`.
+///
+/// Returns `Ok(None)` for variants the M7-D.1 runtime does not yet
+/// apply (`LockViolation`, `InvalidProofSigning`,
+/// `LongRangeForkParticipation`, `DaCommitmentFraud`); those will
+/// surface as runtime transactions when the corresponding engine
+/// detectors land in later M7-D slices.
+fn encode_slashing(
+    evidence: &SlashingEvidence,
+    active_validators: &[Validator],
+) -> Result<Option<Vec<u8>>, BodyEncodeError> {
+    let offender_index: ValidatorIndex = match evidence {
+        SlashingEvidence::DoubleProposal { proposer_index, .. }
+        | SlashingEvidence::InvalidVrfClaim { proposer_index, .. } => *proposer_index,
+        SlashingEvidence::DoublePrevote {
+            validator_index, ..
+        }
+        | SlashingEvidence::DoublePrecommit {
+            validator_index, ..
+        } => *validator_index,
+        SlashingEvidence::LockViolation { .. }
+        | SlashingEvidence::InvalidProofSigning { .. }
+        | SlashingEvidence::LongRangeForkParticipation { .. }
+        | SlashingEvidence::DaCommitmentFraud { .. } => return Ok(None),
+    };
+    let position =
+        usize::try_from(offender_index).map_err(|_| BodyEncodeError::UnknownValidatorIndex {
+            index: offender_index,
+        })?;
+    let validator =
+        active_validators
+            .get(position)
+            .ok_or(BodyEncodeError::UnknownValidatorIndex {
+                index: offender_index,
+            })?;
+    let mut tx = Vec::with_capacity(1 + validator.pubkey.len());
+    tx.push(TX_SLASH);
+    tx.extend_from_slice(&validator.pubkey);
+    Ok(Some(tx))
 }
 
 /// Five header-level Merkle roots committed by the [`Header`].
@@ -238,7 +293,8 @@ mod tests {
     use super::*;
     use crate::merkle::EMPTY_MERKLE_ROOT;
     use neutrino_consensus_types::{
-        Body, Deposit, FinalityVote, FinalityVoteData, FinalityVotePhase, VoluntaryExit,
+        Body, Deposit, FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedVote,
+        SlashingEvidence, VoluntaryExit, VrfRejectionReason,
     };
     use neutrino_primitives::Validator;
 
@@ -354,6 +410,225 @@ mod tests {
         assert!(matches!(
             encode_runtime_body(&body),
             Err(BodyEncodeError::PayloadTooLarge { .. })
+        ));
+    }
+
+    fn sample_header(proposer_index: u32) -> Header {
+        Header {
+            version: 1,
+            height: 1,
+            slot: 1,
+            parent_hash: [0xAA; 32],
+            proposer_index,
+            vrf_proof: [0; 96],
+            state_root: [0x11; 32],
+            transactions_root: [0; 32],
+            votes_root: [0; 32],
+            slashings_root: [0; 32],
+            validator_ops_root: [0; 32],
+            da_root: [0; 32],
+            runtime_extra: [0; 32],
+            gas_used: 0,
+            gas_limit: 1_000_000,
+            timestamp: 0,
+            signature: [0; 96],
+        }
+    }
+
+    fn sample_indexed_vote(chunk_hash_byte: u8) -> IndexedVote {
+        IndexedVote {
+            data: FinalityVoteData {
+                chunk_id: 0,
+                round: 0,
+                chunk_hash: [chunk_hash_byte; 32],
+                phase: FinalityVotePhase::Prevote,
+            },
+            signature: [0; 96],
+        }
+    }
+
+    #[test]
+    fn encode_runtime_body_emits_tx_slash_for_each_double_proposal() {
+        let active = vec![
+            Validator {
+                pubkey: [0xAA; 48],
+                withdrawal_credentials: [0; 32],
+                effective_stake: 100,
+                slashed: false,
+                activation_epoch: 0,
+                exit_epoch: u64::MAX,
+                last_active_chunk: 0,
+            },
+            Validator {
+                pubkey: [0xBB; 48],
+                withdrawal_credentials: [0; 32],
+                effective_stake: 100,
+                slashed: false,
+                activation_epoch: 0,
+                exit_epoch: u64::MAX,
+                last_active_chunk: 0,
+            },
+        ];
+        let body = Body {
+            slashings: vec![SlashingEvidence::DoubleProposal {
+                proposer_index: 1,
+                header_a: sample_header(1),
+                header_b: {
+                    let mut h = sample_header(1);
+                    h.state_root = [0x22; 32];
+                    h
+                },
+            }],
+            ..Body::default()
+        };
+
+        let encoded = encode_runtime_body_with_validators(&body, &active).expect("encode");
+        // tx_count prefix = 1.
+        assert_eq!(&encoded[..4], &1_u32.to_le_bytes());
+        // single tx is 49 bytes (1 tag + 48 pubkey).
+        assert_eq!(&encoded[4..8], &49_u32.to_le_bytes());
+        assert_eq!(encoded[8], TX_SLASH);
+        assert_eq!(&encoded[9..9 + 48], &active[1].pubkey);
+    }
+
+    #[test]
+    fn encode_runtime_body_emits_tx_slash_for_each_supported_variant() {
+        let active = vec![Validator {
+            pubkey: [0x77; 48],
+            withdrawal_credentials: [0; 32],
+            effective_stake: 100,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }];
+        let body = Body {
+            slashings: vec![
+                SlashingEvidence::DoubleProposal {
+                    proposer_index: 0,
+                    header_a: sample_header(0),
+                    header_b: {
+                        let mut h = sample_header(0);
+                        h.state_root = [0x33; 32];
+                        h
+                    },
+                },
+                SlashingEvidence::DoublePrevote {
+                    validator_index: 0,
+                    vote_a: sample_indexed_vote(0xAA),
+                    vote_b: sample_indexed_vote(0xBB),
+                },
+                SlashingEvidence::DoublePrecommit {
+                    validator_index: 0,
+                    vote_a: sample_indexed_vote(0xCC),
+                    vote_b: sample_indexed_vote(0xDD),
+                },
+                SlashingEvidence::InvalidVrfClaim {
+                    proposer_index: 0,
+                    header: sample_header(0),
+                    reason: VrfRejectionReason::ThresholdNotMet,
+                },
+            ],
+            ..Body::default()
+        };
+
+        let encoded = encode_runtime_body_with_validators(&body, &active).expect("encode");
+        assert_eq!(&encoded[..4], &4_u32.to_le_bytes());
+        // Walk the four transactions: each is 49 bytes, all TX_SLASH for v0.
+        let mut off = 4;
+        for _ in 0..4 {
+            assert_eq!(&encoded[off..off + 4], &49_u32.to_le_bytes());
+            off += 4;
+            assert_eq!(encoded[off], TX_SLASH);
+            assert_eq!(&encoded[off + 1..off + 49], &active[0].pubkey);
+            off += 49;
+        }
+    }
+
+    #[test]
+    fn encode_runtime_body_skips_unsupported_slashing_variants() {
+        use neutrino_consensus_types::{
+            AggregatedVote, BlockProofRejection, DaFraudProof, LockEvidence, ProofRejectionReason,
+            QuorumCertificate,
+        };
+        let active = vec![Validator {
+            pubkey: [0x11; 48],
+            withdrawal_credentials: [0; 32],
+            effective_stake: 100,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }];
+        let qc = QuorumCertificate {
+            data: FinalityVoteData {
+                chunk_id: 0,
+                round: 0,
+                chunk_hash: [0; 32],
+                phase: FinalityVotePhase::Prevote,
+            },
+            aggregate: AggregatedVote {
+                aggregation_bits: neutrino_primitives::BitVec::default(),
+                signature: [0; 96],
+            },
+        };
+        let body = Body {
+            slashings: vec![
+                SlashingEvidence::LockViolation {
+                    validator_index: 0,
+                    vote_a: sample_indexed_vote(0xAA),
+                    vote_b: sample_indexed_vote(0xBB),
+                    lock_evidence: LockEvidence {
+                        locked_prevote_quorum: qc,
+                        claimed_unlock_quorum: None,
+                    },
+                },
+                SlashingEvidence::InvalidProofSigning {
+                    validator_index: 0,
+                    vote: sample_indexed_vote(0xCC),
+                    invalid_proof_evidence: BlockProofRejection {
+                        block_hash: [0; 32],
+                        proof_hash: [0; 32],
+                        verifier_version: 1,
+                        reason: ProofRejectionReason::VerifierRejected,
+                    },
+                },
+                SlashingEvidence::DaCommitmentFraud {
+                    proposer_index: 0,
+                    header: sample_header(0),
+                    fraud_proof: DaFraudProof {
+                        expected_da_root: [0; 32],
+                        computed_da_root: [0; 32],
+                        bundle_hash: [0; 32],
+                        offending_bundle: Vec::new(),
+                    },
+                },
+            ],
+            ..Body::default()
+        };
+
+        // None of the three variants is supported by the M7-D.1
+        // body encoder, so the runtime payload is empty.
+        let encoded = encode_runtime_body_with_validators(&body, &active).expect("encode");
+        assert!(
+            encoded.is_empty(),
+            "unsupported slashing variants must not surface as runtime transactions"
+        );
+    }
+
+    #[test]
+    fn encode_runtime_body_rejects_out_of_range_offender_index() {
+        let body = Body {
+            slashings: vec![SlashingEvidence::DoubleProposal {
+                proposer_index: 5,
+                header_a: sample_header(5),
+                header_b: sample_header(5),
+            }],
+            ..Body::default()
+        };
+        assert!(matches!(
+            encode_runtime_body_with_validators(&body, &[]),
+            Err(BodyEncodeError::UnknownValidatorIndex { index: 5 })
         ));
     }
 

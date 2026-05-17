@@ -79,6 +79,13 @@ const DEFAULT_MEMPOOL_CAPACITY_BYTES: usize = 256 * 1024;
 /// drain past the runtime's buffer.
 const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 3_500;
 
+/// Default cap on the number of slashing-evidence items pulled from
+/// the slashing pool into a single block body. Sized to leave room
+/// for transactions and validator-set operations inside the
+/// runtime's 4 KiB input buffer even when every slot drains the
+/// pool to the limit.
+const DEFAULT_BODY_SLASHING_BUDGET: usize = 32;
+
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
 /// Internally wraps an [`Engine`] behind a `std::sync::Mutex`. The mutex
@@ -344,8 +351,10 @@ where
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
         let drained = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
         let drained_hashes: Vec<Hash> = drained.iter().map(|tx| blake3_256(tx)).collect();
+        let drained_slashings = self.drain_slashing_pool(DEFAULT_BODY_SLASHING_BUDGET);
         let body = Body {
             transactions: drained.clone(),
+            slashings: drained_slashings.clone(),
             ..Body::default()
         };
         let result = self.with_engine_mut(|e| {
@@ -356,19 +365,27 @@ where
             };
             e.try_produce_block(slot, cfg, body, gas_limit)
         });
-        match &result {
-            // On Ok(Some) the engine consumed the body — the drained
-            // transactions are now mined.
-            Ok(Some(_)) => {}
-            // On Ok(None) (not eligible) the engine did not touch the
-            // body; on Err the engine rejected. Return drained txs
-            // either way so the next slot can retry them.
-            Ok(None) | Err(_) => {
-                self.restore_to_mempool(drained);
-            }
+        // On Ok(Some) the engine consumed the body — the drained
+        // transactions and slashings are now committed. On Ok(None)
+        // (not eligible) the engine did not touch the body; on Err
+        // the engine rejected. Restore both drained pools in either
+        // non-success case so the next slot can retry them.
+        if !matches!(&result, Ok(Some(_))) {
+            self.restore_to_mempool(drained);
+            self.restore_to_slashing_pool(drained_slashings);
         }
         let _ = drained_hashes; // hashes are only useful for log filtering today
         result
+    }
+
+    fn restore_to_slashing_pool(&self, evidence: Vec<SlashingEvidence>) {
+        let mut pool = self
+            .slashing_pool
+            .lock()
+            .expect("ChainBackend slashing_pool poisoned");
+        for item in evidence {
+            pool.insert(item);
+        }
     }
 
     /// Submit a peer-supplied transaction into the local mempool.

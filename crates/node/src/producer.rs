@@ -77,10 +77,24 @@ async fn attempt_slot(
 
     match backend.try_produce_empty_block(slot, &config.proposer, &config.runtime_elf) {
         Ok(Some(outcome)) => {
+            let proof = match backend.prove_block(&outcome.block_hash) {
+                Ok(proof) => proof.block_proof,
+                Err(err) => {
+                    warn!(slot, error = %err, "block proof generation failed");
+                    return;
+                }
+            };
             let data = match to_vec(&outcome.block) {
                 Ok(data) => data,
                 Err(err) => {
                     warn!(slot, error = %err, "failed to encode produced block");
+                    return;
+                }
+            };
+            let proof_data = match to_vec(&proof) {
+                Ok(data) => data,
+                Err(err) => {
+                    warn!(slot, error = %err, "failed to encode block proof");
                     return;
                 }
             };
@@ -95,6 +109,20 @@ async fn attempt_slot(
                 warn!(
                     slot,
                     "network command channel closed; stopping block publication"
+                );
+                return;
+            }
+            if cmd_tx
+                .send(NetworkCommand::Publish {
+                    topic: Topic::BlockProofs,
+                    data: proof_data,
+                })
+                .await
+                .is_err()
+            {
+                warn!(
+                    slot,
+                    "network command channel closed; stopping block proof publication"
                 );
                 return;
             }

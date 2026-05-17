@@ -259,6 +259,15 @@ pub enum SyncCommand {
         /// Initial set of paths to fetch.
         paths: Vec<Vec<u8>>,
     },
+    /// Fetch a batch of block proofs from the peer.
+    RequestBlockProofs {
+        /// Peer to query.
+        peer: PeerId,
+        /// First block height whose proof is missing.
+        start_height: Height,
+        /// Number of proofs to fetch.
+        count: u64,
+    },
     /// Subscribe to a gossip topic.
     Subscribe(Topic),
     /// Reached [`SyncState::Following`]; the driver should now treat the
@@ -273,6 +282,8 @@ pub struct SyncBatchSizes {
     pub recursive_proof_batch: u64,
     /// Number of blocks requested per `BlocksByRange` RPC.
     pub block_batch: u64,
+    /// Number of block proofs requested per `BlockProofByHeight` RPC.
+    pub block_proof_batch: u64,
 }
 
 impl Default for SyncBatchSizes {
@@ -280,6 +291,7 @@ impl Default for SyncBatchSizes {
         Self {
             recursive_proof_batch: 32,
             block_batch: 16,
+            block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
         }
     }
 }
@@ -317,6 +329,7 @@ impl SyncMachine {
             batch_sizes: SyncBatchSizes {
                 recursive_proof_batch: 32,
                 block_batch: 16,
+                block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
             },
         }
     }
@@ -639,13 +652,16 @@ impl SyncMachine {
         self.state = SyncState::ProofBackfill {
             from_height: from,
             target_height: target,
-            in_flight: false,
+            in_flight: true,
         };
-        // The FSM does not directly request block proofs in this slice
-        // (block_proof_* RPCs are deferred). Driver pulls them via existing
-        // RPC primitives or local replay. We just emit no commands; the
-        // driver triggers `ProofsAdvanced` once it has caught the tail.
-        Vec::new()
+        let Some(sync_peer) = self.sync_peer else {
+            return Vec::new();
+        };
+        vec![SyncCommand::RequestBlockProofs {
+            peer: sync_peer.peer,
+            start_height: from,
+            count: self.batch_sizes.block_proof_batch,
+        }]
     }
 
     fn advance_past_proof_backfill(&mut self) -> Vec<SyncCommand> {
@@ -663,12 +679,20 @@ impl SyncMachine {
         if new_proven_height >= target_height {
             self.advance_past_proof_backfill()
         } else {
+            let from = new_proven_height.saturating_add(1);
             self.state = SyncState::ProofBackfill {
-                from_height: new_proven_height.saturating_add(1),
+                from_height: from,
                 target_height,
-                in_flight: false,
+                in_flight: true,
             };
-            Vec::new()
+            let Some(sync_peer) = self.sync_peer else {
+                return Vec::new();
+            };
+            vec![SyncCommand::RequestBlockProofs {
+                peer: sync_peer.peer,
+                start_height: from,
+                count: self.batch_sizes.block_proof_batch,
+            }]
         }
     }
 
@@ -770,6 +794,26 @@ impl SyncMachine {
                     peer,
                     start_height: head.saturating_add(1),
                     count: self.batch_sizes.block_batch,
+                }]
+            }
+            (
+                SyncState::ProofBackfill {
+                    from_height,
+                    target_height,
+                    ..
+                },
+                RpcProtocol::BlockProofByHeight,
+            ) => {
+                let (from, target) = (*from_height, *target_height);
+                self.state = SyncState::ProofBackfill {
+                    from_height: from,
+                    target_height: target,
+                    in_flight: false,
+                };
+                vec![SyncCommand::RequestBlockProofs {
+                    peer,
+                    start_height: from,
+                    count: self.batch_sizes.block_proof_batch,
                 }]
             }
             _ => Vec::new(),
@@ -1029,9 +1073,10 @@ mod tests {
         let cmds = fsm.on_event(SyncEvent::StateRootReconstructed([2; 32]));
         // proven_height is 0 (default), so we should enter ProofBackfill.
         assert!(matches!(fsm.state(), SyncState::ProofBackfill { .. }));
-        // FSM does not emit a direct command for proof backfill in this
-        // slice — driver pulls proofs out of band.
-        assert!(cmds.is_empty());
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, SyncCommand::RequestBlockProofs { .. }))
+        );
 
         // Driver fills proofs up to head height.
         let cmds = fsm.on_event(SyncEvent::ProofsAdvanced {

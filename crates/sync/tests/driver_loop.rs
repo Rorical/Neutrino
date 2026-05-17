@@ -15,20 +15,21 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use neutrino_consensus_types::{Block, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, BlockProof, RecursiveCheckpointProof};
 use neutrino_network::PeerId;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::rpc::{
-    BlocksByRangeResponse, BlocksByRootResponse, RecursiveProofByIndexResponse,
+    BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
+    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
     RecursiveProofLatestResponse, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
     StateByRootResponse, Status,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::LocalProgress;
-use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, Height, StateRoot};
+use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
 use neutrino_sync::{
-    CheckpointsImported, HeadersImported, StateProgress, SyncBackend, SyncBackendError, SyncDriver,
-    SyncDriverConfig,
+    CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
+    SyncBackendError, SyncDriver, SyncDriverConfig,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -122,6 +123,37 @@ impl SyncBackend for MockBackend {
         StateByRootResponse::default()
     }
 
+    async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse {
+        self.inner
+            .lock()
+            .unwrap()
+            .rpc_calls
+            .push(format!("block_proofs_by_hash({})", roots.len()));
+        BlockProofByHashResponse::default()
+    }
+
+    async fn block_proofs_by_height(
+        &self,
+        start: Height,
+        count: u64,
+    ) -> BlockProofByHeightResponse {
+        self.inner
+            .lock()
+            .unwrap()
+            .rpc_calls
+            .push(format!("block_proofs_by_height({start},{count})"));
+        BlockProofByHeightResponse::default()
+    }
+
+    async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse {
+        self.inner
+            .lock()
+            .unwrap()
+            .rpc_calls
+            .push(format!("chunk_proofs_by_id({})", chunk_ids.len()));
+        ChunkProofByIdResponse::default()
+    }
+
     async fn verify_and_import_checkpoints(
         &self,
         items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
@@ -165,6 +197,24 @@ impl SyncBackend for MockBackend {
         Ok(StateProgress {
             root_complete: true,
             next_paths: vec![],
+        })
+    }
+
+    async fn verify_and_import_block_proofs(
+        &self,
+        start: Height,
+        proofs: Vec<BlockProof>,
+    ) -> Result<ProofsImported, SyncBackendError> {
+        let last = proofs.last().ok_or_else(|| {
+            SyncBackendError::Rejected("empty block proof batch in mock".to_owned())
+        })?;
+        if last.height < start {
+            return Err(SyncBackendError::Rejected(
+                "proof height moved backwards in mock".to_owned(),
+            ));
+        }
+        Ok(ProofsImported {
+            new_proven_height: last.height,
         })
     }
 
@@ -348,6 +398,137 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
     handle.await.unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[allow(clippy::too_many_lines)]
+async fn proof_backfill_requests_and_imports_block_proofs() {
+    let backend = MockBackend::default();
+    backend.set_status(Status {
+        chain_id: 1,
+        chain_spec_hash: [0; 32],
+        finalized_checkpoint_index: 0,
+        finalized_checkpoint_hash: [0; 32],
+        head_block_hash: [0; 32],
+        head_slot: 0,
+        head_height: 0,
+    });
+    backend.set_advance(0, 1);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress {
+            chain_id: 1,
+            chain_spec_hash: [0; 32],
+            ..LocalProgress::default()
+        },
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    let peer = random_peer();
+    event_tx
+        .send(NetworkEvent::PeerConnected(peer))
+        .await
+        .unwrap();
+
+    let cmd = timeout(Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("status command")
+        .expect("channel open");
+    let NetworkCommand::SendRpcRequest {
+        request,
+        response_tx,
+        ..
+    } = cmd
+    else {
+        panic!("expected status request, got {cmd:?}");
+    };
+    assert_eq!(request.protocol(), RpcProtocol::Status);
+    response_tx
+        .send(Ok(RpcResponse::Status(Status {
+            chain_id: 1,
+            chain_spec_hash: [0; 32],
+            finalized_checkpoint_index: 0,
+            finalized_checkpoint_hash: [0; 32],
+            head_block_hash: [1; 32],
+            head_slot: 1,
+            head_height: 1,
+        })))
+        .ok();
+
+    let cmd = timeout(Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("blocks command")
+        .expect("channel open");
+    let NetworkCommand::SendRpcRequest {
+        request,
+        response_tx,
+        ..
+    } = cmd
+    else {
+        panic!("expected blocks request, got {cmd:?}");
+    };
+    assert_eq!(request.protocol(), RpcProtocol::BlocksByRange);
+    response_tx
+        .send(Ok(RpcResponse::BlocksByRange(BlocksByRangeResponse {
+            blocks: vec![sample_block(1, 1, 0)],
+        })))
+        .ok();
+
+    let cmd = timeout(Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("state command")
+        .expect("channel open");
+    let NetworkCommand::SendRpcRequest {
+        request,
+        response_tx,
+        ..
+    } = cmd
+    else {
+        panic!("expected state request, got {cmd:?}");
+    };
+    assert_eq!(request.protocol(), RpcProtocol::StateByRoot);
+    response_tx
+        .send(Ok(RpcResponse::StateByRoot(StateByRootResponse::default())))
+        .ok();
+
+    let cmd = timeout(Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("block proof command")
+        .expect("channel open");
+    let NetworkCommand::SendRpcRequest {
+        request,
+        response_tx,
+        ..
+    } = cmd
+    else {
+        panic!("expected block proof request, got {cmd:?}");
+    };
+    assert!(matches!(
+        request,
+        RpcRequest::BlockProofByHeight(ref req)
+            if req.start_height == 1 && req.count == neutrino_network::rpc::MAX_BLOCK_PROOFS_PER_RESPONSE
+    ));
+    response_tx
+        .send(Ok(RpcResponse::BlockProofByHeight(
+            BlockProofByHeightResponse {
+                proofs: vec![sample_block_proof(1)],
+            },
+        )))
+        .ok();
+
+    let cmd = timeout(Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("following subscribe")
+        .expect("channel open");
+    assert!(matches!(cmd, NetworkCommand::Subscribe(_)));
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
 fn sample_block(height: Height, slot: u64, _seed: u8) -> Block {
     use neutrino_consensus_types::{Body, Header};
     use neutrino_primitives::HEADER_VERSION;
@@ -373,5 +554,30 @@ fn sample_block(height: Height, slot: u64, _seed: u8) -> Block {
     Block {
         header,
         body: Body::default(),
+    }
+}
+
+fn sample_block_proof(height: Height) -> BlockProof {
+    use neutrino_consensus_types::BlockProofPublicInputs;
+    use neutrino_primitives::ZERO_HASH;
+
+    let byte = u8::try_from(height).expect("sample height fits u8");
+    BlockProof {
+        height,
+        block_hash: [byte; 32],
+        public_inputs: BlockProofPublicInputs {
+            chain_id: 1,
+            height,
+            parent_block_hash: ZERO_HASH,
+            block_hash: [byte; 32],
+            state_root_before: ZERO_HASH,
+            state_root_after: ZERO_HASH,
+            transactions_root: ZERO_HASH,
+            receipt_root: ZERO_HASH,
+            da_root: ZERO_HASH,
+            vm_code_hash: ZERO_HASH,
+            abi_version: 1,
+        },
+        proof_bytes: vec![0xAA],
     }
 }

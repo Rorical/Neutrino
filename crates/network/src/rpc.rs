@@ -1,7 +1,7 @@
 //! Request/response RPC for Neutrino, per doc 06 §"Request/response protocols".
 //!
-//! Implements the **core** RPC family every full node supports, plus the two
-//! recursive-proof endpoints the sync FSM needs for `CheckpointBackfill`:
+//! Implements the **core** RPC family every full node supports, plus the proof
+//! retrieval endpoints the sync FSM uses while backfilling:
 //!
 //! | Protocol id                                | Request → Response                                       |
 //! |--------------------------------------------|----------------------------------------------------------|
@@ -11,6 +11,9 @@
 //! | `/neutrino/req/blocks_by_range/1`          | [`BlocksByRangeRequest`] → [`BlocksByRangeResponse`]     |
 //! | `/neutrino/req/blocks_by_root/1`           | [`BlocksByRootRequest`]  → [`BlocksByRootResponse`]      |
 //! | `/neutrino/req/state_by_root/1`            | [`StateByRootRequest`]   → [`StateByRootResponse`]       |
+//! | `/neutrino/req/block_proof_by_hash/1`      | [`BlockProofByHashRequest`] → [`BlockProofByHashResponse`] |
+//! | `/neutrino/req/block_proof_by_height/1`    | [`BlockProofByHeightRequest`] → [`BlockProofByHeightResponse`] |
+//! | `/neutrino/req/chunk_proof_by_id/1`        | [`ChunkProofByIdRequest`] → [`ChunkProofByIdResponse`]   |
 //! | `/neutrino/req/recursive_proof_latest/1`   | [`RecursiveProofLatestRequest`] → [`RecursiveProofLatestResponse`]   |
 //! | `/neutrino/req/recursive_proof_by_index/1` | [`RecursiveProofByIndexRequest`] → [`RecursiveProofByIndexResponse`] |
 //!
@@ -27,9 +30,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use core::marker::PhantomData;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{StreamProtocol, request_response};
-use neutrino_consensus_types::{Block, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, BlockProof, ChunkProof, RecursiveCheckpointProof};
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, Hash, Height, Slot, StateRoot,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
 };
 use std::io;
 use thiserror::Error;
@@ -46,6 +49,12 @@ pub const PROTOCOL_BLOCKS_BY_RANGE: &str = "/neutrino/req/blocks_by_range/1";
 pub const PROTOCOL_BLOCKS_BY_ROOT: &str = "/neutrino/req/blocks_by_root/1";
 /// `StateByRoot` RPC protocol id.
 pub const PROTOCOL_STATE_BY_ROOT: &str = "/neutrino/req/state_by_root/1";
+/// `BlockProofByHash` RPC protocol id.
+pub const PROTOCOL_BLOCK_PROOF_BY_HASH: &str = "/neutrino/req/block_proof_by_hash/1";
+/// `BlockProofByHeight` RPC protocol id.
+pub const PROTOCOL_BLOCK_PROOF_BY_HEIGHT: &str = "/neutrino/req/block_proof_by_height/1";
+/// `ChunkProofById` RPC protocol id.
+pub const PROTOCOL_CHUNK_PROOF_BY_ID: &str = "/neutrino/req/chunk_proof_by_id/1";
 /// `RecursiveProofLatest` RPC protocol id.
 pub const PROTOCOL_RECURSIVE_PROOF_LATEST: &str = "/neutrino/req/recursive_proof_latest/1";
 /// `RecursiveProofByIndex` RPC protocol id.
@@ -69,10 +78,14 @@ pub const MAX_STATE_PATHS_PER_REQUEST: u64 = 256;
 /// Each recursive proof is small (≤ 64 KiB per doc 06), so a higher batch
 /// size is safe than for block payloads.
 pub const MAX_RECURSIVE_PROOFS_PER_RESPONSE: u64 = 64;
+/// Maximum number of block proofs returned in one response.
+pub const MAX_BLOCK_PROOFS_PER_RESPONSE: u64 = 8;
+/// Maximum number of chunk proofs returned in one response.
+pub const MAX_CHUNK_PROOFS_PER_RESPONSE: u64 = 2;
 
 /// Identifies one of the core RPC protocols defined by doc 06.
 ///
-/// Used to namespace per-protocol request IDs across the six independent
+/// Used to namespace per-protocol request IDs across the independent
 /// [`request_response::Behaviour`] instances.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RpcProtocol {
@@ -88,6 +101,12 @@ pub enum RpcProtocol {
     BlocksByRoot,
     /// Doc 06 `/neutrino/req/state_by_root/1`.
     StateByRoot,
+    /// Doc 06 `/neutrino/req/block_proof_by_hash/1`.
+    BlockProofByHash,
+    /// Doc 06 `/neutrino/req/block_proof_by_height/1`.
+    BlockProofByHeight,
+    /// Doc 06 `/neutrino/req/chunk_proof_by_id/1`.
+    ChunkProofById,
     /// Doc 06 `/neutrino/req/recursive_proof_latest/1`.
     RecursiveProofLatest,
     /// Doc 06 `/neutrino/req/recursive_proof_by_index/1`.
@@ -105,6 +124,9 @@ impl RpcProtocol {
             Self::BlocksByRange => PROTOCOL_BLOCKS_BY_RANGE,
             Self::BlocksByRoot => PROTOCOL_BLOCKS_BY_ROOT,
             Self::StateByRoot => PROTOCOL_STATE_BY_ROOT,
+            Self::BlockProofByHash => PROTOCOL_BLOCK_PROOF_BY_HASH,
+            Self::BlockProofByHeight => PROTOCOL_BLOCK_PROOF_BY_HEIGHT,
+            Self::ChunkProofById => PROTOCOL_CHUNK_PROOF_BY_ID,
             Self::RecursiveProofLatest => PROTOCOL_RECURSIVE_PROOF_LATEST,
             Self::RecursiveProofByIndex => PROTOCOL_RECURSIVE_PROOF_BY_INDEX,
         }
@@ -241,6 +263,50 @@ pub struct StateByRootResponse {
     pub nodes: Vec<Vec<u8>>,
 }
 
+/// `BlockProofByHash` request: fetch specific block proofs by block hash.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct BlockProofByHashRequest {
+    /// Block header hashes whose proofs are requested.
+    pub roots: Vec<BlockHash>,
+}
+
+/// `BlockProofByHash` response carrying the requested block proofs.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockProofByHashResponse {
+    /// Proofs in the same order as the requested roots; entries omitted when unknown.
+    pub proofs: Vec<BlockProof>,
+}
+
+/// `BlockProofByHeight` request: fetch a contiguous proof range by height.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct BlockProofByHeightRequest {
+    /// First block height to include.
+    pub start_height: Height,
+    /// Number of proofs to include; clamped to [`MAX_BLOCK_PROOFS_PER_RESPONSE`].
+    pub count: u64,
+}
+
+/// `BlockProofByHeight` response carrying block proofs in height order.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlockProofByHeightResponse {
+    /// Block proofs in ascending height order.
+    pub proofs: Vec<BlockProof>,
+}
+
+/// `ChunkProofById` request: fetch chunk proofs by chunk id.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct ChunkProofByIdRequest {
+    /// Chunk ids whose proofs are requested.
+    pub chunk_ids: Vec<ChunkId>,
+}
+
+/// `ChunkProofById` response carrying requested chunk proofs.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChunkProofByIdResponse {
+    /// Chunk proofs in the same order as requested ids; entries omitted when unknown.
+    pub proofs: Vec<ChunkProof>,
+}
+
 /// `RecursiveProofLatest` request: fetch the peer's latest recursive checkpoint.
 ///
 /// Cheap query used by light clients on bootstrap and by full nodes on
@@ -294,6 +360,12 @@ pub enum RpcRequest {
     BlocksByRoot(BlocksByRootRequest),
     /// State trie node fetch.
     StateByRoot(StateByRootRequest),
+    /// Block proof fetch by block hash.
+    BlockProofByHash(BlockProofByHashRequest),
+    /// Block proof fetch by height range.
+    BlockProofByHeight(BlockProofByHeightRequest),
+    /// Chunk proof fetch by chunk id.
+    ChunkProofById(ChunkProofByIdRequest),
     /// Latest recursive checkpoint fetch.
     RecursiveProofLatest(RecursiveProofLatestRequest),
     /// Range of recursive checkpoint proofs by index.
@@ -311,6 +383,9 @@ impl RpcRequest {
             Self::BlocksByRange(_) => RpcProtocol::BlocksByRange,
             Self::BlocksByRoot(_) => RpcProtocol::BlocksByRoot,
             Self::StateByRoot(_) => RpcProtocol::StateByRoot,
+            Self::BlockProofByHash(_) => RpcProtocol::BlockProofByHash,
+            Self::BlockProofByHeight(_) => RpcProtocol::BlockProofByHeight,
+            Self::ChunkProofById(_) => RpcProtocol::ChunkProofById,
             Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
             Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
         }
@@ -336,6 +411,12 @@ pub enum RpcResponse {
     BlocksByRoot(BlocksByRootResponse),
     /// `StateByRoot` reply.
     StateByRoot(StateByRootResponse),
+    /// `BlockProofByHash` reply.
+    BlockProofByHash(BlockProofByHashResponse),
+    /// `BlockProofByHeight` reply.
+    BlockProofByHeight(BlockProofByHeightResponse),
+    /// `ChunkProofById` reply.
+    ChunkProofById(ChunkProofByIdResponse),
     /// `RecursiveProofLatest` reply (boxed to keep the enum compact).
     RecursiveProofLatest(Box<RecursiveProofLatestResponse>),
     /// `RecursiveProofByIndex` reply.
@@ -353,6 +434,9 @@ impl RpcResponse {
             Self::BlocksByRange(_) => RpcProtocol::BlocksByRange,
             Self::BlocksByRoot(_) => RpcProtocol::BlocksByRoot,
             Self::StateByRoot(_) => RpcProtocol::StateByRoot,
+            Self::BlockProofByHash(_) => RpcProtocol::BlockProofByHash,
+            Self::BlockProofByHeight(_) => RpcProtocol::BlockProofByHeight,
+            Self::ChunkProofById(_) => RpcProtocol::ChunkProofById,
             Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
             Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
         }
@@ -517,6 +601,13 @@ pub type BlocksByRangeCodec = BorshCodec<BlocksByRangeRequest, BlocksByRangeResp
 pub type BlocksByRootCodec = BorshCodec<BlocksByRootRequest, BlocksByRootResponse>;
 /// Codec for the `StateByRoot` RPC.
 pub type StateByRootCodec = BorshCodec<StateByRootRequest, StateByRootResponse>;
+/// Codec for the `BlockProofByHash` RPC.
+pub type BlockProofByHashCodec = BorshCodec<BlockProofByHashRequest, BlockProofByHashResponse>;
+/// Codec for the `BlockProofByHeight` RPC.
+pub type BlockProofByHeightCodec =
+    BorshCodec<BlockProofByHeightRequest, BlockProofByHeightResponse>;
+/// Codec for the `ChunkProofById` RPC.
+pub type ChunkProofByIdCodec = BorshCodec<ChunkProofByIdRequest, ChunkProofByIdResponse>;
 /// Codec for the `RecursiveProofLatest` RPC.
 pub type RecursiveProofLatestCodec =
     BorshCodec<RecursiveProofLatestRequest, RecursiveProofLatestResponse>;
@@ -536,6 +627,12 @@ pub type BlocksByRangeBehaviour = request_response::Behaviour<BlocksByRangeCodec
 pub type BlocksByRootBehaviour = request_response::Behaviour<BlocksByRootCodec>;
 /// Behaviour type for the `StateByRoot` RPC.
 pub type StateByRootBehaviour = request_response::Behaviour<StateByRootCodec>;
+/// Behaviour type for the `BlockProofByHash` RPC.
+pub type BlockProofByHashBehaviour = request_response::Behaviour<BlockProofByHashCodec>;
+/// Behaviour type for the `BlockProofByHeight` RPC.
+pub type BlockProofByHeightBehaviour = request_response::Behaviour<BlockProofByHeightCodec>;
+/// Behaviour type for the `ChunkProofById` RPC.
+pub type ChunkProofByIdBehaviour = request_response::Behaviour<ChunkProofByIdCodec>;
 /// Behaviour type for the `RecursiveProofLatest` RPC.
 pub type RecursiveProofLatestBehaviour = request_response::Behaviour<RecursiveProofLatestCodec>;
 /// Behaviour type for the `RecursiveProofByIndex` RPC.
@@ -600,6 +697,18 @@ mod tests {
             "/neutrino/req/state_by_root/1"
         );
         assert_eq!(
+            RpcProtocol::BlockProofByHash.protocol_id(),
+            "/neutrino/req/block_proof_by_hash/1"
+        );
+        assert_eq!(
+            RpcProtocol::BlockProofByHeight.protocol_id(),
+            "/neutrino/req/block_proof_by_height/1"
+        );
+        assert_eq!(
+            RpcProtocol::ChunkProofById.protocol_id(),
+            "/neutrino/req/chunk_proof_by_id/1"
+        );
+        assert_eq!(
             RpcProtocol::RecursiveProofLatest.protocol_id(),
             "/neutrino/req/recursive_proof_latest/1"
         );
@@ -647,6 +756,21 @@ mod tests {
                     paths: vec![],
                 }),
                 RpcProtocol::StateByRoot,
+            ),
+            (
+                RpcRequest::BlockProofByHash(BlockProofByHashRequest { roots: vec![] }),
+                RpcProtocol::BlockProofByHash,
+            ),
+            (
+                RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
+                    start_height: 0,
+                    count: 1,
+                }),
+                RpcProtocol::BlockProofByHeight,
+            ),
+            (
+                RpcRequest::ChunkProofById(ChunkProofByIdRequest { chunk_ids: vec![] }),
+                RpcProtocol::ChunkProofById,
             ),
             (
                 RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest),

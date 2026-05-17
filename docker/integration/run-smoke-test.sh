@@ -3,8 +3,9 @@
 # M6 integration smoke test.
 #
 # Brings up a 3-node Neutrino stack via docker compose, waits for the
-# gossipsub mesh to form (each node must observe the other two as peers),
-# then tears the stack back down. Exits non-zero on any failure.
+# gossipsub mesh to form, verifies block production/import, then starts a
+# fourth node late and requires it to sync through the full FSM. Exits
+# non-zero on any failure.
 #
 # Usage:
 #     ./docker/integration/run-smoke-test.sh
@@ -49,8 +50,8 @@ trap cleanup EXIT
 echo "--- building neutrino-node image ---"
 "${COMPOSE[@]}" -f docker-compose.yml build --quiet
 
-echo "--- starting 3-node stack ---"
-"${COMPOSE[@]}" -f docker-compose.yml up -d
+echo "--- starting initial 3-node stack ---"
+"${COMPOSE[@]}" -f docker-compose.yml up -d node1 node2 node3
 
 NODES=(node1 node2 node3)
 DEADLINE=$(( $(date +%s) + 60 ))
@@ -123,6 +124,28 @@ for node in node2 node3; do
         fi
         sleep 1
     done
+done
+
+echo "--- starting late-joining node4 ---"
+"${COMPOSE[@]}" -f docker-compose.yml up -d node4
+
+DEADLINE=$(( $(date +%s) + 90 ))
+echo "--- waiting for node4 to connect and sync from genesis ---"
+while :; do
+    if [[ $(date +%s) -ge ${DEADLINE} ]]; then
+        echo "timeout: node4 did not complete full sync" >&2
+        "${COMPOSE[@]}" -f docker-compose.yml logs --tail=160 node4 >&2 || true
+        exit 1
+    fi
+    connections=$(docker logs neutrino-m6-node4 2>&1 | grep -c "connection established" || true)
+    block_batches=$(docker logs neutrino-m6-node4 2>&1 | grep -c "imported block batch" || true)
+    proof_batches=$(docker logs neutrino-m6-node4 2>&1 | grep -c "imported block proof batch" || true)
+    following=$(docker logs neutrino-m6-node4 2>&1 | grep -c "sync FSM entered Following" || true)
+    if [[ ${connections} -ge 1 && ${block_batches} -ge 1 && ${proof_batches} -ge 1 && ${following} -ge 1 ]]; then
+        echo "  node4: ${connections} connection(s), ${block_batches} block batch(es), ${proof_batches} proof batch(es), Following reached"
+        break
+    fi
+    sleep 1
 done
 
 echo

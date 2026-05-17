@@ -198,6 +198,16 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
 
     let by_root = backend.blocks_by_root(&[b1.hash()]).await;
     assert_eq!(by_root.blocks.len(), 1);
+
+    let proof = backend
+        .prove_block(&b1.hash())
+        .expect("prove imported block")
+        .block_proof;
+    let by_height = backend.block_proofs_by_height(1, 1).await;
+    assert_eq!(by_height.proofs, vec![proof.clone()]);
+    let by_hash = backend.block_proofs_by_hash(&[b1.hash()]).await;
+    assert_eq!(by_hash.proofs, vec![proof]);
+    assert_eq!(backend.local_progress().await.proven_height, 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

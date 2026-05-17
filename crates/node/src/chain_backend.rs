@@ -22,20 +22,23 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use neutrino_consensus_engine::{
     Engine, ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey,
+    ProveError, ProveOutcome,
 };
-use neutrino_consensus_types::{Block, Body, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, BlockProof, Body, RecursiveCheckpointProof};
 use neutrino_network::rpc::{
-    BlocksByRangeResponse, BlocksByRootResponse, RecursiveProofByIndexResponse,
+    self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
+    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
     RecursiveProofLatestResponse, StateByRootResponse, Status,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, Height, Slot, StateRoot, ZERO_HASH,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Height, Slot, StateRoot, ZERO_HASH,
 };
 use neutrino_proof_system::ProofSystem;
 use neutrino_storage::Database;
 use neutrino_sync::{
-    CheckpointsImported, HeadersImported, StateProgress, SyncBackend, SyncBackendError,
+    CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
+    SyncBackendError,
 };
 use tracing::{debug, warn};
 
@@ -103,6 +106,33 @@ where
             };
             e.try_produce_block(slot, cfg, Body::default(), gas_limit)
         })
+    }
+
+    /// Prove a block that is already stored in the wrapped engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProveError`] when the block is unknown, already advanced in
+    /// an incompatible way, or the active proof backend rejects proving.
+    pub fn prove_block(
+        &self,
+        block_hash: &BlockHash,
+    ) -> Result<ProveOutcome, ProveError<DB::Error>> {
+        self.with_engine_mut(|e| e.prove_block(block_hash, &[], &self.proof_system))
+    }
+
+    fn contiguous_proven_height(e: &Engine<DB>) -> Height {
+        let mut height = 0;
+        for candidate in 1..=e.head_height() {
+            let Ok(Some(hash)) = e.store().get_block_hash_by_height(candidate) else {
+                break;
+            };
+            let Ok(Some(_proof)) = e.store().get_block_proof(&hash) else {
+                break;
+            };
+            height = candidate;
+        }
+        height
     }
 
     fn with_engine<R>(&self, f: impl FnOnce(&Engine<DB>) -> R) -> R {
@@ -193,7 +223,7 @@ where
                 head_height: e.head_height(),
                 head_block_hash: head_hash,
                 head_slot,
-                proven_height: e.head_height(),
+                proven_height: Self::contiguous_proven_height(e),
                 body_height: e.head_height(),
             }
         })
@@ -302,6 +332,57 @@ where
         StateByRootResponse::default()
     }
 
+    async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse {
+        self.with_engine(|e| {
+            let mut proofs = Vec::with_capacity(roots.len());
+            let max = usize::try_from(rpc::MAX_BLOCK_PROOFS_PER_RESPONSE)
+                .expect("block proof response limit fits usize");
+            for root in roots.iter().take(max) {
+                let Ok(Some(proof)) = e.store().get_block_proof(root) else {
+                    continue;
+                };
+                proofs.push(proof);
+            }
+            BlockProofByHashResponse { proofs }
+        })
+    }
+
+    async fn block_proofs_by_height(
+        &self,
+        start: Height,
+        count: u64,
+    ) -> BlockProofByHeightResponse {
+        let count = count.min(rpc::MAX_BLOCK_PROOFS_PER_RESPONSE);
+        self.with_engine(|e| {
+            let mut proofs = Vec::new();
+            for height in start..start.saturating_add(count) {
+                let Ok(Some(hash)) = e.store().get_block_hash_by_height(height) else {
+                    break;
+                };
+                let Ok(Some(proof)) = e.store().get_block_proof(&hash) else {
+                    break;
+                };
+                proofs.push(proof);
+            }
+            BlockProofByHeightResponse { proofs }
+        })
+    }
+
+    async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse {
+        self.with_engine(|e| {
+            let mut proofs = Vec::with_capacity(chunk_ids.len());
+            let max = usize::try_from(rpc::MAX_CHUNK_PROOFS_PER_RESPONSE)
+                .expect("chunk proof response limit fits usize");
+            for chunk_id in chunk_ids.iter().copied().take(max) {
+                let Ok(Some(proof)) = e.store().get_chunk_proof(chunk_id) else {
+                    continue;
+                };
+                proofs.push(proof);
+            }
+            ChunkProofByIdResponse { proofs }
+        })
+    }
+
     async fn verify_and_import_checkpoints(
         &self,
         items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
@@ -354,6 +435,31 @@ where
             root_complete: true,
             next_paths: vec![],
         })
+    }
+
+    async fn verify_and_import_block_proofs(
+        &self,
+        start: Height,
+        proofs: Vec<BlockProof>,
+    ) -> Result<ProofsImported, SyncBackendError> {
+        let mut expected_height = start;
+        let mut last_height = None;
+        for proof in proofs {
+            if proof.height != expected_height {
+                return Err(SyncBackendError::Rejected(format!(
+                    "block proof height {} does not match expected {}",
+                    proof.height, expected_height
+                )));
+            }
+            let outcome = self
+                .with_engine_mut(|e| e.import_block_proof(&proof, &self.proof_system))
+                .map_err(Self::map_import_err)?;
+            last_height = Some(outcome.height);
+            expected_height = expected_height.saturating_add(1);
+        }
+        let new_proven_height = last_height
+            .ok_or_else(|| SyncBackendError::Rejected("empty block proof batch".to_owned()))?;
+        Ok(ProofsImported { new_proven_height })
     }
 
     async fn verify_and_import_gossip_block(

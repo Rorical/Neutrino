@@ -34,7 +34,9 @@ pub use clock::SlotClock;
 pub use engine::Engine;
 pub use error::EngineError;
 pub use finalize::{FinalizeError, FinalizeOutcome};
-pub use import::{ImportBlockOutcome, ImportError, ImportRecursiveProofOutcome};
+pub use import::{
+    ImportBlockOutcome, ImportBlockProofOutcome, ImportError, ImportRecursiveProofOutcome,
+};
 pub use merkle::{EMPTY_MERKLE_ROOT, hash_leaf, merkle_root, merkle_root_of_hashes};
 pub use produce::{ProductionConfig, ProductionError, ProductionOutcome};
 pub use proposer::ProposerKey;

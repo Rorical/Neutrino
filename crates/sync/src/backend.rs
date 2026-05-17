@@ -8,13 +8,14 @@
 //! lightweight in-memory mock.
 
 use async_trait::async_trait;
-use neutrino_consensus_types::{Block, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, BlockProof, RecursiveCheckpointProof};
 use neutrino_network::rpc::{
-    BlocksByRangeResponse, BlocksByRootResponse, RecursiveProofByIndexResponse,
+    BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
+    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
     RecursiveProofLatestResponse, StateByRootResponse, Status,
 };
 use neutrino_network::sync::LocalProgress;
-use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, Height, StateRoot};
+use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
 use thiserror::Error;
 
 /// Errors a backend can surface to the driver.
@@ -66,6 +67,13 @@ pub struct StateProgress {
     pub next_paths: Vec<Vec<u8>>,
 }
 
+/// Result of importing a batch of block proofs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofsImported {
+    /// Highest contiguous block height now proven locally.
+    pub new_proven_height: Height,
+}
+
 /// Host-supplied verification + storage adapter.
 ///
 /// All methods take `&self`; implementations are expected to use interior
@@ -104,6 +112,16 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Build a response to `/neutrino/req/state_by_root/1`.
     async fn state_nodes(&self, root: StateRoot, paths: &[Vec<u8>]) -> StateByRootResponse;
 
+    /// Build a response to `/neutrino/req/block_proof_by_hash/1`.
+    async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse;
+
+    /// Build a response to `/neutrino/req/block_proof_by_height/1`.
+    async fn block_proofs_by_height(&self, start: Height, count: u64)
+    -> BlockProofByHeightResponse;
+
+    /// Build a response to `/neutrino/req/chunk_proof_by_id/1`.
+    async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse;
+
     /// Verify each `(Checkpoint, RecursiveCheckpointProof)` in chain order,
     /// then persist the highest accepted entry.
     ///
@@ -131,6 +149,13 @@ pub trait SyncBackend: Send + Sync + 'static {
         paths: Vec<Vec<u8>>,
         nodes: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError>;
+
+    /// Verify each block proof, then persist all accepted proofs.
+    async fn verify_and_import_block_proofs(
+        &self,
+        start: Height,
+        proofs: Vec<BlockProof>,
+    ) -> Result<ProofsImported, SyncBackendError>;
 
     /// Verify + import a block received via gossip on
     /// `/neutrino/blocks/borsh/1`.

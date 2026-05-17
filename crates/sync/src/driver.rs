@@ -18,9 +18,9 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use neutrino_network::rpc::{
-    BlocksByRangeRequest, MetadataRequest, RecursiveProofByIndexRequest,
-    RecursiveProofLatestRequest, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
-    StateByRootRequest,
+    BlockProofByHeightRequest, BlocksByRangeRequest, ChunkProofByIdRequest, MetadataRequest,
+    RecursiveProofByIndexRequest, RecursiveProofLatestRequest, RpcInboundId, RpcProtocol,
+    RpcRequest, RpcResponse, StateByRootRequest,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::{SyncCommand, SyncEvent, SyncMachine, SyncMode};
@@ -144,8 +144,10 @@ impl SyncDriver {
     }
 
     async fn handle_gossip(&mut self, topic: Topic, data: Vec<u8>) {
-        // Stage 5 wires the Blocks topic to the engine's import path;
-        // other topics (votes, proofs, etc.) come online in later stages.
+        if topic == Topic::BlockProofs {
+            self.handle_block_proof_gossip(data).await;
+            return;
+        }
         if topic != Topic::Blocks {
             debug!(
                 ?topic,
@@ -183,6 +185,25 @@ impl SyncDriver {
             Err(err) => {
                 warn!(?err, "rejecting gossipped block");
             }
+        }
+    }
+
+    async fn handle_block_proof_gossip(&self, data: Vec<u8>) {
+        let proof = match borsh::from_slice::<neutrino_consensus_types::BlockProof>(&data) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(?err, "failed to decode gossipped block proof; dropping");
+                return;
+            }
+        };
+        let height = proof.height;
+        match self
+            .backend
+            .verify_and_import_block_proofs(height, vec![proof])
+            .await
+        {
+            Ok(_) => debug!(height, "imported gossipped block proof"),
+            Err(err) => warn!(height, ?err, "rejecting gossipped block proof"),
         }
     }
 
@@ -225,6 +246,20 @@ impl SyncDriver {
             )),
             RpcRequest::StateByRoot(StateByRootRequest { state_root, paths }) => Some(
                 RpcResponse::StateByRoot(self.backend.state_nodes(state_root, &paths).await),
+            ),
+            RpcRequest::BlockProofByHash(req) => Some(RpcResponse::BlockProofByHash(
+                self.backend.block_proofs_by_hash(&req.roots).await,
+            )),
+            RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
+                start_height,
+                count,
+            }) => Some(RpcResponse::BlockProofByHeight(
+                self.backend
+                    .block_proofs_by_height(start_height, count)
+                    .await,
+            )),
+            RpcRequest::ChunkProofById(ChunkProofByIdRequest { chunk_ids }) => Some(
+                RpcResponse::ChunkProofById(self.backend.chunk_proofs_by_id(&chunk_ids).await),
             ),
             RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest) => {
                 match self.backend.latest_recursive_proof().await {
@@ -316,6 +351,25 @@ impl SyncDriver {
                         peer,
                         state_root,
                         paths: paths_for_callback,
+                        response,
+                    },
+                )
+                .await;
+            }
+            SyncCommand::RequestBlockProofs {
+                peer,
+                start_height,
+                count,
+            } => {
+                self.send_rpc(
+                    peer,
+                    RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
+                        start_height,
+                        count,
+                    }),
+                    move |peer, response| OutboundOutcome::BlockProofs {
+                        peer,
+                        start_height,
                         response,
                     },
                 )
@@ -438,6 +492,28 @@ impl SyncDriver {
                     self.dispatch_sync_commands(cmds).await;
                 }
             },
+            OutboundOutcome::BlockProofs {
+                peer,
+                start_height,
+                response,
+            } => match response {
+                Ok(RpcResponse::BlockProofByHeight(payload)) => {
+                    self.handle_block_proofs_response(peer, start_height, payload.proofs)
+                        .await;
+                }
+                Ok(other) => warn!(
+                    ?other,
+                    "unexpected response type for BlockProofByHeight RPC"
+                ),
+                Err(err) => {
+                    let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
+                        protocol: RpcProtocol::BlockProofByHeight,
+                        peer,
+                        error: err.to_string(),
+                    });
+                    self.dispatch_sync_commands(cmds).await;
+                }
+            },
         }
     }
 
@@ -520,6 +596,48 @@ impl SyncDriver {
                 warn!(?err, "rejected block batch");
                 let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
                     protocol: RpcProtocol::BlocksByRange,
+                    peer,
+                    error: err.to_string(),
+                });
+                self.dispatch_sync_commands(cmds).await;
+            }
+        }
+    }
+
+    async fn handle_block_proofs_response(
+        &mut self,
+        peer: neutrino_network::PeerId,
+        start_height: u64,
+        proofs: Vec<neutrino_consensus_types::BlockProof>,
+    ) {
+        if proofs.is_empty() {
+            let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
+                protocol: RpcProtocol::BlockProofByHeight,
+                peer,
+                error: "empty block proof batch".to_owned(),
+            });
+            self.dispatch_sync_commands(cmds).await;
+            return;
+        }
+        match self
+            .backend
+            .verify_and_import_block_proofs(start_height, proofs)
+            .await
+        {
+            Ok(imported) => {
+                info!(
+                    new_proven_height = imported.new_proven_height,
+                    "imported block proof batch"
+                );
+                let cmds = self.fsm.on_event(SyncEvent::ProofsAdvanced {
+                    new_proven_height: imported.new_proven_height,
+                });
+                self.dispatch_sync_commands(cmds).await;
+            }
+            Err(err) => {
+                warn!(?err, "rejected block proof batch");
+                let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
+                    protocol: RpcProtocol::BlockProofByHeight,
                     peer,
                     error: err.to_string(),
                 });
@@ -623,6 +741,11 @@ enum OutboundOutcome {
         peer: neutrino_network::PeerId,
         state_root: StateRoot,
         paths: Vec<Vec<u8>>,
+        response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
+    },
+    BlockProofs {
+        peer: neutrino_network::PeerId,
+        start_height: u64,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     },
 }

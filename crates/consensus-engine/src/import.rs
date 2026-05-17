@@ -23,8 +23,10 @@
 
 use core::fmt;
 
-use neutrino_consensus_types::{Block, RecursiveCheckpointProof, RecursiveProofPublicInputs};
-use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, Height, Slot};
+use neutrino_consensus_types::{
+    Block, BlockProof, BlockProofPublicInputs, RecursiveCheckpointProof, RecursiveProofPublicInputs,
+};
+use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, Height, Slot, StateRoot};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
@@ -52,6 +54,15 @@ pub struct ImportRecursiveProofOutcome {
     pub checkpoint_hash: BlockHash,
 }
 
+/// Successful outcome of [`Engine::import_block_proof`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportBlockProofOutcome {
+    /// Hash of the proven block.
+    pub block_hash: BlockHash,
+    /// Height of the proven block.
+    pub height: Height,
+}
+
 /// Failures while importing a peer-supplied block or recursive proof.
 #[derive(Debug)]
 pub enum ImportError<E> {
@@ -68,6 +79,29 @@ pub enum ImportError<E> {
         expected: BlockHash,
         /// Parent hash in the imported header.
         actual: BlockHash,
+    },
+    /// Block proof references a block header that is not stored locally.
+    UnknownBlock(BlockHash),
+    /// Stored header's parent is required to reconstruct proof public inputs.
+    MissingParentHeader {
+        /// Parent hash that should have been present.
+        parent_hash: BlockHash,
+    },
+    /// Block proof envelope does not match the stored canonical header.
+    BlockProofEnvelopeMismatch {
+        /// Hash the proof should have covered.
+        expected_hash: BlockHash,
+        /// Hash carried by the proof envelope.
+        actual_hash: BlockHash,
+        /// Height the proof should have covered.
+        expected_height: Height,
+        /// Height carried by the proof envelope.
+        actual_height: Height,
+    },
+    /// Block proof's public inputs do not match the stored canonical header.
+    BlockProofPublicInputsMismatch {
+        /// Block hash whose proof inputs were inconsistent.
+        hash: BlockHash,
     },
     /// Imported recursive proof carries the wrong chain id.
     ChainIdMismatch {
@@ -99,8 +133,10 @@ pub enum ImportError<E> {
         /// Re-derived hash from the embedded checkpoint.
         public_inputs: BlockHash,
     },
-    /// Recursive proof bytes failed to decode under the active backend.
+    /// Backend proof bytes failed to decode under the active backend.
     Codec(borsh::io::Error),
+    /// Block proof verification rejected the proof.
+    InvalidBlockProof(ProofError),
     /// Recursive proof verification rejected the proof.
     InvalidRecursiveProof(ProofError),
     /// Underlying chain store / database error.
@@ -128,6 +164,25 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                     "header parent_hash {actual:?} does not match local head hash {expected:?}"
                 )
             }
+            Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
+            Self::MissingParentHeader { parent_hash } => {
+                write!(f, "parent header {parent_hash:?} is missing")
+            }
+            Self::BlockProofEnvelopeMismatch {
+                expected_hash,
+                actual_hash,
+                expected_height,
+                actual_height,
+            } => write!(
+                f,
+                "block proof envelope ({actual_height}, {actual_hash:?}) does not match canonical ({expected_height}, {expected_hash:?})"
+            ),
+            Self::BlockProofPublicInputsMismatch { hash } => {
+                write!(
+                    f,
+                    "block proof for {hash:?} does not match canonical public inputs"
+                )
+            }
             Self::ChainIdMismatch { expected, actual } => {
                 write!(f, "chain id mismatch: local {expected}, peer {actual}")
             }
@@ -149,7 +204,10 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                 f,
                 "recursive proof envelope hash {envelope:?} does not match re-derived hash {public_inputs:?}"
             ),
-            Self::Codec(err) => write!(f, "borsh decode of backend recursive proof failed: {err}"),
+            Self::Codec(err) => write!(f, "borsh decode of backend proof failed: {err}"),
+            Self::InvalidBlockProof(err) => {
+                write!(f, "block proof verification rejected: {err:?}")
+            }
             Self::InvalidRecursiveProof(err) => {
                 write!(f, "recursive proof verification rejected: {err:?}")
             }
@@ -206,6 +264,69 @@ impl<DB: Database> Engine<DB> {
             block_hash: hash,
             new_head_height: block.header.height,
             new_head_slot: block.header.slot,
+        })
+    }
+
+    /// Import a peer-supplied block proof for an already-stored block.
+    ///
+    /// The proof envelope and public inputs are reconstructed against the
+    /// canonical header in the local store before the active proof backend
+    /// verifies the backend proof bytes. On success the proof is persisted and
+    /// the block FSM advances to [`BlockState::Proven`] unless it is already
+    /// past that state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError`] when the block is unknown, the proof is not
+    /// bound to the canonical header, backend proof bytes fail to decode, proof
+    /// verification fails, or persistence fails.
+    pub fn import_block_proof<PS: ProofSystem>(
+        &mut self,
+        proof: &BlockProof,
+        proof_system: &PS,
+    ) -> Result<ImportBlockProofOutcome, ImportError<DB::Error>> {
+        let header = self
+            .store()
+            .get_header(&proof.block_hash)?
+            .ok_or(ImportError::UnknownBlock(proof.block_hash))?;
+        let canonical_hash = header.hash();
+        if proof.block_hash != canonical_hash || proof.height != header.height {
+            return Err(ImportError::BlockProofEnvelopeMismatch {
+                expected_hash: canonical_hash,
+                actual_hash: proof.block_hash,
+                expected_height: header.height,
+                actual_height: proof.height,
+            });
+        }
+
+        let state_root_before = self.block_proof_state_root_before(&header)?;
+        let expected_public_inputs =
+            self.block_proof_public_inputs(&header, state_root_before, canonical_hash);
+        if proof.public_inputs != expected_public_inputs {
+            return Err(ImportError::BlockProofPublicInputsMismatch {
+                hash: canonical_hash,
+            });
+        }
+
+        let backend_proof: PS::BlockProof =
+            borsh::from_slice(&proof.proof_bytes).map_err(ImportError::Codec)?;
+        proof_system
+            .verify_block(&backend_proof, &proof.public_inputs)
+            .map_err(ImportError::InvalidBlockProof)?;
+
+        self.store_mut().put_block_proof(&canonical_hash, proof)?;
+        match self.store().get_block_state(&canonical_hash)? {
+            Some(BlockState::BlockProduced | BlockState::PendingProof | BlockState::Proven)
+            | None => {
+                self.store_mut()
+                    .put_block_state(&canonical_hash, BlockState::Proven)?;
+            }
+            Some(BlockState::ChunkProven | BlockState::Finalized | BlockState::Checkpointed) => {}
+        }
+
+        Ok(ImportBlockProofOutcome {
+            block_hash: canonical_hash,
+            height: header.height,
         })
     }
 
@@ -282,6 +403,42 @@ impl<DB: Database> Engine<DB> {
             checkpoint_index: proof.checkpoint_index,
             checkpoint_hash: recomputed_hash,
         })
+    }
+
+    fn block_proof_state_root_before(
+        &self,
+        header: &neutrino_consensus_types::Header,
+    ) -> Result<StateRoot, ImportError<DB::Error>> {
+        if header.parent_hash == self.chain_spec().genesis_block_hash {
+            return Ok(self.chain_spec().genesis_state_root);
+        }
+        let parent = self.store().get_header(&header.parent_hash)?.ok_or(
+            ImportError::MissingParentHeader {
+                parent_hash: header.parent_hash,
+            },
+        )?;
+        Ok(parent.state_root)
+    }
+
+    const fn block_proof_public_inputs(
+        &self,
+        header: &neutrino_consensus_types::Header,
+        state_root_before: StateRoot,
+        block_hash: BlockHash,
+    ) -> BlockProofPublicInputs {
+        BlockProofPublicInputs {
+            chain_id: self.chain_spec().chain_id,
+            height: header.height,
+            parent_block_hash: header.parent_hash,
+            block_hash,
+            state_root_before,
+            state_root_after: header.state_root,
+            transactions_root: header.transactions_root,
+            receipt_root: neutrino_primitives::ZERO_HASH,
+            da_root: header.da_root,
+            vm_code_hash: self.chain_spec().runtime_code_hash,
+            abi_version: self.chain_spec().runtime_version.abi_version,
+        }
     }
 }
 

@@ -11,17 +11,19 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use neutrino_consensus_types::{Block, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, BlockProof, RecursiveCheckpointProof};
 use neutrino_network::rpc::{
-    BlocksByRangeResponse, BlocksByRootResponse, RecursiveProofByIndexResponse,
+    BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
+    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
     RecursiveProofLatestResponse, StateByRootResponse, Status,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, Height, StateRoot, ZERO_HASH,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot, ZERO_HASH,
 };
 use neutrino_sync::{
-    CheckpointsImported, HeadersImported, StateProgress, SyncBackend, SyncBackendError,
+    CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
+    SyncBackendError,
 };
 
 /// Minimal in-memory sync backend.
@@ -132,6 +134,22 @@ impl SyncBackend for StubSyncBackend {
         StateByRootResponse::default()
     }
 
+    async fn block_proofs_by_hash(&self, _roots: &[BlockHash]) -> BlockProofByHashResponse {
+        BlockProofByHashResponse::default()
+    }
+
+    async fn block_proofs_by_height(
+        &self,
+        _start: Height,
+        _count: u64,
+    ) -> BlockProofByHeightResponse {
+        BlockProofByHeightResponse::default()
+    }
+
+    async fn chunk_proofs_by_id(&self, _chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse {
+        ChunkProofByIdResponse::default()
+    }
+
     async fn verify_and_import_checkpoints(
         &self,
         items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
@@ -175,6 +193,19 @@ impl SyncBackend for StubSyncBackend {
         Ok(StateProgress {
             root_complete: true,
             next_paths: vec![],
+        })
+    }
+
+    async fn verify_and_import_block_proofs(
+        &self,
+        _start: Height,
+        proofs: Vec<BlockProof>,
+    ) -> Result<ProofsImported, SyncBackendError> {
+        let last = proofs
+            .last()
+            .ok_or_else(|| SyncBackendError::Rejected("empty block proof batch".to_owned()))?;
+        Ok(ProofsImported {
+            new_proven_height: last.height,
         })
     }
 

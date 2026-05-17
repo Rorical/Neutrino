@@ -13,7 +13,7 @@
 //! six-heartbeat history window, strict validation, BLAKE3 message IDs,
 //! and per-topic byte caps from [`crate::topic::Topic::max_transmit_size`].
 //!
-//! Each of the six core request/response RPCs from doc 06 runs as its own
+//! Each request/response RPC from doc 06 runs as its own
 //! [`libp2p::request_response::Behaviour`]; outbound and inbound state is
 //! tracked through `RpcDispatch` so callers see one unified
 //! [`NetworkCommand::SendRpcRequest`]/[`NetworkEvent::RpcRequestReceived`]
@@ -24,10 +24,12 @@
 
 use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::rpc::{
-    self, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec, BlocksByRootResponse,
-    MetadataCodec, PingCodec, RecursiveProofByIndexCodec, RecursiveProofByIndexResponse,
-    RecursiveProofLatestCodec, RecursiveProofLatestResponse, RpcError, RpcInboundId, RpcProtocol,
-    RpcRequest, RpcResponse, StateByRootCodec, StateByRootResponse, StatusCodec,
+    self, BlockProofByHashCodec, BlockProofByHashResponse, BlockProofByHeightCodec,
+    BlockProofByHeightResponse, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec,
+    BlocksByRootResponse, ChunkProofByIdCodec, ChunkProofByIdResponse, MetadataCodec, PingCodec,
+    RecursiveProofByIndexCodec, RecursiveProofByIndexResponse, RecursiveProofLatestCodec,
+    RecursiveProofLatestResponse, RpcError, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
+    StateByRootCodec, StateByRootResponse, StatusCodec,
 };
 use crate::topic::Topic;
 use futures::StreamExt;
@@ -177,7 +179,7 @@ impl core::fmt::Debug for NetworkCommand {
     }
 }
 
-/// Tracks in-flight RPC state across the six independent
+/// Tracks in-flight RPC state across the independent
 /// `request_response::Behaviour` instances.
 ///
 /// Outbound maps are keyed by libp2p's `OutboundRequestId`, which is unique
@@ -197,6 +199,12 @@ struct RpcDispatch {
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_state_by_root:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_block_proof_by_hash:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_block_proof_by_height:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_chunk_proof_by_id:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_recursive_proof_latest:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_recursive_proof_by_index:
@@ -208,6 +216,9 @@ struct RpcDispatch {
     inbound_blocks_by_range: HashMap<u64, ResponseChannel<BlocksByRangeResponse>>,
     inbound_blocks_by_root: HashMap<u64, ResponseChannel<BlocksByRootResponse>>,
     inbound_state_by_root: HashMap<u64, ResponseChannel<StateByRootResponse>>,
+    inbound_block_proof_by_hash: HashMap<u64, ResponseChannel<BlockProofByHashResponse>>,
+    inbound_block_proof_by_height: HashMap<u64, ResponseChannel<BlockProofByHeightResponse>>,
+    inbound_chunk_proof_by_id: HashMap<u64, ResponseChannel<ChunkProofByIdResponse>>,
     inbound_recursive_proof_latest: HashMap<u64, ResponseChannel<RecursiveProofLatestResponse>>,
     inbound_recursive_proof_by_index: HashMap<u64, ResponseChannel<RecursiveProofByIndexResponse>>,
 }
@@ -232,6 +243,9 @@ impl RpcDispatch {
             RpcProtocol::BlocksByRange => self.pending_blocks_by_range.insert(id, tx),
             RpcProtocol::BlocksByRoot => self.pending_blocks_by_root.insert(id, tx),
             RpcProtocol::StateByRoot => self.pending_state_by_root.insert(id, tx),
+            RpcProtocol::BlockProofByHash => self.pending_block_proof_by_hash.insert(id, tx),
+            RpcProtocol::BlockProofByHeight => self.pending_block_proof_by_height.insert(id, tx),
+            RpcProtocol::ChunkProofById => self.pending_chunk_proof_by_id.insert(id, tx),
             RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.insert(id, tx),
             RpcProtocol::RecursiveProofByIndex => {
                 self.pending_recursive_proof_by_index.insert(id, tx)
@@ -251,6 +265,9 @@ impl RpcDispatch {
             RpcProtocol::BlocksByRange => self.pending_blocks_by_range.remove(&id),
             RpcProtocol::BlocksByRoot => self.pending_blocks_by_root.remove(&id),
             RpcProtocol::StateByRoot => self.pending_state_by_root.remove(&id),
+            RpcProtocol::BlockProofByHash => self.pending_block_proof_by_hash.remove(&id),
+            RpcProtocol::BlockProofByHeight => self.pending_block_proof_by_height.remove(&id),
+            RpcProtocol::ChunkProofById => self.pending_chunk_proof_by_id.remove(&id),
             RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.remove(&id),
             RpcProtocol::RecursiveProofByIndex => self.pending_recursive_proof_by_index.remove(&id),
         }
@@ -431,6 +448,15 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcStateByRoot(ev)) => {
                 self.handle_rpc_state_by_root(ev).await;
             }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcBlockProofByHash(ev)) => {
+                self.handle_rpc_block_proof_by_hash(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcBlockProofByHeight(ev)) => {
+                self.handle_rpc_block_proof_by_height(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcChunkProofById(ev)) => {
+                self.handle_rpc_chunk_proof_by_id(ev).await;
+            }
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcRecursiveProofLatest(ev)) => {
                 self.handle_rpc_recursive_proof_latest(ev).await;
             }
@@ -505,6 +531,15 @@ impl NetworkService {
             }
             RpcRequest::BlocksByRoot(req) => behaviour.rpc_blocks_by_root.send_request(&peer, req),
             RpcRequest::StateByRoot(req) => behaviour.rpc_state_by_root.send_request(&peer, req),
+            RpcRequest::BlockProofByHash(req) => {
+                behaviour.rpc_block_proof_by_hash.send_request(&peer, req)
+            }
+            RpcRequest::BlockProofByHeight(req) => {
+                behaviour.rpc_block_proof_by_height.send_request(&peer, req)
+            }
+            RpcRequest::ChunkProofById(req) => {
+                behaviour.rpc_chunk_proof_by_id.send_request(&peer, req)
+            }
             RpcRequest::RecursiveProofLatest(req) => behaviour
                 .rpc_recursive_proof_latest
                 .send_request(&peer, req),
@@ -515,6 +550,7 @@ impl NetworkService {
         self.rpc.record_outbound(protocol, id, response_tx);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dispatch_outbound_response(&mut self, inbound_id: RpcInboundId, response: RpcResponse) {
         if response.protocol() != inbound_id.protocol {
             warn!(
@@ -569,6 +605,36 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_state_by_root
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::BlockProofByHash, RpcResponse::BlockProofByHash(payload)) => self
+                .rpc
+                .inbound_block_proof_by_hash
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_block_proof_by_hash
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::BlockProofByHeight, RpcResponse::BlockProofByHeight(payload)) => self
+                .rpc
+                .inbound_block_proof_by_height
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_block_proof_by_height
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::ChunkProofById, RpcResponse::ChunkProofById(payload)) => self
+                .rpc
+                .inbound_chunk_proof_by_id
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_chunk_proof_by_id
                         .send_response(chan, payload)
                         .is_ok()
                 }),
@@ -886,6 +952,161 @@ impl NetworkService {
         }
     }
 
+    async fn handle_rpc_block_proof_by_hash(
+        &mut self,
+        ev: request_response::Event<rpc::BlockProofByHashRequest, BlockProofByHashResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlockProofByHash);
+                self.rpc
+                    .inbound_block_proof_by_hash
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::BlockProofByHash(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::BlockProofByHash, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::BlockProofByHash(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::BlockProofByHash, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on BlockProofByHash RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_block_proof_by_height(
+        &mut self,
+        ev: request_response::Event<rpc::BlockProofByHeightRequest, BlockProofByHeightResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlockProofByHeight);
+                self.rpc
+                    .inbound_block_proof_by_height
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::BlockProofByHeight(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::BlockProofByHeight, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::BlockProofByHeight(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                self.complete_outbound_failure(RpcProtocol::BlockProofByHeight, request_id, &error);
+            }
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on BlockProofByHeight RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_chunk_proof_by_id(
+        &mut self,
+        ev: request_response::Event<rpc::ChunkProofByIdRequest, ChunkProofByIdResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::ChunkProofById);
+                self.rpc
+                    .inbound_chunk_proof_by_id
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::ChunkProofById(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::ChunkProofById, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::ChunkProofById(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::ChunkProofById, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on ChunkProofById RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     async fn handle_rpc_recursive_proof_latest(
         &mut self,
         ev: request_response::Event<rpc::RecursiveProofLatestRequest, RecursiveProofLatestResponse>,
@@ -1049,6 +1270,9 @@ fn build_behaviour(
         rpc_blocks_by_range: build_rpc_blocks_by_range(),
         rpc_blocks_by_root: build_rpc_blocks_by_root(),
         rpc_state_by_root: build_rpc_state_by_root(),
+        rpc_block_proof_by_hash: build_rpc_block_proof_by_hash(),
+        rpc_block_proof_by_height: build_rpc_block_proof_by_height(),
+        rpc_chunk_proof_by_id: build_rpc_chunk_proof_by_id(),
         rpc_recursive_proof_latest: build_rpc_recursive_proof_latest(),
         rpc_recursive_proof_by_index: build_rpc_recursive_proof_by_index(),
     })
@@ -1163,6 +1387,39 @@ fn build_rpc_state_by_root() -> rpc::StateByRootBehaviour {
         StateByRootCodec::default(),
         [(
             RpcProtocol::StateByRoot.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_block_proof_by_hash() -> rpc::BlockProofByHashBehaviour {
+    request_response::Behaviour::with_codec(
+        BlockProofByHashCodec::default(),
+        [(
+            RpcProtocol::BlockProofByHash.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_block_proof_by_height() -> rpc::BlockProofByHeightBehaviour {
+    request_response::Behaviour::with_codec(
+        BlockProofByHeightCodec::default(),
+        [(
+            RpcProtocol::BlockProofByHeight.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_chunk_proof_by_id() -> rpc::ChunkProofByIdBehaviour {
+    request_response::Behaviour::with_codec(
+        ChunkProofByIdCodec::default(),
+        [(
+            RpcProtocol::ChunkProofById.stream_protocol(),
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(30)),

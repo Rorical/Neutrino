@@ -1,8 +1,8 @@
 # M6 integration smoke test.
 #
-# Three nodes on a private bridge network. `node1` acts as the bootnode
+# Four nodes on a private bridge network. `node1` acts as the bootnode
 # (its container hostname is dialable by name on the user-defined bridge).
-# All three share an identical chain spec and run the real ChainBackend
+# All nodes share an identical chain spec and run the real ChainBackend
 # against an in-memory database (no persistent storage yet).
 #
 # What this proves today:
@@ -11,11 +11,10 @@
 # - Peers discover each other through the configured bootnode.
 # - Chain-spec hash matching succeeds during the status handshake.
 # - Topic subscriptions complete on all three nodes.
-# - node1 produces runtime-backed blocks and followers import them via
-#   block gossip.
-#
-# What it does NOT yet prove (future commits):
-# - Sync FSM end-to-end (4th joining node syncs from genesis).
+# - node1 produces runtime-backed blocks and block proofs.
+# - node2/node3 import live gossipped blocks.
+# - node4 starts late and syncs from genesis through HeaderBackfill,
+#   StateFetch, ProofBackfill, and Following.
 
 services:
   node1:
@@ -72,6 +71,27 @@ services:
       - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
     ports:
       - "30303:30303/tcp"
+    depends_on:
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 30303 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+
+  node4:
+    image: neutrino-node:m6
+    hostname: node4
+    container_name: neutrino-m6-node4
+    networks:
+      neutrino-m6:
+        aliases: [node4]
+    volumes:
+      - ./configs/node4.toml:/etc/neutrino/config.toml:ro
+      - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
+    ports:
+      - "30304:30303/tcp"
     depends_on:
       node1:
         condition: service_healthy

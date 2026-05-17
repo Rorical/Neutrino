@@ -253,6 +253,60 @@ async fn detects_double_prevote_from_two_partial_votes() {
 }
 
 #[tokio::test]
+async fn detects_lock_violation_across_rounds() {
+    // Same validator precommits two different chunk hashes for the
+    // same chunk_id but in different rounds → LockViolation. M7-D.2
+    // attribution: vote_a (the lock) is the earlier round.
+    let backend = fresh_backend();
+    let v1 = proposer(1);
+
+    let lock = partial_vote(0, 0, FinalityVotePhase::Precommit, 0xAA, &v1, 2);
+    let violation = partial_vote(0, 1, FinalityVotePhase::Precommit, 0xBB, &v1, 2);
+    backend.ingest_finality_vote(lock).await;
+    assert_eq!(backend.slashing_pool_len(), 0);
+
+    backend.ingest_finality_vote(violation).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        1,
+        "cross-round precommit with different chunk hash must trigger LockViolation"
+    );
+    let drained = backend.drain_slashing_pool(10);
+    match drained.as_slice() {
+        [
+            SlashingEvidence::LockViolation {
+                validator_index,
+                vote_a,
+                vote_b,
+                ..
+            },
+        ] => {
+            assert_eq!(*validator_index, 1);
+            assert_eq!(vote_a.data.round, 0);
+            assert_eq!(vote_b.data.round, 1);
+            assert_ne!(vote_a.data.chunk_hash, vote_b.data.chunk_hash);
+        }
+        other => panic!("expected single LockViolation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn does_not_flag_lock_violation_when_revoting_same_hash_across_rounds() {
+    let backend = fresh_backend();
+    let v1 = proposer(1);
+
+    let r0 = partial_vote(0, 0, FinalityVotePhase::Precommit, 0xCC, &v1, 2);
+    let r1_same = partial_vote(0, 1, FinalityVotePhase::Precommit, 0xCC, &v1, 2);
+    backend.ingest_finality_vote(r0).await;
+    backend.ingest_finality_vote(r1_same).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "re-precommitting the same chunk_hash at a later round is honest behaviour"
+    );
+}
+
+#[tokio::test]
 async fn detects_double_precommit_from_two_partial_votes() {
     let backend = fresh_backend();
     let v1 = proposer(1);

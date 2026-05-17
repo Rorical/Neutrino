@@ -21,7 +21,7 @@ use crate::error::EngineError;
 use crate::proposer::ProposerKey;
 use crate::slashing::{
     self, SlashingError, SlashingMonitor, verify_double_proposal_evidence,
-    verify_double_vote_evidence, verify_invalid_vrf_claim_evidence,
+    verify_double_vote_evidence, verify_invalid_vrf_claim_evidence, verify_lock_violation_evidence,
 };
 use crate::store::{ChainStore, StoreError, pointers};
 
@@ -661,9 +661,21 @@ impl<DB: Database> Engine<DB> {
                 &self.finalized_seed(),
                 self.chain_spec().consensus.expected_proposers_per_slot,
             ),
-            // LockViolation / InvalidProofSigning /
-            // LongRangeForkParticipation / DaCommitmentFraud require
-            // engine state that lands in later M7 slices.
+            SlashingEvidence::LockViolation {
+                validator_index,
+                vote_a,
+                vote_b,
+                ..
+            } => verify_lock_violation_evidence(
+                *validator_index,
+                vote_a,
+                vote_b,
+                self.active_validator_set(),
+                self.chain_spec().chain_id,
+            ),
+            // InvalidProofSigning / LongRangeForkParticipation /
+            // DaCommitmentFraud require engine state that lands in
+            // later M7 slices.
             _ => Err(SlashingError::UnsupportedVariant),
         }
     }

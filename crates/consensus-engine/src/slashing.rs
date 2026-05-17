@@ -40,8 +40,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use neutrino_consensus_types::{
-    FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedVote, SlashingEvidence,
-    VrfRejectionReason,
+    AggregatedVote, FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedVote,
+    LockEvidence, QuorumCertificate, SlashingEvidence, VrfRejectionReason,
 };
 use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
 use neutrino_crypto::bls::{PublicKey, Signature};
@@ -69,6 +69,17 @@ pub struct SlashingMonitor {
     /// `(validator_index, chunk_id, round, phase) → vote` previously
     /// accepted from a single-signer aggregation bit set.
     seen_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedVote>,
+    /// `(validator_index, chunk_id) → first_seen_precommit`.
+    ///
+    /// Used to detect [`SlashingEvidence::LockViolation`]: a
+    /// validator precommitting two different chunk hashes for the
+    /// same chunk id across different rounds violates the
+    /// Tendermint lock rule from docs/design/02-consensus.md §2.5
+    /// step 4 — switching from a locked chunk to a different one
+    /// requires observing (and ideally carrying) a higher-round
+    /// polka cert for the new hash, which honest validators always
+    /// gossip.
+    first_precommit_per_chunk: BTreeMap<(ValidatorIndex, ChunkId), IndexedVote>,
 }
 
 impl SlashingMonitor {
@@ -105,15 +116,30 @@ impl SlashingMonitor {
         }
     }
 
-    /// Record a single-signer indexed vote. If the same validator
-    /// has previously been observed voting for a *different*
-    /// `chunk_hash` at the same `(chunk_id, round, phase)`, return
-    /// the matching `DoublePrevote` / `DoublePrecommit` evidence.
+    /// Record a single-signer indexed vote.
     ///
-    /// Exact duplicate votes (same chunk hash) are silently ignored.
+    /// Returns evidence under three rules, checked in order:
+    ///
+    /// 1. **Same-round equivocation** — a validator that has already
+    ///    been observed voting for a *different* `chunk_hash` at the
+    ///    exact same `(chunk_id, round, phase)` produces
+    ///    [`SlashingEvidence::DoublePrevote`] /
+    ///    [`SlashingEvidence::DoublePrecommit`].
+    /// 2. **Cross-round lock violation** (precommits only) — a
+    ///    validator precommitting a different `chunk_hash` for the
+    ///    same `chunk_id` at a *different round* than a prior
+    ///    precommit produces
+    ///    [`SlashingEvidence::LockViolation`]. The earlier-round
+    ///    precommit is always slotted into `vote_a` (the lock) and
+    ///    the later-round one into `vote_b` (the violation) so
+    ///    the evidence shape is canonical regardless of arrival
+    ///    order.
+    /// 3. **No equivocation** — exact-duplicate or same-hash votes
+    ///    return `None`. The vote is still recorded for future
+    ///    equivocation lookups.
+    ///
     /// Aggregated votes carrying more than one signer bit do not
-    /// produce evidence here; the equivocation detector for
-    /// aggregated votes is a separate (M7-C) concern.
+    /// participate here; that's M7-C territory.
     pub fn record_indexed_vote(
         &mut self,
         validator_index: ValidatorIndex,
@@ -125,8 +151,8 @@ impl SlashingMonitor {
             vote.data.round,
             vote.data.phase,
         );
-        match self.seen_votes.get(&key) {
-            Some(existing) if existing.data.chunk_hash != vote.data.chunk_hash => {
+        if let Some(existing) = self.seen_votes.get(&key) {
+            if existing.data.chunk_hash != vote.data.chunk_hash {
                 let evidence = match vote.data.phase {
                     FinalityVotePhase::Prevote => SlashingEvidence::DoublePrevote {
                         validator_index,
@@ -139,14 +165,41 @@ impl SlashingMonitor {
                         vote_b: vote.clone(),
                     },
                 };
-                Some(evidence)
+                return Some(evidence);
             }
-            Some(_) => None,
-            None => {
-                self.seen_votes.insert(key, vote.clone());
-                None
+            return None;
+        }
+        self.seen_votes.insert(key, vote.clone());
+
+        // M7-D.2 cross-round lock-violation detection. Only fires for
+        // precommits, only when the prior precommit on this chunk
+        // used a different chunk_hash, and only when the rounds
+        // differ (same-round, different-hash already short-circuited
+        // through the DoublePrecommit branch above).
+        if vote.data.phase == FinalityVotePhase::Precommit {
+            let chunk_key = (validator_index, vote.data.chunk_id);
+            if let Some(earlier) = self.first_precommit_per_chunk.get(&chunk_key) {
+                if earlier.data.chunk_hash != vote.data.chunk_hash
+                    && earlier.data.round != vote.data.round
+                {
+                    let (lock, violation) = if earlier.data.round < vote.data.round {
+                        (earlier.clone(), vote.clone())
+                    } else {
+                        (vote.clone(), earlier.clone())
+                    };
+                    return Some(SlashingEvidence::LockViolation {
+                        validator_index,
+                        vote_a: lock.clone(),
+                        vote_b: violation,
+                        lock_evidence: lock_evidence_from_locked_precommit(&lock),
+                    });
+                }
+            } else {
+                self.first_precommit_per_chunk
+                    .insert(chunk_key, vote.clone());
             }
         }
+        None
     }
 
     /// Number of distinct (proposer, slot) headers indexed.
@@ -336,6 +389,76 @@ pub fn verify_double_proposal_evidence(
     }
     verify_header_signature(header_a, active_set, chain_id).map_err(map_signature_error)?;
     verify_header_signature(header_b, active_set, chain_id).map_err(map_signature_error)?;
+    Ok(())
+}
+
+/// Build a [`LockEvidence`] surface from the locked precommit.
+///
+/// M7-D.2 emits a *minimal* lock evidence: the prevote-equivalent
+/// of the locked precommit's vote data, with an empty
+/// [`AggregatedVote`]. Verification only re-checks the two
+/// precommit signatures and the canonical "different chunk hash at
+/// different round on the same chunk_id" invariant — the embedded
+/// QC bits are placeholder. The full polka cert + unlock cert
+/// surface is preserved in the wire type for the post-M7 detector
+/// that enforces the carry-the-polka-cert protocol rule.
+fn lock_evidence_from_locked_precommit(locked_precommit: &IndexedVote) -> LockEvidence {
+    LockEvidence {
+        locked_prevote_quorum: QuorumCertificate {
+            data: FinalityVoteData {
+                chunk_id: locked_precommit.data.chunk_id,
+                round: locked_precommit.data.round,
+                chunk_hash: locked_precommit.data.chunk_hash,
+                phase: FinalityVotePhase::Prevote,
+            },
+            aggregate: AggregatedVote {
+                aggregation_bits: neutrino_primitives::BitVec::default(),
+                signature: [0; 96],
+            },
+        },
+        claimed_unlock_quorum: None,
+    }
+}
+
+/// Verify a [`SlashingEvidence::LockViolation`].
+///
+/// Both votes must be precommits from the same validator on the
+/// same `chunk_id`, with different rounds, different chunk hashes,
+/// and valid per-validator signatures.
+///
+/// The carried [`LockEvidence`] surface is **not** cross-checked
+/// against an external polka cert at this milestone; M7's
+/// objective slashing rule only requires that the validator's two
+/// own precommit signatures both verify and that they conflict.
+///
+/// # Errors
+///
+/// Returns the relevant [`SlashingError`] variant on any failure.
+pub fn verify_lock_violation_evidence(
+    validator_index: ValidatorIndex,
+    vote_a: &IndexedVote,
+    vote_b: &IndexedVote,
+    active_set: &[Validator],
+    chain_id: ChainId,
+) -> Result<(), SlashingError> {
+    if vote_a.data.phase != FinalityVotePhase::Precommit
+        || vote_b.data.phase != FinalityVotePhase::Precommit
+    {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    if vote_a.data.chunk_id != vote_b.data.chunk_id {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    if vote_a.data.round == vote_b.data.round {
+        // Same round + same chunk + different hash is a
+        // DoublePrecommit, not a LockViolation.
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    if vote_a.data.chunk_hash == vote_b.data.chunk_hash {
+        return Err(SlashingError::NotEquivocating);
+    }
+    verify_indexed_vote_signature(validator_index, vote_a, active_set, chain_id)?;
+    verify_indexed_vote_signature(validator_index, vote_b, active_set, chain_id)?;
     Ok(())
 }
 
@@ -778,6 +901,137 @@ mod tests {
                 CHAIN_ID,
             ),
             Err(SlashingError::BadSignature),
+        );
+    }
+
+    #[test]
+    fn record_indexed_vote_detects_cross_round_lock_violation_for_precommits() {
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+        let precommit_r0 = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let precommit_r1_other = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+
+        assert!(monitor.record_indexed_vote(1, &precommit_r0).is_none());
+        let evidence = monitor
+            .record_indexed_vote(1, &precommit_r1_other)
+            .expect("cross-round lock violation");
+        match evidence {
+            SlashingEvidence::LockViolation {
+                validator_index,
+                vote_a,
+                vote_b,
+                ..
+            } => {
+                assert_eq!(validator_index, 1);
+                assert_eq!(vote_a.data.round, 0, "earlier round is the lock");
+                assert_eq!(vote_b.data.round, 1, "later round is the violation");
+            }
+            other => panic!("expected LockViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_indexed_vote_normalises_lock_violation_round_order_on_late_arrivals() {
+        // First-seen precommit happens to be the LATER round (e.g.
+        // out-of-order gossip); the detector must still slot the
+        // earlier round into vote_a so the evidence shape is
+        // canonical.
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+        let precommit_r3 = signed_indexed_vote(7, 3, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let precommit_r0_other = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xBB, &v1);
+
+        assert!(monitor.record_indexed_vote(1, &precommit_r3).is_none());
+        let evidence = monitor
+            .record_indexed_vote(1, &precommit_r0_other)
+            .expect("cross-round lock violation");
+        match evidence {
+            SlashingEvidence::LockViolation { vote_a, vote_b, .. } => {
+                assert_eq!(vote_a.data.round, 0);
+                assert_eq!(vote_b.data.round, 3);
+            }
+            other => panic!("expected LockViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_indexed_vote_does_not_trigger_lock_violation_when_hashes_match_across_rounds() {
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+        let precommit_r0 = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xCC, &v1);
+        let precommit_r1_same = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xCC, &v1);
+        assert!(monitor.record_indexed_vote(1, &precommit_r0).is_none());
+        assert!(
+            monitor.record_indexed_vote(1, &precommit_r1_same).is_none(),
+            "re-precommitting the same chunk_hash at a later round is honest behaviour"
+        );
+    }
+
+    #[test]
+    fn record_indexed_vote_prefers_double_precommit_for_same_round_conflict() {
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+        let precommit_a = signed_indexed_vote(7, 4, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let precommit_b = signed_indexed_vote(7, 4, FinalityVotePhase::Precommit, 0xBB, &v1);
+        assert!(monitor.record_indexed_vote(1, &precommit_a).is_none());
+        let evidence = monitor
+            .record_indexed_vote(1, &precommit_b)
+            .expect("same-round equivocation");
+        assert!(matches!(evidence, SlashingEvidence::DoublePrecommit { .. }));
+    }
+
+    #[test]
+    fn verify_lock_violation_accepts_genuine_cross_round_conflict() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let lock = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let violation = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        verify_lock_violation_evidence(1, &lock, &violation, &active_set, CHAIN_ID)
+            .expect("genuine cross-round lock violation verifies");
+    }
+
+    #[test]
+    fn verify_lock_violation_rejects_same_round_and_matching_hash() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let a = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let b_same_round = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xBB, &v1);
+        assert_eq!(
+            verify_lock_violation_evidence(1, &a, &b_same_round, &active_set, CHAIN_ID),
+            Err(SlashingError::EvidenceFieldsInconsistent),
+            "same round + different hash is DoublePrecommit territory, not LockViolation"
+        );
+        let b_same_hash = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xAA, &v1);
+        assert_eq!(
+            verify_lock_violation_evidence(1, &a, &b_same_hash, &active_set, CHAIN_ID),
+            Err(SlashingError::NotEquivocating)
+        );
+    }
+
+    #[test]
+    fn verify_lock_violation_rejects_prevote_payloads() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let prevote = signed_indexed_vote(7, 0, FinalityVotePhase::Prevote, 0xAA, &v1);
+        let precommit = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        assert_eq!(
+            verify_lock_violation_evidence(1, &prevote, &precommit, &active_set, CHAIN_ID),
+            Err(SlashingError::EvidenceFieldsInconsistent),
+            "LockViolation requires two precommits"
+        );
+    }
+
+    #[test]
+    fn verify_lock_violation_rejects_wrong_signer_pubkey() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let lock = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let violation = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        // Claim the offender is validator 0 but the signatures are
+        // from validator 1.
+        assert_eq!(
+            verify_lock_violation_evidence(0, &lock, &violation, &active_set, CHAIN_ID),
+            Err(SlashingError::BadSignature)
         );
     }
 

@@ -199,9 +199,11 @@ fn encode_slashing(
         }
         | SlashingEvidence::DoublePrecommit {
             validator_index, ..
+        }
+        | SlashingEvidence::LockViolation {
+            validator_index, ..
         } => *validator_index,
-        SlashingEvidence::LockViolation { .. }
-        | SlashingEvidence::InvalidProofSigning { .. }
+        SlashingEvidence::InvalidProofSigning { .. }
         | SlashingEvidence::LongRangeForkParticipation { .. }
         | SlashingEvidence::DaCommitmentFraud { .. } => return Ok(None),
     };
@@ -546,13 +548,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_runtime_body_skips_unsupported_slashing_variants() {
-        use neutrino_consensus_types::{
-            AggregatedVote, BlockProofRejection, DaFraudProof, LockEvidence, ProofRejectionReason,
-            QuorumCertificate,
-        };
+    fn encode_runtime_body_emits_tx_slash_for_lock_violation() {
+        use neutrino_consensus_types::{AggregatedVote, LockEvidence, QuorumCertificate};
         let active = vec![Validator {
-            pubkey: [0x11; 48],
+            pubkey: [0x77; 48],
             withdrawal_credentials: [0; 32],
             effective_stake: 100,
             slashed: false,
@@ -564,7 +563,7 @@ mod tests {
             data: FinalityVoteData {
                 chunk_id: 0,
                 round: 0,
-                chunk_hash: [0; 32],
+                chunk_hash: [0xAA; 32],
                 phase: FinalityVotePhase::Prevote,
             },
             aggregate: AggregatedVote {
@@ -573,16 +572,39 @@ mod tests {
             },
         };
         let body = Body {
-            slashings: vec![
-                SlashingEvidence::LockViolation {
-                    validator_index: 0,
-                    vote_a: sample_indexed_vote(0xAA),
-                    vote_b: sample_indexed_vote(0xBB),
-                    lock_evidence: LockEvidence {
-                        locked_prevote_quorum: qc,
-                        claimed_unlock_quorum: None,
-                    },
+            slashings: vec![SlashingEvidence::LockViolation {
+                validator_index: 0,
+                vote_a: sample_indexed_vote(0xAA),
+                vote_b: sample_indexed_vote(0xBB),
+                lock_evidence: LockEvidence {
+                    locked_prevote_quorum: qc,
+                    claimed_unlock_quorum: None,
                 },
+            }],
+            ..Body::default()
+        };
+
+        let encoded = encode_runtime_body_with_validators(&body, &active).expect("encode");
+        assert_eq!(&encoded[..4], &1_u32.to_le_bytes());
+        assert_eq!(&encoded[4..8], &49_u32.to_le_bytes());
+        assert_eq!(encoded[8], TX_SLASH);
+        assert_eq!(&encoded[9..9 + 48], &active[0].pubkey);
+    }
+
+    #[test]
+    fn encode_runtime_body_skips_remaining_unsupported_slashing_variants() {
+        use neutrino_consensus_types::{BlockProofRejection, DaFraudProof, ProofRejectionReason};
+        let active = vec![Validator {
+            pubkey: [0x11; 48],
+            withdrawal_credentials: [0; 32],
+            effective_stake: 100,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }];
+        let body = Body {
+            slashings: vec![
                 SlashingEvidence::InvalidProofSigning {
                     validator_index: 0,
                     vote: sample_indexed_vote(0xCC),
@@ -607,8 +629,9 @@ mod tests {
             ..Body::default()
         };
 
-        // None of the three variants is supported by the M7-D.1
-        // body encoder, so the runtime payload is empty.
+        // Two unsupported variants (InvalidProofSigning,
+        // DaCommitmentFraud) remain skipped pending later M7
+        // slices; the runtime payload stays empty.
         let encoded = encode_runtime_body_with_validators(&body, &active).expect("encode");
         assert!(
             encoded.is_empty(),

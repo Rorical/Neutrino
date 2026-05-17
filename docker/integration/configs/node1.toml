@@ -1,0 +1,6 @@
+# Bootnode for the m6 integration stack.
+chain_id = 7
+role = "validator"
+listen = ["/ip4/0.0.0.0/tcp/30303"]
+# No bootnodes: node1 *is* the bootnode.
+bootnodes = []

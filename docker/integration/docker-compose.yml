@@ -1,0 +1,80 @@
+# M6 integration smoke test.
+#
+# Three nodes on a private bridge network. `node1` acts as the bootnode
+# (its container hostname is dialable by name on the user-defined bridge).
+# All three subscribe to every canonical gossip topic and run the sync
+# driver against the stub backend.
+#
+# What this proves today:
+# - The binary starts cleanly under Docker.
+# - libp2p Identify + Kademlia + Gossipsub negotiate over the bridge.
+# - Peers discover each other through the configured bootnode.
+#
+# What it does NOT yet prove (future commits):
+# - Block production by a validator and gossip propagation.
+# - Sync FSM end-to-end (4th joining node syncs from genesis).
+
+services:
+  node1:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    image: neutrino-node:m6
+    hostname: node1
+    container_name: neutrino-m6-node1
+    networks:
+      neutrino-m6:
+        aliases: [node1]
+    volumes:
+      - ./configs/node1.toml:/etc/neutrino/config.toml:ro
+    ports:
+      - "30301:30303/tcp"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 30303 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+
+  node2:
+    image: neutrino-node:m6
+    hostname: node2
+    container_name: neutrino-m6-node2
+    networks:
+      neutrino-m6:
+        aliases: [node2]
+    volumes:
+      - ./configs/node2.toml:/etc/neutrino/config.toml:ro
+    ports:
+      - "30302:30303/tcp"
+    depends_on:
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 30303 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+
+  node3:
+    image: neutrino-node:m6
+    hostname: node3
+    container_name: neutrino-m6-node3
+    networks:
+      neutrino-m6:
+        aliases: [node3]
+    volumes:
+      - ./configs/node3.toml:/etc/neutrino/config.toml:ro
+    ports:
+      - "30303:30303/tcp"
+    depends_on:
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 30303 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+
+networks:
+  neutrino-m6:
+    driver: bridge

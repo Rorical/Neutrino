@@ -1,0 +1,4 @@
+chain_id = 7
+role = "full"
+listen = ["/ip4/0.0.0.0/tcp/30303"]
+bootnodes = ["/dns4/node1/tcp/30303"]

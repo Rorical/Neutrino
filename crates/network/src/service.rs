@@ -64,6 +64,9 @@ pub enum NetworkError {
     /// Listener could not bind to the requested address.
     #[error("transport error: {0}")]
     Transport(#[from] TransportError<io::Error>),
+    /// System DNS resolver initialisation failed.
+    #[error("dns transport error: {0}")]
+    Dns(io::Error),
 }
 
 /// Events emitted by [`NetworkService`] for the host to consume.
@@ -288,6 +291,8 @@ impl NetworkService {
                 yamux::Config::default,
             )?
             .with_quic()
+            .with_dns()
+            .map_err(NetworkError::Dns)?
             .with_behaviour(|_| behaviour)
             .expect("infallible: behaviour already constructed")
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))

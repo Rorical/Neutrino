@@ -16,7 +16,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 /// Failures while verifying a header proposer signature.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignatureError {
     /// Header references a validator index outside the active set.
     ValidatorIndexOutOfBounds {

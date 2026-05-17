@@ -134,7 +134,9 @@ impl Block {
 }
 
 /// Finality vote phase.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd,
+)]
 pub enum FinalityVotePhase {
     /// Tendermint prevote.
     Prevote,

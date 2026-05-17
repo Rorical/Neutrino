@@ -24,6 +24,7 @@ pub mod produce;
 pub mod proposer;
 pub mod prove;
 pub mod signature;
+pub mod slashing;
 pub mod store;
 pub mod validator_set;
 
@@ -46,6 +47,7 @@ pub use produce::{ProductionConfig, ProductionError, ProductionOutcome};
 pub use proposer::ProposerKey;
 pub use prove::{ProveError, ProveOutcome};
 pub use signature::{SignatureError, proposer_signed_message, verify_header_signature};
+pub use slashing::{SlashingError, SlashingMonitor, extract_single_signer, vrf_rejection_reason};
 pub use store::{
     ChainStore, ContentAddressedEntries, StoreError, ValidatorSetSnapshot, keys, pointers,
 };

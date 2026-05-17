@@ -6,6 +6,9 @@
 
 use alloc::collections::BTreeMap;
 
+use neutrino_consensus_types::{
+    FinalityVote, FinalityVotePhase, Header, SlashingEvidence, VrfRejectionReason,
+};
 use neutrino_primitives::{
     BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot, Validator,
 };
@@ -16,6 +19,10 @@ use crate::bft_loop::BftSession;
 use crate::clock::SlotClock;
 use crate::error::EngineError;
 use crate::proposer::ProposerKey;
+use crate::slashing::{
+    self, SlashingError, SlashingMonitor, verify_double_proposal_evidence,
+    verify_double_vote_evidence, verify_invalid_vrf_claim_evidence,
+};
 use crate::store::{ChainStore, StoreError, pointers};
 
 extern crate alloc;
@@ -46,6 +53,9 @@ pub struct Engine<DB: Database> {
     /// Local validator key used by the BFT loop to sign prevotes and
     /// precommits. Unset on non-voting nodes.
     pub(crate) local_voter: Option<ProposerKey>,
+    /// Equivocation detector for the M7-B slashing pipeline. See
+    /// [`crate::slashing`].
+    pub(crate) slashing_monitor: SlashingMonitor,
 }
 
 impl<DB: Database> Engine<DB> {
@@ -98,6 +108,7 @@ impl<DB: Database> Engine<DB> {
             active_validator_set,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
+            slashing_monitor: SlashingMonitor::new(),
         })
     }
 
@@ -196,6 +207,7 @@ impl<DB: Database> Engine<DB> {
             active_validator_set,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
+            slashing_monitor: SlashingMonitor::new(),
         })
     }
 
@@ -453,6 +465,183 @@ impl<DB: Database> Engine<DB> {
                 .put_seed_advanced_through_checkpoint(advanced_through)?;
         }
         Ok(())
+    }
+
+    /// Observe a signed header for slashing detection.
+    ///
+    /// Verifies the proposer signature first (so a malformed peer
+    /// cannot pollute the equivocation monitor) and then records
+    /// the header. Returns [`SlashingEvidence::DoubleProposal`] if
+    /// the same proposer has already been observed signing a
+    /// *different* header at the same slot.
+    ///
+    /// Headers that fail signature verification surface
+    /// [`SlashingError::BadSignature`] (or the relevant `Invalid*`
+    /// variant) and are *not* recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the matching [`SlashingError`] variant on signature
+    /// failure.
+    pub fn observe_header_for_slashing(
+        &mut self,
+        header: &Header,
+    ) -> Result<Option<SlashingEvidence>, SlashingError> {
+        // Re-use the engine's existing signature verifier; the
+        // result type is mapped onto the slashing crate's error
+        // enum for caller uniformity.
+        crate::signature::verify_header_signature(
+            header,
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+        )
+        .map_err(slashing_signature_to_slashing_err)?;
+        Ok(self.slashing_monitor.record_header(header))
+    }
+
+    /// Observe a finality vote for slashing detection.
+    ///
+    /// Only single-signer (partial) votes participate in detection.
+    /// Aggregated votes with more than one bit set short-circuit to
+    /// `Ok(None)` since the equivocator cannot be attributed from
+    /// the aggregate alone — M7-C will add subnet-aware detection.
+    ///
+    /// The vote's BLS signature is re-verified before recording so a
+    /// malicious peer cannot pollute the monitor with forged
+    /// commitments. On signature failure the call returns
+    /// [`SlashingError::BadSignature`] and nothing is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlashingError`] when the vote's signature fails to
+    /// verify or the carried validator index is outside the active
+    /// set.
+    pub fn observe_vote_for_slashing(
+        &mut self,
+        vote: &FinalityVote,
+    ) -> Result<Option<SlashingEvidence>, SlashingError> {
+        let active_set_len = self.active_validator_set().len();
+        let Some((signer, indexed)) = slashing::extract_single_signer(vote, active_set_len) else {
+            return Ok(None);
+        };
+        // Round-trip the per-validator signature against the active
+        // set so we record nothing that was not actually signed by
+        // the claimed validator.
+        slashing::verify_indexed_vote_signature(
+            signer,
+            &indexed,
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+        )?;
+        Ok(self.slashing_monitor.record_indexed_vote(signer, &indexed))
+    }
+
+    /// Build an [`SlashingEvidence::InvalidVrfClaim`] from a header
+    /// whose VRF claim was just rejected by
+    /// [`neutrino_consensus_vrf::verify_header_proposer`]. Caller is
+    /// responsible for verifying the header signature and for
+    /// translating the [`neutrino_consensus_vrf::VrfError`] into a
+    /// [`VrfRejectionReason`] via
+    /// [`slashing::vrf_rejection_reason`].
+    #[must_use]
+    pub fn invalid_vrf_evidence(
+        &self,
+        header: &Header,
+        reason: VrfRejectionReason,
+    ) -> SlashingEvidence {
+        SlashingEvidence::InvalidVrfClaim {
+            proposer_index: header.proposer_index,
+            header: header.clone(),
+            reason,
+        }
+    }
+
+    /// Verify peer-supplied [`SlashingEvidence`] against the
+    /// engine's current active validator set, chain spec, and
+    /// finalized seed.
+    ///
+    /// Used by the chain backend when ingesting evidence off
+    /// `Topic::SlashingEvidence` so a node refuses to pool forged
+    /// or stale claims. Variants the engine does not yet support
+    /// return [`SlashingError::UnsupportedVariant`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the matching [`SlashingError`] on any failed check.
+    pub fn verify_slashing_evidence(
+        &self,
+        evidence: &SlashingEvidence,
+    ) -> Result<(), SlashingError> {
+        match evidence {
+            SlashingEvidence::DoubleProposal {
+                proposer_index,
+                header_a,
+                header_b,
+            } => verify_double_proposal_evidence(
+                *proposer_index,
+                header_a,
+                header_b,
+                self.active_validator_set(),
+                self.chain_spec().chain_id,
+            ),
+            SlashingEvidence::DoublePrevote {
+                validator_index,
+                vote_a,
+                vote_b,
+            } => verify_double_vote_evidence(
+                *validator_index,
+                FinalityVotePhase::Prevote,
+                vote_a,
+                vote_b,
+                self.active_validator_set(),
+                self.chain_spec().chain_id,
+            ),
+            SlashingEvidence::DoublePrecommit {
+                validator_index,
+                vote_a,
+                vote_b,
+            } => verify_double_vote_evidence(
+                *validator_index,
+                FinalityVotePhase::Precommit,
+                vote_a,
+                vote_b,
+                self.active_validator_set(),
+                self.chain_spec().chain_id,
+            ),
+            SlashingEvidence::InvalidVrfClaim {
+                proposer_index,
+                header,
+                reason,
+            } => verify_invalid_vrf_claim_evidence(
+                *proposer_index,
+                header,
+                *reason,
+                self.active_validator_set(),
+                self.chain_spec().chain_id,
+                &self.finalized_seed(),
+                self.chain_spec().consensus.expected_proposers_per_slot,
+            ),
+            // LockViolation / InvalidProofSigning /
+            // LongRangeForkParticipation / DaCommitmentFraud require
+            // engine state that lands in later M7 slices.
+            _ => Err(SlashingError::UnsupportedVariant),
+        }
+    }
+}
+
+/// Map [`crate::signature::SignatureError`] onto the slashing
+/// error enum so callers handle a single failure type.
+const fn slashing_signature_to_slashing_err(
+    err: crate::signature::SignatureError,
+) -> SlashingError {
+    use crate::signature::SignatureError as Sig;
+    match err {
+        Sig::ValidatorIndexOutOfBounds { index, len } => {
+            SlashingError::ValidatorIndexOutOfBounds { index, len }
+        }
+        Sig::InvalidPublicKey { index } => SlashingError::InvalidPublicKey { index },
+        Sig::InvalidSignatureBytes => SlashingError::InvalidSignatureBytes,
+        Sig::BadSignature => SlashingError::BadSignature,
     }
 }
 

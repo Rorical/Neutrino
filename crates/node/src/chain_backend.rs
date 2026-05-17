@@ -24,13 +24,14 @@
 //! - `state_root` re-execution — deferred to M8 when a real proof
 //!   backend ships.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use neutrino_consensus_engine::{
     BftAction, CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome,
     ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError,
-    ProveOutcome,
+    ProveOutcome, vrf_rejection_reason,
 };
 use neutrino_consensus_types::{
     Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
@@ -102,6 +103,50 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// `voter` argument to [`Engine::finalize_chunk`]. Wrapped in an
     /// [`Arc`] so async tasks can hold a snapshot without re-locking.
     local_voter: Mutex<Option<Arc<ProposerKey>>>,
+    /// In-memory pool of slashing evidence detected locally or
+    /// ingested from peers. Drained by the producer when assembling
+    /// a block body's `slashings` field. M7-D will switch this to a
+    /// persistent column once the runtime starts applying penalties.
+    slashing_pool: Mutex<SlashingPool>,
+}
+
+/// FIFO pool of [`SlashingEvidence`] with dedup-by-content. Two
+/// detectors that observe the same equivocation produce
+/// byte-identical evidence, so the BLAKE3 of the borsh encoding is
+/// a safe canonical key.
+#[derive(Default)]
+struct SlashingPool {
+    evidence: Vec<SlashingEvidence>,
+    seen: BTreeSet<Hash>,
+}
+
+impl SlashingPool {
+    fn insert(&mut self, evidence: SlashingEvidence) -> bool {
+        let Ok(encoded) = borsh::to_vec(&evidence) else {
+            return false;
+        };
+        let hash = blake3_256(&encoded);
+        if !self.seen.insert(hash) {
+            return false;
+        }
+        self.evidence.push(evidence);
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.evidence.len()
+    }
+
+    fn drain(&mut self, max: usize) -> Vec<SlashingEvidence> {
+        let take = max.min(self.evidence.len());
+        let drained: Vec<_> = self.evidence.drain(..take).collect();
+        for evidence in &drained {
+            if let Ok(bytes) = borsh::to_vec(evidence) {
+                self.seen.remove(&blake3_256(&bytes));
+            }
+        }
+        drained
+    }
 }
 
 impl<DB, P> ChainBackend<DB, P>
@@ -111,7 +156,7 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     /// Wrap an already-initialised [`Engine`].
-    pub const fn new(engine: Engine<DB>, proof_system: P) -> Self {
+    pub fn new(engine: Engine<DB>, proof_system: P) -> Self {
         Self {
             engine: Mutex::new(engine),
             proof_system,
@@ -119,6 +164,7 @@ where
             runtime_elf: None,
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
+            slashing_pool: Mutex::new(SlashingPool::default()),
         }
     }
 
@@ -129,7 +175,7 @@ where
     /// against the backend's current state before entering the mempool.
     /// Without it, transaction admission rejects all gossipped
     /// transactions rather than falling back to syntactic validation.
-    pub const fn new_with_runtime_elf(
+    pub fn new_with_runtime_elf(
         engine: Engine<DB>,
         proof_system: P,
         runtime_elf: Option<Vec<u8>>,
@@ -141,6 +187,7 @@ where
             runtime_elf,
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
+            slashing_pool: Mutex::new(SlashingPool::default()),
         }
     }
 
@@ -205,6 +252,62 @@ where
             .lock()
             .expect("ChainBackend network_publisher poisoned")
             .clone()
+    }
+
+    /// Number of distinct slashing-evidence items currently pooled.
+    #[must_use]
+    pub fn slashing_pool_len(&self) -> usize {
+        self.slashing_pool
+            .lock()
+            .expect("ChainBackend slashing_pool poisoned")
+            .len()
+    }
+
+    /// Drain up to `max` pooled slashing evidence items in FIFO
+    /// insertion order. Used by the producer when assembling a
+    /// block body's `slashings` field.
+    pub fn drain_slashing_pool(&self, max: usize) -> Vec<SlashingEvidence> {
+        self.slashing_pool
+            .lock()
+            .expect("ChainBackend slashing_pool poisoned")
+            .drain(max)
+    }
+
+    /// Add an [`SlashingEvidence`] to the local pool and, when a
+    /// network publisher is configured, gossip it on
+    /// `Topic::SlashingEvidence`.
+    ///
+    /// Deduplicates by `blake3(borsh(evidence))` so two detection
+    /// paths that produce the same canonical evidence only enqueue
+    /// it once.
+    async fn pool_and_gossip_slashing(&self, evidence: SlashingEvidence) {
+        let inserted = self
+            .slashing_pool
+            .lock()
+            .expect("ChainBackend slashing_pool poisoned")
+            .insert(evidence.clone());
+        if !inserted {
+            return;
+        }
+        let Some(publisher) = self.publisher_snapshot() else {
+            return;
+        };
+        let data = match borsh::to_vec(&evidence) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(?err, "failed to encode slashing evidence for gossip");
+                return;
+            }
+        };
+        if let Err(err) = publisher
+            .send(NetworkCommand::Publish {
+                topic: Topic::SlashingEvidence,
+                data,
+            })
+            .await
+        {
+            debug!(?err, "slashing evidence publish channel closed");
+        }
     }
 
     /// Local chain id; convenience helper for the node binary.
@@ -1061,9 +1164,37 @@ where
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
-        let outcome = self
-            .with_engine_mut(|e| e.import_block(&block))
-            .map_err(Self::map_import_err)?;
+        // Slashing detection runs first: a peer that gossips a
+        // validly-signed but non-extending header (e.g. an
+        // equivocating block we already reorg'd past) must still be
+        // surfaced as evidence even if `import_block` later rejects
+        // the second copy on chain continuity grounds. Headers that
+        // fail signature verification are silently dropped — they
+        // are not authentic so there is no slashable signer to
+        // attribute.
+        if let Ok(Some(evidence)) =
+            self.with_engine_mut(|e| e.observe_header_for_slashing(&block.header))
+        {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
+
+        let outcome = match self.with_engine_mut(|e| e.import_block(&block)) {
+            Ok(outcome) => outcome,
+            Err(ImportError::HeaderVrf(vrf_err)) => {
+                // The header signature already verified above (the
+                // observe call would have surfaced its own error
+                // otherwise), so this rejection is a genuine
+                // InvalidVrfClaim. Emit slashing evidence before
+                // bouncing the import.
+                if let Some(reason) = vrf_rejection_reason(&vrf_err) {
+                    let evidence =
+                        self.with_engine(|e| e.invalid_vrf_evidence(&block.header, reason));
+                    self.pool_and_gossip_slashing(evidence).await;
+                }
+                return Err(Self::map_import_err(ImportError::HeaderVrf(vrf_err)));
+            }
+            Err(other) => return Err(Self::map_import_err(other)),
+        };
         self.forget_mined_transactions(&block.body.transactions);
         Ok(HeadersImported {
             new_head_height: outcome.new_head_height,
@@ -1105,6 +1236,12 @@ where
             ?vote.data.phase,
             "received finality vote"
         );
+        // Slashing detection observes single-signer votes; aggregated
+        // votes silently return Ok(None) and are routed through
+        // observe_finality_vote only.
+        if let Ok(Some(evidence)) = self.with_engine_mut(|e| e.observe_vote_for_slashing(&vote)) {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
         let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
             Ok(actions) => actions,
             Err(err) => {
@@ -1127,6 +1264,9 @@ where
             ?vote.data.phase,
             "received aggregate finality vote"
         );
+        if let Ok(Some(evidence)) = self.with_engine_mut(|e| e.observe_vote_for_slashing(&vote)) {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
         let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
             Ok(actions) => actions,
             Err(err) => {
@@ -1138,13 +1278,25 @@ where
     }
 
     async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {
-        // M7 detection logic will buffer evidence in an explicit
-        // pool for runtime application; for now we log it so M6
-        // smoke tests confirm the transport delivers correctly.
-        trace!(
-            ?evidence,
-            "received slashing evidence (deferred to M7 evidence pool)"
-        );
+        // Verify the peer-supplied evidence cryptographically before
+        // pooling it: a forged claim must not poison the pool that
+        // the producer will later include in a block body. The
+        // ingest path does *not* re-gossip — gossipsub handles
+        // mesh-wide propagation and the M7-B detector already
+        // gossipped locally-detected items via
+        // `pool_and_gossip_slashing`.
+        if let Err(err) = self.with_engine(|e| e.verify_slashing_evidence(&evidence)) {
+            debug!(?err, "rejected peer-supplied slashing evidence");
+            return;
+        }
+        let inserted = self
+            .slashing_pool
+            .lock()
+            .expect("ChainBackend slashing_pool poisoned")
+            .insert(evidence);
+        if inserted {
+            trace!("pooled peer-supplied slashing evidence");
+        }
     }
 }
 

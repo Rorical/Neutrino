@@ -69,6 +69,10 @@ fn print_usage() {
     eprintln!("    listen           = [\"<multiaddr>\"]      # defaults to /ip4/0.0.0.0/tcp/0");
     eprintln!("    bootnodes        = [\"<multiaddr>\"]");
     eprintln!("    data_dir         = \"/path/to/data\"");
+    eprintln!("    chain_spec_path  = \"/path/to/chain-spec.toml\"");
+    eprintln!("    runtime_elf_path = \"/path/to/runtime.elf\"");
+    eprintln!("    proposer_ikm_hex = \"<64 hex chars>\"     # validator only");
+    eprintln!("    proposer_index   = 0                    # validator only");
     eprintln!("    subscribe_topics = [\"/neutrino/blocks/borsh/1\", ...]");
 }
 

@@ -2,16 +2,19 @@
 #
 # Three nodes on a private bridge network. `node1` acts as the bootnode
 # (its container hostname is dialable by name on the user-defined bridge).
-# All three subscribe to every canonical gossip topic and run the sync
-# driver against the stub backend.
+# All three share an identical chain spec and run the real ChainBackend
+# against an in-memory database (no persistent storage yet).
 #
 # What this proves today:
 # - The binary starts cleanly under Docker.
 # - libp2p Identify + Kademlia + Gossipsub negotiate over the bridge.
 # - Peers discover each other through the configured bootnode.
+# - Chain-spec hash matching succeeds during the status handshake.
+# - Topic subscriptions complete on all three nodes.
+# - node1 produces runtime-backed blocks and followers import them via
+#   block gossip.
 #
 # What it does NOT yet prove (future commits):
-# - Block production by a validator and gossip propagation.
 # - Sync FSM end-to-end (4th joining node syncs from genesis).
 
 services:
@@ -27,6 +30,7 @@ services:
         aliases: [node1]
     volumes:
       - ./configs/node1.toml:/etc/neutrino/config.toml:ro
+      - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
     ports:
       - "30301:30303/tcp"
     healthcheck:
@@ -44,6 +48,7 @@ services:
         aliases: [node2]
     volumes:
       - ./configs/node2.toml:/etc/neutrino/config.toml:ro
+      - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
     ports:
       - "30302:30303/tcp"
     depends_on:
@@ -64,6 +69,7 @@ services:
         aliases: [node3]
     volumes:
       - ./configs/node3.toml:/etc/neutrino/config.toml:ro
+      - ./chain-spec.toml:/etc/neutrino/chain-spec.toml:ro
     ports:
       - "30303:30303/tcp"
     depends_on:

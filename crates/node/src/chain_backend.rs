@@ -20,15 +20,17 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use neutrino_consensus_engine::{Engine, ImportError};
-use neutrino_consensus_types::{Block, RecursiveCheckpointProof};
+use neutrino_consensus_engine::{
+    Engine, ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey,
+};
+use neutrino_consensus_types::{Block, Body, RecursiveCheckpointProof};
 use neutrino_network::rpc::{
     BlocksByRangeResponse, BlocksByRootResponse, RecursiveProofByIndexResponse,
     RecursiveProofLatestResponse, StateByRootResponse, Status,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, Height, StateRoot, ZERO_HASH,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, Height, Slot, StateRoot, ZERO_HASH,
 };
 use neutrino_proof_system::ProofSystem;
 use neutrino_storage::Database;
@@ -69,6 +71,38 @@ where
     /// Local chain id; convenience helper for the node binary.
     pub fn chain_id(&self) -> ChainId {
         self.with_engine(|e| e.chain_spec().chain_id)
+    }
+
+    /// Genesis timestamp and slot duration for wall-clock production.
+    pub fn production_timing(&self) -> (u64, u64) {
+        self.with_engine(|e| {
+            (
+                e.chain_spec().genesis_time,
+                e.chain_spec().consensus.slot_duration_secs,
+            )
+        })
+    }
+
+    /// Try to produce an empty-body block for `slot` using the shared engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProductionError`] when the runtime, proposer key, or engine
+    /// state reject the production attempt.
+    pub fn try_produce_empty_block(
+        &self,
+        slot: Slot,
+        proposer: &ProposerKey,
+        runtime_elf: &[u8],
+    ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
+        self.with_engine_mut(|e| {
+            let gas_limit = e.chain_spec().genesis_gas_limit;
+            let cfg = ProductionConfig {
+                runtime_elf,
+                proposer,
+            };
+            e.try_produce_block(slot, cfg, Body::default(), gas_limit)
+        })
     }
 
     fn with_engine<R>(&self, f: impl FnOnce(&Engine<DB>) -> R) -> R {
@@ -117,6 +151,7 @@ where
                 .map_or(ZERO_HASH, |cp| cp.hash());
             Status {
                 chain_id: e.chain_spec().chain_id,
+                chain_spec_hash: e.chain_spec_hash(),
                 finalized_checkpoint_index: finalized_index,
                 finalized_checkpoint_hash: finalized_hash,
                 head_block_hash: e.head_hash(),
@@ -149,6 +184,7 @@ where
 
             LocalProgress {
                 chain_id: e.chain_spec().chain_id,
+                chain_spec_hash: e.chain_spec_hash(),
                 finalized_checkpoint_index: finalized_index,
                 finalized_checkpoint_hash: finalized_hash,
                 finalized_state_root,

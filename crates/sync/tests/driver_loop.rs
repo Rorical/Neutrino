@@ -71,8 +71,10 @@ impl SyncBackend for MockBackend {
     }
 
     async fn local_progress(&self) -> LocalProgress {
+        let status = self.inner.lock().unwrap().status;
         LocalProgress {
-            chain_id: self.inner.lock().unwrap().status.chain_id,
+            chain_id: status.chain_id,
+            chain_spec_hash: status.chain_spec_hash,
             ..LocalProgress::default()
         }
     }
@@ -187,6 +189,7 @@ async fn peer_connected_triggers_outbound_status_handshake() {
     let backend = MockBackend::default();
     backend.set_status(Status {
         chain_id: 1,
+        chain_spec_hash: [0; 32],
         finalized_checkpoint_index: 0,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -200,6 +203,7 @@ async fn peer_connected_triggers_outbound_status_handshake() {
         Arc::new(backend),
         LocalProgress {
             chain_id: 1,
+            chain_spec_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -235,6 +239,7 @@ async fn inbound_status_request_is_served_from_backend() {
     let backend = MockBackend::default();
     let local_status = Status {
         chain_id: 9,
+        chain_spec_hash: [0; 32],
         finalized_checkpoint_index: 3,
         finalized_checkpoint_hash: [0xAA; 32],
         head_block_hash: [0xBB; 32],
@@ -249,6 +254,7 @@ async fn inbound_status_request_is_served_from_backend() {
         Arc::new(backend),
         LocalProgress {
             chain_id: 9,
+            chain_spec_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -263,6 +269,7 @@ async fn inbound_status_request_is_served_from_backend() {
     };
     let peer_status = Status {
         chain_id: 9,
+        chain_spec_hash: [0; 32],
         finalized_checkpoint_index: 1,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -302,6 +309,7 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
     let backend = MockBackend::default();
     backend.set_status(Status {
         chain_id: 1,
+        chain_spec_hash: [0; 32],
         finalized_checkpoint_index: 0,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -315,6 +323,7 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
         Arc::new(backend),
         LocalProgress {
             chain_id: 1,
+            chain_spec_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,

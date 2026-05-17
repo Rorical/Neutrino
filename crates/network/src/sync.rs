@@ -131,6 +131,8 @@ pub enum SyncStallReason {
 pub struct LocalProgress {
     /// Local chain id; peers reporting a mismatch are rejected.
     pub chain_id: u64,
+    /// Canonical hash of the local chain spec.
+    pub chain_spec_hash: Hash,
     /// Highest recursive checkpoint index finalized locally.
     pub finalized_checkpoint_index: CheckpointIndex,
     /// Hash of the highest finalized checkpoint.
@@ -411,10 +413,12 @@ impl SyncMachine {
     }
 
     fn on_peer_status(&mut self, peer: PeerId, status: &rpc::Status) -> Vec<SyncCommand> {
-        // Wrong chain → ignore the peer (could become a Stall condition once
-        // we count all peers, but with one-peer-at-a-time semantics a single
-        // mismatch is not fatal).
-        if status.chain_id != self.progress.chain_id {
+        // Wrong chain/spec → ignore the peer (could become a Stall condition
+        // once we count all peers, but with one-peer-at-a-time semantics a
+        // single mismatch is not fatal).
+        if status.chain_id != self.progress.chain_id
+            || status.chain_spec_hash != self.progress.chain_spec_hash
+        {
             return Vec::new();
         }
 
@@ -465,6 +469,14 @@ impl SyncMachine {
     fn advance_to_checkpoint_backfill(&mut self, status: &rpc::Status) -> Vec<SyncCommand> {
         let local = self.progress.finalized_checkpoint_index;
         let target = status.finalized_checkpoint_index;
+        if target == local {
+            return match self.mode {
+                SyncMode::LightClient => self.enter_following(),
+                SyncMode::Snap | SyncMode::Archive => {
+                    self.advance_to_header_backfill(status.head_height)
+                }
+            };
+        }
         self.state = SyncState::CheckpointBackfill {
             local_finalized_index: local,
             target_index: target,
@@ -784,6 +796,7 @@ mod tests {
     fn peer_status(chain_id: u64, finalized: CheckpointIndex, head: Height) -> rpc::Status {
         rpc::Status {
             chain_id,
+            chain_spec_hash: [0; 32],
             finalized_checkpoint_index: finalized,
             finalized_checkpoint_hash: [0xAA; 32],
             head_block_hash: [0xBB; 32],
@@ -810,6 +823,20 @@ mod tests {
             status: peer_status(99, 5, 100),
         });
         assert!(cmds.is_empty(), "wrong chain id must not advance");
+        assert!(matches!(fsm.state(), SyncState::Init));
+        assert_eq!(fsm.sync_peer(), None);
+    }
+
+    #[test]
+    fn init_ignores_peer_with_wrong_chain_spec_hash() {
+        let mut progress = fresh_progress(7);
+        progress.chain_spec_hash = [1; 32];
+        let mut fsm = SyncMachine::new(SyncMode::Snap, progress);
+        let peer = pid();
+        let mut status = peer_status(7, 5, 100);
+        status.chain_spec_hash = [2; 32];
+        let cmds = fsm.on_event(SyncEvent::PeerStatus { peer, status });
+        assert!(cmds.is_empty(), "wrong chain spec must not advance");
         assert!(matches!(fsm.state(), SyncState::Init));
         assert_eq!(fsm.sync_peer(), None);
     }
@@ -869,6 +896,36 @@ mod tests {
                 peer,
                 start_index: 1,
                 count: 32,
+            }]
+        );
+    }
+
+    #[test]
+    fn snap_skips_checkpoint_backfill_when_only_head_is_ahead() {
+        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
+        let peer = pid();
+        let cmds = fsm.on_event(SyncEvent::PeerStatus {
+            peer,
+            status: peer_status(7, 0, 3),
+        });
+        match fsm.state() {
+            SyncState::HeaderBackfill {
+                local_head_height,
+                target_height,
+                in_flight,
+            } => {
+                assert_eq!(*local_head_height, 0);
+                assert_eq!(*target_height, 3);
+                assert!(*in_flight);
+            }
+            other => panic!("expected HeaderBackfill, got {other:?}"),
+        }
+        assert_eq!(
+            cmds,
+            vec![SyncCommand::RequestBlocks {
+                peer,
+                start_height: 1,
+                count: 16,
             }]
         );
     }

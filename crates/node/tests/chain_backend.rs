@@ -33,7 +33,6 @@ fn validators() -> Vec<Validator> {
         last_active_chunk: 0,
     }]
 }
-
 fn spec() -> ChainSpec {
     let proof = ProofParams::default();
     let vs_root = validator_set_root(&validators());

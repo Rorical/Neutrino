@@ -50,11 +50,30 @@ pub struct NodeConfig {
     /// Bootnode multiaddrs to dial on startup.
     #[serde(default)]
     pub bootnodes: Vec<String>,
+    /// Optional path to a `chain-spec.toml` file. When set, the node
+    /// bootstraps a real [`ChainSpec`]-backed engine via
+    /// [`ChainBackend`](crate::ChainBackend). When unset, the stub
+    /// backend is used.
+    #[serde(default)]
+    pub chain_spec_path: Option<String>,
     /// Data directory for the chain database. Optional — when unset the
     /// node runs against an in-memory backend (useful for ephemeral
     /// test containers).
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
+    /// Optional runtime ELF path. When set, the node hashes this ELF into
+    /// the loaded chain spec if the chain-spec file omits
+    /// `runtime_code_hash_hex`; validators also execute it for local block
+    /// production.
+    #[serde(default)]
+    pub runtime_elf_path: Option<PathBuf>,
+    /// Optional hex-encoded BLS IKM (32 bytes) used to derive the local
+    /// proposer key for validator block production.
+    #[serde(default)]
+    pub proposer_ikm_hex: Option<String>,
+    /// Validator index paired with [`Self::proposer_ikm_hex`].
+    #[serde(default)]
+    pub proposer_index: Option<u32>,
     /// Gossip topics to subscribe to on startup. Defaults to all canonical
     /// topics from `docs/design/06-networking.md`.
     #[serde(default)]
@@ -73,5 +92,32 @@ impl NodeConfig {
         } else {
             self.listen.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_validator_production_fields() {
+        let cfg: NodeConfig = toml::from_str(
+            r#"
+chain_id = 7
+role = "validator"
+runtime_elf_path = "/runtime/default.elf"
+proposer_ikm_hex = "4242424242424242424242424242424242424242424242424242424242424242"
+proposer_index = 3
+"#,
+        )
+        .expect("parse node config");
+
+        assert_eq!(cfg.role, NodeRole::Validator);
+        assert_eq!(
+            cfg.runtime_elf_path,
+            Some(PathBuf::from("/runtime/default.elf"))
+        );
+        assert_eq!(cfg.proposer_index, Some(3));
+        assert!(cfg.proposer_ikm_hex.is_some());
     }
 }

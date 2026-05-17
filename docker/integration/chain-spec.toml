@@ -1,0 +1,26 @@
+# Shared chain spec for the M6 integration testnet.
+# All nodes in the docker-compose stack mount this exact file
+# read-only; the resulting ChainSpec::hash() is what peers compare
+# during the status handshake.
+
+name = "neutrino-m6-testnet"
+
+chain_id = 7
+
+genesis_time = 1700000000
+
+genesis_gas_limit = 30000000
+
+genesis_block_hash_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+genesis_seed_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# The runtime code hash is derived by each node from runtime_elf_path so
+# the Docker image can build the rv32im ELF in its own deterministic path.
+
+[[validators]]
+# Deterministic BLS keypair generated for M6 integration.  The raw
+# secret IKM is [0x42; 32] with DST "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_"
+# (the standard BLS12-381 G2 hash-to-curve suite for POP signatures),
+# fed through KeyGen(IKM, key_info).  Public key bytes are serialized
+# as a compressed G1 point (48 bytes).
+pubkey_hex = "95e8938e0974808cacb1926f1cf87561b1b98e76a7a74291285b4f7d84092ffae92609a21a56394d6aa19be7195c7a65"
+effective_stake = 32000000000

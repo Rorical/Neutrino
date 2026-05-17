@@ -1,5 +1,6 @@
 chain_id = 7
 role = "full"
 listen = ["/ip4/0.0.0.0/tcp/30303"]
-# Dial node1 by DNS name on the bridge network.
 bootnodes = ["/dns4/node1/tcp/30303"]
+chain_spec_path = "/etc/neutrino/chain-spec.toml"
+runtime_elf_path = "/usr/local/lib/neutrino-default-runtime"

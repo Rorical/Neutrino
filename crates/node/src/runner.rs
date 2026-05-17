@@ -1,25 +1,30 @@
 //! High-level node lifecycle.
 //!
 //! Builds a libp2p [`NetworkService`], spawns the [`SyncDriver`],
-//! attaches a stub backend, and waits for `SIGINT`/`SIGTERM` before
-//! shutting down. The runner intentionally avoids any pre-existing
-//! consensus state — it is the wiring backbone that subsequent commits
-//! flesh out with engine integration.
+//! attaches a [`SyncBackend`], and waits for `SIGINT`/`SIGTERM` before
+//! shutting down. The backend is selected at startup based on
+//! [`NodeConfig::chain_spec_path`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
-use neutrino_network::sync::LocalProgress;
-use neutrino_sync::{SyncDriver, SyncDriverConfig};
+use neutrino_primitives::{ChainSpec, Hash, ZERO_HASH, blake3_256};
+use neutrino_proof_system::MockProofSystem;
+use neutrino_storage::MemoryDatabase;
+use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::backend::StubSyncBackend;
-use crate::config::NodeConfig;
+use crate::chain_backend::ChainBackend;
+use crate::chain_spec::{ChainSpecError, ChainSpecFile, decode_hex_exact};
+use crate::config::{NodeConfig, NodeRole};
+use crate::producer::{BlockProducerConfig, run_block_producer};
 
 /// Errors returned by [`run`].
 #[derive(Debug, Error)]
@@ -36,6 +41,32 @@ pub enum NodeError {
     /// Network service construction failed.
     #[error("network service error: {0}")]
     Network(#[from] NetworkError),
+    /// Chain spec loading or validation failed.
+    #[error("chain spec error: {0}")]
+    ChainSpec(#[from] ChainSpecError),
+    /// Engine initialisation failed.
+    #[error("engine error: {0}")]
+    Engine(String),
+    /// Reading the runtime ELF failed.
+    #[error("failed to read runtime ELF `{path}`: {source}")]
+    RuntimeElf {
+        /// Runtime ELF path.
+        path: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Runtime ELF hash mismatched an explicit chain-spec hash.
+    #[error("runtime ELF hash mismatch: chain spec {expected:?}, computed {actual:?}")]
+    RuntimeCodeHashMismatch {
+        /// Hash committed in the chain spec.
+        expected: Hash,
+        /// Hash computed from the configured runtime ELF.
+        actual: Hash,
+    },
+    /// Proposer key derivation failed.
+    #[error("proposer key error: {0}")]
+    ProposerKey(String),
     /// Driver loop failed.
     #[error("sync driver error: {0}")]
     Driver(#[from] neutrino_sync::SyncDriverError),
@@ -49,6 +80,7 @@ pub enum NodeError {
 /// # Errors
 ///
 /// Surfaces any of the variants of [`NodeError`].
+#[allow(clippy::too_many_lines)]
 pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     let local_key = Keypair::generate_ed25519();
     let local_peer_id = neutrino_network::PeerId::from(local_key.public());
@@ -107,12 +139,52 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    // Spawn the sync driver.
-    let backend = Arc::new(StubSyncBackend::new(config.chain_id));
-    let local_progress = LocalProgress {
-        chain_id: config.chain_id,
-        ..LocalProgress::default()
+    // Select the sync backend.
+    let mut producer_job: Option<(
+        Arc<ChainBackend<MemoryDatabase, MockProofSystem>>,
+        BlockProducerConfig,
+    )> = None;
+    let backend: Arc<dyn SyncBackend> = if let Some(path) = &config.chain_spec_path {
+        let spec_file = ChainSpecFile::load_from_path(path)?;
+        let runtime_elf = load_runtime_elf(&config)?;
+        let mut chain_spec = spec_file.to_chain_spec()?;
+        apply_runtime_hash(&mut chain_spec, &spec_file, runtime_elf.as_deref())?;
+        if chain_spec.chain_id != config.chain_id {
+            return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
+                "chain spec chain_id {} does not match node config chain_id {}",
+                chain_spec.chain_id, config.chain_id
+            ))));
+        }
+        let production_config =
+            build_block_producer_config(&config, &chain_spec, runtime_elf.as_deref())?;
+        let engine = Engine::genesis(chain_spec, MemoryDatabase::new())
+            .map_err(|err| NodeError::Engine(err.to_string()))?;
+        let proof_system = MockProofSystem::new();
+        info!(
+            chain_id = config.chain_id,
+            backend = "ChainBackend",
+            "using real engine backend"
+        );
+        let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
+        if let Some(production_config) = production_config {
+            producer_job = Some((Arc::clone(&concrete_backend), production_config));
+        }
+        concrete_backend
+    } else {
+        if config.role == NodeRole::Validator
+            && (config.runtime_elf_path.is_some() || config.proposer_ikm_hex.is_some())
+        {
+            warn!("chain_spec_path not set; ignoring validator production config");
+        }
+        info!(
+            chain_id = config.chain_id,
+            backend = "StubSyncBackend",
+            "chain_spec_path not set; using stub backend"
+        );
+        Arc::new(StubSyncBackend::new(config.chain_id))
     };
+
+    let local_progress = backend.local_progress().await;
     let driver_cfg = SyncDriverConfig {
         mode: config.role.sync_mode(),
         ..SyncDriverConfig::default()
@@ -125,6 +197,13 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         event_rx,
     );
     let driver_handle = tokio::spawn(driver.run());
+    let producer_handle = producer_job.map(|(backend, production_config)| {
+        tokio::spawn(run_block_producer(
+            backend,
+            cmd_tx.clone(),
+            production_config,
+        ))
+    });
 
     // Wait for shutdown signal.
     wait_for_shutdown().await?;
@@ -132,12 +211,18 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
 
     // Closing the command channel triggers the network service to stop;
     // dropping the channels propagates to the driver loop.
+    if let Some(handle) = producer_handle.as_ref() {
+        handle.abort();
+    }
     drop(cmd_tx);
 
     // Give tasks a brief grace period to flush logs.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         let _ = network_handle.await;
         let _ = driver_handle.await;
+        if let Some(handle) = producer_handle {
+            let _ = handle.await;
+        }
     })
     .await;
 
@@ -150,6 +235,85 @@ fn topic_from_name(name: &str) -> Option<Topic> {
         .iter()
         .copied()
         .find(|t| t.protocol_string() == name)
+}
+
+fn load_runtime_elf(config: &NodeConfig) -> Result<Option<Vec<u8>>, NodeError> {
+    let Some(path) = &config.runtime_elf_path else {
+        return Ok(None);
+    };
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|source| NodeError::RuntimeElf {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+fn apply_runtime_hash(
+    chain_spec: &mut ChainSpec,
+    spec_file: &ChainSpecFile,
+    runtime_elf: Option<&[u8]>,
+) -> Result<(), NodeError> {
+    let Some(runtime_elf) = runtime_elf else {
+        return Ok(());
+    };
+    let actual = blake3_256(runtime_elf);
+    if spec_file.runtime_code_hash_hex.is_some() && chain_spec.runtime_code_hash != actual {
+        return Err(NodeError::RuntimeCodeHashMismatch {
+            expected: chain_spec.runtime_code_hash,
+            actual,
+        });
+    }
+    if chain_spec.runtime_code_hash == ZERO_HASH {
+        chain_spec.runtime_code_hash = actual;
+        chain_spec
+            .validate()
+            .map_err(|err| NodeError::ChainSpec(ChainSpecError::Validation(err.to_string())))?;
+        info!(runtime_code_hash = ?actual, "derived runtime code hash from runtime ELF");
+    }
+    Ok(())
+}
+
+fn build_block_producer_config(
+    config: &NodeConfig,
+    chain_spec: &ChainSpec,
+    runtime_elf: Option<&[u8]>,
+) -> Result<Option<BlockProducerConfig>, NodeError> {
+    if config.role != NodeRole::Validator {
+        return Ok(None);
+    }
+    let Some(runtime_elf) = runtime_elf else {
+        warn!("validator role configured without runtime_elf_path; block production disabled");
+        return Ok(None);
+    };
+    let Some(ikm_hex) = &config.proposer_ikm_hex else {
+        warn!("validator role configured without proposer_ikm_hex; block production disabled");
+        return Ok(None);
+    };
+
+    let proposer_index = config.proposer_index.unwrap_or(0);
+    let ikm = decode_hex_exact::<32>(ikm_hex, "proposer_ikm_hex")?;
+    let proposer = ProposerKey::from_ikm(&ikm, proposer_index)
+        .map_err(|err| NodeError::ProposerKey(err.to_string()))?;
+
+    let index = usize::try_from(proposer_index).expect("u32 fits usize on supported targets");
+    let validator = chain_spec.initial_validators.get(index).ok_or_else(|| {
+        NodeError::ChainSpec(ChainSpecError::Validation(format!(
+            "proposer_index {proposer_index} is outside initial validator set"
+        )))
+    })?;
+    if validator.pubkey != *proposer.public_key_bytes() {
+        return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
+            "proposer key does not match validator pubkey at index {proposer_index}"
+        ))));
+    }
+
+    Ok(Some(BlockProducerConfig {
+        runtime_elf: runtime_elf.to_vec(),
+        proposer,
+        genesis_time_secs: chain_spec.genesis_time,
+        slot_duration_secs: chain_spec.consensus.slot_duration_secs,
+    }))
 }
 
 async fn wait_for_shutdown() -> Result<(), std::io::Error> {

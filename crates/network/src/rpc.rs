@@ -125,6 +125,8 @@ impl RpcProtocol {
 pub struct Status {
     /// Chain identifier; mismatching peers should be disconnected.
     pub chain_id: ChainId,
+    /// Canonical hash of the local chain spec.
+    pub chain_spec_hash: Hash,
     /// Highest checkpoint index finalized by the local node.
     pub finalized_checkpoint_index: CheckpointIndex,
     /// Hash of the highest finalized [`Checkpoint`].
@@ -613,6 +615,7 @@ mod tests {
             (
                 RpcRequest::Status(Status {
                     chain_id: 1,
+                    chain_spec_hash: [0; 32],
                     finalized_checkpoint_index: 0,
                     finalized_checkpoint_hash: [0; 32],
                     head_block_hash: [0; 32],
@@ -696,6 +699,7 @@ mod tests {
     fn status_round_trips_via_borsh() {
         let status = Status {
             chain_id: 7,
+            chain_spec_hash: [9; 32],
             finalized_checkpoint_index: 12,
             finalized_checkpoint_hash: [1; 32],
             head_block_hash: [2; 32],
@@ -745,6 +749,7 @@ mod tests {
     async fn borsh_codec_round_trips_status() {
         let req = Status {
             chain_id: 9,
+            chain_spec_hash: [8; 32],
             finalized_checkpoint_index: 1,
             finalized_checkpoint_hash: [3; 32],
             head_block_hash: [4; 32],

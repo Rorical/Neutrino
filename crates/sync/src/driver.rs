@@ -167,7 +167,7 @@ impl SyncDriver {
                 new_head_hash,
                 new_head_slot,
             }) => {
-                debug!(
+                info!(
                     new_head_height,
                     head_hash = %hex_short(&new_head_hash),
                     new_head_slot,
@@ -503,6 +503,12 @@ impl SyncDriver {
                 new_head_hash,
                 new_head_slot,
             }) => {
+                info!(
+                    new_head_height,
+                    head_hash = %hex_short(&new_head_hash),
+                    new_head_slot,
+                    "imported block batch"
+                );
                 let cmds = self.fsm.on_event(SyncEvent::HeadersAdvanced {
                     new_head_height,
                     new_head_hash,

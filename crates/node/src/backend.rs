@@ -72,6 +72,7 @@ impl SyncBackend for StubSyncBackend {
         let snap = self.snapshot();
         Status {
             chain_id: self.chain_id,
+            chain_spec_hash: ZERO_HASH,
             finalized_checkpoint_index: 0,
             finalized_checkpoint_hash: ZERO_HASH,
             head_block_hash: snap.head_hash,
@@ -84,6 +85,7 @@ impl SyncBackend for StubSyncBackend {
         let snap = self.snapshot();
         LocalProgress {
             chain_id: self.chain_id,
+            chain_spec_hash: ZERO_HASH,
             finalized_checkpoint_index: 0,
             finalized_checkpoint_hash: ZERO_HASH,
             finalized_state_root: ZERO_HASH,

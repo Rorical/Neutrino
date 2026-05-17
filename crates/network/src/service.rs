@@ -1501,6 +1501,7 @@ mod tests {
         // distinguishable Status payload so we can assert on it from A.
         let canned_b_status = rpc::Status {
             chain_id: 7,
+            chain_spec_hash: [0xAB; 32],
             finalized_checkpoint_index: 42,
             finalized_checkpoint_hash: [0xBB; 32],
             head_block_hash: [0xCC; 32],
@@ -1531,6 +1532,7 @@ mod tests {
         // A sends a Status request to B.
         let a_status = rpc::Status {
             chain_id: 7,
+            chain_spec_hash: [0xAB; 32],
             finalized_checkpoint_index: 5,
             finalized_checkpoint_hash: [0xAA; 32],
             head_block_hash: [0xDD; 32],

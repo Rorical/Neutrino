@@ -91,5 +91,39 @@ for node in "${NODES[@]}"; do
     echo "  ${node}: ${count} topic subscriptions"
 done
 
+DEADLINE=$(( $(date +%s) + 60 ))
+echo "--- waiting for validator block production ---"
+while :; do
+    if [[ $(date +%s) -ge ${DEADLINE} ]]; then
+        echo "timeout: node1 did not produce a block" >&2
+        "${COMPOSE[@]}" -f docker-compose.yml logs --tail=120 node1 >&2 || true
+        exit 1
+    fi
+    count=$(docker logs neutrino-m6-node1 2>&1 | grep -c "produced and published block" || true)
+    if [[ ${count} -ge 1 ]]; then
+        echo "  node1: ${count} produced block(s)"
+        break
+    fi
+    sleep 1
+done
+
+echo "--- verifying gossipped block import on followers ---"
+for node in node2 node3; do
+    container="neutrino-m6-${node}"
+    while :; do
+        if [[ $(date +%s) -ge ${DEADLINE} ]]; then
+            echo "timeout: ${node} did not import a gossipped block" >&2
+            "${COMPOSE[@]}" -f docker-compose.yml logs --tail=120 "${node}" >&2 || true
+            exit 1
+        fi
+        count=$(docker logs "${container}" 2>&1 | grep -c "imported gossipped block" || true)
+        if [[ ${count} -ge 1 ]]; then
+            echo "  ${node}: ${count} imported block(s)"
+            break
+        fi
+        sleep 1
+    done
+done
+
 echo
 echo "--- M6 smoke test passed ---"

@@ -1631,6 +1631,167 @@ fn slashing_a_dust_validator_removes_them_from_the_active_set() {
     assert_eq!(overlay.get(VS_KEY), Some(vs2.to_vec()));
 }
 
+// -------- M7-D.3 inactivity-leak tests --------------------------------------
+
+const TX_INACTIVITY_LEAK_BATCH: u8 = 0x06;
+const LEAK_THROUGH_KEY: &[u8] = b"leak:through";
+
+fn make_inactivity_leak_batch(chunk_id: u64, pubkeys: &[BlsPublicKey]) -> Vec<u8> {
+    let mut txn = Vec::with_capacity(1 + 8 + 4 + pubkeys.len() * BLS_KEY_LEN);
+    txn.push(TX_INACTIVITY_LEAK_BATCH);
+    txn.extend_from_slice(&chunk_id.to_le_bytes());
+    txn.extend_from_slice(
+        &u32::try_from(pubkeys.len())
+            .expect("count fits")
+            .to_le_bytes(),
+    );
+    for pk in pubkeys {
+        txn.extend_from_slice(pk);
+    }
+    txn
+}
+
+#[test]
+fn inactivity_leak_batch_decreases_stake_by_ten_basis_points_per_validator() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping inactivity-leak test.");
+        return;
+    };
+
+    let bls_a = bls_pk(0xA);
+    let bls_b = bls_pk(0xB);
+
+    // Deposit 1_000_000 for two validators.
+    let body1 = body_from_txns(&[
+        make_deposit_txn(bls_a, 1_000_000, [0u8; DEP_POP_LEN]),
+        make_deposit_txn(bls_b, 1_000_000, [0u8; DEP_POP_LEN]),
+    ]);
+    let mut overlay = Overlay::empty();
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(1, overlay.base_root()),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("deposits");
+
+    // Apply inactivity leak for chunk 5 listing both validators.
+    let batch = make_inactivity_leak_batch(5, &[bls_a, bls_b]);
+    let body2 = body_from_txns(&[batch]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(2, overlay.base_root()),
+        body2,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("leak");
+
+    // 0.1% of 1_000_000 = 1_000 → 999_000 remaining for each.
+    let expected_after = 1_000_000_u64 - 1_000_u64;
+    assert_eq!(
+        overlay.get(&stk_key(&bls_a)),
+        Some(make_stake_value(expected_after, [0u8; 32]))
+    );
+    assert_eq!(
+        overlay.get(&stk_key(&bls_b)),
+        Some(make_stake_value(expected_after, [0u8; 32]))
+    );
+    // The `leak:through` pointer advanced to chunk 5.
+    assert_eq!(
+        overlay.get(LEAK_THROUGH_KEY),
+        Some(5u64.to_le_bytes().to_vec())
+    );
+}
+
+#[test]
+fn inactivity_leak_batch_is_idempotent_against_earlier_chunks() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping inactivity-leak-idempotency test.");
+        return;
+    };
+
+    let bls = bls_pk(0xC);
+    let body1 = body_from_txns(&[make_deposit_txn(bls, 1_000_000, [0u8; DEP_POP_LEN])]);
+    let mut overlay = Overlay::empty();
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(1, overlay.base_root()),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("deposit");
+
+    // First leak at chunk 10 → applied.
+    let body2 = body_from_txns(&[make_inactivity_leak_batch(10, &[bls])]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(2, overlay.base_root()),
+        body2,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("first leak");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(999_000, [0u8; 32]))
+    );
+
+    // Second leak at chunk 10 → silently ignored (chunk_id <= pointer).
+    let body3 = body_from_txns(&[make_inactivity_leak_batch(10, &[bls])]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(3, overlay.base_root()),
+        body3,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("dup leak");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(999_000, [0u8; 32])),
+        "duplicate leak for the same chunk must be a no-op"
+    );
+
+    // Leak at chunk 9 (lower than pointer) → also ignored.
+    let body4 = body_from_txns(&[make_inactivity_leak_batch(9, &[bls])]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(4, overlay.base_root()),
+        body4,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("stale leak");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(999_000, [0u8; 32])),
+        "leak for an older chunk must be a no-op"
+    );
+
+    // Leak at chunk 11 → applied (and pointer advances).
+    let body5 = body_from_txns(&[make_inactivity_leak_batch(11, &[bls])]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(5, overlay.base_root()),
+        body5,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("forward leak");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(998_001, [0u8; 32])),
+        "999_000 → 999_000 - 999 = 998_001 (penalty rounded down)"
+    );
+    assert_eq!(
+        overlay.get(LEAK_THROUGH_KEY),
+        Some(11u64.to_le_bytes().to_vec())
+    );
+}
+
 #[test]
 fn slash_with_no_prior_stake_is_a_noop() {
     let Some(elf) = read_elf() else {

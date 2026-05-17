@@ -499,6 +499,44 @@ impl<DB: Database> Engine<DB> {
         Ok(self.slashing_monitor.record_header(header))
     }
 
+    /// Compute the set of validator indices that did not sign the
+    /// finalized precommit quorum for `chunk_id`.
+    ///
+    /// Used by the M7-D.3 inactivity-leak emission path: the chain
+    /// backend turns the returned set into a single
+    /// `TX_INACTIVITY_LEAK_BATCH` runtime transaction that deducts
+    /// a small percentage from each non-participating validator's
+    /// staked balance.
+    ///
+    /// Returns an empty vector when the chunk's finality cert is
+    /// missing or every active validator participated.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces store errors.
+    pub fn compute_inactivity_report(
+        &self,
+        chunk_id: ChunkId,
+    ) -> Result<Vec<neutrino_primitives::ValidatorIndex>, StoreError<DB::Error>> {
+        let Some(cert) = self.store().get_finality_cert(chunk_id)? else {
+            return Ok(Vec::new());
+        };
+        let active_set = self.active_validator_set();
+        let mut missing = Vec::new();
+        for (idx, _) in active_set.iter().enumerate() {
+            let idx_u32 = u32::try_from(idx).expect("u32 fits usize on supported targets");
+            if !cert
+                .precommit
+                .aggregation_bits
+                .get(idx_u32)
+                .unwrap_or(false)
+            {
+                missing.push(idx_u32);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Subnet index used by the M7-C aggregator role to route the
     /// aggregated vote for `chunk_id` onto a single
     /// [`neutrino_network::Topic::AggregateFinalityVotes`] subnet.

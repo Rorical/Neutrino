@@ -95,11 +95,28 @@ const TX_EXIT: u8 = 0x04;
 /// validator-set snapshot the engine reads at chunk boundaries.
 const TX_SLASH: u8 = 0x05;
 
+/// Transaction type tag: engine-provided inactivity-leak batch.
+///
+/// Format:
+/// `[0x06] || chunk_id (u64 LE) || count (u32 LE) || (bls_pubkey × count)`.
+///
+/// Applies [`INACTIVITY_PENALTY_BPS`] basis points of each listed
+/// validator's currently-staked amount and bumps the
+/// [`LEAK_THROUGH_KEY`] state pointer to `chunk_id`. Batches at or
+/// below the pointer are silently ignored so the same chunk's leak
+/// cannot be applied twice across producers.
+const TX_INACTIVITY_LEAK_BATCH: u8 = 0x06;
+
 /// Slashing penalty in basis points (1 bp = 0.01%). Applied to the
 /// offender's `staked` balance on every [`TX_SLASH`]. 100 bp = 1%
 /// matches the M7-B doc 02 §2.7 recommendation for the four
 /// "double-X" and "InvalidVrfClaim" objective conditions.
 const SLASH_PENALTY_BPS: u64 = 100;
+
+/// Inactivity-leak penalty in basis points. 10 bp = 0.1% per
+/// missed chunk: much smaller than the slashing penalty since
+/// unavailability is not objectively malicious, just non-productive.
+const INACTIVITY_PENALTY_BPS: u64 = 10;
 
 /// Byte ranges within a transfer.
 const XFR_FROM_OFF: usize = 1;
@@ -129,6 +146,24 @@ const EXT_BLS_OFF: usize = 1;
 const SLASH_BLS_OFF: usize = 1;
 /// Total wire size of a [`TX_SLASH`] transaction: type tag + BLS pubkey.
 const SLASH_TX_LEN: usize = 1 + BLS_KEY_LEN;
+
+/// Byte ranges within an inactivity-leak batch.
+const LEAK_CHUNK_ID_OFF: usize = 1;
+const LEAK_COUNT_OFF: usize = 9;
+const LEAK_PUBKEYS_OFF: usize = 13;
+/// Minimum wire size of an empty [`TX_INACTIVITY_LEAK_BATCH`]
+/// transaction: type tag + chunk_id (8) + count (4) = 13 bytes.
+const LEAK_HEADER_LEN: usize = LEAK_PUBKEYS_OFF;
+/// Maximum number of validators carried in a single inactivity-leak
+/// batch. Sized to fit comfortably alongside other body lanes
+/// inside the runtime's 4 KiB input buffer.
+const MAX_LEAK_BATCH_COUNT: u32 = 32;
+/// State key storing the highest chunk id for which an inactivity
+/// leak has been applied. Used for idempotent batch application:
+/// the runtime ignores batches at or below this pointer.
+const LEAK_THROUGH_KEY: &[u8] = b"leak:through";
+/// Wire encoding of the [`LEAK_THROUGH_KEY`] value: u64 LE chunk id.
+const LEAK_THROUGH_LEN: usize = 8;
 
 /// Maximum host-input body bytes the runtime will attempt to read.
 const BODY_BUF: usize = 4096;
@@ -726,6 +761,84 @@ fn validate_slash(txn: &[u8]) -> TxValidationCode {
     TxValidationCode::Valid
 }
 
+/// Validate an inactivity-leak batch transaction.
+fn validate_inactivity_leak_batch(txn: &[u8]) -> TxValidationCode {
+    if txn.len() < LEAK_HEADER_LEN {
+        return TxValidationCode::Malformed;
+    }
+    let count = read_u32_le(txn, LEAK_COUNT_OFF);
+    if count == 0 || count > MAX_LEAK_BATCH_COUNT {
+        return TxValidationCode::Malformed;
+    }
+    let expected = LEAK_HEADER_LEN.saturating_add((count as usize).saturating_mul(BLS_KEY_LEN));
+    if txn.len() < expected {
+        return TxValidationCode::Malformed;
+    }
+    TxValidationCode::Valid
+}
+
+/// Read the `leak:through` chunk-id pointer; missing pointer
+/// surfaces as `0` so the first ever leak (chunk 0) is permitted.
+fn read_leak_through() -> u64 {
+    let mut value = [0u8; LEAK_THROUGH_LEN];
+    let (status, _len) = syscalls::state_read(
+        LEAK_THROUGH_KEY.as_ptr() as u32,
+        LEAK_THROUGH_KEY.len() as u32,
+        value.as_mut_ptr() as u32,
+        LEAK_THROUGH_LEN as u32,
+    );
+    match status {
+        STATUS_OK => u64::from_le_bytes(value),
+        STATUS_NOT_FOUND => 0,
+        other => syscalls::abort(other),
+    }
+}
+
+/// Persist the `leak:through` chunk-id pointer.
+fn write_leak_through(chunk_id: u64) {
+    let bytes = chunk_id.to_le_bytes();
+    syscalls::state_write(
+        LEAK_THROUGH_KEY.as_ptr() as u32,
+        LEAK_THROUGH_KEY.len() as u32,
+        bytes.as_ptr() as u32,
+        LEAK_THROUGH_LEN as u32,
+    );
+}
+
+/// Apply an inactivity-leak batch transaction.
+///
+/// Skips silently when `chunk_id <= read_leak_through()` so
+/// multiple producers cannot apply the same chunk's leak twice.
+/// Otherwise deducts [`INACTIVITY_PENALTY_BPS`] of each listed
+/// validator's `staked` balance with a floor of 1 unit, then
+/// advances the pointer to `chunk_id`.
+fn apply_inactivity_leak_batch(txn: &[u8]) {
+    let chunk_id = read_u64_le(txn, LEAK_CHUNK_ID_OFF);
+    if chunk_id != 0 && chunk_id <= read_leak_through() {
+        return;
+    }
+    let count = read_u32_le(txn, LEAK_COUNT_OFF);
+    for i in 0..count {
+        let off = LEAK_PUBKEYS_OFF + (i as usize) * BLS_KEY_LEN;
+        let bls_pk: [u8; BLS_KEY_LEN] =
+            txn[off..off + BLS_KEY_LEN].try_into().expect("48-byte bls");
+        let mut stk = read_stake_account(&bls_pk);
+        if stk.staked == 0 {
+            continue;
+        }
+        let penalty = (stk.staked.saturating_mul(INACTIVITY_PENALTY_BPS) / 10_000).max(1);
+        stk.staked = stk.staked.saturating_sub(penalty);
+        if stk.staked == 0 {
+            delete_stake_account(&bls_pk);
+            update_validator_set(TX_INACTIVITY_LEAK_BATCH, &bls_pk, 0);
+        } else {
+            write_stake_account(&bls_pk, &stk);
+            update_validator_set(TX_INACTIVITY_LEAK_BATCH, &bls_pk, stk.staked);
+        }
+    }
+    write_leak_through(chunk_id);
+}
+
 /// Apply a slashing transaction: deduct [`SLASH_PENALTY_BPS`] of
 /// the offender's current `staked` balance and refresh the
 /// validator-set snapshot. A validator whose stake reaches zero is
@@ -761,6 +874,7 @@ fn transaction_validity(txn: &[u8]) -> TxValidationCode {
         TX_DEPOSIT => validate_deposit(txn),
         TX_EXIT => validate_exit(txn),
         TX_SLASH => validate_slash(txn),
+        TX_INACTIVITY_LEAK_BATCH => validate_inactivity_leak_batch(txn),
         _other => TxValidationCode::UnknownType,
     }
 }
@@ -794,6 +908,7 @@ fn process_transaction(txn: &[u8]) {
         TX_DEPOSIT => apply_deposit(txn),
         TX_EXIT => apply_exit(txn),
         TX_SLASH => apply_slash(txn),
+        TX_INACTIVITY_LEAK_BATCH => apply_inactivity_leak_batch(txn),
         _other => syscalls::abort(ABORT_BAD_TXN_TYPE),
     }
 }

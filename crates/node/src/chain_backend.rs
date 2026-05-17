@@ -86,6 +86,20 @@ const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 3_500;
 /// pool to the limit.
 const DEFAULT_BODY_SLASHING_BUDGET: usize = 32;
 
+/// Default cap on the number of inactivity-leak batches pulled into
+/// a single block body. Each batch already carries up to 32
+/// validators; a value of 4 lets the producer drain a small
+/// backlog without exceeding the runtime's input buffer.
+const DEFAULT_BODY_INACTIVITY_BATCH_BUDGET: usize = 4;
+
+/// Maximum validators per [`TX_INACTIVITY_LEAK_BATCH`] transaction.
+/// Mirrors the runtime-side `MAX_LEAK_BATCH_COUNT` so the encoder
+/// silently splits an over-sized report into chunks of this size.
+const MAX_INACTIVITY_BATCH_COUNT: usize = 32;
+
+/// Runtime wire tag for the inactivity-leak batch transaction.
+const TX_INACTIVITY_LEAK_BATCH: u8 = 0x06;
+
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
 /// Internally wraps an [`Engine`] behind a `std::sync::Mutex`. The mutex
@@ -115,6 +129,30 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// a block body's `slashings` field. M7-D will switch this to a
     /// persistent column once the runtime starts applying penalties.
     slashing_pool: Mutex<SlashingPool>,
+    /// FIFO pool of encoded [`TX_INACTIVITY_LEAK_BATCH`] runtime
+    /// transactions produced after every chunk finalization.
+    /// Drained by the producer alongside the mempool into
+    /// `body.transactions`; idempotency against multi-producer
+    /// double-application is enforced by the runtime's
+    /// `leak:through` pointer.
+    inactivity_pool: Mutex<Vec<Vec<u8>>>,
+}
+
+/// Encode a single `TX_INACTIVITY_LEAK_BATCH` runtime transaction
+/// for the given chunk id and validator BLS pubkeys.
+///
+/// Wire format mirrors the runtime side:
+/// `tag (1) || chunk_id (8 LE) || count (4 LE) || pubkey × count`.
+fn encode_inactivity_batch(chunk_id: ChunkId, pubkeys: &[[u8; 48]]) -> Vec<u8> {
+    let count = u32::try_from(pubkeys.len()).expect("batch count fits u32");
+    let mut tx = Vec::with_capacity(1 + 8 + 4 + pubkeys.len() * 48);
+    tx.push(TX_INACTIVITY_LEAK_BATCH);
+    tx.extend_from_slice(&chunk_id.to_le_bytes());
+    tx.extend_from_slice(&count.to_le_bytes());
+    for pk in pubkeys {
+        tx.extend_from_slice(pk);
+    }
+    tx
 }
 
 /// FIFO pool of [`SlashingEvidence`] with dedup-by-content. Two
@@ -172,6 +210,7 @@ where
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(SlashingPool::default()),
+            inactivity_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -195,6 +234,7 @@ where
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(SlashingPool::default()),
+            inactivity_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -349,11 +389,19 @@ where
         proposer: &ProposerKey,
         runtime_elf: &[u8],
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
-        let drained = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
-        let drained_hashes: Vec<Hash> = drained.iter().map(|tx| blake3_256(tx)).collect();
+        // Inactivity-leak batches are prepended to the mempool drain
+        // so a saturated mempool cannot starve them out of the body.
+        // Each batch is already an opaque runtime transaction
+        // (TX_INACTIVITY_LEAK_BATCH); the runtime applies it
+        // alongside any other tx in body.transactions.
+        let drained_inactivity = self.drain_inactivity_pool(DEFAULT_BODY_INACTIVITY_BATCH_BUDGET);
+        let drained_mempool = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
+        let drained_hashes: Vec<Hash> = drained_mempool.iter().map(|tx| blake3_256(tx)).collect();
         let drained_slashings = self.drain_slashing_pool(DEFAULT_BODY_SLASHING_BUDGET);
+        let mut all_txs = drained_inactivity.clone();
+        all_txs.extend(drained_mempool.iter().cloned());
         let body = Body {
-            transactions: drained.clone(),
+            transactions: all_txs,
             slashings: drained_slashings.clone(),
             ..Body::default()
         };
@@ -366,13 +414,15 @@ where
             e.try_produce_block(slot, cfg, body, gas_limit)
         });
         // On Ok(Some) the engine consumed the body — the drained
-        // transactions and slashings are now committed. On Ok(None)
-        // (not eligible) the engine did not touch the body; on Err
-        // the engine rejected. Restore both drained pools in either
-        // non-success case so the next slot can retry them.
+        // transactions, slashings, and inactivity leaks are now
+        // committed. On Ok(None) (not eligible) the engine did not
+        // touch the body; on Err the engine rejected. Restore every
+        // drained pool in either non-success case so the next slot
+        // can retry them.
         if !matches!(&result, Ok(Some(_))) {
-            self.restore_to_mempool(drained);
+            self.restore_to_mempool(drained_mempool);
             self.restore_to_slashing_pool(drained_slashings);
+            self.restore_to_inactivity_pool(drained_inactivity);
         }
         let _ = drained_hashes; // hashes are only useful for log filtering today
         result
@@ -385,6 +435,72 @@ where
             .expect("ChainBackend slashing_pool poisoned");
         for item in evidence {
             pool.insert(item);
+        }
+    }
+
+    fn restore_to_inactivity_pool(&self, batches: Vec<Vec<u8>>) {
+        let mut pool = self
+            .inactivity_pool
+            .lock()
+            .expect("ChainBackend inactivity_pool poisoned");
+        // Restore at the head to preserve the original FIFO order.
+        let mut combined = batches;
+        combined.append(&mut pool);
+        *pool = combined;
+    }
+
+    /// Number of inactivity-leak batches currently pooled.
+    #[must_use]
+    pub fn inactivity_pool_len(&self) -> usize {
+        self.inactivity_pool
+            .lock()
+            .expect("ChainBackend inactivity_pool poisoned")
+            .len()
+    }
+
+    /// Drain up to `max` inactivity-leak batches in FIFO order.
+    /// Used by the producer when assembling a block body's
+    /// transaction list.
+    pub fn drain_inactivity_pool(&self, max: usize) -> Vec<Vec<u8>> {
+        let mut pool = self
+            .inactivity_pool
+            .lock()
+            .expect("ChainBackend inactivity_pool poisoned");
+        let take = max.min(pool.len());
+        pool.drain(..take).collect()
+    }
+
+    /// Compute and pool the inactivity-leak batch for `chunk_id`.
+    /// Splits the non-participant set into batches of at most
+    /// [`MAX_INACTIVITY_BATCH_COUNT`] validators so each fits
+    /// comfortably inside the runtime input buffer.
+    fn pool_inactivity_leak_for(&self, chunk_id: ChunkId) {
+        let report = self.with_engine(|e| e.compute_inactivity_report(chunk_id));
+        let Ok(report) = report else {
+            return;
+        };
+        if report.is_empty() {
+            return;
+        }
+        let pubkeys = self.with_engine(|e| {
+            let active = e.active_validator_set();
+            report
+                .iter()
+                .filter_map(|idx| {
+                    let pos = usize::try_from(*idx).ok()?;
+                    active.get(pos).map(|v| v.pubkey)
+                })
+                .collect::<Vec<_>>()
+        });
+        if pubkeys.is_empty() {
+            return;
+        }
+        let mut pool = self
+            .inactivity_pool
+            .lock()
+            .expect("ChainBackend inactivity_pool poisoned");
+        for chunk_pubkeys in pubkeys.chunks(MAX_INACTIVITY_BATCH_COUNT) {
+            pool.push(encode_inactivity_batch(chunk_id, chunk_pubkeys));
         }
     }
 
@@ -747,7 +863,10 @@ where
     /// Drive [`Engine::finalize_chunk`] now that the BFT session for
     /// `chunk_id` has reached its 2/3 precommit quorum, persist the
     /// resulting chunk proof and recursive checkpoint, and gossip
-    /// both.
+    /// both. After persistence, pool a `TX_INACTIVITY_LEAK_BATCH`
+    /// for every validator that missed the precommit quorum so the
+    /// next produced block applies the M7-D.3 inactivity penalty
+    /// on-chain.
     async fn handle_quorum_reached(&self, chunk_id: ChunkId) {
         let Some(voter) = self.local_voter() else {
             debug!(chunk_id, "QuorumReached but no local voter configured");
@@ -762,6 +881,14 @@ where
                 return;
             }
         };
+
+        // M7-D.3: derive the inactivity report from the freshly-
+        // persisted finality cert and pool a leak batch so the next
+        // block the local node produces applies the penalty
+        // on-chain. The runtime's `leak:through` pointer guards
+        // against multi-producer double-application across the
+        // network.
+        self.pool_inactivity_leak_for(chunk_id);
 
         if let Some(publisher) = self.publisher_snapshot() {
             match borsh::to_vec(&finalize_outcome.chunk_proof) {

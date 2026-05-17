@@ -499,6 +499,46 @@ impl<DB: Database> Engine<DB> {
         Ok(self.slashing_monitor.record_header(header))
     }
 
+    /// Subnet index used by the M7-C aggregator role to route the
+    /// aggregated vote for `chunk_id` onto a single
+    /// [`neutrino_network::Topic::AggregateFinalityVotes`] subnet.
+    ///
+    /// The mapping is deterministic across the network: every node
+    /// derives the same subnet from `chunk_id` and the chain spec's
+    /// `vote_subnets`, so a publisher and a subscriber never need
+    /// to coordinate which subnet to use for a given chunk.
+    #[must_use]
+    pub fn subnet_for_chunk(&self, chunk_id: ChunkId) -> u8 {
+        let subnets = u64::from(self.chain_spec.consensus.vote_subnets.max(1));
+        u8::try_from(chunk_id % subnets).expect("modulo by u16 fits u8")
+    }
+
+    /// Whether the local validator is part of the VRF-elected
+    /// aggregator committee for `(chunk_id, round)`.
+    ///
+    /// Returns `false` when no local voter is configured, when the
+    /// committee selection itself errors (e.g. empty active set),
+    /// or when the local validator's index is not selected.
+    #[must_use]
+    pub fn local_is_aggregator_for(&self, chunk_id: ChunkId, round: u32) -> bool {
+        let Some(voter) = self.local_voter.as_ref() else {
+            return false;
+        };
+        let local_idx = voter.validator_index();
+        let Ok(committee) = neutrino_consensus_vrf::aggregator_committee(
+            self.active_validator_set(),
+            &self.finalized_seed(),
+            chunk_id,
+            round,
+            self.chain_spec.consensus.expected_aggregators_per_round,
+        ) else {
+            return false;
+        };
+        committee
+            .iter()
+            .any(|selection| selection.validator_index == local_idx)
+    }
+
     /// Observe a finality vote for slashing detection.
     ///
     /// Only single-signer (partial) votes participate in detection.

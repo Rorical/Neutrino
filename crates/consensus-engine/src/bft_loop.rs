@@ -84,6 +84,20 @@ pub struct BftSession {
     bft: ChunkBft,
     local: LocalVoteProgress,
     peer_quorum: PeerQuorumProgress,
+    /// Whether the local validator was elected as an aggregator for
+    /// `(chunk_id, round=0)`. Cached at session-open time; round
+    /// timeouts (deferred to M7-D) will refresh this.
+    is_local_aggregator: bool,
+    /// Subnet routing for the union-aggregated vote when this node
+    /// publishes aggregate prevotes / precommits.
+    subnet: u8,
+    /// Aggregate prevote stake last published as an aggregator
+    /// action; used to suppress re-publishing the same union vote
+    /// when no new partial votes arrived.
+    last_published_aggregate_prevote_stake: u64,
+    /// Aggregate precommit stake last published as an aggregator
+    /// action.
+    last_published_aggregate_precommit_stake: u64,
 }
 
 impl BftSession {
@@ -140,6 +154,19 @@ impl BftSession {
     pub const fn chunk_bft(&self) -> &ChunkBft {
         &self.bft
     }
+
+    /// Whether the local validator was elected into the VRF
+    /// aggregator committee for this chunk and round.
+    #[must_use]
+    pub const fn is_local_aggregator(&self) -> bool {
+        self.is_local_aggregator
+    }
+
+    /// Subnet routing for the local aggregate publications.
+    #[must_use]
+    pub const fn subnet(&self) -> u8 {
+        self.subnet
+    }
 }
 
 /// External effect the engine wants the caller to perform after a
@@ -158,6 +185,25 @@ pub enum BftAction {
     /// Publish the carried finality vote on
     /// `Topic::FinalityVotesPrecommit`.
     BroadcastPrecommit(FinalityVote),
+    /// The local validator was elected as an aggregator for this
+    /// chunk and round and its locally-accumulated aggregate
+    /// prevote has grown since the last publish. Caller should
+    /// gossip on `Topic::AggregateFinalityVotes(subnet)`.
+    PublishAggregatePrevote {
+        /// Subnet topic suffix derived from the chunk id.
+        subnet: u8,
+        /// Union-aggregated vote covering every partial prevote
+        /// recorded locally so far.
+        vote: FinalityVote,
+    },
+    /// Same as [`BftAction::PublishAggregatePrevote`] for precommits.
+    PublishAggregatePrecommit {
+        /// Subnet topic suffix derived from the chunk id.
+        subnet: u8,
+        /// Union-aggregated vote covering every partial precommit
+        /// recorded locally so far.
+        vote: FinalityVote,
+    },
     /// The 2/3 precommit quorum has been reached for this chunk.
     /// Caller should invoke
     /// [`Engine::finalize_chunk`](crate::Engine::finalize_chunk).
@@ -298,12 +344,18 @@ impl<DB: Database> Engine<DB> {
                 consensus.bft_precommit_quorum_denominator,
             ),
         )?;
+        let is_local_aggregator = self.local_is_aggregator_for(chunk_id, bft.round());
+        let subnet = self.subnet_for_chunk(chunk_id);
         let mut session = BftSession {
             chunk_id,
             chunk_hash,
             bft,
             local: LocalVoteProgress::Idle,
             peer_quorum: PeerQuorumProgress::BelowPrevote,
+            is_local_aggregator,
+            subnet,
+            last_published_aggregate_prevote_stake: 0,
+            last_published_aggregate_precommit_stake: 0,
         };
 
         let mut actions = Vec::new();
@@ -333,6 +385,7 @@ impl<DB: Database> Engine<DB> {
             active_set_len,
             &mut actions,
         )?;
+        emit_aggregator_actions(&mut session, &mut actions);
 
         self.bft_sessions.insert(chunk_id, session);
         Ok(actions)
@@ -383,6 +436,7 @@ impl<DB: Database> Engine<DB> {
             active_set_len,
             &mut actions,
         )?;
+        emit_aggregator_actions(session, &mut actions);
         Ok(actions)
     }
 
@@ -450,6 +504,57 @@ fn recompute_quorum_transitions<E>(
         actions.push(BftAction::QuorumReached(session.chunk_id));
     }
     Ok(())
+}
+
+/// If the local validator is in the aggregator committee for this
+/// session and the union-aggregated stake has grown since the last
+/// publish, emit a [`BftAction::PublishAggregatePrevote`] /
+/// [`BftAction::PublishAggregatePrecommit`] carrying the
+/// current aggregate.
+fn emit_aggregator_actions(session: &mut BftSession, actions: &mut Vec<BftAction>) {
+    if !session.is_local_aggregator {
+        return;
+    }
+    let prevote_stake = session.bft.aggregate_stake(FinalityVotePhase::Prevote);
+    if prevote_stake > session.last_published_aggregate_prevote_stake
+        && let Some(aggregate) = session.bft.current_aggregate(FinalityVotePhase::Prevote)
+    {
+        let vote = FinalityVote {
+            aggregation_bits: aggregate.aggregation_bits,
+            data: FinalityVoteData {
+                chunk_id: session.chunk_id,
+                round: session.bft.round(),
+                chunk_hash: session.chunk_hash,
+                phase: FinalityVotePhase::Prevote,
+            },
+            signature: aggregate.signature,
+        };
+        actions.push(BftAction::PublishAggregatePrevote {
+            subnet: session.subnet,
+            vote,
+        });
+        session.last_published_aggregate_prevote_stake = prevote_stake;
+    }
+    let precommit_stake = session.bft.aggregate_stake(FinalityVotePhase::Precommit);
+    if precommit_stake > session.last_published_aggregate_precommit_stake
+        && let Some(aggregate) = session.bft.current_aggregate(FinalityVotePhase::Precommit)
+    {
+        let vote = FinalityVote {
+            aggregation_bits: aggregate.aggregation_bits,
+            data: FinalityVoteData {
+                chunk_id: session.chunk_id,
+                round: session.bft.round(),
+                chunk_hash: session.chunk_hash,
+                phase: FinalityVotePhase::Precommit,
+            },
+            signature: aggregate.signature,
+        };
+        actions.push(BftAction::PublishAggregatePrecommit {
+            subnet: session.subnet,
+            vote,
+        });
+        session.last_published_aggregate_precommit_stake = precommit_stake;
+    }
 }
 
 /// Build and sign the local validator's vote for `(chunk_id, round,
@@ -531,6 +636,15 @@ mod tests {
             history_root: ZERO_HASH,
             proof_system_version: proof.proof_system_version,
         };
+        // M7-C: keep the foundational session tests deterministic by
+        // pinning `expected_aggregators_per_round` to a value so
+        // small that no validator clears the VRF threshold. Tests
+        // that want aggregator behaviour build their own spec via
+        // [`chain_spec_with_aggregators`].
+        let consensus = ConsensusParams {
+            expected_aggregators_per_round: 1,
+            ..ConsensusParams::default()
+        };
         ChainSpec {
             spec_version: CHAIN_SPEC_VERSION,
             name: BoundedBytes::new(b"bft-loop-test".to_vec()).expect("name fits"),
@@ -544,13 +658,22 @@ mod tests {
             genesis_block_hash,
             genesis_validator_set_root: vs_root,
             genesis_checkpoint: checkpoint,
-            consensus: ConsensusParams::default(),
+            consensus,
             proof,
             state: StateParams::default(),
             light_client: LightClientParams::default(),
             initial_validators: validators,
             metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
         }
+    }
+
+    fn chain_spec_with_aggregators(n: u8) -> ChainSpec {
+        let mut spec = chain_spec_with(n);
+        // Pin a large expectation so every validator clears the
+        // aggregator threshold deterministically.
+        spec.consensus.expected_aggregators_per_round =
+            neutrino_primitives::fixed_u128_from_integer(100);
+        spec
     }
 
     fn dummy_chunk(
@@ -678,6 +801,114 @@ mod tests {
             err,
             BftLoopError::SessionAlreadyOpen { chunk_id: 0 }
         ));
+    }
+
+    #[test]
+    fn aggregator_emits_publish_actions_when_local_aggregate_grows() {
+        let spec = chain_spec_with_aggregators(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        assert!(
+            engine.local_is_aggregator_for(0, 0),
+            "spec must elect v0 into the aggregator committee"
+        );
+
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let actions = engine
+            .open_bft_session(chunk.clone())
+            .expect("open session");
+        let aggregate_prevotes = actions
+            .iter()
+            .filter(|a| matches!(a, BftAction::PublishAggregatePrevote { .. }))
+            .count();
+        assert_eq!(
+            aggregate_prevotes, 1,
+            "open with local prevote crosses 0 → 1 stake → one aggregate publish"
+        );
+
+        // Feed v1's prevote — aggregate stake grows from 1 to 2, so
+        // another aggregate publish should fire.
+        let v1_prevote = build_local_vote(
+            0,
+            chunk.hash(),
+            0,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        let actions = engine
+            .observe_finality_vote(v1_prevote)
+            .expect("ingest v1 prevote");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, BftAction::PublishAggregatePrevote { .. })),
+            "aggregate prevote publish must fire when stake grows from 1 → 2"
+        );
+        // The same prevote re-ingested produces no new publish
+        // (aggregate stake did not change).
+        let v1_prevote_dupe = build_local_vote(
+            0,
+            chunk.hash(),
+            0,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        let actions = engine
+            .observe_finality_vote(v1_prevote_dupe)
+            .expect("ingest duplicate v1 prevote");
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, BftAction::PublishAggregatePrevote { .. })),
+            "duplicate vote must not retrigger aggregator publish"
+        );
+    }
+
+    #[test]
+    fn aggregator_publish_subnet_matches_engine_helper() {
+        let spec = chain_spec_with_aggregators(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        let chunk_id: ChunkId = 11;
+        let chunk = {
+            let mut c = dummy_chunk(chunk_id, spec.genesis_checkpoint.end_validator_set_root);
+            c.start_height = chunk_id + 1;
+            c.end_height = chunk_id + 1;
+            c
+        };
+        let expected_subnet = engine.subnet_for_chunk(chunk_id);
+        let actions = engine.open_bft_session(chunk).expect("open session");
+        let publish_subnet = actions
+            .iter()
+            .find_map(|a| match a {
+                BftAction::PublishAggregatePrevote { subnet, .. } => Some(*subnet),
+                _ => None,
+            })
+            .expect("aggregator publish must be present");
+        assert_eq!(publish_subnet, expected_subnet);
+    }
+
+    #[test]
+    fn non_aggregator_never_emits_publish_actions() {
+        // chain_spec_with pins expected_aggregators_per_round to a
+        // value so small that no validator clears the threshold.
+        let spec = chain_spec_with(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        assert!(
+            !engine.local_is_aggregator_for(0, 0),
+            "spec must not elect any aggregator"
+        );
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let actions = engine.open_bft_session(chunk).expect("open session");
+        assert!(actions.iter().all(|a| !matches!(
+            a,
+            BftAction::PublishAggregatePrevote { .. } | BftAction::PublishAggregatePrecommit { .. }
+        )));
     }
 
     #[test]

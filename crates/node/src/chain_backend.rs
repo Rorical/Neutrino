@@ -510,6 +510,13 @@ where
         self.with_engine(|e| e.chain_spec().consensus.chunk_size)
     }
 
+    /// Subnet routing for `chunk_id`'s aggregate finality votes.
+    /// Exposed for the M7-C test harness; production callers stay
+    /// inside [`Engine::subnet_for_chunk`].
+    pub fn subnet_for_chunk(&self, chunk_id: ChunkId) -> u8 {
+        self.with_engine(|e| e.subnet_for_chunk(chunk_id))
+    }
+
     /// Next chunk id the local engine is ready to finalize.
     ///
     /// `Some(0)` immediately after genesis; `Some(latest + 1)` after
@@ -687,6 +694,11 @@ where
                 }
                 BftAction::BroadcastPrecommit(vote) => {
                     self.publish_finality_vote(Topic::FinalityVotesPrecommit, &vote)
+                        .await;
+                }
+                BftAction::PublishAggregatePrevote { subnet, vote }
+                | BftAction::PublishAggregatePrecommit { subnet, vote } => {
+                    self.publish_finality_vote(Topic::AggregateFinalityVotes(subnet), &vote)
                         .await;
                 }
                 BftAction::QuorumReached(chunk_id) => {

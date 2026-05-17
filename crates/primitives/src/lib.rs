@@ -90,6 +90,10 @@ pub const DEFAULT_FINALITY_STALL_THRESHOLD_SLOTS: u64 = 64;
 pub const DEFAULT_PROPOSER_BOOST_FRACTION: FixedU128 = (FIXED_U128_ONE * 2) / 5;
 /// Default expected proposer count per slot, `1.0` as `Q64.64`.
 pub const DEFAULT_EXPECTED_PROPOSERS_PER_SLOT: FixedU128 = FIXED_U128_ONE;
+/// Default expected aggregator count per `(chunk, round)`, `4.0`
+/// as `Q64.64`. Sized to keep aggregation work distributed across
+/// roughly a quarter of a 16-validator set per round.
+pub const DEFAULT_EXPECTED_AGGREGATORS_PER_ROUND: FixedU128 = FIXED_U128_ONE * 4;
 /// Default fallback prover premium, `0.5` as `Q64.64`.
 pub const DEFAULT_FALLBACK_PREMIUM: FixedU128 = FIXED_U128_ONE / 2;
 /// Default number of finality-vote subnets.
@@ -476,6 +480,8 @@ pub struct ConsensusParams {
     pub lock_window_chunks: u64,
     /// Expected proposer count per slot as `Q64.64`.
     pub expected_proposers_per_slot: FixedU128,
+    /// Expected aggregator count per `(chunk, round)` as `Q64.64`.
+    pub expected_aggregators_per_round: FixedU128,
     /// Number of finality-vote subnets.
     pub vote_subnets: u16,
     /// Validator subnets assigned per chunk.
@@ -499,6 +505,7 @@ impl Default for ConsensusParams {
             min_validator_withdrawal_delay_secs: DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS,
             lock_window_chunks: DEFAULT_LOCK_WINDOW_CHUNKS,
             expected_proposers_per_slot: DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
+            expected_aggregators_per_round: DEFAULT_EXPECTED_AGGREGATORS_PER_ROUND,
             vote_subnets: DEFAULT_VOTE_SUBNETS,
             validator_subnets_per_chunk: DEFAULT_VALIDATOR_SUBNETS_PER_CHUNK,
         }
@@ -749,7 +756,10 @@ impl ConsensusParams {
             return Err(ChainSpecError::ZeroConsensusParameter);
         }
 
-        if self.expected_proposers_per_slot == 0 || self.proposer_boost_fraction > FIXED_U128_ONE {
+        if self.expected_proposers_per_slot == 0
+            || self.expected_aggregators_per_round == 0
+            || self.proposer_boost_fraction > FIXED_U128_ONE
+        {
             return Err(ChainSpecError::InvalidFixedPointParameter);
         }
 

@@ -238,6 +238,24 @@ impl ChunkBft {
         )
     }
 
+    /// The currently-accumulated aggregate vote for `phase`, if any
+    /// partial votes have been recorded. Used by the M7-C aggregator
+    /// role to publish the union-aggregated vote on a subnet topic.
+    #[must_use]
+    pub fn current_aggregate(&self, phase: FinalityVotePhase) -> Option<AggregatedVote> {
+        self.accumulator(phase).aggregate()
+    }
+
+    /// Active stake represented by the currently-accumulated
+    /// aggregate vote for `phase`. Zero if no votes are recorded.
+    #[must_use]
+    pub const fn aggregate_stake(&self, phase: FinalityVotePhase) -> u64 {
+        match phase {
+            FinalityVotePhase::Prevote => self.prevotes.aggregate_stake,
+            FinalityVotePhase::Precommit => self.precommits.aggregate_stake,
+        }
+    }
+
     /// Adds an aggregated prevote for the current round.
     pub fn add_prevote(&mut self, vote: FinalityVote) -> Result<(), BftError> {
         self.add_vote(vote, FinalityVotePhase::Prevote)

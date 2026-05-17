@@ -26,10 +26,11 @@ use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::rpc::{
     self, BlockProofByHashCodec, BlockProofByHashResponse, BlockProofByHeightCodec,
     BlockProofByHeightResponse, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec,
-    BlocksByRootResponse, ChunkProofByIdCodec, ChunkProofByIdResponse, MetadataCodec, PingCodec,
-    RecursiveProofByIndexCodec, RecursiveProofByIndexResponse, RecursiveProofLatestCodec,
-    RecursiveProofLatestResponse, RpcError, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
-    StateByRootCodec, StateByRootResponse, StatusCodec,
+    BlocksByRootResponse, ChunkProofByIdCodec, ChunkProofByIdResponse, FinalityCertByChunkCodec,
+    FinalityCertByChunkResponse, MetadataCodec, PingCodec, RecursiveProofByIndexCodec,
+    RecursiveProofByIndexResponse, RecursiveProofLatestCodec, RecursiveProofLatestResponse,
+    RpcError, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse, StateByRootCodec,
+    StateByRootResponse, StatusCodec, WitnessByBlockCodec, WitnessByBlockResponse,
 };
 use crate::topic::Topic;
 use futures::StreamExt;
@@ -253,6 +254,10 @@ struct RpcDispatch {
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_recursive_proof_by_index:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_finality_cert_by_chunk:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_witness_by_block:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
 
     inbound_status: HashMap<u64, ResponseChannel<rpc::Status>>,
     inbound_metadata: HashMap<u64, ResponseChannel<rpc::Metadata>>,
@@ -265,6 +270,8 @@ struct RpcDispatch {
     inbound_chunk_proof_by_id: HashMap<u64, ResponseChannel<ChunkProofByIdResponse>>,
     inbound_recursive_proof_latest: HashMap<u64, ResponseChannel<RecursiveProofLatestResponse>>,
     inbound_recursive_proof_by_index: HashMap<u64, ResponseChannel<RecursiveProofByIndexResponse>>,
+    inbound_finality_cert_by_chunk: HashMap<u64, ResponseChannel<FinalityCertByChunkResponse>>,
+    inbound_witness_by_block: HashMap<u64, ResponseChannel<WitnessByBlockResponse>>,
 }
 
 impl RpcDispatch {
@@ -294,6 +301,8 @@ impl RpcDispatch {
             RpcProtocol::RecursiveProofByIndex => {
                 self.pending_recursive_proof_by_index.insert(id, tx)
             }
+            RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.insert(id, tx),
+            RpcProtocol::WitnessByBlock => self.pending_witness_by_block.insert(id, tx),
         };
     }
 
@@ -314,6 +323,8 @@ impl RpcDispatch {
             RpcProtocol::ChunkProofById => self.pending_chunk_proof_by_id.remove(&id),
             RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.remove(&id),
             RpcProtocol::RecursiveProofByIndex => self.pending_recursive_proof_by_index.remove(&id),
+            RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.remove(&id),
+            RpcProtocol::WitnessByBlock => self.pending_witness_by_block.remove(&id),
         }
     }
 }
@@ -520,6 +531,12 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcRecursiveProofByIndex(ev)) => {
                 self.handle_rpc_recursive_proof_by_index(ev).await;
             }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcFinalityCertByChunk(ev)) => {
+                self.handle_rpc_finality_cert_by_chunk(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcWitnessByBlock(ev)) => {
+                self.handle_rpc_witness_by_block(ev).await;
+            }
             _ => {}
         }
     }
@@ -624,6 +641,12 @@ impl NetworkService {
             RpcRequest::RecursiveProofByIndex(req) => behaviour
                 .rpc_recursive_proof_by_index
                 .send_request(&peer, req),
+            RpcRequest::FinalityCertByChunk(req) => behaviour
+                .rpc_finality_cert_by_chunk
+                .send_request(&peer, req),
+            RpcRequest::WitnessByBlock(req) => {
+                behaviour.rpc_witness_by_block.send_request(&peer, req)
+            }
         };
         self.rpc.record_outbound(protocol, id, response_tx);
     }
@@ -737,6 +760,26 @@ impl NetworkService {
                             .is_ok()
                     })
             }
+            (RpcProtocol::FinalityCertByChunk, RpcResponse::FinalityCertByChunk(payload)) => self
+                .rpc
+                .inbound_finality_cert_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_finality_cert_by_chunk
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
+            (RpcProtocol::WitnessByBlock, RpcResponse::WitnessByBlock(payload)) => self
+                .rpc
+                .inbound_witness_by_block
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_witness_by_block
+                        .send_response(chan, payload)
+                        .is_ok()
+                }),
             _ => false,
         };
 
@@ -1298,6 +1341,110 @@ impl NetworkService {
         }
     }
 
+    async fn handle_rpc_finality_cert_by_chunk(
+        &mut self,
+        ev: request_response::Event<rpc::FinalityCertByChunkRequest, FinalityCertByChunkResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::FinalityCertByChunk);
+                self.rpc
+                    .inbound_finality_cert_by_chunk
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::FinalityCertByChunk(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::FinalityCertByChunk, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::FinalityCertByChunk(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                self.complete_outbound_failure(RpcProtocol::FinalityCertByChunk, request_id, &error)
+            }
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on FinalityCertByChunk RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_witness_by_block(
+        &mut self,
+        ev: request_response::Event<rpc::WitnessByBlockRequest, WitnessByBlockResponse>,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::WitnessByBlock);
+                self.rpc
+                    .inbound_witness_by_block
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::WitnessByBlock(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::WitnessByBlock, request_id)
+                {
+                    let _ = tx.send(Ok(RpcResponse::WitnessByBlock(response)));
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::WitnessByBlock, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on WitnessByBlock RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn complete_outbound_failure(
         &mut self,
         protocol: RpcProtocol,
@@ -1353,6 +1500,8 @@ fn build_behaviour(
         rpc_chunk_proof_by_id: build_rpc_chunk_proof_by_id(),
         rpc_recursive_proof_latest: build_rpc_recursive_proof_latest(),
         rpc_recursive_proof_by_index: build_rpc_recursive_proof_by_index(),
+        rpc_finality_cert_by_chunk: build_rpc_finality_cert_by_chunk(),
+        rpc_witness_by_block: build_rpc_witness_by_block(),
     })
 }
 
@@ -1612,6 +1761,28 @@ fn build_rpc_recursive_proof_by_index() -> rpc::RecursiveProofByIndexBehaviour {
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    )
+}
+
+fn build_rpc_finality_cert_by_chunk() -> rpc::FinalityCertByChunkBehaviour {
+    request_response::Behaviour::with_codec(
+        FinalityCertByChunkCodec::default(),
+        [(
+            RpcProtocol::FinalityCertByChunk.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_witness_by_block() -> rpc::WitnessByBlockBehaviour {
+    request_response::Behaviour::with_codec(
+        WitnessByBlockCodec::default(),
+        [(
+            RpcProtocol::WitnessByBlock.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
     )
 }
 

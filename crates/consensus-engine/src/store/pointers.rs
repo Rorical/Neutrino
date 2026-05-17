@@ -21,6 +21,18 @@ pub const LATEST_CHECKPOINT_INDEX: &[u8] = b"latest_ckpt_index";
 /// silently fork.
 pub const FINALIZED_SEED: &[u8] = b"finalized_seed";
 
+/// Highest checkpoint index whose covering headers have already been
+/// folded into [`FINALIZED_SEED`].
+///
+/// Followers may import a recursive checkpoint before the headers it
+/// covers, so the seed advance is two-phase: the engine bumps this
+/// pointer only after every header in the checkpoint's range is
+/// present and folded. Producers advance both the pointer and the
+/// seed inline at chunk-close. The pointer is reloaded on
+/// [`Engine::open`] so restart-resume never re-folds or skips a
+/// chunk.
+pub const SEED_ADVANCED_THROUGH_CHECKPOINT: &[u8] = b"seed_advanced_idx";
+
 /// Index of the currently active validator-set snapshot.
 ///
 /// Persisted so restarts resume with the correct active validator list

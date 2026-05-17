@@ -20,8 +20,8 @@ pub mod driver;
 pub mod error;
 
 pub use backend::{
-    CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
-    SyncBackendError,
+    CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
+    SyncBackend, SyncBackendError,
 };
 pub use driver::{SyncDriver, SyncDriverConfig};
 pub use error::SyncDriverError;

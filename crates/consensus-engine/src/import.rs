@@ -23,15 +23,20 @@
 use core::fmt;
 
 use neutrino_consensus_types::{
-    Block, BlockProof, BlockProofPublicInputs, RecursiveCheckpointProof, RecursiveProofPublicInputs,
+    Block, BlockProof, BlockProofPublicInputs, ChunkProof, RecursiveCheckpointProof,
+    RecursiveProofPublicInputs,
 };
-use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, Height, Slot, StateRoot};
+use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
+use neutrino_primitives::{
+    BlockHash, Checkpoint, CheckpointIndex, ChunkHash, ChunkId, Height, Slot, StateRoot,
+};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
 use crate::block_state::BlockState;
 use crate::body::{BodyRoots, compute_body_roots};
 use crate::engine::Engine;
+use crate::signature::{SignatureError, verify_header_signature};
 use crate::store::StoreError;
 
 /// Successful outcome of [`Engine::import_block`].
@@ -63,6 +68,17 @@ pub struct ImportBlockProofOutcome {
     pub height: Height,
 }
 
+/// Successful outcome of [`Engine::import_chunk_proof`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportChunkProofOutcome {
+    /// Chunk id covered by the imported proof.
+    pub chunk_id: ChunkId,
+    /// Last block height covered by the chunk.
+    pub end_height: Height,
+    /// Hash of the imported chunk envelope.
+    pub chunk_hash: ChunkHash,
+}
+
 /// Failures while importing a peer-supplied block or recursive proof.
 #[derive(Debug)]
 pub enum ImportError<E> {
@@ -80,6 +96,10 @@ pub enum ImportError<E> {
         /// Parent hash in the imported header.
         actual: BlockHash,
     },
+    /// Header proposer BLS signature failed to verify.
+    HeaderSignature(SignatureError),
+    /// Header proposer VRF claim failed to verify.
+    HeaderVrf(VrfError),
     /// Block proof references a block header that is not stored locally.
     UnknownBlock(BlockHash),
     /// Body lane roots derived from the supplied body do not match the header.
@@ -144,6 +164,15 @@ pub enum ImportError<E> {
     Codec(borsh::io::Error),
     /// Block proof verification rejected the proof.
     InvalidBlockProof(ProofError),
+    /// Chunk proof verification rejected the proof.
+    InvalidChunkProof(ProofError),
+    /// Chunk proof envelope's `chunk_id` does not match its public inputs.
+    ChunkProofIdInconsistent {
+        /// Chunk id in the wire envelope.
+        envelope: ChunkId,
+        /// Chunk id in the embedded public inputs.
+        public_inputs: ChunkId,
+    },
     /// Recursive proof verification rejected the proof.
     InvalidRecursiveProof(ProofError),
     /// Underlying chain store / database error.
@@ -171,6 +200,8 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                     "header parent_hash {actual:?} does not match local head hash {expected:?}"
                 )
             }
+            Self::HeaderSignature(err) => write!(f, "header signature rejected: {err}"),
+            Self::HeaderVrf(err) => write!(f, "header VRF claim rejected: {err}"),
             Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
             Self::BodyRootsMismatch { header, computed } => write!(
                 f,
@@ -219,6 +250,16 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
             Self::InvalidBlockProof(err) => {
                 write!(f, "block proof verification rejected: {err:?}")
             }
+            Self::InvalidChunkProof(err) => {
+                write!(f, "chunk proof verification rejected: {err:?}")
+            }
+            Self::ChunkProofIdInconsistent {
+                envelope,
+                public_inputs,
+            } => write!(
+                f,
+                "chunk proof envelope id {envelope} does not match public inputs id {public_inputs}"
+            ),
             Self::InvalidRecursiveProof(err) => {
                 write!(f, "recursive proof verification rejected: {err:?}")
             }
@@ -263,6 +304,26 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
+        // Authenticate the header before doing any further work: a
+        // mis-signed or non-eligible header is rejected before its
+        // body is inspected or persisted. Both checks consult the
+        // engine's live active validator set and the latest finalized
+        // seed.
+        verify_header_signature(
+            &block.header,
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+        )
+        .map_err(ImportError::HeaderSignature)?;
+        consensus_vrf::verify_header_proposer(
+            &block.header,
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+            &self.finalized_seed(),
+            self.chain_spec().consensus.expected_proposers_per_slot,
+        )
+        .map_err(ImportError::HeaderVrf)?;
+
         let header_roots = BodyRoots {
             transactions_root: block.header.transactions_root,
             votes_root: block.header.votes_root,
@@ -290,6 +351,13 @@ impl<DB: Database> Engine<DB> {
         // blocks could still have queued writes, so the call is
         // unconditional.
         self.flush_trie_to_store()?;
+
+        // If this header completes the covering range of a previously
+        // imported recursive proof, advance the finalized seed now
+        // so subsequent VRF-eligibility checks observe the right
+        // seed. The helper is idempotent and cheap when no advance
+        // is possible.
+        self.try_advance_finalized_seed()?;
 
         Ok(ImportBlockOutcome {
             block_hash: hash,
@@ -361,6 +429,49 @@ impl<DB: Database> Engine<DB> {
         })
     }
 
+    /// Import a peer-supplied chunk proof.
+    ///
+    /// The envelope's `chunk_id` is validated against its embedded
+    /// public inputs, the backend proof bytes are decoded and verified
+    /// against [`ProofSystem::verify_chunk`], and the wire proof is
+    /// persisted at [`crate::store::keys::chunk_id_key`]. The engine's
+    /// `latest_finalized_chunk_id` pointer is **not** advanced — that
+    /// transition is driven by the BFT finalization path in M7.
+    /// Persisting the proof early lets followers serve
+    /// `/neutrino/req/chunk_proof_by_id/1` and gives the M7 BFT slice
+    /// a local artifact to bind votes against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError::ChunkProofIdInconsistent`] when the
+    /// envelope and public inputs disagree, [`ImportError::Codec`]
+    /// when the backend proof bytes fail to decode,
+    /// [`ImportError::InvalidChunkProof`] when verification fails,
+    /// or [`ImportError::Store`] on persistence failure.
+    pub fn import_chunk_proof<PS: ProofSystem>(
+        &mut self,
+        proof: &ChunkProof,
+        proof_system: &PS,
+    ) -> Result<ImportChunkProofOutcome, ImportError<DB::Error>> {
+        if proof.chunk_id != proof.public_inputs.chunk_id {
+            return Err(ImportError::ChunkProofIdInconsistent {
+                envelope: proof.chunk_id,
+                public_inputs: proof.public_inputs.chunk_id,
+            });
+        }
+        let backend_proof: PS::ChunkProof =
+            borsh::from_slice(&proof.proof_bytes).map_err(ImportError::Codec)?;
+        proof_system
+            .verify_chunk(&backend_proof, &proof.public_inputs)
+            .map_err(ImportError::InvalidChunkProof)?;
+        self.store_mut().put_chunk_proof(proof.chunk_id, proof)?;
+        Ok(ImportChunkProofOutcome {
+            chunk_id: proof.chunk_id,
+            end_height: proof.public_inputs.end_height,
+            chunk_hash: proof.chunk_hash,
+        })
+    }
+
     /// Import a peer-supplied recursive checkpoint proof.
     ///
     /// The proof's `public_inputs` carry the [`Checkpoint`] under
@@ -422,14 +533,17 @@ impl<DB: Database> Engine<DB> {
             .put_recursive_proof(proof.checkpoint_index, proof)?;
         self.store_mut()
             .put_latest_checkpoint_index(proof.checkpoint_index)?;
-        // Engine in-memory pointers also track the latest checkpoint.
-        // The next finalized-seed is normally derived from VRF folding
-        // over the chunk's blocks; we do not have that information here
-        // so we keep the current seed. Block import does not unblock
-        // VRF-eligibility decisions on the sync path because the joiner
-        // never produces blocks until it reaches Following.
+        // Update the in-memory checkpoint pointer; the seed advance
+        // is two-phase and may only complete after the corresponding
+        // headers are also imported.
         self.update_checkpoint_pointers(proof.checkpoint_index, self.finalized_seed());
-        self.persist_finalized_seed()?;
+        // Followers usually receive recursive proofs ahead of the
+        // headers they cover (CheckpointBackfill → HeaderBackfill).
+        // Attempt the advance now in case the headers were already
+        // imported — `import_block` re-runs the helper after every
+        // gossip block so a later header that completes the chunk's
+        // range triggers the fold without further user action.
+        self.try_advance_finalized_seed()?;
 
         Ok(ImportRecursiveProofOutcome {
             checkpoint_index: proof.checkpoint_index,
@@ -477,6 +591,7 @@ impl<DB: Database> Engine<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProposerKey;
     use crate::validator_set::validator_set_root;
     use neutrino_consensus_types::{BlockProofPublicInputs, Body, ChunkProofPublicInputs, Header};
     use neutrino_primitives::{
@@ -486,9 +601,17 @@ mod tests {
     use neutrino_proof_system::MockProofSystem;
     use neutrino_storage::MemoryDatabase;
 
+    const TEST_CHAIN_ID: u64 = 7;
+    const TEST_GENESIS_SEED: [u8; 32] = [0xDD; 32];
+    const TEST_IKM: [u8; 32] = [0xAA; 32];
+
+    fn proposer() -> ProposerKey {
+        ProposerKey::from_ikm(&TEST_IKM, 0).expect("derive proposer key")
+    }
+
     fn validators() -> Vec<Validator> {
         vec![Validator {
-            pubkey: [1; 48],
+            pubkey: *proposer().public_key_bytes(),
             withdrawal_credentials: [2; 32],
             effective_stake: 32_000_000_000,
             slashed: false,
@@ -503,7 +626,7 @@ mod tests {
         let vs_root = validator_set_root(&validators());
         let genesis_block_hash: BlockHash = [0xAA; 32];
         let checkpoint = Checkpoint {
-            chain_id: 7,
+            chain_id: TEST_CHAIN_ID,
             index: 0,
             start_height: 0,
             end_height: 0,
@@ -518,12 +641,12 @@ mod tests {
         ChainSpec {
             spec_version: CHAIN_SPEC_VERSION,
             name: BoundedBytes::new(b"m6-import-test".to_vec()).expect("name fits"),
-            chain_id: 7,
+            chain_id: TEST_CHAIN_ID,
             genesis_time: 1_700_000_000,
             genesis_gas_limit: 30_000_000,
             runtime_version: RuntimeVersion::default(),
             runtime_code_hash: [0xCC; 32],
-            genesis_seed: [0xDD; 32],
+            genesis_seed: TEST_GENESIS_SEED,
             genesis_state_root: ZERO_HASH,
             genesis_block_hash,
             genesis_validator_set_root: vs_root,
@@ -537,38 +660,55 @@ mod tests {
         }
     }
 
-    fn header(height: Height, slot: Slot, parent: BlockHash, state_root: [u8; 32]) -> Header {
-        Header {
+    /// Build a fully signed, VRF-eligible block. `proposer_override` lets
+    /// individual tests use a key whose pubkey is NOT in the active set,
+    /// which is how the rejection paths are exercised.
+    fn signed_block(
+        height: Height,
+        slot: Slot,
+        parent: BlockHash,
+        state_root: [u8; 32],
+        proposer_override: Option<&ProposerKey>,
+    ) -> Block {
+        let key = proposer();
+        let signing_key = proposer_override.unwrap_or(&key);
+        let body = Body::default();
+        let roots = compute_body_roots(&body, &[]);
+
+        let (vrf_proof, _) = neutrino_vrf::eval(
+            signing_key.secret_key(),
+            TEST_CHAIN_ID,
+            &TEST_GENESIS_SEED,
+            slot,
+        );
+
+        let mut header = Header {
             version: HEADER_VERSION,
             height,
             slot,
             parent_hash: parent,
-            proposer_index: 0,
-            vrf_proof: [3; 96],
+            proposer_index: signing_key.validator_index(),
+            vrf_proof: vrf_proof.to_bytes(),
             state_root,
-            transactions_root: ZERO_HASH,
-            votes_root: ZERO_HASH,
-            slashings_root: ZERO_HASH,
-            validator_ops_root: ZERO_HASH,
-            da_root: ZERO_HASH,
+            transactions_root: roots.transactions_root,
+            votes_root: roots.votes_root,
+            slashings_root: roots.slashings_root,
+            validator_ops_root: roots.validator_ops_root,
+            da_root: roots.da_root,
             runtime_extra: ZERO_HASH,
             gas_used: 0,
             gas_limit: 1_000_000,
             timestamp: slot * 4,
-            signature: [4; 96],
-        }
+            signature: [0; 96],
+        };
+        let header_hash = header.hash();
+        header.signature = signing_key.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+        Block { header, body }
     }
 
+    /// Convenience: signed by the canonical test proposer.
     fn block(height: Height, slot: Slot, parent: BlockHash, state_root: [u8; 32]) -> Block {
-        let body = Body::default();
-        let roots = compute_body_roots(&body, &[]);
-        let mut header = header(height, slot, parent, state_root);
-        header.transactions_root = roots.transactions_root;
-        header.votes_root = roots.votes_root;
-        header.slashings_root = roots.slashings_root;
-        header.validator_ops_root = roots.validator_ops_root;
-        header.da_root = roots.da_root;
-        Block { header, body }
+        signed_block(height, slot, parent, state_root, None)
     }
 
     #[test]
@@ -623,6 +763,89 @@ mod tests {
         match engine.import_block(&block) {
             Err(ImportError::BodyRootsMismatch { .. }) => {}
             other => panic!("expected BodyRootsMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_block_rejects_tampered_signature() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let mut block = block(1, 1, engine.head_hash(), [5; 32]);
+        // Flip a bit in the signature so it no longer matches the
+        // canonical signed message.
+        block.header.signature[0] ^= 0x80;
+        match engine.import_block(&block) {
+            Err(ImportError::HeaderSignature(_)) => {}
+            other => panic!("expected HeaderSignature error, got {other:?}"),
+        }
+        assert_eq!(engine.head_height(), 0);
+    }
+
+    #[test]
+    fn import_block_rejects_signature_from_foreign_key() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        // Build a block whose header signature comes from a key that
+        // is NOT in the active set. The proposer_index still points at
+        // slot 0 (the canonical validator), so the signature is checked
+        // against the wrong pubkey and must fail.
+        let attacker = ProposerKey::from_ikm(&[0xBE; 32], 0).expect("derive attacker");
+        let mut block = signed_block(1, 1, engine.head_hash(), [5; 32], Some(&attacker));
+        // Force the proposer index back to the legitimate validator so
+        // the active-set lookup picks the wrong key for verification.
+        block.header.proposer_index = 0;
+        let header_hash = block.header.hash();
+        // Re-sign with the attacker key under the legitimate proposer
+        // index so the signature decodes but verifies against the
+        // wrong public key.
+        block.header.signature = attacker.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+
+        match engine.import_block(&block) {
+            Err(ImportError::HeaderSignature(_)) => {}
+            other => panic!("expected HeaderSignature error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_block_rejects_tampered_vrf_proof() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let mut block = block(1, 1, engine.head_hash(), [5; 32]);
+        // Replace the VRF proof with garbage that decodes as a BLS
+        // signature but does not verify against the validator's key.
+        let attacker = ProposerKey::from_ikm(&[0xCE; 32], 0).expect("derive attacker");
+        let (bogus_vrf, _) = neutrino_vrf::eval(
+            attacker.secret_key(),
+            TEST_CHAIN_ID,
+            &TEST_GENESIS_SEED,
+            block.header.slot,
+        );
+        block.header.vrf_proof = bogus_vrf.to_bytes();
+        // Re-sign the header so the signature check passes; only the
+        // VRF claim is bogus.
+        let header_hash = block.header.hash();
+        block.header.signature = proposer().sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+
+        match engine.import_block(&block) {
+            Err(ImportError::HeaderVrf(_)) => {}
+            other => panic!("expected HeaderVrf error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_block_rejects_proposer_index_out_of_range() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let mut block = block(1, 1, engine.head_hash(), [5; 32]);
+        // The active set has length 1, so index 5 is out of bounds.
+        block.header.proposer_index = 5;
+        let header_hash = block.header.hash();
+        // Re-sign so signature decoding does not short-circuit; the
+        // missing validator lookup must be the first failure.
+        block.header.signature = proposer().sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+
+        match engine.import_block(&block) {
+            Err(ImportError::HeaderSignature(SignatureError::ValidatorIndexOutOfBounds {
+                index: 5,
+                len: 1,
+            })) => {}
+            other => panic!("expected ValidatorIndexOutOfBounds, got {other:?}"),
         }
     }
 
@@ -750,5 +973,130 @@ mod tests {
             }) => {}
             other => panic!("expected NonContiguousCheckpointIndex, got {other:?}"),
         }
+    }
+
+    /// Build a recursive proof whose covered range matches the given
+    /// `end_height`. Mirrors `produce_and_verify_recursive_proof` but
+    /// is parameterised so seed-advance tests can supply the real
+    /// `end_height` after a small block sequence.
+    fn recursive_proof_for_range(
+        chain_spec: &ChainSpec,
+        index: CheckpointIndex,
+        start_height: Height,
+        end_height: Height,
+        end_block_hash: BlockHash,
+        end_state_root: [u8; 32],
+    ) -> RecursiveCheckpointProof {
+        produce_and_verify_recursive_proof(
+            chain_spec,
+            index,
+            start_height,
+            end_height,
+            end_block_hash,
+            end_state_root,
+        )
+    }
+
+    #[test]
+    fn import_recursive_proof_advances_seed_when_headers_already_present() {
+        // Header-first ordering: import block 1, then import the
+        // recursive proof covering height 1. The seed should advance
+        // immediately because the covering header is in the store.
+        let chain_spec = spec();
+        let mut engine = Engine::genesis(chain_spec.clone(), MemoryDatabase::new()).unwrap();
+        let proof_system = MockProofSystem::new();
+
+        let initial_seed = engine.finalized_seed();
+        let b1 = block(1, 1, engine.head_hash(), [0x11; 32]);
+        engine.import_block(&b1).expect("import block 1");
+        // No checkpoint imported yet, so seed must not have advanced.
+        assert_eq!(engine.finalized_seed(), initial_seed);
+
+        let proof = recursive_proof_for_range(&chain_spec, 1, 0, 1, b1.hash(), [0x11; 32]);
+        engine
+            .import_recursive_proof(&proof, &proof_system)
+            .expect("import recursive proof");
+        // The header at height 1 was already present, so the seed
+        // must have folded chunk 1's VRF proofs in.
+        let folded = neutrino_vrf::fold_seed(&initial_seed, &[b1.header.vrf_proof]);
+        assert_eq!(engine.finalized_seed(), folded);
+        assert_eq!(
+            engine
+                .store()
+                .get_seed_advanced_through_checkpoint()
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn import_block_advances_seed_after_checkpoint_for_late_arriving_header() {
+        // Checkpoint-first ordering (typical sync FSM):
+        // CheckpointBackfill imports the recursive proof before
+        // HeaderBackfill imports the headers. The seed must defer
+        // until the last covering header arrives and then advance.
+        let chain_spec = spec();
+        let mut engine = Engine::genesis(chain_spec.clone(), MemoryDatabase::new()).unwrap();
+        let proof_system = MockProofSystem::new();
+
+        let initial_seed = engine.finalized_seed();
+
+        // Build the header but do NOT import it yet so we know its
+        // VRF proof for later assertion.
+        let b1 = block(1, 1, engine.head_hash(), [0x11; 32]);
+
+        // Phase 1: checkpoint arrives before the header. The seed
+        // cannot advance because heights [1, 1] are missing.
+        let proof = recursive_proof_for_range(&chain_spec, 1, 0, 1, b1.hash(), [0x11; 32]);
+        engine
+            .import_recursive_proof(&proof, &proof_system)
+            .expect("import recursive proof");
+        assert_eq!(engine.finalized_seed(), initial_seed);
+        assert_eq!(
+            engine
+                .store()
+                .get_seed_advanced_through_checkpoint()
+                .unwrap()
+                .unwrap_or(0),
+            0
+        );
+
+        // Phase 2: header arrives. The block-import path retries
+        // the seed advance and folds the chunk now that headers
+        // are present.
+        engine.import_block(&b1).expect("import block 1");
+        let folded = neutrino_vrf::fold_seed(&initial_seed, &[b1.header.vrf_proof]);
+        assert_eq!(engine.finalized_seed(), folded);
+        assert_eq!(
+            engine
+                .store()
+                .get_seed_advanced_through_checkpoint()
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn import_recursive_proof_does_not_advance_seed_when_headers_missing() {
+        // No headers imported. The recursive proof for height 1
+        // arrives. Seed must stay put; the pointer must stay at 0.
+        let chain_spec = spec();
+        let mut engine = Engine::genesis(chain_spec.clone(), MemoryDatabase::new()).unwrap();
+        let proof_system = MockProofSystem::new();
+
+        let initial_seed = engine.finalized_seed();
+        let proof = recursive_proof_for_range(&chain_spec, 1, 0, 1, [0x22; 32], [0x11; 32]);
+        engine
+            .import_recursive_proof(&proof, &proof_system)
+            .expect("import recursive proof");
+        assert_eq!(engine.finalized_seed(), initial_seed);
+        assert_eq!(
+            engine
+                .store()
+                .get_seed_advanced_through_checkpoint()
+                .unwrap()
+                .unwrap_or(0),
+            0
+        );
     }
 }

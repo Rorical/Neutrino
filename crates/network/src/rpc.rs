@@ -30,7 +30,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use core::marker::PhantomData;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{StreamProtocol, request_response};
-use neutrino_consensus_types::{Block, BlockProof, ChunkProof, RecursiveCheckpointProof};
+use neutrino_consensus_types::{
+    Block, BlockProof, ChunkProof, FinalityCert, RecursiveCheckpointProof,
+};
 use neutrino_primitives::{
     BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
 };
@@ -59,6 +61,10 @@ pub const PROTOCOL_CHUNK_PROOF_BY_ID: &str = "/neutrino/req/chunk_proof_by_id/1"
 pub const PROTOCOL_RECURSIVE_PROOF_LATEST: &str = "/neutrino/req/recursive_proof_latest/1";
 /// `RecursiveProofByIndex` RPC protocol id.
 pub const PROTOCOL_RECURSIVE_PROOF_BY_INDEX: &str = "/neutrino/req/recursive_proof_by_index/1";
+/// `FinalityCertByChunk` RPC protocol id.
+pub const PROTOCOL_FINALITY_CERT_BY_CHUNK: &str = "/neutrino/req/finality_cert_by_chunk/1";
+/// `WitnessByBlock` RPC protocol id.
+pub const PROTOCOL_WITNESS_BY_BLOCK: &str = "/neutrino/req/witness_by_block/1";
 
 /// Default maximum request payload size in bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
@@ -82,6 +88,13 @@ pub const MAX_RECURSIVE_PROOFS_PER_RESPONSE: u64 = 64;
 pub const MAX_BLOCK_PROOFS_PER_RESPONSE: u64 = 8;
 /// Maximum number of chunk proofs returned in one response.
 pub const MAX_CHUNK_PROOFS_PER_RESPONSE: u64 = 2;
+/// Maximum number of finality certificates returned in one response.
+pub const MAX_FINALITY_CERTS_PER_RESPONSE: u64 = 16;
+/// Maximum number of block witnesses returned in one response.
+///
+/// Witnesses are large; the cap keeps a single response under
+/// [`DEFAULT_MAX_RESPONSE_SIZE`] even for fully populated blocks.
+pub const MAX_WITNESSES_PER_RESPONSE: u64 = 4;
 
 /// Identifies one of the core RPC protocols defined by doc 06.
 ///
@@ -111,6 +124,10 @@ pub enum RpcProtocol {
     RecursiveProofLatest,
     /// Doc 06 `/neutrino/req/recursive_proof_by_index/1`.
     RecursiveProofByIndex,
+    /// Doc 06 `/neutrino/req/finality_cert_by_chunk/1`.
+    FinalityCertByChunk,
+    /// Doc 06 `/neutrino/req/witness_by_block/1`.
+    WitnessByBlock,
 }
 
 impl RpcProtocol {
@@ -129,6 +146,8 @@ impl RpcProtocol {
             Self::ChunkProofById => PROTOCOL_CHUNK_PROOF_BY_ID,
             Self::RecursiveProofLatest => PROTOCOL_RECURSIVE_PROOF_LATEST,
             Self::RecursiveProofByIndex => PROTOCOL_RECURSIVE_PROOF_BY_INDEX,
+            Self::FinalityCertByChunk => PROTOCOL_FINALITY_CERT_BY_CHUNK,
+            Self::WitnessByBlock => PROTOCOL_WITNESS_BY_BLOCK,
         }
     }
 
@@ -353,6 +372,44 @@ pub struct RecursiveProofByIndexResponse {
     pub items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
 }
 
+/// `FinalityCertByChunk` request: fetch the BFT finality certificate
+/// for one or more chunk ids.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct FinalityCertByChunkRequest {
+    /// Chunk ids whose finality certificates are requested.
+    pub chunk_ids: Vec<ChunkId>,
+}
+
+/// `FinalityCertByChunk` response carrying requested finality
+/// certificates in the same order as the request; entries omitted when
+/// the local node has not finalized the requested chunk.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct FinalityCertByChunkResponse {
+    /// Finality certificates in request order.
+    pub certs: Vec<FinalityCert>,
+}
+
+/// `WitnessByBlock` request: fetch execution witnesses for blocks.
+///
+/// Witnesses are produced and persisted by archive providers serving
+/// the prover swarm; non-archive nodes may return an empty response.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct WitnessByBlockRequest {
+    /// Block header hashes whose witnesses are requested.
+    pub block_hashes: Vec<BlockHash>,
+}
+
+/// `WitnessByBlock` response carrying opaque witness bytes.
+///
+/// Entries are in request order; missing entries indicate the local
+/// node has no witness for that block. Consumers should treat a
+/// short response as partial and re-request from another peer.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct WitnessByBlockResponse {
+    /// Opaque witness blobs in request order.
+    pub witnesses: Vec<Vec<u8>>,
+}
+
 /// Host-facing umbrella request enum used by the command surface.
 ///
 /// Never serialized to the wire — each variant maps to a different
@@ -381,6 +438,10 @@ pub enum RpcRequest {
     RecursiveProofLatest(RecursiveProofLatestRequest),
     /// Range of recursive checkpoint proofs by index.
     RecursiveProofByIndex(RecursiveProofByIndexRequest),
+    /// Finality certificate fetch by chunk id.
+    FinalityCertByChunk(FinalityCertByChunkRequest),
+    /// Execution witness fetch by block hash.
+    WitnessByBlock(WitnessByBlockRequest),
 }
 
 impl RpcRequest {
@@ -399,6 +460,8 @@ impl RpcRequest {
             Self::ChunkProofById(_) => RpcProtocol::ChunkProofById,
             Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
             Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
+            Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
+            Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
         }
     }
 }
@@ -432,6 +495,10 @@ pub enum RpcResponse {
     RecursiveProofLatest(Box<RecursiveProofLatestResponse>),
     /// `RecursiveProofByIndex` reply.
     RecursiveProofByIndex(RecursiveProofByIndexResponse),
+    /// `FinalityCertByChunk` reply.
+    FinalityCertByChunk(FinalityCertByChunkResponse),
+    /// `WitnessByBlock` reply.
+    WitnessByBlock(WitnessByBlockResponse),
 }
 
 impl RpcResponse {
@@ -450,6 +517,8 @@ impl RpcResponse {
             Self::ChunkProofById(_) => RpcProtocol::ChunkProofById,
             Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
             Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
+            Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
+            Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
         }
     }
 }
@@ -625,6 +694,11 @@ pub type RecursiveProofLatestCodec =
 /// Codec for the `RecursiveProofByIndex` RPC.
 pub type RecursiveProofByIndexCodec =
     BorshCodec<RecursiveProofByIndexRequest, RecursiveProofByIndexResponse>;
+/// Codec for the `FinalityCertByChunk` RPC.
+pub type FinalityCertByChunkCodec =
+    BorshCodec<FinalityCertByChunkRequest, FinalityCertByChunkResponse>;
+/// Codec for the `WitnessByBlock` RPC.
+pub type WitnessByBlockCodec = BorshCodec<WitnessByBlockRequest, WitnessByBlockResponse>;
 
 /// Behaviour type for the Status RPC.
 pub type StatusBehaviour = request_response::Behaviour<StatusCodec>;
@@ -648,6 +722,10 @@ pub type ChunkProofByIdBehaviour = request_response::Behaviour<ChunkProofByIdCod
 pub type RecursiveProofLatestBehaviour = request_response::Behaviour<RecursiveProofLatestCodec>;
 /// Behaviour type for the `RecursiveProofByIndex` RPC.
 pub type RecursiveProofByIndexBehaviour = request_response::Behaviour<RecursiveProofByIndexCodec>;
+/// Behaviour type for the `FinalityCertByChunk` RPC.
+pub type FinalityCertByChunkBehaviour = request_response::Behaviour<FinalityCertByChunkCodec>;
+/// Behaviour type for the `WitnessByBlock` RPC.
+pub type WitnessByBlockBehaviour = request_response::Behaviour<WitnessByBlockCodec>;
 
 #[cfg(test)]
 mod tests {

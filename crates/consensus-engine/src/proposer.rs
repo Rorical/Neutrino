@@ -13,7 +13,7 @@ use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
 use neutrino_crypto::bls::{SecretKey, Signature};
 use neutrino_primitives::{
     BlsPublicKey, BlsSignature, ChainId, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG,
-    DomainTag, Hash, ValidatorIndex,
+    DomainTag, Hash, Seed, Slot, ValidatorIndex,
 };
 
 extern crate alloc;
@@ -104,6 +104,21 @@ impl ProposerKey {
     #[must_use]
     pub(crate) const fn secret_key(&self) -> &SecretKey {
         &self.secret_key
+    }
+
+    /// Evaluate the proposer VRF for `(chain_id, seed, slot)` and
+    /// return the 96-byte BLS signature ready to be assigned to
+    /// [`neutrino_consensus_types::Header::vrf_proof`].
+    ///
+    /// This is the public-key-encapsulated counterpart to
+    /// [`neutrino_vrf::eval`]; the raw `SecretKey` stays inside the
+    /// crate. Callers that also need the deterministic VRF output
+    /// (e.g. for fork choice randomness) can re-derive it via
+    /// [`neutrino_vrf::verify`] against the returned proof.
+    #[must_use]
+    pub fn vrf_eval(&self, chain_id: ChainId, seed: &Seed, slot: Slot) -> BlsSignature {
+        let (signature, _output) = neutrino_vrf::eval(&self.secret_key, chain_id, seed, slot);
+        signature.to_bytes()
     }
 
     /// Sign a header hash under the proposer-signature domain.

@@ -10,6 +10,7 @@
 //! - the corresponding RPC read methods see what we just imported.
 
 use neutrino_consensus_engine::Engine;
+use neutrino_consensus_engine::ProposerKey;
 use neutrino_consensus_engine::body::compute_body_roots;
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_types::{Block, Body, Header, RecursiveCheckpointProof};
@@ -23,9 +24,17 @@ use neutrino_proof_system::{MockProofSystem, ProofSystem};
 use neutrino_storage::MemoryDatabase;
 use neutrino_sync::SyncBackend;
 
+const TEST_CHAIN_ID: u64 = 9;
+const TEST_GENESIS_SEED: [u8; 32] = [0xDD; 32];
+const TEST_IKM: [u8; 32] = [0xAA; 32];
+
+fn proposer() -> ProposerKey {
+    ProposerKey::from_ikm(&TEST_IKM, 0).expect("derive proposer key")
+}
+
 fn validators() -> Vec<Validator> {
     vec![Validator {
-        pubkey: [1; 48],
+        pubkey: *proposer().public_key_bytes(),
         withdrawal_credentials: [2; 32],
         effective_stake: 32_000_000_000,
         slashed: false,
@@ -39,7 +48,7 @@ fn spec() -> ChainSpec {
     let vs_root = validator_set_root(&validators());
     let genesis_block_hash: BlockHash = [0xAA; 32];
     let checkpoint = Checkpoint {
-        chain_id: 9,
+        chain_id: TEST_CHAIN_ID,
         index: 0,
         start_height: 0,
         end_height: 0,
@@ -54,12 +63,12 @@ fn spec() -> ChainSpec {
     ChainSpec {
         spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"chain-backend-test".to_vec()).unwrap(),
-        chain_id: 9,
+        chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_version: RuntimeVersion::default(),
         runtime_code_hash: [0xCC; 32],
-        genesis_seed: [0xDD; 32],
+        genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
@@ -73,37 +82,37 @@ fn spec() -> ChainSpec {
     }
 }
 
-const fn header(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> Header {
-    Header {
+/// Build a fully signed, VRF-eligible block over the canonical test
+/// proposer key. The active set declared in [`validators`] holds the
+/// matching public key so the resulting block passes both header
+/// signature and VRF eligibility checks during `import_block`.
+fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> Block {
+    let p = proposer();
+    let body = Body::default();
+    let roots = compute_body_roots(&body, &[]);
+    let vrf_proof = p.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
+
+    let mut header = Header {
         version: HEADER_VERSION,
         height,
         slot,
         parent_hash: parent,
-        proposer_index: 0,
-        vrf_proof: [3; 96],
+        proposer_index: p.validator_index(),
+        vrf_proof,
         state_root,
-        transactions_root: ZERO_HASH,
-        votes_root: ZERO_HASH,
-        slashings_root: ZERO_HASH,
-        validator_ops_root: ZERO_HASH,
-        da_root: ZERO_HASH,
+        transactions_root: roots.transactions_root,
+        votes_root: roots.votes_root,
+        slashings_root: roots.slashings_root,
+        validator_ops_root: roots.validator_ops_root,
+        da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
         gas_used: 0,
         gas_limit: 1_000_000,
         timestamp: slot * 4,
-        signature: [4; 96],
-    }
-}
-
-fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> Block {
-    let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
-    let mut header = header(height, slot, parent, state_root);
-    header.transactions_root = roots.transactions_root;
-    header.votes_root = roots.votes_root;
-    header.slashings_root = roots.slashings_root;
-    header.validator_ops_root = roots.validator_ops_root;
-    header.da_root = roots.da_root;
+        signature: [0; 96],
+    };
+    let header_hash = header.hash();
+    header.signature = p.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
     Block { header, body }
 }
 

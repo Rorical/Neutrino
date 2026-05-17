@@ -378,6 +378,66 @@ impl<DB: Database> Engine<DB> {
         self.latest_checkpoint_index = checkpoint_index;
         self.finalized_seed = next_finalized_seed;
     }
+
+    /// Fold every newly-eligible chunk's VRF proofs into the local
+    /// `finalized_seed`. Walks the persisted checkpoints in order
+    /// starting from
+    /// [`pointers::SEED_ADVANCED_THROUGH_CHECKPOINT`](crate::store::pointers::SEED_ADVANCED_THROUGH_CHECKPOINT)
+    /// and stops at the first checkpoint whose covering headers are
+    /// not yet present (followers receive checkpoints before
+    /// headers, so partial advance is normal).
+    ///
+    /// On every successful checkpoint advance the seed is folded
+    /// incrementally; the persisted seed and pointer are written
+    /// exactly once at the end of the walk to avoid disk write
+    /// amplification.
+    ///
+    /// Idempotent: a no-op when no new headers or checkpoints have
+    /// arrived since the last call. Safe to invoke after every
+    /// [`Engine::import_block`] and [`Engine::import_recursive_proof`].
+    pub(crate) fn try_advance_finalized_seed(&mut self) -> Result<(), StoreError<DB::Error>> {
+        let starting_pointer = self
+            .store
+            .get_seed_advanced_through_checkpoint()?
+            .unwrap_or(0);
+        let mut seed = self.finalized_seed;
+        let mut advanced_through = starting_pointer;
+        let mut next = advanced_through.saturating_add(1);
+        let latest = self.latest_checkpoint_index;
+
+        while next <= latest {
+            let Some(checkpoint) = self.store.get_checkpoint(next)? else {
+                break;
+            };
+            // Genesis (index 0) covers no blocks; non-genesis
+            // checkpoints record `start_height = previous.end_height`
+            // so the covered range is `[start+1, end]`.
+            let mut proofs: Vec<neutrino_primitives::BlsSignature> = Vec::new();
+            let mut complete = true;
+            let lower = checkpoint.start_height.saturating_add(1);
+            for height in lower..=checkpoint.end_height {
+                let Some(header) = self.store.get_header_by_height(height)? else {
+                    complete = false;
+                    break;
+                };
+                proofs.push(header.vrf_proof);
+            }
+            if !complete {
+                break;
+            }
+            seed = neutrino_vrf::fold_seed(&seed, &proofs);
+            advanced_through = next;
+            next = next.saturating_add(1);
+        }
+
+        if advanced_through != starting_pointer {
+            self.finalized_seed = seed;
+            self.store.put_finalized_seed(seed)?;
+            self.store
+                .put_seed_advanced_through_checkpoint(advanced_through)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

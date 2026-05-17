@@ -24,12 +24,16 @@ use neutrino_consensus_engine::{
     CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome, ImportError,
     ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
 };
-use neutrino_consensus_types::{Block, BlockProof, Body, Header, RecursiveCheckpointProof};
+use neutrino_consensus_types::{
+    Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
+    SlashingEvidence,
+};
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::rpc::{
     self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, RecursiveProofByIndexResponse,
-    RecursiveProofLatestResponse, StateByRootResponse, Status,
+    BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse,
+    RecursiveProofByIndexResponse, RecursiveProofLatestResponse, StateByRootResponse, Status,
+    WitnessByBlockResponse,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
@@ -45,10 +49,10 @@ use neutrino_runtime_abi::{BlockContext, QueryRequest};
 use neutrino_runtime_host::{Overlay, QueryError, run_query, validate_transaction};
 use neutrino_storage::Database;
 use neutrino_sync::{
-    CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
-    SyncBackendError,
+    CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
+    SyncBackend, SyncBackendError,
 };
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Default mempool byte budget. Sized generously so the M6 default
 /// runtime's 4096-byte body buffer easily fits a handful of validated
@@ -704,6 +708,29 @@ where
         })
     }
 
+    async fn finality_certs_by_chunk(&self, chunk_ids: &[ChunkId]) -> FinalityCertByChunkResponse {
+        self.with_engine(|e| {
+            let max = usize::try_from(rpc::MAX_FINALITY_CERTS_PER_RESPONSE)
+                .expect("finality cert response limit fits usize");
+            let mut certs = Vec::with_capacity(chunk_ids.len().min(max));
+            for chunk_id in chunk_ids.iter().copied().take(max) {
+                let Ok(Some(cert)) = e.store().get_finality_cert(chunk_id) else {
+                    continue;
+                };
+                certs.push(cert);
+            }
+            FinalityCertByChunkResponse { certs }
+        })
+    }
+
+    async fn witnesses_by_block(&self, _block_hashes: &[BlockHash]) -> WitnessByBlockResponse {
+        // Witness storage is M8 territory; archive nodes will
+        // populate this once the prover pipeline lands. For now
+        // every full node returns an empty response (consistent
+        // with the default trait impl).
+        WitnessByBlockResponse::default()
+    }
+
     async fn verify_and_import_checkpoints(
         &self,
         items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
@@ -809,6 +836,59 @@ where
             Ok(_) => {}
             Err(err) => debug!(?err, "mempool admission rejected a gossipped transaction"),
         }
+    }
+
+    async fn verify_and_import_chunk_proof(
+        &self,
+        proof: ChunkProof,
+    ) -> Result<ChunkProofImported, SyncBackendError> {
+        let chunk_id = proof.chunk_id;
+        let outcome = self
+            .with_engine_mut(|e| e.import_chunk_proof(&proof, &self.proof_system))
+            .map_err(Self::map_import_err)?;
+        debug!(
+            chunk_id,
+            end_height = outcome.end_height,
+            "persisted gossipped chunk proof"
+        );
+        Ok(ChunkProofImported {
+            chunk_id: outcome.chunk_id,
+            end_height: outcome.end_height,
+        })
+    }
+
+    async fn ingest_finality_vote(&self, vote: FinalityVote) {
+        // M6 lands the transport: decode succeeded, so we count the
+        // vote as a healthy gossip artifact. M7 will route this
+        // into the chunk-BFT state machine via a dedicated vote
+        // pool on this backend.
+        trace!(
+            chunk_id = vote.data.chunk_id,
+            round = vote.data.round,
+            ?vote.data.phase,
+            "received finality vote (deferred to M7 BFT loop)"
+        );
+    }
+
+    async fn ingest_aggregate_finality_vote(&self, subnet: u8, vote: FinalityVote) {
+        // Same as `ingest_finality_vote`: M7 wires subnet ingest.
+        trace!(
+            subnet,
+            chunk_id = vote.data.chunk_id,
+            round = vote.data.round,
+            ?vote.data.phase,
+            "received aggregate finality vote (deferred to M7 BFT loop)"
+        );
+    }
+
+    async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {
+        // M7 detection logic will buffer evidence in an explicit
+        // pool for runtime application; for now we log it so M6
+        // smoke tests confirm the transport delivers correctly.
+        trace!(
+            ?evidence,
+            "received slashing evidence (deferred to M7 evidence pool)"
+        );
     }
 }
 

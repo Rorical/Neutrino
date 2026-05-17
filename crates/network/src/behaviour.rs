@@ -2,9 +2,9 @@
 
 use crate::rpc::{
     BlockProofByHashBehaviour, BlockProofByHeightBehaviour, BlocksByRangeBehaviour,
-    BlocksByRootBehaviour, ChunkProofByIdBehaviour, MetadataBehaviour, PingBehaviour,
-    RecursiveProofByIndexBehaviour, RecursiveProofLatestBehaviour, StateByRootBehaviour,
-    StatusBehaviour,
+    BlocksByRootBehaviour, ChunkProofByIdBehaviour, FinalityCertByChunkBehaviour,
+    MetadataBehaviour, PingBehaviour, RecursiveProofByIndexBehaviour,
+    RecursiveProofLatestBehaviour, StateByRootBehaviour, StatusBehaviour, WitnessByBlockBehaviour,
 };
 use libp2p::{
     connection_limits, gossipsub, identify,
@@ -59,4 +59,8 @@ pub struct NeutrinoBehaviour {
     pub rpc_recursive_proof_latest: RecursiveProofLatestBehaviour,
     /// `/neutrino/req/recursive_proof_by_index/1` request/response.
     pub rpc_recursive_proof_by_index: RecursiveProofByIndexBehaviour,
+    /// `/neutrino/req/finality_cert_by_chunk/1` request/response.
+    pub rpc_finality_cert_by_chunk: FinalityCertByChunkBehaviour,
+    /// `/neutrino/req/witness_by_block/1` request/response.
+    pub rpc_witness_by_block: WitnessByBlockBehaviour,
 }

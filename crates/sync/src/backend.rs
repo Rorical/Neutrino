@@ -8,11 +8,14 @@
 //! lightweight in-memory mock.
 
 use async_trait::async_trait;
-use neutrino_consensus_types::{Block, BlockProof, RecursiveCheckpointProof};
+use neutrino_consensus_types::{
+    Block, BlockProof, ChunkProof, FinalityVote, RecursiveCheckpointProof, SlashingEvidence,
+};
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, Metadata, RecursiveProofByIndexResponse,
-    RecursiveProofLatestResponse, StateByRootResponse, Status, role_flags,
+    BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse, Metadata,
+    RecursiveProofByIndexResponse, RecursiveProofLatestResponse, StateByRootResponse, Status,
+    WitnessByBlockResponse, role_flags,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
@@ -83,6 +86,15 @@ pub struct ProofsImported {
     pub new_proven_height: Height,
 }
 
+/// Result of importing a single chunk proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkProofImported {
+    /// Chunk id covered by the imported proof.
+    pub chunk_id: ChunkId,
+    /// Last block height covered by the chunk.
+    pub end_height: Height,
+}
+
 /// Host-supplied verification + storage adapter.
 ///
 /// All methods take `&self`; implementations are expected to use interior
@@ -139,6 +151,23 @@ pub trait SyncBackend: Send + Sync + 'static {
 
     /// Build a response to `/neutrino/req/chunk_proof_by_id/1`.
     async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse;
+
+    /// Build a response to `/neutrino/req/finality_cert_by_chunk/1`.
+    ///
+    /// Default impl returns an empty response; backends override
+    /// it to look up the persisted finality certificate per chunk
+    /// from the chain store.
+    async fn finality_certs_by_chunk(&self, _chunk_ids: &[ChunkId]) -> FinalityCertByChunkResponse {
+        FinalityCertByChunkResponse::default()
+    }
+
+    /// Build a response to `/neutrino/req/witness_by_block/1`.
+    ///
+    /// Default impl returns an empty response; archive nodes
+    /// override it once block witnesses are persisted (M8+).
+    async fn witnesses_by_block(&self, _block_hashes: &[BlockHash]) -> WitnessByBlockResponse {
+        WitnessByBlockResponse::default()
+    }
 
     /// Verify each `(Checkpoint, RecursiveCheckpointProof)` in chain order,
     /// then persist the highest accepted entry.
@@ -197,4 +226,43 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Errors are intentionally not surfaced — duplicates and
     /// capacity rejections are best-effort.
     async fn submit_transaction(&self, _bytes: Vec<u8>) {}
+
+    /// Verify + persist a chunk proof received via
+    /// `/neutrino/chunk_proofs/borsh/1`.
+    ///
+    /// The default implementation rejects every chunk proof so test
+    /// backends that have no proof system stay safe. The production
+    /// backend overrides this to call
+    /// `Engine::import_chunk_proof`.
+    async fn verify_and_import_chunk_proof(
+        &self,
+        _proof: ChunkProof,
+    ) -> Result<ChunkProofImported, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "chunk proof import is not implemented by this backend".to_owned(),
+        ))
+    }
+
+    /// Ingest a finality vote received via
+    /// `/neutrino/finality_votes_prevote/borsh/1` or
+    /// `/neutrino/finality_votes_precommit/borsh/1`.
+    ///
+    /// Default impl drops the vote. M7 BFT backends override this
+    /// to route the vote into the chunk-BFT state machine.
+    async fn ingest_finality_vote(&self, _vote: FinalityVote) {}
+
+    /// Ingest an aggregate finality vote received via
+    /// `/neutrino/aggregate_finality_votes_<subnet>/borsh/1`.
+    ///
+    /// Default impl drops the aggregate. M7 BFT backends override
+    /// this to merge the aggregate into the per-chunk vote
+    /// accumulator.
+    async fn ingest_aggregate_finality_vote(&self, _subnet: u8, _vote: FinalityVote) {}
+
+    /// Ingest a slashing evidence record received via
+    /// `/neutrino/slashing_evidence/borsh/1`.
+    ///
+    /// Default impl drops the evidence. M7 slashing backends
+    /// override this to buffer evidence for runtime application.
+    async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {}
 }

@@ -446,6 +446,36 @@ impl<DB: Database> ChainStore<DB> {
         Ok(raw.and_then(|bytes| Seed::try_from(bytes.as_slice()).ok()))
     }
 
+    /// Write the highest checkpoint index whose covering headers have
+    /// already been folded into [`pointers::FINALIZED_SEED`].
+    pub fn put_seed_advanced_through_checkpoint(
+        &mut self,
+        index: CheckpointIndex,
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.put_raw(
+            Column::Finalized,
+            pointers::SEED_ADVANCED_THROUGH_CHECKPOINT,
+            &keys::checkpoint_index_key(index),
+        )
+    }
+
+    /// Read the highest checkpoint index whose covering headers have
+    /// already been folded into the persisted seed. Returns `None`
+    /// when the engine has never advanced the seed (treat as `0`).
+    pub fn get_seed_advanced_through_checkpoint(
+        &self,
+    ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
+        let raw = self.get_raw(
+            Column::Finalized,
+            pointers::SEED_ADVANCED_THROUGH_CHECKPOINT,
+        )?;
+        Ok(raw.and_then(|b| {
+            <[u8; 8]>::try_from(b.as_slice())
+                .ok()
+                .map(u64::from_be_bytes)
+        }))
+    }
+
     /// Iterate every persisted `(hash, bytes)` pair in
     /// [`Column::TrieNodes`]. Used by `Engine::open` to rehydrate the
     /// runtime state trie after restart.

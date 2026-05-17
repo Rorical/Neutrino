@@ -17,7 +17,6 @@ use neutrino_consensus_types::{
 use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Hash, Seed, ZERO_HASH};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
-use neutrino_vrf::fold_seed;
 
 use crate::block_state::BlockState;
 use crate::engine::Engine;
@@ -198,7 +197,6 @@ impl<DB: Database> Engine<DB> {
             .ok_or(CheckpointError::MissingChunkProof(chunk_id))?;
 
         let block_hashes = self.collect_finalized_block_hashes(&chunk)?;
-        let vrf_proofs = self.collect_chunk_vrf_proofs(&chunk)?;
 
         let new_index = self.latest_checkpoint_index().saturating_add(1);
         let previous_checkpoint_index = self.latest_checkpoint_index();
@@ -232,8 +230,6 @@ impl<DB: Database> Engine<DB> {
 
         let _ = recursive_witness; // M5 mock backend ignores witnesses.
 
-        let next_finalized_seed = fold_seed(&self.finalized_seed(), &vrf_proofs);
-
         for hash in &block_hashes {
             self.store_mut()
                 .put_block_state(hash, BlockState::Checkpointed)?;
@@ -242,11 +238,16 @@ impl<DB: Database> Engine<DB> {
         self.store_mut()
             .put_recursive_proof(new_index, &wire_recursive_proof)?;
         self.store_mut().put_latest_checkpoint_index(new_index)?;
-        self.update_checkpoint_pointers(new_index, next_finalized_seed);
-        // The new seed must survive restart: otherwise `Engine::open`
-        // would fall back to the genesis seed and forks every running
-        // chain after chunk 0.
-        self.persist_finalized_seed()?;
+        // Update the in-memory checkpoint pointer keeping the current
+        // seed; the helper below folds the new chunk's headers in.
+        self.update_checkpoint_pointers(new_index, self.finalized_seed());
+        // Producers always have the chunk's headers locally, so this
+        // call advances the seed for the new checkpoint immediately
+        // and persists both the seed and the seed-advance pointer.
+        // It is also what M6 followers use to fold headers as they
+        // arrive after a checkpoint backfill.
+        self.try_advance_finalized_seed()?;
+        let next_finalized_seed = self.finalized_seed();
 
         let checkpoint_hash = checkpoint.hash();
         Ok(CheckpointOutcome {
@@ -308,23 +309,6 @@ impl<DB: Database> Engine<DB> {
             hashes.push(hash);
         }
         Ok(hashes)
-    }
-
-    fn collect_chunk_vrf_proofs(
-        &self,
-        chunk: &Chunk,
-    ) -> Result<Vec<[u8; 96]>, CheckpointError<DB::Error>> {
-        let capacity = usize::try_from(chunk.end_height - chunk.start_height + 1)
-            .expect("chunk_size fits usize on supported targets");
-        let mut proofs = Vec::with_capacity(capacity);
-        for height in chunk.start_height..=chunk.end_height {
-            let header = self
-                .store()
-                .get_header_by_height(height)?
-                .ok_or(CheckpointError::MissingBlock { hash: ZERO_HASH })?;
-            proofs.push(header.vrf_proof);
-        }
-        Ok(proofs)
     }
 
     fn checkpoint_history_root(

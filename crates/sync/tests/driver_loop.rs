@@ -15,7 +15,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use neutrino_consensus_types::{Block, BlockProof, RecursiveCheckpointProof};
+use neutrino_consensus_types::{
+    Block, BlockProof, ChunkProof, FinalityVote, RecursiveCheckpointProof, SlashingEvidence,
+};
 use neutrino_network::PeerId;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::rpc::{
@@ -28,8 +30,8 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
 use neutrino_sync::{
-    CheckpointsImported, HeadersImported, ProofsImported, StateProgress, SyncBackend,
-    SyncBackendError, SyncDriver, SyncDriverConfig,
+    CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
+    SyncBackend, SyncBackendError, SyncDriver, SyncDriverConfig,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -40,6 +42,10 @@ struct MockState {
     rpc_calls: Vec<String>,
     advance_to_index: CheckpointIndex,
     advance_to_height: Height,
+    chunk_proof_imports: Vec<ChunkId>,
+    finality_vote_count: u32,
+    aggregate_finality_vote_count: u32,
+    slashing_evidence_count: u32,
 }
 
 #[derive(Clone, Default)]
@@ -62,6 +68,22 @@ impl MockBackend {
     #[allow(dead_code)]
     fn rpc_calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().rpc_calls.clone()
+    }
+
+    fn chunk_proof_imports(&self) -> Vec<ChunkId> {
+        self.inner.lock().unwrap().chunk_proof_imports.clone()
+    }
+
+    fn finality_vote_count(&self) -> u32 {
+        self.inner.lock().unwrap().finality_vote_count
+    }
+
+    fn aggregate_finality_vote_count(&self) -> u32 {
+        self.inner.lock().unwrap().aggregate_finality_vote_count
+    }
+
+    fn slashing_evidence_count(&self) -> u32 {
+        self.inner.lock().unwrap().slashing_evidence_count
     }
 }
 
@@ -228,6 +250,35 @@ impl SyncBackend for MockBackend {
             new_head_hash: block.hash(),
             new_head_slot: block.header.slot,
         })
+    }
+
+    async fn verify_and_import_chunk_proof(
+        &self,
+        proof: ChunkProof,
+    ) -> Result<ChunkProofImported, SyncBackendError> {
+        let chunk_id = proof.chunk_id;
+        let end_height = proof.public_inputs.end_height;
+        self.inner
+            .lock()
+            .unwrap()
+            .chunk_proof_imports
+            .push(chunk_id);
+        Ok(ChunkProofImported {
+            chunk_id,
+            end_height,
+        })
+    }
+
+    async fn ingest_finality_vote(&self, _vote: FinalityVote) {
+        self.inner.lock().unwrap().finality_vote_count += 1;
+    }
+
+    async fn ingest_aggregate_finality_vote(&self, _subnet: u8, _vote: FinalityVote) {
+        self.inner.lock().unwrap().aggregate_finality_vote_count += 1;
+    }
+
+    async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {
+        self.inner.lock().unwrap().slashing_evidence_count += 1;
     }
 }
 
@@ -636,4 +687,208 @@ fn sample_block_proof(height: Height) -> BlockProof {
         },
         proof_bytes: vec![0xAA],
     }
+}
+
+fn sample_chunk_proof(chunk_id: ChunkId, end_height: Height) -> ChunkProof {
+    use neutrino_consensus_types::ChunkProofPublicInputs;
+    use neutrino_primitives::ZERO_HASH;
+    ChunkProof {
+        chunk_id,
+        chunk_hash: [0xCC; 32],
+        public_inputs: ChunkProofPublicInputs {
+            chunk_id,
+            start_height: 0,
+            end_height,
+            start_state_root: ZERO_HASH,
+            end_state_root: ZERO_HASH,
+            start_block_hash: ZERO_HASH,
+            end_block_hash: ZERO_HASH,
+            block_hash_root: ZERO_HASH,
+            block_proof_root: ZERO_HASH,
+            vrf_proof_root: ZERO_HASH,
+            active_validator_set_root: ZERO_HASH,
+            next_validator_set_root: ZERO_HASH,
+            da_root: ZERO_HASH,
+        },
+        proof_bytes: vec![0xBB],
+    }
+}
+
+fn sample_finality_vote(chunk_id: ChunkId) -> FinalityVote {
+    use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
+    use neutrino_primitives::BitVec;
+    FinalityVote {
+        aggregation_bits: BitVec::default(),
+        data: FinalityVoteData {
+            chunk_id,
+            round: 0,
+            chunk_hash: [0xAB; 32],
+            phase: FinalityVotePhase::Prevote,
+        },
+        signature: [0; 96],
+    }
+}
+
+fn sample_slashing_evidence() -> SlashingEvidence {
+    use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase, IndexedVote};
+    let make_vote = |chunk_hash: [u8; 32]| IndexedVote {
+        data: FinalityVoteData {
+            chunk_id: 7,
+            round: 0,
+            chunk_hash,
+            phase: FinalityVotePhase::Prevote,
+        },
+        signature: [0; 96],
+    };
+    SlashingEvidence::DoublePrevote {
+        validator_index: 3,
+        vote_a: make_vote([0x11; 32]),
+        vote_b: make_vote([0x22; 32]),
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn gossipped_chunk_proof_is_routed_to_backend() {
+    let backend = MockBackend::default();
+    backend.set_status(Status::default());
+    let backend_handle = backend.clone();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    let proof = sample_chunk_proof(42, 128);
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::ChunkProofs,
+            data: borsh::to_vec(&proof).unwrap(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"cp-1".to_vec()),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(backend_handle.chunk_proof_imports(), vec![42]);
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn gossipped_finality_vote_is_routed_to_backend() {
+    let backend = MockBackend::default();
+    backend.set_status(Status::default());
+    let backend_handle = backend.clone();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    let vote = sample_finality_vote(7);
+    let encoded = borsh::to_vec(&vote).unwrap();
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::FinalityVotesPrevote,
+            data: encoded.clone(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"fv-1".to_vec()),
+        })
+        .await
+        .unwrap();
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::FinalityVotesPrecommit,
+            data: encoded,
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"fv-2".to_vec()),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(backend_handle.finality_vote_count(), 2);
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn gossipped_aggregate_finality_vote_is_routed_to_backend() {
+    let backend = MockBackend::default();
+    backend.set_status(Status::default());
+    let backend_handle = backend.clone();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    let vote = sample_finality_vote(9);
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::AggregateFinalityVotes(3),
+            data: borsh::to_vec(&vote).unwrap(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"agg".to_vec()),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(backend_handle.aggregate_finality_vote_count(), 1);
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn gossipped_slashing_evidence_is_routed_to_backend() {
+    let backend = MockBackend::default();
+    backend.set_status(Status::default());
+    let backend_handle = backend.clone();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    let evidence = sample_slashing_evidence();
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::SlashingEvidence,
+            data: borsh::to_vec(&evidence).unwrap(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"sl-1".to_vec()),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(backend_handle.slashing_evidence_count(), 1);
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
 }

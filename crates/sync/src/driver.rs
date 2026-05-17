@@ -196,6 +196,9 @@ impl SyncDriver {
         if topic == Topic::BlockProofs {
             return self.handle_block_proof_gossip(data).await;
         }
+        if topic == Topic::ChunkProofs {
+            return self.handle_chunk_proof_gossip(data).await;
+        }
         if topic == Topic::Checkpoints {
             return self.handle_checkpoint_gossip(data).await;
         }
@@ -203,11 +206,25 @@ impl SyncDriver {
             self.backend.submit_transaction(data).await;
             return MessageAcceptance::Accept;
         }
+        if topic == Topic::FinalityVotesPrevote || topic == Topic::FinalityVotesPrecommit {
+            return self.handle_finality_vote_gossip(data).await;
+        }
+        if let Topic::AggregateFinalityVotes(subnet) = topic {
+            return self
+                .handle_aggregate_finality_vote_gossip(subnet, data)
+                .await;
+        }
+        if topic == Topic::SlashingEvidence {
+            return self.handle_slashing_evidence_gossip(data).await;
+        }
         if topic != Topic::Blocks {
+            // Topics still without a handler today: ProverBounty (M11).
+            // Stay Ignore so honest peers are not penalised; M11
+            // will route this through the fallback prover market.
             debug!(
                 ?topic,
                 len = data.len(),
-                "ignoring gossip for non-Blocks topic"
+                "ignoring gossip for unhandled topic"
             );
             return MessageAcceptance::Ignore;
         }
@@ -287,6 +304,99 @@ impl SyncDriver {
                 MessageAcceptance::Ignore
             }
         }
+    }
+
+    async fn handle_chunk_proof_gossip(
+        &self,
+        data: Vec<u8>,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+        let proof = match borsh::from_slice::<neutrino_consensus_types::ChunkProof>(&data) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(?err, "failed to decode gossipped chunk proof; rejecting");
+                return MessageAcceptance::Reject;
+            }
+        };
+        let chunk_id = proof.chunk_id;
+        match self.backend.verify_and_import_chunk_proof(proof).await {
+            Ok(outcome) => {
+                debug!(
+                    chunk_id = outcome.chunk_id,
+                    end_height = outcome.end_height,
+                    "imported gossipped chunk proof"
+                );
+                MessageAcceptance::Accept
+            }
+            Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
+            Err(err) => {
+                debug!(chunk_id, ?err, "ignoring gossipped chunk proof");
+                MessageAcceptance::Ignore
+            }
+        }
+    }
+
+    async fn handle_finality_vote_gossip(
+        &self,
+        data: Vec<u8>,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+        let vote = match borsh::from_slice::<neutrino_consensus_types::FinalityVote>(&data) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(?err, "failed to decode gossipped finality vote; rejecting");
+                return MessageAcceptance::Reject;
+            }
+        };
+        // M6 lands the transport; M7 wires this into the chunk-BFT
+        // state machine. Backends override the default no-op trait
+        // method when they have a BFT loop to feed.
+        self.backend.ingest_finality_vote(vote).await;
+        MessageAcceptance::Accept
+    }
+
+    async fn handle_aggregate_finality_vote_gossip(
+        &self,
+        subnet: u8,
+        data: Vec<u8>,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+        let vote = match borsh::from_slice::<neutrino_consensus_types::FinalityVote>(&data) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    subnet, "failed to decode gossipped aggregate finality vote; rejecting"
+                );
+                return MessageAcceptance::Reject;
+            }
+        };
+        self.backend
+            .ingest_aggregate_finality_vote(subnet, vote)
+            .await;
+        MessageAcceptance::Accept
+    }
+
+    async fn handle_slashing_evidence_gossip(
+        &self,
+        data: Vec<u8>,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+        let evidence = match borsh::from_slice::<neutrino_consensus_types::SlashingEvidence>(&data)
+        {
+            Ok(e) => e,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to decode gossipped slashing evidence; rejecting"
+                );
+                return MessageAcceptance::Reject;
+            }
+        };
+        // M6 lands the transport. M7 detection logic will buffer
+        // evidence for runtime application via a dedicated pool.
+        self.backend.ingest_slashing_evidence(evidence).await;
+        MessageAcceptance::Accept
     }
 
     async fn handle_checkpoint_gossip(
@@ -404,6 +514,12 @@ impl SyncDriver {
                 self.backend
                     .recursive_proofs_by_index(start_index, count)
                     .await,
+            )),
+            RpcRequest::FinalityCertByChunk(req) => Some(RpcResponse::FinalityCertByChunk(
+                self.backend.finality_certs_by_chunk(&req.chunk_ids).await,
+            )),
+            RpcRequest::WitnessByBlock(req) => Some(RpcResponse::WitnessByBlock(
+                self.backend.witnesses_by_block(&req.block_hashes).await,
             )),
         };
         if let Some(response) = response {

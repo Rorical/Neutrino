@@ -13,7 +13,8 @@
 //!
 //! M8-C lays the baseline; M8-D adds the public-input commitment;
 //! M8-E adds the first lookup-table AIR; M8-F adds the memory
-//! consistency AIR. The crate currently exposes:
+//! consistency AIR; M8-G adds the program ROM AIR. The crate
+//! currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -28,13 +29,18 @@
 //! - [`memory_consistency`] — the sorted multi-set memory consistency
 //!   AIR. M8-L wires its `addr` / `ts` differences to the range table
 //!   and its rows to the CPU AIR via the logUp bus.
+//! - [`program_rom`] — the `(pc, instruction)` table anchored at the
+//!   ELF's `pc_base`. M8-L routes the CPU AIR's per-fetch lookups
+//!   into this table; M8-N pins the table's preprocessed commitment
+//!   to the `vm_code_hash` public input.
 //!
-//! Later M8 slices (M8-G onwards) grow the crate one AIR at a time
+//! Later M8 slices (M8-H onwards) grow the crate one AIR at a time
 //! against this scaffold.
 
 pub mod config;
 pub mod fibonacci;
 pub mod memory_consistency;
+pub mod program_rom;
 pub mod public_inputs;
 pub mod range_check;
 
@@ -47,6 +53,7 @@ pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
     memory_consistency_trace,
 };
+pub use program_rom::{PROGRAM_ROM_TRACE_WIDTH, ProgramRomAir, program_rom_trace};
 pub use public_inputs::{
     BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,
     commit_block_public_inputs,

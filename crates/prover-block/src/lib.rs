@@ -12,7 +12,8 @@
 //! logUp lookup bus.
 //!
 //! M8-C lays the baseline; M8-D adds the public-input commitment;
-//! M8-E adds the first lookup-table AIR. The crate currently exposes:
+//! M8-E adds the first lookup-table AIR; M8-F adds the memory
+//! consistency AIR. The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -24,12 +25,16 @@
 //! - [`range_check`] — the ascending lookup-table AIR every later
 //!   range argument (u8 / u16 / u32 byte decomposition) targets via
 //!   the M8-L logUp bus.
+//! - [`memory_consistency`] — the sorted multi-set memory consistency
+//!   AIR. M8-L wires its `addr` / `ts` differences to the range table
+//!   and its rows to the CPU AIR via the logUp bus.
 //!
-//! Later M8 slices (M8-F onwards) grow the crate one AIR at a time
+//! Later M8 slices (M8-G onwards) grow the crate one AIR at a time
 //! against this scaffold.
 
 pub mod config;
 pub mod fibonacci;
+pub mod memory_consistency;
 pub mod public_inputs;
 pub mod range_check;
 
@@ -38,6 +43,10 @@ pub use config::{
     build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
+pub use memory_consistency::{
+    MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
+    memory_consistency_trace,
+};
 pub use public_inputs::{
     BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,
     commit_block_public_inputs,

@@ -17,8 +17,11 @@
 //! adds the CPU AIR scaffold; M8-H slice 2 adds bit decomposition of
 //! the low instruction bytes and the LUI opcode family; M8-H slice 3
 //! adds the on-trace 32-entry register file with one-hot write
-//! indicators and the x0-pinned write rule. The crate currently
-//! exposes:
+//! indicators and the x0-pinned write rule; M8-H slice 4 adds bit
+//! decomposition of the high two instruction bytes, the OP-IMM ADDI
+//! instruction, and the `rs1` read indicators; M8-H slice 5 adds the
+//! bitwise OP-IMM operations ANDI / ORI / XORI on top of a 32-bit
+//! decomposition of `rs1_val`. The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -41,10 +44,14 @@
 //!   pinned the trace's PC and real/pad selector layout; slice 2
 //!   added bit decomposition of the low instruction bytes plus the
 //!   LUI opcode family (opcode check, `next_pc = pc + 4`,
-//!   `rd_val = imm20 << 12`); slice 3 adds the on-trace 32-entry
+//!   `rd_val = imm20 << 12`); slice 3 added the on-trace 32-entry
 //!   register file with one-hot write indicators, x0 pinning, and
-//!   the per-register transition rule. Subsequent M8-H sub-slices
-//!   add each remaining RV32I instruction family.
+//!   the per-register transition rule; slice 4 added bit
+//!   decomposition of the high two instruction bytes, the OP-IMM
+//!   ADDI instruction, and the `rs1` read-indicator port; slice 5
+//!   adds the bitwise OP-IMM operations ANDI / ORI / XORI on top of
+//!   a 32-bit decomposition of `rs1_val`. Subsequent M8-H
+//!   sub-slices add each remaining RV32I instruction family.
 //!
 //! Later M8 slices (M8-I onwards) grow the crate one AIR at a time
 //! against this scaffold.

@@ -1,12 +1,15 @@
 //! Per-block execution witness produced by the host while the VM runs.
 //!
 //! The witness captures everything a downstream proof system needs to
-//! re-verify a block's state-transition without re-executing the
-//! runtime ELF against an authenticated state trie:
+//! re-verify a block's state-transition without re-fetching chain data
+//! from the node database:
 //!
 //! - The [`StateRoot`](neutrino_trie) at the start of the block.
 //! - The engine-supplied [`BlockContextWitness`] (slot, height,
-//!   parent hash, gas limit, etc.).
+//!   parent hash, gas limit, VRF proof, etc.).
+//! - The runtime input bytes delivered through `host_input`.
+//! - Opaque borsh-encoded header and body bytes supplied by the engine
+//!   after block sealing.
 //! - Every state read the runtime performed, paired with an inclusion
 //!   or exclusion proof against the base state root.
 //!
@@ -43,11 +46,15 @@ pub struct BlockContextWitness {
     pub seed: [u8; 32],
     /// Hash of the parent block's header.
     pub parent_hash: [u8; 32],
+    /// Parent state root delivered to the runtime.
+    pub parent_state_root: [u8; 32],
     /// Gas limit the block was run with.
     pub gas_limit: u64,
     /// Proposer's active-set index. Matches the `u32`
     /// `ValidatorIndex` type used by `runtime-abi` and `primitives`.
     pub proposer_index: u32,
+    /// Proposer VRF proof delivered to the runtime.
+    pub vrf_proof: [u8; 96],
 }
 
 /// One state-read entry: the runtime read `key`, the underlying trie
@@ -71,6 +78,28 @@ pub struct StateRead {
     pub proof: Proof,
 }
 
+/// One `state_next_key` entry recorded in syscall order.
+///
+/// The runtime observes the next live overlay-aware key matching
+/// `prefix` and greater than `after`. The result key, when present, is
+/// paired with its base-trie value/proof so the prover can anchor the
+/// cursor result against the same parent state root as normal reads.
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone, Eq, PartialEq)]
+pub struct StateNextKeyRead {
+    /// Prefix argument supplied by the runtime.
+    pub prefix: Vec<u8>,
+    /// Cursor argument supplied by the runtime.
+    pub after: Vec<u8>,
+    /// Key returned by the host, or `None` when no matching live key
+    /// existed.
+    pub result_key: Option<Vec<u8>>,
+    /// Base-trie value for [`Self::result_key`], if any.
+    pub result_base_value: Option<Vec<u8>>,
+    /// Inclusion or exclusion proof for [`Self::result_key`] against
+    /// [`SealedWitness::parent_state_root`], if a result key existed.
+    pub result_proof: Option<Proof>,
+}
+
 /// Mutable witness accumulator the host writes into while a block
 /// executes.
 ///
@@ -81,18 +110,30 @@ pub struct StateRead {
 pub struct ExecutionWitness {
     parent_state_root: [u8; 32],
     block_context: BlockContextWitness,
+    runtime_input: Vec<u8>,
+    block_header: Vec<u8>,
+    block_body: Vec<u8>,
     state_reads: Vec<StateRead>,
+    state_next_key_reads: Vec<StateNextKeyRead>,
 }
 
 impl ExecutionWitness {
     /// Build a fresh witness for a block running against
     /// `parent_state_root` under the given `block_context`.
     #[must_use]
-    pub const fn new(parent_state_root: [u8; 32], block_context: BlockContextWitness) -> Self {
+    pub const fn new(
+        parent_state_root: [u8; 32],
+        block_context: BlockContextWitness,
+        runtime_input: Vec<u8>,
+    ) -> Self {
         Self {
             parent_state_root,
             block_context,
+            runtime_input,
+            block_header: Vec::new(),
+            block_body: Vec::new(),
             state_reads: Vec::new(),
+            state_next_key_reads: Vec::new(),
         }
     }
 
@@ -114,9 +155,20 @@ impl ExecutionWitness {
         self.state_reads.len()
     }
 
+    /// Number of recorded `state_next_key` syscalls.
+    #[must_use]
+    pub fn state_next_key_read_count(&self) -> usize {
+        self.state_next_key_reads.len()
+    }
+
     /// Append one state-read entry.
     pub fn record_state_read(&mut self, read: StateRead) {
         self.state_reads.push(read);
+    }
+
+    /// Append one `state_next_key` entry.
+    pub fn record_state_next_key_read(&mut self, read: StateNextKeyRead) {
+        self.state_next_key_reads.push(read);
     }
 
     /// Finalize into a [`SealedWitness`].
@@ -125,7 +177,11 @@ impl ExecutionWitness {
         SealedWitness {
             parent_state_root: self.parent_state_root,
             block_context: self.block_context,
+            runtime_input: self.runtime_input,
+            block_header: self.block_header,
+            block_body: self.block_body,
             state_reads: self.state_reads,
+            state_next_key_reads: self.state_next_key_reads,
         }
     }
 }
@@ -142,21 +198,32 @@ pub struct SealedWitness {
     pub parent_state_root: [u8; 32],
     /// Per-block context delivered by the engine.
     pub block_context: BlockContextWitness,
+    /// Bytes delivered to the runtime through `host_input`.
+    pub runtime_input: Vec<u8>,
+    /// Borsh-encoded block header. Empty until the consensus engine
+    /// seals the block and fills this field before persistence.
+    pub block_header: Vec<u8>,
+    /// Borsh-encoded block body. Empty until the consensus engine fills
+    /// this field before persistence.
+    pub block_body: Vec<u8>,
     /// Every state read the runtime performed, in syscall order.
     pub state_reads: Vec<StateRead>,
+    /// Every `state_next_key` syscall the runtime performed, in syscall
+    /// order.
+    pub state_next_key_reads: Vec<StateNextKeyRead>,
 }
 
 impl SealedWitness {
-    /// `true` when no state reads were recorded.
+    /// `true` when no read-side state syscalls were recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.state_reads.is_empty()
+        self.state_reads.is_empty() && self.state_next_key_reads.is_empty()
     }
 
-    /// Number of recorded state reads.
+    /// Number of recorded read-side state syscalls.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.state_reads.len()
+        self.state_reads.len() + self.state_next_key_reads.len()
     }
 }
 
@@ -171,8 +238,10 @@ mod tests {
             height: 7,
             seed: [0xAB; 32],
             parent_hash: [0xCD; 32],
+            parent_state_root: [0xEF; 32],
             gas_limit: 1_000_000,
             proposer_index: 3,
+            vrf_proof: [0x12; 96],
         }
     }
 
@@ -185,8 +254,10 @@ mod tests {
 
     #[test]
     fn fresh_witness_is_empty() {
-        let witness = ExecutionWitness::new([0; 32], sample_context());
+        let context = sample_context();
+        let witness = ExecutionWitness::new(context.parent_state_root, context, Vec::new());
         assert_eq!(witness.state_read_count(), 0);
+        assert_eq!(witness.state_next_key_read_count(), 0);
         let sealed = witness.seal();
         assert!(sealed.is_empty());
         assert_eq!(sealed.len(), 0);
@@ -194,7 +265,12 @@ mod tests {
 
     #[test]
     fn record_and_seal_round_trips_through_borsh() {
-        let mut witness = ExecutionWitness::new([0xEE; 32], sample_context());
+        let context = sample_context();
+        let mut witness = ExecutionWitness::new(
+            context.parent_state_root,
+            context,
+            b"runtime-input".to_vec(),
+        );
         witness.record_state_read(StateRead {
             key: b"counter".to_vec(),
             base_value: Some(7_u64.to_le_bytes().to_vec()),
@@ -205,8 +281,16 @@ mod tests {
             base_value: None,
             proof: empty_proof(),
         });
+        witness.record_state_next_key_read(StateNextKeyRead {
+            prefix: b"acct:".to_vec(),
+            after: b"acct:alice".to_vec(),
+            result_key: Some(b"acct:bob".to_vec()),
+            result_base_value: Some(b"bob-value".to_vec()),
+            result_proof: Some(empty_proof()),
+        });
         let sealed = witness.seal();
-        assert_eq!(sealed.len(), 2);
+        assert_eq!(sealed.len(), 3);
+        assert_eq!(sealed.runtime_input, b"runtime-input");
 
         let encoded = borsh::to_vec(&sealed).expect("borsh encode");
         let decoded: SealedWitness = borsh::from_slice(&encoded).expect("borsh decode");

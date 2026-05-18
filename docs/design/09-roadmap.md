@@ -181,7 +181,7 @@ and applied by the runtime within one chunk.
 - Implement the fallback-prover hook surface even though the
   bounty/economics arrive in M11.
 
-Work is broken into 14 sub-slices so each lands behind the six-gate
+Work is broken into 16 sub-slices so each lands behind the six-gate
 CI:
 
 - **M8-A** Witness pipeline (`SealedWitness`, borsh, storage column,
@@ -189,11 +189,12 @@ CI:
 - **M8-B** Design-doc canonicalisation of the Plonky3-everywhere
   decision.
 - **M8-C** `prover-block` Plonky3 baseline (BabyBear, Poseidon2,
-  Fibonacci hello-world AIR proving + verifying through the
-  `ProofSystem` trait).
+  Fibonacci hello-world AIR proving + verifying directly against
+  Plonky3; `ProofSystem` integration lands in M8-N).
 - **M8-D** Public-input commitment binding (Poseidon2 digest of
   `BlockProofPublicInputs`).
-- **M8-E** Range-check tables (u8 / u16 / u32 decomposition).
+- **M8-E** Range-check tables (parameterised u8 / u16 static tables;
+  u32 decomposes through byte lookups once M8-L wires the shared bus).
 - **M8-F** Memory consistency AIR (multi-set permutation on
   `(addr, ts, op, val)`).
 - **M8-G** Program ROM AIR (PC → instruction lookup anchored at

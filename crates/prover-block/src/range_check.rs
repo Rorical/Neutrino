@@ -6,8 +6,7 @@
 //!
 //! 1. The first row's only cell equals zero.
 //! 2. Each transition adds exactly one: `next[0] = local[0] + 1`.
-//! 3. The trace height is fixed to `2^log_size` (Plonky3's FRI
-//!    commitment makes the verifier reject any other height).
+//! 3. The last row equals `2^log_size - 1`.
 //!
 //! Together these force the trace to contain every integer in
 //! `[0, 2^log_size)` exactly once, in ascending order. Later AIRs
@@ -29,11 +28,32 @@ pub const RANGE_CHECK_TRACE_WIDTH: usize = 1;
 ///
 /// Generic over the bit-width of the range: `log_size = 8` yields a
 /// 256-row u8 table, `log_size = 16` yields a 65 536-row u16 table.
-/// The struct itself carries no parameters; the trace height encodes
-/// the range size and the AIR constraints are identical in every
-/// configuration.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RangeCheckAir;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RangeCheckAir {
+    log_size: u32,
+}
+
+impl RangeCheckAir {
+    /// Build a range-check AIR for values in `[0, 2^log_size)`.
+    #[must_use]
+    pub const fn new(log_size: u32) -> Self {
+        Self { log_size }
+    }
+
+    /// Log-base-2 size of the table this AIR binds.
+    #[must_use]
+    pub const fn log_size(self) -> u32 {
+        self.log_size
+    }
+
+    const fn last_value(self) -> u64 {
+        1_u64
+            .checked_shl(self.log_size)
+            .expect("RangeCheckAir: 2^log_size overflows u64")
+            .checked_sub(1)
+            .expect("RangeCheckAir requires at least one row")
+    }
+}
 
 impl<F> BaseAir<F> for RangeCheckAir {
     fn width(&self) -> usize {
@@ -63,6 +83,11 @@ impl<AB: AirBuilder> Air<AB> for RangeCheckAir {
         builder
             .when_transition()
             .assert_eq(next_value, local_value + one);
+
+        // Last row: bind the exact table size. Without this, any
+        // power-of-two ascending prefix would satisfy the same AIR.
+        let last: AB::Expr = AB::Expr::from(AB::F::from_u64(self.last_value()));
+        builder.when_last_row().assert_eq(local_value, last);
     }
 }
 
@@ -114,8 +139,9 @@ mod tests {
         // 16 rows: large enough to exercise multiple FRI rounds at the
         // configured blowup, small enough to run under one second.
         let trace = range_check_trace::<Val>(4);
-        let proof = prove(&config, &RangeCheckAir, trace, &[]);
-        verify(&config, &RangeCheckAir, &proof, &[]).expect("range proof verifies");
+        let air = RangeCheckAir::new(4);
+        let proof = prove(&config, &air, trace, &[]);
+        verify(&config, &air, &proof, &[]).expect("range proof verifies");
     }
 
     #[test]
@@ -124,8 +150,24 @@ mod tests {
         // range check in the eventual block prover will reference.
         let config = build_stark_config();
         let trace = range_check_trace::<Val>(8);
-        let proof = prove(&config, &RangeCheckAir, trace, &[]);
-        verify(&config, &RangeCheckAir, &proof, &[]).expect("u8 range proof verifies");
+        let air = RangeCheckAir::new(8);
+        let proof = prove(&config, &air, trace, &[]);
+        verify(&config, &air, &proof, &[]).expect("u8 range proof verifies");
+    }
+
+    #[test]
+    fn prover_refuses_trace_with_wrong_table_size() {
+        let config = build_stark_config();
+        let trace = range_check_trace::<Val>(4);
+        let air = RangeCheckAir::new(5);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove(&config, &air, trace, &[])
+        }));
+        assert!(
+            result.is_err(),
+            "prover accepted a trace for the wrong range size",
+        );
     }
 
     #[test]
@@ -142,8 +184,9 @@ mod tests {
         // `next[0] = local[0] + 1` transition into and out of row 5.
         trace.values[5] = Val::from_u64(6);
 
+        let air = RangeCheckAir::new(log_size);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove(&config, &RangeCheckAir, trace, &[])
+            prove(&config, &air, trace, &[])
         }));
         assert!(
             result.is_err(),
@@ -163,8 +206,9 @@ mod tests {
             *slot = Val::from_u64((i + 1) as u64);
         }
 
+        let air = RangeCheckAir::new(log_size);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove(&config, &RangeCheckAir, trace, &[])
+            prove(&config, &air, trace, &[])
         }));
         assert!(
             result.is_err(),

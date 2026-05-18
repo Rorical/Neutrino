@@ -71,11 +71,13 @@ trie.
 
 When the host runs in **proving mode** (BlockProver / FallbackProver roles),
 every read-side state syscall — `state_read`, `state_exists`, `state_next_key`
-— transparently records the trie nodes that produced its result into a
-per-block execution witness. The runtime sees no difference: it issues the
+— transparently records its base-trie anchoring data into a per-block execution
+witness. `state_read` / `state_exists` record a key, base value, and trie proof;
+`state_next_key` records its prefix/cursor/result tuple plus a trie proof for
+the returned key when one exists. The runtime sees no difference: it issues the
 same syscalls, gets the same answers, and pays the same gas. The witness is
-sealed at the end of `_neutrino_execute_block` and handed to `prover-block`
-as zk private input.
+sealed at the end of `_neutrino_execute_block` and handed to `prover-block` as
+zk private input.
 
 Writes are **not** recorded by these syscalls; the verifier circuit
 recomputes the post-state root from the recorded trie nodes plus the writes

@@ -173,9 +173,13 @@ impl HostInterface for DispatchingHost<'_> {
                 self.witness.as_deref_mut(),
                 gas_remaining,
             ),
-            syscall::state::NEXT_KEY => {
-                handlers::state::next_key(cpu, memory, self.overlay, gas_remaining)
-            }
+            syscall::state::NEXT_KEY => handlers::state::next_key(
+                cpu,
+                memory,
+                self.overlay,
+                self.witness.as_deref_mut(),
+                gas_remaining,
+            ),
             syscall::state::ROOT => handlers::state::root(cpu, memory, self.overlay, gas_remaining),
 
             // Block I/O.

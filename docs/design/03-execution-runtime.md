@@ -145,12 +145,19 @@ re-fetches trie nodes from RocksDB.
 What gets recorded (see
 [`vm-rv32im::witness::SealedWitness`](../../crates/vm-rv32im/src/witness.rs)):
 
+- The runtime input bytes handed to `host_input`, plus opaque
+  borsh-encoded `Header` / `Body` bytes supplied by the consensus
+  engine once the block is sealed. These let the real prover bind the
+  private execution transcript back to `transactions_root`, `da_root`,
+  and `block_hash`.
 - Every key the runtime read via `state_read` or `state_exists`, paired
   with the value the *base* trie maps it to and a `neutrino_trie::Proof`
   anchored at `parent_state_root`. Reads served from the dirty overlay
   also carry a base-trie proof so the prover never has to trust the
   overlay; the live value the runtime saw is reconstructed by replaying
   earlier writes in the syscall trace.
+- Every `state_next_key` cursor read, with the prefix, cursor, returned
+  key (if any), and base-trie proof for that returned key.
 - The frozen `BlockContextWitness` mirroring the engine-provided
   `BlockContext`.
 - The parent state root.

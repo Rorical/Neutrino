@@ -17,12 +17,13 @@ use neutrino_consensus_engine::{
     BlockState, Engine, ProductionConfig, ProductionOutcome, ProposerKey, ProveError,
     validator_set_root,
 };
-use neutrino_consensus_types::Body;
+use neutrino_consensus_types::{Body, Header};
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
     ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{MockBlockProof, MockProofSystem, ProofSystem};
+use neutrino_runtime_host::SealedWitness;
 use neutrino_storage::MemoryDatabase;
 
 const ELF_ENV: &str = "NEUTRINO_DEFAULT_RUNTIME_ELF";
@@ -147,6 +148,17 @@ fn prove_block_walks_fsm_to_proven_and_persists_proof() {
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
 
     let produced = produce_one_block(&mut engine, &proposer, &elf, 1);
+
+    let witness_bytes = engine
+        .store()
+        .get_witness(&produced.block_hash)
+        .expect("get witness")
+        .expect("witness persisted");
+    let witness: SealedWitness = borsh::from_slice(&witness_bytes).expect("witness decodes");
+    let witness_header: Header = borsh::from_slice(&witness.block_header).expect("header decodes");
+    let witness_body: Body = borsh::from_slice(&witness.block_body).expect("body decodes");
+    assert_eq!(witness_header.hash(), produced.block_hash);
+    assert_eq!(witness_body, produced.block.body);
 
     let mock = MockProofSystem::new();
     let prove_outcome = engine

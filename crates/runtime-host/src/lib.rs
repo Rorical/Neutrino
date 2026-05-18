@@ -36,7 +36,7 @@ pub use block_runner::{
 };
 pub use host::{DispatchingHost, EmittedLog};
 pub use neutrino_vm_rv32im::witness::{
-    BlockContextWitness, ExecutionWitness, SealedWitness, StateRead,
+    BlockContextWitness, ExecutionWitness, SealedWitness, StateNextKeyRead, StateRead,
 };
 pub use overlay::{Overlay, OverlayEntry};
 pub use scratch::Scratch;

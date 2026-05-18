@@ -219,6 +219,7 @@ impl<DB: Database> Engine<DB> {
             .ok_or(ProductionError::HeightOverflow)?;
         let parent_state_root = self.head_state_root();
 
+        let witness_body = borsh::to_vec(&body)?;
         let encoded_body = encode_runtime_body_with_validators(&body, self.active_validator_set())?;
         let ctx = BlockContext {
             slot,
@@ -233,7 +234,7 @@ impl<DB: Database> Engine<DB> {
 
         let trie = mem::take(self.state_mut_internal());
         let mut overlay = Overlay::new(trie);
-        let outcome = match run_block(
+        let mut outcome = match run_block(
             cfg.runtime_elf,
             &ctx,
             encoded_body.clone(),
@@ -267,10 +268,12 @@ impl<DB: Database> Engine<DB> {
 
         let block = Block { header, body };
         let block_hash = block.hash();
+        outcome.witness.block_body = witness_body;
+        outcome.witness.block_header = borsh::to_vec(&block.header)?;
 
         // Borsh-encode the witness up front so a serialization failure
-        // surfaces before any state mutation. The witness types use
-        // only `Vec<u8>` and fixed-size primitives, so the encode is
+        // surfaces before any store writes. The witness types use only
+        // `Vec<u8>` and fixed-size primitives, so the encode is
         // infallible in practice.
         let witness_bytes = borsh::to_vec(&outcome.witness)?;
 

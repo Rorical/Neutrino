@@ -1213,12 +1213,19 @@ where
         })
     }
 
-    async fn witnesses_by_block(&self, _block_hashes: &[BlockHash]) -> WitnessByBlockResponse {
-        // Witness storage is M8 territory; archive nodes will
-        // populate this once the prover pipeline lands. For now
-        // every full node returns an empty response (consistent
-        // with the default trait impl).
-        WitnessByBlockResponse::default()
+    async fn witnesses_by_block(&self, block_hashes: &[BlockHash]) -> WitnessByBlockResponse {
+        self.with_engine(|e| {
+            let max = usize::try_from(rpc::MAX_WITNESSES_PER_RESPONSE)
+                .expect("witness response limit fits usize");
+            let mut witnesses = Vec::with_capacity(block_hashes.len().min(max));
+            for hash in block_hashes.iter().copied().take(max) {
+                let Ok(Some(witness)) = e.store().get_witness(&hash) else {
+                    continue;
+                };
+                witnesses.push(witness);
+            }
+            WitnessByBlockResponse { witnesses }
+        })
     }
 
     async fn verify_and_import_checkpoints(

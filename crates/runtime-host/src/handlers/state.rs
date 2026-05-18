@@ -9,7 +9,7 @@ use neutrino_runtime_abi::gas;
 use neutrino_runtime_abi::status::Status;
 use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::memory::Memory;
-use neutrino_vm_rv32im::witness::{ExecutionWitness, StateRead};
+use neutrino_vm_rv32im::witness::{ExecutionWitness, StateNextKeyRead, StateRead};
 use neutrino_vm_rv32im::{Halt, Trap};
 
 use crate::overlay::Overlay;
@@ -33,6 +33,28 @@ fn record_state_read(witness: Option<&mut ExecutionWitness>, overlay: &Overlay, 
             key: key.to_vec(),
             base_value,
             proof,
+        });
+    }
+}
+
+/// If `witness` is `Some`, capture one `state_next_key` result.
+fn record_state_next_key(
+    witness: Option<&mut ExecutionWitness>,
+    overlay: &Overlay,
+    prefix: &[u8],
+    after: &[u8],
+    result_key: Option<&[u8]>,
+) {
+    if let Some(w) = witness {
+        let (result_base_value, result_proof) = result_key.map_or((None, None), |key| {
+            (overlay.base_get(key), Some(overlay.base_prove(key)))
+        });
+        w.record_state_next_key_read(StateNextKeyRead {
+            prefix: prefix.to_vec(),
+            after: after.to_vec(),
+            result_key: result_key.map(<[u8]>::to_vec),
+            result_base_value,
+            result_proof,
         });
     }
 }
@@ -178,6 +200,7 @@ pub fn next_key(
     cpu: &mut Cpu,
     memory: &mut Memory,
     overlay: &Overlay,
+    witness: Option<&mut ExecutionWitness>,
     gas_remaining: &mut u64,
 ) -> Result<Option<Halt>, Trap> {
     let prefix_ptr = cpu.read(10);
@@ -189,7 +212,9 @@ pub fn next_key(
 
     let prefix = pointer::read_bytes(memory, prefix_ptr, prefix_len)?;
     let after = pointer::read_bytes(memory, after_ptr, after_len)?;
-    let Some(next) = overlay.next_key(&prefix, &after) else {
+    let next = overlay.next_key(&prefix, &after);
+    record_state_next_key(witness, overlay, &prefix, &after, next.as_deref());
+    let Some(next) = next else {
         *gas_remaining = gas_remaining
             .checked_sub(gas::state_next_key(0))
             .ok_or(Trap::OutOfGas)?;
@@ -246,7 +271,9 @@ pub fn root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neutrino_trie::Trie;
     use neutrino_vm_rv32im::memory::Permissions;
+    use neutrino_vm_rv32im::witness::BlockContextWitness;
 
     fn rw_memory(len: u32) -> Memory {
         let mut mem = Memory::new(len);
@@ -265,6 +292,19 @@ mod tests {
         (0..len)
             .map(|i| mem.load_u8(addr + u32::try_from(i).unwrap()).unwrap())
             .collect()
+    }
+
+    fn sample_context(parent_state_root: [u8; 32]) -> BlockContextWitness {
+        BlockContextWitness {
+            slot: 1,
+            height: 1,
+            seed: [0; 32],
+            parent_hash: [0; 32],
+            parent_state_root,
+            gas_limit: 1_000_000,
+            proposer_index: 0,
+            vrf_proof: [0; 96],
+        }
     }
 
     #[test]
@@ -426,7 +466,7 @@ mod tests {
         cpu.write(15, 32); // out_cap
         let mut gas = 10_000_u64;
 
-        let _ = next_key(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+        let _ = next_key(&mut cpu, &mut mem, &overlay, None, &mut gas).unwrap();
 
         assert_eq!(cpu.read(10), Status::Ok.as_u32());
         assert_eq!(cpu.read(11), 8);
@@ -449,10 +489,45 @@ mod tests {
         cpu.write(15, 4);
         let mut gas = 10_000_u64;
 
-        let _ = next_key(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+        let _ = next_key(&mut cpu, &mut mem, &overlay, None, &mut gas).unwrap();
 
         assert_eq!(cpu.read(10), Status::BufferTooSmall.as_u32());
         assert_eq!(cpu.read(11), 10);
+    }
+
+    #[test]
+    fn next_key_records_witness_event() {
+        let mut trie = Trie::new();
+        trie.insert(b"acct:bob", b"2".to_vec()).unwrap();
+        let overlay = Overlay::new(trie);
+        let mut witness = ExecutionWitness::new(
+            overlay.base_root(),
+            sample_context(overlay.base_root()),
+            Vec::new(),
+        );
+
+        let mut mem = rw_memory(256);
+        store_bytes(&mut mem, 0, b"acct:");
+        store_bytes(&mut mem, 32, b"acct:alice");
+        let mut cpu = Cpu::new();
+        cpu.write(10, 0);
+        cpu.write(11, 5);
+        cpu.write(12, 32);
+        cpu.write(13, 10);
+        cpu.write(14, 100);
+        cpu.write(15, 32);
+        let mut gas = 10_000_u64;
+
+        let _ = next_key(&mut cpu, &mut mem, &overlay, Some(&mut witness), &mut gas).unwrap();
+
+        let sealed = witness.seal();
+        assert_eq!(sealed.state_next_key_reads.len(), 1);
+        let read = &sealed.state_next_key_reads[0];
+        assert_eq!(read.prefix, b"acct:");
+        assert_eq!(read.after, b"acct:alice");
+        assert_eq!(read.result_key.as_deref(), Some(&b"acct:bob"[..]));
+        assert_eq!(read.result_base_value.as_deref(), Some(&b"2"[..]));
+        assert!(read.result_proof.is_some());
     }
 
     #[test]

@@ -368,6 +368,11 @@ fn run_runtime_entrypoint(
     // Build the witness accumulator. `Skip` runs still allocate an
     // empty witness so the run path is shape-uniform; the empty
     // SealedWitness is cheap and never observed by callers.
+    let runtime_input = if witness_mode == WitnessMode::Record {
+        input.clone()
+    } else {
+        Vec::new()
+    };
     let mut witness = ExecutionWitness::new(
         state_root_before,
         BlockContextWitness {
@@ -375,9 +380,12 @@ fn run_runtime_entrypoint(
             height: block_ctx.height,
             seed: block_ctx.seed,
             parent_hash: block_ctx.parent_hash,
+            parent_state_root: block_ctx.parent_state_root,
             gas_limit: block_ctx.gas_limit,
             proposer_index: block_ctx.proposer_index,
+            vrf_proof: block_ctx.vrf_proof,
         },
+        runtime_input,
     );
 
     // Set up the dispatcher.

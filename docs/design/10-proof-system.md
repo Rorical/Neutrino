@@ -110,9 +110,13 @@ shipped peer-to-peer via `/neutrino/req/witness_by_block/1`.
 
 ```rust
 pub struct SealedWitness {
-    pub parent_state_root: [u8; 32],
-    pub block_context:    BlockContextWitness,
-    pub state_reads:      Vec<StateRead>,
+    pub parent_state_root:     [u8; 32],
+    pub block_context:         BlockContextWitness,
+    pub runtime_input:         Vec<u8>,   // bytes served by host_input
+    pub block_header:          Vec<u8>,   // borsh(Header)
+    pub block_body:            Vec<u8>,   // borsh(Body)
+    pub state_reads:           Vec<StateRead>,
+    pub state_next_key_reads:  Vec<StateNextKeyRead>,
 }
 
 pub struct StateRead {
@@ -120,16 +124,26 @@ pub struct StateRead {
     pub base_value: Option<Vec<u8>>,        // None for exclusion
     pub proof:      neutrino_trie::Proof,   // anchored at parent_state_root
 }
+
+pub struct StateNextKeyRead {
+    pub prefix:            Vec<u8>,
+    pub after:             Vec<u8>,
+    pub result_key:        Option<Vec<u8>>,
+    pub result_base_value: Option<Vec<u8>>,
+    pub result_proof:      Option<neutrino_trie::Proof>,
+}
 ```
 
 The proof system anchors every `StateRead.proof` against
-`SealedWitness.parent_state_root`. Writes are not recorded explicitly:
-the prover replays the trace to derive post-state values, then checks
-the post-state root equals the header's `state_root`. Reads that the
-runtime served from its dirty overlay (key written and re-read in the
-same block) still carry a base-trie proof so the prover never has to
-trust the runtime's overlay state; the live overlay value is
-reconstructed from the trace.
+`SealedWitness.parent_state_root`. `StateNextKeyRead` records cursor
+reads separately so syscall replay can constrain key iteration results
+instead of silently omitting them from the private input. Writes are not
+recorded explicitly: the prover replays the trace to derive post-state
+values, then checks the post-state root equals the header's
+`state_root`. Reads that the runtime served from its dirty overlay (key
+written and re-read in the same block) still carry a base-trie proof so
+the prover never has to trust the runtime's overlay state; the live
+overlay value is reconstructed from the trace.
 
 ### Block prover backend
 
@@ -188,8 +202,8 @@ public-input surface is identical regardless of shard count.
 #### Public-input commitment
 
 The borsh-encoded `BlockProofPublicInputs` is hashed under Poseidon2
-to a single field-element-equivalent digest committed as the STARK's
-public values. The verifier recomputes the digest from the same
+to an eight-BabyBear-element digest committed as the STARK's public
+values. The verifier recomputes the digest from the same
 fields and rejects mismatches. The mock backend (M2 through M7) uses
 BLAKE3 under `MOCK_BLOCK_DOMAIN`; the real backend's Poseidon2 digest
 is a separate namespace.

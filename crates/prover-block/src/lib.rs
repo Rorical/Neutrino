@@ -21,8 +21,8 @@
 //! decomposition of the high two instruction bytes, the OP-IMM ADDI
 //! instruction, and the `rs1` read indicators; M8-H slice 5 adds the
 //! bitwise OP-IMM operations ANDI / ORI / XORI on top of a 32-bit
-//! decomposition of `rs1_val`; M8-H slice 6 adds AUIPC. The crate
-//! currently exposes:
+//! decomposition of `rs1_val`; M8-H slice 6 adds AUIPC; M8-H slice 7
+//! adds JAL. The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -51,8 +51,9 @@
 //!   decomposition of the high two instruction bytes, the OP-IMM
 //!   ADDI instruction, and the `rs1` read-indicator port; slice 5
 //!   added the bitwise OP-IMM operations ANDI / ORI / XORI on top
-//!   of a 32-bit decomposition of `rs1_val`; slice 6 adds AUIPC
-//!   (the U-type sibling of LUI that adds `pc` into `rd_val`).
+//!   of a 32-bit decomposition of `rs1_val`; slice 6 added AUIPC
+//!   (the U-type sibling of LUI that adds `pc` into `rd_val`); slice
+//!   7 adds JAL with J-type offset decoding and link-address writes.
 //!   Subsequent M8-H sub-slices add each remaining RV32I
 //!   instruction family.
 //!

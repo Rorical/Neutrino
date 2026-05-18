@@ -24,11 +24,16 @@
 //!   constraint was upgraded to a multi-family aggregate.
 //! - **Slice 5** added the bitwise OP-IMM operations ANDI / ORI /
 //!   XORI on top of a 32-bit decomposition of `rs1_val`.
-//! - **Slice 6** (this slice) adds AUIPC, the U-type sibling of
+//! - **Slice 6** added AUIPC, the U-type sibling of
 //!   LUI. The encoding reuses LUI's `imm20 << 12` decomposition;
 //!   the only semantic difference is `rd_val = pc + (imm20 << 12)`
 //!   rather than `rd_val = imm20 << 12`. No new source-register
 //!   read or arithmetic on register values is involved.
+//! - **Slice 7** (this slice) adds JAL. It decodes the scattered
+//!   J-type signed offset, writes `pc + 4` to `rd`, and transfers
+//!   control to `pc + offset`. Because this AIR models the trap-free
+//!   RV32I/no-`C` path, active JAL rows also require the target offset
+//!   to be 4-byte aligned.
 //!
 //! The remaining OP-IMM operations (SLTI / SLTIU / SLLI / SRLI /
 //! SRAI) all require `mod 2^32` semantics that BabyBear cannot
@@ -42,7 +47,7 @@
 //! field. Both families are deferred to a later M8-H pass that
 //! lands after M8-L's range tables and lookup bus are wired in.
 //! Subsequent sub-slices proceed with the families that work
-//! without u32 wraparound (AUIPC, JAL, JALR, BEQ, BNE, FENCE,
+//! without u32 wraparound (JAL, JALR, BEQ, BNE, FENCE,
 //! ECALL, EBREAK).
 //!
 //! ## Trace layout
@@ -78,6 +83,7 @@
 //! | 176      | `is_ori`       | `1` if this row is the OP-IMM ORI instruction                      |
 //! | 177      | `is_xori`      | `1` if this row is the OP-IMM XORI instruction                     |
 //! | 178      | `is_auipc`     | `1` if this row is the AUIPC instruction                           |
+//! | 179      | `is_jal`       | `1` if this row is the JAL instruction                             |
 //!
 //! Real rows describe an executed RV32I instruction; padding rows
 //! follow the halt and hold the PC in place with the all-zero
@@ -148,18 +154,6 @@
 //!   - **PC**: `next_pc = pc + 4`.
 //!   - **`rd_val`**: `rd_val = rs1_val + imm` in field arithmetic.
 //!
-//! Slice 6 additions:
-//!
-//! - **`is_auipc` boolean**.
-//! - **AUIPC active** (gated by `is_auipc`):
-//!   - **Opcode**: low 7 bits of `b0` equal `0x17`.
-//!   - **PC**: `next_pc = pc + 4`.
-//!   - **`rd_val`**: `rd_val = pc + (imm20 << 12)`, where
-//!     `imm20 << 12 = b1[7:4]·2^12 + b2·2^16 + b3·2^24` (same
-//!     bit expression LUI uses).
-//! - **Family aggregate** extended:
-//!   `is_real = is_lui + is_addi + is_andi + is_ori + is_xori + is_auipc`.
-//!
 //! Slice 5 additions:
 //!
 //! - **`rs1` bit booleans**: each of `rs1_bit_0..31` is in `{0, 1}`.
@@ -186,6 +180,30 @@
 //!   `imm_bit_i` is sourced from `b2_bit_{4+i}` (`i < 4`),
 //!   `b3_bit_{i-4}` (`4 ≤ i < 12`), or `b3_bit_7` (sign extension,
 //!   `12 ≤ i < 32`), and `⊙` is AND, OR, or XOR.
+//!
+//! Slice 6 additions:
+//!
+//! - **`is_auipc` boolean**.
+//! - **AUIPC active** (gated by `is_auipc`):
+//!   - **Opcode**: low 7 bits of `b0` equal `0x17`.
+//!   - **PC**: `next_pc = pc + 4`.
+//!   - **`rd_val`**: `rd_val = pc + (imm20 << 12)`, where
+//!     `imm20 << 12 = b1[7:4]·2^12 + b2·2^16 + b3·2^24` (same
+//!     bit expression LUI uses).
+//!
+//! Slice 7 additions:
+//!
+//! - **`is_jal` boolean**.
+//! - **JAL active** (gated by `is_jal`):
+//!   - **Opcode**: low 7 bits of `b0` equal `0x6F`.
+//!   - **Alignment**: `imm[1] = 0`, which keeps the target 4-byte
+//!     aligned when the current `pc` is aligned.
+//!   - **PC**: `next_pc = pc + imm_j`, where `imm_j` is the signed
+//!     J-type offset assembled from `insn[31]`, `insn[30:21]`,
+//!     `insn[20]`, and `insn[19:12]`.
+//!   - **`rd_val`**: `rd_val = pc + 4`.
+//! - **Family aggregate** extended:
+//!   `is_real = is_lui + is_addi + is_andi + is_ori + is_xori + is_auipc + is_jal`.
 //!
 //! ## What this slice does NOT yet constrain
 //!
@@ -229,13 +247,13 @@ use crate::config::FRI_LOG_FINAL_POLY_LEN;
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
 
-/// Number of trace columns the CPU AIR uses at M8-H slice 6.
+/// Number of trace columns the CPU AIR uses at M8-H slice 7.
 ///
 /// Each later sub-slice extends the layout (additional decoded
 /// fields, more opcode selectors, memory records) by appending
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
-pub const CPU_TRACE_WIDTH: usize = COL_IS_AUIPC + 1;
+pub const CPU_TRACE_WIDTH: usize = COL_IS_JAL + 1;
 
 const COL_PC: usize = 0;
 const COL_NEXT_PC: usize = 1;
@@ -264,6 +282,7 @@ const COL_IS_ANDI: usize = COL_RS1_BIT_START + 32;
 const COL_IS_ORI: usize = COL_IS_ANDI + 1;
 const COL_IS_XORI: usize = COL_IS_ORI + 1;
 const COL_IS_AUIPC: usize = COL_IS_XORI + 1;
+const COL_IS_JAL: usize = COL_IS_AUIPC + 1;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -277,6 +296,10 @@ const LUI_OPCODE: u32 = 0x37;
 /// LUI; the only difference is that `rd_val = pc + (imm20 << 12)`
 /// rather than `rd_val = imm20 << 12`.
 const AUIPC_OPCODE: u32 = 0x17;
+
+/// RV32I JAL opcode (`0b1101111`). Uses the J-type scattered signed
+/// offset and writes the return address (`pc + 4`) to `rd`.
+const JAL_OPCODE: u32 = 0x6F;
 
 /// RV32I OP-IMM opcode (`0b0010011`). The funct3 field selects the
 /// specific operation (ADDI, SLTI, ANDI, ORI, XORI, SLLI, SRLI, SRAI).
@@ -384,6 +407,29 @@ impl CpuInstruction {
         Self::straight(pc, insn)
     }
 
+    /// Encode `jal rd, offset` at the given `pc`.
+    ///
+    /// `offset` is the signed J-type byte offset from `pc` to the jump
+    /// target. This constructor only accepts trap-free no-`C` offsets:
+    /// the target must be 4-byte aligned, so `offset` must be a
+    /// multiple of four when `pc` is aligned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rd >= 32`, if `offset` is outside the signed J-type
+    /// range `[-1_048_576, 1_048_574]`, if `offset` is not 4-byte
+    /// aligned, if `pc + 4` overflows `u32`, or if `pc + offset`
+    /// underflows / overflows `u32`.
+    #[must_use]
+    pub const fn jal(pc: u32, rd: u32, offset: i32) -> Self {
+        let insn = encode_j_type(rd, offset);
+        let Some(_link) = pc.checked_add(4) else {
+            panic!("CpuInstruction::jal: pc + 4 overflows u32");
+        };
+        let target = checked_pc_offset(pc, offset);
+        Self::jump(pc, insn, target)
+    }
+
     /// Encode `addi rd, rs1, imm12` at the given `pc`.
     ///
     /// `rd` and `rs1` are register indices in `[0, 31]`; `imm12` is
@@ -462,6 +508,57 @@ const fn encode_i_type(rd: u32, rs1: u32, funct3: u32, imm12: i32) -> u32 {
     (imm_bits << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | OP_IMM_OPCODE
 }
 
+/// Encode a J-type instruction (`rd`, signed 21-bit even offset,
+/// opcode = JAL) as a 32-bit word.
+///
+/// # Panics
+///
+/// Panics if `rd >= 32`, if `offset` is outside the signed J-type
+/// range, or if `offset` is not 4-byte aligned. The architectural JAL
+/// encoding only requires 2-byte alignment, but this AIR currently
+/// models the trap-free RV32I/no-`C` path.
+const fn encode_j_type(rd: u32, offset: i32) -> u32 {
+    assert!(rd < 32, "encode_j_type: rd must be in [0, 31]");
+    assert!(
+        offset >= -1_048_576 && offset <= 1_048_574,
+        "encode_j_type: offset must fit in signed J-type range"
+    );
+    assert!(
+        offset.trailing_zeros() >= 2,
+        "encode_j_type: offset must be 4-byte aligned"
+    );
+    #[allow(clippy::cast_sign_loss)]
+    let off = offset as u32;
+    let bit20 = (off >> 20) & 1;
+    let bits10_1 = (off >> 1) & 0x3FF;
+    let bit11 = (off >> 11) & 1;
+    let bits19_12 = (off >> 12) & 0xFF;
+    let upper = (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
+    upper | (rd << 7) | JAL_OPCODE
+}
+
+/// Checked `pc + offset` helper for no-wrap CPU AIR constructors.
+///
+/// # Panics
+///
+/// Panics if the signed addition underflows or overflows `u32`.
+const fn checked_pc_offset(pc: u32, offset: i32) -> u32 {
+    if offset >= 0 {
+        #[allow(clippy::cast_sign_loss)]
+        let delta = offset as u32;
+        let Some(target) = pc.checked_add(delta) else {
+            panic!("CpuInstruction::jal: pc + offset overflows u32");
+        };
+        target
+    } else {
+        let delta = offset.unsigned_abs();
+        let Some(target) = pc.checked_sub(delta) else {
+            panic!("CpuInstruction::jal: pc + offset underflows u32");
+        };
+        target
+    }
+}
+
 /// Base RV32I CPU AIR.
 ///
 /// The AIR carries `pc_base` so the first-row constraint can pin the
@@ -518,6 +615,7 @@ impl<AB: AirBuilder> Air<AB> for CpuAir {
         eval_high_bytes_and_addi::<AB>(builder, local);
         eval_rs1_bits_and_bitwise_op_imm::<AB>(builder, local);
         eval_auipc::<AB>(builder, local);
+        eval_jal::<AB>(builder, local);
         eval_family_aggregate::<AB>(builder, local);
     }
 }
@@ -904,6 +1002,65 @@ fn eval_auipc<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     builder.assert_zero(is_auipc * (AB::Expr::from(local[COL_RD_VAL]) - rd_val_expr));
 }
 
+/// Slice 7: JAL. Decodes the signed J-type offset, transfers control
+/// to `pc + offset`, and writes the link address `pc + 4` to `rd`.
+fn eval_jal<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    builder.assert_bool(local[COL_IS_JAL]);
+    let is_jal: AB::Expr = local[COL_IS_JAL].into();
+
+    // Opcode = 0x6F when active.
+    let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(JAL_OPCODE)));
+    let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    builder.assert_zero(is_jal.clone() * (b0_low_7 - opcode_target));
+
+    // Trap-free RV32I/no-C path: with aligned `pc`, JAL must use a
+    // 4-byte-aligned offset. `imm[1]` is instruction bit 21.
+    builder.assert_zero(is_jal.clone() * AB::Expr::from(local[COL_B2_BITS_START + 5]));
+
+    // J-type signed offset:
+    //   imm[10:1]  = insn[30:21]
+    //   imm[11]    = insn[20]
+    //   imm[19:12] = insn[19:12]
+    //   imm[20]    = insn[31] (sign bit)
+    let mut offset: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    let mut weight = 2_u64;
+    for bit in local
+        .iter()
+        .take(COL_B2_BITS_START + 8)
+        .skip(COL_B2_BITS_START + 5)
+    {
+        offset += AB::Expr::from(AB::F::from_u64(weight)) * AB::Expr::from(*bit);
+        weight <<= 1;
+    }
+    for bit in local.iter().skip(COL_B3_BITS_START).take(7) {
+        offset += AB::Expr::from(AB::F::from_u64(weight)) * AB::Expr::from(*bit);
+        weight <<= 1;
+    }
+    offset += AB::Expr::from(AB::F::from_u64(2048)) * AB::Expr::from(local[COL_B2_BITS_START + 4]);
+    offset += AB::Expr::from(AB::F::from_u64(4096)) * AB::Expr::from(local[COL_B1_BITS_START + 4]);
+    offset += AB::Expr::from(AB::F::from_u64(8192)) * AB::Expr::from(local[COL_B1_BITS_START + 5]);
+    offset +=
+        AB::Expr::from(AB::F::from_u64(16_384)) * AB::Expr::from(local[COL_B1_BITS_START + 6]);
+    offset +=
+        AB::Expr::from(AB::F::from_u64(32_768)) * AB::Expr::from(local[COL_B1_BITS_START + 7]);
+    offset += AB::Expr::from(AB::F::from_u64(65_536)) * AB::Expr::from(local[COL_B2_BITS_START]);
+    offset +=
+        AB::Expr::from(AB::F::from_u64(131_072)) * AB::Expr::from(local[COL_B2_BITS_START + 1]);
+    offset +=
+        AB::Expr::from(AB::F::from_u64(262_144)) * AB::Expr::from(local[COL_B2_BITS_START + 2]);
+    offset +=
+        AB::Expr::from(AB::F::from_u64(524_288)) * AB::Expr::from(local[COL_B2_BITS_START + 3]);
+    offset -=
+        AB::Expr::from(AB::F::from_u64(1_048_576)) * AB::Expr::from(local[COL_B3_BITS_START + 7]);
+
+    let target_expr: AB::Expr = AB::Expr::from(local[COL_PC]) + offset;
+    builder.assert_zero(is_jal.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - target_expr));
+
+    let link_expr: AB::Expr = AB::Expr::from(local[COL_PC]) + AB::Expr::from(AB::F::from_u64(4));
+    builder.assert_zero(is_jal * (AB::Expr::from(local[COL_RD_VAL]) - link_expr));
+}
+
 /// Family aggregate: `is_real = Σ is_<family>` over every real-opcode
 /// sub-selector currently constrained. Each new opcode family adds
 /// its selector to this sum.
@@ -913,7 +1070,8 @@ fn eval_family_aggregate<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
         + AB::Expr::from(local[COL_IS_ANDI])
         + AB::Expr::from(local[COL_IS_ORI])
         + AB::Expr::from(local[COL_IS_XORI])
-        + AB::Expr::from(local[COL_IS_AUIPC]);
+        + AB::Expr::from(local[COL_IS_AUIPC])
+        + AB::Expr::from(local[COL_IS_JAL]);
     builder.assert_eq(AB::Expr::from(local[COL_IS_REAL]), aggregate);
 }
 
@@ -1088,6 +1246,15 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
                 // arithmetic. M8-L will pin u32 wrapping.
                 let rd_val_field =
                     F::from_u64(u64::from(insn.pc)) + F::from_u64(u64::from(imm_shifted));
+                values[base + COL_RD_VAL] = rd_val_field;
+                values[base + COL_WI_START + rd_idx_usize] = F::ONE;
+                if rd_idx != 0 {
+                    regs[rd_idx_usize] = rd_val_field;
+                }
+            }
+            x if x == JAL_OPCODE => {
+                values[base + COL_IS_JAL] = F::ONE;
+                let rd_val_field = F::from_u64(u64::from(insn.pc) + 4);
                 values[base + COL_RD_VAL] = rd_val_field;
                 values[base + COL_WI_START + rd_idx_usize] = F::ONE;
                 if rd_idx != 0 {
@@ -2264,6 +2431,160 @@ mod tests {
         trace.values[COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
         trace.values[CPU_TRACE_WIDTH + COL_PC] = Val::from_u64(u64::from(pc_base) + 8);
         trace.values[CPU_TRACE_WIDTH + COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    // -------- Slice 7 tests (JAL) --------
+
+    #[test]
+    fn jal_constructor_encodes_canonical_bytes() {
+        // `jal x1, 8` sets bits10_1 = 4, rd = 1, opcode = 0x6F.
+        let insn = CpuInstruction::jal(0x10000, 1, 8);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10008);
+        assert_eq!(insn.insn, 0x0080_00EF);
+    }
+
+    #[test]
+    fn jal_constructor_encodes_negative_offset() {
+        let insn = CpuInstruction::jal(0x10004, 5, -4);
+        assert_eq!(insn.pc, 0x10004);
+        assert_eq!(insn.next_pc, 0x10000);
+        assert_eq!(insn.insn, 0xFFDF_F2EF);
+    }
+
+    #[test]
+    #[should_panic(expected = "rd must be in [0, 31]")]
+    fn jal_constructor_panics_on_oob_rd() {
+        let _ = CpuInstruction::jal(0x10000, 32, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "offset must fit in signed J-type range")]
+    fn jal_constructor_panics_on_oob_offset() {
+        let _ = CpuInstruction::jal(0x10000, 1, 1_048_576);
+    }
+
+    #[test]
+    #[should_panic(expected = "offset must be 4-byte aligned")]
+    fn jal_constructor_panics_on_misaligned_offset() {
+        let _ = CpuInstruction::jal(0x10000, 1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "pc + offset underflows u32")]
+    fn jal_constructor_panics_on_target_underflow() {
+        let _ = CpuInstruction::jal(0, 1, -4);
+    }
+
+    #[test]
+    fn jal_writes_link_and_jumps_to_target() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+        assert_eq!(trace.values[COL_NEXT_PC], Val::from_u64(0x10008));
+        assert_eq!(trace.values[COL_RD_VAL], Val::from_u64(0x10004));
+        let row1 = CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row1 + COL_PC], Val::from_u64(0x10008));
+        assert_eq!(
+            trace.values[row1 + COL_REG_START + 5],
+            Val::from_u64(0x10004)
+        );
+        assert_eq!(trace.values[COL_IS_JAL], Val::ONE);
+        assert_eq!(trace.values[COL_IS_AUIPC], Val::ZERO);
+    }
+
+    #[test]
+    fn single_jal_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+    }
+
+    #[test]
+    fn jal_with_rd_zero_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(pc_base, &[CpuInstruction::jal(pc_base, 0, 8)]);
+    }
+
+    #[test]
+    fn backward_jal_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 7),
+                CpuInstruction::jal(pc_base + 4, 5, -4),
+            ],
+        );
+    }
+
+    #[test]
+    fn jal_to_non_sequential_instruction_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::jal(pc_base, 5, 8),
+                CpuInstruction::addi(pc_base + 8, 6, 5, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn prover_refuses_jal_with_wrong_rd_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+        trace.values[COL_RD_VAL] = Val::from_u64(0x10008);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_jal_with_wrong_target() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+        trace.values[COL_NEXT_PC] = Val::from_u64(0x1000C);
+        trace.values[CPU_TRACE_WIDTH + COL_PC] = Val::from_u64(0x1000C);
+        trace.values[CPU_TRACE_WIDTH + COL_NEXT_PC] = Val::from_u64(0x1000C);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_jal_with_wrong_opcode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+        // Flip opcode bit 3 from 1 to 0: 0x6F becomes 0x67 (JALR opcode).
+        trace.values[COL_B0_BITS_START + 3] = Val::ZERO;
+        trace.values[COL_B0] -= Val::from_u64(8);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_jal_misaligned_target_offset() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+        // Set imm[1] (instruction bit 21) and adjust next_pc so the
+        // jump-target equation still holds. The alignment constraint
+        // must reject the row.
+        trace.values[COL_B2_BITS_START + 5] = Val::ONE;
+        trace.values[COL_B2] += Val::from_u64(32);
+        trace.values[COL_NEXT_PC] = Val::from_u64(0x1000A);
+        trace.values[CPU_TRACE_WIDTH + COL_PC] = Val::from_u64(0x1000A);
+        trace.values[CPU_TRACE_WIDTH + COL_NEXT_PC] = Val::from_u64(0x1000A);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_jal_set_on_padding_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[]);
+        trace.values[COL_IS_JAL] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_extra_family_selector_with_jal() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
+        trace.values[COL_IS_AUIPC] = Val::ONE;
         assert_prover_rejects(pc_base, trace);
     }
 }

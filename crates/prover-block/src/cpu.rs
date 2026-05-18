@@ -29,25 +29,35 @@
 //!   the only semantic difference is `rd_val = pc + (imm20 << 12)`
 //!   rather than `rd_val = imm20 << 12`. No new source-register
 //!   read or arithmetic on register values is involved.
-//! - **Slice 7** (this slice) adds JAL. It decodes the scattered
-//!   J-type signed offset, writes `pc + 4` to `rd`, and transfers
-//!   control to `pc + offset`. Because this AIR models the trap-free
-//!   RV32I/no-`C` path, active JAL rows also require the target offset
-//!   to be 4-byte aligned.
+//! - **Slice 7** added JAL. It decodes the scattered J-type signed
+//!   offset, writes `pc + 4` to `rd`, and transfers control to
+//!   `pc + offset`. Because this AIR models the trap-free RV32I/no-`C`
+//!   path, active JAL rows also require the target offset to be 4-byte
+//!   aligned.
+//! - **Slice 8** (this slice) adds the BRANCH family BEQ and BNE,
+//!   plus the second source-register port and the B-type immediate
+//!   decode that future branches and OP-REG instructions will reuse.
+//!   The slice introduces a boolean `branch_eq` witness backed by a
+//!   field-inverse witness `branch_diff_inv`, then drives `next_pc`
+//!   to either `pc + br_imm` or `pc + 4` based on the comparison.
+//!   Branches do not write a register, so the slice also splits the
+//!   write-indicator-sum rule away from `is_real` and into a new
+//!   "writeful" aggregate.
 //!
 //! The remaining OP-IMM operations (SLTI / SLTIU / SLLI / SRLI /
-//! SRAI) all require `mod 2^32` semantics that BabyBear cannot
-//! enforce locally without range-checking against the field
-//! modulus `p`. The standard borrow-witness construction for
-//! SLTI / SLTIU has a real soundness gap in this setup: the field
-//! equation `rs1 + lt·2^32 = imm_unsigned + diff` admits two valid
-//! `(lt, diff)` integer solutions, both representable as 32-bit
-//! bit decompositions and both passing the AIR check. The shifts
-//! have the analogous problem with `rs1 << shamt` overflowing the
-//! field. Both families are deferred to a later M8-H pass that
-//! lands after M8-L's range tables and lookup bus are wired in.
-//! Subsequent sub-slices proceed with the families that work
-//! without u32 wraparound (JALR, BEQ, BNE, FENCE,
+//! SRAI) and the ordered branches (BLT / BGE / BLTU / BGEU) all
+//! require `mod 2^32` semantics that BabyBear cannot enforce locally
+//! without range-checking against the field modulus `p`. The standard
+//! borrow-witness construction for SLTI / SLTIU has a real soundness
+//! gap in this setup: the field equation
+//! `rs1 + lt·2^32 = imm_unsigned + diff` admits two valid `(lt, diff)`
+//! integer solutions, both representable as 32-bit bit decompositions
+//! and both passing the AIR check. The shifts have the analogous
+//! problem with `rs1 << shamt` overflowing the field. Both families,
+//! together with the ordered branches and JALR's `& !1` low-bit
+//! masking, are deferred to a later M8-H pass that lands after M8-L's
+//! range tables and lookup bus are wired in. Subsequent sub-slices
+//! proceed with the families that work without u32 wraparound (FENCE,
 //! ECALL, EBREAK).
 //!
 //! ## Trace layout
@@ -84,6 +94,14 @@
 //! | 177      | `is_xori`      | `1` if this row is the OP-IMM XORI instruction                     |
 //! | 178      | `is_auipc`     | `1` if this row is the AUIPC instruction                           |
 //! | 179      | `is_jal`       | `1` if this row is the JAL instruction                             |
+//! | 180      | `rs2_idx`      | source register 2 index (always `insn[24:20]`, `[0, 31]`)          |
+//! | 181      | `rs2_val`      | value read from `rs2_idx`                                          |
+//! | 182..214 | `ri2_0..ri2_31`| one-hot read indicator for `rs2`: `ri2_j = 1` iff `rs2_idx = j`    |
+//! | 214      | `br_imm`       | B-type sign-extended branch offset (`insn[31, 7, 30:25, 11:8] * 2`)|
+//! | 215      | `branch_eq`    | `1` iff `rs1_val = rs2_val` (auxiliary equality witness)           |
+//! | 216      | `branch_diff_inv` | field inverse of `rs1_val - rs2_val` when `branch_eq = 0`       |
+//! | 217      | `is_beq`       | `1` if this row is the BEQ instruction                             |
+//! | 218      | `is_bne`       | `1` if this row is the BNE instruction                             |
 //!
 //! Real rows describe an executed RV32I instruction; padding rows
 //! follow the halt and hold the PC in place with the all-zero
@@ -205,6 +223,57 @@
 //! - **Family aggregate** extended:
 //!   `is_real = is_lui + is_addi + is_andi + is_ori + is_xori + is_auipc + is_jal`.
 //!
+//! Slice 8 additions:
+//!
+//! - **`rs2_idx` decoding** (unconditional): `rs2_idx = insn[24:20]`
+//!   via `b2_bit_4 + 2*b2_bit_5 + 4*b2_bit_6 + 8*b2_bit_7 + 16*b3_bit_0`.
+//! - **`br_imm` decoding** (unconditional): the B-type signed branch
+//!   offset assembled from instruction bits
+//!   `imm[12, 11, 10:5, 4:1, 0]`, with `imm[0] = 0` implicit.
+//! - **Read indicator booleans** for `ri2_j`.
+//! - **rs2 read indicator sum**: `Σ ri2_j = is_beq + is_bne`. Slice N
+//!   grows the right-hand side with each rs2-reading family.
+//! - **rs2 indicator matches `rs2_idx`**: `ri2_j * (rs2_idx - j) = 0`.
+//! - **rs2 read value match**: `ri2_j * (rs2_val - r_j) = 0`.
+//! - **`is_beq` / `is_bne` booleans**.
+//! - **Equality witness**:
+//!   - `branch_eq` boolean.
+//!   - When `branch_eq = 1`: `(rs1_val - rs2_val) = 0`. Constraint
+//!     `branch_eq * (rs1_val - rs2_val) = 0`.
+//!   - When `branch_eq = 0`: `(rs1_val - rs2_val)` is invertible via
+//!     the witness `branch_diff_inv`. Constraint
+//!     `(1 - branch_eq) * ((rs1_val - rs2_val) * branch_diff_inv - 1) = 0`.
+//!   - The witness is only meaningful for BEQ / BNE rows, but the
+//!     boolean and inverse constraints fire unconditionally.
+//!     Padding and writeful rows simply set `branch_eq = 0` and
+//!     supply any `branch_diff_inv` that satisfies the inverse
+//!     equation. Padding rows have `rs1_val = rs2_val = 0` and so
+//!     would naïvely flunk the inverse constraint; the AIR exempts
+//!     them by gating the `(1 - branch_eq) * (... - 1) = 0` clause
+//!     by `is_beq + is_bne`.
+//! - **Branch family opcode** (gated by `is_beq + is_bne`): low 7
+//!   bits of `b0` equal `0x63`.
+//! - **funct3 per op** (gated by the respective selector):
+//!   - BEQ: `b1_bit_4 = 0`, `b1_bit_5 = 0`, `b1_bit_6 = 0`.
+//!   - BNE: `b1_bit_4 = 1`, `b1_bit_5 = 0`, `b1_bit_6 = 0`.
+//! - **Target alignment** (gated by `is_beq + is_bne`): `imm[1] = 0`,
+//!   which keeps the branch target 4-byte aligned in the no-`C`
+//!   path. Instruction bit 8 encodes `imm[1]`, sourced from
+//!   `b1_bit_0`.
+//! - **BEQ PC**: `next_pc = pc + 4 + branch_eq * (br_imm - 4)`. When
+//!   `branch_eq = 1` this reduces to `pc + br_imm`; when
+//!   `branch_eq = 0` it reduces to `pc + 4`.
+//! - **BNE PC**: `next_pc = pc + 4 + (1 - branch_eq) * (br_imm - 4)`.
+//!   Mirror of BEQ with the comparison inverted.
+//! - **Writeful aggregate**: `is_writeful = is_lui + is_addi +
+//!   is_andi + is_ori + is_xori + is_auipc + is_jal`. Branches do
+//!   not write a register, so the slice-3 rule `Σ wi_j = is_real`
+//!   becomes `Σ wi_j = is_writeful`. Together with the existing
+//!   `wi_j * (rd_idx - j) = 0` clauses, branch rows commit no write
+//!   even though their `rd_idx` decoding extracts immediate bits.
+//! - **Family aggregate** extended:
+//!   `is_real = is_writeful + is_beq + is_bne`.
+//!
 //! ## What this slice does NOT yet constrain
 //!
 //! - **Full `u32` register and PC semantics.** This standalone CPU AIR
@@ -246,13 +315,13 @@ use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
 
-/// Number of trace columns the CPU AIR uses at M8-H slice 7.
+/// Number of trace columns the CPU AIR uses at M8-H slice 8.
 ///
 /// Each later sub-slice extends the layout (additional decoded
 /// fields, more opcode selectors, memory records) by appending
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
-pub const CPU_TRACE_WIDTH: usize = COL_IS_JAL + 1;
+pub const CPU_TRACE_WIDTH: usize = COL_IS_BNE + 1;
 
 /// BabyBear modulus as a `u32`, used in `const fn` guards.
 const BABY_BEAR_MODULUS_U32: u32 = 0x7800_0001;
@@ -288,6 +357,14 @@ const COL_IS_ORI: usize = COL_IS_ANDI + 1;
 const COL_IS_XORI: usize = COL_IS_ORI + 1;
 const COL_IS_AUIPC: usize = COL_IS_XORI + 1;
 const COL_IS_JAL: usize = COL_IS_AUIPC + 1;
+const COL_RS2_IDX: usize = COL_IS_JAL + 1;
+const COL_RS2_VAL: usize = COL_RS2_IDX + 1;
+const COL_RS2_IND_START: usize = COL_RS2_VAL + 1;
+const COL_BR_IMM: usize = COL_RS2_IND_START + NUM_REGS;
+const COL_BRANCH_EQ: usize = COL_BR_IMM + 1;
+const COL_BRANCH_DIFF_INV: usize = COL_BRANCH_EQ + 1;
+const COL_IS_BEQ: usize = COL_BRANCH_DIFF_INV + 1;
+const COL_IS_BNE: usize = COL_IS_BEQ + 1;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -305,6 +382,18 @@ const AUIPC_OPCODE: u32 = 0x17;
 /// RV32I JAL opcode (`0b1101111`). Uses the J-type scattered signed
 /// offset and writes the return address (`pc + 4`) to `rd`.
 const JAL_OPCODE: u32 = 0x6F;
+
+/// RV32I BRANCH opcode (`0b1100011`). Six funct3 values select the
+/// concrete comparison (BEQ, BNE, BLT, BGE, BLTU, BGEU). M8-H slice 8
+/// only constrains BEQ and BNE; the ordered comparisons defer to
+/// M8-L's u32 range/lookup support.
+const BRANCH_OPCODE: u32 = 0x63;
+
+/// funct3 value for the BEQ instruction (`0b000`).
+const FUNCT3_BEQ: u32 = 0;
+
+/// funct3 value for the BNE instruction (`0b001`).
+const FUNCT3_BNE: u32 = 1;
 
 /// RV32I OP-IMM opcode (`0b0010011`). The funct3 field selects the
 /// specific operation (ADDI, SLTI, ANDI, ORI, XORI, SLLI, SRLI, SRAI).
@@ -525,6 +614,68 @@ impl CpuInstruction {
     pub const fn xori(pc: u32, rd: u32, rs1: u32, imm12: i32) -> Self {
         Self::straight(pc, encode_i_type(rd, rs1, FUNCT3_XORI, imm12))
     }
+
+    /// Encode `beq rs1, rs2, offset` at the given `pc` with the taken
+    /// branch target.
+    ///
+    /// The trace builder uses the encoded `next_pc` to anchor the
+    /// branch's PC transition. Callers select `beq_taken` when the
+    /// register values at the prior trace cursor will compare equal,
+    /// and `beq_not_taken` otherwise. The AIR re-derives the same
+    /// outcome from the trace's running register state, so a wrong
+    /// choice here is caught by the prover.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rs1 >= 32`, `rs2 >= 32`, `offset` is outside the
+    /// signed B-type range `[-4096, 4094]`, `offset` is not 4-byte
+    /// aligned, `pc + 4` overflows `u32`, or `pc + offset`
+    /// overflows / underflows `u32`.
+    #[must_use]
+    pub const fn beq_taken(pc: u32, rs1: u32, rs2: u32, offset: i32) -> Self {
+        let insn = encode_b_type(rs1, rs2, FUNCT3_BEQ, offset);
+        let target = checked_pc_offset(pc, offset);
+        Self::jump(pc, insn, target)
+    }
+
+    /// Encode `beq rs1, rs2, offset` at the given `pc` with the
+    /// fall-through (not-taken) target `pc + 4`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rs1 >= 32`, `rs2 >= 32`, `offset` is outside the
+    /// signed B-type range `[-4096, 4094]`, `offset` is not 4-byte
+    /// aligned, or `pc + 4` overflows `u32`.
+    #[must_use]
+    pub const fn beq_not_taken(pc: u32, rs1: u32, rs2: u32, offset: i32) -> Self {
+        Self::straight(pc, encode_b_type(rs1, rs2, FUNCT3_BEQ, offset))
+    }
+
+    /// Encode `bne rs1, rs2, offset` at the given `pc` with the
+    /// taken branch target.
+    ///
+    /// Mirrors [`Self::beq_taken`] with the comparison inverted.
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`Self::beq_taken`].
+    #[must_use]
+    pub const fn bne_taken(pc: u32, rs1: u32, rs2: u32, offset: i32) -> Self {
+        let insn = encode_b_type(rs1, rs2, FUNCT3_BNE, offset);
+        let target = checked_pc_offset(pc, offset);
+        Self::jump(pc, insn, target)
+    }
+
+    /// Encode `bne rs1, rs2, offset` at the given `pc` with the
+    /// fall-through (not-taken) target `pc + 4`.
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`Self::beq_not_taken`].
+    #[must_use]
+    pub const fn bne_not_taken(pc: u32, rs1: u32, rs2: u32, offset: i32) -> Self {
+        Self::straight(pc, encode_b_type(rs1, rs2, FUNCT3_BNE, offset))
+    }
 }
 
 /// Encode a generic I-type instruction (`rd`, `rs1`, signed 12-bit
@@ -548,6 +699,43 @@ const fn encode_i_type(rd: u32, rs1: u32, funct3: u32, imm12: i32) -> u32 {
     #[allow(clippy::cast_sign_loss)]
     let imm_bits = (imm12 as u32) & 0xFFF;
     (imm_bits << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | OP_IMM_OPCODE
+}
+
+/// Encode a B-type instruction (`rs1`, `rs2`, signed 13-bit even
+/// offset, `funct3`, opcode = BRANCH) as a 32-bit word.
+///
+/// The architectural B-type encoding allows 2-byte-aligned offsets,
+/// but this AIR currently models the trap-free RV32I/no-`C` path, so
+/// the constructor rejects offsets that are not 4-byte aligned.
+///
+/// # Panics
+///
+/// Panics if `rs1 >= 32`, `rs2 >= 32`, `funct3 >= 8`, if `offset` is
+/// outside the signed B-type range `[-4096, 4094]`, or if `offset` is
+/// not 4-byte aligned.
+const fn encode_b_type(rs1: u32, rs2: u32, funct3: u32, offset: i32) -> u32 {
+    assert!(rs1 < 32, "encode_b_type: rs1 must be in [0, 31]");
+    assert!(rs2 < 32, "encode_b_type: rs2 must be in [0, 31]");
+    assert!(funct3 < 8, "encode_b_type: funct3 must be in [0, 7]");
+    assert!(
+        offset >= -4096 && offset <= 4094,
+        "encode_b_type: offset must fit in signed B-type range"
+    );
+    assert!(
+        offset.trailing_zeros() >= 2,
+        "encode_b_type: offset must be 4-byte aligned"
+    );
+    #[allow(clippy::cast_sign_loss)]
+    let off = offset as u32;
+    // Bits in the encoded immediate, sourced from the absolute offset
+    // value (two's complement preserves the encoding for negatives).
+    let bit12 = (off >> 12) & 1;
+    let bits10_5 = (off >> 5) & 0x3F;
+    let bits4_1 = (off >> 1) & 0xF;
+    let bit11 = (off >> 11) & 1;
+    let upper = (bit12 << 31) | (bits10_5 << 25);
+    let lower = (bits4_1 << 8) | (bit11 << 7);
+    upper | lower | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | BRANCH_OPCODE
 }
 
 /// Encode a J-type instruction (`rd`, signed 21-bit even offset,
@@ -581,6 +769,10 @@ const fn encode_j_type(rd: u32, offset: i32) -> u32 {
 
 /// Checked `pc + offset` helper for no-wrap CPU AIR constructors.
 ///
+/// Used by JAL and the taken-branch constructors. Returns the
+/// computed target without further validation; callers add their own
+/// alignment and BabyBear-native checks.
+///
 /// # Panics
 ///
 /// Panics if the signed addition underflows or overflows `u32`.
@@ -589,13 +781,13 @@ const fn checked_pc_offset(pc: u32, offset: i32) -> u32 {
         #[allow(clippy::cast_sign_loss)]
         let delta = offset as u32;
         let Some(target) = pc.checked_add(delta) else {
-            panic!("CpuInstruction::jal: pc + offset overflows u32");
+            panic!("checked_pc_offset: pc + offset overflows u32");
         };
         target
     } else {
         let delta = offset.unsigned_abs();
         let Some(target) = pc.checked_sub(delta) else {
-            panic!("CpuInstruction::jal: pc + offset underflows u32");
+            panic!("checked_pc_offset: pc + offset underflows u32");
         };
         target
     }
@@ -662,6 +854,9 @@ impl<AB: AirBuilder> Air<AB> for CpuAir {
         eval_rs1_bits_and_bitwise_op_imm::<AB>(builder, local);
         eval_auipc::<AB>(builder, local);
         eval_jal::<AB>(builder, local);
+        eval_rs2_skeleton::<AB>(builder, local);
+        eval_branch_eq_witness::<AB>(builder, local);
+        eval_beq_bne::<AB>(builder, local);
         eval_family_aggregate::<AB>(builder, local);
     }
 }
@@ -772,14 +967,17 @@ fn eval_register_file<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var], next:
         builder.assert_bool(local[COL_WI_START + j]);
     }
 
-    // Sum of write indicators equals is_real. Combined with the
-    // boolean constraint above, real rows write exactly one
-    // register; padding rows write none.
+    // Sum of write indicators equals the writeful-family aggregate.
+    // Slice 8 splits this rule away from `is_real` so non-writeful
+    // ops (BEQ / BNE today; future FENCE / ECALL / EBREAK) commit
+    // no register write even though their decoded `rd_idx` extracts
+    // immediate bits.
     let mut wi_sum: AB::Expr = AB::Expr::from(AB::F::ZERO);
     for j in 0..NUM_REGS {
         wi_sum += AB::Expr::from(local[COL_WI_START + j]);
     }
-    builder.assert_eq(wi_sum, AB::Expr::from(local[COL_IS_REAL]));
+    let writeful: AB::Expr = writeful_aggregate::<AB>(local);
+    builder.assert_eq(wi_sum, writeful);
 
     // Each write indicator agrees with `rd_idx`:
     // `wi_j * (rd_idx - j) = 0`. Together with the sum constraint
@@ -1130,17 +1328,178 @@ fn eval_jal<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     builder.assert_zero(is_jal * (AB::Expr::from(local[COL_RD_VAL]) - link_expr));
 }
 
-/// Family aggregate: `is_real = Σ is_<family>` over every real-opcode
-/// sub-selector currently constrained. Each new opcode family adds
-/// its selector to this sum.
-fn eval_family_aggregate<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
-    let aggregate: AB::Expr = AB::Expr::from(local[COL_IS_LUI])
+/// Slice 8 part 1: rs2 read port and B-type immediate decode.
+///
+/// Decodes `rs2_idx` from `b2`/`b3` bit columns, constrains
+/// `rs2_val` to match the indexed register via a 32-entry one-hot
+/// `ri2` indicator vector, and reassembles the B-type signed branch
+/// offset into [`COL_BR_IMM`].
+///
+/// The decodes are unconditional so non-branch rows still carry a
+/// consistent `rs2_val` / `br_imm`. The read-indicator sum is gated
+/// by the rs2-reading family aggregate (`is_beq + is_bne` today),
+/// which keeps branch rows committing one read and writeful / padding
+/// rows committing none.
+fn eval_rs2_skeleton<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    // rs2_idx = insn[24:20] decoded from the bit columns.
+    let rs2_idx_expr: AB::Expr = AB::Expr::from(local[COL_B2_BITS_START + 4])
+        + AB::Expr::from(AB::F::from_u64(2)) * AB::Expr::from(local[COL_B2_BITS_START + 5])
+        + AB::Expr::from(AB::F::from_u64(4)) * AB::Expr::from(local[COL_B2_BITS_START + 6])
+        + AB::Expr::from(AB::F::from_u64(8)) * AB::Expr::from(local[COL_B2_BITS_START + 7])
+        + AB::Expr::from(AB::F::from_u64(16)) * AB::Expr::from(local[COL_B3_BITS_START]);
+    builder.assert_eq(local[COL_RS2_IDX], rs2_idx_expr);
+
+    // B-type immediate (13-bit signed, even). The scatter is:
+    //   imm[1]    = b1_bit_0  (insn bit 8)
+    //   imm[2..4] = b1_bit_1..b1_bit_3
+    //   imm[5..10]= b3_bit_1..b3_bit_6
+    //   imm[11]   = b0_bit_7  (insn bit 7)
+    //   imm[12]   = b3_bit_7  (insn bit 31, sign)
+    //   imm[0]    = 0 (implicit; never witnessed)
+    let br_imm_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(2))
+        * AB::Expr::from(local[COL_B1_BITS_START])
+        + AB::Expr::from(AB::F::from_u64(4)) * AB::Expr::from(local[COL_B1_BITS_START + 1])
+        + AB::Expr::from(AB::F::from_u64(8)) * AB::Expr::from(local[COL_B1_BITS_START + 2])
+        + AB::Expr::from(AB::F::from_u64(16)) * AB::Expr::from(local[COL_B1_BITS_START + 3])
+        + AB::Expr::from(AB::F::from_u64(32)) * AB::Expr::from(local[COL_B3_BITS_START + 1])
+        + AB::Expr::from(AB::F::from_u64(64)) * AB::Expr::from(local[COL_B3_BITS_START + 2])
+        + AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B3_BITS_START + 3])
+        + AB::Expr::from(AB::F::from_u64(256)) * AB::Expr::from(local[COL_B3_BITS_START + 4])
+        + AB::Expr::from(AB::F::from_u64(512)) * AB::Expr::from(local[COL_B3_BITS_START + 5])
+        + AB::Expr::from(AB::F::from_u64(1024)) * AB::Expr::from(local[COL_B3_BITS_START + 6])
+        + AB::Expr::from(AB::F::from_u64(2048)) * AB::Expr::from(local[COL_B0_BITS_START + 7])
+        - AB::Expr::from(AB::F::from_u64(4096)) * AB::Expr::from(local[COL_B3_BITS_START + 7]);
+    builder.assert_eq(local[COL_BR_IMM], br_imm_expr);
+
+    // ri2 indicator booleans.
+    for j in 0..NUM_REGS {
+        builder.assert_bool(local[COL_RS2_IND_START + j]);
+    }
+
+    // Sum of ri2 indicators equals the rs2-reading aggregate.
+    // Slice 8 contributes BEQ + BNE; future R-type families (ADD /
+    // SUB / AND / OR / XOR / SLT / SLTU / SLL / SRL / SRA) extend
+    // the right-hand side once their semantics are constrained.
+    let mut ri2_sum: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    for j in 0..NUM_REGS {
+        ri2_sum += AB::Expr::from(local[COL_RS2_IND_START + j]);
+    }
+    let rs2_reading_families: AB::Expr =
+        AB::Expr::from(local[COL_IS_BEQ]) + AB::Expr::from(local[COL_IS_BNE]);
+    builder.assert_eq(ri2_sum, rs2_reading_families);
+
+    // Each ri2 indicator agrees with rs2_idx, and the read value
+    // matches the indexed register file column.
+    for j in 0..NUM_REGS {
+        let j_u64 = u64::try_from(j).expect("register index fits in u64");
+        let rs2_idx_minus_j: AB::Expr =
+            AB::Expr::from(local[COL_RS2_IDX]) - AB::Expr::from(AB::F::from_u64(j_u64));
+        builder.assert_zero(AB::Expr::from(local[COL_RS2_IND_START + j]) * rs2_idx_minus_j);
+        let diff: AB::Expr =
+            AB::Expr::from(local[COL_RS2_VAL]) - AB::Expr::from(local[COL_REG_START + j]);
+        builder.assert_zero(AB::Expr::from(local[COL_RS2_IND_START + j]) * diff);
+    }
+}
+
+/// Slice 8 part 2: BEQ and BNE families.
+///
+/// Carries the equality witness (`branch_eq` + `branch_diff_inv`) and
+/// the per-family opcode / funct3 / PC-transition rules.
+///
+/// Equality witness:
+/// - `branch_eq` is boolean.
+/// - `branch_eq * (rs1_val - rs2_val) = 0` forces equality whenever
+///   `branch_eq = 1`.
+/// - `branch_eq + (rs1_val - rs2_val) * branch_diff_inv = 1` forces
+///   `branch_eq = 1` whenever the diff is zero, and exhibits an
+///   inverse witnessing `diff != 0` whenever `branch_eq = 0`.
+///
+/// The witness fires on every row; non-branch rows simply route the
+/// resulting `branch_eq` through their own (vacuous) gating.
+fn eval_branch_eq_witness<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    builder.assert_bool(local[COL_BRANCH_EQ]);
+    let branch_eq: AB::Expr = local[COL_BRANCH_EQ].into();
+    let diff: AB::Expr = AB::Expr::from(local[COL_RS1_VAL]) - AB::Expr::from(local[COL_RS2_VAL]);
+
+    // branch_eq * diff = 0 forces diff = 0 whenever branch_eq = 1.
+    builder.assert_zero(branch_eq.clone() * diff.clone());
+
+    // branch_eq + diff * diff_inv = 1.
+    let one: AB::Expr = AB::Expr::from(AB::F::ONE);
+    let identity: AB::Expr = branch_eq + diff * AB::Expr::from(local[COL_BRANCH_DIFF_INV]) - one;
+    builder.assert_zero(identity);
+}
+
+/// Slice 8 part 3: BEQ + BNE active constraints (opcode, funct3,
+/// target alignment, PC transition).
+fn eval_beq_bne<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    builder.assert_bool(local[COL_IS_BEQ]);
+    builder.assert_bool(local[COL_IS_BNE]);
+
+    let is_beq: AB::Expr = local[COL_IS_BEQ].into();
+    let is_bne: AB::Expr = local[COL_IS_BNE].into();
+    let is_branch: AB::Expr = is_beq.clone() + is_bne.clone();
+    let branch_eq: AB::Expr = local[COL_BRANCH_EQ].into();
+
+    // BRANCH opcode = 0x63 when either branch selector is active.
+    let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(BRANCH_OPCODE)));
+    let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    builder.assert_zero(is_branch.clone() * (b0_low_7 - opcode_target));
+
+    // funct3 per family. funct3 occupies bits 12..14 of insn =
+    // b1_bit_4..b1_bit_6.
+    // BEQ: funct3 = 000.
+    builder.assert_zero(is_beq.clone() * AB::Expr::from(local[COL_B1_BITS_START + 4]));
+    builder.assert_zero(is_beq.clone() * AB::Expr::from(local[COL_B1_BITS_START + 5]));
+    builder.assert_zero(is_beq.clone() * AB::Expr::from(local[COL_B1_BITS_START + 6]));
+    // BNE: funct3 = 001.
+    let one: AB::Expr = AB::Expr::from(AB::F::ONE);
+    builder
+        .assert_zero(is_bne.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 4])));
+    builder.assert_zero(is_bne.clone() * AB::Expr::from(local[COL_B1_BITS_START + 5]));
+    builder.assert_zero(is_bne.clone() * AB::Expr::from(local[COL_B1_BITS_START + 6]));
+
+    // Trap-free RV32I/no-C: imm[1] must be 0 for active branches so
+    // taken targets stay 4-byte aligned. imm[1] = b1_bit_0.
+    builder.assert_zero(is_branch * AB::Expr::from(local[COL_B1_BITS_START]));
+
+    // PC transitions:
+    //   BEQ:  next_pc = pc + 4 + branch_eq * (br_imm - 4)
+    //   BNE:  next_pc = pc + 4 + (1 - branch_eq) * (br_imm - 4)
+    let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
+    let br_imm_minus_four: AB::Expr = AB::Expr::from(local[COL_BR_IMM]) - four.clone();
+    let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
+    let beq_expected_next: AB::Expr =
+        pc_plus_four.clone() + branch_eq.clone() * br_imm_minus_four.clone();
+    let bne_expected_next: AB::Expr = pc_plus_four + (one - branch_eq) * br_imm_minus_four;
+    builder.assert_zero(is_beq * (AB::Expr::from(local[COL_NEXT_PC]) - beq_expected_next));
+    builder.assert_zero(is_bne * (AB::Expr::from(local[COL_NEXT_PC]) - bne_expected_next));
+}
+
+/// Sum of every writeful-family selector currently constrained.
+///
+/// "Writeful" = the row updates exactly one register, so the row's
+/// write indicator vector is one-hot. Branches (BEQ / BNE) and the
+/// future FENCE / ECALL / EBREAK rows are excluded; they contribute
+/// to `is_real` but not to this sum, and their write-indicator
+/// columns are all zero.
+fn writeful_aggregate<AB: AirBuilder>(local: &[AB::Var]) -> AB::Expr {
+    AB::Expr::from(local[COL_IS_LUI])
         + AB::Expr::from(local[COL_IS_ADDI])
         + AB::Expr::from(local[COL_IS_ANDI])
         + AB::Expr::from(local[COL_IS_ORI])
         + AB::Expr::from(local[COL_IS_XORI])
         + AB::Expr::from(local[COL_IS_AUIPC])
-        + AB::Expr::from(local[COL_IS_JAL]);
+        + AB::Expr::from(local[COL_IS_JAL])
+}
+
+/// Family aggregate: `is_real = is_writeful + Σ non-writeful`. Each
+/// new opcode family adds its selector to one of the two sums.
+fn eval_family_aggregate<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    let aggregate: AB::Expr = writeful_aggregate::<AB>(local)
+        + AB::Expr::from(local[COL_IS_BEQ])
+        + AB::Expr::from(local[COL_IS_BNE]);
     builder.assert_eq(AB::Expr::from(local[COL_IS_REAL]), aggregate);
 }
 
@@ -1178,24 +1537,29 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// Build a [`CpuAir`] trace from a sequence of real instruction
 /// executions.
 ///
-/// At M8-H slice 7 the trace builder dispatches on the encoded
-/// opcode (and funct3 for OP-IMM): LUI rows set `is_lui = 1` and
-/// derive `rd_val = imm20 << 12`; OP-IMM rows set the relevant
-/// `is_<op>` selector, read the source register from the running
-/// state into `rs1_val`, decode the sign-extended I-type immediate
-/// into `imm`, and compute `rd_val` via the per-op rule (field
-/// addition for ADDI; bit-by-bit reconstruction for ANDI / ORI /
-/// XORI), AUIPC rows add the shifted U-type immediate to `pc`, and JAL
-/// rows write the link address. The builder maintains a running exact
-/// BabyBear-native register state across rows; a malformed encoding is
-/// caught by the AIR rather than the builder.
+/// At M8-H slice 8 the trace builder dispatches on the encoded
+/// opcode (and funct3 for OP-IMM and BRANCH): LUI rows set
+/// `is_lui = 1` and derive `rd_val = imm20 << 12`; OP-IMM rows set
+/// the relevant `is_<op>` selector, read the source register from
+/// the running state into `rs1_val`, decode the sign-extended I-type
+/// immediate into `imm`, and compute `rd_val` via the per-op rule
+/// (field addition for ADDI; bit-by-bit reconstruction for ANDI /
+/// ORI / XORI). AUIPC rows add the shifted U-type immediate to `pc`,
+/// JAL rows write the link address, and BEQ / BNE rows read a second
+/// source register, populate the equality witness, and route the PC
+/// transition through the taken / not-taken split. The builder
+/// maintains a running exact BabyBear-native register state across
+/// rows; a malformed encoding is caught by the AIR rather than the
+/// builder.
 ///
-/// Every row's `rs1_val` cell is populated from
-/// `regs[rs1_idx_usize]`, and the 32 `rs1_bit_*` cells from its
-/// canonical 32-bit decomposition, so the unconditional slice-5 sum
-/// constraint `rs1_val = Σ rs1_bit_i * 2^i` holds for LUI and
-/// padding rows as well. The read-indicator sum is still gated by
-/// the family aggregate, so LUI and padding rows commit no read.
+/// Every row's `rs1_val` / `rs2_val` cells are populated from the
+/// running register state, and the 32 `rs1_bit_*` cells from
+/// `rs1_val`'s canonical 32-bit decomposition. The B-type signed
+/// branch offset, the equality witness (`branch_eq` and
+/// `branch_diff_inv`), and the `rs2_idx` decode all fire on every
+/// real row; padding rows carry zeros plus `branch_eq = 1`. The
+/// read-indicator sums are still gated by the per-family aggregates,
+/// so non-rs1 and non-rs2 rows commit no read.
 ///
 /// Real rows fill from `program` in order; the remaining rows up to
 /// [`cpu_trace_height`] are padding rows holding the PC at the halt
@@ -1206,10 +1570,12 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// # Panics
 ///
 /// Panics if `pc_base`, any instruction PC / next PC, or any computed
-/// destination value would alias in BabyBear; if a trace index does not
-/// fit in `u64`; or if `program` contains an opcode this slice does not
-/// yet support (anything outside LUI, AUIPC, JAL, ADDI, ANDI, ORI,
-/// XORI).
+/// destination / branch target value would alias in BabyBear; if a
+/// branch instruction's `next_pc` does not match the runtime outcome
+/// of comparing the read registers; if a trace index does not fit in
+/// `u64`; or if `program` contains an opcode this slice does not yet
+/// support (anything outside LUI, AUIPC, JAL, BEQ, BNE, ADDI, ANDI,
+/// ORI, XORI).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> RowMajorMatrix<F> {
@@ -1239,6 +1605,10 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
             values[base + COL_PC] = F::from_u64(u64::from(halt_pc));
             values[base + COL_NEXT_PC] = F::from_u64(u64::from(halt_pc));
             values[base + COL_IS_PAD] = F::ONE;
+            // Padding rows carry rs1_val = rs2_val = 0, so the
+            // equality witness `branch_eq + diff * diff_inv = 1`
+            // requires branch_eq = 1 (diff_inv can stay 0).
+            values[base + COL_BRANCH_EQ] = F::ONE;
             continue;
         };
 
@@ -1281,6 +1651,49 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
             values[base + COL_RS1_BIT_START + bit] =
                 F::from_u64(u64::from((rs1_val_u32 >> bit) & 1));
         }
+
+        // rs2 read port (slice 8). The AIR decodes rs2_idx and
+        // populates rs2_val unconditionally; non-rs2-reading rows
+        // just leave the read indicators at zero.
+        let rs2_idx = (insn.insn >> 20) & 0x1F;
+        let rs2_idx_usize = usize::try_from(rs2_idx).expect("rs2_idx fits in usize");
+        values[base + COL_RS2_IDX] = F::from_u64(u64::from(rs2_idx));
+        let rs2_val_u32 = regs[rs2_idx_usize];
+        let rs2_val_field = F::from_u64(u64::from(rs2_val_u32));
+        values[base + COL_RS2_VAL] = rs2_val_field;
+
+        // B-type signed branch immediate (slice 8). Decoded for every
+        // row; only BEQ / BNE rows route it into PC arithmetic.
+        let br_imm_bit_12 = (insn.insn >> 31) & 1;
+        let br_imm_low_11 = (((insn.insn >> 8) & 0xF) << 1)
+            | (((insn.insn >> 25) & 0x3F) << 5)
+            | (((insn.insn >> 7) & 1) << 11);
+        let br_imm_field: F = if br_imm_bit_12 == 0 {
+            F::from_u64(u64::from(br_imm_low_11))
+        } else {
+            let magnitude = 4096_u64 - u64::from(br_imm_low_11);
+            -F::from_u64(magnitude)
+        };
+        values[base + COL_BR_IMM] = br_imm_field;
+
+        // Branch equality witness (slice 8). The AIR enforces
+        //   branch_eq * (rs1_val - rs2_val) = 0
+        //   branch_eq + (rs1_val - rs2_val) * diff_inv = 1
+        // unconditionally. Setting branch_eq from the running u32
+        // state and exhibiting an inverse when the values differ
+        // satisfies both clauses; padding rows already set
+        // branch_eq = 1 in the loop above.
+        let diff_field = rs1_val_field - rs2_val_field;
+        let (branch_eq_field, branch_diff_inv_field) = if rs1_val_u32 == rs2_val_u32 {
+            (F::ONE, F::ZERO)
+        } else {
+            let inv = diff_field
+                .try_inverse()
+                .expect("nonzero field element has an inverse");
+            (F::ZERO, inv)
+        };
+        values[base + COL_BRANCH_EQ] = branch_eq_field;
+        values[base + COL_BRANCH_DIFF_INV] = branch_diff_inv_field;
 
         // I-type signed immediate decoded for every row. The column
         // is only used by I-type opcodes; other families just leave
@@ -1372,6 +1785,39 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
                 if rd_idx != 0 {
                     regs[rd_idx_usize] = rd_val_u32;
                 }
+            }
+            x if x == BRANCH_OPCODE => {
+                // BEQ / BNE do not write a register, so the write
+                // indicator vector stays all zero. The B-type imm
+                // bits 11..7 of insn are split between imm[11] and
+                // imm[4:1]; the `rd_idx` column decoded from
+                // `insn[11:7]` therefore generally has a non-zero
+                // value, but slice 8's writeful aggregate excludes
+                // branches so no `wi_j` is set.
+                let funct3 = (insn.insn >> 12) & 0x7;
+                values[base + COL_RS2_IND_START + rs2_idx_usize] = F::ONE;
+                let br_imm_signed_i32: i32 = if br_imm_bit_12 == 0 {
+                    i32::try_from(br_imm_low_11).expect("br_imm_low_11 fits in i32")
+                } else {
+                    -i32::try_from(4096 - br_imm_low_11).expect("br_imm magnitude fits in i32")
+                };
+                let taken_target = checked_pc_offset(insn.pc, br_imm_signed_i32);
+                let fall_through = insn
+                    .pc
+                    .checked_add(4)
+                    .expect("cpu_trace: branch pc + 4 overflows u32");
+                let (selector_col, taken) = match funct3 {
+                    f if f == FUNCT3_BEQ => (COL_IS_BEQ, rs1_val_u32 == rs2_val_u32),
+                    f if f == FUNCT3_BNE => (COL_IS_BNE, rs1_val_u32 != rs2_val_u32),
+                    _ => panic!("cpu_trace: unsupported BRANCH funct3 {funct3}"),
+                };
+                values[base + selector_col] = F::ONE;
+                let expected_next_pc = if taken { taken_target } else { fall_through };
+                assert_eq!(
+                    insn.next_pc, expected_next_pc,
+                    "cpu_trace: branch next_pc does not match runtime outcome (taken={taken})"
+                );
+                assert_babybear_native_u32("cpu_trace: branch next_pc", expected_next_pc);
             }
             _ => panic!("cpu_trace: unsupported opcode 0x{opcode:02X}"),
         }
@@ -2752,6 +3198,557 @@ mod tests {
         let pc_base = 0x10000;
         let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::jal(pc_base, 5, 8)]);
         trace.values[COL_IS_AUIPC] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    // -------- Slice 8 tests (BEQ + BNE + rs2 infrastructure) --------
+
+    #[test]
+    fn beq_taken_constructor_encodes_canonical_bytes() {
+        // `beq x1, x2, 8` → funct3 = 000, opcode = 0x63.
+        let insn = CpuInstruction::beq_taken(0x10000, 1, 2, 8);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10008);
+        assert_eq!(insn.insn, 0x0020_8463);
+    }
+
+    #[test]
+    fn bne_taken_constructor_encodes_canonical_bytes() {
+        // `bne x1, x2, 8` → funct3 = 001, opcode = 0x63.
+        let insn = CpuInstruction::bne_taken(0x10000, 1, 2, 8);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10008);
+        assert_eq!(insn.insn, 0x0020_9463);
+    }
+
+    #[test]
+    fn beq_not_taken_constructor_uses_fall_through_next_pc() {
+        let insn = CpuInstruction::beq_not_taken(0x10000, 1, 2, 8);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10004);
+        assert_eq!(insn.insn, 0x0020_8463);
+    }
+
+    #[test]
+    fn bne_not_taken_constructor_uses_fall_through_next_pc() {
+        let insn = CpuInstruction::bne_not_taken(0x10000, 1, 2, 8);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10004);
+        assert_eq!(insn.insn, 0x0020_9463);
+    }
+
+    #[test]
+    fn beq_constructor_encodes_negative_offset() {
+        // `beq x1, x2, -8` → 13-bit signed offset 0x1FF8.
+        //   imm[12]=1, imm[11]=1, imm[10:5]=0b111111, imm[4:1]=0b1100.
+        let insn = CpuInstruction::beq_taken(0x10010, 1, 2, -8);
+        assert_eq!(insn.pc, 0x10010);
+        assert_eq!(insn.next_pc, 0x10008);
+        assert_eq!(insn.insn, 0xFE20_8CE3);
+    }
+
+    #[test]
+    #[should_panic(expected = "rs1 must be in [0, 31]")]
+    fn beq_constructor_panics_on_oob_rs1() {
+        let _ = CpuInstruction::beq_taken(0x10000, 32, 0, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "rs2 must be in [0, 31]")]
+    fn beq_constructor_panics_on_oob_rs2() {
+        let _ = CpuInstruction::beq_taken(0x10000, 0, 32, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "offset must fit in signed B-type range")]
+    fn beq_constructor_panics_on_oob_offset() {
+        let _ = CpuInstruction::beq_taken(0x10000, 0, 1, 4096);
+    }
+
+    #[test]
+    #[should_panic(expected = "offset must be 4-byte aligned")]
+    fn beq_constructor_panics_on_misaligned_offset() {
+        let _ = CpuInstruction::beq_taken(0x10000, 0, 1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "pc + offset underflows u32")]
+    fn beq_taken_constructor_panics_on_target_underflow() {
+        let _ = CpuInstruction::beq_taken(0, 0, 1, -4);
+    }
+
+    #[test]
+    fn padding_row_carries_branch_eq_one() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[]);
+        // Every padding row must set branch_eq = 1 so the equality
+        // witness `branch_eq + diff * diff_inv = 1` holds with
+        // diff = 0 (all-zero registers / rs1_val / rs2_val).
+        for i in 0..MIN_TRACE_HEIGHT {
+            let base = i * CPU_TRACE_WIDTH;
+            assert_eq!(
+                trace.values[base + COL_BRANCH_EQ],
+                Val::ONE,
+                "padding row {i} branch_eq",
+            );
+        }
+    }
+
+    #[test]
+    fn beq_with_equal_registers_takes_branch_in_trace() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::beq_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_BEQ], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_IS_BNE], Val::ZERO);
+        assert_eq!(trace.values[row2 + COL_BRANCH_EQ], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_NEXT_PC], Val::from_u64(0x10010));
+        // Branch row writes no register: every wi_j is zero.
+        for j in 0..NUM_REGS {
+            assert_eq!(
+                trace.values[row2 + COL_WI_START + j],
+                Val::ZERO,
+                "branch row wi[{j}] must be zero",
+            );
+        }
+        // ri2 indicator agrees with rs2_idx.
+        for j in 0..NUM_REGS {
+            let expected = if j == 2 { Val::ONE } else { Val::ZERO };
+            assert_eq!(
+                trace.values[row2 + COL_RS2_IND_START + j],
+                expected,
+                "ri2[{j}]",
+            );
+        }
+    }
+
+    #[test]
+    fn bne_with_unequal_registers_takes_branch_in_trace() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+                CpuInstruction::bne_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_BNE], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_IS_BEQ], Val::ZERO);
+        assert_eq!(trace.values[row2 + COL_BRANCH_EQ], Val::ZERO);
+        assert_eq!(trace.values[row2 + COL_NEXT_PC], Val::from_u64(0x10010));
+        // branch_diff_inv must be the field inverse of (5 - 7).
+        let diff_inv = trace.values[row2 + COL_BRANCH_DIFF_INV];
+        let diff = Val::from_u64(5) - Val::from_u64(7);
+        assert_eq!(diff * diff_inv, Val::ONE);
+    }
+
+    #[test]
+    fn beq_with_unequal_registers_falls_through_in_trace() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+                CpuInstruction::beq_not_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0xC, 3, 0, 1),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_BEQ], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_BRANCH_EQ], Val::ZERO);
+        assert_eq!(trace.values[row2 + COL_NEXT_PC], Val::from_u64(0x1000C));
+    }
+
+    #[test]
+    fn bne_with_equal_registers_falls_through_in_trace() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::bne_not_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0xC, 3, 0, 1),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_BNE], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_BRANCH_EQ], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_NEXT_PC], Val::from_u64(0x1000C));
+    }
+
+    #[test]
+    fn beq_taken_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::beq_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn beq_not_taken_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+                CpuInstruction::beq_not_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0xC, 3, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn bne_taken_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+                CpuInstruction::bne_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn bne_not_taken_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::bne_not_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0xC, 3, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn beq_with_x0_x0_is_unconditional_jump_proves() {
+        // `beq x0, x0, offset` always succeeds because `x0 = x0`.
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::beq_taken(pc_base, 0, 0, 8),
+                CpuInstruction::addi(pc_base + 8, 1, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn bne_with_x0_x0_never_branches_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::bne_not_taken(pc_base, 0, 0, 8),
+                CpuInstruction::addi(pc_base + 4, 1, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn backward_branch_proves() {
+        let pc_base = 0x10000;
+        // r1 starts at 0, ADDI sets r1 = 1. BNE x1, x1, -4 is
+        // always not-taken (rs1 == rs2 = 1).
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 1),
+                CpuInstruction::bne_not_taken(pc_base + 4, 1, 1, -4),
+            ],
+        );
+    }
+
+    #[test]
+    fn branch_preserves_running_register_state() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::beq_not_taken(pc_base + 4, 1, 0, 8),
+            ],
+        );
+        // After the branch row, r1 still holds 5 and every other
+        // register stays zero.
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_REG_START + 1], Val::from_u64(5));
+        for j in 0..NUM_REGS {
+            if j == 1 {
+                continue;
+            }
+            assert_eq!(
+                trace.values[row2 + COL_REG_START + j],
+                Val::ZERO,
+                "r{j} should stay zero across the branch",
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_branch_program_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 1),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 2),
+                // r1 != r2 → BEQ not taken, fall through.
+                CpuInstruction::beq_not_taken(pc_base + 8, 1, 2, 0x10),
+                // r1 != r2 → BNE taken, jump to pc + 8.
+                CpuInstruction::bne_taken(pc_base + 0xC, 1, 2, 8),
+                // Branch target.
+                CpuInstruction::addi(pc_base + 0x14, 3, 1, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn prover_refuses_beq_with_wrong_branch_eq() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::beq_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+        // BEQ row: rs1 == rs2, branch_eq must be 1. Flip to 0; the
+        // identity `branch_eq + diff * diff_inv = 1` fails because
+        // diff = 0 means no inverse can satisfy the equation.
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        trace.values[row2 + COL_BRANCH_EQ] = Val::ZERO;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_branch_eq_set_when_values_differ() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+                CpuInstruction::beq_not_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0xC, 3, 0, 1),
+            ],
+        );
+        // BEQ row: rs1 != rs2, branch_eq must be 0. Force 1 to flunk
+        // the `branch_eq * (rs1_val - rs2_val) = 0` constraint.
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        trace.values[row2 + COL_BRANCH_EQ] = Val::ONE;
+        trace.values[row2 + COL_BRANCH_DIFF_INV] = Val::ZERO;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_beq_with_wrong_taken_next_pc() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::beq_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+        // Force next_pc to fall-through even though branch_eq = 1
+        // pins the BEQ rule to next_pc = pc + br_imm = pc + 8.
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        let row3 = 3 * CPU_TRACE_WIDTH;
+        trace.values[row2 + COL_NEXT_PC] = Val::from_u64(0x1000C);
+        // Keep the transition consistent so we isolate the BEQ rule.
+        trace.values[row3 + COL_PC] = Val::from_u64(0x1000C);
+        trace.values[row3 + COL_NEXT_PC] = Val::from_u64(0x10010);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_beq_with_wrong_not_taken_next_pc() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+                CpuInstruction::beq_not_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0xC, 3, 0, 1),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        let row3 = 3 * CPU_TRACE_WIDTH;
+        // Branch should fall through to pc + 4 = 0x1000C; force
+        // 0x10010 so the BEQ PC rule rejects it.
+        trace.values[row2 + COL_NEXT_PC] = Val::from_u64(0x10010);
+        trace.values[row3 + COL_PC] = Val::from_u64(0x10010);
+        trace.values[row3 + COL_NEXT_PC] = Val::from_u64(0x10014);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_branch_with_misaligned_target_bit() {
+        // Tamper a branch row to set `imm[1] = 1` so the alignment
+        // constraint `(is_beq + is_bne) * b1_bit_0 = 0` rejects it.
+        // `beq x0, x0, 8` is always taken (both regs are zero), so
+        // the base trace is a valid taken branch.
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        // Flip b1_bit_0 from 0 to 1.
+        trace.values[COL_B1_BITS_START] = Val::ONE;
+        // Compensate b1 so the byte-sum constraint still holds.
+        trace.values[COL_B1] += Val::ONE;
+        // Update br_imm: add 2 because imm[1] now contributes 2.
+        trace.values[COL_BR_IMM] += Val::from_u64(2);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_branch_with_wrong_funct3() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        // BEQ funct3 = 000; flip bit 4 to 1 and patch b1.
+        trace.values[COL_B1_BITS_START + 4] = Val::ONE;
+        trace.values[COL_B1] += Val::from_u64(16);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_branch_with_wrong_opcode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        // BRANCH opcode = 0x63 = 0110_0011. Flip b0_bit_0 to drop it
+        // to 0x62.
+        trace.values[COL_B0_BITS_START] = Val::ZERO;
+        trace.values[COL_B0] -= Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_branch_writing_a_register() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        // Set wi_5 on the branch row. The new writeful aggregate
+        // excludes branches, so wi_sum = 1 fails.
+        trace.values[COL_WI_START + 5] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_beq_and_is_bne_both_set() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        trace.values[COL_IS_BNE] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_beq_set_on_padding_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[]);
+        trace.values[COL_IS_BEQ] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_bne_set_on_padding_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[]);
+        trace.values[COL_IS_BNE] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_branch_with_wrong_rs2_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                CpuInstruction::beq_taken(pc_base + 8, 1, 2, 8),
+                CpuInstruction::addi(pc_base + 0x10, 3, 0, 1),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        // The BEQ row reads r2 (= 5); tamper rs2_val to 7. The ri2
+        // read-match constraint flunks.
+        trace.values[row2 + COL_RS2_VAL] = Val::from_u64(7);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_wrong_rs2_idx_decode() {
+        let pc_base = 0x10000;
+        // `beq x1, x2, 8` with both registers initially zero is a
+        // valid taken branch (rs1 = rs2 = 0).
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 1, 2, 8)]);
+        // Decoded rs2_idx should be 2; force 7.
+        trace.values[COL_RS2_IDX] = Val::from_u64(7);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_wrong_br_imm_decode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        // Decoded br_imm = 8; force 16. The BEQ PC rule then
+        // demands next_pc = pc + 16, but the row's next_pc is pc + 8.
+        trace.values[COL_BR_IMM] = Val::from_u64(16);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_extra_family_selector_with_branch() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        // Family aggregate becomes 2 while is_real = 1.
+        trace.values[COL_IS_LUI] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_ri2_indicator_on_non_branch_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0x10)]);
+        // LUI does not read rs2; setting a ri2 indicator violates
+        // `Σ ri2_j = is_beq + is_bne = 0`.
+        trace.values[COL_RS2_IND_START + 3] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_non_boolean_ri2_indicator() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        trace.values[COL_RS2_IND_START] = Val::from_u64(2);
         assert_prover_rejects(pc_base, trace);
     }
 }

@@ -13,8 +13,8 @@
 //!
 //! M8-C lays the baseline; M8-D adds the public-input commitment;
 //! M8-E adds the first lookup-table AIR; M8-F adds the memory
-//! consistency AIR; M8-G adds the program ROM AIR. The crate
-//! currently exposes:
+//! consistency AIR; M8-G adds the program ROM AIR; M8-H slice 1
+//! adds the CPU AIR scaffold. The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -33,11 +33,16 @@
 //!   ELF's `pc_base`. M8-L routes the CPU AIR's per-fetch lookups
 //!   into this table; M8-N pins the table's preprocessed commitment
 //!   to the `vm_code_hash` public input.
+//! - [`cpu`] — the per-instruction execution-trace AIR. Slice 1
+//!   pins the trace's PC and real/pad selector layout; subsequent
+//!   M8-H sub-slices add bit decomposition, the register file, and
+//!   each RV32I instruction family.
 //!
-//! Later M8 slices (M8-H onwards) grow the crate one AIR at a time
+//! Later M8 slices (M8-I onwards) grow the crate one AIR at a time
 //! against this scaffold.
 
 pub mod config;
+pub mod cpu;
 pub mod fibonacci;
 pub mod memory_consistency;
 pub mod program_rom;
@@ -48,6 +53,7 @@ pub use config::{
     BABY_BEAR_MODULUS, Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm,
     StarkCfg, Val, ValMmcs, build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
 };
+pub use cpu::{CPU_TRACE_WIDTH, CpuAir, CpuInstruction, cpu_trace, cpu_trace_height};
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,

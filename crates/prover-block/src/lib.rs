@@ -45,15 +45,17 @@ pub mod public_inputs;
 pub mod range_check;
 
 pub use config::{
-    Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm, StarkCfg, Val, ValMmcs,
-    build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
+    BABY_BEAR_MODULUS, Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm,
+    StarkCfg, Val, ValMmcs, build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
     memory_consistency_trace,
 };
-pub use program_rom::{PROGRAM_ROM_TRACE_WIDTH, ProgramRomAir, program_rom_trace};
+pub use program_rom::{
+    PROGRAM_ROM_TRACE_WIDTH, ProgramRomAir, program_rom_trace, program_rom_trace_height,
+};
 pub use public_inputs::{
     BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,
     commit_block_public_inputs,

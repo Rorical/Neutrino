@@ -37,6 +37,9 @@ use rand::rngs::SmallRng;
 /// Base field of every block-level constraint and trace cell.
 pub type Val = BabyBear;
 
+/// Canonical modulus of the [`BabyBear`] base field.
+pub const BABY_BEAR_MODULUS: u64 = 0x7800_0001;
+
 /// Width-16 Poseidon2 permutation over `BabyBear`. Used by both the
 /// duplex challenger and the Merkle sponge.
 pub type Perm = Poseidon2BabyBear<16>;

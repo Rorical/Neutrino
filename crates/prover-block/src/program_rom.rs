@@ -28,12 +28,16 @@
 //!
 //! - **First row**: `pc = pc_base`.
 //! - **Transition**: `next.pc = local.pc + 4`.
+//! - **Last row**: `pc = pc_base + 4 * (trace_height - 1)`.
 //!
 //! Together they force `pc[i] = pc_base + 4 * i` across the full
-//! trace height. The byte columns are intentionally unconstrained at
-//! the M8-G level: the CPU AIR (M8-H) requires `b0..b3 ∈ [0, 256)`,
-//! and M8-L routes each byte through the [`crate::range_check`] u8
-//! table on the shared logUp bus.
+//! trace height and bind the proof to the expected ROM size. The AIR
+//! constructor and trace builder also require the last PC to be below
+//! the BabyBear modulus, making the single-cell PC representation
+//! injective for every accepted ROM. The byte columns are intentionally
+//! unconstrained at the M8-G level: the CPU AIR (M8-H) requires
+//! `b0..b3 ∈ [0, 256)`, and M8-L routes each byte through the
+//! [`crate::range_check`] u8 table on the shared logUp bus.
 //!
 //! ## Why the instruction is split into four bytes
 //!
@@ -58,7 +62,7 @@ use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
 
-use crate::config::FRI_LOG_FINAL_POLY_LEN;
+use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 
 /// Number of trace columns the program ROM AIR uses.
 pub const PROGRAM_ROM_TRACE_WIDTH: usize = 5;
@@ -77,37 +81,48 @@ const MIN_TRACE_HEIGHT: usize = 1 << (FRI_LOG_FINAL_POLY_LEN + 1);
 /// Program ROM AIR anchored at a fixed `pc_base`.
 ///
 /// The AIR is intentionally tiny: it ties the trace's first PC value
-/// to a constant and enforces a `+4` stride between consecutive rows.
-/// The lookup soundness ("the CPU's executed `(pc, instruction)`
-/// matches the table") is provided by M8-L's logUp bus; the binding
-/// to `vm_code_hash` is provided by M8-N's preprocessed commitment.
+/// to a constant, enforces a `+4` stride between consecutive rows, and
+/// pins the last PC to the configured trace height. The lookup
+/// soundness ("the CPU's executed `(pc, instruction)` matches the
+/// table") is provided by M8-L's logUp bus; the binding to
+/// `vm_code_hash` is provided by M8-N's preprocessed commitment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramRomAir {
     pc_base: u32,
+    trace_height: usize,
 }
 
 impl ProgramRomAir {
     /// Build the AIR for an ELF whose executable segment begins at
-    /// `pc_base`.
+    /// `pc_base` and whose padded ROM trace has `trace_height` rows.
     ///
     /// # Panics
     ///
-    /// Panics if `pc_base` is not 4-byte aligned. RV32I requires the
-    /// PC to be a multiple of 4 (no `C` extension), so a misaligned
-    /// `pc_base` always denotes a programmer error.
+    /// Panics if `pc_base` is not 4-byte aligned, if `trace_height` is
+    /// not a supported power-of-two height, or if the last PC would be
+    /// greater than or equal to the BabyBear modulus. RV32I requires
+    /// the PC to be a multiple of 4 (no `C` extension), and BabyBear
+    /// requires every represented PC to be below its modulus to avoid
+    /// field-element aliasing.
     #[must_use]
-    pub const fn new(pc_base: u32) -> Self {
-        assert!(
-            pc_base.trailing_zeros() >= 2,
-            "ProgramRomAir::new: pc_base must be 4-byte aligned"
-        );
-        Self { pc_base }
+    pub fn new(pc_base: u32, trace_height: usize) -> Self {
+        let _last_pc = validate_pc_range(pc_base, trace_height);
+        Self {
+            pc_base,
+            trace_height,
+        }
     }
 
     /// Base PC the AIR pins the trace's first row to.
     #[must_use]
     pub const fn pc_base(self) -> u32 {
         self.pc_base
+    }
+
+    /// Padded trace height the AIR pins with its last-row constraint.
+    #[must_use]
+    pub const fn trace_height(self) -> usize {
+        self.trace_height
     }
 }
 
@@ -138,7 +153,33 @@ impl<AB: AirBuilder> Air<AB> for ProgramRomAir {
         builder
             .when_transition()
             .assert_eq(next[COL_PC], local[COL_PC] + four);
+
+        // Last row: bind the committed trace to the expected ROM height.
+        let last_pc = validate_pc_range(self.pc_base, self.trace_height);
+        let last_pc_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(last_pc));
+        builder
+            .when_last_row()
+            .assert_eq(local[COL_PC], last_pc_expr);
     }
+}
+
+/// Padded trace height for an instruction slice of `instruction_count`
+/// words.
+///
+/// The height is the next power of two of at least one row, then raised
+/// to the FRI-imposed minimum height.
+///
+/// # Panics
+///
+/// Panics if rounding `instruction_count` to the next power of two
+/// overflows `usize`.
+#[must_use]
+pub fn program_rom_trace_height(instruction_count: usize) -> usize {
+    instruction_count
+        .max(1)
+        .checked_next_power_of_two()
+        .expect("program_rom_trace_height: trace height overflows usize")
+        .max(MIN_TRACE_HEIGHT)
 }
 
 /// Build a [`ProgramRomAir`] trace from a slice of executable
@@ -152,18 +193,15 @@ impl<AB: AirBuilder> Air<AB> for ProgramRomAir {
 ///
 /// # Panics
 ///
-/// Panics if `pc_base` is not 4-byte aligned, or if the trace index
-/// `i` cannot be encoded as a `u64` (unreachable on every supported
+/// Panics if `pc_base` is not 4-byte aligned, if the padded PC range
+/// would not fit injectively in BabyBear, or if the trace index `i`
+/// cannot be encoded as a `u64` (unreachable on every supported
 /// platform, since `usize` is at most 64 bits wide).
 #[must_use]
 pub fn program_rom_trace<F: Field>(pc_base: u32, instructions: &[u32]) -> RowMajorMatrix<F> {
-    assert!(
-        pc_base.trailing_zeros() >= 2,
-        "program_rom_trace: pc_base must be 4-byte aligned"
-    );
-
     let real_rows = instructions.len();
-    let height = real_rows.max(1).next_power_of_two().max(MIN_TRACE_HEIGHT);
+    let height = program_rom_trace_height(real_rows);
+    let _last_pc = validate_pc_range(pc_base, height);
 
     let mut values = F::zero_vec(height * PROGRAM_ROM_TRACE_WIDTH);
     for i in 0..height {
@@ -183,6 +221,37 @@ pub fn program_rom_trace<F: Field>(pc_base: u32, instructions: &[u32]) -> RowMaj
     RowMajorMatrix::new(values, PROGRAM_ROM_TRACE_WIDTH)
 }
 
+fn validate_pc_range(pc_base: u32, trace_height: usize) -> u64 {
+    assert!(
+        pc_base.trailing_zeros() >= 2,
+        "program ROM: pc_base must be 4-byte aligned"
+    );
+    assert!(
+        trace_height >= MIN_TRACE_HEIGHT,
+        "program ROM: trace height is below the FRI minimum"
+    );
+    assert!(
+        trace_height.is_power_of_two(),
+        "program ROM: trace height must be a power of two"
+    );
+
+    let last_row = trace_height
+        .checked_sub(1)
+        .expect("program ROM: trace height must be nonzero");
+    let pc_offset = u64::try_from(last_row)
+        .expect("program ROM: trace height fits in u64")
+        .checked_mul(4)
+        .expect("program ROM: PC offset overflows u64");
+    let last_pc = u64::from(pc_base)
+        .checked_add(pc_offset)
+        .expect("program ROM: last PC overflows u64");
+    assert!(
+        last_pc < BABY_BEAR_MODULUS,
+        "program ROM: PC range must fit below the BabyBear modulus"
+    );
+    last_pc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,14 +265,14 @@ mod tests {
     fn prove_and_verify(pc_base: u32, instructions: &[u32]) {
         let config = build_stark_config();
         let trace = program_rom_trace::<Val>(pc_base, instructions);
-        let air = ProgramRomAir::new(pc_base);
+        let air = ProgramRomAir::new(pc_base, program_rom_trace_height(instructions.len()));
         let proof = prove(&config, &air, trace, &[]);
         verify(&config, &air, &proof, &[]).expect("program ROM proof verifies");
     }
 
     fn assert_prover_rejects(pc_base: u32, trace: RowMajorMatrix<Val>) {
         let config = build_stark_config();
-        let air = ProgramRomAir::new(pc_base);
+        let air = ProgramRomAir::new(pc_base, trace.values.len() / PROGRAM_ROM_TRACE_WIDTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             prove(&config, &air, trace, &[]);
         }));
@@ -303,20 +372,72 @@ mod tests {
 
     #[test]
     fn pc_base_round_trips_through_accessor() {
-        let air = ProgramRomAir::new(0x2_0000);
+        let air = ProgramRomAir::new(0x2_0000, MIN_TRACE_HEIGHT);
         assert_eq!(air.pc_base(), 0x2_0000);
+    }
+
+    #[test]
+    fn trace_height_round_trips_through_accessor() {
+        let air = ProgramRomAir::new(0x2_0000, MIN_TRACE_HEIGHT * 2);
+        assert_eq!(air.trace_height(), MIN_TRACE_HEIGHT * 2);
+    }
+
+    #[test]
+    fn trace_height_rounds_to_fri_minimum() {
+        assert_eq!(program_rom_trace_height(0), MIN_TRACE_HEIGHT);
+        assert_eq!(program_rom_trace_height(1), MIN_TRACE_HEIGHT);
+        assert_eq!(
+            program_rom_trace_height(MIN_TRACE_HEIGHT + 1),
+            MIN_TRACE_HEIGHT * 2
+        );
     }
 
     #[test]
     #[should_panic(expected = "pc_base must be 4-byte aligned")]
     fn air_constructor_panics_on_misaligned_pc_base() {
-        let _ = ProgramRomAir::new(0x1_0001);
+        let _ = ProgramRomAir::new(0x1_0001, MIN_TRACE_HEIGHT);
     }
 
     #[test]
     #[should_panic(expected = "pc_base must be 4-byte aligned")]
     fn trace_builder_panics_on_misaligned_pc_base() {
         let _ = program_rom_trace::<Val>(0x1_0002, &[NOP]);
+    }
+
+    #[test]
+    #[should_panic(expected = "PC range must fit below the BabyBear modulus")]
+    fn air_constructor_panics_when_pc_range_aliases_babybear() {
+        let _ = ProgramRomAir::new(
+            u32::try_from(BABY_BEAR_MODULUS - 1).unwrap(),
+            MIN_TRACE_HEIGHT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "PC range must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_pc_range_aliases_babybear() {
+        let _ = program_rom_trace::<Val>(u32::try_from(BABY_BEAR_MODULUS - 1).unwrap(), &[NOP]);
+    }
+
+    #[test]
+    #[should_panic(expected = "trace height must be a power of two")]
+    fn air_constructor_panics_on_non_power_of_two_height() {
+        let _ = ProgramRomAir::new(0x10000, MIN_TRACE_HEIGHT + 1);
+    }
+
+    #[test]
+    fn prover_refuses_wrong_trace_height() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP; MIN_TRACE_HEIGHT + 1]);
+        let air = ProgramRomAir::new(pc_base, MIN_TRACE_HEIGHT);
+        let config = build_stark_config();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove(&config, &air, trace, &[]);
+        }));
+        assert!(
+            result.is_err(),
+            "prover accepted a ROM trace with the wrong configured height",
+        );
     }
 
     #[test]

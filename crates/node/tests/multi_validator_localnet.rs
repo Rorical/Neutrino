@@ -6,18 +6,10 @@
 //! M7-C VRF-elected aggregator subnet, and the M7-B / M7-D.1
 //! slashing pipeline.
 //!
-//! The roadmap target is 16 validators; we pin the test at
-//! `N_VALIDATORS = 12` because `rust-libp2p`'s default gossipsub
-//! configuration (`D_high = 12`) means a 16-node localnet
-//! routinely prunes its meshes down to the saturation cliff on
-//! every topic, and `16 × 10` topics × `15` peers worth of mesh
-//! state can leave one or more validators silent through the test
-//! window. Twelve validators is 6× the M7-A integration baseline
-//! and exercises every M7 system end-to-end (live BFT + aggregator
-//! subnet + slashing pool) while keeping the test under 30
-//! seconds in CI. Lifting the cap to the full 16-validator target
-//! requires tuning gossipsub (peer-exchange, mesh-degree bumps)
-//! and lands as part of the M15 hardening pass.
+//! The roadmap target is 16 validators, matching the M7 exit
+//! criterion. The driver reports every decoded gossip payload as
+//! accepted so libp2p's strict-validation gossipsub pipeline forwards
+//! it beyond the first mesh hop.
 //!
 //! The test scales the same wiring that powers the M7-A
 //! `two_validators_finalize_chunk_via_real_bft_loop` integration:
@@ -55,10 +47,11 @@ use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_consensus_types::{
     Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
 };
-use neutrino_network::Multiaddr;
 use neutrino_network::Topic;
+use neutrino_network::libp2p::gossipsub::MessageAcceptance;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
+use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
@@ -71,7 +64,7 @@ use neutrino_sync::SyncBackend;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-const N_VALIDATORS: u8 = 12;
+const N_VALIDATORS: u8 = 16;
 const VOTE_SUBNETS: u16 = 4;
 const TEST_CHAIN_ID: u64 = 16_161_616;
 const TEST_GENESIS_SEED: [u8; 32] = [0xE7; 32];
@@ -225,6 +218,25 @@ async fn wait_for_listen_addr(rx: &mut mpsc::Receiver<NetworkEvent>) -> Multiadd
     .expect("listener advertised")
 }
 
+async fn wait_for_peer_count(
+    rx: &mut mpsc::Receiver<NetworkEvent>,
+    expected_peers: usize,
+) -> Vec<PeerId> {
+    timeout(Duration::from_secs(10), async {
+        let mut peers = Vec::with_capacity(expected_peers);
+        while peers.len() < expected_peers {
+            if let NetworkEvent::PeerConnected(peer) = rx.recv().await.expect("peer stream open")
+                && !peers.contains(&peer)
+            {
+                peers.push(peer);
+            }
+        }
+        peers
+    })
+    .await
+    .expect("full peer mesh established")
+}
+
 fn all_bft_topics() -> Vec<Topic> {
     let mut topics = vec![
         Topic::Blocks,
@@ -255,17 +267,27 @@ async fn subscribe_all(handle: &NodeHandle, topics: &[Topic]) {
 /// so the test can keep it alive for the duration of the run.
 fn spawn_handle_driver(
     backend: Arc<ChainBackend<MemoryDatabase, MockProofSystem>>,
+    cmd_tx: mpsc::Sender<NetworkCommand>,
     mut event_rx: mpsc::Receiver<NetworkEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            let NetworkEvent::GossipMessage { topic, data, .. } = event else {
+            let NetworkEvent::GossipMessage {
+                propagation_source,
+                topic,
+                data,
+                message_id,
+            } = event
+            else {
                 continue;
             };
-            match topic {
+            let acceptance = match topic {
                 Topic::Blocks => {
                     if let Ok(block) = borsh::from_slice::<Block>(&data) {
                         let _ = backend.verify_and_import_gossip_block(block).await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
                     }
                 }
                 Topic::BlockProofs => {
@@ -274,21 +296,33 @@ fn spawn_handle_driver(
                         let _ = backend
                             .verify_and_import_block_proofs(height, vec![proof])
                             .await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
                     }
                 }
                 Topic::FinalityVotesPrevote | Topic::FinalityVotesPrecommit => {
                     if let Ok(vote) = borsh::from_slice::<FinalityVote>(&data) {
                         backend.ingest_finality_vote(vote).await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
                     }
                 }
                 Topic::AggregateFinalityVotes(subnet) => {
                     if let Ok(vote) = borsh::from_slice::<FinalityVote>(&data) {
                         backend.ingest_aggregate_finality_vote(subnet, vote).await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
                     }
                 }
                 Topic::ChunkProofs => {
                     if let Ok(proof) = borsh::from_slice::<ChunkProof>(&data) {
                         let _ = backend.verify_and_import_chunk_proof(proof).await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
                     }
                 }
                 Topic::Checkpoints => {
@@ -297,10 +331,20 @@ fn spawn_handle_driver(
                         let _ = backend
                             .verify_and_import_checkpoints(vec![(checkpoint, proof)])
                             .await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
                     }
                 }
-                _ => {}
-            }
+                _ => MessageAcceptance::Ignore,
+            };
+            let _ = cmd_tx
+                .send(NetworkCommand::ReportGossipValidation {
+                    message_id,
+                    propagation_source,
+                    acceptance,
+                })
+                .await;
         }
     })
 }
@@ -359,11 +403,22 @@ async fn wait_for_all_finalised(
         if indices.iter().all(|i| *i >= 1) {
             return indices;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "M7-D.4 16-validator BFT did not finalize chunk 0 within the test budget. \
-             Latest finalized indices = {indices:?}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let mut head_heights = Vec::with_capacity(handles.len());
+            let mut proven_heights = Vec::with_capacity(handles.len());
+            let mut next_chunks = Vec::with_capacity(handles.len());
+            for h in handles {
+                let progress = h.backend.local_progress().await;
+                head_heights.push(progress.head_height);
+                proven_heights.push(progress.proven_height);
+                next_chunks.push(h.backend.next_chunk_to_close());
+            }
+            panic!(
+                "M7-D.4 16-validator BFT did not finalize chunk 0 within the test budget. \
+                 Latest finalized indices = {indices:?}; head heights = {head_heights:?}; \
+                 proven heights = {proven_heights:?}; next chunks = {next_chunks:?}"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -383,7 +438,7 @@ async fn multi_validator_localnet_finalises_chunk_zero_over_real_libp2p() {
     }
 
     // Every node listens on its own port so we can build a full-
-    // mesh dial topology — a star topology with v0 at the centre
+    // mesh dial topology: a star topology with v0 at the centre
     // bottlenecks gossipsub mesh formation past ~8 validators
     // because followers only know about v0 until they see
     // gossipsub heartbeats from peers that v0 forwards a message
@@ -425,12 +480,22 @@ async fn multi_validator_localnet_finalises_chunk_zero_over_real_libp2p() {
         }
     }
 
+    for h in &mut handles {
+        let rx = h.event_rx.as_mut().expect("event_rx still attached");
+        let peers = wait_for_peer_count(rx, usize::from(N_VALIDATORS - 1)).await;
+        assert_eq!(
+            peers.len(),
+            usize::from(N_VALIDATORS - 1),
+            "node did not connect to the full localnet peer mesh"
+        );
+    }
+
     // Permanent driver tasks consume each handle's NetworkEvent
     // receiver and forward gossip events into the matching
     // ChainBackend method. We attach them after the dials so the
     // dial commands aren't racing gossip ingestion for the engine
     // mutex. The tasks run for the full duration of the test;
-    // dropping their `JoinHandle`s here is intentional — the
+    // dropping their `JoinHandle`s here is intentional; the
     // Tokio runtime will reap them on drop after the assertion
     // finishes.
     for h in &mut handles {
@@ -439,11 +504,18 @@ async fn multi_validator_localnet_finalises_chunk_zero_over_real_libp2p() {
         // its JoinHandle is dropped on purpose so the runtime reaps
         // it once the assertion below completes and the test
         // function returns.
-        drop(spawn_handle_driver(Arc::clone(&h.backend), rx));
+        drop(spawn_handle_driver(
+            Arc::clone(&h.backend),
+            h.cmd_tx.clone(),
+            rx,
+        ));
     }
 
-    // Subscribe every node to every BFT topic. With vote_subnets=4
-    // that's 10 topics × 16 nodes = 160 Subscribe commands.
+    // Subscribe every node to every BFT topic after the full mesh is
+    // established, so gossipsub announces the subscriptions to all
+    // connected peers before v0 publishes the first block. With
+    // vote_subnets=4 that's 10 topics × 16 nodes = 160 Subscribe
+    // commands.
     let topics = all_bft_topics();
     for h in &handles {
         subscribe_all(h, &topics).await;
@@ -451,9 +523,9 @@ async fn multi_validator_localnet_finalises_chunk_zero_over_real_libp2p() {
     // Allow gossipsub meshes to form across all peers. Larger
     // networks need a longer settle window than the 2-validator
     // case because gossipsub heartbeats (1 second each) discover
-    // peers across topics one round at a time; 5 seconds is the
-    // empirical comfort zone for the 12-node full-mesh topology
-    // on localhost.
+    // peers across topics one round at a time; 5 seconds gives the
+    // 16-node full-mesh topology several heartbeat rounds before the
+    // first publish.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // v0 produces, proves, and gossips block 1, then opens its

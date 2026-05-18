@@ -1519,9 +1519,8 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
 
     // Global ceiling matches the largest per-topic limit (blocks @ 8 MiB).
     // Per-topic caps tighten this further below.
-    let global_max = Topic::STATIC
-        .iter()
-        .map(|t| t.max_transmit_size())
+    let global_max = Topic::all_default()
+        .map(Topic::max_transmit_size)
         .max()
         .unwrap_or(1024 * 1024);
 
@@ -1544,7 +1543,7 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
         // never gets graylisted.
         .validate_messages();
 
-    for topic in Topic::STATIC {
+    for topic in Topic::all_default() {
         builder.set_topic_max_transmit_size(topic.to_ident().hash(), topic.max_transmit_size());
     }
 
@@ -1574,16 +1573,23 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
 /// within a small number of `Reject` verdicts.
 fn build_peer_score_config() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     let mut topics: HashMap<libp2p::gossipsub::TopicHash, gossipsub::TopicScoreParams> =
         HashMap::new();
-    for topic in Topic::STATIC {
+    for topic in Topic::all_default() {
         topics.insert(topic.to_ident().hash(), build_topic_score_params());
     }
 
     let params = gossipsub::PeerScoreParams {
         topics,
         topic_score_cap: 32.0,
+        ip_colocation_factor_whitelist: [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]
+        .into_iter()
+        .collect(),
         behaviour_penalty_weight: -10.0,
         behaviour_penalty_threshold: 6.0,
         behaviour_penalty_decay: 0.5,
@@ -1802,7 +1808,9 @@ fn parse_topic(s: &str) -> Option<Topic> {
     let suffix = "/borsh/1";
     if let Some(rest) = s.strip_prefix(prefix) {
         if let Some(idx_str) = rest.strip_suffix(suffix) {
-            if let Ok(idx) = idx_str.parse::<u8>() {
+            if let Ok(idx) = idx_str.parse::<u8>()
+                && Topic::valid_aggregate_subnet(idx)
+            {
                 return Some(Topic::AggregateFinalityVotes(idx));
             }
         }
@@ -1833,6 +1841,10 @@ mod tests {
             let topic = Topic::AggregateFinalityVotes(subnet);
             assert_eq!(parse_topic(&topic.protocol_string()), Some(topic));
         }
+        assert_eq!(
+            parse_topic(&Topic::AggregateFinalityVotes(16).protocol_string()),
+            None
+        );
         assert_eq!(parse_topic("/neutrino/garbage/borsh/1"), None);
     }
 

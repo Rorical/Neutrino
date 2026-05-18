@@ -15,6 +15,7 @@ default = ["std"]
 std = ["neutrino-consensus-types/std", "neutrino-crypto", "neutrino-primitives/std"]
 
 [dependencies]
+borsh                    = { workspace = true }
 neutrino-consensus-types = { workspace = true }
 neutrino-crypto          = { workspace = true, optional = true }
 neutrino-primitives      = { workspace = true }

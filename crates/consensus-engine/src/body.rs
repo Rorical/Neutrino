@@ -44,6 +44,8 @@ pub enum BodyEncodeError {
         /// Referenced validator index.
         index: u32,
     },
+    /// A slashing evidence variant has no verified runtime application path yet.
+    UnsupportedSlashingVariant,
 }
 
 impl core::fmt::Display for BodyEncodeError {
@@ -59,6 +61,9 @@ impl core::fmt::Display for BodyEncodeError {
                     f,
                     "voluntary exit references unknown validator index {index}"
                 )
+            }
+            Self::UnsupportedSlashingVariant => {
+                f.write_str("slashing evidence variant is not supported by the runtime encoder")
             }
         }
     }
@@ -142,9 +147,7 @@ fn runtime_transactions(
         txs.push(encode_exit(exit, active_validators)?);
     }
     for evidence in &body.slashings {
-        if let Some(tx) = encode_slashing(evidence, active_validators)? {
-            txs.push(tx);
-        }
+        txs.push(encode_slashing(evidence, active_validators)?);
     }
     Ok(txs)
 }
@@ -182,15 +185,10 @@ fn encode_exit(
 /// resolving the offender's index against the active validator set
 /// and emitting `[0x05] || validator.pubkey`.
 ///
-/// Returns `Ok(None)` for variants the M7-D.1 runtime does not yet
-/// apply (`LockViolation`, `InvalidProofSigning`,
-/// `LongRangeForkParticipation`, `DaCommitmentFraud`); those will
-/// surface as runtime transactions when the corresponding engine
-/// detectors land in later M7-D slices.
 fn encode_slashing(
     evidence: &SlashingEvidence,
     active_validators: &[Validator],
-) -> Result<Option<Vec<u8>>, BodyEncodeError> {
+) -> Result<Vec<u8>, BodyEncodeError> {
     let offender_index: ValidatorIndex = match evidence {
         SlashingEvidence::DoubleProposal { proposer_index, .. }
         | SlashingEvidence::InvalidVrfClaim { proposer_index, .. } => *proposer_index,
@@ -205,7 +203,9 @@ fn encode_slashing(
         } => *validator_index,
         SlashingEvidence::InvalidProofSigning { .. }
         | SlashingEvidence::LongRangeForkParticipation { .. }
-        | SlashingEvidence::DaCommitmentFraud { .. } => return Ok(None),
+        | SlashingEvidence::DaCommitmentFraud { .. } => {
+            return Err(BodyEncodeError::UnsupportedSlashingVariant);
+        }
     };
     let position =
         usize::try_from(offender_index).map_err(|_| BodyEncodeError::UnknownValidatorIndex {
@@ -220,7 +220,7 @@ fn encode_slashing(
     let mut tx = Vec::with_capacity(1 + validator.pubkey.len());
     tx.push(TX_SLASH);
     tx.extend_from_slice(&validator.pubkey);
-    Ok(Some(tx))
+    Ok(tx)
 }
 
 /// Five header-level Merkle roots committed by the [`Header`].
@@ -592,8 +592,9 @@ mod tests {
     }
 
     #[test]
-    fn encode_runtime_body_skips_remaining_unsupported_slashing_variants() {
+    fn encode_runtime_body_rejects_unsupported_slashing_variants() {
         use neutrino_consensus_types::{BlockProofRejection, DaFraudProof, ProofRejectionReason};
+        use neutrino_primitives::{Checkpoint, ZERO_HASH};
         let active = vec![Validator {
             pubkey: [0x11; 48],
             withdrawal_credentials: [0; 32],
@@ -615,6 +616,23 @@ mod tests {
                         reason: ProofRejectionReason::VerifierRejected,
                     },
                 },
+                SlashingEvidence::LongRangeForkParticipation {
+                    validator_index: 0,
+                    vote: sample_indexed_vote(0xDD),
+                    canonical_finalized_chunk: Checkpoint {
+                        chain_id: 1,
+                        index: 0,
+                        start_height: 0,
+                        end_height: 0,
+                        start_block_hash: ZERO_HASH,
+                        end_block_hash: ZERO_HASH,
+                        start_state_root: ZERO_HASH,
+                        end_state_root: ZERO_HASH,
+                        end_validator_set_root: ZERO_HASH,
+                        history_root: ZERO_HASH,
+                        proof_system_version: 1,
+                    },
+                },
                 SlashingEvidence::DaCommitmentFraud {
                     proposer_index: 0,
                     header: sample_header(0),
@@ -629,13 +647,12 @@ mod tests {
             ..Body::default()
         };
 
-        // Two unsupported variants (InvalidProofSigning,
-        // DaCommitmentFraud) remain skipped pending later M7
-        // slices; the runtime payload stays empty.
-        let encoded = encode_runtime_body_with_validators(&body, &active).expect("encode");
         assert!(
-            encoded.is_empty(),
-            "unsupported slashing variants must not surface as runtime transactions"
+            matches!(
+                encode_runtime_body_with_validators(&body, &active),
+                Err(BodyEncodeError::UnsupportedSlashingVariant)
+            ),
+            "unsupported slashing variants must not silently diverge from runtime effects"
         );
     }
 

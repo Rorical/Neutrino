@@ -540,9 +540,11 @@ impl SyncMachine {
             // Reached the peer's reported finalized cursor.
             match self.mode {
                 SyncMode::LightClient => self.enter_following(),
-                SyncMode::Snap | SyncMode::Archive => {
-                    self.advance_to_header_backfill(new_finalized_height)
-                }
+                SyncMode::Snap | SyncMode::Archive => self.advance_to_header_backfill(
+                    self.sync_peer.map_or(new_finalized_height, |sync_peer| {
+                        sync_peer.status.head_height.max(new_finalized_height)
+                    }),
+                ),
             }
         } else {
             // Need more checkpoints.
@@ -743,11 +745,12 @@ impl SyncMachine {
 
     fn enter_following(&mut self) -> Vec<SyncCommand> {
         self.state = SyncState::Following;
-        let mut cmds: Vec<SyncCommand> = Topic::STATIC
-            .iter()
-            .copied()
-            .map(SyncCommand::Subscribe)
-            .collect();
+        let mut cmds: Vec<SyncCommand> = match self.mode {
+            SyncMode::LightClient => vec![SyncCommand::Subscribe(Topic::Checkpoints)],
+            SyncMode::Snap | SyncMode::Archive => {
+                Topic::all_default().map(SyncCommand::Subscribe).collect()
+            }
+        };
         cmds.push(SyncCommand::EnterFollowing);
         cmds
     }
@@ -796,6 +799,15 @@ impl SyncMachine {
                     count: self.batch_sizes.block_batch,
                 }]
             }
+            (SyncState::StateFetch { target_state_root }, RpcProtocol::StateByRoot) => {
+                let target_state_root = *target_state_root;
+                self.state = SyncState::StateFetch { target_state_root };
+                vec![SyncCommand::RequestStateNodes {
+                    peer,
+                    state_root: target_state_root,
+                    paths: vec![Vec::new()],
+                }]
+            }
             (
                 SyncState::ProofBackfill {
                     from_height,
@@ -814,6 +826,26 @@ impl SyncMachine {
                     peer,
                     start_height: from,
                     count: self.batch_sizes.block_proof_batch,
+                }]
+            }
+            (
+                SyncState::BodyBackfill {
+                    from_height,
+                    target_height,
+                    ..
+                },
+                RpcProtocol::BlocksByRange,
+            ) => {
+                let (from, target) = (*from_height, *target_height);
+                self.state = SyncState::BodyBackfill {
+                    from_height: from,
+                    target_height: target,
+                    in_flight: false,
+                };
+                vec![SyncCommand::RequestBlocks {
+                    peer,
+                    start_height: from,
+                    count: self.batch_sizes.block_batch,
                 }]
             }
             _ => Vec::new(),
@@ -975,6 +1007,39 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_backfill_targets_peer_live_head_after_finalized_cursor() {
+        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
+        let peer = pid();
+        fsm.on_event(SyncEvent::PeerStatus {
+            peer,
+            status: peer_status(7, 2, 300),
+        });
+
+        let cmds = fsm.on_event(SyncEvent::CheckpointsAdvanced {
+            new_finalized_index: 2,
+            new_finalized_hash: [2; 32],
+            new_finalized_state_root: [2; 32],
+            new_finalized_height: 256,
+            new_finalized_block_hash: [2; 32],
+        });
+
+        match fsm.state() {
+            SyncState::HeaderBackfill { target_height, .. } => {
+                assert_eq!(*target_height, 300);
+            }
+            other => panic!("expected HeaderBackfill, got {other:?}"),
+        }
+        assert_eq!(
+            cmds,
+            vec![SyncCommand::RequestBlocks {
+                peer,
+                start_height: 1,
+                count: 16,
+            }]
+        );
+    }
+
+    #[test]
     fn checkpoint_backfill_completes_for_light_client() {
         let mut fsm = SyncMachine::new(SyncMode::LightClient, fresh_progress(7));
         let peer = pid();
@@ -1002,6 +1067,7 @@ mod tests {
                 // Final batch — LightClient goes straight to Following.
                 assert!(matches!(fsm.state(), SyncState::Following));
                 assert!(cmds.contains(&SyncCommand::EnterFollowing));
+                assert!(!cmds.contains(&SyncCommand::Subscribe(Topic::Blocks)));
             }
         }
     }
@@ -1168,6 +1234,56 @@ mod tests {
         match fsm.state() {
             SyncState::CheckpointBackfill { in_flight, .. } => assert!(!in_flight),
             other => panic!("expected CheckpointBackfill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_fetch_rpc_failure_retries_root_request() {
+        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
+        let peer = pid();
+        fsm.state = SyncState::StateFetch {
+            target_state_root: [9; 32],
+        };
+        let cmds = fsm.on_event(SyncEvent::RpcFailed {
+            protocol: RpcProtocol::StateByRoot,
+            peer,
+            error: "timeout".to_owned(),
+        });
+        assert_eq!(
+            cmds,
+            vec![SyncCommand::RequestStateNodes {
+                peer,
+                state_root: [9; 32],
+                paths: vec![Vec::new()],
+            }]
+        );
+    }
+
+    #[test]
+    fn body_backfill_rpc_failure_retries_body_batch() {
+        let mut fsm = SyncMachine::new(SyncMode::Archive, fresh_progress(7));
+        let peer = pid();
+        fsm.state = SyncState::BodyBackfill {
+            from_height: 17,
+            target_height: 32,
+            in_flight: true,
+        };
+        let cmds = fsm.on_event(SyncEvent::RpcFailed {
+            protocol: RpcProtocol::BlocksByRange,
+            peer,
+            error: "timeout".to_owned(),
+        });
+        assert_eq!(
+            cmds,
+            vec![SyncCommand::RequestBlocks {
+                peer,
+                start_height: 17,
+                count: 16,
+            }]
+        );
+        match fsm.state() {
+            SyncState::BodyBackfill { in_flight, .. } => assert!(!in_flight),
+            other => panic!("expected BodyBackfill, got {other:?}"),
         }
     }
 

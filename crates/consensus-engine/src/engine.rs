@@ -703,17 +703,22 @@ impl<DB: Database> Engine<DB> {
                 validator_index,
                 vote_a,
                 vote_b,
-                ..
+                lock_evidence,
             } => verify_lock_violation_evidence(
                 *validator_index,
                 vote_a,
                 vote_b,
+                lock_evidence,
                 self.active_validator_set(),
                 self.chain_spec().chain_id,
+                (
+                    self.chain_spec().consensus.bft_prevote_quorum_numerator,
+                    self.chain_spec().consensus.bft_prevote_quorum_denominator,
+                ),
             ),
             // InvalidProofSigning / LongRangeForkParticipation /
-            // DaCommitmentFraud require engine state that lands in
-            // later M7 slices.
+            // DaCommitmentFraud require invalid-proof, fork-choice,
+            // or DA-ingest state this engine does not maintain yet.
             _ => Err(SlashingError::UnsupportedVariant),
         }
     }

@@ -253,10 +253,11 @@ async fn detects_double_prevote_from_two_partial_votes() {
 }
 
 #[tokio::test]
-async fn detects_lock_violation_across_rounds() {
-    // Same validator precommits two different chunk hashes for the
-    // same chunk_id but in different rounds → LockViolation. M7-D.2
-    // attribution: vote_a (the lock) is the earlier round.
+async fn pair_only_cross_round_precommits_do_not_create_lock_violation() {
+    // Same-validator cross-round precommit pairs are not enough by
+    // themselves to prove a Tendermint lock violation: the evidence
+    // also needs a real locked prevote quorum and no valid unlock
+    // quorum. Pair-only detection would falsely slash honest unlocks.
     let backend = fresh_backend();
     let v1 = proposer(1);
 
@@ -268,26 +269,9 @@ async fn detects_lock_violation_across_rounds() {
     backend.ingest_finality_vote(violation).await;
     assert_eq!(
         backend.slashing_pool_len(),
-        1,
-        "cross-round precommit with different chunk hash must trigger LockViolation"
+        0,
+        "cross-round precommit pairs without lock evidence must not be slashable"
     );
-    let drained = backend.drain_slashing_pool(10);
-    match drained.as_slice() {
-        [
-            SlashingEvidence::LockViolation {
-                validator_index,
-                vote_a,
-                vote_b,
-                ..
-            },
-        ] => {
-            assert_eq!(*validator_index, 1);
-            assert_eq!(vote_a.data.round, 0);
-            assert_eq!(vote_b.data.round, 1);
-            assert_ne!(vote_a.data.chunk_hash, vote_b.data.chunk_hash);
-        }
-        other => panic!("expected single LockViolation, got {other:?}"),
-    }
 }
 
 #[tokio::test]

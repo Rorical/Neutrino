@@ -486,6 +486,7 @@ impl<DB: Database> Engine<DB> {
         }
 
         let mut bft = ChunkBft::with_quorum(
+            self.chain_spec().chain_id,
             chunk.clone(),
             0,
             active_set.clone(),

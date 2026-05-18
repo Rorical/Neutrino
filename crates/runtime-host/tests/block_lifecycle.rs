@@ -1540,6 +1540,29 @@ fn make_slash_txn(bls_pk: BlsPublicKey) -> Vec<u8> {
 }
 
 #[test]
+fn runtime_rejects_control_transactions_with_trailing_bytes() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping control-shape validation test.");
+        return;
+    };
+
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+
+    let mut slash = make_slash_txn(bls_pk(0x41));
+    slash.push(0xFF);
+    let slash_validity = validate_transaction(&elf, &ctx, &slash, &mut overlay, 5_000_000)
+        .expect("slash validation returns");
+    assert_eq!(slash_validity.code, TxValidationCode::Malformed);
+
+    let mut leak = make_inactivity_leak_batch(0, &[bls_pk(0x42)]);
+    leak.push(0xFF);
+    let leak_validity = validate_transaction(&elf, &ctx, &leak, &mut overlay, 5_000_000)
+        .expect("leak validation returns");
+    assert_eq!(leak_validity.code, TxValidationCode::Malformed);
+}
+
+#[test]
 fn slash_transaction_decreases_stake_account_by_one_percent() {
     let Some(elf) = read_elf() else {
         eprintln!("{ELF_ENV} not set; skipping slash test.");
@@ -1789,6 +1812,59 @@ fn inactivity_leak_batch_is_idempotent_against_earlier_chunks() {
     assert_eq!(
         overlay.get(LEAK_THROUGH_KEY),
         Some(11u64.to_le_bytes().to_vec())
+    );
+}
+
+#[test]
+fn inactivity_leak_batch_is_idempotent_for_chunk_zero() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping chunk-zero inactivity-leak test.");
+        return;
+    };
+
+    let bls = bls_pk(0xD);
+    let body1 = body_from_txns(&[make_deposit_txn(bls, 1_000_000, [0u8; DEP_POP_LEN])]);
+    let mut overlay = Overlay::empty();
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(1, overlay.base_root()),
+        body1,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("deposit");
+
+    let body2 = body_from_txns(&[make_inactivity_leak_batch(0, &[bls])]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(2, overlay.base_root()),
+        body2,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("first chunk-zero leak");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(999_000, [0u8; 32]))
+    );
+
+    let body3 = body_from_txns(&[make_inactivity_leak_batch(0, &[bls])]);
+    let _ = run_block(
+        &elf,
+        &make_block_ctx(3, overlay.base_root()),
+        body3,
+        &mut overlay,
+        5_000_000,
+    )
+    .expect("duplicate chunk-zero leak");
+    assert_eq!(
+        overlay.get(&stk_key(&bls)),
+        Some(make_stake_value(999_000, [0u8; 32])),
+        "duplicate chunk-zero leak must be a no-op"
+    );
+    assert_eq!(
+        overlay.get(LEAK_THROUGH_KEY),
+        Some(0u64.to_le_bytes().to_vec())
     );
 }
 

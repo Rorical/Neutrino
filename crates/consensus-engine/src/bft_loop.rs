@@ -331,6 +331,7 @@ impl<DB: Database> Engine<DB> {
         }
         let consensus = &self.chain_spec().consensus;
         let bft = ChunkBft::with_quorum(
+            self.chain_spec().chain_id,
             chunk,
             0,
             active_set,

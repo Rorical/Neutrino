@@ -8,11 +8,13 @@
 //! - [`SlashingEvidence::DoublePrecommit`]
 //! - [`SlashingEvidence::InvalidVrfClaim`]
 //!
-//! The remaining four — `LockViolation`, `InvalidProofSigning`,
-//! `LongRangeForkParticipation`, `DaCommitmentFraud` — depend on
-//! state the engine does not yet maintain (lock state machine,
-//! invalid-proof markers, long-range fork-choice integration, DA
-//! bundle ingest) and will land in later M7 slices.
+//! Fully-formed [`SlashingEvidence::LockViolation`] can be verified
+//! when it carries a real lock quorum, but the live detector does not
+//! synthesize lock evidence from precommit pairs alone. The remaining
+//! three, `InvalidProofSigning`, `LongRangeForkParticipation`, and
+//! `DaCommitmentFraud`, depend on state the engine does not yet
+//! maintain: invalid-proof markers, long-range fork-choice
+//! integration, and DA bundle ingest.
 //!
 //! Detection vs. verification:
 //!
@@ -24,12 +26,13 @@
 //! * **Verification** re-runs the cryptographic checks every
 //!   accepting node must independently apply to gossiped evidence:
 //!   for `DoubleProposal` both header signatures verify under the
-//!   proposer's BLS public key, for `Double{Pre,Pre}vote` both
-//!   per-validator BLS signatures verify under the validator's BLS
-//!   public key, and for `InvalidVrfClaim` the header proposer
-//!   signature verifies but the VRF claim re-derived from the
-//!   active validator set + finalized seed fails for the carried
-//!   reason.
+//!   proposer's BLS public key, for `DoublePrevote` and
+//!   `DoublePrecommit` both per-validator BLS signatures verify under
+//!   the validator's BLS public key, for `LockViolation` a real locked
+//!   prevote quorum is verified before the conflicting precommits, and
+//!   for `InvalidVrfClaim` the header proposer signature verifies but
+//!   the VRF claim re-derived from the active validator set + finalized
+//!   seed fails for the carried reason.
 //!
 //! All evidence variants carry full headers / votes so a replaying
 //! node can independently re-verify them without needing the
@@ -40,8 +43,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use neutrino_consensus_types::{
-    AggregatedVote, FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedVote,
-    LockEvidence, QuorumCertificate, SlashingEvidence, VrfRejectionReason,
+    FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedVote, LockEvidence,
+    QuorumCertificate, SlashingEvidence, VrfRejectionReason,
 };
 use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
 use neutrino_crypto::bls::{PublicKey, Signature};
@@ -69,17 +72,6 @@ pub struct SlashingMonitor {
     /// `(validator_index, chunk_id, round, phase) → vote` previously
     /// accepted from a single-signer aggregation bit set.
     seen_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedVote>,
-    /// `(validator_index, chunk_id) → first_seen_precommit`.
-    ///
-    /// Used to detect [`SlashingEvidence::LockViolation`]: a
-    /// validator precommitting two different chunk hashes for the
-    /// same chunk id across different rounds violates the
-    /// Tendermint lock rule from docs/design/02-consensus.md §2.5
-    /// step 4 — switching from a locked chunk to a different one
-    /// requires observing (and ideally carrying) a higher-round
-    /// polka cert for the new hash, which honest validators always
-    /// gossip.
-    first_precommit_per_chunk: BTreeMap<(ValidatorIndex, ChunkId), IndexedVote>,
 }
 
 impl SlashingMonitor {
@@ -118,23 +110,14 @@ impl SlashingMonitor {
 
     /// Record a single-signer indexed vote.
     ///
-    /// Returns evidence under three rules, checked in order:
+    /// Returns evidence under two rules, checked in order:
     ///
-    /// 1. **Same-round equivocation** — a validator that has already
+    /// 1. **Same-round equivocation** - a validator that has already
     ///    been observed voting for a *different* `chunk_hash` at the
     ///    exact same `(chunk_id, round, phase)` produces
     ///    [`SlashingEvidence::DoublePrevote`] /
     ///    [`SlashingEvidence::DoublePrecommit`].
-    /// 2. **Cross-round lock violation** (precommits only) — a
-    ///    validator precommitting a different `chunk_hash` for the
-    ///    same `chunk_id` at a *different round* than a prior
-    ///    precommit produces
-    ///    [`SlashingEvidence::LockViolation`]. The earlier-round
-    ///    precommit is always slotted into `vote_a` (the lock) and
-    ///    the later-round one into `vote_b` (the violation) so
-    ///    the evidence shape is canonical regardless of arrival
-    ///    order.
-    /// 3. **No equivocation** — exact-duplicate or same-hash votes
+    /// 2. **No equivocation** - exact-duplicate or same-hash votes
     ///    return `None`. The vote is still recorded for future
     ///    equivocation lookups.
     ///
@@ -171,34 +154,6 @@ impl SlashingMonitor {
         }
         self.seen_votes.insert(key, vote.clone());
 
-        // M7-D.2 cross-round lock-violation detection. Only fires for
-        // precommits, only when the prior precommit on this chunk
-        // used a different chunk_hash, and only when the rounds
-        // differ (same-round, different-hash already short-circuited
-        // through the DoublePrecommit branch above).
-        if vote.data.phase == FinalityVotePhase::Precommit {
-            let chunk_key = (validator_index, vote.data.chunk_id);
-            if let Some(earlier) = self.first_precommit_per_chunk.get(&chunk_key) {
-                if earlier.data.chunk_hash != vote.data.chunk_hash
-                    && earlier.data.round != vote.data.round
-                {
-                    let (lock, violation) = if earlier.data.round < vote.data.round {
-                        (earlier.clone(), vote.clone())
-                    } else {
-                        (vote.clone(), earlier.clone())
-                    };
-                    return Some(SlashingEvidence::LockViolation {
-                        validator_index,
-                        vote_a: lock.clone(),
-                        vote_b: violation,
-                        lock_evidence: lock_evidence_from_locked_precommit(&lock),
-                    });
-                }
-            } else {
-                self.first_precommit_per_chunk
-                    .insert(chunk_key, vote.clone());
-            }
-        }
         None
     }
 
@@ -278,7 +233,7 @@ pub fn extract_single_signer(
 /// [`SlashingEvidence::InvalidVrfClaim`].
 ///
 /// Returns `None` for errors that are not objectively slashable
-/// (e.g. a slashed validator was the proposer index — that's
+/// (e.g. a slashed validator was the proposer index; that's
 /// already accounted for at the validator-set layer).
 #[must_use]
 pub const fn vrf_rejection_reason(err: &VrfError) -> Option<VrfRejectionReason> {
@@ -309,14 +264,14 @@ pub enum SlashingError {
     /// A signature in the evidence does not verify against the
     /// validator's BLS public key.
     BadSignature,
-    /// Both artifacts in the evidence are byte-for-byte identical —
+    /// Both artifacts in the evidence are byte-for-byte identical;
     /// there is no equivocation to slash.
     NotEquivocating,
     /// Two artifacts disagree on a field that must match for the
     /// evidence to be coherent (different proposer indices, different
     /// slots, different chunk ids, etc.).
     EvidenceFieldsInconsistent,
-    /// The VRF claim in the evidence actually verifies — the
+    /// The VRF claim in the evidence actually verifies; the
     /// proposer's claim was valid.
     VrfClaimVerifies,
     /// The carried `VrfRejectionReason` does not match what
@@ -392,44 +347,17 @@ pub fn verify_double_proposal_evidence(
     Ok(())
 }
 
-/// Build a [`LockEvidence`] surface from the locked precommit.
-///
-/// M7-D.2 emits a *minimal* lock evidence: the prevote-equivalent
-/// of the locked precommit's vote data, with an empty
-/// [`AggregatedVote`]. Verification only re-checks the two
-/// precommit signatures and the canonical "different chunk hash at
-/// different round on the same chunk_id" invariant — the embedded
-/// QC bits are placeholder. The full polka cert + unlock cert
-/// surface is preserved in the wire type for the post-M7 detector
-/// that enforces the carry-the-polka-cert protocol rule.
-fn lock_evidence_from_locked_precommit(locked_precommit: &IndexedVote) -> LockEvidence {
-    LockEvidence {
-        locked_prevote_quorum: QuorumCertificate {
-            data: FinalityVoteData {
-                chunk_id: locked_precommit.data.chunk_id,
-                round: locked_precommit.data.round,
-                chunk_hash: locked_precommit.data.chunk_hash,
-                phase: FinalityVotePhase::Prevote,
-            },
-            aggregate: AggregatedVote {
-                aggregation_bits: neutrino_primitives::BitVec::default(),
-                signature: [0; 96],
-            },
-        },
-        claimed_unlock_quorum: None,
-    }
-}
-
 /// Verify a [`SlashingEvidence::LockViolation`].
 ///
-/// Both votes must be precommits from the same validator on the
-/// same `chunk_id`, with different rounds, different chunk hashes,
-/// and valid per-validator signatures.
+/// Both votes must be precommits from the same validator on the same
+/// `chunk_id`, with different rounds, different chunk hashes, valid
+/// per-validator signatures, and a carried [`LockEvidence`] whose
+/// locked prevote quorum matches `vote_a` and satisfies
+/// `prevote_quorum` against `active_set`.
 ///
-/// The carried [`LockEvidence`] surface is **not** cross-checked
-/// against an external polka cert at this milestone; M7's
-/// objective slashing rule only requires that the validator's two
-/// own precommit signatures both verify and that they conflict.
+/// If the evidence carries a valid higher-round prevote quorum for
+/// `vote_b`'s chunk hash, the precommit switch is treated as an honest
+/// unlock rather than a slashable lock violation.
 ///
 /// # Errors
 ///
@@ -438,8 +366,10 @@ pub fn verify_lock_violation_evidence(
     validator_index: ValidatorIndex,
     vote_a: &IndexedVote,
     vote_b: &IndexedVote,
+    lock_evidence: &LockEvidence,
     active_set: &[Validator],
     chain_id: ChainId,
+    prevote_quorum: (u64, u64),
 ) -> Result<(), SlashingError> {
     if vote_a.data.phase != FinalityVotePhase::Precommit
         || vote_b.data.phase != FinalityVotePhase::Precommit
@@ -457,9 +387,103 @@ pub fn verify_lock_violation_evidence(
     if vote_a.data.chunk_hash == vote_b.data.chunk_hash {
         return Err(SlashingError::NotEquivocating);
     }
+    verify_lock_quorum_matches_vote(
+        &lock_evidence.locked_prevote_quorum,
+        vote_a,
+        active_set,
+        chain_id,
+        prevote_quorum,
+    )?;
+    if let Some(unlock) = &lock_evidence.claimed_unlock_quorum
+        && unlock.data.phase == FinalityVotePhase::Prevote
+        && unlock.data.chunk_id == vote_a.data.chunk_id
+        && unlock.data.chunk_hash == vote_b.data.chunk_hash
+        && unlock.data.round > vote_a.data.round
+        && unlock.data.round <= vote_b.data.round
+        && verify_quorum_certificate(unlock, active_set, chain_id, prevote_quorum).is_ok()
+    {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
     verify_indexed_vote_signature(validator_index, vote_a, active_set, chain_id)?;
     verify_indexed_vote_signature(validator_index, vote_b, active_set, chain_id)?;
     Ok(())
+}
+
+fn verify_lock_quorum_matches_vote(
+    quorum: &QuorumCertificate,
+    locked_vote: &IndexedVote,
+    active_set: &[Validator],
+    chain_id: ChainId,
+    prevote_quorum: (u64, u64),
+) -> Result<(), SlashingError> {
+    if quorum.data.phase != FinalityVotePhase::Prevote
+        || quorum.data.chunk_id != locked_vote.data.chunk_id
+        || quorum.data.round != locked_vote.data.round
+        || quorum.data.chunk_hash != locked_vote.data.chunk_hash
+    {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    verify_quorum_certificate(quorum, active_set, chain_id, prevote_quorum)
+}
+
+fn verify_quorum_certificate(
+    quorum: &QuorumCertificate,
+    active_set: &[Validator],
+    chain_id: ChainId,
+    quorum_fraction: (u64, u64),
+) -> Result<(), SlashingError> {
+    if quorum.aggregate.aggregation_bits.bit_len()
+        != u32::try_from(active_set.len()).expect("active set length fits u32")
+    {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    let signature = Signature::from_bytes(&quorum.aggregate.signature)
+        .map_err(|_| SlashingError::InvalidSignatureBytes)?;
+    let mut total_stake = 0_u64;
+    let mut signed_stake = 0_u64;
+    let mut public_keys = Vec::new();
+    for (index, validator) in active_set.iter().enumerate() {
+        if !validator.slashed && validator.effective_stake != 0 {
+            total_stake = total_stake
+                .checked_add(validator.effective_stake)
+                .ok_or(SlashingError::EvidenceFieldsInconsistent)?;
+        }
+        let bit_index = u32::try_from(index).expect("active set length fits u32");
+        if quorum
+            .aggregate
+            .aggregation_bits
+            .get(bit_index)
+            .unwrap_or(false)
+        {
+            public_keys.push(PublicKey::from_bytes(&validator.pubkey).map_err(|_| {
+                SlashingError::InvalidPublicKey {
+                    index: u32::try_from(index).expect("active set length fits u32"),
+                }
+            })?);
+            if !validator.slashed && validator.effective_stake != 0 {
+                signed_stake = signed_stake
+                    .checked_add(validator.effective_stake)
+                    .ok_or(SlashingError::EvidenceFieldsInconsistent)?;
+            }
+        }
+    }
+    if total_stake == 0
+        || !quorum_reached(signed_stake, total_stake, quorum_fraction)
+        || public_keys.is_empty()
+    {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    let public_key_refs: Vec<&PublicKey> = public_keys.iter().collect();
+    let message = finality_vote_signed_message(chain_id, &quorum.data);
+    neutrino_crypto::bls::fast_aggregate_verify(&public_key_refs, &message, &signature)
+        .map_err(|_| SlashingError::BadSignature)
+}
+
+fn quorum_reached(stake: u64, total_stake: u64, (numerator, denominator): (u64, u64)) -> bool {
+    denominator != 0
+        && numerator != 0
+        && u128::from(stake) * u128::from(denominator)
+            >= u128::from(total_stake) * u128::from(numerator)
 }
 
 /// Verify a [`SlashingEvidence::DoublePrevote`] or
@@ -583,7 +607,8 @@ const fn map_signature_error(err: SignatureError) -> SlashingError {
 mod tests {
     use super::*;
     use crate::ProposerKey;
-    use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
+    use neutrino_consensus_types::{AggregatedVote, FinalityVoteData, FinalityVotePhase};
+    use neutrino_crypto::bls::{Signature, aggregate_signatures};
     use neutrino_primitives::{BitVec, BlsSignature, HEADER_VERSION, ZERO_HASH};
 
     const CHAIN_ID: ChainId = 7;
@@ -651,6 +676,49 @@ mod tests {
         };
         let signature: BlsSignature = signer.sign_finality_vote(CHAIN_ID, &data);
         IndexedVote { data, signature }
+    }
+
+    fn quorum_certificate_for_data(data: FinalityVoteData, signers: &[u8]) -> QuorumCertificate {
+        let signatures: Vec<Signature> = signers
+            .iter()
+            .map(|signer| {
+                let sig = proposer(*signer).sign_finality_vote(CHAIN_ID, &data);
+                Signature::from_bytes(&sig).expect("test signature decodes")
+            })
+            .collect();
+        let signature_refs: Vec<&Signature> = signatures.iter().collect();
+        let signature = aggregate_signatures(&signature_refs)
+            .expect("aggregate lock quorum signatures")
+            .to_bytes();
+        let mut aggregation_bits = BitVec::default();
+        let max_signer = signers.iter().copied().max().unwrap_or(0);
+        for index in 0..=max_signer {
+            aggregation_bits.push(signers.contains(&index));
+        }
+        QuorumCertificate {
+            data,
+            aggregate: AggregatedVote {
+                aggregation_bits,
+                signature,
+            },
+        }
+    }
+
+    fn quorum_certificate_for(vote: &IndexedVote, signers: &[u8]) -> QuorumCertificate {
+        quorum_certificate_for_data(
+            FinalityVoteData {
+                phase: FinalityVotePhase::Prevote,
+                ..vote.data.clone()
+            },
+            signers,
+        )
+    }
+
+    fn lock_evidence_for(vote: &IndexedVote, signers: &[u8]) -> LockEvidence {
+        LockEvidence {
+            locked_prevote_quorum: quorum_certificate_for(vote, signers),
+            claimed_unlock_quorum: None,
+        }
     }
 
     #[test]
@@ -905,53 +973,34 @@ mod tests {
     }
 
     #[test]
-    fn record_indexed_vote_detects_cross_round_lock_violation_for_precommits() {
+    fn record_indexed_vote_does_not_emit_pair_only_lock_violation() {
         let v1 = proposer(1);
         let mut monitor = SlashingMonitor::new();
         let precommit_r0 = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
         let precommit_r1_other = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
 
         assert!(monitor.record_indexed_vote(1, &precommit_r0).is_none());
-        let evidence = monitor
-            .record_indexed_vote(1, &precommit_r1_other)
-            .expect("cross-round lock violation");
-        match evidence {
-            SlashingEvidence::LockViolation {
-                validator_index,
-                vote_a,
-                vote_b,
-                ..
-            } => {
-                assert_eq!(validator_index, 1);
-                assert_eq!(vote_a.data.round, 0, "earlier round is the lock");
-                assert_eq!(vote_b.data.round, 1, "later round is the violation");
-            }
-            other => panic!("expected LockViolation, got {other:?}"),
-        }
+        assert!(
+            monitor
+                .record_indexed_vote(1, &precommit_r1_other)
+                .is_none(),
+            "cross-round precommit pairs need lock quorum evidence before they are slashable"
+        );
     }
 
     #[test]
-    fn record_indexed_vote_normalises_lock_violation_round_order_on_late_arrivals() {
-        // First-seen precommit happens to be the LATER round (e.g.
-        // out-of-order gossip); the detector must still slot the
-        // earlier round into vote_a so the evidence shape is
-        // canonical.
+    fn record_indexed_vote_does_not_emit_pair_only_lock_violation_on_late_arrivals() {
         let v1 = proposer(1);
         let mut monitor = SlashingMonitor::new();
         let precommit_r3 = signed_indexed_vote(7, 3, FinalityVotePhase::Precommit, 0xAA, &v1);
         let precommit_r0_other = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xBB, &v1);
 
         assert!(monitor.record_indexed_vote(1, &precommit_r3).is_none());
-        let evidence = monitor
-            .record_indexed_vote(1, &precommit_r0_other)
-            .expect("cross-round lock violation");
-        match evidence {
-            SlashingEvidence::LockViolation { vote_a, vote_b, .. } => {
-                assert_eq!(vote_a.data.round, 0);
-                assert_eq!(vote_b.data.round, 3);
-            }
-            other => panic!("expected LockViolation, got {other:?}"),
-        }
+        assert!(
+            monitor
+                .record_indexed_vote(1, &precommit_r0_other)
+                .is_none()
+        );
     }
 
     #[test]
@@ -986,8 +1035,79 @@ mod tests {
         let active_set = validators_with_keys(2);
         let lock = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
         let violation = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
-        verify_lock_violation_evidence(1, &lock, &violation, &active_set, CHAIN_ID)
-            .expect("genuine cross-round lock violation verifies");
+        let evidence = lock_evidence_for(&lock, &[0, 1]);
+        verify_lock_violation_evidence(
+            1,
+            &lock,
+            &violation,
+            &evidence,
+            &active_set,
+            CHAIN_ID,
+            (2, 3),
+        )
+        .expect("genuine cross-round lock violation verifies");
+    }
+
+    #[test]
+    fn verify_lock_violation_rejects_bad_lock_quorum_signature() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let lock = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let violation = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        let wrong_message = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xCC, &v1);
+        let mut evidence = LockEvidence {
+            locked_prevote_quorum: quorum_certificate_for(&wrong_message, &[0, 1]),
+            claimed_unlock_quorum: None,
+        };
+        evidence.locked_prevote_quorum.data = FinalityVoteData {
+            phase: FinalityVotePhase::Prevote,
+            ..lock.data
+        };
+
+        assert_eq!(
+            verify_lock_violation_evidence(
+                1,
+                &lock,
+                &violation,
+                &evidence,
+                &active_set,
+                CHAIN_ID,
+                (2, 3)
+            ),
+            Err(SlashingError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn verify_lock_violation_rejects_valid_unlock_quorum() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let lock = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let violation = signed_indexed_vote(7, 2, FinalityVotePhase::Precommit, 0xBB, &v1);
+        let unlock = quorum_certificate_for_data(
+            FinalityVoteData {
+                chunk_id: violation.data.chunk_id,
+                round: 1,
+                chunk_hash: violation.data.chunk_hash,
+                phase: FinalityVotePhase::Prevote,
+            },
+            &[0, 1],
+        );
+        let mut evidence = lock_evidence_for(&lock, &[0, 1]);
+        evidence.claimed_unlock_quorum = Some(unlock);
+
+        assert_eq!(
+            verify_lock_violation_evidence(
+                1,
+                &lock,
+                &violation,
+                &evidence,
+                &active_set,
+                CHAIN_ID,
+                (2, 3)
+            ),
+            Err(SlashingError::EvidenceFieldsInconsistent)
+        );
     }
 
     #[test]
@@ -996,14 +1116,31 @@ mod tests {
         let active_set = validators_with_keys(2);
         let a = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
         let b_same_round = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xBB, &v1);
+        let evidence = lock_evidence_for(&a, &[0, 1]);
         assert_eq!(
-            verify_lock_violation_evidence(1, &a, &b_same_round, &active_set, CHAIN_ID),
+            verify_lock_violation_evidence(
+                1,
+                &a,
+                &b_same_round,
+                &evidence,
+                &active_set,
+                CHAIN_ID,
+                (2, 3)
+            ),
             Err(SlashingError::EvidenceFieldsInconsistent),
             "same round + different hash is DoublePrecommit territory, not LockViolation"
         );
         let b_same_hash = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xAA, &v1);
         assert_eq!(
-            verify_lock_violation_evidence(1, &a, &b_same_hash, &active_set, CHAIN_ID),
+            verify_lock_violation_evidence(
+                1,
+                &a,
+                &b_same_hash,
+                &evidence,
+                &active_set,
+                CHAIN_ID,
+                (2, 3)
+            ),
             Err(SlashingError::NotEquivocating)
         );
     }
@@ -1014,8 +1151,17 @@ mod tests {
         let active_set = validators_with_keys(2);
         let prevote = signed_indexed_vote(7, 0, FinalityVotePhase::Prevote, 0xAA, &v1);
         let precommit = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        let evidence = lock_evidence_for(&precommit, &[0, 1]);
         assert_eq!(
-            verify_lock_violation_evidence(1, &prevote, &precommit, &active_set, CHAIN_ID),
+            verify_lock_violation_evidence(
+                1,
+                &prevote,
+                &precommit,
+                &evidence,
+                &active_set,
+                CHAIN_ID,
+                (2, 3)
+            ),
             Err(SlashingError::EvidenceFieldsInconsistent),
             "LockViolation requires two precommits"
         );
@@ -1027,10 +1173,19 @@ mod tests {
         let active_set = validators_with_keys(2);
         let lock = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
         let violation = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        let evidence = lock_evidence_for(&lock, &[0, 1]);
         // Claim the offender is validator 0 but the signatures are
         // from validator 1.
         assert_eq!(
-            verify_lock_violation_evidence(0, &lock, &violation, &active_set, CHAIN_ID),
+            verify_lock_violation_evidence(
+                0,
+                &lock,
+                &violation,
+                &evidence,
+                &active_set,
+                CHAIN_ID,
+                (2, 3)
+            ),
             Err(SlashingError::BadSignature)
         );
     }

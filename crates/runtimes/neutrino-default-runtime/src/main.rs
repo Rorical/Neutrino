@@ -755,7 +755,7 @@ fn apply_exit(txn: &[u8]) {
 /// this transaction (see `Engine::verify_slashing_evidence`), so
 /// the runtime only checks wire shape.
 fn validate_slash(txn: &[u8]) -> TxValidationCode {
-    if txn.len() < SLASH_TX_LEN {
+    if txn.len() != SLASH_TX_LEN {
         return TxValidationCode::Malformed;
     }
     TxValidationCode::Valid
@@ -771,15 +771,14 @@ fn validate_inactivity_leak_batch(txn: &[u8]) -> TxValidationCode {
         return TxValidationCode::Malformed;
     }
     let expected = LEAK_HEADER_LEN.saturating_add((count as usize).saturating_mul(BLS_KEY_LEN));
-    if txn.len() < expected {
+    if txn.len() != expected {
         return TxValidationCode::Malformed;
     }
     TxValidationCode::Valid
 }
 
-/// Read the `leak:through` chunk-id pointer; missing pointer
-/// surfaces as `0` so the first ever leak (chunk 0) is permitted.
-fn read_leak_through() -> u64 {
+/// Read the `leak:through` chunk-id pointer.
+fn read_leak_through() -> Option<u64> {
     let mut value = [0u8; LEAK_THROUGH_LEN];
     let (status, _len) = syscalls::state_read(
         LEAK_THROUGH_KEY.as_ptr() as u32,
@@ -788,8 +787,8 @@ fn read_leak_through() -> u64 {
         LEAK_THROUGH_LEN as u32,
     );
     match status {
-        STATUS_OK => u64::from_le_bytes(value),
-        STATUS_NOT_FOUND => 0,
+        STATUS_OK => Some(u64::from_le_bytes(value)),
+        STATUS_NOT_FOUND => None,
         other => syscalls::abort(other),
     }
 }
@@ -814,7 +813,7 @@ fn write_leak_through(chunk_id: u64) {
 /// advances the pointer to `chunk_id`.
 fn apply_inactivity_leak_batch(txn: &[u8]) {
     let chunk_id = read_u64_le(txn, LEAK_CHUNK_ID_OFF);
-    if chunk_id != 0 && chunk_id <= read_leak_through() {
+    if read_leak_through().is_some_and(|through| chunk_id <= through) {
         return;
     }
     let count = read_u32_le(txn, LEAK_COUNT_OFF);

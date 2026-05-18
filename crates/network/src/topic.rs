@@ -9,6 +9,9 @@
 
 use core::fmt;
 
+/// Number of aggregate finality-vote subnets from doc 06.
+pub const VOTE_SUBNETS: u8 = 16;
+
 /// The set of canonical Neutrino gossip topics.
 ///
 /// Every variant maps to a stable, versioned protocol string. The mapping is
@@ -52,6 +55,19 @@ impl Topic {
         Self::FinalityVotesPrevote,
         Self::FinalityVotesPrecommit,
     ];
+
+    /// All default gossip topics, including the 16 aggregate-vote subnet topics.
+    pub fn all_default() -> impl Iterator<Item = Self> {
+        Self::STATIC
+            .into_iter()
+            .chain((0..VOTE_SUBNETS).map(Self::AggregateFinalityVotes))
+    }
+
+    /// Whether an aggregate finality-vote subnet is in the doc-06 default range.
+    #[must_use]
+    pub const fn valid_aggregate_subnet(subnet: u8) -> bool {
+        subnet < VOTE_SUBNETS
+    }
 
     /// Maximum permitted transmission size in bytes, per doc 06.
     ///
@@ -155,7 +171,7 @@ mod tests {
 
     #[test]
     fn static_topics_are_unique() {
-        let strings: Vec<_> = Topic::STATIC.iter().map(|t| t.protocol_string()).collect();
+        let strings: Vec<_> = Topic::all_default().map(Topic::protocol_string).collect();
         let mut sorted = strings.clone();
         sorted.sort();
         sorted.dedup();
@@ -176,5 +192,17 @@ mod tests {
         );
         assert_eq!(Topic::Transactions.max_transmit_size(), 128 * 1024);
         assert_eq!(Topic::SlashingEvidence.max_transmit_size(), 16 * 1024);
+    }
+
+    #[test]
+    fn default_topic_set_includes_all_aggregate_subnets() {
+        let topics: Vec<_> = Topic::all_default().collect();
+        assert!(topics.contains(&Topic::AggregateFinalityVotes(0)));
+        assert!(topics.contains(&Topic::AggregateFinalityVotes(15)));
+        assert!(!topics.contains(&Topic::AggregateFinalityVotes(16)));
+        assert_eq!(
+            topics.len(),
+            Topic::STATIC.len() + usize::from(VOTE_SUBNETS)
+        );
     }
 }

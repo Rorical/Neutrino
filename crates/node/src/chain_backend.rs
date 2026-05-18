@@ -595,7 +595,7 @@ where
         &self,
         block_hash: &BlockHash,
     ) -> Result<ProveOutcome, ProveError<DB::Error>> {
-        self.with_engine_mut(|e| e.prove_block(block_hash, &[], &self.proof_system))
+        self.with_engine_mut(|e| e.prove_block(block_hash, &self.proof_system))
     }
 
     /// Finalize chunk `chunk_id` against the local engine state.

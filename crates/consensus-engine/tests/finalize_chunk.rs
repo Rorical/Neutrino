@@ -119,7 +119,7 @@ fn produce_and_prove(
         .expect("produce ok")
         .expect("eligibility");
     engine
-        .prove_block(&produced.block_hash, &[], &proof_system)
+        .prove_block(&produced.block_hash, &proof_system)
         .expect("prove ok");
     produced.block_hash
 }
@@ -363,7 +363,7 @@ fn finalize_chunk_rejects_block_not_yet_proven() {
         .expect("produce ok")
         .expect("eligibility");
     engine
-        .prove_block(&first.block_hash, &[], &proof_system)
+        .prove_block(&first.block_hash, &proof_system)
         .expect("prove ok");
     for slot in 2..=TEST_CHUNK_SIZE {
         let cfg = ProductionConfig {

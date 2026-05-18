@@ -215,7 +215,7 @@ fn run_chain(elf: &[u8]) -> RunSummary {
                 .expect("validator should be elected");
             block_hashes.push(produced.block_hash);
             engine
-                .prove_block(&produced.block_hash, &[], &proof_system)
+                .prove_block(&produced.block_hash, &proof_system)
                 .expect("prove ok");
         }
 
@@ -270,7 +270,7 @@ fn produce_and_prove_with_fsm_checks(
     );
 
     let err = engine
-        .prove_block(&produced.block_hash, &[], &FailingBlockProofSystem)
+        .prove_block(&produced.block_hash, &FailingBlockProofSystem)
         .expect_err("failing prover leaves block pending");
     assert!(matches!(
         err,
@@ -285,7 +285,7 @@ fn produce_and_prove_with_fsm_checks(
     );
 
     engine
-        .prove_block(&produced.block_hash, &[], &proof_system)
+        .prove_block(&produced.block_hash, &proof_system)
         .expect("prove ok");
     assert_eq!(
         engine

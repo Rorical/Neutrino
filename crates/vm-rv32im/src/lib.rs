@@ -16,8 +16,6 @@ pub mod host;
 pub mod instruction;
 pub mod loader;
 pub mod memory;
-
-#[cfg(feature = "witness")]
 pub mod witness;
 
 /// Reason a VM execution halted normally.

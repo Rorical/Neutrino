@@ -273,6 +273,27 @@ impl<DB: Database> ChainStore<DB> {
         self.get_decoded(Column::FinalityCerts, &keys::chunk_id_key(chunk_id))
     }
 
+    // ---------- Witnesses ----------
+
+    /// Persist a block's execution witness keyed by block hash.
+    ///
+    /// `bytes` is the borsh-encoded
+    /// [`SealedWitness`](neutrino_vm_rv32im::witness::SealedWitness)
+    /// the runtime host produced during execution. The store does not
+    /// decode the bytes; it only round-trips them.
+    pub fn put_witness(
+        &mut self,
+        hash: &BlockHash,
+        bytes: &[u8],
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.put_raw(Column::Witnesses, &keys::hash_key(hash), bytes)
+    }
+
+    /// Read the borsh-encoded execution witness for `hash`, if any.
+    pub fn get_witness(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StoreError<DB::Error>> {
+        self.get_raw(Column::Witnesses, &keys::hash_key(hash))
+    }
+
     // ---------- Checkpoints ----------
 
     /// Persist `checkpoint` keyed by `checkpoint.index`.

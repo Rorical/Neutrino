@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use neutrino_primitives::StateRoot;
-use neutrino_trie::Trie;
+use neutrino_trie::{Proof, Trie};
 
 /// A single pending overlay mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +147,27 @@ impl Overlay {
             Some(OverlayEntry::Delete) => false,
             None => self.base.get(key).is_some(),
         }
+    }
+
+    /// Read `key` from the underlying base trie, ignoring any staged
+    /// mutations.
+    ///
+    /// Used by the witness recorder to capture the trie-anchored value
+    /// of every state-read syscall regardless of overlay shadowing.
+    #[must_use]
+    pub fn base_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.base.get(key)
+    }
+
+    /// Build an inclusion or exclusion proof for `key` against the
+    /// base trie's [`Overlay::base_root`].
+    ///
+    /// Like [`Overlay::base_get`] this bypasses staged overlay
+    /// mutations. The returned [`Proof`] verifies under
+    /// [`Overlay::base_root`] using the trie's selected hasher.
+    #[must_use]
+    pub fn base_prove(&self, key: &[u8]) -> Proof {
+        self.base.prove(key)
     }
 
     /// Stage a put. Overwrites a previously staged put or delete for

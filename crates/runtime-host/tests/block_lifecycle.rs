@@ -25,9 +25,10 @@ use neutrino_primitives::{
 use neutrino_proof_system::{BlockPublicInputs, MockProofSystem, ProofError, ProofSystem};
 use neutrino_runtime_abi::{BlockContext, QueryRequest, QueryStatus, TxValidationCode};
 use neutrino_runtime_host::{
-    BlockError, Overlay, QueryError, VALIDATOR_SET_KEY, run_block, run_query, validate_transaction,
+    BlockError, Overlay, QueryError, SealedWitness, VALIDATOR_SET_KEY, run_block, run_query,
+    validate_transaction,
 };
-use neutrino_trie::Trie;
+use neutrino_trie::{Blake3Hasher, Hasher, ProofOutcome, Trie};
 use rand::SeedableRng;
 
 const COUNTER_KEY: &[u8] = b"counter";
@@ -168,6 +169,116 @@ fn deterministic_replay_yields_same_state_root() {
     let r1 = run(1);
     let r2 = run(1);
     assert_eq!(r1, r2, "two identical blocks must produce the same root");
+}
+
+#[test]
+fn block_witness_records_state_reads_and_proofs_verify() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping witness pipeline test.");
+        return;
+    };
+
+    // Block 1 against an empty trie. Every state read must resolve to
+    // an exclusion proof against the empty root.
+    let mut overlay = Overlay::empty();
+    let root_before_b1 = overlay.base_root();
+    let ctx1 = make_block_ctx(1, root_before_b1);
+    let out1 = run_block(&elf, &ctx1, Vec::new(), &mut overlay, 5_000_000).expect("block 1");
+
+    assert_eq!(out1.witness.parent_state_root, root_before_b1);
+    assert_eq!(out1.witness.block_context.height, 1);
+    assert_eq!(out1.witness.block_context.proposer_index, 0);
+    for read in &out1.witness.state_reads {
+        assert!(
+            read.base_value.is_none(),
+            "block-1 reads must miss the empty base trie (key={:02x?})",
+            read.key
+        );
+        let outcome = read
+            .proof
+            .verify::<Blake3Hasher>(&root_before_b1, &read.key)
+            .expect("witness proof verifies against empty root");
+        assert_eq!(outcome, ProofOutcome::Excluded);
+    }
+
+    // Capture the trie after block 1 commits so we can reuse it as
+    // the witness verifier for block 2 *and* as the base for running
+    // block 2. The default runtime writes more than just the
+    // counter (validator-set accumulator, snapshot, etc.) so we
+    // cannot reconstruct the verifier trie from a synthetic insert.
+    let post_b1_trie: Trie = overlay.into_base();
+    let root_before_b2 = post_b1_trie.root();
+    assert_eq!(root_before_b2, out1.state_root_after);
+    let verifier_trie = post_b1_trie.clone();
+
+    let mut overlay2 = Overlay::new(post_b1_trie);
+    let ctx2 = make_block_ctx(2, root_before_b2);
+    let out2 = run_block(&elf, &ctx2, Vec::new(), &mut overlay2, 5_000_000).expect("block 2");
+
+    assert_eq!(out2.witness.parent_state_root, root_before_b2);
+    assert!(
+        !out2.witness.is_empty(),
+        "block 2 should record at least one state read (counter)"
+    );
+    assert_eq!(verifier_trie.root(), root_before_b2);
+
+    let mut counter_read_seen = false;
+    for read in &out2.witness.state_reads {
+        let outcome = read
+            .proof
+            .verify::<Blake3Hasher>(&root_before_b2, &read.key)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "witness proof failed to verify against base root for key={:02x?}: {err:?}",
+                    read.key
+                )
+            });
+        match (read.base_value.as_ref(), outcome) {
+            (Some(value), ProofOutcome::Included { value_hash }) => {
+                assert_eq!(
+                    value_hash,
+                    Blake3Hasher::hash_value(value),
+                    "proof value hash must match the recorded base_value"
+                );
+                if read.key == COUNTER_KEY {
+                    assert_eq!(value.as_slice(), &1u64.to_le_bytes());
+                    counter_read_seen = true;
+                }
+            }
+            (None, ProofOutcome::Excluded) => {}
+            (some, other) => {
+                panic!("inconsistent witness entry: base_value={some:?} proof outcome={other:?}")
+            }
+        }
+    }
+    assert!(
+        counter_read_seen,
+        "block 2 witness must include an inclusion proof for the counter key",
+    );
+
+    // The sealed witness round-trips through borsh exactly.
+    let encoded = borsh::to_vec(&out2.witness).expect("borsh encode");
+    let decoded: SealedWitness = borsh::from_slice(&encoded).expect("borsh decode");
+    assert_eq!(decoded, out2.witness);
+}
+
+#[test]
+fn validate_transaction_does_not_record_a_witness() {
+    let Some(elf) = read_elf() else {
+        eprintln!("{ELF_ENV} not set; skipping validate-transaction witness test.");
+        return;
+    };
+
+    // Empty/invalid tx is fine here; we only care that the call
+    // returns and produces no witness. The runtime will reject the
+    // payload but the host still finishes a normal halt.
+    let mut overlay = Overlay::empty();
+    let ctx = make_block_ctx(1, overlay.base_root());
+    let _ = validate_transaction(&elf, &ctx, &[], &mut overlay, 5_000_000);
+    // The contract is statically enforced by the type of the
+    // returned value: validate_transaction never surfaces a witness.
+    // This test exists to document the intent and to flag any future
+    // attempt to plumb one in.
 }
 
 // -------- M4A transfer helpers & test ---------------------------------------

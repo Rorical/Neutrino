@@ -12,10 +12,11 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["neutrino-primitives/std"]
+std = ["neutrino-primitives/std", "borsh/std"]
 
 [dependencies]
 neutrino-primitives = { workspace = true }
+borsh               = { workspace = true }
 
 [dev-dependencies]
 rand                = { workspace = true }

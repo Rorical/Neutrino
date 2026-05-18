@@ -21,10 +21,20 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::fmt;
 
+use borsh::{BorshDeserialize, BorshSerialize};
+
 use crate::error::TrieError;
 
 /// A length-tagged bit sequence with canonical wire encoding.
-#[derive(Clone, Default, Eq, Hash, PartialEq)]
+///
+/// `BitPath` also derives [`BorshSerialize`] and [`BorshDeserialize`]
+/// so it can be carried through proof witnesses ([`crate::Proof`]).
+/// The borsh form is `bit_len: u32 LE || borsh-encoded Vec<u8>` and is
+/// independent of the trie's internal canonical encoding produced by
+/// [`BitPath::encode_into`]; borsh decoders do not enforce trailing-bit
+/// padding because witness consumers only ever round-trip values
+/// previously serialized by the trie itself.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Default, Eq, Hash, PartialEq)]
 pub struct BitPath {
     bit_len: u32,
     bytes: Vec<u8>,

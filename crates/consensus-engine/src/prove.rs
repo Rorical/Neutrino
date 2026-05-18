@@ -110,18 +110,23 @@ impl<DB: Database> Engine<DB> {
     /// Prove a previously-produced block end-to-end.
     ///
     /// Walks the block FSM `BlockProduced → PendingProof → Proven`,
-    /// invokes `proof_system.prove_block(witness, public_inputs)`,
-    /// wraps the backend proof in a [`WireBlockProof`], persists the
-    /// result, and bumps the stored block state to [`BlockState::Proven`].
+    /// loads the sealed execution witness from the
+    /// [`Witnesses`](neutrino_storage::Column) column, invokes
+    /// `proof_system.prove_block(witness_bytes, public_inputs)`, wraps
+    /// the backend proof in a [`WireBlockProof`], persists the result,
+    /// and bumps the stored block state to [`BlockState::Proven`].
     ///
-    /// `witness` is opaque to the engine: the mock backend ignores
-    /// it; real backends (M8+) consume bytes captured by the
-    /// witness-recording mode of `vm-rv32im`. Until M8 ships the
-    /// witness pipeline, callers pass `&[]`.
+    /// Blocks produced through
+    /// [`Engine::try_produce_block`](crate::Engine::try_produce_block)
+    /// have their witness persisted automatically. For blocks that
+    /// reached the store through a different path (e.g. the legacy
+    /// M5 fixtures or sync without witness backfill), the witness is
+    /// absent and the backend is invoked with an empty byte slice. The
+    /// mock backend ignores the witness; real backends (M8-C onward)
+    /// reject empty witnesses with [`ProofError::InvalidWitness`].
     pub fn prove_block<PS: ProofSystem>(
         &mut self,
         block_hash: &BlockHash,
-        witness: &[u8],
         proof_system: &PS,
     ) -> Result<ProveOutcome, ProveError<DB::Error>> {
         // Load + sanity-check the FSM state.
@@ -149,8 +154,14 @@ impl<DB: Database> Engine<DB> {
         let state_root_before = self.parent_state_root(&header)?;
         let public_inputs = self.public_inputs_for(&header, state_root_before, block_hash);
 
+        // Load the persisted witness, if any. Falling back to empty
+        // bytes preserves the M5 legacy path where blocks were
+        // produced before the witness pipeline existed; the mock
+        // backend tolerates this and real backends will reject it.
+        let witness_bytes = self.store().get_witness(block_hash)?.unwrap_or_default();
+
         // Invoke the backend.
-        let backend_proof = proof_system.prove_block(witness, &public_inputs)?;
+        let backend_proof = proof_system.prove_block(&witness_bytes, &public_inputs)?;
         let proof_bytes = borsh::to_vec(&backend_proof)?;
 
         let wire_proof = WireBlockProof {

@@ -120,7 +120,7 @@ fn produce_and_prove(
         .expect("produce ok")
         .expect("eligibility");
     engine
-        .prove_block(&produced.block_hash, &[], &proof_system)
+        .prove_block(&produced.block_hash, &proof_system)
         .expect("prove ok");
     produced.block_hash
 }

@@ -35,5 +35,8 @@ pub use block_runner::{
     VALIDATOR_SET_KEY, VS_SNAPSHOT_KEY, run_block, run_query, validate_transaction,
 };
 pub use host::{DispatchingHost, EmittedLog};
+pub use neutrino_vm_rv32im::witness::{
+    BlockContextWitness, ExecutionWitness, SealedWitness, StateRead,
+};
 pub use overlay::{Overlay, OverlayEntry};
 pub use scratch::Scratch;

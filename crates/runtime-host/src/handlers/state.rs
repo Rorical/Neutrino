@@ -9,12 +9,33 @@ use neutrino_runtime_abi::gas;
 use neutrino_runtime_abi::status::Status;
 use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::memory::Memory;
+use neutrino_vm_rv32im::witness::{ExecutionWitness, StateRead};
 use neutrino_vm_rv32im::{Halt, Trap};
 
 use crate::overlay::Overlay;
 use crate::pointer;
 
 use super::{set_status, set_status_pair};
+
+/// If `witness` is `Some`, capture a [`StateRead`] anchored against
+/// the overlay's base trie root.
+///
+/// The proof commits to whether `key` is present in the *base* trie at
+/// the start of the block. If the runtime had previously written to
+/// `key` in the same block, the value the runtime observes via the
+/// overlay differs from `base_value`; the proof system reconstructs
+/// the live value by replaying earlier syscall writes from the trace.
+fn record_state_read(witness: Option<&mut ExecutionWitness>, overlay: &Overlay, key: &[u8]) {
+    if let Some(w) = witness {
+        let base_value = overlay.base_get(key);
+        let proof = overlay.base_prove(key);
+        w.record_state_read(StateRead {
+            key: key.to_vec(),
+            base_value,
+            proof,
+        });
+    }
+}
 
 /// `state_read(key_ptr, key_len, out_ptr, out_cap) -> (status, written_len)` — `0x10`.
 ///
@@ -29,6 +50,7 @@ pub fn read(
     cpu: &mut Cpu,
     memory: &mut Memory,
     overlay: &Overlay,
+    witness: Option<&mut ExecutionWitness>,
     gas_remaining: &mut u64,
 ) -> Result<Option<Halt>, Trap> {
     let key_ptr = cpu.read(10);
@@ -37,6 +59,7 @@ pub fn read(
     let out_cap = cpu.read(13);
 
     let key = pointer::read_bytes(memory, key_ptr, key_len)?;
+    record_state_read(witness, overlay, &key);
     let Some(value) = overlay.get(&key) else {
         // Treat misses as a successful syscall with status=NotFound.
         // No bytes get copied, so per-byte gas is zero. The flat base
@@ -126,6 +149,7 @@ pub fn exists(
     cpu: &mut Cpu,
     memory: &mut Memory,
     overlay: &Overlay,
+    witness: Option<&mut ExecutionWitness>,
     gas_remaining: &mut u64,
 ) -> Result<Option<Halt>, Trap> {
     let key_ptr = cpu.read(10);
@@ -136,6 +160,7 @@ pub fn exists(
         .ok_or(Trap::OutOfGas)?;
 
     let key = pointer::read_bytes(memory, key_ptr, key_len)?;
+    record_state_read(witness, overlay, &key);
     let present = u32::from(overlay.exists(&key));
     cpu.write(10, present);
     cpu.write(11, 0);
@@ -253,7 +278,7 @@ mod tests {
         store_bytes(&mut mem, 0, b"key");
         let overlay = Overlay::empty();
         let mut gas = 10_000_u64;
-        let result = read(&mut cpu, &mut mem, &overlay, &mut gas);
+        let result = read(&mut cpu, &mut mem, &overlay, None, &mut gas);
         assert_eq!(result, Ok(None));
         assert_eq!(cpu.read(10), Status::NotFound.as_u32());
         assert_eq!(cpu.read(11), 0);
@@ -272,7 +297,7 @@ mod tests {
         let mut mem = rw_memory(256);
         store_bytes(&mut mem, 0, b"foo");
         let mut gas = 10_000_u64;
-        let result = read(&mut cpu, &mut mem, &overlay, &mut gas);
+        let result = read(&mut cpu, &mut mem, &overlay, None, &mut gas);
         assert_eq!(result, Ok(None));
         assert_eq!(cpu.read(10), Status::Ok.as_u32());
         assert_eq!(cpu.read(11), 5);
@@ -292,7 +317,7 @@ mod tests {
         let mut mem = rw_memory(256);
         store_bytes(&mut mem, 0, b"k");
         let mut gas = 10_000_u64;
-        let _ = read(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+        let _ = read(&mut cpu, &mut mem, &overlay, None, &mut gas).unwrap();
         assert_eq!(cpu.read(10), Status::BufferTooSmall.as_u32());
         assert_eq!(cpu.read(11), 19);
     }
@@ -344,12 +369,12 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.write(10, 0);
         cpu.write(11, 7);
-        let _ = exists(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+        let _ = exists(&mut cpu, &mut mem, &overlay, None, &mut gas).unwrap();
         assert_eq!(cpu.read(10), 1);
 
         cpu.write(10, 32);
         cpu.write(11, 6);
-        let _ = exists(&mut cpu, &mut mem, &overlay, &mut gas).unwrap();
+        let _ = exists(&mut cpu, &mut mem, &overlay, None, &mut gas).unwrap();
         assert_eq!(cpu.read(10), 0);
     }
 
@@ -440,7 +465,7 @@ mod tests {
         let mut mem = rw_memory(64);
         let overlay = Overlay::empty();
         let mut gas = 1_u64; // way too low
-        let result = read(&mut cpu, &mut mem, &overlay, &mut gas);
+        let result = read(&mut cpu, &mut mem, &overlay, None, &mut gas);
         assert_eq!(result, Err(Trap::OutOfGas));
     }
 }

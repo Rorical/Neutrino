@@ -12,8 +12,11 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = []
-witness = []
+std = ["borsh/std", "neutrino-trie/std"]
+
+[dependencies]
+borsh         = { workspace = true }
+neutrino-trie = { workspace = true }
 
 [lints]
 workspace = true

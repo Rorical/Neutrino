@@ -150,7 +150,7 @@ fn prove_block_walks_fsm_to_proven_and_persists_proof() {
 
     let mock = MockProofSystem::new();
     let prove_outcome = engine
-        .prove_block(&produced.block_hash, &[], &mock)
+        .prove_block(&produced.block_hash, &mock)
         .expect("prove_block ok");
 
     // FSM has moved to Proven.
@@ -222,11 +222,11 @@ fn prove_block_rejects_already_proven_block() {
 
     let mock = MockProofSystem::new();
     engine
-        .prove_block(&produced.block_hash, &[], &mock)
+        .prove_block(&produced.block_hash, &mock)
         .expect("first prove ok");
 
     let err = engine
-        .prove_block(&produced.block_hash, &[], &mock)
+        .prove_block(&produced.block_hash, &mock)
         .expect_err("second prove should fail");
     assert!(matches!(
         err,
@@ -245,7 +245,7 @@ fn prove_block_rejects_unknown_block_hash() {
     let mock = MockProofSystem::new();
     let phantom = [0xFE; 32];
     let err = engine
-        .prove_block(&phantom, &[], &mock)
+        .prove_block(&phantom, &mock)
         .expect_err("phantom block prove should fail");
     assert!(matches!(err, ProveError::NoBlockState(h) if h == phantom));
 }
@@ -266,10 +266,10 @@ fn prove_block_chains_state_roots_across_consecutive_blocks() {
 
     let mock = MockProofSystem::new();
     let p1 = engine
-        .prove_block(&first.block_hash, &[], &mock)
+        .prove_block(&first.block_hash, &mock)
         .expect("prove first");
     let p2 = engine
-        .prove_block(&second.block_hash, &[], &mock)
+        .prove_block(&second.block_hash, &mock)
         .expect("prove second");
 
     // p2's state_root_before must equal p1's state_root_after, which
@@ -313,7 +313,7 @@ fn prove_block_is_callable_after_external_pending_proof_write() {
 
     let mock = MockProofSystem::new();
     let outcome = engine
-        .prove_block(&produced.block_hash, &[], &mock)
+        .prove_block(&produced.block_hash, &mock)
         .expect("prove from pending should succeed");
     assert_eq!(outcome.state, BlockState::Proven);
 }

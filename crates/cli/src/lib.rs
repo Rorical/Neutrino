@@ -319,7 +319,7 @@ fn produce_and_prove(
             "single validator was not eligible for a slot",
         ))?;
     engine
-        .prove_block(&produced.block_hash, &[], &proof_system)
+        .prove_block(&produced.block_hash, &proof_system)
         .map_err(|err| CliError::Prove(err.to_string()))?;
     Ok(BlockDump {
         height: produced.block.header.height,

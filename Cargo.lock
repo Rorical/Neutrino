@@ -2777,6 +2777,7 @@ dependencies = [
 name = "neutrino-trie"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "neutrino-primitives",
  "rand 0.8.6",
 ]
@@ -2784,6 +2785,10 @@ dependencies = [
 [[package]]
 name = "neutrino-vm-rv32im"
 version = "0.1.0"
+dependencies = [
+ "borsh",
+ "neutrino-trie",
+]
 
 [[package]]
 name = "neutrino-vrf"

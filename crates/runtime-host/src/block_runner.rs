@@ -15,6 +15,7 @@ use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::executor;
 use neutrino_vm_rv32im::loader::load_elf_into_memory;
 use neutrino_vm_rv32im::memory::{Memory, Permissions};
+use neutrino_vm_rv32im::witness::{BlockContextWitness, ExecutionWitness, SealedWitness};
 use neutrino_vm_rv32im::{Halt, Trap};
 
 use crate::host::{DispatchingHost, EmittedLog};
@@ -48,8 +49,11 @@ pub const VS_SNAPSHOT_KEY: &[u8] = b"vs:snapshot";
 /// `pubkey(48) || effective_stake(8 LE) || slashed(1)`.
 const VS_SNAPSHOT_ENTRY_LEN: usize = 48 + 8 + 1;
 
-/// Successful block execution outcome. Carries the new state root, the
-/// halt reason, gas accounting, runtime output bytes, and any logs.
+/// Successful block execution outcome.
+///
+/// Carries the new state root, the halt reason, gas accounting,
+/// runtime output bytes, logs, and the sealed execution witness the
+/// proof system needs to attest to the state transition.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BlockOutcome {
     /// State root before the block executed (snapshot of the base trie
@@ -80,6 +84,12 @@ pub struct BlockOutcome {
     pub output: Vec<u8>,
     /// Logs emitted by the runtime during execution.
     pub logs: Vec<EmittedLog>,
+    /// Sealed execution witness for this block. Captures every state
+    /// read with an inclusion or exclusion proof against
+    /// `state_root_before`. The engine persists this in the
+    /// `witnesses` storage column and pipes it through to
+    /// `Engine::prove_block`.
+    pub witness: SealedWitness,
 }
 
 /// Failure modes for [`run_block`]. The block is treated as invalid in
@@ -173,6 +183,15 @@ enum HostPolicy {
     ReadOnly,
 }
 
+/// Whether the host should accumulate a [`SealedWitness`] for this
+/// run. Block execution records; transaction validation and queries
+/// do not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WitnessMode {
+    Record,
+    Skip,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct RuntimeRunOutcome {
     state_root_before: StateRoot,
@@ -184,6 +203,11 @@ struct RuntimeRunOutcome {
     gas_limit: u64,
     output: Vec<u8>,
     logs: Vec<EmittedLog>,
+    /// Sealed witness when [`WitnessMode::Record`] was selected.
+    /// Always-present so callers do not have to plumb an `Option`
+    /// through; a `Skip` run yields an empty witness over the run's
+    /// `state_root_before` for shape uniformity.
+    witness: SealedWitness,
 }
 
 /// Drive a single block execution end-to-end.
@@ -214,6 +238,7 @@ pub fn run_block(
         gas_limit,
         StateMode::Commit,
         HostPolicy::Writable,
+        WitnessMode::Record,
     )?;
     Ok(BlockOutcome {
         state_root_before: outcome.state_root_before,
@@ -225,6 +250,7 @@ pub fn run_block(
         gas_limit: outcome.gas_limit,
         output: outcome.output,
         logs: outcome.logs,
+        witness: outcome.witness,
     })
 }
 
@@ -255,6 +281,7 @@ pub fn validate_transaction(
         // enforcement is the responsibility of the caller (`run_query`
         // sets it).
         HostPolicy::Writable,
+        WitnessMode::Skip,
     )?;
     TxValidity::decode(&outcome.output).map_err(TransactionValidationError::Decode)
 }
@@ -291,6 +318,7 @@ pub fn run_query(
         gas_limit,
         StateMode::Discard,
         HostPolicy::ReadOnly,
+        WitnessMode::Skip,
     )?;
     let response: QueryResponse =
         borsh::from_slice(&outcome.output).map_err(|err| QueryError::Decode(err.to_string()))?;
@@ -312,6 +340,7 @@ fn run_runtime_entrypoint(
     gas_limit: u64,
     state_mode: StateMode,
     host_policy: HostPolicy,
+    witness_mode: WitnessMode,
 ) -> Result<RuntimeRunOutcome, BlockError> {
     let state_root_before = overlay.base_root();
 
@@ -336,12 +365,30 @@ fn run_runtime_entrypoint(
     cpu.pc = entry;
     cpu.write(2, DEFAULT_MEMORY_BUDGET); // x2 = sp = top of memory
 
+    // Build the witness accumulator. `Skip` runs still allocate an
+    // empty witness so the run path is shape-uniform; the empty
+    // SealedWitness is cheap and never observed by callers.
+    let mut witness = ExecutionWitness::new(
+        state_root_before,
+        BlockContextWitness {
+            slot: block_ctx.slot,
+            height: block_ctx.height,
+            seed: block_ctx.seed,
+            parent_hash: block_ctx.parent_hash,
+            gas_limit: block_ctx.gas_limit,
+            proposer_index: block_ctx.proposer_index,
+        },
+    );
+
     // Set up the dispatcher.
     let mut scratch = Scratch::with_input(input);
     let mut host = match host_policy {
         HostPolicy::Writable => DispatchingHost::new(overlay, block_ctx, &mut scratch),
         HostPolicy::ReadOnly => DispatchingHost::new_read_only(overlay, block_ctx, &mut scratch),
     };
+    if witness_mode == WitnessMode::Record {
+        host = host.with_witness(&mut witness);
+    }
 
     // Run the interpreter.
     let mut gas_remaining: u64 = gas_limit;
@@ -356,6 +403,11 @@ fn run_runtime_entrypoint(
     let gas_used = gas_limit.saturating_sub(gas_remaining);
     let panic_msg = host.panic_msg.clone();
     let logs = std::mem::take(&mut host.logs);
+    // Drop the dispatcher before touching `scratch` again, otherwise
+    // its `&mut scratch` borrow keeps us from reclaiming the output
+    // buffer. Also releases the `&mut witness` borrow so the witness
+    // can be sealed below.
+    drop(host);
     let output = std::mem::take(&mut scratch.output);
 
     let halt = match result {
@@ -409,6 +461,7 @@ fn run_runtime_entrypoint(
         gas_limit,
         output,
         logs,
+        witness: witness.seal(),
     })
 }
 

@@ -14,7 +14,7 @@ use neutrino_primitives::{
     BlockHash, BlsSignature, Hash, Height, Slot, StateRoot, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_runtime_abi::BlockContext;
-use neutrino_runtime_host::{BlockError, BlockOutcome, Overlay, run_block};
+use neutrino_runtime_host::{BlockError, BlockOutcome, Overlay, SealedWitness, run_block};
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
@@ -48,6 +48,11 @@ pub enum ProductionError<E> {
     BodyEncode(BodyEncodeError),
     /// Runtime execution failed.
     Runtime(BlockError),
+    /// The runtime returned a witness that failed to borsh-encode for
+    /// persistence. Borsh serialization is infallible for canonical
+    /// witness types so this variant exists only for diagnostic
+    /// completeness.
+    WitnessEncode(borsh::io::Error),
     /// The supplied runtime ELF does not match the chain-spec runtime code hash.
     RuntimeCodeHashMismatch {
         /// Runtime hash committed by the chain spec.
@@ -91,6 +96,7 @@ impl<E: fmt::Display + fmt::Debug> fmt::Display for ProductionError<E> {
             Self::ProposerKeyMismatch { index } => {
                 write!(f, "proposer key does not match validator at index {index}")
             }
+            Self::WitnessEncode(err) => write!(f, "witness borsh encode failed: {err}"),
             Self::NonMonotonicSlot {
                 parent_slot,
                 requested,
@@ -129,6 +135,12 @@ impl<E> From<BlockError> for ProductionError<E> {
     }
 }
 
+impl<E> From<borsh::io::Error> for ProductionError<E> {
+    fn from(value: borsh::io::Error) -> Self {
+        Self::WitnessEncode(value)
+    }
+}
+
 /// Runtime + proposer binding for [`Engine::try_produce_block`].
 #[derive(Clone, Copy, Debug)]
 pub struct ProductionConfig<'a> {
@@ -157,6 +169,13 @@ pub struct ProductionOutcome {
     /// Full active validator set when the runtime changed it in this
     /// block, `None` otherwise.
     pub next_validator_set: Option<Vec<Validator>>,
+    /// Sealed execution witness captured by the runtime host. The
+    /// engine persists this in the [`Witnesses`](neutrino_storage::Column)
+    /// column under `block_hash` so a later
+    /// [`Engine::prove_block`](crate::Engine::prove_block) can load
+    /// and pass it to the proof backend without the caller having to
+    /// thread bytes through.
+    pub witness: SealedWitness,
 }
 
 impl<DB: Database> Engine<DB> {
@@ -249,10 +268,17 @@ impl<DB: Database> Engine<DB> {
         let block = Block { header, body };
         let block_hash = block.hash();
 
+        // Borsh-encode the witness up front so a serialization failure
+        // surfaces before any state mutation. The witness types use
+        // only `Vec<u8>` and fixed-size primitives, so the encode is
+        // infallible in practice.
+        let witness_bytes = borsh::to_vec(&outcome.witness)?;
+
         self.store_mut().put_header(&block.header)?;
         self.store_mut().put_body(&block_hash, &block.body)?;
         self.store_mut()
             .put_block_state(&block_hash, BlockState::BlockProduced)?;
+        self.store_mut().put_witness(&block_hash, &witness_bytes)?;
         self.store_mut().put_tip(block_hash)?;
 
         self.update_head_internal(height, block_hash, outcome.state_root_after);
@@ -279,6 +305,7 @@ impl<DB: Database> Engine<DB> {
             gas_used: outcome.gas_used,
             next_validator_set_root,
             next_validator_set: outcome.next_validator_set,
+            witness: outcome.witness,
         }))
     }
 

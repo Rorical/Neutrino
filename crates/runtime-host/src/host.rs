@@ -15,6 +15,7 @@ use neutrino_runtime_abi::syscall;
 use neutrino_vm_rv32im::cpu::Cpu;
 use neutrino_vm_rv32im::host::HostInterface;
 use neutrino_vm_rv32im::memory::Memory;
+use neutrino_vm_rv32im::witness::ExecutionWitness;
 use neutrino_vm_rv32im::{Halt, Trap};
 
 use crate::handlers;
@@ -53,11 +54,20 @@ pub struct DispatchingHost<'a> {
     /// remember to discard. Logs and panics are still recorded; gas
     /// is not consumed when the call is refused.
     pub read_only: bool,
+    /// Optional witness accumulator. `Some` for block execution so the
+    /// proof system can later attest to every state read; `None` for
+    /// transaction validation and read-only queries where no proof is
+    /// produced and the recording would only burn allocations.
+    pub witness: Option<&'a mut ExecutionWitness>,
 }
 
 impl<'a> DispatchingHost<'a> {
     /// Build a fresh dispatcher with empty logs / panic message and
     /// the default (writable) state-access policy.
+    ///
+    /// Witness recording is disabled. Use
+    /// [`DispatchingHost::with_witness`] for block execution where the
+    /// proof system needs a witness.
     #[must_use]
     pub const fn new(
         overlay: &'a mut Overlay,
@@ -71,11 +81,13 @@ impl<'a> DispatchingHost<'a> {
             logs: Vec::new(),
             panic_msg: None,
             read_only: false,
+            witness: None,
         }
     }
 
     /// Build a read-only dispatcher. State writes and deletes return
-    /// [`Status::PermissionDenied`]; reads behave normally.
+    /// [`Status::PermissionDenied`]; reads behave normally. Witness
+    /// recording is disabled.
     #[must_use]
     pub const fn new_read_only(
         overlay: &'a mut Overlay,
@@ -89,7 +101,17 @@ impl<'a> DispatchingHost<'a> {
             logs: Vec::new(),
             panic_msg: None,
             read_only: true,
+            witness: None,
         }
+    }
+
+    /// Attach a witness accumulator to a dispatcher. The dispatcher
+    /// records every state read into `witness` for the proof system to
+    /// later anchor its statement against the parent state root.
+    #[must_use]
+    pub const fn with_witness(mut self, witness: &'a mut ExecutionWitness) -> Self {
+        self.witness = Some(witness);
+        self
     }
 }
 
@@ -121,7 +143,13 @@ impl HostInterface for DispatchingHost<'_> {
             }
 
             // State access.
-            syscall::state::READ => handlers::state::read(cpu, memory, self.overlay, gas_remaining),
+            syscall::state::READ => handlers::state::read(
+                cpu,
+                memory,
+                self.overlay,
+                self.witness.as_deref_mut(),
+                gas_remaining,
+            ),
             syscall::state::WRITE => {
                 if self.read_only {
                     refuse_with_permission_denied(cpu);
@@ -138,9 +166,13 @@ impl HostInterface for DispatchingHost<'_> {
                     handlers::state::delete(cpu, memory, self.overlay, gas_remaining)
                 }
             }
-            syscall::state::EXISTS => {
-                handlers::state::exists(cpu, memory, self.overlay, gas_remaining)
-            }
+            syscall::state::EXISTS => handlers::state::exists(
+                cpu,
+                memory,
+                self.overlay,
+                self.witness.as_deref_mut(),
+                gas_remaining,
+            ),
             syscall::state::NEXT_KEY => {
                 handlers::state::next_key(cpu, memory, self.overlay, gas_remaining)
             }

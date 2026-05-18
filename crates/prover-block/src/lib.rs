@@ -11,8 +11,8 @@
 //! program ROM, base RV32I, M-extension, traps, syscalls) sharing a
 //! logUp lookup bus.
 //!
-//! M8-C lays the baseline. M8-D adds the public-input commitment.
-//! The crate currently exposes:
+//! M8-C lays the baseline; M8-D adds the public-input commitment;
+//! M8-E adds the first lookup-table AIR. The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -21,13 +21,17 @@
 //! - [`public_inputs`] — the Poseidon2 commitment binding for
 //!   `BlockProofPublicInputs`; M8-N integration will commit this
 //!   digest as the real block AIR's public values.
+//! - [`range_check`] — the ascending lookup-table AIR every later
+//!   range argument (u8 / u16 / u32 byte decomposition) targets via
+//!   the M8-L logUp bus.
 //!
-//! Later M8 slices (M8-E onwards) grow the crate one AIR at a time
+//! Later M8 slices (M8-F onwards) grow the crate one AIR at a time
 //! against this scaffold.
 
 pub mod config;
 pub mod fibonacci;
 pub mod public_inputs;
+pub mod range_check;
 
 pub use config::{
     Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm, StarkCfg, Val, ValMmcs,
@@ -38,3 +42,4 @@ pub use public_inputs::{
     BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,
     commit_block_public_inputs,
 };
+pub use range_check::{RANGE_CHECK_TRACE_WIDTH, RangeCheckAir, range_check_trace};

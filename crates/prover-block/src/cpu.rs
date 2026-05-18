@@ -10,12 +10,19 @@
 //!   instruction bytes plus the first real-opcode family `LUI`, with
 //!   its opcode check, `next_pc = pc + 4` rule, and
 //!   `rd_val = imm20 << 12` decoding.
-//! - **Slice 3** (this slice) adds the on-trace 32-entry register
-//!   file (`r0..r31`), per-row one-hot write indicators
-//!   (`wi_0..wi_31`), and the per-register transition rule. `x0` is
-//!   pinned to zero on every row; for `j > 0` writes land at
-//!   `next.r_j = (1 - wi_j) * local.r_j + wi_j * rd_val`. LUI now
-//!   actually updates the register file.
+//! - **Slice 3** added the on-trace 32-entry register file
+//!   (`r0..r31`), per-row one-hot write indicators (`wi_0..wi_31`),
+//!   and the per-register transition rule. `x0` is pinned to zero on
+//!   every row; for `j > 0` writes land at
+//!   `next.r_j = (1 - wi_j) * local.r_j + wi_j * rd_val`.
+//! - **Slice 4** (this slice) adds the OP-IMM ADDI instruction:
+//!   bit decomposition of the high two instruction bytes, the
+//!   funct3 and opcode checks for ADDI, the 12-bit signed-immediate
+//!   decode, register reads via 32 one-hot read indicators
+//!   (`ri_0..ri_31`), and the field-arithmetic
+//!   `rd_val = rs1_val + imm` rule. The slice-2 `is_lui ⇒ is_real`
+//!   constraint is upgraded to the multi-family form
+//!   `is_real = is_lui + is_addi`.
 //!
 //! Subsequent sub-slices add the remaining RV32I opcode families one
 //! at a time on this scaffold.
@@ -24,23 +31,30 @@
 //!
 //! [`CPU_TRACE_WIDTH`] columns:
 //!
-//! | col    | name           | semantics                                                          |
-//! | ------ | -------------- | ------------------------------------------------------------------ |
-//! | 0      | `pc`           | program counter at the start of this row                           |
-//! | 1      | `next_pc`      | program counter after executing this row                           |
-//! | 2      | `b0`           | instruction byte 0 (LSB)                                           |
-//! | 3      | `b1`           | instruction byte 1                                                 |
-//! | 4      | `b2`           | instruction byte 2                                                 |
-//! | 5      | `b3`           | instruction byte 3 (MSB)                                           |
-//! | 6      | `is_real`      | `1` if this row models a real instruction execution                |
-//! | 7      | `is_pad`       | `1` if this row is padding (PC halted, no semantic effect)         |
-//! | 8..16  | `b0_bit_0..7`  | bit decomposition of `b0` (8 boolean cells)                        |
-//! | 16..24 | `b1_bit_0..7`  | bit decomposition of `b1` (8 boolean cells)                        |
-//! | 24     | `is_lui`       | `1` if this row is the LUI opcode family                           |
-//! | 25     | `rd_idx`       | destination register index (always `insn[11:7]`, `[0, 31]`)        |
-//! | 26     | `rd_val`       | value to write to `rd_idx`; for LUI: `imm20 << 12` (`insn[31:12]`) |
-//! | 27..59 | `r_0..r_31`    | register file at the start of this row (`r_0` always zero)         |
-//! | 59..91 | `wi_0..wi_31`  | one-hot write indicator: `wi_j = 1` iff this row writes to `r_j`   |
+//! | col      | name           | semantics                                                          |
+//! | -------- | -------------- | ------------------------------------------------------------------ |
+//! | 0        | `pc`           | program counter at the start of this row                           |
+//! | 1        | `next_pc`      | program counter after executing this row                           |
+//! | 2        | `b0`           | instruction byte 0 (LSB)                                           |
+//! | 3        | `b1`           | instruction byte 1                                                 |
+//! | 4        | `b2`           | instruction byte 2                                                 |
+//! | 5        | `b3`           | instruction byte 3 (MSB)                                           |
+//! | 6        | `is_real`      | `1` if this row models a real instruction execution                |
+//! | 7        | `is_pad`       | `1` if this row is padding (PC halted, no semantic effect)         |
+//! | 8..16    | `b0_bit_0..7`  | bit decomposition of `b0` (8 boolean cells)                        |
+//! | 16..24   | `b1_bit_0..7`  | bit decomposition of `b1` (8 boolean cells)                        |
+//! | 24       | `is_lui`       | `1` if this row is the LUI opcode family                           |
+//! | 25       | `rd_idx`       | destination register index (always `insn[11:7]`, `[0, 31]`)        |
+//! | 26       | `rd_val`       | value to write to `rd_idx`                                         |
+//! | 27..59   | `r_0..r_31`    | register file at the start of this row (`r_0` always zero)         |
+//! | 59..91   | `wi_0..wi_31`  | one-hot write indicator: `wi_j = 1` iff this row writes to `r_j`   |
+//! | 91..99   | `b2_bit_0..7`  | bit decomposition of `b2` (8 boolean cells)                        |
+//! | 99..107  | `b3_bit_0..7`  | bit decomposition of `b3` (8 boolean cells)                        |
+//! | 107      | `is_addi`      | `1` if this row is the OP-IMM ADDI instruction                     |
+//! | 108      | `rs1_idx`      | source register 1 index (always `insn[19:15]`, `[0, 31]`)          |
+//! | 109      | `rs1_val`      | value read from `rs1_idx`                                          |
+//! | 110      | `imm`          | I-type sign-extended immediate (`insn[31:20]` two's complement)    |
+//! | 111..143 | `ri_0..ri_31`  | one-hot read indicator for `rs1`: `ri_j = 1` iff `rs1_idx = j`     |
 //!
 //! Real rows describe an executed RV32I instruction; padding rows
 //! follow the halt and hold the PC in place with the all-zero
@@ -88,26 +102,55 @@
 //!   above; `wi_0` still counts toward the sum so the indicator math
 //!   stays one-hot.
 //!
+//! Slice 4 additions:
+//!
+//! - **Bit booleans for `b2`, `b3`**: each of the 16 new bit columns
+//!   is in `{0, 1}`.
+//! - **Byte sums**: `b2 = Σ b2_bit_i * 2^i`, `b3 = Σ b3_bit_i * 2^i`.
+//! - **`is_addi` boolean**.
+//! - **Family aggregate**: `is_real = is_lui + is_addi`. Replaces
+//!   slice 2's weaker `is_lui ⇒ is_real`. Slice N continues adding
+//!   `is_<family>` selectors to the sum.
+//! - **`rs1_idx` decoding** (unconditional): `rs1_idx = insn[19:15]`
+//!   via `b1_bit_7 + 2*b2_bit_0 + 4*b2_bit_1 + 8*b2_bit_2 + 16*b2_bit_3`.
+//! - **`imm` decoding** (unconditional): the I-type signed immediate
+//!   `imm = b2[7:4] + b3 * 16 - 4096 * b3_bit_7`. For non-I-type
+//!   opcodes the value is decoded but unused.
+//! - **Read indicator booleans**: each `ri_j` is in `{0, 1}`.
+//! - **Read indicator sum**: `Σ ri_j = is_addi`. Slice N grows the
+//!   right-hand side to include every other `rs1`-reading family.
+//! - **Read indicator matches `rs1_idx`**: `ri_j * (rs1_idx - j) = 0`.
+//! - **Read value match**: `ri_j * (rs1_val - r_j) = 0`. When
+//!   `ri_j = 1`, `rs1_val` equals the register-file column `r_j`.
+//! - **ADDI active**:
+//!   - **Opcode**: low 7 bits of `b0` equal `0x13`.
+//!   - **funct3 = 000**: `b1_bit_4 = b1_bit_5 = b1_bit_6 = 0`.
+//!   - **PC**: `next_pc = pc + 4`.
+//!   - **`rd_val`**: `rd_val = rs1_val + imm` in field arithmetic.
+//!
 //! ## What this slice does NOT yet constrain
 //!
+//! - **u32-wrapping arithmetic.** Slice 4 computes
+//!   `rd_val = rs1_val + imm` in BabyBear field arithmetic. This
+//!   matches u32 semantics exactly for sums below the BabyBear
+//!   modulus (`~2.01 × 10^9`); for larger sums the field reduction
+//!   differs from the desired `mod 2^32` wrap. M8-L's byte
+//!   decomposition + carry argument will pin true u32 semantics.
+//!   ADDI tests in this slice stay below the modulus.
 //! - **Other instruction families.** Each later sub-slice adds an
 //!   `is_<family>` selector with its own decode and semantics
-//!   constraints, and updates the `is_real` aggregate to a sum over
-//!   all family selectors.
-//! - **Register reads.** Slice 3 only commits the destination-side
-//!   write effect. RV32I families that read source registers (ADDI,
-//!   OP-REG, branches, jumps via `rs1`, etc.) will add `rs1_val`,
-//!   `rs2_val` columns and pin them to the corresponding `r_j`
-//!   cells in the per-row constraints of those slices.
+//!   constraints, and updates the family-aggregate sum.
+//! - **rs2 reads.** ADDI does not read a second source register.
+//!   `rs2_idx`, `rs2_val`, and a second port of read indicators
+//!   land with the first OP-REG family.
 //! - **Cross-AIR composition.** M8-L wires `(pc, b0..b3)` to
 //!   [`crate::program_rom::ProgramRomAir`] so the prover cannot fetch
 //!   an instruction the ELF does not contain, and routes byte cells
-//!   through the M8-E range tables for the `b2`, `b3` byte-range
-//!   bounds. The local AIR currently leaves `b2`, `b3` unconstrained
-//!   beyond being field elements. M8-L will also replace the
-//!   on-trace register file with a permutation-argument-backed
-//!   `RegisterFileAir`, dropping the 64 register-related columns
-//!   from this AIR.
+//!   through the M8-E range tables. The local AIR currently leaves
+//!   byte cells unconstrained beyond field arithmetic. M8-L will
+//!   also replace the on-trace register file with a
+//!   permutation-argument-backed `RegisterFileAir`, dropping the
+//!   register and indicator columns from this AIR.
 //!
 //! ## Padding
 //!
@@ -127,13 +170,13 @@ use crate::config::FRI_LOG_FINAL_POLY_LEN;
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
 
-/// Number of trace columns the CPU AIR uses at M8-H slice 3.
+/// Number of trace columns the CPU AIR uses at M8-H slice 4.
 ///
 /// Each later sub-slice extends the layout (additional decoded
 /// fields, more opcode selectors, memory records) by appending
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
-pub const CPU_TRACE_WIDTH: usize = COL_WI_START + NUM_REGS;
+pub const CPU_TRACE_WIDTH: usize = COL_RS1_IND_START + NUM_REGS;
 
 const COL_PC: usize = 0;
 const COL_NEXT_PC: usize = 1;
@@ -150,6 +193,13 @@ const COL_RD_IDX: usize = 25;
 const COL_RD_VAL: usize = 26;
 const COL_REG_START: usize = 27;
 const COL_WI_START: usize = COL_REG_START + NUM_REGS;
+const COL_B2_BITS_START: usize = COL_WI_START + NUM_REGS;
+const COL_B3_BITS_START: usize = COL_B2_BITS_START + 8;
+const COL_IS_ADDI: usize = COL_B3_BITS_START + 8;
+const COL_RS1_IDX: usize = COL_IS_ADDI + 1;
+const COL_RS1_VAL: usize = COL_RS1_IDX + 1;
+const COL_IMM: usize = COL_RS1_VAL + 1;
+const COL_RS1_IND_START: usize = COL_IMM + 1;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -159,6 +209,13 @@ const MIN_TRACE_HEIGHT: usize = 1 << (FRI_LOG_FINAL_POLY_LEN + 1);
 /// RV32I LUI opcode (`0b0110111`).
 const LUI_OPCODE: u32 = 0x37;
 
+/// RV32I OP-IMM opcode (`0b0010011`). The funct3 field selects the
+/// specific operation (ADDI, SLTI, ANDI, ORI, XORI, SLLI, SRLI, SRAI).
+const OP_IMM_OPCODE: u32 = 0x13;
+
+/// funct3 value for the ADDI instruction (`0b000`).
+const FUNCT3_ADDI: u32 = 0;
+
 /// One real instruction in the CPU execution trace.
 ///
 /// `pc` is the address fetched; `next_pc` is the address the
@@ -166,10 +223,12 @@ const LUI_OPCODE: u32 = 0x37;
 /// `next_pc == pc + 4`; for jumps and taken branches `next_pc` is the
 /// branch target.
 ///
-/// At M8-H slice 2 the trace builder treats every entry as a LUI
-/// instruction (the only real-opcode family currently constrained).
-/// Later sub-slices will introduce additional constructors and an
-/// opcode tag so the builder can dispatch per family.
+/// At M8-H slice 4 the trace builder dispatches on the encoded opcode
+/// (and funct3 where relevant): LUI rows route through
+/// [`CpuInstruction::lui`]'s decoding path, ADDI rows route through
+/// [`CpuInstruction::addi`]'s. Each future sub-slice adds another
+/// opcode family. A malformed encoding is caught by the AIR rather
+/// than the builder.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CpuInstruction {
     /// Program counter at fetch.
@@ -224,6 +283,33 @@ impl CpuInstruction {
         let insn = (imm20 << 12) | (rd << 7) | LUI_OPCODE;
         Self::straight(pc, insn)
     }
+
+    /// Encode `addi rd, rs1, imm12` at the given `pc`.
+    ///
+    /// `rd` and `rs1` are register indices in `[0, 31]`; `imm12` is
+    /// the signed 12-bit immediate in `[-2048, 2047]`, encoded into
+    /// `insn[31:20]` as two's complement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rd >= 32`, `rs1 >= 32`, `imm12 < -2048`,
+    /// `imm12 > 2047`, or `pc + 4` overflows `u32`.
+    #[must_use]
+    pub const fn addi(pc: u32, rd: u32, rs1: u32, imm12: i32) -> Self {
+        assert!(rd < 32, "CpuInstruction::addi: rd must be in [0, 31]");
+        assert!(rs1 < 32, "CpuInstruction::addi: rs1 must be in [0, 31]");
+        assert!(
+            imm12 >= -2048 && imm12 <= 2047,
+            "CpuInstruction::addi: imm12 must be in [-2048, 2047]"
+        );
+        // Two's complement: casting i32 to u32 already produces the
+        // 32-bit two's complement bit pattern; masking the low 12
+        // bits gives the I-type immediate field exactly.
+        #[allow(clippy::cast_sign_loss)]
+        let imm_bits = (imm12 as u32) & 0xFFF;
+        let insn = (imm_bits << 20) | (rs1 << 15) | (rd << 7) | OP_IMM_OPCODE;
+        Self::straight(pc, insn)
+    }
 }
 
 /// Base RV32I CPU AIR.
@@ -276,142 +362,255 @@ impl<AB: AirBuilder> Air<AB> for CpuAir {
         let local: &[AB::Var] = main.current_slice();
         let next: &[AB::Var] = main.next_slice();
 
-        // -------- Slice 1: PC and selector skeleton --------
+        eval_pc_and_selectors::<AB>(builder, local, next, self.pc_base);
+        eval_low_bytes_and_lui::<AB>(builder, local);
+        eval_register_file::<AB>(builder, local, next);
+        eval_high_bytes_and_addi::<AB>(builder, local);
+    }
+}
 
-        // First row: pc starts at the configured pc_base.
-        let pc_base_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(self.pc_base)));
+/// Slice 1: PC and `is_real` / `is_pad` selector skeleton.
+fn eval_pc_and_selectors<AB: AirBuilder>(
+    builder: &mut AB,
+    local: &[AB::Var],
+    next: &[AB::Var],
+    pc_base: u32,
+) {
+    // First row: pc starts at the configured pc_base.
+    let pc_base_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(pc_base)));
+    builder
+        .when_first_row()
+        .assert_eq(local[COL_PC], pc_base_expr);
+
+    // Boolean selectors.
+    builder.assert_bool(local[COL_IS_REAL]);
+    builder.assert_bool(local[COL_IS_PAD]);
+
+    // One-hot: exactly one row kind is active per row.
+    let one: AB::Expr = AB::Expr::from(AB::F::ONE);
+    builder.assert_eq(local[COL_IS_REAL] + local[COL_IS_PAD], one);
+
+    // Padding rows hold the PC and emit the all-zero instruction
+    // word. Each constraint is gated by `is_pad` so real rows are
+    // untouched.
+    let pad: AB::Expr = local[COL_IS_PAD].into();
+    builder.assert_zero(pad.clone() * (local[COL_NEXT_PC] - local[COL_PC]));
+    builder.assert_zero(pad.clone() * local[COL_B0]);
+    builder.assert_zero(pad.clone() * local[COL_B1]);
+    builder.assert_zero(pad.clone() * local[COL_B2]);
+    builder.assert_zero(pad * local[COL_B3]);
+
+    // Transition: this row's next_pc becomes the next row's pc.
+    builder
+        .when_transition()
+        .assert_eq(next[COL_PC], local[COL_NEXT_PC]);
+}
+
+/// Slice 2: bit decomposition of `b0` / `b1`, opcode-independent
+/// `rd_idx` decode, and the LUI active constraints.
+fn eval_low_bytes_and_lui<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    // Booleans for the 16 bit columns covering b0 and b1.
+    for offset in 0..8 {
+        builder.assert_bool(local[COL_B0_BITS_START + offset]);
+        builder.assert_bool(local[COL_B1_BITS_START + offset]);
+    }
+
+    // Byte sums: b_k = sum of bit_i * 2^i.
+    let b0_sum = byte_from_bits::<AB>(local, COL_B0_BITS_START);
+    builder.assert_eq(local[COL_B0], b0_sum);
+    let b1_sum = byte_from_bits::<AB>(local, COL_B1_BITS_START);
+    builder.assert_eq(local[COL_B1], b1_sum);
+
+    // is_lui boolean.
+    builder.assert_bool(local[COL_IS_LUI]);
+    let is_lui: AB::Expr = local[COL_IS_LUI].into();
+
+    // rd_idx = insn[11:7] decoded from the bit columns.
+    let rd_idx_expr: AB::Expr = AB::Expr::from(local[COL_B0_BITS_START + 7])
+        + AB::Expr::from(AB::F::from_u64(2)) * AB::Expr::from(local[COL_B1_BITS_START])
+        + AB::Expr::from(AB::F::from_u64(4)) * AB::Expr::from(local[COL_B1_BITS_START + 1])
+        + AB::Expr::from(AB::F::from_u64(8)) * AB::Expr::from(local[COL_B1_BITS_START + 2])
+        + AB::Expr::from(AB::F::from_u64(16)) * AB::Expr::from(local[COL_B1_BITS_START + 3]);
+    builder.assert_eq(local[COL_RD_IDX], rd_idx_expr);
+
+    // Opcode check: low 7 bits of b0 equal LUI_OPCODE.
+    let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(LUI_OPCODE)));
+    builder.assert_zero(is_lui.clone() * (b0_low_7 - opcode_target));
+
+    // PC: next_pc = pc + 4 for LUI (straight-line execution).
+    let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
+    let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
+    builder.assert_zero(is_lui.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
+
+    // rd_val = imm20 << 12 = b1[7:4] * 2^12 + b2 * 2^16 + b3 * 2^24.
+    let rd_val_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(4096))
+        * AB::Expr::from(local[COL_B1_BITS_START + 4])
+        + AB::Expr::from(AB::F::from_u64(8192)) * AB::Expr::from(local[COL_B1_BITS_START + 5])
+        + AB::Expr::from(AB::F::from_u64(16384)) * AB::Expr::from(local[COL_B1_BITS_START + 6])
+        + AB::Expr::from(AB::F::from_u64(32768)) * AB::Expr::from(local[COL_B1_BITS_START + 7])
+        + AB::Expr::from(AB::F::from_u64(65536)) * AB::Expr::from(local[COL_B2])
+        + AB::Expr::from(AB::F::from_u64(16_777_216)) * AB::Expr::from(local[COL_B3]);
+    builder.assert_zero(is_lui * (AB::Expr::from(local[COL_RD_VAL]) - rd_val_expr));
+}
+
+/// Slice 3: 32-entry register file with x0 pinning, write indicators
+/// driven by `rd_idx`, and the per-register transition rule.
+fn eval_register_file<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var], next: &[AB::Var]) {
+    // x0 is hardwired to zero on every row.
+    builder.assert_zero(local[COL_REG_START]);
+
+    // First row: registers x1..x31 start at zero.
+    for j in 1..NUM_REGS {
         builder
             .when_first_row()
-            .assert_eq(local[COL_PC], pc_base_expr);
+            .assert_zero(local[COL_REG_START + j]);
+    }
 
-        // Boolean selectors.
-        builder.assert_bool(local[COL_IS_REAL]);
-        builder.assert_bool(local[COL_IS_PAD]);
+    // Write indicators are boolean.
+    for j in 0..NUM_REGS {
+        builder.assert_bool(local[COL_WI_START + j]);
+    }
 
-        // One-hot: exactly one row kind is active per row.
-        let one: AB::Expr = AB::Expr::from(AB::F::ONE);
-        builder.assert_eq(local[COL_IS_REAL] + local[COL_IS_PAD], one);
+    // Sum of write indicators equals is_real. Combined with the
+    // boolean constraint above, real rows write exactly one
+    // register; padding rows write none.
+    let mut wi_sum: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    for j in 0..NUM_REGS {
+        wi_sum += AB::Expr::from(local[COL_WI_START + j]);
+    }
+    builder.assert_eq(wi_sum, AB::Expr::from(local[COL_IS_REAL]));
 
-        // Padding rows hold the PC and emit the all-zero instruction
-        // word. Each constraint is gated by `is_pad` so real rows are
-        // untouched.
-        let pad: AB::Expr = local[COL_IS_PAD].into();
-        builder.assert_zero(pad.clone() * (local[COL_NEXT_PC] - local[COL_PC]));
-        builder.assert_zero(pad.clone() * local[COL_B0]);
-        builder.assert_zero(pad.clone() * local[COL_B1]);
-        builder.assert_zero(pad.clone() * local[COL_B2]);
-        builder.assert_zero(pad * local[COL_B3]);
+    // Each write indicator agrees with `rd_idx`:
+    // `wi_j * (rd_idx - j) = 0`. Together with the sum constraint
+    // this forces `wi_j = 1` iff `is_real = 1 ∧ rd_idx = j`.
+    for j in 0..NUM_REGS {
+        let j_u64 = u64::try_from(j).expect("register index fits in u64");
+        let rd_idx_minus_j: AB::Expr =
+            AB::Expr::from(local[COL_RD_IDX]) - AB::Expr::from(AB::F::from_u64(j_u64));
+        builder.assert_zero(AB::Expr::from(local[COL_WI_START + j]) * rd_idx_minus_j);
+    }
 
-        // Transition: this row's next_pc becomes the next row's pc.
+    // Register transitions for `j` in `[1, 32)`:
+    // `next.r_j = (1 - wi_j) * local.r_j + wi_j * rd_val`. The
+    // x0-pinned constraint above already forces row 0's `r_0 = 0`
+    // and every row's `r_0 = 0`, so no transition rule is needed
+    // for register 0.
+    for j in 1..NUM_REGS {
+        let wi: AB::Expr = local[COL_WI_START + j].into();
+        let one_minus_wi: AB::Expr = AB::Expr::from(AB::F::ONE) - wi.clone();
+        let updated: AB::Expr = one_minus_wi * AB::Expr::from(local[COL_REG_START + j])
+            + wi * AB::Expr::from(local[COL_RD_VAL]);
         builder
             .when_transition()
-            .assert_eq(next[COL_PC], local[COL_NEXT_PC]);
-
-        // -------- Slice 2: bit decomposition + LUI --------
-
-        // Booleans for the 16 bit columns covering b0 and b1.
-        for offset in 0..8 {
-            builder.assert_bool(local[COL_B0_BITS_START + offset]);
-            builder.assert_bool(local[COL_B1_BITS_START + offset]);
-        }
-
-        // Byte sums: b_k = sum of bit_i * 2^i.
-        let b0_sum = byte_from_bits::<AB>(local, COL_B0_BITS_START);
-        builder.assert_eq(local[COL_B0], b0_sum);
-        let b1_sum = byte_from_bits::<AB>(local, COL_B1_BITS_START);
-        builder.assert_eq(local[COL_B1], b1_sum);
-
-        // is_lui boolean.
-        builder.assert_bool(local[COL_IS_LUI]);
-
-        // is_lui implies is_real. Future sub-slices upgrade this to
-        // `is_lui + is_addi + ... = is_real` (a sum over all
-        // real-opcode sub-selectors).
-        let is_lui: AB::Expr = local[COL_IS_LUI].into();
-        let one_minus_is_real: AB::Expr =
-            AB::Expr::from(AB::F::ONE) - AB::Expr::from(local[COL_IS_REAL]);
-        builder.assert_zero(is_lui.clone() * one_minus_is_real);
-
-        // rd_idx = insn[11:7] decoded from the bit columns.
-        let rd_idx_expr: AB::Expr = AB::Expr::from(local[COL_B0_BITS_START + 7])
-            + AB::Expr::from(AB::F::from_u64(2)) * AB::Expr::from(local[COL_B1_BITS_START])
-            + AB::Expr::from(AB::F::from_u64(4)) * AB::Expr::from(local[COL_B1_BITS_START + 1])
-            + AB::Expr::from(AB::F::from_u64(8)) * AB::Expr::from(local[COL_B1_BITS_START + 2])
-            + AB::Expr::from(AB::F::from_u64(16)) * AB::Expr::from(local[COL_B1_BITS_START + 3]);
-        builder.assert_eq(local[COL_RD_IDX], rd_idx_expr);
-
-        // Opcode check: low 7 bits of b0 equal LUI_OPCODE.
-        let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
-            - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
-        let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(LUI_OPCODE)));
-        builder.assert_zero(is_lui.clone() * (b0_low_7 - opcode_target));
-
-        // PC: next_pc = pc + 4 for LUI (straight-line execution).
-        let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
-        let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
-        builder.assert_zero(is_lui.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
-
-        // rd_val = imm20 << 12 = b1[7:4] * 2^12 + b2 * 2^16 + b3 * 2^24.
-        let rd_val_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(4096))
-            * AB::Expr::from(local[COL_B1_BITS_START + 4])
-            + AB::Expr::from(AB::F::from_u64(8192)) * AB::Expr::from(local[COL_B1_BITS_START + 5])
-            + AB::Expr::from(AB::F::from_u64(16384)) * AB::Expr::from(local[COL_B1_BITS_START + 6])
-            + AB::Expr::from(AB::F::from_u64(32768)) * AB::Expr::from(local[COL_B1_BITS_START + 7])
-            + AB::Expr::from(AB::F::from_u64(65536)) * AB::Expr::from(local[COL_B2])
-            + AB::Expr::from(AB::F::from_u64(16_777_216)) * AB::Expr::from(local[COL_B3]);
-        builder.assert_zero(is_lui * (AB::Expr::from(local[COL_RD_VAL]) - rd_val_expr));
-
-        // -------- Slice 3: register file --------
-
-        // x0 is hardwired to zero on every row.
-        builder.assert_zero(local[COL_REG_START]);
-
-        // First row: registers x1..x31 start at zero.
-        for j in 1..NUM_REGS {
-            builder
-                .when_first_row()
-                .assert_zero(local[COL_REG_START + j]);
-        }
-
-        // Write indicators are boolean.
-        for j in 0..NUM_REGS {
-            builder.assert_bool(local[COL_WI_START + j]);
-        }
-
-        // Sum of write indicators equals is_real. Combined with the
-        // boolean constraint above, real rows write exactly one
-        // register; padding rows write none.
-        let mut wi_sum: AB::Expr = AB::Expr::from(AB::F::ZERO);
-        for j in 0..NUM_REGS {
-            wi_sum += AB::Expr::from(local[COL_WI_START + j]);
-        }
-        builder.assert_eq(wi_sum, AB::Expr::from(local[COL_IS_REAL]));
-
-        // Each write indicator agrees with `rd_idx`:
-        // `wi_j * (rd_idx - j) = 0`. Together with the sum constraint
-        // this forces `wi_j = 1` iff `is_real = 1 ∧ rd_idx = j`.
-        for j in 0..NUM_REGS {
-            let j_u64 = u64::try_from(j).expect("register index fits in u64");
-            let rd_idx_minus_j: AB::Expr =
-                AB::Expr::from(local[COL_RD_IDX]) - AB::Expr::from(AB::F::from_u64(j_u64));
-            builder.assert_zero(AB::Expr::from(local[COL_WI_START + j]) * rd_idx_minus_j);
-        }
-
-        // Register transitions for `j` in `[1, 32)`:
-        // `next.r_j = (1 - wi_j) * local.r_j + wi_j * rd_val`. The
-        // x0-pinned constraint above already forces row 0's `r_0 = 0`
-        // and every row's `r_0 = 0`, so no transition rule is needed
-        // for register 0.
-        for j in 1..NUM_REGS {
-            let wi: AB::Expr = local[COL_WI_START + j].into();
-            let one_minus_wi: AB::Expr = AB::Expr::from(AB::F::ONE) - wi.clone();
-            let updated: AB::Expr = one_minus_wi * AB::Expr::from(local[COL_REG_START + j])
-                + wi * AB::Expr::from(local[COL_RD_VAL]);
-            builder
-                .when_transition()
-                .assert_eq(next[COL_REG_START + j], updated);
-        }
+            .assert_eq(next[COL_REG_START + j], updated);
     }
+}
+
+/// Slice 4: bit decomposition of `b2` / `b3`, `rs1_idx` and `imm`
+/// decoding, the `rs1` read indicators, and the ADDI active rules
+/// (opcode, funct3, PC, `rd_val = rs1_val + imm`). The family
+/// aggregate `is_real = is_lui + is_addi` lives here so each new
+/// opcode family can extend it incrementally.
+fn eval_high_bytes_and_addi<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    // Booleans for the 16 new bit columns covering b2 and b3.
+    for offset in 0..8 {
+        builder.assert_bool(local[COL_B2_BITS_START + offset]);
+        builder.assert_bool(local[COL_B3_BITS_START + offset]);
+    }
+
+    // Byte sums: b_k = sum of bit_i * 2^i.
+    let b2_sum = byte_from_bits::<AB>(local, COL_B2_BITS_START);
+    builder.assert_eq(local[COL_B2], b2_sum);
+    let b3_sum = byte_from_bits::<AB>(local, COL_B3_BITS_START);
+    builder.assert_eq(local[COL_B3], b3_sum);
+
+    // is_addi boolean.
+    builder.assert_bool(local[COL_IS_ADDI]);
+    let is_addi: AB::Expr = local[COL_IS_ADDI].into();
+    let is_lui: AB::Expr = local[COL_IS_LUI].into();
+
+    // Family aggregate: `is_real = is_lui + is_addi`. This replaces
+    // slice 2's weaker `is_lui ⇒ is_real`; future sub-slices grow the
+    // right-hand side to include every other real-opcode sub-selector.
+    builder.assert_eq(AB::Expr::from(local[COL_IS_REAL]), is_lui + is_addi.clone());
+
+    // rs1_idx = insn[19:15] decoded from the bit columns.
+    let rs1_idx_expr: AB::Expr = AB::Expr::from(local[COL_B1_BITS_START + 7])
+        + AB::Expr::from(AB::F::from_u64(2)) * AB::Expr::from(local[COL_B2_BITS_START])
+        + AB::Expr::from(AB::F::from_u64(4)) * AB::Expr::from(local[COL_B2_BITS_START + 1])
+        + AB::Expr::from(AB::F::from_u64(8)) * AB::Expr::from(local[COL_B2_BITS_START + 2])
+        + AB::Expr::from(AB::F::from_u64(16)) * AB::Expr::from(local[COL_B2_BITS_START + 3]);
+    builder.assert_eq(local[COL_RS1_IDX], rs1_idx_expr);
+
+    // imm = I-type sign-extended 12-bit immediate.
+    //   imm[3:0]  = b2[7:4]    → b2_bit_4 + 2*b2_bit_5 + 4*b2_bit_6 + 8*b2_bit_7
+    //   imm[11:4] = b3[7:0]    → b3 << 4
+    //   sign      = b3_bit_7   → subtract 4096 to two's complement extend
+    let imm_low_nibble: AB::Expr = AB::Expr::from(local[COL_B2_BITS_START + 4])
+        + AB::Expr::from(AB::F::from_u64(2)) * AB::Expr::from(local[COL_B2_BITS_START + 5])
+        + AB::Expr::from(AB::F::from_u64(4)) * AB::Expr::from(local[COL_B2_BITS_START + 6])
+        + AB::Expr::from(AB::F::from_u64(8)) * AB::Expr::from(local[COL_B2_BITS_START + 7]);
+    let imm_expr: AB::Expr = imm_low_nibble
+        + AB::Expr::from(AB::F::from_u64(16)) * AB::Expr::from(local[COL_B3])
+        - AB::Expr::from(AB::F::from_u64(4096)) * AB::Expr::from(local[COL_B3_BITS_START + 7]);
+    builder.assert_eq(local[COL_IMM], imm_expr);
+
+    // Read indicators are boolean.
+    for j in 0..NUM_REGS {
+        builder.assert_bool(local[COL_RS1_IND_START + j]);
+    }
+
+    // Sum of read indicators equals the total `rs1`-reading family.
+    // Slice 4 has only ADDI; future families add to this right-hand
+    // side.
+    let mut ri_sum: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    for j in 0..NUM_REGS {
+        ri_sum += AB::Expr::from(local[COL_RS1_IND_START + j]);
+    }
+    builder.assert_eq(ri_sum, is_addi.clone());
+
+    // Each read indicator agrees with `rs1_idx`. Mirror of the
+    // write-indicator construction in slice 3.
+    for j in 0..NUM_REGS {
+        let j_u64 = u64::try_from(j).expect("register index fits in u64");
+        let rs1_idx_minus_j: AB::Expr =
+            AB::Expr::from(local[COL_RS1_IDX]) - AB::Expr::from(AB::F::from_u64(j_u64));
+        builder.assert_zero(AB::Expr::from(local[COL_RS1_IND_START + j]) * rs1_idx_minus_j);
+    }
+
+    // Read value matches the indexed register file column. Combined
+    // with the sum and index-match constraints above, this forces
+    // `rs1_val = r_{rs1_idx}` whenever the family sum on the right
+    // is 1.
+    for j in 0..NUM_REGS {
+        let diff: AB::Expr =
+            AB::Expr::from(local[COL_RS1_VAL]) - AB::Expr::from(local[COL_REG_START + j]);
+        builder.assert_zero(AB::Expr::from(local[COL_RS1_IND_START + j]) * diff);
+    }
+
+    // ADDI active constraints. Opcode = 0x13 (OP-IMM).
+    let opimm_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(OP_IMM_OPCODE)));
+    let b0_low_7_for_addi: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    builder.assert_zero(is_addi.clone() * (b0_low_7_for_addi - opimm_target));
+
+    // funct3 = 000 selects ADDI within OP-IMM. funct3 occupies bits
+    // 12..14 of insn, which is b1_bit_4..b1_bit_6.
+    builder.assert_zero(is_addi.clone() * AB::Expr::from(local[COL_B1_BITS_START + 4]));
+    builder.assert_zero(is_addi.clone() * AB::Expr::from(local[COL_B1_BITS_START + 5]));
+    builder.assert_zero(is_addi.clone() * AB::Expr::from(local[COL_B1_BITS_START + 6]));
+
+    // PC: ADDI is straight-line.
+    let four_addi: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
+    let pc_plus_four_addi: AB::Expr = AB::Expr::from(local[COL_PC]) + four_addi;
+    builder.assert_zero(is_addi.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four_addi));
+
+    // `rd_val = rs1_val + imm` in field arithmetic. M8-L will turn
+    // this into a byte-decomposed u32 wrap.
+    let sum_expr: AB::Expr = AB::Expr::from(local[COL_RS1_VAL]) + AB::Expr::from(local[COL_IMM]);
+    builder.assert_zero(is_addi * (AB::Expr::from(local[COL_RD_VAL]) - sum_expr));
 }
 
 /// Build the polynomial `Σ_{i=0..8} bit_i * 2^i` referencing the eight
@@ -448,25 +647,27 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// Build a [`CpuAir`] trace from a sequence of real instruction
 /// executions.
 ///
-/// At M8-H slice 3 every entry of `program` is treated as a LUI
-/// instruction: the trace builder sets `is_lui = 1` for every real
-/// row, computes `rd_idx`, `rd_val`, and the bit decomposition from
-/// `insn`, materialises the on-trace register file row by row, and
-/// sets the corresponding write indicator. A malformed encoding
-/// (wrong opcode bits, wrong `rd_val`, etc.) is caught by the AIR
-/// during proving.
+/// At M8-H slice 4 the trace builder dispatches on the encoded
+/// opcode (and funct3 for OP-IMM): LUI rows set `is_lui = 1` and
+/// derive `rd_val = imm20 << 12`; ADDI rows set `is_addi = 1`, read
+/// the source register from the running state into `rs1_val`, decode
+/// the sign-extended I-type immediate into `imm`, and write
+/// `rd_val = rs1_val + imm` in BabyBear field arithmetic. The
+/// builder maintains a running `[F; 32]` register state across rows;
+/// a malformed encoding is caught by the AIR rather than the builder.
 ///
 /// Real rows fill from `program` in order; the remaining rows up to
 /// [`cpu_trace_height`] are padding rows holding the PC at the halt
 /// address (the `next_pc` of the last real instruction, or
 /// `pc_base` if the program is empty). Padding rows freeze the
 /// register file: every padding row carries the register state at
-/// the time of halt and sets no write indicator.
+/// the time of halt and sets no write or read indicator.
 ///
 /// # Panics
 ///
-/// Panics if `pc_base` is not 4-byte aligned, or if a trace index
-/// does not fit in `u64`.
+/// Panics if `pc_base` is not 4-byte aligned, if a trace index does
+/// not fit in `u64`, or if `program` contains an opcode this slice
+/// does not yet support (anything outside LUI / ADDI).
 #[must_use]
 pub fn cpu_trace<F: Field>(pc_base: u32, program: &[CpuInstruction]) -> RowMajorMatrix<F> {
     assert!(
@@ -480,60 +681,92 @@ pub fn cpu_trace<F: Field>(pc_base: u32, program: &[CpuInstruction]) -> RowMajor
     let halt_pc = program.last().map_or(pc_base, |insn| insn.next_pc);
 
     let mut values = F::zero_vec(height * CPU_TRACE_WIDTH);
-    let mut regs = [0_u32; NUM_REGS];
+    let mut regs: [F; NUM_REGS] = [F::ZERO; NUM_REGS];
     for i in 0..height {
         let base = i * CPU_TRACE_WIDTH;
 
         // Register file at the start of this row (state before
         // executing this row's instruction).
-        for (j, &reg) in regs.iter().enumerate() {
-            values[base + COL_REG_START + j] = F::from_u64(u64::from(reg));
+        for (j, reg) in regs.iter().enumerate() {
+            values[base + COL_REG_START + j] = *reg;
         }
 
-        if let Some(insn) = program.get(i) {
-            values[base + COL_PC] = F::from_u64(u64::from(insn.pc));
-            values[base + COL_NEXT_PC] = F::from_u64(u64::from(insn.next_pc));
-
-            let bytes = insn.insn.to_le_bytes();
-            values[base + COL_B0] = F::from_u64(u64::from(bytes[0]));
-            values[base + COL_B1] = F::from_u64(u64::from(bytes[1]));
-            values[base + COL_B2] = F::from_u64(u64::from(bytes[2]));
-            values[base + COL_B3] = F::from_u64(u64::from(bytes[3]));
-
-            for bit in 0..8 {
-                values[base + COL_B0_BITS_START + bit] =
-                    F::from_u64(u64::from((bytes[0] >> bit) & 1));
-                values[base + COL_B1_BITS_START + bit] =
-                    F::from_u64(u64::from((bytes[1] >> bit) & 1));
-            }
-
-            values[base + COL_IS_REAL] = F::ONE;
-            values[base + COL_IS_LUI] = F::ONE;
-
-            let rd_idx = (insn.insn >> 7) & 0x1F;
-            values[base + COL_RD_IDX] = F::from_u64(u64::from(rd_idx));
-
-            let rd_val = insn.insn & 0xFFFF_F000;
-            values[base + COL_RD_VAL] = F::from_u64(u64::from(rd_val));
-
-            // Write indicator one-hot: wi_{rd_idx} = 1, others stay
-            // zero from `zero_vec`. The indicator is set even when
-            // `rd_idx = 0` so the sum constraint stays one-hot; the
-            // x0-pinned constraint silently drops the write itself.
-            let rd_idx_usize = usize::try_from(rd_idx).expect("rd_idx fits in usize");
-            values[base + COL_WI_START + rd_idx_usize] = F::ONE;
-
-            // Apply the write to the running register state. Skip
-            // `x0` so the trace matches the AIR's x0-pinned rule.
-            if rd_idx != 0 {
-                regs[rd_idx_usize] = rd_val;
-            }
-        } else {
+        let Some(insn) = program.get(i) else {
             values[base + COL_PC] = F::from_u64(u64::from(halt_pc));
             values[base + COL_NEXT_PC] = F::from_u64(u64::from(halt_pc));
             values[base + COL_IS_PAD] = F::ONE;
-            // All other columns (bytes, bits, is_real, is_lui,
-            // rd_idx, rd_val, wi_*) stay F::ZERO from zero_vec.
+            continue;
+        };
+
+        values[base + COL_PC] = F::from_u64(u64::from(insn.pc));
+        values[base + COL_NEXT_PC] = F::from_u64(u64::from(insn.next_pc));
+
+        let bytes = insn.insn.to_le_bytes();
+        values[base + COL_B0] = F::from_u64(u64::from(bytes[0]));
+        values[base + COL_B1] = F::from_u64(u64::from(bytes[1]));
+        values[base + COL_B2] = F::from_u64(u64::from(bytes[2]));
+        values[base + COL_B3] = F::from_u64(u64::from(bytes[3]));
+
+        for bit in 0..8 {
+            values[base + COL_B0_BITS_START + bit] = F::from_u64(u64::from((bytes[0] >> bit) & 1));
+            values[base + COL_B1_BITS_START + bit] = F::from_u64(u64::from((bytes[1] >> bit) & 1));
+            values[base + COL_B2_BITS_START + bit] = F::from_u64(u64::from((bytes[2] >> bit) & 1));
+            values[base + COL_B3_BITS_START + bit] = F::from_u64(u64::from((bytes[3] >> bit) & 1));
+        }
+
+        values[base + COL_IS_REAL] = F::ONE;
+
+        let rd_idx = (insn.insn >> 7) & 0x1F;
+        let rd_idx_usize = usize::try_from(rd_idx).expect("rd_idx fits in usize");
+        values[base + COL_RD_IDX] = F::from_u64(u64::from(rd_idx));
+
+        let rs1_idx = (insn.insn >> 15) & 0x1F;
+        let rs1_idx_usize = usize::try_from(rs1_idx).expect("rs1_idx fits in usize");
+        values[base + COL_RS1_IDX] = F::from_u64(u64::from(rs1_idx));
+
+        // I-type signed immediate decoded for every row. The column
+        // is only used by I-type opcodes; other families just leave
+        // it untouched after the AIR's unconditional decode check.
+        let imm12_unsigned = (insn.insn >> 20) & 0xFFF;
+        let imm_field: F = if imm12_unsigned & 0x800 == 0 {
+            F::from_u64(u64::from(imm12_unsigned))
+        } else {
+            // Negative: two's complement → value = imm12_unsigned - 4096.
+            let magnitude = 4096_u64 - u64::from(imm12_unsigned);
+            -F::from_u64(magnitude)
+        };
+        values[base + COL_IMM] = imm_field;
+
+        let opcode = insn.insn & 0x7F;
+        match opcode {
+            x if x == LUI_OPCODE => {
+                values[base + COL_IS_LUI] = F::ONE;
+                let rd_val = insn.insn & 0xFFFF_F000;
+                let rd_val_field = F::from_u64(u64::from(rd_val));
+                values[base + COL_RD_VAL] = rd_val_field;
+                values[base + COL_WI_START + rd_idx_usize] = F::ONE;
+                if rd_idx != 0 {
+                    regs[rd_idx_usize] = rd_val_field;
+                }
+            }
+            x if x == OP_IMM_OPCODE => {
+                let funct3 = (insn.insn >> 12) & 0x7;
+                assert!(
+                    funct3 == FUNCT3_ADDI,
+                    "cpu_trace: unsupported OP-IMM funct3 {funct3}",
+                );
+                values[base + COL_IS_ADDI] = F::ONE;
+                let rs1_val_field = regs[rs1_idx_usize];
+                values[base + COL_RS1_VAL] = rs1_val_field;
+                values[base + COL_RS1_IND_START + rs1_idx_usize] = F::ONE;
+                let rd_val_field = rs1_val_field + imm_field;
+                values[base + COL_RD_VAL] = rd_val_field;
+                values[base + COL_WI_START + rd_idx_usize] = F::ONE;
+                if rd_idx != 0 {
+                    regs[rd_idx_usize] = rd_val_field;
+                }
+            }
+            _ => panic!("cpu_trace: unsupported opcode 0x{opcode:02X}"),
         }
     }
 
@@ -1007,18 +1240,290 @@ mod tests {
         assert_prover_rejects(pc_base, trace);
     }
 
-    // -------- Slice 1 PC-only tests that don't engage LUI --------
+    // -------- Slice 4 tests (bit decomposition for b2/b3 + ADDI) --------
 
     #[test]
-    fn single_real_instruction_with_nop_proves() {
-        // A non-LUI instruction (NOP) is encoded directly via
-        // `CpuInstruction::straight`. The trace builder marks it as
-        // LUI because slice 2 only supports the LUI family; the AIR
-        // then rejects it on opcode mismatch. This test asserts that
-        // behaviour: the prover refuses a non-LUI insn presented as a
-        // real row.
+    fn addi_constructor_encodes_canonical_bytes() {
+        // `addi x5, x3, 100` → imm12 = 0x064, rs1 = 3, rd = 5, opcode = 0x13.
+        // insn = (0x064 << 20) | (3 << 15) | (5 << 7) | 0x13
+        //      = 0x0640_0000 | 0x0001_8000 | 0x0000_0280 | 0x13
+        //      = 0x0641_8293
+        let insn = CpuInstruction::addi(0x10000, 5, 3, 100);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10004);
+        assert_eq!(insn.insn, 0x0641_8293);
+    }
+
+    #[test]
+    fn addi_constructor_encodes_negative_immediate() {
+        // `addi x5, x0, -1` → imm12 = 0xFFF (two's complement of -1).
+        // insn = (0xFFF << 20) | (0 << 15) | (5 << 7) | 0x13
+        //      = 0xFFF0_0000 | 0x0000_0000 | 0x0000_0280 | 0x13
+        //      = 0xFFF0_0293
+        let insn = CpuInstruction::addi(0x10000, 5, 0, -1);
+        assert_eq!(insn.insn, 0xFFF0_0293);
+    }
+
+    #[test]
+    #[should_panic(expected = "rd must be in [0, 31]")]
+    fn addi_constructor_panics_on_oob_rd() {
+        let _ = CpuInstruction::addi(0x10000, 32, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "rs1 must be in [0, 31]")]
+    fn addi_constructor_panics_on_oob_rs1() {
+        let _ = CpuInstruction::addi(0x10000, 0, 32, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "imm12 must be in [-2048, 2047]")]
+    fn addi_constructor_panics_on_oob_positive_immediate() {
+        let _ = CpuInstruction::addi(0x10000, 0, 0, 2048);
+    }
+
+    #[test]
+    #[should_panic(expected = "imm12 must be in [-2048, 2047]")]
+    fn addi_constructor_panics_on_oob_negative_immediate() {
+        let _ = CpuInstruction::addi(0x10000, 0, 0, -2049);
+    }
+
+    #[test]
+    fn nop_proves_as_addi_x0_x0_0() {
+        // RV32I NOP is canonically `addi x0, x0, 0`; slice 4 now
+        // implements that family, so NOP should prove.
         let pc_base = 0x10000;
         let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::straight(pc_base, NOP)]);
+        let air = CpuAir::new(pc_base);
+        let config = build_stark_config();
+        let proof = prove(&config, &air, trace, &[]);
+        verify(&config, &air, &proof, &[]).expect("NOP proof verifies");
+    }
+
+    #[test]
+    fn addi_writes_destination_register_at_next_row() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 100)]);
+
+        // Row 0: r5 = 0 (state before ADDI).
+        assert_eq!(trace.values[COL_REG_START + 5], Val::ZERO);
+
+        // Row 0 decoded fields.
+        assert_eq!(trace.values[COL_RS1_IDX], Val::ZERO);
+        assert_eq!(trace.values[COL_RS1_VAL], Val::ZERO);
+        assert_eq!(trace.values[COL_IMM], Val::from_u64(100));
+        assert_eq!(trace.values[COL_RD_IDX], Val::from_u64(5));
+        assert_eq!(trace.values[COL_RD_VAL], Val::from_u64(100));
+        assert_eq!(trace.values[COL_IS_REAL], Val::ONE);
+        assert_eq!(trace.values[COL_IS_ADDI], Val::ONE);
+        assert_eq!(trace.values[COL_IS_LUI], Val::ZERO);
+
+        // Row 1: r5 = 100 (state after ADDI).
+        let row1 = CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row1 + COL_REG_START + 5], Val::from_u64(100));
+    }
+
+    #[test]
+    fn addi_with_negative_immediate_decodes_to_neg_field_value() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, -7)]);
+        // imm field value = -7 in BabyBear = p - 7.
+        assert_eq!(trace.values[COL_IMM], -Val::from_u64(7));
+        // rd_val = rs1_val + imm = 0 + (-7) = -7 in field.
+        assert_eq!(trace.values[COL_RD_VAL], -Val::from_u64(7));
+    }
+
+    #[test]
+    fn read_indicator_is_one_hot_for_rs1() {
+        let pc_base = 0x10000;
+        // LUI to set r3 first, then ADDI reading r3.
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 3, 0x000FF),
+                CpuInstruction::addi(pc_base + 4, 5, 3, 1),
+            ],
+        );
+        // Row 1 (the ADDI row): ri_3 = 1, others = 0.
+        let row1 = CPU_TRACE_WIDTH;
+        for j in 0..NUM_REGS {
+            let expected = if j == 3 { Val::ONE } else { Val::ZERO };
+            assert_eq!(trace.values[row1 + COL_RS1_IND_START + j], expected);
+        }
+    }
+
+    #[test]
+    fn addi_reads_previously_written_register() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                // r3 = 0xFF000 (LUI puts 0xFF000 << 12 = 0xFF000000 there;
+                // pick a smaller LUI so subsequent ADDI stays below modulus).
+                CpuInstruction::lui(pc_base, 3, 0x00010),
+                // r5 = r3 + 5 = 0x10005.
+                CpuInstruction::addi(pc_base + 4, 5, 3, 5),
+                // r5 = r5 + (-5) = 0x10000.
+                CpuInstruction::addi(pc_base + 8, 5, 5, -5),
+            ],
+        );
+    }
+
+    #[test]
+    fn addi_chain_proves() {
+        let pc_base = 0x10000;
+        // Increment r1 by 1 four times: r1 = 4 at the end.
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 1, 1),
+                CpuInstruction::addi(pc_base + 4, 1, 1, 1),
+                CpuInstruction::addi(pc_base + 8, 1, 1, 1),
+                CpuInstruction::addi(pc_base + 12, 1, 1, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn addi_with_rd_zero_does_not_modify_x0() {
+        let pc_base = 0x10000;
+        prove_and_verify(pc_base, &[CpuInstruction::addi(pc_base, 0, 0, 1234)]);
+    }
+
+    #[test]
+    fn mixed_lui_and_addi_program_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 1, 0x00010),
+                CpuInstruction::addi(pc_base + 4, 2, 1, 256),
+                CpuInstruction::lui(pc_base + 8, 3, 0x00020),
+                CpuInstruction::addi(pc_base + 12, 4, 3, -1),
+            ],
+        );
+    }
+
+    #[test]
+    fn trace_decodes_b2_b3_bits_correctly() {
+        let pc_base = 0x10000;
+        // ADDI x5, x3, 100 → insn = 0x06418293
+        // b2 = 0x41 = 0100_0001, b3 = 0x06 = 0000_0110.
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 3, 100)]);
+        assert_eq!(trace.values[COL_B2], Val::from_u64(0x41));
+        assert_eq!(trace.values[COL_B3], Val::from_u64(0x06));
+        let b2_bits = [1, 0, 0, 0, 0, 0, 1, 0];
+        let b3_bits = [0, 1, 1, 0, 0, 0, 0, 0];
+        for (i, expected) in b2_bits.iter().enumerate() {
+            assert_eq!(
+                trace.values[COL_B2_BITS_START + i],
+                Val::from_u64(*expected),
+                "b2 bit {i}",
+            );
+        }
+        for (i, expected) in b3_bits.iter().enumerate() {
+            assert_eq!(
+                trace.values[COL_B3_BITS_START + i],
+                Val::from_u64(*expected),
+                "b3 bit {i}",
+            );
+        }
+    }
+
+    #[test]
+    fn prover_refuses_addi_with_wrong_opcode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 100)]);
+        // Flip b0_bit_0 (opcode becomes 0x12 instead of 0x13).
+        trace.values[COL_B0_BITS_START] = Val::ZERO;
+        // Compensate b0 so the byte-sum constraint still holds.
+        let original_b0 = trace.values[COL_B0];
+        trace.values[COL_B0] = original_b0 - Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_addi_with_wrong_rs1_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 3, 0x10),
+                CpuInstruction::addi(pc_base + 4, 5, 3, 1),
+            ],
+        );
+        // Row 1's rs1_val should equal r3 (which is 0x10000); tamper.
+        trace.values[CPU_TRACE_WIDTH + COL_RS1_VAL] = Val::from_u64(0xDEAD);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_addi_with_wrong_rd_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 100)]);
+        trace.values[COL_RD_VAL] = Val::from_u64(101);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_addi_with_nonzero_funct3() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 100)]);
+        // funct3 lives at b1_bit_4..b1_bit_6 (insn bits 12..14).
+        // ADDI requires funct3 = 000; force a 1 in b1_bit_4.
+        trace.values[COL_B1_BITS_START + 4] = Val::ONE;
+        // Re-balance b1 so the byte-sum constraint still passes.
+        trace.values[COL_B1] += Val::from_u64(16);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_wrong_imm_decoding() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 100)]);
+        // The decoded immediate must equal 100; force it to 7.
+        trace.values[COL_IMM] = Val::from_u64(7);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_wrong_rs1_idx() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 3, 100)]);
+        // Decoded rs1_idx should be 3; force it to 7.
+        trace.values[COL_RS1_IDX] = Val::from_u64(7);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_addi_with_wrong_next_pc() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 1)]);
+        trace.values[COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
+        // Keep the transition consistent so we isolate the ADDI rule.
+        trace.values[CPU_TRACE_WIDTH + COL_PC] = Val::from_u64(u64::from(pc_base) + 8);
+        trace.values[CPU_TRACE_WIDTH + COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_lui_and_is_addi_both_set() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0x10)]);
+        // Force is_addi = 1 while is_lui = 1; the family-aggregate
+        // constraint `is_real = is_lui + is_addi` fails because the
+        // RHS becomes 2.
+        trace.values[COL_IS_ADDI] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_read_indicator_without_real_read() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0x10)]);
+        // LUI does not read rs1; setting a read indicator on a LUI
+        // row violates the sum constraint `Σ ri_j = is_addi = 0`.
+        trace.values[COL_RS1_IND_START + 3] = Val::ONE;
         assert_prover_rejects(pc_base, trace);
     }
 }

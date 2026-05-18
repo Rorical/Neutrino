@@ -47,7 +47,7 @@
 //! field. Both families are deferred to a later M8-H pass that
 //! lands after M8-L's range tables and lookup bus are wired in.
 //! Subsequent sub-slices proceed with the families that work
-//! without u32 wraparound (JAL, JALR, BEQ, BNE, FENCE,
+//! without u32 wraparound (JALR, BEQ, BNE, FENCE,
 //! ECALL, EBREAK).
 //!
 //! ## Trace layout
@@ -207,13 +207,12 @@
 //!
 //! ## What this slice does NOT yet constrain
 //!
-//! - **u32-wrapping arithmetic.** Slice 4 computes
-//!   `rd_val = rs1_val + imm` in BabyBear field arithmetic. This
-//!   matches u32 semantics exactly for sums below the BabyBear
-//!   modulus (`~2.01 × 10^9`); for larger sums the field reduction
-//!   differs from the desired `mod 2^32` wrap. M8-L's byte
-//!   decomposition + carry argument will pin true u32 semantics.
-//!   ADDI tests in this slice stay below the modulus.
+//! - **Full `u32` register and PC semantics.** This standalone CPU AIR
+//!   stores PCs and registers in one BabyBear cell, so honest trace
+//!   construction rejects rows whose PCs or destination values would
+//!   reach the BabyBear modulus. The local constraints are still field
+//!   equations; M8-L's byte decomposition + carry/range argument will
+//!   pin full `mod 2^32` RV32 semantics.
 //! - **Other instruction families.** Each later sub-slice adds an
 //!   `is_<family>` selector with its own decode and semantics
 //!   constraints, and updates the family-aggregate sum.
@@ -242,7 +241,7 @@ use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
 
-use crate::config::FRI_LOG_FINAL_POLY_LEN;
+use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
@@ -254,6 +253,12 @@ pub const NUM_REGS: usize = 32;
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
 pub const CPU_TRACE_WIDTH: usize = COL_IS_JAL + 1;
+
+/// BabyBear modulus as a `u32`, used in `const fn` guards.
+const BABY_BEAR_MODULUS_U32: u32 = 0x7800_0001;
+
+/// Conservative U-type immediate cap enforced without lookup columns.
+const MAX_BABYBEAR_NATIVE_U_IMM20: u32 = 0x77FFF;
 
 const COL_PC: usize = 0;
 const COL_NEXT_PC: usize = 1;
@@ -348,15 +353,31 @@ impl CpuInstruction {
     /// Panics if `pc.checked_add(4)` overflows `u32`.
     #[must_use]
     pub const fn straight(pc: u32, insn: u32) -> Self {
+        assert!(
+            pc < BABY_BEAR_MODULUS_U32,
+            "CpuInstruction::straight: pc must fit below the BabyBear modulus"
+        );
         let Some(next_pc) = pc.checked_add(4) else {
             panic!("CpuInstruction::straight: pc + 4 overflows u32");
         };
+        assert!(
+            next_pc < BABY_BEAR_MODULUS_U32,
+            "CpuInstruction::straight: next_pc must fit below the BabyBear modulus"
+        );
         Self { pc, next_pc, insn }
     }
 
     /// Construct an instruction with an explicit `next_pc` target.
     #[must_use]
     pub const fn jump(pc: u32, insn: u32, target: u32) -> Self {
+        assert!(
+            pc < BABY_BEAR_MODULUS_U32,
+            "CpuInstruction::jump: pc must fit below the BabyBear modulus"
+        );
+        assert!(
+            target < BABY_BEAR_MODULUS_U32,
+            "CpuInstruction::jump: target must fit below the BabyBear modulus"
+        );
         Self {
             pc,
             next_pc: target,
@@ -381,7 +402,16 @@ impl CpuInstruction {
             imm20 < 1 << 20,
             "CpuInstruction::lui: imm20 must fit in 20 bits"
         );
-        let insn = (imm20 << 12) | (rd << 7) | LUI_OPCODE;
+        assert!(
+            imm20 <= MAX_BABYBEAR_NATIVE_U_IMM20,
+            "CpuInstruction::lui: imm20 exceeds the BabyBear-native U-type bound"
+        );
+        let rd_val = imm20 << 12;
+        assert!(
+            rd_val < BABY_BEAR_MODULUS_U32,
+            "CpuInstruction::lui: rd_val must fit below the BabyBear modulus"
+        );
+        let insn = rd_val | (rd << 7) | LUI_OPCODE;
         Self::straight(pc, insn)
     }
 
@@ -403,7 +433,19 @@ impl CpuInstruction {
             imm20 < 1 << 20,
             "CpuInstruction::auipc: imm20 must fit in 20 bits"
         );
-        let insn = (imm20 << 12) | (rd << 7) | AUIPC_OPCODE;
+        assert!(
+            imm20 <= MAX_BABYBEAR_NATIVE_U_IMM20,
+            "CpuInstruction::auipc: imm20 exceeds the BabyBear-native U-type bound"
+        );
+        let imm_shifted = imm20 << 12;
+        let Some(rd_val) = pc.checked_add(imm_shifted) else {
+            panic!("CpuInstruction::auipc: pc + immediate overflows u32");
+        };
+        assert!(
+            rd_val < BABY_BEAR_MODULUS_U32,
+            "CpuInstruction::auipc: rd_val must fit below the BabyBear modulus"
+        );
+        let insn = imm_shifted | (rd << 7) | AUIPC_OPCODE;
         Self::straight(pc, insn)
     }
 
@@ -583,6 +625,10 @@ impl CpuAir {
             pc_base.trailing_zeros() >= 2,
             "CpuAir::new: pc_base must be 4-byte aligned"
         );
+        assert!(
+            pc_base < BABY_BEAR_MODULUS_U32,
+            "CpuAir::new: pc_base must fit below the BabyBear modulus"
+        );
         Self { pc_base }
     }
 
@@ -694,6 +740,8 @@ fn eval_low_bytes_and_lui<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
     let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
     builder.assert_zero(is_lui.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
+
+    eval_u_type_shifted_immediate_bound::<AB>(builder, local, is_lui.clone());
 
     // rd_val = imm20 << 12 = b1[7:4] * 2^12 + b2 * 2^16 + b3 * 2^24.
     let rd_val_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(4096))
@@ -988,6 +1036,8 @@ fn eval_auipc<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
     builder.assert_zero(is_auipc.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
 
+    eval_u_type_shifted_immediate_bound::<AB>(builder, local, is_auipc.clone());
+
     // rd_val = pc + (imm20 << 12), where the U-type shifted
     // immediate matches LUI's expression:
     //   imm20 << 12 = b1[7:4]·2^12 + b2·2^16 + b3·2^24.
@@ -1000,6 +1050,25 @@ fn eval_auipc<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
         + AB::Expr::from(AB::F::from_u64(16_777_216)) * AB::Expr::from(local[COL_B3]);
     let rd_val_expr: AB::Expr = AB::Expr::from(local[COL_PC]) + imm_shifted;
     builder.assert_zero(is_auipc * (AB::Expr::from(local[COL_RD_VAL]) - rd_val_expr));
+}
+
+/// Constrain a U-type shifted immediate to the BabyBear-native subset.
+///
+/// The shifted immediate is `b3:b2:b1[7:4]:000`. Requiring `b3 <= 0x77`
+/// is a local, lookup-free sufficient condition for the whole value to
+/// be below the BabyBear modulus. M8-L's byte-range/carry work will
+/// replace this conservative bound with full RV32 `u32` semantics.
+fn eval_u_type_shifted_immediate_bound<AB: AirBuilder>(
+    builder: &mut AB,
+    local: &[AB::Var],
+    selector: AB::Expr,
+) {
+    builder.assert_zero(selector.clone() * AB::Expr::from(local[COL_B3_BITS_START + 7]));
+    let forbidden_0x78_to_0x7f: AB::Expr = AB::Expr::from(local[COL_B3_BITS_START + 6])
+        * AB::Expr::from(local[COL_B3_BITS_START + 5])
+        * AB::Expr::from(local[COL_B3_BITS_START + 4])
+        * AB::Expr::from(local[COL_B3_BITS_START + 3]);
+    builder.assert_zero(selector * forbidden_0x78_to_0x7f);
 }
 
 /// Slice 7: JAL. Decodes the signed J-type offset, transfers control
@@ -1109,16 +1178,17 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// Build a [`CpuAir`] trace from a sequence of real instruction
 /// executions.
 ///
-/// At M8-H slice 5 the trace builder dispatches on the encoded
+/// At M8-H slice 7 the trace builder dispatches on the encoded
 /// opcode (and funct3 for OP-IMM): LUI rows set `is_lui = 1` and
 /// derive `rd_val = imm20 << 12`; OP-IMM rows set the relevant
 /// `is_<op>` selector, read the source register from the running
 /// state into `rs1_val`, decode the sign-extended I-type immediate
 /// into `imm`, and compute `rd_val` via the per-op rule (field
 /// addition for ADDI; bit-by-bit reconstruction for ANDI / ORI /
-/// XORI). The builder maintains a running `[F; 32]` register state
-/// across rows; a malformed encoding is caught by the AIR rather
-/// than the builder.
+/// XORI), AUIPC rows add the shifted U-type immediate to `pc`, and JAL
+/// rows write the link address. The builder maintains a running exact
+/// BabyBear-native register state across rows; a malformed encoding is
+/// caught by the AIR rather than the builder.
 ///
 /// Every row's `rs1_val` cell is populated from
 /// `regs[rs1_idx_usize]`, and the 32 `rs1_bit_*` cells from its
@@ -1135,9 +1205,10 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 ///
 /// # Panics
 ///
-/// Panics if `pc_base` is not 4-byte aligned, if a trace index does
-/// not fit in `u64`, or if `program` contains an opcode this slice
-/// does not yet support (anything outside LUI, ADDI, ANDI, ORI,
+/// Panics if `pc_base`, any instruction PC / next PC, or any computed
+/// destination value would alias in BabyBear; if a trace index does not
+/// fit in `u64`; or if `program` contains an opcode this slice does not
+/// yet support (anything outside LUI, AUIPC, JAL, ADDI, ANDI, ORI,
 /// XORI).
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -1146,6 +1217,7 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
         pc_base.trailing_zeros() >= 2,
         "cpu_trace: pc_base must be 4-byte aligned"
     );
+    assert_babybear_native_u32("cpu_trace: pc_base", pc_base);
 
     let real_rows = program.len();
     let height = cpu_trace_height(real_rows);
@@ -1153,14 +1225,14 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
     let halt_pc = program.last().map_or(pc_base, |insn| insn.next_pc);
 
     let mut values = F::zero_vec(height * CPU_TRACE_WIDTH);
-    let mut regs: [F; NUM_REGS] = [F::ZERO; NUM_REGS];
+    let mut regs: [u32; NUM_REGS] = [0; NUM_REGS];
     for i in 0..height {
         let base = i * CPU_TRACE_WIDTH;
 
         // Register file at the start of this row (state before
         // executing this row's instruction).
         for (j, reg) in regs.iter().enumerate() {
-            values[base + COL_REG_START + j] = *reg;
+            values[base + COL_REG_START + j] = F::from_u64(u64::from(*reg));
         }
 
         let Some(insn) = program.get(i) else {
@@ -1172,6 +1244,8 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
 
         values[base + COL_PC] = F::from_u64(u64::from(insn.pc));
         values[base + COL_NEXT_PC] = F::from_u64(u64::from(insn.next_pc));
+        assert_babybear_native_u32("cpu_trace: instruction pc", insn.pc);
+        assert_babybear_native_u32("cpu_trace: instruction next_pc", insn.next_pc);
 
         let bytes = insn.insn.to_le_bytes();
         values[base + COL_B0] = F::from_u64(u64::from(bytes[0]));
@@ -1200,9 +1274,9 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
         // bit-sum constraint holds on every row. LUI / padding rows
         // never set a read indicator, so the value is unused by the
         // AIR's read-match constraints.
-        let rs1_val_field: F = regs[rs1_idx_usize];
+        let rs1_val_u32 = regs[rs1_idx_usize];
+        let rs1_val_field = F::from_u64(u64::from(rs1_val_u32));
         values[base + COL_RS1_VAL] = rs1_val_field;
-        let rs1_val_u32 = rs1_val_field.as_canonical_u32();
         for bit in 0..32 {
             values[base + COL_RS1_BIT_START + bit] =
                 F::from_u64(u64::from((rs1_val_u32 >> bit) & 1));
@@ -1231,62 +1305,72 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
         match opcode {
             x if x == LUI_OPCODE => {
                 values[base + COL_IS_LUI] = F::ONE;
-                let rd_val = insn.insn & 0xFFFF_F000;
-                let rd_val_field = F::from_u64(u64::from(rd_val));
+                let rd_val_u32 = insn.insn & 0xFFFF_F000;
+                assert_u_type_imm20_babybear_native("cpu_trace: LUI imm20", insn.insn >> 12);
+                assert_babybear_native_u32("cpu_trace: LUI rd_val", rd_val_u32);
+                let rd_val_field = F::from_u64(u64::from(rd_val_u32));
                 values[base + COL_RD_VAL] = rd_val_field;
                 values[base + COL_WI_START + rd_idx_usize] = F::ONE;
                 if rd_idx != 0 {
-                    regs[rd_idx_usize] = rd_val_field;
+                    regs[rd_idx_usize] = rd_val_u32;
                 }
             }
             x if x == AUIPC_OPCODE => {
                 values[base + COL_IS_AUIPC] = F::ONE;
                 let imm_shifted = insn.insn & 0xFFFF_F000;
-                // rd_val = pc + (imm20 << 12), computed in field
-                // arithmetic. M8-L will pin u32 wrapping.
-                let rd_val_field =
-                    F::from_u64(u64::from(insn.pc)) + F::from_u64(u64::from(imm_shifted));
+                assert_u_type_imm20_babybear_native("cpu_trace: AUIPC imm20", insn.insn >> 12);
+                let rd_val_u64 = u64::from(insn.pc) + u64::from(imm_shifted);
+                assert_babybear_native_u64("cpu_trace: AUIPC rd_val", rd_val_u64);
+                let rd_val_u32 = u32::try_from(rd_val_u64).expect("AUIPC rd_val fits in u32");
+                let rd_val_field = F::from_u64(u64::from(rd_val_u32));
                 values[base + COL_RD_VAL] = rd_val_field;
                 values[base + COL_WI_START + rd_idx_usize] = F::ONE;
                 if rd_idx != 0 {
-                    regs[rd_idx_usize] = rd_val_field;
+                    regs[rd_idx_usize] = rd_val_u32;
                 }
             }
             x if x == JAL_OPCODE => {
                 values[base + COL_IS_JAL] = F::ONE;
-                let rd_val_field = F::from_u64(u64::from(insn.pc) + 4);
+                let rd_val_u32 = insn
+                    .pc
+                    .checked_add(4)
+                    .expect("cpu_trace: JAL link address overflows u32");
+                assert_babybear_native_u32("cpu_trace: JAL rd_val", rd_val_u32);
+                let rd_val_field = F::from_u64(u64::from(rd_val_u32));
                 values[base + COL_RD_VAL] = rd_val_field;
                 values[base + COL_WI_START + rd_idx_usize] = F::ONE;
                 if rd_idx != 0 {
-                    regs[rd_idx_usize] = rd_val_field;
+                    regs[rd_idx_usize] = rd_val_u32;
                 }
             }
             x if x == OP_IMM_OPCODE => {
                 let funct3 = (insn.insn >> 12) & 0x7;
                 values[base + COL_RS1_IND_START + rs1_idx_usize] = F::ONE;
-                let rd_val_field: F = match funct3 {
+                let rd_val_u32: u32 = match funct3 {
                     f if f == FUNCT3_ADDI => {
                         values[base + COL_IS_ADDI] = F::ONE;
-                        rs1_val_field + imm_field
+                        rs1_val_u32.wrapping_add(imm_signed_u32)
                     }
                     f if f == FUNCT3_ANDI => {
                         values[base + COL_IS_ANDI] = F::ONE;
-                        F::from_u64(u64::from(rs1_val_u32 & imm_signed_u32))
+                        rs1_val_u32 & imm_signed_u32
                     }
                     f if f == FUNCT3_ORI => {
                         values[base + COL_IS_ORI] = F::ONE;
-                        F::from_u64(u64::from(rs1_val_u32 | imm_signed_u32))
+                        rs1_val_u32 | imm_signed_u32
                     }
                     f if f == FUNCT3_XORI => {
                         values[base + COL_IS_XORI] = F::ONE;
-                        F::from_u64(u64::from(rs1_val_u32 ^ imm_signed_u32))
+                        rs1_val_u32 ^ imm_signed_u32
                     }
                     _ => panic!("cpu_trace: unsupported OP-IMM funct3 {funct3}"),
                 };
+                assert_babybear_native_u32("cpu_trace: OP-IMM rd_val", rd_val_u32);
+                let rd_val_field = F::from_u64(u64::from(rd_val_u32));
                 values[base + COL_RD_VAL] = rd_val_field;
                 values[base + COL_WI_START + rd_idx_usize] = F::ONE;
                 if rd_idx != 0 {
-                    regs[rd_idx_usize] = rd_val_field;
+                    regs[rd_idx_usize] = rd_val_u32;
                 }
             }
             _ => panic!("cpu_trace: unsupported opcode 0x{opcode:02X}"),
@@ -1294,6 +1378,24 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
     }
 
     RowMajorMatrix::new(values, CPU_TRACE_WIDTH)
+}
+
+fn assert_babybear_native_u32(label: &str, value: u32) {
+    assert_babybear_native_u64(label, u64::from(value));
+}
+
+fn assert_u_type_imm20_babybear_native(label: &str, imm20: u32) {
+    assert!(
+        imm20 <= MAX_BABYBEAR_NATIVE_U_IMM20,
+        "{label} exceeds the BabyBear-native U-type bound"
+    );
+}
+
+fn assert_babybear_native_u64(label: &str, value: u64) {
+    assert!(
+        value < BABY_BEAR_MODULUS,
+        "{label} must fit below the BabyBear modulus"
+    );
 }
 
 #[cfg(test)]
@@ -1308,6 +1410,11 @@ mod tests {
     /// Not a LUI; used by slice-1-shaped tests that exercise the PC
     /// machinery without engaging the LUI opcode constraints.
     const NOP: u32 = 0x0000_0013;
+
+    /// U-type immediate whose shifted value stays below BabyBear.
+    const SAFE_U_IMM20: u32 = 0x12345;
+    const SAFE_U_VALUE: u64 = 0x1234_5000;
+    const SAFE_MAX_U_IMM20: u32 = 0x77FFF;
 
     fn prove_and_verify(pc_base: u32, program: &[CpuInstruction]) {
         let config = build_stark_config();
@@ -1344,9 +1451,26 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "pc_base must fit below the BabyBear modulus")]
+    fn air_constructor_panics_when_pc_base_aliases_babybear() {
+        let _ = CpuAir::new(BABY_BEAR_MODULUS_U32 + 3);
+    }
+
+    #[test]
     #[should_panic(expected = "pc_base must be 4-byte aligned")]
     fn trace_builder_panics_on_misaligned_pc_base() {
         let _ = cpu_trace::<Val>(0x1_0002, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "instruction next_pc must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_next_pc_aliases_babybear() {
+        let insn = CpuInstruction {
+            pc: 0x10000,
+            next_pc: BABY_BEAR_MODULUS_U32,
+            insn: NOP,
+        };
+        let _ = cpu_trace::<Val>(0x10000, &[insn]);
     }
 
     #[test]
@@ -1415,10 +1539,10 @@ mod tests {
 
     #[test]
     fn lui_constructor_encodes_canonical_bytes() {
-        let insn = CpuInstruction::lui(0x10000, 5, 0xABCDE);
+        let insn = CpuInstruction::lui(0x10000, 5, SAFE_U_IMM20);
         assert_eq!(insn.pc, 0x10000);
         assert_eq!(insn.next_pc, 0x10004);
-        assert_eq!(insn.insn, 0xABCD_E2B7);
+        assert_eq!(insn.insn, 0x1234_52B7);
     }
 
     #[test]
@@ -1434,15 +1558,21 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "BabyBear-native U-type bound")]
+    fn lui_constructor_panics_when_imm20_aliases_babybear() {
+        let _ = CpuInstruction::lui(0x10000, 0, 0x78000);
+    }
+
+    #[test]
     fn trace_decodes_lui_bits_correctly() {
         let pc_base = 0x10000;
-        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
 
-        // insn = 0xABCDE2B7 -> bytes [0xB7, 0xE2, 0xCD, 0xAB].
+        // insn = 0x123452B7 -> bytes [0xB7, 0x52, 0x34, 0x12].
         assert_eq!(trace.values[COL_B0], Val::from_u64(0xB7));
-        assert_eq!(trace.values[COL_B1], Val::from_u64(0xE2));
-        assert_eq!(trace.values[COL_B2], Val::from_u64(0xCD));
-        assert_eq!(trace.values[COL_B3], Val::from_u64(0xAB));
+        assert_eq!(trace.values[COL_B1], Val::from_u64(0x52));
+        assert_eq!(trace.values[COL_B2], Val::from_u64(0x34));
+        assert_eq!(trace.values[COL_B3], Val::from_u64(0x12));
 
         // b0 = 0xB7 = 1011_0111 -> bits LSB..MSB = 1,1,1,0,1,1,0,1.
         let b0_bits = [1, 1, 1, 0, 1, 1, 0, 1];
@@ -1454,8 +1584,8 @@ mod tests {
             );
         }
 
-        // b1 = 0xE2 = 1110_0010 -> bits LSB..MSB = 0,1,0,0,0,1,1,1.
-        let b1_bits = [0, 1, 0, 0, 0, 1, 1, 1];
+        // b1 = 0x52 = 0101_0010 -> bits LSB..MSB = 0,1,0,0,1,0,1,0.
+        let b1_bits = [0, 1, 0, 0, 1, 0, 1, 0];
         for (i, expected) in b1_bits.iter().enumerate() {
             assert_eq!(
                 trace.values[COL_B1_BITS_START + i],
@@ -1468,13 +1598,13 @@ mod tests {
         assert_eq!(trace.values[COL_IS_PAD], Val::ZERO);
         assert_eq!(trace.values[COL_IS_LUI], Val::ONE);
         assert_eq!(trace.values[COL_RD_IDX], Val::from_u64(5));
-        assert_eq!(trace.values[COL_RD_VAL], Val::from_u64(0xABCD_E000));
+        assert_eq!(trace.values[COL_RD_VAL], Val::from_u64(SAFE_U_VALUE));
     }
 
     #[test]
     fn single_lui_proves() {
         let pc_base = 0x10000;
-        prove_and_verify(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        prove_and_verify(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
     }
 
     #[test]
@@ -1486,7 +1616,7 @@ mod tests {
                 CpuInstruction::lui(pc_base, 1, 0x12345),
                 CpuInstruction::lui(pc_base + 4, 2, 0x6789A),
                 CpuInstruction::lui(pc_base + 8, 0, 0x00000),
-                CpuInstruction::lui(pc_base + 12, 31, 0xFFFFF),
+                CpuInstruction::lui(pc_base + 12, 31, SAFE_MAX_U_IMM20),
             ],
         );
     }
@@ -1498,12 +1628,15 @@ mod tests {
         // to keep the indicator sum equal to `is_real`, and the
         // x0-pinned constraint silently drops the actual write so
         // `r_0` stays zero across the trace.
-        prove_and_verify(0x10000, &[CpuInstruction::lui(0x10000, 0, 0xABCDE)]);
+        prove_and_verify(0x10000, &[CpuInstruction::lui(0x10000, 0, SAFE_U_IMM20)]);
     }
 
     #[test]
-    fn lui_with_max_imm20_proves() {
-        prove_and_verify(0x10000, &[CpuInstruction::lui(0x10000, 7, 0xFFFFF)]);
+    fn lui_with_max_babybear_native_imm20_proves() {
+        prove_and_verify(
+            0x10000,
+            &[CpuInstruction::lui(0x10000, 7, SAFE_MAX_U_IMM20)],
+        );
     }
 
     #[test]
@@ -1512,9 +1645,25 @@ mod tests {
     }
 
     #[test]
+    fn prover_refuses_lui_with_non_native_u_type_immediate() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
+        // Force b3 = 0x78 while preserving byte/bit consistency and
+        // LUI's rd_val equation. The local U-type native-bound
+        // constraint must reject this otherwise self-consistent row.
+        trace.values[COL_B3] = Val::from_u64(0x78);
+        for bit in 0..8 {
+            trace.values[COL_B3_BITS_START + bit] = Val::from_u64(u64::from((0x78_u8 >> bit) & 1));
+        }
+        trace.values[COL_RD_VAL] = Val::from_u64(0x7834_5000);
+        trace.values[CPU_TRACE_WIDTH + COL_REG_START + 5] = Val::from_u64(0x7834_5000);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
     fn prover_refuses_lui_with_wrong_opcode() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Flip b0_bit_0 from 1 to 0 (opcode becomes 0x36 instead of 0x37).
         trace.values[COL_B0_BITS_START] = Val::ZERO;
         // Match b0 so the byte-sum constraint still holds; we are
@@ -1526,7 +1675,7 @@ mod tests {
     #[test]
     fn prover_refuses_lui_with_wrong_rd_val() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         trace.values[COL_RD_VAL] = Val::from_u64(0xDEAD_BEEF);
         assert_prover_rejects(pc_base, trace);
     }
@@ -1534,7 +1683,7 @@ mod tests {
     #[test]
     fn prover_refuses_lui_with_wrong_next_pc() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Force next_pc = pc + 8 on the LUI row.
         trace.values[COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
         // Keep the transition consistent so we isolate the LUI rule.
@@ -1546,7 +1695,7 @@ mod tests {
     #[test]
     fn prover_refuses_byte_sum_mismatch() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Tamper b0 to differ from the bit decomposition.
         trace.values[COL_B0] = Val::from_u64(0xB8);
         assert_prover_rejects(pc_base, trace);
@@ -1555,7 +1704,7 @@ mod tests {
     #[test]
     fn prover_refuses_non_boolean_bit() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         trace.values[COL_B0_BITS_START] = Val::from_u64(2);
         // Re-balance the byte sum so we only trip the boolean constraint:
         // moving bit_0 from 1 to 2 inflates the sum by 1; compensate b0.
@@ -1566,7 +1715,7 @@ mod tests {
     #[test]
     fn prover_refuses_wrong_rd_idx() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Decoded rd_idx should equal 5; force it to 10.
         trace.values[COL_RD_IDX] = Val::from_u64(10);
         assert_prover_rejects(pc_base, trace);
@@ -1599,16 +1748,16 @@ mod tests {
     #[test]
     fn lui_writes_destination_register_at_next_row() {
         let pc_base = 0x10000;
-        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
 
         // Row 0: r5 = 0 (state before LUI executes).
         assert_eq!(trace.values[COL_REG_START + 5], Val::ZERO);
 
-        // Row 1: r5 = 0xABCD_E000 (state after LUI executes).
+        // Row 1: r5 = SAFE_U_VALUE (state after LUI executes).
         let row1 = CPU_TRACE_WIDTH;
         assert_eq!(
             trace.values[row1 + COL_REG_START + 5],
-            Val::from_u64(0xABCD_E000),
+            Val::from_u64(SAFE_U_VALUE),
         );
 
         // All other registers stay zero.
@@ -1623,8 +1772,8 @@ mod tests {
     #[test]
     fn lui_to_x0_leaves_register_zero_at_next_row() {
         let pc_base = 0x10000;
-        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 0, 0xABCDE)]);
-        // Row 1: r0 = 0 even though LUI tried to write 0xABCD_E000.
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 0, SAFE_U_IMM20)]);
+        // Row 1: r0 = 0 even though LUI tried to write SAFE_U_VALUE.
         let row1 = CPU_TRACE_WIDTH;
         assert_eq!(trace.values[row1 + COL_REG_START], Val::ZERO);
     }
@@ -1632,7 +1781,7 @@ mod tests {
     #[test]
     fn write_indicator_is_one_hot_for_destination() {
         let pc_base = 0x10000;
-        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         for j in 0..NUM_REGS {
             let expected = if j == 5 { Val::ONE } else { Val::ZERO };
             assert_eq!(trace.values[COL_WI_START + j], expected, "wi[{j}]");
@@ -1642,12 +1791,12 @@ mod tests {
     #[test]
     fn padding_row_carries_running_register_state() {
         let pc_base = 0x10000;
-        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
-        // Row 2 onwards are padding; r5 should still hold 0xABCD_E000.
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
+        // Row 2 onwards are padding; r5 should still hold SAFE_U_VALUE.
         let row2 = 2 * CPU_TRACE_WIDTH;
         assert_eq!(
             trace.values[row2 + COL_REG_START + 5],
-            Val::from_u64(0xABCD_E000),
+            Val::from_u64(SAFE_U_VALUE),
         );
         // No write indicators set on padding.
         for j in 0..NUM_REGS {
@@ -1662,7 +1811,7 @@ mod tests {
             pc_base,
             &[
                 CpuInstruction::lui(pc_base, 1, 0x12345),
-                CpuInstruction::lui(pc_base + 4, 1, 0xABCDE),
+                CpuInstruction::lui(pc_base + 4, 1, 0x23456),
             ],
         );
     }
@@ -1705,8 +1854,8 @@ mod tests {
     #[test]
     fn prover_refuses_tampered_register_after_write() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
-        // Row 1's r5 should be 0xABCD_E000; tamper to a wrong value.
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
+        // Row 1's r5 should be SAFE_U_VALUE; tamper to a wrong value.
         let row1_r5 = CPU_TRACE_WIDTH + COL_REG_START + 5;
         trace.values[row1_r5] = Val::from_u64(0xDEAD_BEEF);
         assert_prover_rejects(pc_base, trace);
@@ -1715,7 +1864,7 @@ mod tests {
     #[test]
     fn prover_refuses_register_unchanged_when_write_should_happen() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Row 1's r5 stays 0 instead of taking rd_val.
         let row1_r5 = CPU_TRACE_WIDTH + COL_REG_START + 5;
         trace.values[row1_r5] = Val::ZERO;
@@ -1725,7 +1874,7 @@ mod tests {
     #[test]
     fn prover_refuses_wrong_write_indicator() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Clear wi_5 and set wi_7 instead: wi_7 * (rd_idx - 7) =
         // 1 * (5 - 7) != 0, so the rd_idx-match constraint fails.
         trace.values[COL_WI_START + 5] = Val::ZERO;
@@ -1736,7 +1885,7 @@ mod tests {
     #[test]
     fn prover_refuses_indicator_sum_below_is_real() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Real row but no write indicator set: sum = 0, is_real = 1.
         trace.values[COL_WI_START + 5] = Val::ZERO;
         // Also fix the register update so we isolate the sum
@@ -1749,7 +1898,7 @@ mod tests {
     #[test]
     fn prover_refuses_two_write_indicators_set() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         // Sum becomes 2 while is_real = 1.
         trace.values[COL_WI_START + 6] = Val::ONE;
         assert_prover_rejects(pc_base, trace);
@@ -1758,7 +1907,7 @@ mod tests {
     #[test]
     fn prover_refuses_non_boolean_write_indicator() {
         let pc_base = 0x10000;
-        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, 0xABCDE)]);
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
         trace.values[COL_WI_START + 5] = Val::from_u64(2);
         assert_prover_rejects(pc_base, trace);
     }
@@ -1847,13 +1996,28 @@ mod tests {
     }
 
     #[test]
-    fn addi_with_negative_immediate_decodes_to_neg_field_value() {
+    fn addi_with_negative_immediate_can_stay_babybear_native() {
         let pc_base = 0x10000;
-        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, -7)]);
-        // imm field value = -7 in BabyBear = p - 7.
-        assert_eq!(trace.values[COL_IMM], -Val::from_u64(7));
-        // rd_val = rs1_val + imm = 0 + (-7) = -7 in field.
-        assert_eq!(trace.values[COL_RD_VAL], -Val::from_u64(7));
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 10),
+                CpuInstruction::addi(pc_base + 4, 5, 3, -7),
+            ],
+        );
+        let row1 = CPU_TRACE_WIDTH;
+        // imm field value = -7 in BabyBear = p - 7, but the exact
+        // RV32 result remains 3 and therefore fits in the local
+        // BabyBear-native subset.
+        assert_eq!(trace.values[row1 + COL_IMM], -Val::from_u64(7));
+        assert_eq!(trace.values[row1 + COL_RD_VAL], Val::from_u64(3));
+    }
+
+    #[test]
+    #[should_panic(expected = "OP-IMM rd_val must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_op_imm_result_aliases_babybear() {
+        let pc_base = 0x10000;
+        let _ = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, -1)]);
     }
 
     #[test]
@@ -2308,14 +2472,11 @@ mod tests {
 
     #[test]
     fn auipc_constructor_encodes_canonical_bytes() {
-        // `auipc x5, 0xABCDE` → imm20 = 0xABCDE, rd = 5, opcode = 0x17.
-        // insn = (0xABCDE << 12) | (5 << 7) | 0x17
-        //      = 0xABCDE000 | 0x0000_0280 | 0x17
-        //      = 0xABCDE297
-        let insn = CpuInstruction::auipc(0x10000, 5, 0xABCDE);
+        // `auipc x5, SAFE_U_IMM20` → rd = 5, opcode = 0x17.
+        let insn = CpuInstruction::auipc(0x10000, 5, SAFE_U_IMM20);
         assert_eq!(insn.pc, 0x10000);
         assert_eq!(insn.next_pc, 0x10004);
-        assert_eq!(insn.insn, 0xABCD_E297);
+        assert_eq!(insn.insn, 0x1234_5297);
     }
 
     #[test]
@@ -2328,6 +2489,12 @@ mod tests {
     #[should_panic(expected = "imm20 must fit in 20 bits")]
     fn auipc_constructor_panics_on_oob_imm20() {
         let _ = CpuInstruction::auipc(0x10000, 0, 1 << 20);
+    }
+
+    #[test]
+    #[should_panic(expected = "BabyBear-native U-type bound")]
+    fn auipc_constructor_panics_when_imm20_aliases_babybear() {
+        let _ = CpuInstruction::auipc(0x10000, 0, 0x78000);
     }
 
     #[test]

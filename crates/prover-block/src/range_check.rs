@@ -9,7 +9,9 @@
 //! 3. The last row equals `2^log_size - 1`.
 //!
 //! Together these force the trace to contain every integer in
-//! `[0, 2^log_size)` exactly once, in ascending order. Later AIRs
+//! `[0, 2^log_size)` exactly once, in ascending order, as long as the
+//! table is injective in BabyBear. The constructor caps `log_size` at
+//! 30; larger tables would wrap modulo the field. Later AIRs
 //! (M8-H base RV32I, M8-I M-extension, M8-K syscall replay) bind
 //! their byte / word range arguments by feeding cells through a logUp
 //! lookup ([`crate::range_check`] is the *source* side; the lookup
@@ -20,6 +22,12 @@
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
+
+/// Largest power-of-two table that is injective in BabyBear.
+///
+/// `2^30 - 1 < p`, while `2^31 - 1 > p`, so u32 range checks must be
+/// expressed through byte / limb lookups rather than one huge table.
+const MAX_INJECTIVE_LOG_SIZE: u32 = 30;
 
 /// Number of trace columns the [`RangeCheckAir`] uses.
 pub const RANGE_CHECK_TRACE_WIDTH: usize = 1;
@@ -35,8 +43,17 @@ pub struct RangeCheckAir {
 
 impl RangeCheckAir {
     /// Build a range-check AIR for values in `[0, 2^log_size)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `log_size > 30`, because larger power-of-two tables
+    /// are not injective in BabyBear.
     #[must_use]
     pub const fn new(log_size: u32) -> Self {
+        assert!(
+            log_size <= MAX_INJECTIVE_LOG_SIZE,
+            "RangeCheckAir: log_size must be <= 30 for BabyBear injectivity"
+        );
         Self { log_size }
     }
 
@@ -97,13 +114,17 @@ impl<AB: AirBuilder> Air<AB> for RangeCheckAir {
 /// # Panics
 ///
 /// Panics if `log_size` is so large that `2^log_size` overflows
-/// `usize`, or if `2^log_size` does not fit in `u64`. Realistic
-/// values are at most `log_size = 16` (65 536 rows); 32 would be
-/// `~4e9` rows which is beyond any practical STARK trace anyway.
+/// `usize`, or if the table would not be injective in BabyBear.
+/// Realistic values are at most `log_size = 16` (65 536 rows); u32
+/// decomposes through byte lookups once M8-L wires the shared bus.
 #[must_use]
 pub fn range_check_trace<F: PrimeCharacteristicRing + Copy + Send + Sync>(
     log_size: u32,
 ) -> RowMajorMatrix<F> {
+    assert!(
+        log_size <= MAX_INJECTIVE_LOG_SIZE,
+        "range_check_trace: log_size must be <= 30 for BabyBear injectivity"
+    );
     let n: usize = 1_usize
         .checked_shl(log_size)
         .expect("range_check_trace: 2^log_size overflows usize");
@@ -153,6 +174,18 @@ mod tests {
         let air = RangeCheckAir::new(8);
         let proof = prove(&config, &air, trace, &[]);
         verify(&config, &air, &proof, &[]).expect("u8 range proof verifies");
+    }
+
+    #[test]
+    #[should_panic(expected = "log_size must be <= 30")]
+    fn air_constructor_panics_when_table_would_alias_babybear() {
+        let _ = RangeCheckAir::new(31);
+    }
+
+    #[test]
+    #[should_panic(expected = "log_size must be <= 30")]
+    fn trace_builder_panics_when_table_would_alias_babybear() {
+        let _ = range_check_trace::<Val>(31);
     }
 
     #[test]

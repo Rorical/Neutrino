@@ -55,23 +55,27 @@
 //! - **Boundary reads from trie state.** The "first read at an
 //!   address" semantics needs a lookup against the witness's
 //!   `state_reads`. That lookup also rides the M8-L bus.
-//! - **`u32` value range.** `val` is treated as an arbitrary field
-//!   element. The downstream CPU AIR (M8-H) bounds `val` to `u32`
-//!   via byte decomposition + the M8-E range-check table.
+//! - **Full `u32` value range.** M8-F uses one BabyBear cell for each
+//!   of `addr`, `ts`, and `val`, so the trace builder currently accepts
+//!   only values below the BabyBear modulus. Full RV32 memory values
+//!   are represented losslessly once M8-L replaces those bus records
+//!   with byte limbs routed through the range-check table.
 //!
 //! ## Padding
 //!
 //! Plonky3 requires a power-of-two trace height. The trace builder
 //! pads with no-op reads continuing the last real address: `op =
 //! READ`, `same_addr = 1`, `val` unchanged, `addr_diff_inv = 0`, `ts`
-//! incremented by one each row. C(1)–C(3) hold trivially on padding
-//! rows (`addr_diff = 0`, `val - val_prev = 0`).
+//! incremented by one each row. The builder rejects inputs whose
+//! padding timestamps would reach the BabyBear modulus, keeping the
+//! single-cell timestamp representation injective. C(1)–C(3) hold
+//! trivially on padding rows (`addr_diff = 0`, `val - val_prev = 0`).
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
 
-use crate::config::FRI_LOG_FINAL_POLY_LEN;
+use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 
 /// Number of trace columns the memory consistency AIR uses.
 pub const MEM_CONSISTENCY_TRACE_WIDTH: usize = 6;
@@ -116,10 +120,11 @@ impl MemoryOp {
 
 /// One memory access in the CPU's execution order.
 ///
-/// `addr`, `ts`, and `val` are 32-bit quantities; they fit losslessly
-/// into BabyBear field elements via [`PrimeCharacteristicRing::from_u64`].
-/// The strict `u32` range constraint is added downstream by the CPU
-/// AIR's byte-decomposition lookups, not here.
+/// `addr`, `ts`, and `val` are carried as `u32` host values, but this
+/// standalone M8-F AIR stores each one in a single BabyBear cell. The
+/// trace builder therefore requires all three to be strictly below the
+/// BabyBear modulus. M8-L's byte-limb bus removes that temporary
+/// BabyBear-native restriction for full RV32 memory records.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryAccess {
     /// Address read or written.
@@ -225,10 +230,9 @@ impl<AB: AirBuilder> Air<AB> for MemoryConsistencyAir {
 ///
 /// # Panics
 ///
-/// Panics if any `ts` value cannot be encoded into the field (this is
-/// only reachable on fields with characteristic smaller than `2^32`,
-/// which BabyBear is not), or if the rounded-up trace height overflows
-/// `usize`.
+/// Panics if any `addr`, `ts`, or `val` would alias in BabyBear, if
+/// padding timestamps would reach the BabyBear modulus, or if the
+/// rounded-up trace height overflows `usize`.
 #[must_use]
 pub fn memory_consistency_trace<F>(accesses: &[MemoryAccess]) -> RowMajorMatrix<F>
 where
@@ -239,6 +243,7 @@ where
 
     let real_rows = sorted.len().max(1);
     let height = real_rows.next_power_of_two().max(MIN_TRACE_HEIGHT);
+    validate_accesses_fit_babybear(&sorted, height - real_rows);
 
     let mut values = F::zero_vec(height * MEM_CONSISTENCY_TRACE_WIDTH);
     let mut prev_addr: Option<u32> = None;
@@ -254,7 +259,9 @@ where
         // timestamp and unchanged value.
         let (addr, ts, op, val, is_padding) = sorted.get(i).map_or_else(
             || {
-                let padded_ts = last_ts.saturating_add(1);
+                let padded_ts = last_ts
+                    .checked_add(1)
+                    .expect("memory_consistency_trace: padding timestamp overflows u32");
                 (last_addr, padded_ts, MemoryOp::Read, last_val, true)
             },
             |access| (access.addr, access.ts, access.op, access.val, false),
@@ -295,6 +302,30 @@ where
     }
 
     RowMajorMatrix::new(values, MEM_CONSISTENCY_TRACE_WIDTH)
+}
+
+fn validate_accesses_fit_babybear(sorted: &[MemoryAccess], padding_rows: usize) {
+    for access in sorted {
+        assert_babybear_native_u32("memory access addr", access.addr);
+        assert_babybear_native_u32("memory access ts", access.ts);
+        assert_babybear_native_u32("memory access val", access.val);
+    }
+
+    if let Some(last) = sorted.last() {
+        let padding_rows_u64 = u64::try_from(padding_rows).expect("padding row count fits in u64");
+        let final_padding_ts = u64::from(last.ts) + padding_rows_u64;
+        assert!(
+            final_padding_ts < BABY_BEAR_MODULUS,
+            "memory_consistency_trace: padding timestamps must fit below the BabyBear modulus"
+        );
+    }
+}
+
+fn assert_babybear_native_u32(label: &str, value: u32) {
+    assert!(
+        u64::from(value) < BABY_BEAR_MODULUS,
+        "memory_consistency_trace: {label} must fit below the BabyBear modulus"
+    );
 }
 
 #[cfg(test)]
@@ -541,5 +572,26 @@ mod tests {
         let same_addr_idx = MEM_CONSISTENCY_TRACE_WIDTH + COL_SAME_ADDR;
         trace.values[same_addr_idx] = Val::from_u64(2);
         assert_prover_rejects(trace);
+    }
+
+    #[test]
+    #[should_panic(expected = "memory access addr must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_addr_aliases_babybear() {
+        let aliasing_addr = u32::try_from(BABY_BEAR_MODULUS).unwrap();
+        let _ = memory_consistency_trace::<Val>(&[MemoryAccess::read(aliasing_addr, 1, 0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "memory access val must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_val_aliases_babybear() {
+        let aliasing_val = u32::try_from(BABY_BEAR_MODULUS).unwrap();
+        let _ = memory_consistency_trace::<Val>(&[MemoryAccess::write(0x100, 1, aliasing_val)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "padding timestamps must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_padding_ts_would_alias_babybear() {
+        let near_modulus_ts = u32::try_from(BABY_BEAR_MODULUS - 1).unwrap();
+        let _ = memory_consistency_trace::<Val>(&[MemoryAccess::write(0x100, near_modulus_ts, 1)]);
     }
 }

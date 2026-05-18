@@ -2707,6 +2707,8 @@ dependencies = [
 name = "neutrino-prover-block"
 version = "0.1.0"
 dependencies = [
+ "borsh",
+ "neutrino-consensus-types",
  "p3-air",
  "p3-baby-bear",
  "p3-challenger",

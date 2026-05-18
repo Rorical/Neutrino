@@ -11,21 +11,30 @@
 //! program ROM, base RV32I, M-extension, traps, syscalls) sharing a
 //! logUp lookup bus.
 //!
-//! M8-C lays the baseline. The crate exposes:
+//! M8-C lays the baseline. M8-D adds the public-input commitment.
+//! The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
 //! - [`fibonacci`] — a small hello-world AIR that exercises the
 //!   prove/verify pipeline end-to-end.
+//! - [`public_inputs`] — the Poseidon2 commitment binding for
+//!   `BlockProofPublicInputs`; M8-N integration will commit this
+//!   digest as the real block AIR's public values.
 //!
-//! Later M8 slices (M8-D onwards) grow the crate one AIR at a time
+//! Later M8 slices (M8-E onwards) grow the crate one AIR at a time
 //! against this scaffold.
 
 pub mod config;
 pub mod fibonacci;
+pub mod public_inputs;
 
 pub use config::{
     Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm, StarkCfg, Val, ValMmcs,
-    build_stark_config,
+    build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
+pub use public_inputs::{
+    BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,
+    commit_block_public_inputs,
+};

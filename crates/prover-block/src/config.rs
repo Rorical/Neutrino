@@ -109,6 +109,30 @@ pub const FRI_COMMIT_POW_BITS: usize = 8;
 /// Grinding bits for the query-phase proof of work.
 pub const FRI_QUERY_POW_BITS: usize = 8;
 
+/// Build a deterministic Poseidon2 permutation seeded from
+/// [`POSEIDON2_SEED`].
+///
+/// Every other backend object (the Merkle MMCS hash and compressor,
+/// the duplex challenger, the public-input commitment hasher) is
+/// built from a fresh `Perm` produced by this function. Construction
+/// is cheap relative to a real STARK proof.
+#[must_use]
+pub fn build_poseidon2_perm() -> Perm {
+    let mut rng = SmallRng::seed_from_u64(POSEIDON2_SEED);
+    Perm::new_from_rng_128(&mut rng)
+}
+
+/// Build a deterministic Poseidon2 sponge hasher.
+///
+/// Wraps [`build_poseidon2_perm`] in the same [`PaddingFreeSponge`]
+/// the Merkle leaves use. Re-exported so other modules in the crate
+/// (e.g. [`super::public_inputs`]) can commit auxiliary values
+/// without rebuilding the permutation seeding logic.
+#[must_use]
+pub fn build_poseidon2_hasher() -> Hash {
+    Hash::new(build_poseidon2_perm())
+}
+
 /// Build a fresh Plonky3 STARK configuration tuned for block proofs.
 ///
 /// The returned [`StarkCfg`] is deterministic: callers on different
@@ -118,8 +142,7 @@ pub const FRI_QUERY_POW_BITS: usize = 8;
 /// here), so call sites can rebuild the config rather than caching it.
 #[must_use]
 pub fn build_stark_config() -> StarkCfg {
-    let mut rng = SmallRng::seed_from_u64(POSEIDON2_SEED);
-    let perm = Perm::new_from_rng_128(&mut rng);
+    let perm = build_poseidon2_perm();
     let hash = Hash::new(perm.clone());
     let compress = Compress::new(perm.clone());
     let val_mmcs = ValMmcs::new(hash, compress, 0);
@@ -155,17 +178,13 @@ mod tests {
 
     #[test]
     fn poseidon2_permutation_is_deterministic_across_calls() {
-        // The constants must be reproducible: two SmallRng-seeded
-        // permutations derived from the same seed produce identical
-        // output on the same input.
+        // The constants must be reproducible: two `build_poseidon2_perm`
+        // calls produce identical output on the same input.
         use p3_field::PrimeCharacteristicRing;
         use p3_symmetric::Permutation;
 
-        let mut rng_a = SmallRng::seed_from_u64(POSEIDON2_SEED);
-        let perm_a = Perm::new_from_rng_128(&mut rng_a);
-
-        let mut rng_b = SmallRng::seed_from_u64(POSEIDON2_SEED);
-        let perm_b = Perm::new_from_rng_128(&mut rng_b);
+        let perm_a = build_poseidon2_perm();
+        let perm_b = build_poseidon2_perm();
 
         let mut state_a = [Val::ZERO; 16];
         let mut state_b = [Val::ZERO; 16];

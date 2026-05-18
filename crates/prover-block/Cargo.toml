@@ -15,6 +15,7 @@ default = ["std"]
 std = []
 
 [dependencies]
+neutrino-consensus-types = { workspace = true }
 p3-air         = { workspace = true }
 p3-baby-bear   = { workspace = true }
 p3-challenger  = { workspace = true }
@@ -26,6 +27,7 @@ p3-matrix      = { workspace = true }
 p3-merkle-tree = { workspace = true }
 p3-symmetric   = { workspace = true }
 p3-uni-stark   = { workspace = true }
+borsh          = { workspace = true }
 # Workspace rand is 0.10. SmallRng (used to seed Poseidon2 permutation
 # constants for Plonky3's `new_from_rng_128`) lives at
 # `rand::rngs::SmallRng` under the default feature set.

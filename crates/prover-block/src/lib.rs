@@ -14,7 +14,9 @@
 //! M8-C lays the baseline; M8-D adds the public-input commitment;
 //! M8-E adds the first lookup-table AIR; M8-F adds the memory
 //! consistency AIR; M8-G adds the program ROM AIR; M8-H slice 1
-//! adds the CPU AIR scaffold. The crate currently exposes:
+//! adds the CPU AIR scaffold; M8-H slice 2 adds bit decomposition of
+//! the low instruction bytes and the LUI opcode family. The crate
+//! currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -34,9 +36,11 @@
 //!   into this table; M8-N pins the table's preprocessed commitment
 //!   to the `vm_code_hash` public input.
 //! - [`cpu`] — the per-instruction execution-trace AIR. Slice 1
-//!   pins the trace's PC and real/pad selector layout; subsequent
-//!   M8-H sub-slices add bit decomposition, the register file, and
-//!   each RV32I instruction family.
+//!   pinned the trace's PC and real/pad selector layout; slice 2
+//!   adds bit decomposition of the low instruction bytes plus the
+//!   LUI opcode family (opcode check, `next_pc = pc + 4`,
+//!   `rd_val = imm20 << 12`). Subsequent M8-H sub-slices add the
+//!   register file and each remaining RV32I instruction family.
 //!
 //! Later M8 slices (M8-I onwards) grow the crate one AIR at a time
 //! against this scaffold.

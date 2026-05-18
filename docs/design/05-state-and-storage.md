@@ -73,8 +73,10 @@ enum TrieNode {
 ```
 
 - Node hash = `H(domain_tag || canonical_encoding(node))`, where H = BLAKE3 by
-  default (configurable; SP1 block prover may want SHA-256 inside the circuit
-  to halve in-circuit hashing cost — selectable per deployment).
+  default. The hash is selectable per deployment under the `Hasher` trait;
+  the v1 Plonky3 block prover (M8) prefers Poseidon2 for in-circuit Merkle
+  cost, so deployments that pair a Poseidon-friendly state trie with the
+  Plonky3 backend can swap the hash without changing the trie semantics.
 - `value_hash` is the hash of the stored value, not the value itself; the
   value lives in a separate `state_values` column to keep the trie compact.
 - Raw runtime keys are converted to trie bit paths as
@@ -366,4 +368,4 @@ chain back to this base case.
 | `PRUNING_DELAY`        | 2 checkpoints      | Extra margin before deleting pruning-eligible data.                            |
 | `WITNESS_RETENTION`    | 1 chunk past prove | Beyond this, witness deletable; needed only if you want to re-prove.           |
 | `SNAPSHOT_INTERVAL`    | 1024 checkpoints   | How often to publish a state-snapshot bundle.                                  |
-| `STATE_TRIE_HASH`      | BLAKE3             | M0 default and reference implementation. SP1 may prefer SHA-256 in-circuit and Plonky3 Poseidon; both are post-M0 overrides under the same `Hasher` trait. |
+| `STATE_TRIE_HASH`      | BLAKE3             | M0 default and reference implementation. M8's Plonky3 backend may prefer Poseidon2 in-circuit; this is a post-M0 override under the same `Hasher` trait and does not change trie semantics. |

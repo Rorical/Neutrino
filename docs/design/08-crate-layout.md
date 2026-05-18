@@ -24,7 +24,7 @@ neutrino/
 │   ├── consensus-fork-choice/          # vote-weighted heaviest-proven-chain
 │   ├── consensus-chunk-bft/            # Tendermint-style prevote/precommit
 │   ├── proof-system/                   # ProofSystem trait + mock backend
-│   ├── prover-block/                   # block-proof generation (SP1 backend)
+│   ├── prover-block/                   # block-proof generation (custom Plonky3 STARK)
 │   ├── prover-chunk/                   # chunk-proof aggregation (Plonky3)
 │   ├── prover-checkpoint/              # recursive checkpoint (Plonky3+SNARK)
 │   ├── consensus-engine/               # block import, sync state machine
@@ -413,18 +413,23 @@ proof bytes = sha256 of public inputs). Real backends live in the
 
 ### `prover-block`
 
-Block-proof backend. v1 wraps **SP1** for the block proof. The proof must bind
-to the canonical on-chain `vm_code_hash`: either SP1 runs the stock runtime ELF
-directly, or the SP1 guest proves `vm-rv32im` executing that ELF with host
-syscalls implemented as deterministic guest calls. Backend-specific runtime
-builds are optimization-only after equivalence tests.
+Block-proof backend. v1 is an **in-tree custom Plonky3 STARK** over
+BabyBear with Poseidon2 Merkle / Fiat-Shamir. The proof binds to the
+canonical on-chain `vm_code_hash`: the AIR set re-derives every
+opcode and memory access of `vm-rv32im` executing that ELF and
+consumes the `SealedWitness` (see
+[`vm-rv32im::witness`](../../crates/vm-rv32im/src/witness.rs)) as the
+input to the trace generator.
 
 ```rust
-pub struct Sp1BlockProver { /* sp1 ProverClient */ }
-impl ProofSystem for Sp1BlockProver { /* prove_block, verify_block, ... */ }
+pub struct Plonky3BlockProver { /* AIR set + FRI config */ }
+impl ProofSystem for Plonky3BlockProver { /* prove_block, verify_block, ... */ }
 ```
 
-Heavy deps (sp1 toolchain). Gated behind `--features prover-block`.
+See [10-proof-system.md](10-proof-system.md) for the AIR decomposition
+(range tables, memory consistency, program ROM, base RV32I, M-extension,
+traps, syscalls) and the continuations strategy for long block traces.
+Heavy dependencies (Plonky3) gated behind `--features prover-block`.
 
 ### `prover-chunk`
 
@@ -558,7 +563,7 @@ Cargo features at the workspace level:
 
 | Feature | Pulls in | Default? |
 |---|---|---|
-| `prover-block` | `prover-block` crate + SP1 toolchain | no |
+| `prover-block` | `prover-block` crate + Plonky3 | no |
 | `prover-chunk` | `prover-chunk` + Plonky3 | no |
 | `prover-checkpoint` | `prover-checkpoint` + SNARK wrapper | no |
 | `light-client` | `light-client` only | yes |

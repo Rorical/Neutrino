@@ -13,9 +13,10 @@
 //!
 //! The [`mock`] backend is the M2 implementation. It hashes the
 //! borsh-encoded public inputs under a per-layer domain tag and is
-//! the stand-in until M8/M9/M10 plug in SP1, Plonky3, and the
-//! Plonky3-to-SNARK wrapper. Real backends share the same `ProofSystem`
-//! seam.
+//! the stand-in until M8 / M9 / M10 plug in the v1 in-tree Plonky3
+//! STARK block prover, the Plonky3 chunk circuit, and the Plonky3 →
+//! SNARK wrapper for the recursive checkpoint. Real backends share
+//! the same `ProofSystem` seam.
 
 extern crate alloc;
 

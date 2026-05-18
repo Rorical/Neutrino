@@ -349,7 +349,7 @@ proven chunk.
 | Tx sigs | Defined by runtime; default Ed25519 | `ed25519-dalek` |
 | Block hash | BLAKE3 | `crypto::hash` |
 | State trie hash | BLAKE3 (configurable per network) | `crypto::hash` |
-| Proof-system hashing | Backend-defined (SP1 = SHA-256; Plonky3 = Poseidon variant) | proof backend |
+| Proof-system hashing | Backend-defined (v1 Plonky3 backend = Poseidon2 over BabyBear) | proof backend |
 
 **Single-curve principle**: BLS12-381 carries all consensus-critical signature
 and VRF checks (VRF, block signatures, finality votes). Hash commitments such

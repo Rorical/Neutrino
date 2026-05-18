@@ -1,13 +1,14 @@
 //! The single `ProofSystem` trait every proof backend implements.
 //!
-//! At M2 only the [`MockProofSystem`] satisfies it; M8/M9/M10 plug in
-//! SP1, Plonky3, and the Plonky3 → SNARK wrapper. The trait is the
-//! seam between the consensus engine — which produces witnesses,
-//! aggregates block proofs into chunk proofs, and recurses chunk
-//! proofs into checkpoints — and the cryptographic backend that
-//! actually proves and verifies. Real backends must be bit-identical
-//! to the mock on the public-input surface area; only the proof bytes
-//! themselves differ.
+//! At M2 only the [`MockProofSystem`] satisfies it; M8 / M9 / M10
+//! plug in the v1 in-tree Plonky3 STARK block prover, the Plonky3
+//! chunk circuit, and the Plonky3 → SNARK wrapper for the recursive
+//! checkpoint. The trait is the seam between the consensus engine —
+//! which produces witnesses, aggregates block proofs into chunk
+//! proofs, and recurses chunk proofs into checkpoints — and the
+//! cryptographic backend that actually proves and verifies. Real
+//! backends must be bit-identical to the mock on the public-input
+//! surface area; only the proof bytes themselves differ.
 //!
 //! [`MockProofSystem`]: super::mock::MockProofSystem
 

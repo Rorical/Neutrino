@@ -123,27 +123,36 @@ across every proving backend**:
   or arbitrary I/O. Everything the runtime can observe is supplied as input or
   read via state.
 - The `vm-rv32im` interpreter is the reference. A future JIT must match it
-  bit-for-bit; the SP1 / RISC Zero / Jolt prover backends must also match it
-  bit-for-bit. We run differential fuzzing across `vm-rv32im` ↔ JIT ↔ each
-  enabled prover backend continuously in CI.
+  bit-for-bit; every prover backend (the v1 custom Plonky3 STARK, plus any
+  later SP1 / RISC Zero / Jolt option enabled via `proof_system_version`)
+  must also match it bit-for-bit. We run differential fuzzing across
+  `vm-rv32im` ↔ JIT ↔ each enabled prover backend continuously in CI.
 - Memory is zero-initialized; reads of uninitialized memory are well-defined
   reads of zero.
 
-## Witness recording (proving mode)
+## Witness recording
 
-When the host runs the VM in **proving mode** (feature `witness` on
-`vm-rv32im`, enabled by BlockProver and FallbackProver roles), every state
-read served from the trie also records the trie nodes that produced it into
-a per-block witness buffer. The buffer is sealed at the end of
-`_neutrino_execute_block` and handed to `prover-block` as one of the SP1
-program's private inputs.
+The host runs the VM with witness recording enabled for every
+`run_block` call. Every state read served from the trie records the
+read key, the base-trie value (or `None` for exclusion), and the
+binary-trie inclusion / exclusion proof anchored at the parent state
+root. The accumulator is sealed at the end of
+`_neutrino_execute_block`, borsh-encoded, and persisted in the
+`witnesses` storage column under the block hash. `prover-block`
+ingests it as the trace-generator input; downstream proving never
+re-fetches trie nodes from RocksDB.
 
-What gets recorded:
+What gets recorded (see
+[`vm-rv32im::witness::SealedWitness`](../../crates/vm-rv32im/src/witness.rs)):
 
-- Every trie node fetched to serve a `state_read` / `state_exists` /
-  `state_next_key`.
-- Every value byte string returned for a key.
-- The frozen `BlockContext` provided to the runtime.
+- Every key the runtime read via `state_read` or `state_exists`, paired
+  with the value the *base* trie maps it to and a `neutrino_trie::Proof`
+  anchored at `parent_state_root`. Reads served from the dirty overlay
+  also carry a base-trie proof so the prover never has to trust the
+  overlay; the live value the runtime saw is reconstructed by replaying
+  earlier writes in the syscall trace.
+- The frozen `BlockContextWitness` mirroring the engine-provided
+  `BlockContext`.
 - The parent state root.
 
 What does NOT need to be recorded:
@@ -198,16 +207,18 @@ depending on the node's role:
 - Target: tens of millions of insns/sec on modern hardware.
 - The reference implementation. Everything else must agree with it.
 
-**Proof generation — SP1 (M8).**
+**Proof generation — custom Plonky3 STARK (M8).**
 
 - Used by BlockProvers and FallbackProvers.
-- Preferred v1 path: prove the canonical runtime ELF's transition, binding the
-  proof to the on-chain `vm_code_hash`. If SP1 cannot execute the stock ELF
-  directly, the SP1 guest proves the Neutrino RV32IM interpreter running that
-  ELF. Backend-specific guest binaries are optimization-only until proven
-  equivalent.
-- We feed it the same witness buffer recorded by `vm-rv32im` so that proving
-  doesn't have to re-fetch trie nodes from RocksDB.
+- A multi-AIR Plonky3 STARK over BabyBear, with Poseidon2 Merkle / Fiat-Shamir,
+  re-derives every opcode and memory access of `vm-rv32im` executing the
+  on-chain ELF. The proof binds to the on-chain `vm_code_hash` via the
+  program-ROM AIR. AIR decomposition and continuations strategy are detailed
+  in [10-proof-system.md](10-proof-system.md).
+- The prover consumes the `SealedWitness` (`vm-rv32im::witness::SealedWitness`)
+  recorded during host execution and shipped via the `witnesses` storage
+  column / `/neutrino/req/witness_by_block/1` so proving never re-fetches
+  trie nodes from RocksDB.
 
 **Fast execution — JIT to host (`cranelift` or `dynasmrt`, post-v1).**
 
@@ -216,11 +227,11 @@ depending on the node's role:
 - Must match the interpreter bit-for-bit; CI runs interpreter and JIT in
   differential mode on every block.
 
-Alternative proving backends (RISC Zero, Jolt) plug in behind the
-`ProofSystem` trait without changing the runtime ELF. The single
-`vm-rv32im` interpreter remains the source of truth for what a block means;
-everything else exists to make verifying that meaning cheap, fast, or
-zero-knowledge.
+Alternative proving backends (SP1, RISC Zero, Jolt) plug in behind the
+`ProofSystem` trait via `proof_system_version` without changing the runtime
+ELF. The single `vm-rv32im` interpreter remains the source of truth for
+what a block means; everything else exists to make verifying that meaning
+cheap, fast, or zero-knowledge.
 
 ## Trap and abort
 

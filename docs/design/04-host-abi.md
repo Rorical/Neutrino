@@ -114,8 +114,9 @@ Gas costs reflect underlying work (e.g. hashing is ~1 gas/byte; BLS verify is
 ## Gas cost table (v1 draft)
 
 These are starting values; M1 will calibrate them against the interpreter and
-M8 will re-calibrate against the SP1 prover cost model. All values are
-deterministic, included in `ChainSpec`, and frozen per release.
+M8 will re-calibrate against the in-tree Plonky3 STARK prover cost model
+(constraint counts per syscall, range-check / memory-bus rows induced). All
+values are deterministic, included in `ChainSpec`, and frozen per release.
 
 | Syscall                              | Base gas | Per-byte / per-item |
 |--------------------------------------|----------|---------------------|

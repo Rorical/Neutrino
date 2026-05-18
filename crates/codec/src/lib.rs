@@ -6,7 +6,7 @@
 //!
 //! Neutrino uses borsh as its canonical wire codec because borsh's
 //! fixed-width `u32` length prefixes produce smaller, simpler in-circuit
-//! decoders for the SP1 and Plonky3 backends in `prover-block` and
+//! decoders for the v1 Plonky3 backends in `prover-block` and
 //! `prover-chunk`. See `docs/design/07-block-format.md`.
 
 pub use borsh::io::{Error, ErrorKind, Read, Result as IoResult, Write};

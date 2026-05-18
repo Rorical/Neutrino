@@ -211,8 +211,9 @@ merkle-proof-friendliness is on the table; we encapsulate the codec choice
 behind a `Codec` trait.
 
 Proof bytes are opaque to the network layer — they carry whatever encoding
-the active proof system defines (SP1's bincode, Plonky3's custom, etc.) and
-are gated only by the proof system's verifier on receipt.
+the active proof system defines (the v1 Plonky3 STARK serialises its own FRI
+transcript and openings; alternative backends would carry their own bytes)
+and are gated only by the proof system's verifier on receipt.
 
 ## Sync state machine (engine-side)
 

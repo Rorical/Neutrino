@@ -10,9 +10,11 @@ The proof system is **first-class from day one**, but split into two phases:
    placeholder proofs. This lets us bring up the full block → chunk →
    checkpoint → recursive lifecycle, BFT finality, networking, slashing, and
    sync against the real interfaces without paying any zk-prover cost.
-2. **Phases M8–M10** swap each layer of the mock for a real proof backend
-   (SP1 for block, Plonky3 for chunk, Plonky3 → SNARK wrapper for recursive
-   checkpoint).
+2. **Phases M8–M10** swap each layer of the mock for a real proof backend.
+   All three tiers run on the same Plonky3 / BabyBear / Poseidon2 stack:
+   a custom in-tree Plonky3 STARK for the block prover, a Plonky3 chunk
+   circuit aggregating 128 block proofs, and a Plonky3 → SNARK wrapper for
+   the recursive checkpoint.
 
 This is the Mina-style ordering: stand up the protocol first against stubs,
 verify end-to-end correctness, then bolt on the heavy cryptographic
@@ -162,25 +164,63 @@ Exit criteria: 16-validator network finalizes a chunk roughly every
 the eight slashing variants in turn) is detected, gossiped as evidence,
 and applied by the runtime within one chunk.
 
-## M8 — Real block prover (week 22–25)
+## M8 — Real block prover (custom Plonky3 RV32IM AIR)
 
-- `prover-block`: SP1 integration. Preferred path is proving the canonical
-  on-chain RV32IM ELF directly. If SP1 cannot execute that stock ELF, the SP1
-  guest proves the Neutrino RV32IM interpreter running the canonical ELF.
-  Witnesses from M1 feed the prover; the resulting `BlockProof` plugs into the
-  same `ProofSystem` trait that `MockProofSystem` implemented.
+- `prover-block`: in-tree Plonky3 STARK over BabyBear with Poseidon2
+  Merkle / Fiat-Shamir. Proves correct execution of the canonical
+  on-chain RV32IM ELF identified by `vm_code_hash`. Consumes the
+  `SealedWitness` shipped by M8-A; `BlockProof` plugs into the same
+  `ProofSystem` trait that `MockProofSystem` implemented. See
+  [10-proof-system.md](10-proof-system.md) for the AIR decomposition.
 - Public-input binding: chain_id, height, parent_block_hash, block_hash,
   state_root_before, state_root_after, transactions_root, receipt_root,
-  da_root, vm_code_hash, abi_version.
+  da_root, vm_code_hash, abi_version. Bound under a Poseidon2 digest
+  committed as the STARK's public values.
 - Benchmark prove time vs. block fullness; tune `PROOF_WINDOW` based on
   observed reality.
 - Implement the fallback-prover hook surface even though the
   bounty/economics arrive in M11.
 
+Work is broken into 14 sub-slices so each lands behind the six-gate
+CI:
+
+- **M8-A** Witness pipeline (`SealedWitness`, borsh, storage column,
+  engine wiring).
+- **M8-B** Design-doc canonicalisation of the Plonky3-everywhere
+  decision.
+- **M8-C** `prover-block` Plonky3 baseline (BabyBear, Poseidon2,
+  Fibonacci hello-world AIR proving + verifying through the
+  `ProofSystem` trait).
+- **M8-D** Public-input commitment binding (Poseidon2 digest of
+  `BlockProofPublicInputs`).
+- **M8-E** Range-check tables (u8 / u16 / u32 decomposition).
+- **M8-F** Memory consistency AIR (multi-set permutation on
+  `(addr, ts, op, val)`).
+- **M8-G** Program ROM AIR (PC → instruction lookup anchored at
+  `vm_code_hash`).
+- **M8-H** Base RV32I CPU AIR (register file, ALU, branches, jumps,
+  loads/stores via the memory bus).
+- **M8-I** M-extension AIR (MUL / MULH / MULHU / MULHSU / DIV / DIVU
+  / REM / REMU with M0 non-trapping semantics).
+- **M8-J** System and trap AIR (ECALL, EBREAK, illegal, alignment,
+  OOG; gas accounting).
+- **M8-K** Syscall replay AIR (host ABI replay against the witness's
+  syscall records).
+- **M8-L** Multi-AIR composition with the shared logUp lookup bus.
+- **M8-M** Continuations / shards (boundary-state linking argument
+  for traces above `TRACE_LIMIT`).
+- **M8-N** `Plonky3BlockProver: ProofSystem` integration in the
+  engine and node binaries; mock retained for chunk/recursive (M9 /
+  M10 work).
+- **M8-O** Differential mutation rejection test (tamper with
+  witness, register file, memory, public inputs; verifier must
+  reject).
+- **M8-P** Bench harness + `PROOF_WINDOW` tuning.
+
 Exit criteria: 1000 consecutive blocks proved and verified end-to-end
-against SP1; mean prove time within `PROOF_WINDOW`; differential check that
-SP1 verification accepts every honestly-produced proof and rejects
-mutations.
+against the Plonky3 backend; mean prove time within `PROOF_WINDOW`;
+differential mutation test confirms the verifier accepts every
+honestly-produced proof and rejects all tampered variants.
 
 ## M9 — Real chunk prover (week 25–29)
 

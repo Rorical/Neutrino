@@ -400,9 +400,11 @@ pub enum HashAlgorithm {
     /// BLAKE3, the M0 default and reference implementation.
     #[default]
     Blake3,
-    /// SHA-256, useful for SP1-oriented circuit economics.
+    /// SHA-256, useful for backends that prefer SHA-friendly trie
+    /// commitments (e.g. an alternative `proof_system_version` swap).
     Sha256,
-    /// Poseidon, useful for Plonky3-oriented circuit economics.
+    /// Poseidon (Poseidon2 over BabyBear under the v1 Plonky3 backend),
+    /// useful for in-circuit Merkle and Fiat-Shamir economics.
     Poseidon,
 }
 

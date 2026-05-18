@@ -2,8 +2,8 @@
 //! `BlockProduced → PendingProof → Proven` for a single produced block.
 //!
 //! Phase E plugs the [`ProofSystem`] trait into the engine. The mock
-//! backend is used for M5 through M7; M8 swaps it for SP1 without any
-//! engine-side change.
+//! backend is used for M5 through M7; M8 swaps it for the v1 in-tree
+//! Plonky3 STARK block prover without any engine-side change.
 
 use core::fmt;
 

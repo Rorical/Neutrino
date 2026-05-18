@@ -101,6 +101,99 @@ Instead, the proof is a separate object referenced by the block via the
 `block_hash` it proves. Provers publish proofs on a dedicated gossip topic
 (see [06-networking](06-networking.md)).
 
+### Witness format
+
+The block prover does not re-fetch state. It consumes a `SealedWitness`
+the runtime host emits during execution. The witness is borsh-encoded,
+persisted in the `witnesses` storage column under the block hash, and
+shipped peer-to-peer via `/neutrino/req/witness_by_block/1`.
+
+```rust
+pub struct SealedWitness {
+    pub parent_state_root: [u8; 32],
+    pub block_context:    BlockContextWitness,
+    pub state_reads:      Vec<StateRead>,
+}
+
+pub struct StateRead {
+    pub key:        Vec<u8>,
+    pub base_value: Option<Vec<u8>>,        // None for exclusion
+    pub proof:      neutrino_trie::Proof,   // anchored at parent_state_root
+}
+```
+
+The proof system anchors every `StateRead.proof` against
+`SealedWitness.parent_state_root`. Writes are not recorded explicitly:
+the prover replays the trace to derive post-state values, then checks
+the post-state root equals the header's `state_root`. Reads that the
+runtime served from its dirty overlay (key written and re-read in the
+same block) still carry a base-trie proof so the prover never has to
+trust the runtime's overlay state; the live overlay value is
+reconstructed from the trace.
+
+### Block prover backend
+
+The v1 block backend is a **custom Plonky3 STARK** that proves
+correct execution of the canonical RV32IM ELF identified by
+`vm_code_hash`. The block prover is therefore an in-tree zkVM, not a
+wrapper around an external backend (SP1, RISC Zero, Jolt). This
+trade-off is detailed under [Alternatives considered](#alternatives-considered).
+
+- **Field.** BabyBear, `p = 2^31 - 2^27 + 1`. Native 31-bit arithmetic
+  matches the dominant Plonky3 deployments, has the best FRI tooling,
+  and decomposes RV32IM's 32-bit operands with one extra bit-witness
+  per word.
+- **Hash.** Poseidon2 over BabyBear. Arithmetic-friendly hash with
+  practical in-circuit Merkle and Fiat-Shamir performance; mandatory if
+  the chunk (M9) and recursive (M10) layers are to verify block proofs
+  cheaply in-circuit. The chain's consensus hash remains BLAKE3
+  (`primitives::blake3_256`); the two hashes occupy disjoint namespaces.
+- **Recursion target.** Block proofs are the leaves of the Plonky3
+  recursion tree built by M9 (chunk) and M10 (recursive checkpoint).
+  Keeping all three tiers on Plonky3 / BabyBear / Poseidon2 removes one
+  cross-backend wrapping step from the chunk circuit.
+
+#### AIR decomposition
+
+The block prover is not a single STARK. It is a set of AIRs sharing a
+logUp lookup bus, each constraining one shape of work:
+
+| AIR | Trace shape | Role |
+|---|---|---|
+| Range check (u8 / u16 / u32) | Static lookup tables | Source of truth for byte and word range arguments every other AIR consumes. |
+| Program ROM | One row per `(pc, instruction)` pair in the ELF | Anchors PC → instruction lookups to `vm_code_hash`. |
+| Memory consistency | One row per memory access | Sorted multi-set over `(addr, ts, op, val)`; checks reads return latest writes; ingests the witness's `state_reads` as the boundary for trie-backed memory. |
+| Base RV32I CPU | One row per executed RV32I instruction | Register file, ALU, branches, jumps, loads/stores via the memory bus. |
+| M-extension | One row per multiply/divide | MUL/MULH/MULHU/MULHSU/DIV/DIVU/REM/REMU with the M0 non-trapping semantics for `/0` and signed overflow. |
+| Traps + system | One row per ECALL/EBREAK/illegal/alignment/OOM | Encodes the [`Trap`](../../crates/vm-rv32im/src/lib.rs) variants and gas accounting. |
+| Syscall replay | One row per `ECALL` | Binds the syscall number, request, and response bytes to the host ABI; gas-consumed constraint matches the per-syscall cost table from [04-host-abi](04-host-abi.md). |
+
+Cross-AIR consistency lives on the lookup bus: each AIR sends/receives
+typed records (memory accesses, byte-range queries, program-rom rows,
+syscall pairs) and the multi-set permutation closes globally per
+shard. No AIR can fabricate a memory access or a syscall response
+without a matching counterpart on another AIR.
+
+#### Continuations
+
+A block whose RV32IM trace exceeds `TRACE_LIMIT` rows splits into
+**shards**. Each shard is a full multi-AIR STARK; consecutive shards
+are linked by an argument committing to the boundary state: register
+file, program counter, last memory commitment, and gas remaining. The
+final shard's boundary state must match the post-execution
+commitments encoded in the public inputs. `TRACE_LIMIT` is a backend
+constant tuned against measured prover memory and FRI cost; the
+public-input surface is identical regardless of shard count.
+
+#### Public-input commitment
+
+The borsh-encoded `BlockProofPublicInputs` is hashed under Poseidon2
+to a single field-element-equivalent digest committed as the STARK's
+public values. The verifier recomputes the digest from the same
+fields and rejects mismatches. The mock backend (M2 through M7) uses
+BLAKE3 under `MOCK_BLOCK_DOMAIN`; the real backend's Poseidon2 digest
+is a separate namespace.
+
 ### Lifecycle FSM
 
 ```
@@ -224,18 +317,27 @@ public inputs:
     next_validator_set_root is derived from runtime state at end_state_root.
 ```
 
-The chunk proof composes block proofs. Three implementation strategies:
+The chunk proof composes block proofs. v1 uses **recursive verification**
+inside the same Plonky3 / BabyBear / Poseidon2 stack the block prover
+emits: the chunk circuit re-runs the block-proof FRI verifier
+in-circuit and accumulates across blocks. This is the highest per-block
+cost option but the simplest in terms of semantics, and the
+cross-backend wrapping overhead that motivates folding schemes does
+not exist because every proof in the recursion shares one backend.
 
-1. **Recursive verification.** The chunk circuit runs the block-proof
-   verifier in-circuit, accumulating across blocks. Highest cost, simplest
-   semantics.
-2. **Folding scheme.** Use Nova / SuperNova / HyperNova to fold block
-   instances into one. Lower per-block overhead at the cost of an external
-   "decider" step.
-3. **Dedicated chunk circuit.** Aggregate via Plonk / Halo2 lookup arguments.
-   Lowest cost; tightest coupling to the proof backend.
+Alternative aggregation strategies the `ProofSystem` trait still
+permits:
 
-The `ProofSystem` trait (below) hides which strategy a backend uses.
+1. **Folding scheme.** Nova / SuperNova / HyperNova fold block
+   instances into one with an external "decider" step. Lower per-block
+   overhead, more moving pieces.
+2. **Dedicated chunk circuit.** Aggregate via Plonkish lookup
+   arguments without explicitly verifying each block proof.
+   Lowest cost, tightest coupling to the in-tree backend.
+
+Either can become the v1.x default once measured against the M9
+baseline; the `proof_system_version` field on the recursive checkpoint
+public inputs is the upgrade lever.
 
 ### Adaptive chunking
 
@@ -411,23 +513,58 @@ pub trait ProofSystem: Send + Sync + 'static {
 Every component that touches proofs takes a `dyn ProofSystem`. Tests use a
 mock backend that produces trivial proofs (just hashes).
 
-### Candidate backends
+### v1 stack
 
-| Backend | Tier | Strengths | Weaknesses |
-|---|---|---|---|
-| **SP1** (Succinct) | Block | Rust zkVM over RV32IM, active development, recursion-ready, Plonky3 / Plonkish base. | Single vendor; proving cost still high. |
-| **RISC Zero** | Block | Mature, used in production, well-documented. | Older STARK, larger proofs, weaker recursion story. |
-| **Jolt** (a16z) | Block | Pure lookups, very fast prover. | Less mature; recursion still maturing. |
-| **Nexus** | Block + folding | Nova-based folding all the way up. | Earliest stage. |
-| **Plonky3 / Halo2** custom | Chunk + recursive | Direct control of public inputs and recursion. | We write the circuit. |
-| **Risc0 STARK → Groth16 wrapper** | Recursive | Tiny final proof (~200 B). | Trusted setup for the wrap. |
+All three tiers ship on the same backend:
 
-**Tentative v1 stack**: SP1 for block proofs, custom Plonky3 chunk circuit,
-Plonky3 → SNARK wrapper for the recursive checkpoint to keep on-chain (or
-on-light-client) verifier cost minimal.
+| Tier | Backend | Notes |
+|---|---|---|
+| Block | Custom Plonky3 STARK over BabyBear | In-tree zkVM. AIR decomposition above. Poseidon2 hash. |
+| Chunk | Custom Plonky3 circuit | Aggregates 128 block proofs. Verifies their Plonky3 STARKs natively without a cross-backend wrapper. |
+| Recursive checkpoint | Plonky3 → SNARK wrapper (Groth16 or PLONK over BN254) | Tiny final proof; light clients verify one Plonky3 → SNARK proof per checkpoint. |
 
-This is deferred — the `ProofSystem` trait lets us prototype with a mock,
-then evaluate backends with real benchmarks at M2/M3.
+The mock backend ([`MockProofSystem`](../../crates/proof-system/src/mock.rs))
+remains the M2 through M7 stand-in. M8 onwards swaps in real backends.
+`proof_system_version` in `RecursivePublicInputs` lets governance
+upgrade the backend without invalidating old proofs (see
+[Versioning](#versioning)).
+
+### Alternatives considered
+
+Three off-the-shelf RV32IM zkVMs were viable v1 block backends:
+
+| Backend | Strengths | Why not v1 |
+|---|---|---|
+| **SP1** (Succinct) | Plonky3-based Rust zkVM; recursion-ready; production users. | Single-vendor coupling to the `succinct` toolchain (`sp1up`, `cargo-prove`). Block-proof outputs wrap inside Plonky3 for the chunk circuit at non-trivial cost. |
+| **RISC Zero** | Mature, well-documented, Groth16 wrap built in. | Older STARK; larger block proofs; weaker recursion story. Cross-backend wrap into Plonky3 for chunk aggregation is expensive. |
+| **Jolt** (a16z) | Lookup-heavy, fast prover. | Less mature; recursion path still developing; same cross-backend wrap problem as RISC Zero. |
+| **Nexus** | Nova / SuperNova folding all the way up. | Earliest stage of the four; unclear long-term backend stability. |
+
+We chose to build a custom Plonky3 RV32IM zkVM because
+
+1. **Recursion uniformity.** All three tiers (block, chunk, recursive)
+   run on Plonky3 / BabyBear / Poseidon2. The chunk circuit verifies
+   block proofs natively rather than verifying a wrapped SP1 / RISC Zero
+   proof inside Plonky3, which materially reduces chunk-circuit cost.
+2. **No vendor lock-in.** The block prover lives in-tree under the
+   workspace lints and license. There is no second toolchain to track
+   for reproducible builds.
+3. **Public-input control.** We bind exactly the
+   [`BlockProofPublicInputs`](../../crates/consensus-types) shape; no
+   adapter layer translates between an external zkVM's commitment and
+   ours.
+
+The cost is real and we own it. Writing a sound RV32IM AIR is large
+engineering work: full opcode coverage, memory consistency, range
+checks, lookup arguments, M-extension corner cases, continuations.
+The audit surface is ours. The [Roadmap](09-roadmap.md) M8 entry
+breaks the work into 14 sub-slices so progress is land-by-slice rather
+than a single big-bang circuit.
+
+A `proof_system_version = 2` upgrade can later switch to a different
+block backend without disturbing the chunk and recursive tiers; the
+recursion circuit verifies whichever block-proof shape matches its
+own `proof_system_version`.
 
 ## Network roles
 

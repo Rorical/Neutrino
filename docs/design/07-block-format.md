@@ -23,7 +23,7 @@ Why borsh:
   variable-length collections. No compact-int encoding. Variable-length
   parsing is the single biggest constraint cost in a zk decoder, and borsh's
   fixed-width prefixes are materially cheaper in-circuit than SCALE's
-  compact ints — important for the SP1 and Plonky3 backends in
+  compact ints — important for the v1 Plonky3 block backend in
   [10-proof-system](10-proof-system.md).
 - `no_std` friendly via its own `borsh::io::{Read, Write}` traits; works on
   `riscv32im-unknown-none-elf` without depending on `std::io`.
@@ -544,7 +544,7 @@ checkpoint proofs are gossiped per-checkpoint.
 | Chunk/checkpoint hash | BLAKE3 | Consistency with block hashing |
 | VRF output derivation | SHA-256 | BLS hash-to-curve compatibility |
 | Signing-domain hashing | SHA-256 | BLS uniformity / EIP-2333 compat |
-| Proof-system public-input hash | Backend-defined | SP1=SHA-256; Plonky3=Poseidon |
+| Proof-system public-input hash | Backend-defined | v1 Plonky3 backend uses Poseidon2 over BabyBear |
 
 We deliberately split fast hashing (BLAKE3) from BLS-compat hashing (SHA-256).
 The recursive proof verifier handles both because both occur in public inputs.

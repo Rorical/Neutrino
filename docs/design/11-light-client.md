@@ -297,7 +297,8 @@ clients we default to checkpoint-only.
 
 What the client trusts:
 
-- **The proof system** (soundness of SP1/Plonky3/whatever backend is in use).
+- **The proof system** (soundness of the v1 in-tree Plonky3 STARK or whichever
+  backend `proof_system_version` selects).
 - **The proof system's compiled circuit** (the verifier key embedded in the
   client). A new verifier key requires a client upgrade; we treat circuit
   upgrades as breaking releases.

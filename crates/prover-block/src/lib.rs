@@ -15,8 +15,10 @@
 //! M8-E adds the first lookup-table AIR; M8-F adds the memory
 //! consistency AIR; M8-G adds the program ROM AIR; M8-H slice 1
 //! adds the CPU AIR scaffold; M8-H slice 2 adds bit decomposition of
-//! the low instruction bytes and the LUI opcode family. The crate
-//! currently exposes:
+//! the low instruction bytes and the LUI opcode family; M8-H slice 3
+//! adds the on-trace 32-entry register file with one-hot write
+//! indicators and the x0-pinned write rule. The crate currently
+//! exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -37,10 +39,12 @@
 //!   to the `vm_code_hash` public input.
 //! - [`cpu`] — the per-instruction execution-trace AIR. Slice 1
 //!   pinned the trace's PC and real/pad selector layout; slice 2
-//!   adds bit decomposition of the low instruction bytes plus the
+//!   added bit decomposition of the low instruction bytes plus the
 //!   LUI opcode family (opcode check, `next_pc = pc + 4`,
-//!   `rd_val = imm20 << 12`). Subsequent M8-H sub-slices add the
-//!   register file and each remaining RV32I instruction family.
+//!   `rd_val = imm20 << 12`); slice 3 adds the on-trace 32-entry
+//!   register file with one-hot write indicators, x0 pinning, and
+//!   the per-register transition rule. Subsequent M8-H sub-slices
+//!   add each remaining RV32I instruction family.
 //!
 //! Later M8 slices (M8-I onwards) grow the crate one AIR at a time
 //! against this scaffold.
@@ -57,7 +61,7 @@ pub use config::{
     BABY_BEAR_MODULUS, Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm,
     StarkCfg, Val, ValMmcs, build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
 };
-pub use cpu::{CPU_TRACE_WIDTH, CpuAir, CpuInstruction, cpu_trace, cpu_trace_height};
+pub use cpu::{CPU_TRACE_WIDTH, CpuAir, CpuInstruction, NUM_REGS, cpu_trace, cpu_trace_height};
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,

@@ -692,9 +692,8 @@ mod tests {
     use super::*;
     use crate::proof::{ProofError, ProofOutcome, ProofStep, ProofTerminal};
     use alloc::vec;
-    use rand::RngCore;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::{RngCore, SeedableRng};
 
     type TestTrie = Trie<Blake3Hasher>;
 
@@ -982,7 +981,7 @@ mod tests {
 
     #[test]
     fn random_insert_get_remove_roundtrip() {
-        let mut rng = StdRng::seed_from_u64(0x5452_4945);
+        let mut rng = ChaCha20Rng::seed_from_u64(0x5452_4945);
         let mut trie = TestTrie::new();
         let mut pairs = Vec::new();
 

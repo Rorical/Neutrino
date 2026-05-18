@@ -19,7 +19,10 @@ neutrino-primitives = { workspace = true }
 borsh               = { workspace = true }
 
 [dev-dependencies]
-rand                = { workspace = true }
+# Trie tests use rand_chacha (rand_core 0.6 compatible) for
+# deterministic randomised insertion / proof checks.
+rand_chacha         = { workspace = true }
+rand_core           = { workspace = true }
 
 [lints]
 workspace = true

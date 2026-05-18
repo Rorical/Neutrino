@@ -29,7 +29,8 @@ use neutrino_runtime_host::{
     validate_transaction,
 };
 use neutrino_trie::{Blake3Hasher, Hasher, ProofOutcome, Trie};
-use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
+use rand_core::SeedableRng;
 
 const COUNTER_KEY: &[u8] = b"counter";
 const ELF_ENV: &str = "NEUTRINO_DEFAULT_RUNTIME_ELF";
@@ -359,7 +360,7 @@ fn transfer_updates_accounts_and_state_root() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let mut rng = ChaCha20Rng::seed_from_u64(42);
     let sk_sender = SecretKey::generate(&mut rng);
     let sk_receiver = SecretKey::generate(&mut rng);
     let pk_sender = sk_sender.public_key().to_bytes();
@@ -490,7 +491,7 @@ fn runtime_validates_single_transaction_without_mutating_state() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(43);
+    let mut rng = ChaCha20Rng::seed_from_u64(43);
     let sk_sender = SecretKey::generate(&mut rng);
     let pk_sender = sk_sender.public_key().to_bytes();
     let pk_receiver = SecretKey::generate(&mut rng).public_key().to_bytes();
@@ -526,7 +527,7 @@ fn runtime_validation_reports_same_signature_failure_as_block_execution() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(44);
+    let mut rng = ChaCha20Rng::seed_from_u64(44);
     let sk_sender = SecretKey::generate(&mut rng);
     let pk_sender = sk_sender.public_key().to_bytes();
     let pk_receiver = SecretKey::generate(&mut rng).public_key().to_bytes();
@@ -575,7 +576,7 @@ fn stake_and_unstake_update_validator_set() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+    let mut rng = ChaCha20Rng::seed_from_u64(99);
     let sk_owner = SecretKey::generate(&mut rng);
     let pk_owner = sk_owner.public_key().to_bytes();
     let bls1 = bls_pk(1);
@@ -652,7 +653,7 @@ fn full_unstake_clears_stake_account_and_vs_hash() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+    let mut rng = ChaCha20Rng::seed_from_u64(77);
     let sk_owner = SecretKey::generate(&mut rng);
     let pk_owner = sk_owner.public_key().to_bytes();
     let bls1 = bls_pk(2);
@@ -748,7 +749,7 @@ fn deposit_credits_stake_account_and_exit_returns_to_owner() {
 
     // Generate Ed25519 owner. Deposit uses a raw BLS pubkey (no keygen
     // needed — the runtime trusts engine-side POP verification).
-    let mut rng = rand::rngs::StdRng::seed_from_u64(55);
+    let mut rng = ChaCha20Rng::seed_from_u64(55);
     let ed_sk = SecretKey::generate(&mut rng);
     let ed_pubkey = ed_sk.public_key().to_bytes();
     let bls_pk = bls_pk(1);
@@ -853,7 +854,7 @@ fn multi_lane_body_exercises_all_transaction_types() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+    let mut rng = ChaCha20Rng::seed_from_u64(12);
     let sk_a = SecretKey::generate(&mut rng);
     let sk_b = SecretKey::generate(&mut rng);
     let sk_c = SecretKey::generate(&mut rng);
@@ -1034,7 +1035,7 @@ fn transfer_with_bad_signature_aborts_with_signature_code() {
         eprintln!("{ELF_ENV} not set; skipping bad-sig test.");
         return;
     };
-    let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+    let mut rng = ChaCha20Rng::seed_from_u64(1);
     let sk = SecretKey::generate(&mut rng);
     let pk_from = sk.public_key().to_bytes();
     let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
@@ -1066,7 +1067,7 @@ fn transfer_with_wrong_nonce_aborts_with_nonce_code() {
         eprintln!("{ELF_ENV} not set; skipping bad-nonce test.");
         return;
     };
-    let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+    let mut rng = ChaCha20Rng::seed_from_u64(2);
     let sk = SecretKey::generate(&mut rng);
     let pk_from = sk.public_key().to_bytes();
     let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
@@ -1097,7 +1098,7 @@ fn transfer_with_insufficient_balance_aborts_with_underflow_code() {
         eprintln!("{ELF_ENV} not set; skipping underflow test.");
         return;
     };
-    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    let mut rng = ChaCha20Rng::seed_from_u64(3);
     let sk = SecretKey::generate(&mut rng);
     let pk_from = sk.public_key().to_bytes();
     let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
@@ -1144,7 +1145,7 @@ fn stake_by_wrong_owner_aborts_with_underflow_code() {
         eprintln!("{ELF_ENV} not set; skipping wrong-owner stake test.");
         return;
     };
-    let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+    let mut rng = ChaCha20Rng::seed_from_u64(4);
     let sk_real = SecretKey::generate(&mut rng);
     let sk_attacker = SecretKey::generate(&mut rng);
     let pk_real = sk_real.public_key().to_bytes();
@@ -1269,7 +1270,7 @@ fn transfer_only_block_reports_no_validator_set_root() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let mut rng = ChaCha20Rng::seed_from_u64(11);
     let sk = SecretKey::generate(&mut rng);
     let pk_from = sk.public_key().to_bytes();
     let pk_to = SecretKey::generate(&mut rng).public_key().to_bytes();
@@ -1302,7 +1303,7 @@ fn stake_block_exposes_next_validator_set_root_in_outcome() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(22);
+    let mut rng = ChaCha20Rng::seed_from_u64(22);
     let sk = SecretKey::generate(&mut rng);
     let pk_owner = sk.public_key().to_bytes();
     let bls = bls_pk(7);
@@ -1351,7 +1352,7 @@ fn validator_set_root_carries_through_non_validator_blocks() {
         return;
     };
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(33);
+    let mut rng = ChaCha20Rng::seed_from_u64(33);
     let sk = SecretKey::generate(&mut rng);
     let pk_owner = sk.public_key().to_bytes();
     let pk_recv = SecretKey::generate(&mut rng).public_key().to_bytes();

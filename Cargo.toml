@@ -144,8 +144,18 @@ k256                = { version = "0.13", default-features = false, features = [
 
 subtle              = { version = "2.6",  default-features = false }
 zeroize             = { version = "1.8",  default-features = false, features = ["derive"] }
+# rand_core stays at 0.6 because ed25519-dalek 2.1 and k256 0.13 both
+# bind their generic Rng arguments to the rand_core 0.6 trait set.
 rand_core           = { version = "0.6",  default-features = false, features = ["getrandom"] }
-rand                = { version = "0.8" }
+# Workspace rand is 0.10 to match the version Plonky3 0.5 (`prover-block`)
+# pulls in. Tests on the consensus side use `rand_core::OsRng` directly
+# rather than `rand::rngs::OsRng` so the two crates do not have to
+# share a rand version with the prover backend.
+rand                = { version = "0.10" }
+# Deterministic CSPRNG paired with rand_core 0.6 for tests that need
+# both a reproducible seed and an Rng that satisfies `ed25519-dalek`,
+# `k256`, and `blst`'s rand_core 0.6 trait bounds.
+rand_chacha         = { version = "0.3" }
 rocksdb             = { version = "0.22", default-features = false }
 
 thiserror           = { version = "2.0" }
@@ -164,6 +174,25 @@ tracing             = { version = "0.1" }
 proc-macro2         = { version = "1.0" }
 quote               = { version = "1.0" }
 syn                 = { version = "2.0",  features = ["full"] }
+
+# Plonky3 — STARK toolkit for the v1 in-tree block prover (M8) and the
+# chunk / recursive layers that follow (M9, M10). All p3-* crates are
+# pinned to the same 0.5 minor; the project still ships pre-1.0 minor
+# breaks. See `docs/design/10-proof-system.md` for the architectural
+# rationale (custom RV32IM AIR over BabyBear + Poseidon2).
+p3-air              = { version = "0.5" }
+p3-baby-bear        = { version = "0.5" }
+p3-challenger       = { version = "0.5" }
+p3-commit           = { version = "0.5" }
+p3-dft              = { version = "0.5" }
+p3-field            = { version = "0.5" }
+p3-fri              = { version = "0.5" }
+p3-matrix           = { version = "0.5" }
+p3-merkle-tree      = { version = "0.5" }
+p3-poseidon2        = { version = "0.5" }
+p3-symmetric        = { version = "0.5" }
+p3-uni-stark        = { version = "0.5" }
+p3-util             = { version = "0.5" }
 
 # Test-only.
 proptest            = { version = "1.6" }

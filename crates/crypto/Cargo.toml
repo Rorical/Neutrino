@@ -29,7 +29,9 @@ rand_core           = { workspace = true }
 hex                 = { workspace = true }
 
 [dev-dependencies]
-rand                = { workspace = true }
+# Crypto tests source OsRng from rand_core (already a runtime dep)
+# rather than `rand::rngs::OsRng` so the test path does not couple
+# to whichever rand major version the workspace pins.
 
 [lints]
 workspace = true

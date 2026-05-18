@@ -25,7 +25,10 @@ borsh                  = { workspace = true }
 
 [dev-dependencies]
 neutrino-proof-system  = { workspace = true }
-rand                   = { workspace = true }
+# Tests source deterministic randomness from rand_chacha (rand_core
+# 0.6 trait set) so they can feed neutrino-crypto's `SecretKey::generate`.
+rand_chacha            = { workspace = true }
+rand_core              = { workspace = true }
 
 [lints]
 workspace = true

@@ -174,9 +174,8 @@ const MASK_LO_64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
 mod tests {
     use super::*;
     use neutrino_primitives::{DEFAULT_EXPECTED_PROPOSERS_PER_SLOT, FIXED_U128_ONE};
-    use rand::RngCore;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::{RngCore, SeedableRng};
 
     const E_ONE: FixedU128 = FIXED_U128_ONE;
 
@@ -206,13 +205,13 @@ mod tests {
         output
     }
 
-    fn next_u64(rng: &mut StdRng) -> u64 {
+    fn next_u64(rng: &mut ChaCha20Rng) -> u64 {
         let mut bytes = [0_u8; 8];
         rng.fill_bytes(&mut bytes);
         u64::from_le_bytes(bytes)
     }
 
-    fn next_u128(rng: &mut StdRng) -> u128 {
+    fn next_u128(rng: &mut ChaCha20Rng) -> u128 {
         let mut bytes = [0_u8; 16];
         rng.fill_bytes(&mut bytes);
         u128::from_le_bytes(bytes)
@@ -364,7 +363,7 @@ mod tests {
         let expected = 1_000_usize;
         let tolerance = 150_usize;
 
-        let mut rng = StdRng::seed_from_u64(0x00C0_FFEE_AABB_CCDD);
+        let mut rng = ChaCha20Rng::seed_from_u64(0x00C0_FFEE_AABB_CCDD);
         let mut count = 0_usize;
         for _ in 0..n {
             let mut output = [0_u8; 32];
@@ -382,7 +381,7 @@ mod tests {
 
     #[test]
     fn eligibility_rate_zero_when_p_is_zero() {
-        let mut rng = StdRng::seed_from_u64(7);
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
         for _ in 0..256 {
             let mut output = [0_u8; 32];
             rng.fill_bytes(&mut output);
@@ -394,7 +393,7 @@ mod tests {
     fn higher_stake_strictly_dominates_lower_stake() {
         // For any fixed output, a validator with strictly more stake is
         // eligible whenever the lower-stake validator is.
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
         for _ in 0..1024 {
             let mut output = [0_u8; 32];
             rng.fill_bytes(&mut output);
@@ -413,7 +412,7 @@ mod tests {
     fn half_stake_eligibility_rate_is_near_one_half() {
         // Stake = total/2, E=1.0 -> p = 0.5. Sample and check ~50%.
         let n = 4_096_usize;
-        let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+        let mut rng = ChaCha20Rng::seed_from_u64(0xDEAD_BEEF);
         let mut count = 0_usize;
         for _ in 0..n {
             let mut output = [0_u8; 32];
@@ -439,7 +438,7 @@ mod tests {
     #[test]
     fn random_eligibility_inputs_do_not_panic() {
         // Smoke test against arbitrary (potentially overflowing) inputs.
-        let mut rng = StdRng::seed_from_u64(99);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
         for _ in 0..256 {
             let mut output = [0_u8; 32];
             rng.fill_bytes(&mut output);

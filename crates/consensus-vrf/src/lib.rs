@@ -364,15 +364,15 @@ mod tests {
     use neutrino_primitives::{
         DEFAULT_EXPECTED_PROPOSERS_PER_SLOT, FIXED_U128_ONE, Validator, fixed_u128_from_integer,
     };
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
 
     const CHAIN_ID: u64 = 7;
     const SEED: Seed = [0x42; 32];
     const SLOT: Slot = 11;
 
     fn secret_key(seed: u64) -> SecretKey {
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
         SecretKey::generate(&mut rng)
     }
 

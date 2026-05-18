@@ -142,7 +142,7 @@ impl fmt::Debug for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     #[test]
     fn keygen_sign_verify_roundtrips() {

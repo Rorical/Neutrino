@@ -77,11 +77,11 @@ mod tests {
 
     use neutrino_crypto::bls::SecretKey;
     use neutrino_primitives::BlsSignature;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
 
     fn deterministic_sk(seed: u64) -> SecretKey {
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
         SecretKey::generate(&mut rng)
     }
 

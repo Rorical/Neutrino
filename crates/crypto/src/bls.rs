@@ -289,7 +289,7 @@ impl fmt::Debug for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     fn gen_sk() -> SecretKey {
         SecretKey::generate(&mut OsRng)

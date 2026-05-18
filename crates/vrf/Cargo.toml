@@ -22,7 +22,11 @@ neutrino-crypto     = { workspace = true }
 sha2                = { workspace = true }
 
 [dev-dependencies]
-rand                = { workspace = true }
+# Tests use rand_chacha (rand_core 0.6 compatible) so they can feed
+# `neutrino-crypto::SecretKey::generate`, plus rand 0.10 stays out of
+# the VRF test path.
+rand_chacha         = { workspace = true }
+rand_core           = { workspace = true }
 
 [lints]
 workspace = true

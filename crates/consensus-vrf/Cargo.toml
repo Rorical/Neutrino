@@ -21,7 +21,10 @@ neutrino-primitives      = { workspace = true }
 neutrino-vrf             = { workspace = true }
 
 [dev-dependencies]
-rand                     = { workspace = true }
+# Tests use rand_chacha (rand_core 0.6 compatible) so they can feed
+# `neutrino-crypto::SecretKey::generate` deterministic seeds.
+rand_chacha              = { workspace = true }
+rand_core                = { workspace = true }
 
 [lints]
 workspace = true

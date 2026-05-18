@@ -22,17 +22,28 @@
 //!   (`ri_0..ri_31`), and the field-arithmetic
 //!   `rd_val = rs1_val + imm` rule. The slice-2 `is_lui ⇒ is_real`
 //!   constraint was upgraded to a multi-family aggregate.
-//! - **Slice 5** (this slice) adds the bitwise OP-IMM operations
-//!   ANDI / ORI / XORI. Each shares the OP-IMM opcode `0x13` and is
-//!   distinguished by `funct3` (`111`, `110`, `100`). The slice
-//!   introduces a 32-bit decomposition of `rs1_val`
-//!   (`rs1_bit_0..31`) so each result bit can be computed from
-//!   `rs1_bit_i ⊙ imm_bit_i` and summed into `rd_val`. The
-//!   immediate's bit-by-bit view reuses the existing `b2` / `b3`
-//!   bits plus a sign-extension of `b3_bit_7` across bits 12..31.
+//! - **Slice 5** added the bitwise OP-IMM operations ANDI / ORI /
+//!   XORI on top of a 32-bit decomposition of `rs1_val`.
+//! - **Slice 6** (this slice) adds AUIPC, the U-type sibling of
+//!   LUI. The encoding reuses LUI's `imm20 << 12` decomposition;
+//!   the only semantic difference is `rd_val = pc + (imm20 << 12)`
+//!   rather than `rd_val = imm20 << 12`. No new source-register
+//!   read or arithmetic on register values is involved.
 //!
-//! Subsequent sub-slices add the remaining RV32I opcode families one
-//! at a time on this scaffold.
+//! The remaining OP-IMM operations (SLTI / SLTIU / SLLI / SRLI /
+//! SRAI) all require `mod 2^32` semantics that BabyBear cannot
+//! enforce locally without range-checking against the field
+//! modulus `p`. The standard borrow-witness construction for
+//! SLTI / SLTIU has a real soundness gap in this setup: the field
+//! equation `rs1 + lt·2^32 = imm_unsigned + diff` admits two valid
+//! `(lt, diff)` integer solutions, both representable as 32-bit
+//! bit decompositions and both passing the AIR check. The shifts
+//! have the analogous problem with `rs1 << shamt` overflowing the
+//! field. Both families are deferred to a later M8-H pass that
+//! lands after M8-L's range tables and lookup bus are wired in.
+//! Subsequent sub-slices proceed with the families that work
+//! without u32 wraparound (AUIPC, JAL, JALR, BEQ, BNE, FENCE,
+//! ECALL, EBREAK).
 //!
 //! ## Trace layout
 //!
@@ -66,6 +77,7 @@
 //! | 175      | `is_andi`      | `1` if this row is the OP-IMM ANDI instruction                     |
 //! | 176      | `is_ori`       | `1` if this row is the OP-IMM ORI instruction                      |
 //! | 177      | `is_xori`      | `1` if this row is the OP-IMM XORI instruction                     |
+//! | 178      | `is_auipc`     | `1` if this row is the AUIPC instruction                           |
 //!
 //! Real rows describe an executed RV32I instruction; padding rows
 //! follow the halt and hold the PC in place with the all-zero
@@ -136,6 +148,18 @@
 //!   - **PC**: `next_pc = pc + 4`.
 //!   - **`rd_val`**: `rd_val = rs1_val + imm` in field arithmetic.
 //!
+//! Slice 6 additions:
+//!
+//! - **`is_auipc` boolean**.
+//! - **AUIPC active** (gated by `is_auipc`):
+//!   - **Opcode**: low 7 bits of `b0` equal `0x17`.
+//!   - **PC**: `next_pc = pc + 4`.
+//!   - **`rd_val`**: `rd_val = pc + (imm20 << 12)`, where
+//!     `imm20 << 12 = b1[7:4]·2^12 + b2·2^16 + b3·2^24` (same
+//!     bit expression LUI uses).
+//! - **Family aggregate** extended:
+//!   `is_real = is_lui + is_addi + is_andi + is_ori + is_xori + is_auipc`.
+//!
 //! Slice 5 additions:
 //!
 //! - **`rs1` bit booleans**: each of `rs1_bit_0..31` is in `{0, 1}`.
@@ -205,13 +229,13 @@ use crate::config::FRI_LOG_FINAL_POLY_LEN;
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
 
-/// Number of trace columns the CPU AIR uses at M8-H slice 5.
+/// Number of trace columns the CPU AIR uses at M8-H slice 6.
 ///
 /// Each later sub-slice extends the layout (additional decoded
 /// fields, more opcode selectors, memory records) by appending
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
-pub const CPU_TRACE_WIDTH: usize = COL_IS_XORI + 1;
+pub const CPU_TRACE_WIDTH: usize = COL_IS_AUIPC + 1;
 
 const COL_PC: usize = 0;
 const COL_NEXT_PC: usize = 1;
@@ -239,6 +263,7 @@ const COL_RS1_BIT_START: usize = COL_RS1_IND_START + NUM_REGS;
 const COL_IS_ANDI: usize = COL_RS1_BIT_START + 32;
 const COL_IS_ORI: usize = COL_IS_ANDI + 1;
 const COL_IS_XORI: usize = COL_IS_ORI + 1;
+const COL_IS_AUIPC: usize = COL_IS_XORI + 1;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -247,6 +272,11 @@ const MIN_TRACE_HEIGHT: usize = 1 << (FRI_LOG_FINAL_POLY_LEN + 1);
 
 /// RV32I LUI opcode (`0b0110111`).
 const LUI_OPCODE: u32 = 0x37;
+
+/// RV32I AUIPC opcode (`0b0010111`). Shares the U-type encoding with
+/// LUI; the only difference is that `rd_val = pc + (imm20 << 12)`
+/// rather than `rd_val = imm20 << 12`.
+const AUIPC_OPCODE: u32 = 0x17;
 
 /// RV32I OP-IMM opcode (`0b0010011`). The funct3 field selects the
 /// specific operation (ADDI, SLTI, ANDI, ORI, XORI, SLLI, SRLI, SRAI).
@@ -329,6 +359,28 @@ impl CpuInstruction {
             "CpuInstruction::lui: imm20 must fit in 20 bits"
         );
         let insn = (imm20 << 12) | (rd << 7) | LUI_OPCODE;
+        Self::straight(pc, insn)
+    }
+
+    /// Encode `auipc rd, imm20` at the given `pc`.
+    ///
+    /// Like [`Self::lui`] but produces `rd_val = pc + (imm20 << 12)`
+    /// rather than `rd_val = imm20 << 12`. Shares the U-type
+    /// encoding shape with LUI; the only encoding difference is the
+    /// opcode byte (`0x17` vs `0x37`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rd >= 32`, if `imm20 >= 1 << 20`, or if `pc + 4`
+    /// overflows `u32`.
+    #[must_use]
+    pub const fn auipc(pc: u32, rd: u32, imm20: u32) -> Self {
+        assert!(rd < 32, "CpuInstruction::auipc: rd must be in [0, 31]");
+        assert!(
+            imm20 < 1 << 20,
+            "CpuInstruction::auipc: imm20 must fit in 20 bits"
+        );
+        let insn = (imm20 << 12) | (rd << 7) | AUIPC_OPCODE;
         Self::straight(pc, insn)
     }
 
@@ -465,6 +517,7 @@ impl<AB: AirBuilder> Air<AB> for CpuAir {
         eval_register_file::<AB>(builder, local, next);
         eval_high_bytes_and_addi::<AB>(builder, local);
         eval_rs1_bits_and_bitwise_op_imm::<AB>(builder, local);
+        eval_auipc::<AB>(builder, local);
         eval_family_aggregate::<AB>(builder, local);
     }
 }
@@ -819,6 +872,38 @@ fn eval_rs1_bits_and_bitwise_op_imm<AB: AirBuilder>(builder: &mut AB, local: &[A
     builder.assert_zero(is_xori * (AB::Expr::from(local[COL_RD_VAL]) - xor_expr));
 }
 
+/// Slice 6: AUIPC. Reuses LUI's U-type immediate bit expression but
+/// adds `pc` into `rd_val`. AUIPC reads no source register and emits
+/// no read indicator.
+fn eval_auipc<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    builder.assert_bool(local[COL_IS_AUIPC]);
+    let is_auipc: AB::Expr = local[COL_IS_AUIPC].into();
+
+    // Opcode = 0x17 when active.
+    let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(AUIPC_OPCODE)));
+    let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    builder.assert_zero(is_auipc.clone() * (b0_low_7 - opcode_target));
+
+    // PC: AUIPC is straight-line.
+    let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
+    let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
+    builder.assert_zero(is_auipc.clone() * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
+
+    // rd_val = pc + (imm20 << 12), where the U-type shifted
+    // immediate matches LUI's expression:
+    //   imm20 << 12 = b1[7:4]·2^12 + b2·2^16 + b3·2^24.
+    let imm_shifted: AB::Expr = AB::Expr::from(AB::F::from_u64(4096))
+        * AB::Expr::from(local[COL_B1_BITS_START + 4])
+        + AB::Expr::from(AB::F::from_u64(8192)) * AB::Expr::from(local[COL_B1_BITS_START + 5])
+        + AB::Expr::from(AB::F::from_u64(16384)) * AB::Expr::from(local[COL_B1_BITS_START + 6])
+        + AB::Expr::from(AB::F::from_u64(32768)) * AB::Expr::from(local[COL_B1_BITS_START + 7])
+        + AB::Expr::from(AB::F::from_u64(65536)) * AB::Expr::from(local[COL_B2])
+        + AB::Expr::from(AB::F::from_u64(16_777_216)) * AB::Expr::from(local[COL_B3]);
+    let rd_val_expr: AB::Expr = AB::Expr::from(local[COL_PC]) + imm_shifted;
+    builder.assert_zero(is_auipc * (AB::Expr::from(local[COL_RD_VAL]) - rd_val_expr));
+}
+
 /// Family aggregate: `is_real = Σ is_<family>` over every real-opcode
 /// sub-selector currently constrained. Each new opcode family adds
 /// its selector to this sum.
@@ -827,7 +912,8 @@ fn eval_family_aggregate<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
         + AB::Expr::from(local[COL_IS_ADDI])
         + AB::Expr::from(local[COL_IS_ANDI])
         + AB::Expr::from(local[COL_IS_ORI])
-        + AB::Expr::from(local[COL_IS_XORI]);
+        + AB::Expr::from(local[COL_IS_XORI])
+        + AB::Expr::from(local[COL_IS_AUIPC]);
     builder.assert_eq(AB::Expr::from(local[COL_IS_REAL]), aggregate);
 }
 
@@ -989,6 +1075,19 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
                 values[base + COL_IS_LUI] = F::ONE;
                 let rd_val = insn.insn & 0xFFFF_F000;
                 let rd_val_field = F::from_u64(u64::from(rd_val));
+                values[base + COL_RD_VAL] = rd_val_field;
+                values[base + COL_WI_START + rd_idx_usize] = F::ONE;
+                if rd_idx != 0 {
+                    regs[rd_idx_usize] = rd_val_field;
+                }
+            }
+            x if x == AUIPC_OPCODE => {
+                values[base + COL_IS_AUIPC] = F::ONE;
+                let imm_shifted = insn.insn & 0xFFFF_F000;
+                // rd_val = pc + (imm20 << 12), computed in field
+                // arithmetic. M8-L will pin u32 wrapping.
+                let rd_val_field =
+                    F::from_u64(u64::from(insn.pc)) + F::from_u64(u64::from(imm_shifted));
                 values[base + COL_RD_VAL] = rd_val_field;
                 values[base + COL_WI_START + rd_idx_usize] = F::ONE;
                 if rd_idx != 0 {
@@ -2035,6 +2134,136 @@ mod tests {
         let pc_base = 0x10000;
         let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 5, 0, 1)]);
         trace.values[COL_IS_ANDI] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    // -------- Slice 6 tests (AUIPC) --------
+
+    #[test]
+    fn auipc_constructor_encodes_canonical_bytes() {
+        // `auipc x5, 0xABCDE` → imm20 = 0xABCDE, rd = 5, opcode = 0x17.
+        // insn = (0xABCDE << 12) | (5 << 7) | 0x17
+        //      = 0xABCDE000 | 0x0000_0280 | 0x17
+        //      = 0xABCDE297
+        let insn = CpuInstruction::auipc(0x10000, 5, 0xABCDE);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10004);
+        assert_eq!(insn.insn, 0xABCD_E297);
+    }
+
+    #[test]
+    #[should_panic(expected = "rd must be in [0, 31]")]
+    fn auipc_constructor_panics_on_oob_rd() {
+        let _ = CpuInstruction::auipc(0x10000, 32, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "imm20 must fit in 20 bits")]
+    fn auipc_constructor_panics_on_oob_imm20() {
+        let _ = CpuInstruction::auipc(0x10000, 0, 1 << 20);
+    }
+
+    #[test]
+    fn auipc_writes_pc_plus_shifted_immediate() {
+        let pc_base = 0x10000;
+        // `auipc x5, 0x00001` → rd_val = 0x10000 + 0x1000 = 0x11000.
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::auipc(pc_base, 5, 0x00001)]);
+        assert_eq!(trace.values[COL_RD_VAL], Val::from_u64(0x11000));
+        let row1 = CPU_TRACE_WIDTH;
+        assert_eq!(
+            trace.values[row1 + COL_REG_START + 5],
+            Val::from_u64(0x11000),
+        );
+        assert_eq!(trace.values[COL_IS_AUIPC], Val::ONE);
+        assert_eq!(trace.values[COL_IS_LUI], Val::ZERO);
+        assert_eq!(trace.values[COL_IS_ADDI], Val::ZERO);
+    }
+
+    #[test]
+    fn single_auipc_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(pc_base, &[CpuInstruction::auipc(pc_base, 5, 0x00010)]);
+    }
+
+    #[test]
+    fn auipc_with_rd_zero_proves() {
+        // Like LUI x0, AUIPC x0 sets `wi_0 = 1` but the x0 pinning
+        // silently drops the write.
+        prove_and_verify(0x10000, &[CpuInstruction::auipc(0x10000, 0, 0x00010)]);
+    }
+
+    #[test]
+    fn auipc_with_zero_imm20_writes_just_pc() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::auipc(pc_base, 5, 0)]);
+        // rd_val = pc + 0 = pc.
+        assert_eq!(trace.values[COL_RD_VAL], Val::from_u64(u64::from(pc_base)));
+    }
+
+    #[test]
+    fn auipc_followed_by_addi_computes_pc_relative_address() {
+        // Canonical PC-relative load pattern: `auipc rd, hi` then
+        // `addi rd, rd, lo` builds an address relative to the
+        // current PC. Here we materialise `pc_base + 0x123` into r5.
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::auipc(pc_base, 5, 0x00000),
+                CpuInstruction::addi(pc_base + 4, 5, 5, 0x123),
+            ],
+        );
+    }
+
+    #[test]
+    fn mixed_lui_auipc_addi_program_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 1, 0x00010),
+                CpuInstruction::auipc(pc_base + 4, 2, 0x00010),
+                CpuInstruction::addi(pc_base + 8, 3, 2, 0x010),
+            ],
+        );
+    }
+
+    #[test]
+    fn prover_refuses_auipc_with_wrong_rd_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::auipc(pc_base, 5, 0x00001)]);
+        // rd_val should be 0x11000; tamper.
+        trace.values[COL_RD_VAL] = Val::from_u64(0x12000);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_auipc_with_wrong_opcode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::auipc(pc_base, 5, 0x00001)]);
+        // Flip b0_bit_5 from 0 to 1 (opcode becomes 0x37 = LUI).
+        // 0x17 = 0001_0111 → bit 5 = 0. After flip → 0011_0111 = 0x37.
+        trace.values[COL_B0_BITS_START + 5] = Val::ONE;
+        trace.values[COL_B0] += Val::from_u64(32);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_auipc_set_on_padding_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[]);
+        trace.values[COL_IS_AUIPC] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_auipc_with_wrong_next_pc() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::auipc(pc_base, 5, 0x00001)]);
+        // Force next_pc = pc + 8.
+        trace.values[COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
+        trace.values[CPU_TRACE_WIDTH + COL_PC] = Val::from_u64(u64::from(pc_base) + 8);
+        trace.values[CPU_TRACE_WIDTH + COL_NEXT_PC] = Val::from_u64(u64::from(pc_base) + 8);
         assert_prover_rejects(pc_base, trace);
     }
 }

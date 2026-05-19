@@ -81,7 +81,8 @@ pub use cpu::{
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use logup::{
-    balance, encode_record, is_balanced, permutation_trace, row_contribution, running_sum,
+    MultiAirClosureReport, balance, encode_record, is_balanced, multi_air_cumulative_sum,
+    permutation_trace, row_contribution, running_sum,
 };
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,

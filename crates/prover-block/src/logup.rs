@@ -204,6 +204,89 @@ where
     delta
 }
 
+/// Result of running the field-arithmetic bus closure across every
+/// AIR in a shard.
+///
+/// The future multi-AIR prover commits each AIR's permutation trace
+/// alongside its main trace, and the verifier sums every AIR's
+/// `permutation_values()` entry — i.e. every AIR's `cumulative_value`
+/// here — and checks the total is zero. Surfaces both the per-AIR
+/// values and the global sum so test code (and eventually the
+/// verifier) can pinpoint which side of the bus is unbalanced.
+#[derive(Clone, Debug)]
+pub struct MultiAirClosureReport<EF> {
+    /// Per-AIR cumulative values, in the order the input AIRs were
+    /// supplied to [`multi_air_cumulative_sum`].
+    pub per_air_cumulatives: Vec<EF>,
+    /// Sum of every per-AIR cumulative value. The bus closes iff
+    /// this equals [`EF::ZERO`](p3_field::PrimeCharacteristicRing::ZERO).
+    pub global_sum: EF,
+}
+
+impl<EF: PrimeCharacteristicRing + Eq + Copy> MultiAirClosureReport<EF> {
+    /// `true` iff the global cumulative sum is zero.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.global_sum == EF::ZERO
+    }
+
+    /// Indices of AIRs whose individual cumulative value is non-zero.
+    ///
+    /// Useful for diagnosing where the imbalance lives when a multi-
+    /// AIR closure check fails. Note that a closed bus can still have
+    /// non-zero per-AIR cumulatives (one AIR's positive contribution
+    /// cancels another's negative), so this set should be read as
+    /// "AIRs participating in the bus", not "AIRs at fault".
+    #[must_use]
+    pub fn nonzero_air_indices(&self) -> Vec<usize> {
+        self.per_air_cumulatives
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, value)| (*value != EF::ZERO).then_some(idx))
+            .collect()
+    }
+}
+
+/// Compute every AIR's per-AIR cumulative bus value and the global
+/// sum, packaged into a [`MultiAirClosureReport`].
+///
+/// `per_air_records[k]` is the row-aligned record schedule for AIR
+/// `k` (the same shape every AIR's `per_row_bus_records` helper
+/// produces). The function calls [`permutation_trace`] for each AIR
+/// and folds the resulting cumulative values into the report.
+///
+/// This is the field-arithmetic mirror of the cross-AIR closure
+/// check the future multi-AIR verifier will perform: it sums the
+/// per-AIR cumulative values, and the bus is honest iff that sum is
+/// `EF::ZERO`.
+///
+/// # Panics
+///
+/// Same panic surface as [`permutation_trace`] (α-collides-with-
+/// encoding).
+#[must_use]
+pub fn multi_air_cumulative_sum<F, EF>(
+    per_air_records: &[Vec<Vec<BusRecord<F>>>],
+    alpha: EF,
+    beta: EF,
+) -> MultiAirClosureReport<EF>
+where
+    F: PrimeField32,
+    EF: ExtensionField<F>,
+{
+    let mut per_air_cumulatives = Vec::with_capacity(per_air_records.len());
+    let mut global_sum = EF::ZERO;
+    for rows in per_air_records {
+        let (_trace, cumulative) = permutation_trace::<F, EF>(rows, alpha, beta);
+        per_air_cumulatives.push(cumulative);
+        global_sum += cumulative;
+    }
+    MultiAirClosureReport {
+        per_air_cumulatives,
+        global_sum,
+    }
+}
+
 /// Build a one-column extension-field permutation trace aligned to
 /// an AIR's main trace, plus the AIR's cumulative bus value.
 ///
@@ -802,9 +885,8 @@ mod tests {
     #[test]
     fn multi_air_closure_via_per_row_helpers_for_both_channels() {
         // Threads every AIR's `per_row_bus_records` helper through
-        // `logup::permutation_trace`, then sums the per-AIR
-        // cumulative values across all four AIRs. Honest traces must
-        // close to zero for every channel simultaneously.
+        // the multi-AIR cumulative-sum helper. Honest traces must
+        // close to zero across both U8Range and ProgramRom channels.
         let pc_base = 0x10000;
         let cpu_insns = [
             CpuInstruction::addi(pc_base, 1, 0, 5),
@@ -819,33 +901,113 @@ mod tests {
         let alpha = test_alpha();
         let beta = test_beta();
 
-        // CPU side: combined byte-range + program-rom records per
-        // row, via the new helper.
         let cpu_rows = crate::cpu::per_row_bus_records::<Val>(&cpu_t);
-        let (_cpu_perm, cpu_cumulative) =
-            permutation_trace::<Val, Challenge>(&cpu_rows, alpha, beta);
-
-        // u8 table receives: aggregate the CPU's byte-range sends
-        // into per-value multiplicities, then build the table's
-        // per-row records.
         let byte_sends = byte_range_send_records::<Val>(&cpu_t);
         let u8_mult = range_send_multiplicities::<Val>(&byte_sends, BusChannel::U8Range, 256);
         let u8_rows = crate::range_check::per_row_bus_records::<Val>(BusChannel::U8Range, &u8_mult);
-        let (_u8_perm, u8_cumulative) = permutation_trace::<Val, Challenge>(&u8_rows, alpha, beta);
-
-        // ROM receives.
         let pc_sends = program_rom_send_records::<Val>(&cpu_t);
         let rom_mult = program_rom_send_multiplicities::<Val>(&pc_sends, &rom_t);
         let rom_rows = crate::program_rom::per_row_bus_records::<Val>(&rom_t, &rom_mult);
-        let (_rom_perm, rom_cumulative) =
-            permutation_trace::<Val, Challenge>(&rom_rows, alpha, beta);
 
-        // Global closure: sum of every AIR's cumulative value across
-        // both bus channels must be zero.
-        assert_eq!(
-            cpu_cumulative + u8_cumulative + rom_cumulative,
-            Challenge::ZERO,
+        let report =
+            multi_air_cumulative_sum::<Val, Challenge>(&[cpu_rows, u8_rows, rom_rows], alpha, beta);
+        assert!(report.is_closed(), "multi-AIR closure failed: {report:?}");
+        assert_eq!(report.per_air_cumulatives.len(), 3);
+    }
+
+    // -------- Multi-AIR closure helper --------
+
+    #[test]
+    fn multi_air_cumulative_sum_empty_input_reports_zero_global() {
+        let report = multi_air_cumulative_sum::<Val, Challenge>(&[], test_alpha(), test_beta());
+        assert!(report.per_air_cumulatives.is_empty());
+        assert_eq!(report.global_sum, Challenge::ZERO);
+        assert!(report.is_closed());
+        assert!(report.nonzero_air_indices().is_empty());
+    }
+
+    #[test]
+    fn multi_air_cumulative_sum_single_air_passes_through() {
+        // Single AIR whose records balance internally: the report's
+        // per-air slot must equal zero and the global sum matches.
+        let payload = payload_u8(0x42);
+        let rows = vec![
+            vec![BusRecord::send(BusChannel::U8Range, payload.clone())],
+            vec![BusRecord::receive(BusChannel::U8Range, payload)],
+        ];
+        let report = multi_air_cumulative_sum::<Val, Challenge>(&[rows], test_alpha(), test_beta());
+        assert_eq!(report.per_air_cumulatives.len(), 1);
+        assert_eq!(report.per_air_cumulatives[0], Challenge::ZERO);
+        assert_eq!(report.global_sum, Challenge::ZERO);
+        assert!(report.is_closed());
+        assert!(report.nonzero_air_indices().is_empty());
+    }
+
+    #[test]
+    fn multi_air_cumulative_sum_complementary_airs_close_with_nonzero_per_air_values() {
+        // Two AIRs whose individual cumulatives are non-zero, but
+        // sum to zero across the bus. This is the typical sender +
+        // receiver pattern: sender's cumulative = +k / (α − e),
+        // receiver's cumulative = −k / (α − e), summing to zero.
+        let payload = payload_u8(0x21);
+        let alpha = test_alpha();
+        let beta = test_beta();
+        let sender_rows = vec![vec![BusRecord::send(BusChannel::U8Range, payload.clone())]];
+        let receiver_rows = vec![vec![BusRecord::receive(BusChannel::U8Range, payload)]];
+        let report =
+            multi_air_cumulative_sum::<Val, Challenge>(&[sender_rows, receiver_rows], alpha, beta);
+
+        // Sender / receiver each have non-zero individual contributions.
+        assert_eq!(report.per_air_cumulatives.len(), 2);
+        assert_ne!(report.per_air_cumulatives[0], Challenge::ZERO);
+        assert_ne!(report.per_air_cumulatives[1], Challenge::ZERO);
+        // But the contributions cancel globally.
+        assert_eq!(report.global_sum, Challenge::ZERO);
+        assert!(report.is_closed());
+        // `nonzero_air_indices` still reports both as participating.
+        let nonzero = report.nonzero_air_indices();
+        assert_eq!(nonzero, vec![0, 1]);
+    }
+
+    #[test]
+    fn multi_air_cumulative_sum_reports_global_imbalance() {
+        // Sender with no matching receiver. The global sum is
+        // non-zero and the report flags index 0 as participating.
+        let rows = vec![vec![BusRecord::send(BusChannel::U8Range, payload_u8(0x42))]];
+        let report = multi_air_cumulative_sum::<Val, Challenge>(&[rows], test_alpha(), test_beta());
+        assert!(!report.is_closed());
+        assert_ne!(report.global_sum, Challenge::ZERO);
+        assert_eq!(report.nonzero_air_indices(), vec![0]);
+    }
+
+    #[test]
+    fn multi_air_cumulative_sum_matches_per_air_running_sum_finals() {
+        // The helper must agree cell-for-cell with calling
+        // `permutation_trace` per AIR and summing the cumulative
+        // values manually.
+        let alpha = test_alpha();
+        let beta = test_beta();
+        let air_a = vec![
+            vec![BusRecord::send(BusChannel::U8Range, payload_u8(0x10))],
+            vec![],
+            vec![BusRecord::send(BusChannel::U8Range, payload_u8(0x20))],
+        ];
+        let air_b = vec![
+            vec![BusRecord::receive(BusChannel::U8Range, payload_u8(0x10))],
+            vec![BusRecord::receive(BusChannel::U8Range, payload_u8(0x20))],
+        ];
+
+        let report = multi_air_cumulative_sum::<Val, Challenge>(
+            &[air_a.clone(), air_b.clone()],
+            alpha,
+            beta,
         );
+
+        let (_perm_a, cum_a) = permutation_trace::<Val, Challenge>(&air_a, alpha, beta);
+        let (_perm_b, cum_b) = permutation_trace::<Val, Challenge>(&air_b, alpha, beta);
+        assert_eq!(report.per_air_cumulatives[0], cum_a);
+        assert_eq!(report.per_air_cumulatives[1], cum_b);
+        assert_eq!(report.global_sum, cum_a + cum_b);
     }
 
     #[test]

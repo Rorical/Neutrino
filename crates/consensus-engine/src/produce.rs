@@ -1,28 +1,19 @@
-//! Per-slot block production: VRF eligibility, runtime execution,
-//! header sealing, and persistence.
+//! Per-slot block production shell.
 //!
-//! Phase D drives the engine state forward block-by-block. Phase E
-//! attaches the mock block proof on top of the [`Block`] produced
-//! here.
+//! The legacy RV32IM runtime-host implementation was removed by the
+//! SP1/WASM rewrite. Block production will be reintroduced through the
+//! new WASM dry-run plus SP1 proving path described in
+//! `docs/design/13-sp1-runtime-proof-rewrite.md`.
 
 use core::fmt;
-use core::mem;
 
-use neutrino_consensus_types::{Block, Body, Header};
+use neutrino_consensus_types::{Block, Body};
 use neutrino_consensus_vrf::{VrfError, total_active_stake};
-use neutrino_primitives::{
-    BlockHash, BlsSignature, Hash, Height, Slot, StateRoot, Validator, ZERO_HASH, blake3_256,
-};
-use neutrino_runtime_abi::BlockContext;
-use neutrino_runtime_host::{BlockError, BlockOutcome, Overlay, SealedWitness, run_block};
+use neutrino_primitives::{BlockHash, BlsSignature, Slot, StateRoot, Validator};
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
-use crate::block_state::BlockState;
-use crate::body::{
-    BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots,
-    encode_runtime_body_with_validators,
-};
+use crate::body::BodyEncodeError;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::proposer::ProposerKey;
@@ -46,20 +37,8 @@ pub enum ProductionError<E> {
     HeightOverflow,
     /// Body encoding rejected the supplied transactions.
     BodyEncode(BodyEncodeError),
-    /// Runtime execution failed.
-    Runtime(BlockError),
-    /// The runtime returned a witness that failed to borsh-encode for
-    /// persistence. Borsh serialization is infallible for canonical
-    /// witness types so this variant exists only for diagnostic
-    /// completeness.
-    WitnessEncode(borsh::io::Error),
-    /// The supplied runtime ELF does not match the chain-spec runtime code hash.
-    RuntimeCodeHashMismatch {
-        /// Runtime hash committed by the chain spec.
-        expected: Hash,
-        /// Runtime hash computed from the supplied ELF bytes.
-        actual: Hash,
-    },
+    /// Block production requires the new WASM/SP1 runtime path.
+    RuntimeUnavailable,
     /// The proposer key does not match the validator pubkey at its declared index.
     ProposerKeyMismatch {
         /// Validator index the proposer key declared.
@@ -88,15 +67,12 @@ impl<E: fmt::Display + fmt::Debug> fmt::Display for ProductionError<E> {
             ),
             Self::HeightOverflow => f.write_str("block height counter overflowed"),
             Self::BodyEncode(e) => write!(f, "body encode failed: {e}"),
-            Self::Runtime(e) => write!(f, "runtime execution failed: {e:?}"),
-            Self::RuntimeCodeHashMismatch { expected, actual } => write!(
-                f,
-                "runtime ELF hash mismatch: expected {expected:?}, computed {actual:?}"
-            ),
+            Self::RuntimeUnavailable => {
+                f.write_str("block production awaits the WASM/SP1 runtime rewrite")
+            }
             Self::ProposerKeyMismatch { index } => {
                 write!(f, "proposer key does not match validator at index {index}")
             }
-            Self::WitnessEncode(err) => write!(f, "witness borsh encode failed: {err}"),
             Self::NonMonotonicSlot {
                 parent_slot,
                 requested,
@@ -129,29 +105,14 @@ impl<E> From<BodyEncodeError> for ProductionError<E> {
     }
 }
 
-impl<E> From<BlockError> for ProductionError<E> {
-    fn from(value: BlockError) -> Self {
-        Self::Runtime(value)
-    }
-}
-
-impl<E> From<borsh::io::Error> for ProductionError<E> {
-    fn from(value: borsh::io::Error) -> Self {
-        Self::WitnessEncode(value)
-    }
-}
-
 /// Runtime + proposer binding for [`Engine::try_produce_block`].
 #[derive(Clone, Copy, Debug)]
 pub struct ProductionConfig<'a> {
-    /// Runtime ELF bytes the engine will execute.
-    pub runtime_elf: &'a [u8],
     /// Proposer secret-key wrapper.
     pub proposer: &'a ProposerKey,
 }
 
-/// Successful block-production outcome with detail about the
-/// engine-side side effects.
+/// Successful block-production outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductionOutcome {
     /// The signed block.
@@ -162,44 +123,26 @@ pub struct ProductionOutcome {
     pub state_root_after: StateRoot,
     /// Gas the runtime actually consumed.
     pub gas_used: u64,
-    /// Validator-set root the runtime committed for the next chunk,
-    /// if any. Forwarded into `header.runtime_extra` and surfaced
-    /// here for chunk-level consumers in later phases.
+    /// Validator-set root the runtime committed for the next chunk, if any.
     pub next_validator_set_root: Option<StateRoot>,
-    /// Full active validator set when the runtime changed it in this
-    /// block, `None` otherwise.
+    /// Full active validator set when the runtime changed it in this block.
     pub next_validator_set: Option<Vec<Validator>>,
-    /// Sealed execution witness captured by the runtime host. The
-    /// engine persists this in the [`Witnesses`](neutrino_storage::Column)
-    /// column under `block_hash` so a later
-    /// [`Engine::prove_block`](crate::Engine::prove_block) can load
-    /// and pass it to the proof backend without the caller having to
-    /// thread bytes through.
-    pub witness: SealedWitness,
 }
 
 impl<DB: Database> Engine<DB> {
     /// Attempt to produce a block at `slot`.
     ///
-    /// Returns `Ok(Some(outcome))` when the local validator is
-    /// eligible to propose, advancing the engine head; `Ok(None)`
-    /// otherwise, leaving the engine state unchanged.
+    /// The legacy runtime executor has been removed. This method still performs
+    /// proposer eligibility checks so validator configuration errors surface in
+    /// the same place, then returns [`ProductionError::RuntimeUnavailable`]
+    /// until the WASM/SP1 production path lands.
     pub fn try_produce_block(
         &mut self,
         slot: Slot,
         cfg: ProductionConfig<'_>,
-        body: Body,
-        gas_limit: u64,
+        _body: Body,
+        _gas_limit: u64,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
-        let actual_runtime_hash = blake3_256(cfg.runtime_elf);
-        let expected_runtime_hash = self.chain_spec().runtime_code_hash;
-        if actual_runtime_hash != expected_runtime_hash {
-            return Err(ProductionError::RuntimeCodeHashMismatch {
-                expected: expected_runtime_hash,
-                actual: actual_runtime_hash,
-            });
-        }
-
         let parent_hash = self.head_hash();
         let parent_slot = self.head_slot(parent_hash)?;
         if slot <= parent_slot {
@@ -209,107 +152,16 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
-        let Some(eligibility) = self.evaluate_eligibility(slot, cfg.proposer)? else {
+        let Some(_eligibility) = self.evaluate_eligibility(slot, cfg.proposer)? else {
             return Ok(None);
         };
 
-        let height = self
+        let _height = self
             .head_height()
             .checked_add(1)
             .ok_or(ProductionError::HeightOverflow)?;
-        let parent_state_root = self.head_state_root();
 
-        let witness_body = borsh::to_vec(&body)?;
-        let encoded_body = encode_runtime_body_with_validators(&body, self.active_validator_set())?;
-        let ctx = BlockContext {
-            slot,
-            height,
-            seed: self.finalized_seed(),
-            parent_hash,
-            parent_state_root,
-            gas_limit,
-            proposer_index: cfg.proposer.validator_index(),
-            vrf_proof: eligibility.vrf_proof,
-        };
-
-        let trie = mem::take(self.state_mut_internal());
-        let mut overlay = Overlay::new(trie);
-        let mut outcome = match run_block(
-            cfg.runtime_elf,
-            &ctx,
-            encoded_body.clone(),
-            &mut overlay,
-            gas_limit,
-        ) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                *self.state_mut_internal() = overlay.into_base();
-                return Err(ProductionError::Runtime(err));
-            }
-        };
-        *self.state_mut_internal() = overlay.into_base();
-
-        let roots = compute_body_roots(&body, &encoded_body);
-        let timestamp = self.clock().timestamp_for(slot);
-        let next_validator_set_root = compute_next_validator_set_root(&outcome);
-        let header = seal_header(
-            self.chain_spec().chain_id,
-            cfg.proposer,
-            slot,
-            height,
-            parent_hash,
-            eligibility.vrf_proof,
-            &outcome,
-            &roots,
-            timestamp,
-            gas_limit,
-            next_validator_set_root,
-        );
-
-        let block = Block { header, body };
-        let block_hash = block.hash();
-        outcome.witness.block_body = witness_body;
-        outcome.witness.block_header = borsh::to_vec(&block.header)?;
-
-        // Borsh-encode the witness up front so a serialization failure
-        // surfaces before any store writes. The witness types use only
-        // `Vec<u8>` and fixed-size primitives, so the encode is
-        // infallible in practice.
-        let witness_bytes = borsh::to_vec(&outcome.witness)?;
-
-        self.store_mut().put_header(&block.header)?;
-        self.store_mut().put_body(&block_hash, &block.body)?;
-        self.store_mut()
-            .put_block_state(&block_hash, BlockState::BlockProduced)?;
-        self.store_mut().put_witness(&block_hash, &witness_bytes)?;
-        self.store_mut().put_tip(block_hash)?;
-
-        self.update_head_internal(height, block_hash, outcome.state_root_after);
-        // Producers own the canonical state trie; persist whatever
-        // nodes/values the runtime just emitted so a restart resumes
-        // at the same trie root the new head commits to.
-        self.flush_trie_to_store()?;
-
-        // If the runtime produced a new validator set, persist it and
-        // adopt it as the active set for the next block.
-        if let Some(new_set) = &outcome.next_validator_set {
-            let next_idx = self.latest_validator_set_index().saturating_add(1);
-            self.store_mut()
-                .put_validator_set_snapshot(next_idx, new_set)?;
-            self.store_mut().put_latest_validator_set_index(next_idx)?;
-            self.set_active_validator_set(new_set.clone());
-        }
-        let next_validator_set_root = compute_next_validator_set_root(&outcome);
-
-        Ok(Some(ProductionOutcome {
-            block,
-            block_hash,
-            state_root_after: outcome.state_root_after,
-            gas_used: outcome.gas_used,
-            next_validator_set_root,
-            next_validator_set: outcome.next_validator_set,
-            witness: outcome.witness,
-        }))
+        Err(ProductionError::RuntimeUnavailable)
     }
 
     fn evaluate_eligibility(
@@ -364,62 +216,8 @@ impl<DB: Database> Engine<DB> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn seal_header(
-    chain_id: u64,
-    proposer: &ProposerKey,
-    slot: Slot,
-    height: Height,
-    parent_hash: BlockHash,
-    vrf_proof: BlsSignature,
-    outcome: &BlockOutcome,
-    roots: &BodyRoots,
-    timestamp: u64,
-    gas_limit: u64,
-    next_validator_set_root: Option<StateRoot>,
-) -> Header {
-    let mut header = Header {
-        version: 1,
-        height,
-        slot,
-        parent_hash,
-        proposer_index: proposer.validator_index(),
-        vrf_proof,
-        state_root: outcome.state_root_after,
-        transactions_root: ZERO_HASH,
-        votes_root: ZERO_HASH,
-        slashings_root: ZERO_HASH,
-        validator_ops_root: ZERO_HASH,
-        da_root: ZERO_HASH,
-        runtime_extra: next_validator_set_root.unwrap_or(ZERO_HASH),
-        gas_used: outcome.gas_used,
-        gas_limit,
-        timestamp,
-        signature: [0; 96],
-    };
-    apply_body_roots(&mut header, roots);
-    let header_hash = header.hash();
-    header.signature = proposer.sign_proposer_message(chain_id, &header_hash);
-    header
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ProposerEligibility {
+    #[allow(dead_code)]
     vrf_proof: BlsSignature,
-}
-
-/// Derive the next-validator-set root from the block outcome.
-///
-/// When the runtime published a full snapshot, compute
-/// `validator_set_root` from the concrete list, which matches what
-/// the engine will use for eligibility and BFT. When no snapshot is
-/// present, fall back to the accumulator root the runtime wrote at
-/// `vs:active`.
-fn compute_next_validator_set_root(outcome: &BlockOutcome) -> Option<StateRoot> {
-    outcome
-        .next_validator_set
-        .as_ref()
-        .map_or(outcome.next_validator_set_root, |set| {
-            Some(crate::validator_set::validator_set_root(set))
-        })
 }

@@ -5,23 +5,19 @@
 //! Stable wire definitions for the Neutrino runtime ABI v1.
 //!
 //! This crate is the single source of truth for the contract between the
-//! consensus node and any runtime running on the RV32IM interpreter. It
+//! consensus node and any runtime (WASM dynamic runtime or SP1 guest). It
 //! declares:
 //!
-//! - The numeric syscall identifiers, grouped by category ([`syscall`]).
-//! - The stable status codes returned in `a0` ([`status::Status`]).
-//! - Deterministic gas-cost helpers per syscall ([`gas`]).
+//! - The stable status codes for runtime operations ([`status::Status`]).
 //! - The borsh-encoded per-block context handed to every entrypoint
 //!   ([`BlockContext`]).
 //! - The borsh-encoded read-only query request and response types
-//!   exchanged through the [`QUERY_ENTRYPOINT`] symbol
 //!   ([`QueryRequest`], [`QueryResponse`]).
+//! - The fixed-width transaction-validity result format
+//!   ([`TxValidity`], [`TxValidationCode`]).
 //!
-//! Everything in this crate is reachable by both the host (which charges
-//! gas and validates buffers) and the guest SDK (which emits the
-//! corresponding `ECALL` instructions). Numbers and field layouts here
-//! are consensus-critical and must not be changed without bumping
-//! [`ABI_VERSION`].
+//! Numbers and field layouts here are consensus-critical and must not be
+//! changed without bumping [`ABI_VERSION`].
 
 extern crate alloc;
 
@@ -32,9 +28,7 @@ use neutrino_primitives::{
     ABI_VERSION, BlockHash, BlsSignature, Height, Seed, Slot, StateRoot, ValidatorIndex,
 };
 
-pub mod gas;
 pub mod status;
-pub mod syscall;
 
 pub use neutrino_primitives::RuntimeVersion;
 pub use status::{Status, UnknownStatus};
@@ -44,21 +38,18 @@ pub use status::{Status, UnknownStatus};
 /// whose [`RuntimeVersion::abi_version`] does not match.
 pub const VERSION: u32 = ABI_VERSION;
 
-/// Runtime symbol used by the host to run a single transaction
-/// admission check.
+/// Runtime function name used by the host to run a single transaction
+/// admission check against the WASM dynamic runtime.
 pub const VALIDATE_TX_ENTRYPOINT: &str = "_neutrino_validate_tx";
 
-/// Runtime symbol used by the host to run a single read-only query.
+/// Runtime function name used by the host to run a single read-only query
+/// against the WASM dynamic runtime.
 ///
-/// The host invokes this with [`Status::PermissionDenied`] returned
-/// from every `state::WRITE` / `state::DELETE` syscall, and the state
-/// overlay is discarded after the call regardless of what the guest
-/// attempts to do.
-///
-/// The guest reads a [`QueryRequest`] from `host_input` and writes a
-/// [`QueryResponse`] to `host_output`. Both shapes are stable across
-/// minor ABI revisions; new query methods are added by the runtime
-/// without changing the wire envelope.
+/// The runtime reads a [`QueryRequest`] from its input buffer and writes a
+/// [`QueryResponse`] to its output buffer. State writes are forbidden; the
+/// host discards the state overlay regardless of what the runtime
+/// attempts. Both shapes are stable across minor ABI revisions; new query
+/// methods are added by the runtime without changing the wire envelope.
 pub const QUERY_ENTRYPOINT: &str = "_neutrino_query";
 
 /// Byte length of the fixed transaction-validity result returned by
@@ -216,8 +207,8 @@ pub enum TxValidityDecodeError {
     },
 }
 
-/// Borsh-encoded per-block context handed to every entrypoint via the
-/// [`syscall::block::CONTEXT_OUT`] syscall.
+/// Borsh-encoded per-block context handed to every entrypoint by the
+/// runtime host.
 ///
 /// All fields are engine-supplied and consensus-critical. The
 /// `parent_state_root` is the trie root the runtime is expected to
@@ -244,8 +235,8 @@ pub struct BlockContext {
     pub vrf_proof: BlsSignature,
 }
 
-/// Borsh-encoded read-only query request handed to [`QUERY_ENTRYPOINT`]
-/// through the runtime's `host_input` buffer.
+/// Borsh-encoded read-only query request passed to
+/// [`QUERY_ENTRYPOINT`] through the runtime's input buffer.
 ///
 /// The wire envelope is intentionally narrow: a runtime-defined method
 /// name plus opaque bytes. The method is a UTF-8 string so an EVM-style
@@ -262,7 +253,8 @@ pub struct QueryRequest {
     pub args: Vec<u8>,
 }
 
-/// Borsh-encoded read-only query response written to `host_output`.
+/// Borsh-encoded read-only query response written to the runtime's output
+/// buffer.
 ///
 /// A successful query carries `code = 0` and the method's serialised
 /// result in `payload`. A failed query carries a non-zero runtime

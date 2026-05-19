@@ -20,8 +20,6 @@ chunk_size = 8
 
 genesis_block_hash_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 genesis_seed_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-# The runtime code hash is derived by each node from runtime_elf_path so
-# the Docker image can build the rv32im ELF in its own deterministic path.
 
 [[validators]]
 # Deterministic BLS keypair generated for M6 integration.  The raw

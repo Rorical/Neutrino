@@ -1,5 +1,10 @@
 # 03 — Execution Runtime
 
+> Rewrite note: the SP1/WASM runtime rewrite is accepted in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). This file
+> describes the pre-rewrite RV32IM ELF/runtime-host design and is retained as
+> historical context until the old runtime code is removed.
+
 The runtime is a single **RV32IM ELF binary**. The node loads it, places it in
 a sandboxed memory, and invokes well-known entrypoints by name.
 

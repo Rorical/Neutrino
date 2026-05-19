@@ -46,7 +46,7 @@ impl SecretKey {
     pub fn to_bytes(&self) -> [u8; 32] {
         let bytes = self.0.to_bytes();
         let mut out = [0_u8; 32];
-        out.copy_from_slice(bytes.as_slice());
+        out.copy_from_slice(bytes.as_ref());
         out
     }
 

@@ -142,10 +142,8 @@ impl Mempool {
 
     /// Insert `bytes` only if `validate` accepts them.
     ///
-    /// This is the M5 seam for runtime-backed transaction validation.
     /// The mempool remains opaque to transaction semantics; RPC or the
-    /// engine can pass a closure that calls
-    /// `neutrino_runtime_host::validate_transaction`.
+    /// engine can pass a closure backed by the active dynamic runtime.
     pub fn insert_validated<F>(&mut self, bytes: Vec<u8>, validate: F) -> Result<Hash, InsertError>
     where
         F: FnOnce(&[u8]) -> bool,

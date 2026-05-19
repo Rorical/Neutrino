@@ -18,8 +18,6 @@ use crate::db::NodeDb;
 
 /// Configuration for local validator block production.
 pub(crate) struct BlockProducerConfig {
-    /// Runtime ELF bytes executed for every produced block.
-    pub(crate) runtime_elf: Vec<u8>,
     /// Local proposer key.
     pub(crate) proposer: ProposerKey,
     /// Slot-0 Unix timestamp.
@@ -75,7 +73,7 @@ async fn attempt_slot(
         return;
     }
 
-    match backend.try_produce_block(slot, &config.proposer, &config.runtime_elf) {
+    match backend.try_produce_block(slot, &config.proposer) {
         Ok(Some(outcome)) => {
             let proof = match backend.prove_block(&outcome.block_hash) {
                 Ok(proof) => proof.block_proof,

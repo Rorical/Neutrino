@@ -1,5 +1,11 @@
 # 05 — State and Storage
 
+> Rewrite note: state trie and storage fundamentals remain valid, but witness
+> generation is now defined by the SP1/WASM rewrite in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). Pruning rules
+> that depend on recursive checkpoint coverage are TODO/deferred until
+> checkpoint recursion is redesigned.
+
 ## Layers
 
 ```

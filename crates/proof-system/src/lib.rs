@@ -12,11 +12,11 @@
 //! cryptographic content of the proof bytes.
 //!
 //! The [`mock`] backend is the M2 implementation. It hashes the
-//! borsh-encoded public inputs under a per-layer domain tag and is
-//! the stand-in until M8 / M9 / M10 plug in the v1 in-tree Plonky3
-//! STARK block prover, the Plonky3 chunk circuit, and the Plonky3 →
-//! SNARK wrapper for the recursive checkpoint. Real backends share
-//! the same `ProofSystem` seam.
+//! borsh-encoded public inputs under a per-layer domain tag. The
+//! accepted SP1 rewrite replaces the planned in-tree Plonky3 block
+//! prover with an SP1 Compressed STARK block backend. Chunk proof
+//! aggregation and checkpoint recursion are TODO/deferred and must not
+//! be required by normal node operation until a new design is accepted.
 
 extern crate alloc;
 

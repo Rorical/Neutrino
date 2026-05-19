@@ -9,7 +9,6 @@ repository    = { workspace = true }
 homepage      = { workspace = true }
 documentation = { workspace = true }
 publish       = { workspace = true }
-build         = "build.rs"
 
 [features]
 default = ["std"]
@@ -28,7 +27,6 @@ neutrino-crypto           = { workspace = true }
 neutrino-mempool          = { workspace = true }
 neutrino-proof-system     = { workspace = true }
 neutrino-runtime-abi      = { workspace = true }
-neutrino-runtime-host     = { workspace = true }
 neutrino-storage          = { workspace = true }
 neutrino-trie             = { workspace = true }
 neutrino-vrf              = { workspace = true }

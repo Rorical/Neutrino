@@ -1,9 +1,7 @@
 //! TOML configuration for [`crate::run`].
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-
 use serde::Deserialize;
+use std::net::SocketAddr;
 
 /// Self-declared role for the node.
 ///
@@ -59,13 +57,7 @@ pub struct NodeConfig {
     /// node runs against an in-memory backend (useful for ephemeral
     /// test containers).
     #[serde(default)]
-    pub data_dir: Option<PathBuf>,
-    /// Optional runtime ELF path. When set, the node hashes this ELF into
-    /// the loaded chain spec if the chain-spec file omits
-    /// `runtime_code_hash_hex`; validators also execute it for local block
-    /// production.
-    #[serde(default)]
-    pub runtime_elf_path: Option<PathBuf>,
+    pub data_dir: Option<std::path::PathBuf>,
     /// Optional hex-encoded BLS IKM (32 bytes) used to derive the local
     /// proposer key for validator block production.
     #[serde(default)]
@@ -160,7 +152,6 @@ mod tests {
             r#"
 chain_id = 7
 role = "validator"
-runtime_elf_path = "/runtime/default.elf"
 proposer_ikm_hex = "4242424242424242424242424242424242424242424242424242424242424242"
 proposer_index = 3
 "#,
@@ -168,10 +159,6 @@ proposer_index = 3
         .expect("parse node config");
 
         assert_eq!(cfg.role, NodeRole::Validator);
-        assert_eq!(
-            cfg.runtime_elf_path,
-            Some(PathBuf::from("/runtime/default.elf"))
-        );
         assert_eq!(cfg.proposer_index, Some(3));
         assert!(cfg.proposer_ikm_hex.is_some());
     }

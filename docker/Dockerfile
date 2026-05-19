@@ -28,24 +28,12 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add riscv32im-unknown-none-elf
-
 WORKDIR /src
 # Copy the entire workspace; cargo will figure out the dependency graph.
-# Test crates and rv32im runtimes are skipped at build time because we
-# only ask for `-p neutrino-node`.
 COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release -p neutrino-default-runtime \
-        --target riscv32im-unknown-none-elf \
-    && cp /src/target/riscv32im-unknown-none-elf/release/neutrino-default-runtime \
-        /usr/local/bin/neutrino-default-runtime
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    CARGO_NEUTRINO_SKIP_RUNTIME_BUILD=1 \
     cargo build --locked --release -p neutrino-node \
     && cp /src/target/release/neutrino-node /usr/local/bin/neutrino-node
 
@@ -61,7 +49,6 @@ RUN apt-get update \
     && useradd --system --create-home --uid 65532 neutrino
 
 COPY --from=builder /usr/local/bin/neutrino-node /usr/local/bin/neutrino-node
-COPY --from=builder /usr/local/bin/neutrino-default-runtime /usr/local/lib/neutrino-default-runtime
 
 # Persistent state directory. `data_dir` in the node config points
 # here, and docker-compose mounts a named volume on top so restarts

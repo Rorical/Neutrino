@@ -1,5 +1,11 @@
 # 11. Light Client
 
+> Rewrite note: the previous light-client design depends on recursive
+> checkpoint proofs. Checkpoint recursion is TODO/deferred under the accepted
+> SP1 rewrite, so this document is historical until the light-client protocol is
+> redesigned. See
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md).
+
 This document defines Neutrino's light-client protocol: how a resource-
 constrained verifier (browser, mobile, embedded device, another chain) can
 follow Neutrino's head, verify state queries, and detect fraud without

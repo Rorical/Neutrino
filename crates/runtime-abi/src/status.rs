@@ -1,34 +1,32 @@
-//! Stable ABI status codes returned by syscalls in `a0`.
+//! Stable ABI status codes for the runtime host contract.
 //!
 //! Status codes are part of the guest/host wire contract: they never
-//! change semantics across ABI minor versions. A successful syscall
+//! change semantics across ABI minor versions. A successful operation
 //! returns [`Status::Ok`]; any other variant indicates the host refused
-//! the call and the guest should treat the operation as having no
-//! effect. Out-of-gas additionally raises a trap immediately after the
-//! syscall returns.
+//! the call and the runtime should treat the operation as having no
+//! effect.
 
 use core::fmt;
 
-/// Stable ABI status code returned in `a0` by every fallible syscall.
+/// Stable ABI status code returned by every fallible runtime operation.
 ///
 /// The numeric discriminants match the values in
 /// `docs/design/04-host-abi.md` exactly and are consensus-critical.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Status {
-    /// The syscall succeeded.
+    /// The operation succeeded.
     Ok = 0,
     /// Caller-provided output buffer was too small; `a1` holds the
     /// required size.
     BufferTooSmall = 1,
     /// Caller passed an invalid argument (pointer, length, or value).
     InvalidArgument = 2,
-    /// Requested item was not found (e.g. `state_read` of a missing key).
+    /// Requested item was not found.
     NotFound = 3,
     /// Operation was not permitted in the current host context.
     PermissionDenied = 4,
-    /// Caller ran out of gas; a trap follows immediately after the
-    /// syscall returns.
+    /// Runtime ran out of gas.
     OutOfGas = 5,
     /// Host encountered an internal error not attributable to the
     /// guest. Never expected; indicates a host bug.
@@ -42,7 +40,7 @@ impl Status {
         self as u32
     }
 
-    /// Returns `true` when the status indicates a successful syscall.
+    /// Returns `true` when the status indicates a successful operation.
     #[must_use]
     pub const fn is_ok(self) -> bool {
         matches!(self, Self::Ok)

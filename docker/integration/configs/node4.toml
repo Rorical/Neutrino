@@ -3,5 +3,4 @@ role = "full"
 listen = ["/ip4/0.0.0.0/tcp/30303"]
 bootnodes = ["/dns4/node1/tcp/30303"]
 chain_spec_path = "/etc/neutrino/chain-spec.toml"
-runtime_elf_path = "/usr/local/lib/neutrino-default-runtime"
 data_dir = "/var/lib/neutrino"

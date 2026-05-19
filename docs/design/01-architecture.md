@@ -1,5 +1,11 @@
 # 01 — Architecture
 
+> Rewrite note: the accepted SP1/WASM runtime and proof architecture lives in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). This file is
+> pre-rewrite architecture where it refers to a single RV32IM runtime ELF,
+> custom Plonky3 proof pipeline, chunk proof aggregation, or recursive
+> checkpoints.
+
 ## Two layers, three pipelines
 
 Neutrino is structured as **two layers** (consensus engine ↔ execution runtime)

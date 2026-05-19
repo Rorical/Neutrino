@@ -290,22 +290,6 @@ impl<DB: Database> Engine<DB> {
         &self.active_validator_set
     }
 
-    /// Replace the active validator set. Called by block production
-    /// when a block commits a new set.
-    pub(crate) fn set_active_validator_set(&mut self, set: Vec<Validator>) {
-        self.active_validator_set = set;
-    }
-
-    /// Latest persisted validator-set snapshot index.
-    #[must_use]
-    pub(crate) fn latest_validator_set_index(&self) -> CheckpointIndex {
-        self.store
-            .get_latest_validator_set_index()
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-    }
-
     /// Finalized seed currently used to evaluate VRF eligibility.
     #[must_use]
     pub const fn finalized_seed(&self) -> Seed {
@@ -339,9 +323,10 @@ impl<DB: Database> Engine<DB> {
         &self.state
     }
 
-    /// Mutable reference to the in-memory state trie. Crate-internal
-    /// because callers must swap the trie out into an [`Overlay`]
-    /// during block execution and restore it afterwards.
+    /// Mutable reference to the in-memory state trie. Crate-internal because
+    /// block execution must preserve the head-state invariant while applying a
+    /// candidate state transition.
+    #[cfg(test)]
     pub(crate) const fn state_mut_internal(&mut self) -> &mut Trie {
         &mut self.state
     }

@@ -32,11 +32,10 @@
 //! validator reaches `latest_finalized_chunk_id = Some(0)` within
 //! the test window over the real libp2p transport**.
 //!
-//! The slashing pipeline at this scale is validated by the
-//! existing `slashing_detection.rs` and `aggregator_subnet.rs`
-//! integration tests plus the runtime-host `block_lifecycle.rs`
-//! `TX_SLASH` / `TX_INACTIVITY_LEAK_BATCH` coverage; this test
-//! focuses on the BFT-scale headline so it stays tractable in CI.
+//! The slashing pipeline at this scale is validated by the existing
+//! `slashing_detection.rs` and `aggregator_subnet.rs` integration
+//! tests; this test focuses on the BFT-scale headline so it stays
+//! tractable in CI.
 
 use std::sync::Arc;
 use std::time::Duration;

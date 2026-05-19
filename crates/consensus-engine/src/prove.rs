@@ -1,9 +1,9 @@
 //! Per-block proof orchestration: the FSM transitions
 //! `BlockProduced → PendingProof → Proven` for a single produced block.
 //!
-//! Phase E plugs the [`ProofSystem`] trait into the engine. The mock
-//! backend is used for M5 through M7; M8 swaps it for the v1 in-tree
-//! Plonky3 STARK block prover without any engine-side change.
+//! The legacy in-tree prover was removed by the SP1/WASM rewrite; the
+//! production backend will be rebuilt as an SP1 Compressed STARK block
+//! proof system.
 
 use core::fmt;
 

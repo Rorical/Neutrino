@@ -403,8 +403,8 @@ pub enum HashAlgorithm {
     /// SHA-256, useful for backends that prefer SHA-friendly trie
     /// commitments (e.g. an alternative `proof_system_version` swap).
     Sha256,
-    /// Poseidon (Poseidon2 over BabyBear under the v1 Plonky3 backend),
-    /// useful for in-circuit Merkle and Fiat-Shamir economics.
+    /// Poseidon-style arithmetic hash, useful for in-circuit Merkle and
+    /// Fiat-Shamir economics in future proof backends.
     Poseidon,
 }
 

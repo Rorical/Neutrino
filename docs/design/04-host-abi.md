@@ -1,5 +1,11 @@
 # 04 — Host ABI
 
+> Rewrite note: the SP1/WASM runtime rewrite is accepted in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). The syscall
+> table below belongs to the pre-rewrite RV32IM runtime-host design. The rewrite
+> replaces it with shared STF input/output types, wasmtime host imports, and SP1
+> Guest input/output commitments.
+
 The ABI is the contract between the consensus node and the runtime. It is
 **versioned**, **stable**, and **the only way the runtime touches the outside
 world.**

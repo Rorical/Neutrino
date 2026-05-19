@@ -14,13 +14,5 @@ publish       = { workspace = true }
 default = ["std"]
 std = []
 
-[dependencies]
-hex                       = { workspace = true }
-neutrino-consensus-engine = { workspace = true }
-neutrino-consensus-types  = { workspace = true }
-neutrino-primitives       = { workspace = true }
-neutrino-proof-system     = { workspace = true }
-neutrino-storage          = { workspace = true }
-
 [lints]
 workspace = true

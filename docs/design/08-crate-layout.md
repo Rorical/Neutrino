@@ -1,5 +1,10 @@
 # 08 — Crate Layout
 
+> Rewrite note: the target crate layout for the accepted SP1/WASM rewrite lives
+> in [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). The layout
+> below describes the current pre-rewrite workspace and should not be used as
+> the target for new VM/prover work.
+
 Cargo workspace at the repository root. Every crate is `no_std`-friendly where
 it makes sense; runtime-side crates are strictly `no_std`. The proof-system
 backend crates are *optional* — gated behind a Cargo feature so light or

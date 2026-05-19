@@ -6,7 +6,7 @@
 //!
 //! The mempool is opaque to transaction contents. Callers (RPC, the
 //! consensus engine) can supply a validation predicate, typically
-//! backed by `neutrino_runtime_host::validate_transaction`. The pool
+//! backed by the active dynamic runtime. The pool
 //! itself enforces uniqueness by BLAKE3 hash, a caller-supplied byte
 //! budget, and deterministic priority ordering with FIFO ties.
 

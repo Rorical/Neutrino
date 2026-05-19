@@ -1,7 +1,6 @@
 //! Body assembly and serialization for the runtime ABI.
 //!
-//! The default runtime (`neutrino-default-runtime`) consumes a flat
-//! per-block payload:
+//! Runtime-visible body lanes are encoded as a flat per-block payload:
 //!
 //! ```text
 //! u32::LE tx_count || (u32::LE tx_len || <tx_len bytes>)+
@@ -91,8 +90,8 @@ pub fn encode_runtime_body(body: &Body) -> Result<Vec<u8>, BodyEncodeError> {
 }
 
 /// Serialize all runtime-visible body lanes into the runtime ABI byte
-/// format. Returns the bytes that the engine must hand to
-/// `run_block(... body_bytes ...)`.
+/// format. Returns the bytes that the engine must hand to the runtime
+/// execution path.
 ///
 /// The runtime consumes a flat transaction list, so consensus body lanes
 /// are converted in this order: `transactions`, `deposits`, then

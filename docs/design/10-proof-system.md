@@ -1,5 +1,11 @@
 # 10 — Proof System
 
+> Rewrite note: the accepted proof direction is SP1 Compressed STARK per-block
+> proving, documented in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). Chunk proof
+> aggregation and checkpoint recursion are TODO/deferred. The custom Plonky3
+> proof hierarchy below is historical pre-rewrite design.
+
 Neutrino is a **proof-aware** chain. Every block's state transition must be
 covered by a zero-knowledge proof; chunk proofs aggregate block proofs;
 recursive checkpoint proofs fold finalized chunks into a single succinct

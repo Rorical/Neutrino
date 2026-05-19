@@ -1,5 +1,11 @@
 # 02 — Consensus
 
+> Rewrite note: chunk-level BFT remains the finality gadget, but the accepted
+> SP1 rewrite changes the proof precondition from "valid chunk proof" to
+> "every block in the chunk has a valid SP1 block proof" until chunk aggregation
+> is redesigned. See
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md).
+
 Neutrino's consensus is a **three-pipeline PoS protocol**:
 
 - **Execution pipeline.** Stake-weighted BLS-VRF leader election produces a

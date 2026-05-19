@@ -1,7 +1,6 @@
-//! Placeholder proof backend used by milestones M2 through M7.
+//! Placeholder proof backend used by tests and bring-up milestones.
 //!
-//! The mock backend lets the consensus engine, chunk BFT, and
-//! recursive checkpoint pipeline run end-to-end without paying any
+//! The mock backend lets the consensus engine run without paying any
 //! zk-prover cost. A mock proof is simply
 //! `BLAKE3(domain_tag || borsh(public_inputs))`. Domain tags keep
 //! block, chunk, and recursive proofs in disjoint namespaces so the
@@ -10,9 +9,9 @@
 //!
 //! The mock prover ignores the witness, the constituent block proofs
 //! (for chunks), and the previous recursive proof (for recursions).
-//! Real backends will exercise all of those; the mock's only job is
-//! to stand in for the cryptographic work so the surrounding protocol
-//! plumbing can be tested.
+//! Chunk and recursive mock proofs are retained only for legacy tests;
+//! real chunk aggregation and checkpoint recursion are deferred by the
+//! SP1 rewrite.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{Hash, blake3_256};

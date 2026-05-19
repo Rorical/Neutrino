@@ -12,7 +12,7 @@ use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
-use neutrino_primitives::{ChainSpec, Hash, ZERO_HASH, blake3_256};
+use neutrino_primitives::ChainSpec;
 use neutrino_proof_system::MockProofSystem;
 use neutrino_rpc::{RpcBackend, RpcStartError};
 use neutrino_storage::Database;
@@ -48,23 +48,6 @@ pub enum NodeError {
     /// Engine initialisation failed.
     #[error("engine error: {0}")]
     Engine(String),
-    /// Reading the runtime ELF failed.
-    #[error("failed to read runtime ELF `{path}`: {source}")]
-    RuntimeElf {
-        /// Runtime ELF path.
-        path: String,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-    /// Runtime ELF hash mismatched an explicit chain-spec hash.
-    #[error("runtime ELF hash mismatch: chain spec {expected:?}, computed {actual:?}")]
-    RuntimeCodeHashMismatch {
-        /// Hash committed in the chain spec.
-        expected: Hash,
-        /// Hash computed from the configured runtime ELF.
-        actual: Hash,
-    },
     /// Proposer key derivation failed.
     #[error("proposer key error: {0}")]
     ProposerKey(String),
@@ -174,17 +157,14 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         )));
     };
     let spec_file = ChainSpecFile::load_from_path(&chain_spec_path)?;
-    let runtime_elf = load_runtime_elf(&config)?;
-    let mut chain_spec = spec_file.to_chain_spec()?;
-    apply_runtime_hash(&mut chain_spec, &spec_file, runtime_elf.as_deref())?;
+    let chain_spec = spec_file.to_chain_spec()?;
     if chain_spec.chain_id != config.chain_id {
         return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
             "chain spec chain_id {} does not match node config chain_id {}",
             chain_spec.chain_id, config.chain_id
         ))));
     }
-    let production_config =
-        build_block_producer_config(&config, &chain_spec, runtime_elf.as_deref())?;
+    let production_config = build_block_producer_config(&config, &chain_spec)?;
     let chain_spec_slot_duration = chain_spec.consensus.slot_duration_secs;
     let db = open_node_db(&config)?;
     let engine = open_or_initialise_engine(db, chain_spec)?;
@@ -195,11 +175,7 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         head_height = engine.head_height(),
         "using real engine backend"
     );
-    let concrete_backend = Arc::new(ChainBackend::new_with_runtime_elf(
-        engine,
-        proof_system,
-        runtime_elf.clone(),
-    ));
+    let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
     let producer_job: Option<(
         Arc<ChainBackend<NodeDb, MockProofSystem>>,
         BlockProducerConfig,
@@ -347,55 +323,13 @@ fn open_or_initialise_engine(
     }
 }
 
-fn load_runtime_elf(config: &NodeConfig) -> Result<Option<Vec<u8>>, NodeError> {
-    let Some(path) = &config.runtime_elf_path else {
-        return Ok(None);
-    };
-    std::fs::read(path)
-        .map(Some)
-        .map_err(|source| NodeError::RuntimeElf {
-            path: path.display().to_string(),
-            source,
-        })
-}
-
-fn apply_runtime_hash(
-    chain_spec: &mut ChainSpec,
-    spec_file: &ChainSpecFile,
-    runtime_elf: Option<&[u8]>,
-) -> Result<(), NodeError> {
-    let Some(runtime_elf) = runtime_elf else {
-        return Ok(());
-    };
-    let actual = blake3_256(runtime_elf);
-    if spec_file.runtime_code_hash_hex.is_some() && chain_spec.runtime_code_hash != actual {
-        return Err(NodeError::RuntimeCodeHashMismatch {
-            expected: chain_spec.runtime_code_hash,
-            actual,
-        });
-    }
-    if chain_spec.runtime_code_hash == ZERO_HASH {
-        chain_spec.runtime_code_hash = actual;
-        chain_spec
-            .validate()
-            .map_err(|err| NodeError::ChainSpec(ChainSpecError::Validation(err.to_string())))?;
-        info!(runtime_code_hash = ?actual, "derived runtime code hash from runtime ELF");
-    }
-    Ok(())
-}
-
 fn build_block_producer_config(
     config: &NodeConfig,
     chain_spec: &ChainSpec,
-    runtime_elf: Option<&[u8]>,
 ) -> Result<Option<BlockProducerConfig>, NodeError> {
     if config.role != NodeRole::Validator {
         return Ok(None);
     }
-    let Some(runtime_elf) = runtime_elf else {
-        warn!("validator role configured without runtime_elf_path; block production disabled");
-        return Ok(None);
-    };
     let Some(ikm_hex) = &config.proposer_ikm_hex else {
         warn!("validator role configured without proposer_ikm_hex; block production disabled");
         return Ok(None);
@@ -419,7 +353,6 @@ fn build_block_producer_config(
     }
 
     Ok(Some(BlockProducerConfig {
-        runtime_elf: runtime_elf.to_vec(),
         proposer,
         genesis_time_secs: chain_spec.genesis_time,
         slot_duration_secs: chain_spec.consensus.slot_duration_secs,

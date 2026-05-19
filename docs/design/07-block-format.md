@@ -1,5 +1,11 @@
 # 07 — Block, Chunk, Checkpoint, and Proof Formats
 
+> Rewrite note: block/header/body formats remain the baseline, but proof
+> artifacts are changing to SP1 Compressed STARK block proofs. `ChunkProof` and
+> `RecursiveCheckpointProof` formats are TODO/deferred under the accepted
+> rewrite. See
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md).
+
 This file defines every authenticated wire shape: `Header`, `Body`, `Block`,
 `Chunk`, `FinalityVote`, `FinalityCert`, `Checkpoint`, and the three proof
 artifacts (`BlockProof`, `ChunkProof`, `RecursiveCheckpointProof`).

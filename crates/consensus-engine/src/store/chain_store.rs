@@ -277,10 +277,9 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Persist a block's execution witness keyed by block hash.
     ///
-    /// `bytes` is the borsh-encoded
-    /// [`SealedWitness`](neutrino_vm_rv32im::witness::SealedWitness)
-    /// the runtime host produced during execution. The store does not
-    /// decode the bytes; it only round-trips them.
+    /// `bytes` is the backend-specific execution witness produced during
+    /// runtime execution. The store does not decode the bytes; it only
+    /// round-trips them.
     pub fn put_witness(
         &mut self,
         hash: &BlockHash,

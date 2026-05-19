@@ -5,77 +5,57 @@ A proof-aware, modular layer-1 blockchain built from scratch in Rust.
 Neutrino separates the chain into two cleanly decoupled layers:
 
 - **Consensus layer (node)** — networking, peering, storage, block production,
-  zk-proof generation/verification, and chunk-level BFT finality. Implemented
-  as a native Rust binary.
-- **Execution layer (runtime)** — a portable **RISC-V RV32IM ELF binary** that
-  defines the state-transition function. The runtime is sandboxed,
-  deterministic, metered, and provable.
+  proof generation/verification, and chunk-level BFT finality. Implemented as a
+  native Rust binary.
+- **Execution layer (runtime)** — one shared state-transition core compiled into
+  a WASM runtime for ordinary execution/RPC/witness generation and into an SP1
+  Guest ELF for proven consensus-critical execution.
 
-The two layers communicate through a small, versioned host ABI. The consensus
-engine treats the runtime as a black-box state machine, just like Polkadot's
-WASM runtime or Avalanche's `ChainVM` — and additionally feeds an execution
-witness to a zk prover, so every executed block produces a verifiable proof.
+The old in-tree RV32IM VM, syscall runtime host, runtime SDK, default rv32im
+runtime, and custom Plonky3 prover were deleted. The accepted replacement is
+SP1 Compressed STARK per-block proving plus a wasmtime dynamic runtime.
 
-## Why this shape
+## Why This Shape
 
-- **Forkless upgrades.** The runtime is data — a blob stored on-chain. New
-  rules ship by deploying a new runtime, not by coordinating node binaries.
-- **Language freedom for runtime authors.** Any LLVM-targetable language that
-  can emit `riscv32im-unknown-none-elf` works.
-- **Zk by construction.** The canonical RV32IM runtime ELF is proven, not just
-  executed. SP1/RISC Zero/Jolt backends must prove the same `vm_code_hash`
-  semantics as the reference interpreter. Block proofs aggregate into chunk
-  proofs aggregate into a single recursive checkpoint proof.
-- **Constant-time light clients.** Verifying the chain's tip costs one
-  recursive-proof check, regardless of chain age. Works in browsers and
-  mobile.
-- **Determinism by construction.** No floats, no syscalls beyond our ABI, no
-  ambient I/O, no nondeterministic instructions. Bit-identical execution
-  across every backend.
+- **Runtime logic only once.** The state-transition function is shared between
+  the WASM dynamic runtime and the SP1 Guest so dry-run and proving cannot
+  drift into separate implementations.
+- **Proof-aware finality.** A chunk can finalize only after every block in the
+  chunk has a valid SP1 block proof and the chunk receives 2/3 prevote and
+  precommit quorums.
+- **Dynamic non-proven execution.** RPC, transaction precheck, simulation, and
+  ordinary full-node execution run through WASM/wasmtime.
+- **No SNARK wrapper in the accepted plan.** Chunk proof aggregation and
+  checkpoint recursion are TODO/deferred.
 
-## Design documents
+## Design Documents
 
 | #  | Doc                                                                  | Topic                                                                  |
 |----|----------------------------------------------------------------------|------------------------------------------------------------------------|
 | 00 | [overview](docs/design/00-overview.md)                               | High-level architecture and design goals                               |
-| 01 | [architecture](docs/design/01-architecture.md)                       | Layer boundary, three pipelines (exec / proof / finality), lifecycle   |
+| 01 | [architecture](docs/design/01-architecture.md)                       | Pre-rewrite architecture with rewrite pointer                          |
 | 02 | [consensus](docs/design/02-consensus.md)                             | PoS, BLS-VRF leader election, chunk BFT, fork choice, slashing         |
-| 03 | [execution-runtime](docs/design/03-execution-runtime.md)             | RV32IM sandbox, witness recording, gas metering, determinism contract  |
-| 04 | [host-abi](docs/design/04-host-abi.md)                               | Syscall ABI between node and runtime                                   |
-| 05 | [state-and-storage](docs/design/05-state-and-storage.md)             | Trie, KV store, witnesses, snapshots, coverage-based pruning           |
+| 03 | [execution-runtime](docs/design/03-execution-runtime.md)             | Historical pre-rewrite runtime design                                  |
+| 04 | [host-abi](docs/design/04-host-abi.md)                               | Historical pre-rewrite syscall ABI                                     |
+| 05 | [state-and-storage](docs/design/05-state-and-storage.md)             | Trie, KV store, witnesses, snapshots, pruning notes                    |
 | 06 | [networking](docs/design/06-networking.md)                           | libp2p topology, gossip, sync, prover topics                           |
 | 07 | [block-format](docs/design/07-block-format.md)                       | Block, chunk, finality cert, checkpoint, proof artifact encoding       |
-| 08 | [crate-layout](docs/design/08-crate-layout.md)                       | Workspace structure                                                    |
-| 09 | [roadmap](docs/design/09-roadmap.md)                                 | Milestones M0–M15                                                      |
-| 10 | [proof-system](docs/design/10-proof-system.md)                       | Block / chunk / recursive checkpoint proofs, prover roles, economics   |
-| 11 | [light-client](docs/design/11-light-client.md)                       | Verifier, weak subjectivity, external anchors                          |
+| 08 | [crate-layout](docs/design/08-crate-layout.md)                       | Historical crate layout with rewrite pointer                           |
+| 09 | [roadmap](docs/design/09-roadmap.md)                                 | Historical roadmap with rewrite pointer                                |
+| 10 | [proof-system](docs/design/10-proof-system.md)                       | Historical proof hierarchy with rewrite pointer                        |
+| 11 | [light-client](docs/design/11-light-client.md)                       | Historical recursive light-client design                               |
 | 12 | [randomness](docs/design/12-randomness.md)                           | BLS-VRF + finalized-mix public seed                                    |
+| 13 | [SP1 runtime/proof rewrite](docs/design/13-sp1-runtime-proof-rewrite.md) | Accepted SP1/WASM runtime and proof architecture                       |
+| 14 | [SP1 rewrite roadmap](docs/design/14-sp1-rewrite-roadmap.md)         | Accepted rewrite roadmap                                               |
+| 15 | [legacy runtime functionality](docs/design/15-legacy-runtime-functionality.md) | Deleted runtime behavior to rebuild                                    |
 
-## Status
+## Building
 
-**Milestone M0 — workspace scaffold.** The Cargo workspace and CI are in
-place, the `neutrino-primitives` crate is implemented (canonical `ChainSpec`,
-hashing, validation, domain tags, defaults), and every other crate exists as
-a compileable stub awaiting its milestone. See the
-[roadmap](docs/design/09-roadmap.md) for the planned build order
-(~40 weeks to public testnet).
-
-### Building
-
-```
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+```text
+cargo build --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
-```
-
-The `runtime-sdk` and `runtimes/neutrino-default-runtime` crates target
-`riscv32im-unknown-none-elf` and are excluded from default builds. CI builds
-both for that target explicitly:
-
-```
-cargo build -p neutrino-runtime-sdk --target riscv32im-unknown-none-elf
-cargo build -p neutrino-default-runtime --target riscv32im-unknown-none-elf
 ```
 
 ## License

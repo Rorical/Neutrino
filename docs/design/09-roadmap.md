@@ -1,5 +1,11 @@
 # 09 — Roadmap
 
+> Rewrite note: the accepted SP1/WASM rewrite roadmap lives in
+> [14-sp1-rewrite-roadmap](14-sp1-rewrite-roadmap.md). This file is the
+> pre-rewrite roadmap and is retained for history only where it discusses the
+> custom RV32IM VM, Plonky3 block prover, chunk prover, or recursive checkpoint
+> proof.
+
 Each milestone is a working end-to-end slice. We build vertically through the
 stack rather than horizontally per crate, so we always have something
 demonstrable.

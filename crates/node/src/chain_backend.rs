@@ -6,9 +6,8 @@
 //! engine's in-memory head pointers stay consistent.
 //!
 //! The backend also owns a bounded [`Mempool`] keyed by
-//! `Topic::Transactions` gossip. Producers drain it when building bodies
-//! (`build_block_body`) and the engine removes mined transactions after
-//! every successful local or peer-supplied block.
+//! `Topic::Transactions` gossip. Runtime-backed transaction admission and
+//! production are disabled until the WASM/SP1 runtime rewrite lands.
 //!
 //! When configured with [`ChainBackend::set_local_voter`] and a network
 //! publisher via [`ChainBackend::set_network_publisher`], the backend
@@ -56,8 +55,6 @@ use neutrino_rpc::{
     BlockId, FinalizedInfo, HeadInfo, RpcBackend, RuntimeCallError, RuntimeCallResponse,
     SubmitError as RpcSubmitError,
 };
-use neutrino_runtime_abi::{BlockContext, QueryRequest};
-use neutrino_runtime_host::{Overlay, QueryError, run_query, validate_transaction};
 use neutrino_storage::Database;
 use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
@@ -114,7 +111,6 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Mutex<Engine<DB>>,
     proof_system: P,
     mempool: Mutex<Mempool>,
-    runtime_elf: Option<Vec<u8>>,
     /// Channel used to publish gossip messages produced by the BFT
     /// loop (prevotes, precommits, chunk proofs, recursive proofs).
     /// `None` disables the BFT loop's broadcast side; the backend
@@ -206,31 +202,6 @@ where
             engine: Mutex::new(engine),
             proof_system,
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
-            runtime_elf: None,
-            network_publisher: Mutex::new(None),
-            local_voter: Mutex::new(None),
-            slashing_pool: Mutex::new(SlashingPool::default()),
-            inactivity_pool: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Wrap an engine and attach a runtime ELF for mempool admission.
-    ///
-    /// When `runtime_elf` is present, every submitted transaction is
-    /// checked by the runtime's `_neutrino_validate_tx` entrypoint
-    /// against the backend's current state before entering the mempool.
-    /// Without it, transaction admission rejects all gossipped
-    /// transactions rather than falling back to syntactic validation.
-    pub fn new_with_runtime_elf(
-        engine: Engine<DB>,
-        proof_system: P,
-        runtime_elf: Option<Vec<u8>>,
-    ) -> Self {
-        Self {
-            engine: Mutex::new(engine),
-            proof_system,
-            mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
-            runtime_elf,
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(SlashingPool::default()),
@@ -387,7 +358,6 @@ where
         &self,
         slot: Slot,
         proposer: &ProposerKey,
-        runtime_elf: &[u8],
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
         // Inactivity-leak batches are prepended to the mempool drain
         // so a saturated mempool cannot starve them out of the body.
@@ -407,10 +377,7 @@ where
         };
         let result = self.with_engine_mut(|e| {
             let gas_limit = e.chain_spec().genesis_gas_limit;
-            let cfg = ProductionConfig {
-                runtime_elf,
-                proposer,
-            };
+            let cfg = ProductionConfig { proposer };
             e.try_produce_block(slot, cfg, body, gas_limit)
         });
         // On Ok(Some) the engine consumed the body — the drained
@@ -506,11 +473,12 @@ where
 
     /// Submit a peer-supplied transaction into the local mempool.
     ///
-    /// Runs the runtime's transaction-validation entrypoint against the
-    /// current state before accepting bytes into the pool. Duplicate or
-    /// oversized txs are surfaced via [`InsertError`] return values.
+    /// Rejects transactions until the WASM runtime precheck path is rebuilt.
+    /// Duplicate or oversized txs are surfaced via [`InsertError`] once
+    /// runtime-backed admission is available again.
     pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
-        let valid = self.runtime_validates_transaction(&bytes);
+        debug!("WASM runtime is not implemented yet; rejecting transaction admission");
+        let valid = false;
         let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
         pool.insert_validated(bytes, |_| valid)
     }
@@ -532,39 +500,6 @@ where
             // just stays out of the pool.
             let _ = self.submit_transaction(bytes);
         }
-    }
-
-    fn runtime_validates_transaction(&self, bytes: &[u8]) -> bool {
-        let Some(runtime_elf) = self.runtime_elf.as_deref() else {
-            debug!("runtime ELF unavailable; rejecting gossipped transaction");
-            return false;
-        };
-        self.with_engine(|engine| {
-            let ctx = BlockContext {
-                slot: 0,
-                height: engine.head_height().saturating_add(1),
-                seed: engine.finalized_seed(),
-                parent_hash: engine.head_hash(),
-                parent_state_root: engine.head_state_root(),
-                gas_limit: engine.chain_spec().genesis_gas_limit,
-                proposer_index: 0,
-                vrf_proof: [0; 96],
-            };
-            let mut overlay = Overlay::new(engine.state().clone());
-            match validate_transaction(
-                runtime_elf,
-                &ctx,
-                bytes,
-                &mut overlay,
-                engine.chain_spec().genesis_gas_limit,
-            ) {
-                Ok(validity) => validity.is_valid(),
-                Err(err) => {
-                    debug!(?err, "runtime rejected transaction validation attempt");
-                    false
-                }
-            }
-        })
     }
 
     /// Number of transactions currently buffered. Mostly useful for
@@ -1475,15 +1410,11 @@ where
     }
 
     fn runtime_abi_version(&self) -> Option<u32> {
-        if self.runtime_elf.is_some() {
-            Some(neutrino_runtime_abi::VERSION)
-        } else {
-            None
-        }
+        None
     }
 
     fn runtime_available(&self) -> bool {
-        self.runtime_elf.is_some()
+        false
     }
 
     fn mempool_len(&self) -> usize {
@@ -1624,48 +1555,7 @@ where
         args: Vec<u8>,
         at: &BlockId,
     ) -> Result<RuntimeCallResponse, RuntimeCallError> {
-        let runtime_elf = self
-            .runtime_elf
-            .as_deref()
-            .ok_or(RuntimeCallError::RuntimeNotConfigured)?;
-        // Only head/finalized are supported in v1; both currently
-        // observe the same trie because the engine commits state
-        // inline. Historical hash/height queries are rejected.
-        match at {
-            BlockId::Latest | BlockId::Finalized => {}
-            BlockId::Hash(_) | BlockId::Height(_) => {
-                return Err(RuntimeCallError::HistoricalStateNotSupported);
-            }
-        }
-        self.with_engine(|engine| {
-            let ctx = BlockContext {
-                slot: 0,
-                height: engine.head_height(),
-                seed: engine.finalized_seed(),
-                parent_hash: engine.head_hash(),
-                parent_state_root: engine.head_state_root(),
-                gas_limit: engine.chain_spec().genesis_gas_limit,
-                proposer_index: 0,
-                vrf_proof: [0; 96],
-            };
-            let mut overlay = Overlay::new(engine.state().clone());
-            let request = QueryRequest { method, args };
-            run_query(
-                runtime_elf,
-                &ctx,
-                &request,
-                &mut overlay,
-                engine.chain_spec().genesis_gas_limit,
-            )
-            .map(|outcome| RuntimeCallResponse {
-                code: outcome.response.code,
-                payload: outcome.response.payload,
-                gas_used: outcome.gas_used,
-            })
-            .map_err(|err| match err {
-                QueryError::Runtime(rterr) => RuntimeCallError::Runtime(format!("{rterr:?}")),
-                QueryError::Decode(msg) => RuntimeCallError::Decode(msg),
-            })
-        })
+        let _ = (at, method, args);
+        Err(RuntimeCallError::RuntimeNotConfigured)
     }
 }

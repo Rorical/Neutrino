@@ -32,7 +32,6 @@ neutrino-primitives.workspace     = true
 neutrino-proof-system.workspace   = true
 neutrino-rpc.workspace            = true
 neutrino-runtime-abi.workspace    = true
-neutrino-runtime-host.workspace   = true
 neutrino-storage                  = { workspace = true, features = ["rocksdb"] }
 neutrino-sync.workspace           = true
 neutrino-trie.workspace           = true

@@ -19,6 +19,8 @@ pub enum ProofError {
     /// Required dependency proof (recursive predecessor, chunk proof)
     /// was missing or did not link.
     RecursionLinkBroken,
+    /// Requested proof layer is not implemented by the selected backend.
+    Unsupported,
     /// Backend rejected the proof or refused to prove for an
     /// implementation-specific reason.
     BackendRejected,
@@ -31,6 +33,7 @@ impl fmt::Display for ProofError {
             Self::PublicInputMismatch => f.write_str("public inputs do not match the proof"),
             Self::InvalidWitness => f.write_str("invalid proving witness"),
             Self::RecursionLinkBroken => f.write_str("recursive proof link is broken"),
+            Self::Unsupported => f.write_str("proof layer is not implemented by this backend"),
             Self::BackendRejected => f.write_str("backend rejected the proof"),
         }
     }

@@ -15,7 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 sp1-zkvm                       = "=6.2.1"
+borsh                          = { version = "1.5", default-features = false, features = ["derive"] }
 neutrino-default-runtime-core  = { path = "../core", default-features = false }
+neutrino-runtime-core          = { path = "../../../runtime-core", default-features = false }
+neutrino-runtime-abi           = { path = "../../../runtime-abi", default-features = false }
 
 [profile.release]
 opt-level     = 3

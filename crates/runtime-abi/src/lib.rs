@@ -15,6 +15,8 @@
 //!   ([`QueryRequest`], [`QueryResponse`]).
 //! - The fixed-width transaction-validity result format
 //!   ([`TxValidity`], [`TxValidationCode`]).
+//! - The witness envelope handed to the SP1 Guest
+//!   ([`StateWitness`], [`WitnessEntry`]).
 //!
 //! Numbers and field layouts here are consensus-critical and must not be
 //! changed without bumping [`ABI_VERSION`].
@@ -331,6 +333,38 @@ impl QueryStatus {
     }
 }
 
+/// One key in a [`StateWitness`].
+///
+/// `value = None` means the key is asserted to be absent from the
+/// pre-state. Any key the STF reads must be witnessed; an unwitnessed
+/// read panics inside the SP1 Guest, which prevents proof generation.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct WitnessEntry {
+    /// Raw state-trie key. Length is runtime-defined.
+    pub key: Vec<u8>,
+    /// Value at this key in the pre-state, or `None` if absent.
+    pub value: Option<Vec<u8>>,
+}
+
+/// Witness handed to the SP1 Guest before it replays the STF.
+///
+/// The guest computes the canonical hash of the witnessed entries (see
+/// `neutrino-runtime-core::state_root_of`) and compares it against
+/// `pre_state_root`. A mismatch is non-recoverable and aborts proving.
+///
+/// For M2-new the witness carries the entire pre-state visible to the
+/// STF. When real Merkle-trie witnesses arrive (M4-new) this envelope
+/// gains per-entry inclusion/exclusion proofs against `pre_state_root`.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct StateWitness {
+    /// Canonical state root the witnessed entries must hash to.
+    pub pre_state_root: StateRoot,
+    /// Entries the STF is allowed to access. Order is not significant
+    /// for the canonical hash, but the host emits them in sorted-key
+    /// order for determinism.
+    pub entries: Vec<WitnessEntry>,
+}
+
 /// Returns the [`RuntimeVersion`] this crate advertises by default. It
 /// reuses the canonical version constants from [`neutrino_primitives`]
 /// so the chain spec, the runtime ABI, and the SDK never drift.
@@ -425,5 +459,25 @@ mod tests {
         assert_eq!(resp.code, QueryStatus::UnknownMethod.as_u32());
         assert_eq!(resp.payload, b"no such method".to_vec());
         assert!(!resp.is_ok());
+    }
+
+    #[test]
+    fn state_witness_round_trips_through_borsh() {
+        let witness = StateWitness {
+            pre_state_root: [7; 32],
+            entries: vec![
+                WitnessEntry {
+                    key: b"counter".to_vec(),
+                    value: Some(b"\x05\x00\x00\x00".to_vec()),
+                },
+                WitnessEntry {
+                    key: b"absent".to_vec(),
+                    value: None,
+                },
+            ],
+        };
+        let bytes = borsh::to_vec(&witness).expect("encode");
+        let decoded: StateWitness = borsh::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, witness);
     }
 }

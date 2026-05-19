@@ -1,6 +1,6 @@
 [package]
 name          = "neutrino-default-runtime-core"
-description   = "Shared STF core for the Neutrino default runtime. Compiles to native, wasm32-unknown-unknown, and riscv32im-succinct-zkvm-elf."
+description   = "Default-runtime STF logic. Compiles to native, wasm32-unknown-unknown, and riscv32im-succinct-zkvm-elf."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -15,11 +15,11 @@ publish       = { workspace = true }
 [lib]
 crate-type = ["rlib"]
 
-[features]
-default = []
-std     = []
-
 [dependencies]
+borsh                = { workspace = true }
+neutrino-runtime-core = { workspace = true }
+neutrino-runtime-abi  = { workspace = true }
+neutrino-primitives   = { workspace = true }
 
 [lints]
 workspace = true

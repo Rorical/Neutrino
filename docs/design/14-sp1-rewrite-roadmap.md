@@ -86,19 +86,34 @@ Exit criteria:
 
 ## M2-new - Shared STF core and witness protocol
 
+Status: Phase A landed. The wasmtime dynamic-runtime host is the remaining
+follow-up; the native dry-run path satisfies the architectural property
+("same code runs both ways") until then.
+
 Goal: one state-transition implementation runs in both WASM and SP1 Guest.
 
-Add:
+Added (Phase A):
 
-1. `runtime-stf-core` with `StateBackend` and `apply_block`.
-2. `runtime-wasm-host` with wasmtime execution support.
-3. `runtimes/neutrino-default/core` as the default shared STF crate.
-4. `runtimes/neutrino-default/wasm` for dynamic runtime exports.
-5. `runtimes/neutrino-default/sp1-guest` for SP1 proving.
-6. `StfInput`, `StateWitness`, `WitnessEntry`, and `StfPublicOutput` in
-   `runtime-abi` or a dedicated shared runtime-types crate.
-7. `WitnessState` in the SP1 Guest path.
-8. `TracingState` in the WASM dry-run path.
+1. `runtime-core` with `StateBackend`, `WitnessState`, `TracingState`,
+   and the canonical `state_root_of` hash.
+2. `runtime-abi` carries the wire envelope: `StateWitness`, `WitnessEntry`.
+3. `runtimes/neutrino-default/core` defines `apply_block`, `StfInput`,
+   `StfPublicOutput`, and the placeholder counter STF.
+4. `runtimes/neutrino-default/master` and `runtimes/neutrino-default/guest`
+   both consume the same generic `apply_block` through the new traits.
+5. `runtime-host` orchestrates dry-run -> witness -> prove -> verify,
+   caches `vk` on disk to skip repeated `setup` calls, and exposes
+   `ProverCtx::new_cached_for(prover, elf)` so future on-chain runtime
+   upgrades can pass non-default ELFs without API churn.
+
+Deferred (Phase B):
+
+1. `runtime-wasm-host` with wasmtime execution support.
+2. The WASM-driven dry-run that builds the witness through host imports
+   into the master binary, replacing the current native dry-run.
+3. Real Merkle-trie witnesses (currently the witness carries the full
+   visible pre-state hashed canonically via `state_root_of`). Will land
+   alongside the real account/state model in M4-new.
 
 Execution model:
 
@@ -109,12 +124,21 @@ Execution model:
 
 Exit criteria:
 
-1. The same simple STF core compiles to WASM and SP1 Guest.
-2. A block-level test executes WASM dry-run, builds witness, proves in SP1, and
-   verifies public output.
-3. A missing witness entry makes SP1 proving fail.
-4. A tampered witness proof makes SP1 verification fail.
+1. The same simple STF core compiles to WASM and SP1 Guest. (Met:
+   `apply_block` lives in `runtimes/neutrino-default/core`; the master
+   `cdylib` and the SP1 guest both link it.)
+2. A block-level test executes WASM dry-run, builds witness, proves in SP1,
+   and verifies public output. (Met via the native dry-run path;
+   wasmtime-driven dry-run is the Phase B follow-up.)
+3. A missing witness entry makes SP1 proving fail. (Met: the guest's
+   `WitnessState::read` panics on unwitnessed keys; surfaced via
+   `ProverCtx::execute().exit_code != 0`.)
+4. A tampered witness proof makes SP1 verification fail. (Met:
+   `WitnessState::new` rejects when the canonical hash of the entries
+   does not match `pre_state_root`.)
 5. A tampered `post_state_root` makes proof/header validation fail.
+   (Met via `Sp1HostError::PublicOutputMismatch` when the committed
+   output disagrees with the caller's expected output.)
 
 ## M3-new - Consensus rewire to per-block SP1 proofs
 

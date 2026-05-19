@@ -1,0 +1,31 @@
+[package]
+name          = "neutrino-runtime-core"
+description   = "Framework code for Neutrino runtimes: StateBackend trait, WitnessState (guest), TracingState (host), canonical state-root hash."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+authors       = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+documentation = { workspace = true }
+readme        = { workspace = true }
+publish       = { workspace = true }
+
+[lib]
+
+[features]
+default = []
+# Enables `TracingState` and `LiveStateMap` which use `BTreeMap`/`Vec`
+# semantics suited to the host side. The core trait and `WitnessState`
+# remain `no_std + alloc` so the SP1 Guest and `wasm32-unknown-unknown`
+# can link them.
+host    = []
+
+[dependencies]
+blake3              = { workspace = true }
+neutrino-primitives = { workspace = true }
+neutrino-runtime-abi = { workspace = true }
+
+[lints]
+workspace = true

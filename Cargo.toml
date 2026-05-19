@@ -23,6 +23,7 @@ members = [
     "crates/rpc",
     "crates/node",
     "crates/cli",
+    "crates/runtime-core",
     "crates/runtime-host",
     "crates/runtimes/neutrino-default/core",
     "crates/runtimes/neutrino-default/master",
@@ -53,6 +54,7 @@ default-members = [
     "crates/rpc",
     "crates/node",
     "crates/cli",
+    "crates/runtime-core",
     "crates/runtime-host",
     "crates/runtimes/neutrino-default/core",
     "crates/runtimes/neutrino-default/master",
@@ -116,6 +118,7 @@ neutrino-sync                   = { path = "crates/sync",                   vers
 neutrino-mempool                = { path = "crates/mempool",                version = "0.1.0" }
 neutrino-light-client           = { path = "crates/light-client",           version = "0.1.0", default-features = false }
 neutrino-rpc                    = { path = "crates/rpc",                    version = "0.1.0" }
+neutrino-runtime-core           = { path = "crates/runtime-core",           version = "0.1.0", default-features = false }
 neutrino-runtime-host           = { path = "crates/runtime-host",           version = "0.1.0", default-features = false }
 neutrino-default-runtime-core   = { path = "crates/runtimes/neutrino-default/core",   version = "0.1.0", default-features = false }
 neutrino-default-runtime-master = { path = "crates/runtimes/neutrino-default/master", version = "0.1.0", default-features = false }
@@ -127,6 +130,10 @@ borsh               = { version = "1.5",  default-features = false, features = [
 # SP1 zkVM — hard environment dependency (see AGENTS.md).
 sp1-sdk             = { version = "=6.2.1", default-features = false, features = ["blocking"] }
 sp1-build           = { version = "=6.2.1" }
+
+# Binary serde codec. Used for on-disk SP1 verifying-key caches. Pulled
+# in transitively by sp1-sdk regardless.
+bincode             = { version = "1.3" }
 
 blake3              = { version = "1.5",  default-features = false }
 sha2                = { version = "0.10", default-features = false }
@@ -168,6 +175,12 @@ proptest-derive     = { version = "0.5" }
 opt-level     = 0
 debug         = true
 overflow-checks = true
+
+# Compile all third-party dependencies (notably SP1's prover/recursion
+# stack) with release optimisations even in dev/test profiles. Our own
+# workspace crates stay at opt-level=0 for fast incremental builds.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level     = 3

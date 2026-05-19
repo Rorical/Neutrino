@@ -3588,12 +3588,21 @@ dependencies = [
 [[package]]
 name = "neutrino-default-runtime-core"
 version = "0.1.0"
+dependencies = [
+ "borsh",
+ "neutrino-primitives",
+ "neutrino-runtime-abi",
+ "neutrino-runtime-core",
+]
 
 [[package]]
 name = "neutrino-default-runtime-master"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "neutrino-default-runtime-core",
+ "neutrino-runtime-abi",
+ "neutrino-runtime-core",
 ]
 
 [[package]]
@@ -3701,9 +3710,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "neutrino-runtime-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "neutrino-primitives",
+ "neutrino-runtime-abi",
+]
+
+[[package]]
 name = "neutrino-runtime-host"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "blake3",
+ "borsh",
+ "neutrino-default-runtime-core",
+ "neutrino-default-runtime-master",
+ "neutrino-runtime-abi",
+ "neutrino-runtime-core",
  "sp1-build",
  "sp1-sdk",
  "thiserror 2.0.18",

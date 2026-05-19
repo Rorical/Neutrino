@@ -13,16 +13,13 @@
 //!
 //! M8-C lays the baseline; M8-D adds the public-input commitment;
 //! M8-E adds the first lookup-table AIR; M8-F adds the memory
-//! consistency AIR; M8-G adds the program ROM AIR; M8-H slice 1
-//! adds the CPU AIR scaffold; M8-H slice 2 adds bit decomposition of
-//! the low instruction bytes and the LUI opcode family; M8-H slice 3
-//! adds the on-trace 32-entry register file with one-hot write
-//! indicators and the x0-pinned write rule; M8-H slice 4 adds bit
-//! decomposition of the high two instruction bytes, the OP-IMM ADDI
-//! instruction, and the `rs1` read indicators; M8-H slice 5 adds the
-//! bitwise OP-IMM operations ANDI / ORI / XORI on top of a 32-bit
-//! decomposition of `rs1_val`; M8-H slice 6 adds AUIPC; M8-H slice 7
-//! adds JAL. The crate currently exposes:
+//! consistency AIR; M8-G adds the program ROM AIR; M8-H slices 1
+//! through 10 cover the local subset of the base RV32I CPU AIR
+//! (LUI, AUIPC, JAL, ADDI / ANDI / ORI / XORI, BEQ / BNE, FENCE,
+//! and the R-type ADD / SUB / AND / OR / XOR). M8-L groundwork
+//! starts with [`bus`], the typed cross-AIR record format every
+//! lookup interaction will share once the cryptographic argument
+//! lands. The crate currently exposes:
 //!
 //! - [`config`] — the Plonky3 `StarkConfig` pinned to BabyBear,
 //!   Poseidon2, and FRI parameters chosen for block-proof workloads.
@@ -41,25 +38,21 @@
 //!   ELF's `pc_base`. M8-L routes the CPU AIR's per-fetch lookups
 //!   into this table; M8-N pins the table's preprocessed commitment
 //!   to the `vm_code_hash` public input.
-//! - [`cpu`] — the per-instruction execution-trace AIR. Slice 1
-//!   pinned the trace's PC and real/pad selector layout; slice 2
-//!   added bit decomposition of the low instruction bytes plus the
-//!   LUI opcode family (opcode check, `next_pc = pc + 4`,
-//!   `rd_val = imm20 << 12`); slice 3 added the on-trace 32-entry
-//!   register file with one-hot write indicators, x0 pinning, and
-//!   the per-register transition rule; slice 4 added bit
-//!   decomposition of the high two instruction bytes, the OP-IMM
-//!   ADDI instruction, and the `rs1` read-indicator port; slice 5
-//!   added the bitwise OP-IMM operations ANDI / ORI / XORI on top
-//!   of a 32-bit decomposition of `rs1_val`; slice 6 added AUIPC
-//!   (the U-type sibling of LUI that adds `pc` into `rd_val`); slice
-//!   7 adds JAL with J-type offset decoding and link-address writes.
-//!   Subsequent M8-H sub-slices add each remaining RV32I
-//!   instruction family.
+//! - [`cpu`] — the per-instruction execution-trace AIR. Slices 1
+//!   through 10 land the local RV32I subset that does not require
+//!   cross-AIR composition or full `mod 2^32` semantics; the
+//!   remaining ordered comparisons, shifts, branches, and JALR
+//!   defer to a later M8-H pass that follows M8-L's bus.
+//! - [`bus`] — typed records and an in-process multiset balance
+//!   checker for the cross-AIR lookup bus. The cryptographic logUp
+//!   argument replaces the balance check in a follow-up slice; the
+//!   record shape lands first so AIR-side wiring can settle against
+//!   a stable surface.
 //!
 //! Later M8 slices (M8-I onwards) grow the crate one AIR at a time
 //! against this scaffold.
 
+pub mod bus;
 pub mod config;
 pub mod cpu;
 pub mod fibonacci;
@@ -68,6 +61,7 @@ pub mod program_rom;
 pub mod public_inputs;
 pub mod range_check;
 
+pub use bus::{BusBalance, BusChannel, BusRecord};
 pub use config::{
     BABY_BEAR_MODULUS, Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm,
     StarkCfg, Val, ValMmcs, build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,

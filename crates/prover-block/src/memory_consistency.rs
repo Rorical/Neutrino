@@ -22,10 +22,11 @@
 //! | 3   | `val`             | value read or written                            |
 //! | 4   | `same_addr`       | `1` iff `addr[i] == addr[i-1]`, `0` at row 0     |
 //! | 5   | `addr_diff_inv`   | `1 / (addr[i] - addr[i-1])` when `same_addr = 0` |
+//! | 6   | `is_real`         | `1` if this row carries a real memory access     |
 //!
 //! ## Constraints
 //!
-//! - **Every row**: `op` and `same_addr` are boolean.
+//! - **Every row**: `op`, `same_addr`, and `is_real` are boolean.
 //! - **First row**: `same_addr = 0`. The first row has no previous row
 //!   to be the same as.
 //! - **Transitions**:
@@ -38,6 +39,11 @@
 //!   3. `next.same_addr * (1 - next.op) * (next.val - local.val) = 0`
 //!      — within the same addr, a READ returns the previous row's
 //!      value (which by induction is the latest write).
+//!   4. `(1 - local.is_real) * next.is_real = 0` — once a row is
+//!      padding, every subsequent row is padding. Together with the
+//!      `is_real` boolean check, this forces real rows to form a
+//!      contiguous prefix of the trace, matching what the M8-L bus
+//!      emitter relies on when filtering rows for sends.
 //!
 //! Together C(1) + C(2) force the boolean column `same_addr` to track
 //! `addr[i] == addr[i-1]` faithfully: no spurious changes, no missed
@@ -72,13 +78,14 @@
 //! trivially on padding rows (`addr_diff = 0`, `val - val_prev = 0`).
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::{Field, PrimeCharacteristicRing};
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
 
+use crate::bus::{BusChannel, BusRecord};
 use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 
 /// Number of trace columns the memory consistency AIR uses.
-pub const MEM_CONSISTENCY_TRACE_WIDTH: usize = 6;
+pub const MEM_CONSISTENCY_TRACE_WIDTH: usize = 7;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -95,6 +102,7 @@ const COL_OP: usize = 2;
 const COL_VAL: usize = 3;
 const COL_SAME_ADDR: usize = 4;
 const COL_ADDR_DIFF_INV: usize = 5;
+const COL_IS_REAL: usize = 6;
 
 /// Read / write tag.
 ///
@@ -188,6 +196,7 @@ impl<AB: AirBuilder> Air<AB> for MemoryConsistencyAir {
         // Every-row booleanity.
         builder.assert_bool(local[COL_OP]);
         builder.assert_bool(local[COL_SAME_ADDR]);
+        builder.assert_bool(local[COL_IS_REAL]);
 
         // First row: `same_addr` cannot be 1 because there is no prior
         // row to be the same as. Combined with the booleanity
@@ -212,8 +221,16 @@ impl<AB: AirBuilder> Air<AB> for MemoryConsistencyAir {
         // C(3): within the same addr, a READ returns the previous
         // value. `(1 - op)` is the "this row is a read" selector.
         let val_diff: AB::Expr = next[COL_VAL] - local[COL_VAL];
-        let read_selector = one - next[COL_OP];
+        let read_selector = one.clone() - next[COL_OP];
         t.assert_zero(next[COL_SAME_ADDR] * read_selector * val_diff);
+
+        // C(4): real rows form a contiguous prefix. If the current
+        // row is padding (`is_real = 0`), every subsequent row is
+        // also padding. Together with the boolean constraint, this
+        // forces the trace to be a (possibly empty) run of real rows
+        // followed by a (possibly empty) run of padding rows.
+        let padding_local: AB::Expr = one - local[COL_IS_REAL].into();
+        t.assert_zero(padding_local * next[COL_IS_REAL]);
     }
 }
 
@@ -271,6 +288,7 @@ where
         values[base + COL_TS] = F::from_u64(u64::from(ts));
         values[base + COL_OP] = F::from_u64(op.to_u64());
         values[base + COL_VAL] = F::from_u64(u64::from(val));
+        values[base + COL_IS_REAL] = if is_padding { F::ZERO } else { F::ONE };
 
         let same_addr_flag = prev_addr == Some(addr);
         values[base + COL_SAME_ADDR] = if same_addr_flag { F::ONE } else { F::ZERO };
@@ -302,6 +320,55 @@ where
     }
 
     RowMajorMatrix::new(values, MEM_CONSISTENCY_TRACE_WIDTH)
+}
+
+/// Bus records the memory-consistency AIR sends on the
+/// [`BusChannel::MemoryAccess`] channel, one per real row of the
+/// trace.
+///
+/// Each send carries the payload `(addr, ts, op, val)` in the same
+/// shape the CPU AIR's future load / store rows will receive. Padding
+/// rows are skipped — the AIR's `is_real` column distinguishes them
+/// from real accesses and the [`is_real` boolean constraint] keeps
+/// the column honest under proof.
+///
+/// [`is_real` boolean constraint]: MemoryConsistencyAir
+///
+/// The CPU side of this channel arrives once the M8-L byte-bus
+/// gives loads / stores their own row layout in the CPU AIR; until
+/// then this helper exists so the memory side's contribution to the
+/// bus is testable in isolation.
+///
+/// # Panics
+///
+/// Panics if `trace.values.len()` is not a multiple of
+/// [`MEM_CONSISTENCY_TRACE_WIDTH`].
+#[must_use]
+pub fn memory_access_send_records<F: PrimeField32 + Copy>(
+    trace: &RowMajorMatrix<F>,
+) -> Vec<BusRecord<F>> {
+    assert_eq!(
+        trace.values.len() % MEM_CONSISTENCY_TRACE_WIDTH,
+        0,
+        "memory_access_send_records: trace length is not a multiple of MEM_CONSISTENCY_TRACE_WIDTH",
+    );
+    let height = trace.values.len() / MEM_CONSISTENCY_TRACE_WIDTH;
+    let mut records = Vec::new();
+    for row in 0..height {
+        let base = row * MEM_CONSISTENCY_TRACE_WIDTH;
+        if trace.values[base + COL_IS_REAL] != F::ONE {
+            continue;
+        }
+        let addr = trace.values[base + COL_ADDR];
+        let ts = trace.values[base + COL_TS];
+        let op = trace.values[base + COL_OP];
+        let val = trace.values[base + COL_VAL];
+        records.push(BusRecord::send(
+            BusChannel::MemoryAccess,
+            vec![addr, ts, op, val],
+        ));
+    }
+    records
 }
 
 fn validate_accesses_fit_babybear(sorted: &[MemoryAccess], padding_rows: usize) {
@@ -593,5 +660,135 @@ mod tests {
     fn trace_builder_panics_when_padding_ts_would_alias_babybear() {
         let near_modulus_ts = u32::try_from(BABY_BEAR_MODULUS - 1).unwrap();
         let _ = memory_consistency_trace::<Val>(&[MemoryAccess::write(0x100, near_modulus_ts, 1)]);
+    }
+
+    // -------- M8-L groundwork: is_real column + MemoryAccess sends --------
+
+    #[test]
+    fn is_real_marks_real_rows_and_padding_distinctly() {
+        let trace = memory_consistency_trace::<Val>(&[
+            MemoryAccess::write(0x100, 1, 0xDEAD),
+            MemoryAccess::read(0x100, 2, 0xDEAD),
+        ]);
+        // Rows 0 and 1 are real accesses.
+        assert_eq!(trace.values[COL_IS_REAL], Val::ONE);
+        let row1 = MEM_CONSISTENCY_TRACE_WIDTH;
+        assert_eq!(trace.values[row1 + COL_IS_REAL], Val::ONE);
+        // Row 2 onwards is padding.
+        for row in 2..(trace.values.len() / MEM_CONSISTENCY_TRACE_WIDTH) {
+            let base = row * MEM_CONSISTENCY_TRACE_WIDTH;
+            assert_eq!(
+                trace.values[base + COL_IS_REAL],
+                Val::ZERO,
+                "padding row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_trace_has_no_real_rows() {
+        let trace = memory_consistency_trace::<Val>(&[]);
+        for row in 0..(trace.values.len() / MEM_CONSISTENCY_TRACE_WIDTH) {
+            let base = row * MEM_CONSISTENCY_TRACE_WIDTH;
+            assert_eq!(trace.values[base + COL_IS_REAL], Val::ZERO);
+        }
+    }
+
+    #[test]
+    fn prover_refuses_non_binary_is_real() {
+        let mut trace = memory_consistency_trace::<Val>(&[
+            MemoryAccess::write(0x100, 1, 1),
+            MemoryAccess::read(0x100, 2, 1),
+        ]);
+        trace.values[COL_IS_REAL] = Val::from_u64(2);
+        assert_prover_rejects(trace);
+    }
+
+    #[test]
+    fn prover_refuses_padding_followed_by_real_row() {
+        // Build a valid two-access trace, then flip row 1 to padding
+        // (is_real = 0) while leaving row 2 alone. The padding-monotone
+        // constraint must reject because once is_real drops, it can
+        // never come back.
+        let mut trace = memory_consistency_trace::<Val>(&[
+            MemoryAccess::write(0x100, 1, 1),
+            MemoryAccess::read(0x100, 2, 1),
+        ]);
+        // Row 1 must already be is_real = 1 in the honest trace.
+        let row1_idx = MEM_CONSISTENCY_TRACE_WIDTH + COL_IS_REAL;
+        assert_eq!(trace.values[row1_idx], Val::ONE);
+        // Force row 1 to padding while row 0 stays real.
+        trace.values[row1_idx] = Val::ZERO;
+        // Set row 2 to is_real = 1 to force the padding-monotone
+        // transition to fire (otherwise the trace is "all-padding
+        // from row 1 onward", which is benign).
+        let row2_idx = 2 * MEM_CONSISTENCY_TRACE_WIDTH + COL_IS_REAL;
+        trace.values[row2_idx] = Val::ONE;
+        assert_prover_rejects(trace);
+    }
+
+    #[test]
+    fn memory_access_send_records_emit_one_per_real_row() {
+        let trace = memory_consistency_trace::<Val>(&[
+            MemoryAccess::write(0x100, 1, 0xDEAD),
+            MemoryAccess::read(0x100, 2, 0xDEAD),
+            MemoryAccess::write(0x200, 3, 0xBEEF),
+        ]);
+        let records = memory_access_send_records::<Val>(&trace);
+        assert_eq!(records.len(), 3);
+        for record in &records {
+            assert_eq!(record.channel, BusChannel::MemoryAccess);
+            assert_eq!(record.multiplicity, 1);
+            assert_eq!(record.payload.len(), 4);
+        }
+        // Records mirror the sorted-by-(addr, ts) trace, not insertion
+        // order. addr=0x100 < addr=0x200, so the 0x100 writes/reads
+        // come first; ts ordering pins write-then-read for that addr.
+        assert_eq!(records[0].payload[0], Val::from_u64(0x100));
+        assert_eq!(records[0].payload[1], Val::from_u64(1));
+        assert_eq!(records[0].payload[2], Val::ONE); // write
+        assert_eq!(records[0].payload[3], Val::from_u64(0xDEAD));
+
+        assert_eq!(records[1].payload[0], Val::from_u64(0x100));
+        assert_eq!(records[1].payload[1], Val::from_u64(2));
+        assert_eq!(records[1].payload[2], Val::ZERO); // read
+
+        assert_eq!(records[2].payload[0], Val::from_u64(0x200));
+        assert_eq!(records[2].payload[1], Val::from_u64(3));
+        assert_eq!(records[2].payload[2], Val::ONE);
+        assert_eq!(records[2].payload[3], Val::from_u64(0xBEEF));
+    }
+
+    #[test]
+    fn memory_access_send_records_skip_padding_rows() {
+        let trace = memory_consistency_trace::<Val>(&[]);
+        let records = memory_access_send_records::<Val>(&trace);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn memory_access_send_records_balance_when_paired_with_synthetic_receives() {
+        // The CPU side of this channel does not exist yet; demonstrate
+        // round-trip closure by pairing the memory sends with manually
+        // constructed receives that mirror the same (addr, ts, op, val)
+        // multiset. This is the exact shape the future CPU AIR will
+        // emit when its loads / stores land.
+        let trace = memory_consistency_trace::<Val>(&[
+            MemoryAccess::write(0x100, 1, 0xDEAD),
+            MemoryAccess::read(0x100, 2, 0xDEAD),
+        ]);
+        let sends = memory_access_send_records::<Val>(&trace);
+        let receives: Vec<_> = sends
+            .iter()
+            .map(|s| BusRecord::receive(BusChannel::MemoryAccess, s.payload.clone()))
+            .collect();
+        let mut balance = crate::bus::BusBalance::<Val>::new();
+        balance.extend(&sends);
+        balance.extend(&receives);
+        assert!(
+            balance.is_balanced(),
+            "synthetic memory bus must close: leftover = {:?}",
+            balance.unbalanced().collect::<Vec<_>>(),
+        );
     }
 }

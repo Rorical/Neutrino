@@ -73,7 +73,7 @@ pub use cpu::{
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
-    memory_consistency_trace,
+    memory_access_send_records, memory_consistency_trace,
 };
 pub use program_rom::{
     PROGRAM_ROM_TRACE_WIDTH, ProgramRomAir, program_rom_receive_records,

@@ -34,15 +34,18 @@
 //!   `pc + offset`. Because this AIR models the trap-free RV32I/no-`C`
 //!   path, active JAL rows also require the target offset to be 4-byte
 //!   aligned.
-//! - **Slice 8** (this slice) adds the BRANCH family BEQ and BNE,
-//!   plus the second source-register port and the B-type immediate
-//!   decode that future branches and OP-REG instructions will reuse.
-//!   The slice introduces a boolean `branch_eq` witness backed by a
-//!   field-inverse witness `branch_diff_inv`, then drives `next_pc`
-//!   to either `pc + br_imm` or `pc + 4` based on the comparison.
-//!   Branches do not write a register, so the slice also splits the
-//!   write-indicator-sum rule away from `is_real` and into a new
-//!   "writeful" aggregate.
+//! - **Slice 8** added the BRANCH family BEQ and BNE, plus the second
+//!   source-register port and the B-type immediate decode that future
+//!   branches and OP-REG instructions will reuse. The slice introduces
+//!   a boolean `branch_eq` witness backed by a field-inverse witness
+//!   `branch_diff_inv`, then drives `next_pc` to either `pc + br_imm`
+//!   or `pc + 4` based on the comparison. Branches do not write a
+//!   register, so the slice also splits the write-indicator-sum rule
+//!   away from `is_real` and into a new "writeful" aggregate.
+//! - **Slice 9** (this slice) adds the MISC-MEM family FENCE. FENCE is
+//!   a non-writeful straight-line no-op with the canonical encoding
+//!   `0x0000_000F`. The slice only needs a new selector column; the
+//!   slice-8 writeful split already covers non-writeful semantics.
 //!
 //! The remaining OP-IMM operations (SLTI / SLTIU / SLLI / SRLI /
 //! SRAI) and the ordered branches (BLT / BGE / BLTU / BGEU) all
@@ -57,8 +60,8 @@
 //! together with the ordered branches and JALR's `& !1` low-bit
 //! masking, are deferred to a later M8-H pass that lands after M8-L's
 //! range tables and lookup bus are wired in. Subsequent sub-slices
-//! proceed with the families that work without u32 wraparound (FENCE,
-//! ECALL, EBREAK).
+//! proceed with the families that work without u32 wraparound (ECALL
+//! and EBREAK; trap and gas accounting move to M8-J).
 //!
 //! ## Trace layout
 //!
@@ -102,6 +105,7 @@
 //! | 216      | `branch_diff_inv` | field inverse of `rs1_val - rs2_val` when `branch_eq = 0`       |
 //! | 217      | `is_beq`       | `1` if this row is the BEQ instruction                             |
 //! | 218      | `is_bne`       | `1` if this row is the BNE instruction                             |
+//! | 219      | `is_fence`     | `1` if this row is the canonical RV32I FENCE instruction           |
 //!
 //! Real rows describe an executed RV32I instruction; padding rows
 //! follow the halt and hold the PC in place with the all-zero
@@ -274,6 +278,22 @@
 //! - **Family aggregate** extended:
 //!   `is_real = is_writeful + is_beq + is_bne`.
 //!
+//! Slice 9 additions:
+//!
+//! - **`is_fence` boolean**.
+//! - **FENCE active** (gated by `is_fence`):
+//!   - **Opcode**: low 7 bits of `b0` equal `0x0F`.
+//!   - **funct3**: `b1_bit_4 = b1_bit_5 = b1_bit_6 = 0`. Rejects the
+//!     FENCE.I variant (`funct3 = 001`, Zifencei extension) and every
+//!     other funct3 reservation under MISC-MEM.
+//!   - **PC**: `next_pc = pc + 4`.
+//!   - **rd / rs1 / hint bits**: architecturally unspecified, so the
+//!     AIR leaves them free. Non-writeful classification keeps the
+//!     row from updating any register, so a permissive `rd` field
+//!     cannot smuggle a write through the indicator mechanism.
+//! - **Family aggregate** extended:
+//!   `is_real = is_writeful + is_beq + is_bne + is_fence`.
+//!
 //! ## What this slice does NOT yet constrain
 //!
 //! - **Full `u32` register and PC semantics.** This standalone CPU AIR
@@ -315,13 +335,13 @@ use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
 
-/// Number of trace columns the CPU AIR uses at M8-H slice 8.
+/// Number of trace columns the CPU AIR uses at M8-H slice 9.
 ///
 /// Each later sub-slice extends the layout (additional decoded
 /// fields, more opcode selectors, memory records) by appending
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
-pub const CPU_TRACE_WIDTH: usize = COL_IS_BNE + 1;
+pub const CPU_TRACE_WIDTH: usize = COL_IS_FENCE + 1;
 
 /// BabyBear modulus as a `u32`, used in `const fn` guards.
 const BABY_BEAR_MODULUS_U32: u32 = 0x7800_0001;
@@ -365,6 +385,7 @@ const COL_BRANCH_EQ: usize = COL_BR_IMM + 1;
 const COL_BRANCH_DIFF_INV: usize = COL_BRANCH_EQ + 1;
 const COL_IS_BEQ: usize = COL_BRANCH_DIFF_INV + 1;
 const COL_IS_BNE: usize = COL_IS_BEQ + 1;
+const COL_IS_FENCE: usize = COL_IS_BNE + 1;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -388,6 +409,11 @@ const JAL_OPCODE: u32 = 0x6F;
 /// only constrains BEQ and BNE; the ordered comparisons defer to
 /// M8-L's u32 range/lookup support.
 const BRANCH_OPCODE: u32 = 0x63;
+
+/// RV32I MISC-MEM opcode (`0b0001111`). funct3 = 000 selects FENCE.
+/// FENCE.I (funct3 = 001, Zifencei extension) is rejected by the
+/// decoder and likewise rejected by this AIR.
+const FENCE_OPCODE: u32 = 0x0F;
 
 /// funct3 value for the BEQ instruction (`0b000`).
 const FUNCT3_BEQ: u32 = 0;
@@ -676,7 +702,31 @@ impl CpuInstruction {
     pub const fn bne_not_taken(pc: u32, rs1: u32, rs2: u32, offset: i32) -> Self {
         Self::straight(pc, encode_b_type(rs1, rs2, FUNCT3_BNE, offset))
     }
+
+    /// Encode the canonical RV32I `fence` instruction at the given
+    /// `pc`.
+    ///
+    /// The architectural FENCE allows arbitrary `pred` / `succ` / `fm`
+    /// hint fields in bits 20..31, but a strictly-conforming
+    /// implementation may ignore them and we likewise emit the
+    /// canonical `0x0000_000F` encoding (all hints zero, `funct3 = 0`,
+    /// `rs1 = rd = 0`). Behaviourally this is a no-op that advances PC
+    /// by four.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pc + 4` overflows `u32`.
+    #[must_use]
+    pub const fn fence(pc: u32) -> Self {
+        Self::straight(pc, FENCE_INSN_CANONICAL)
+    }
 }
+
+/// Canonical encoding of `fence` with all hint fields zero.
+///
+/// `bits 6:0 = 0x0F` opcode, every other bit zero. The decoder accepts
+/// this as a base-RV32I `FENCE` (`funct3 = 0`).
+const FENCE_INSN_CANONICAL: u32 = 0x0000_000F;
 
 /// Encode a generic I-type instruction (`rd`, `rs1`, signed 12-bit
 /// immediate, `funct3`, opcode = OP-IMM) as a 32-bit word.
@@ -857,6 +907,7 @@ impl<AB: AirBuilder> Air<AB> for CpuAir {
         eval_rs2_skeleton::<AB>(builder, local);
         eval_branch_eq_witness::<AB>(builder, local);
         eval_beq_bne::<AB>(builder, local);
+        eval_fence::<AB>(builder, local);
         eval_family_aggregate::<AB>(builder, local);
     }
 }
@@ -1477,11 +1528,38 @@ fn eval_beq_bne<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     builder.assert_zero(is_bne * (AB::Expr::from(local[COL_NEXT_PC]) - bne_expected_next));
 }
 
+/// Slice 9: MISC-MEM FENCE. Straight-line no-op with opcode `0x0F` and
+/// funct3 = 000. The row contributes to `is_real` but not to the
+/// writeful aggregate, so no register write is committed even though
+/// the canonical FENCE encoding leaves `rd` architecturally
+/// unconstrained.
+fn eval_fence<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    builder.assert_bool(local[COL_IS_FENCE]);
+    let is_fence: AB::Expr = local[COL_IS_FENCE].into();
+
+    // Opcode = 0x0F when active.
+    let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(FENCE_OPCODE)));
+    let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    builder.assert_zero(is_fence.clone() * (b0_low_7 - opcode_target));
+
+    // funct3 = 000 to reject FENCE.I (funct3 = 001, Zifencei) and any
+    // other MISC-MEM funct3 reservation.
+    builder.assert_zero(is_fence.clone() * AB::Expr::from(local[COL_B1_BITS_START + 4]));
+    builder.assert_zero(is_fence.clone() * AB::Expr::from(local[COL_B1_BITS_START + 5]));
+    builder.assert_zero(is_fence.clone() * AB::Expr::from(local[COL_B1_BITS_START + 6]));
+
+    // PC: FENCE is straight-line, like other no-trap RV32I instructions.
+    let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
+    let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
+    builder.assert_zero(is_fence * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
+}
+
 /// Sum of every writeful-family selector currently constrained.
 ///
 /// "Writeful" = the row updates exactly one register, so the row's
-/// write indicator vector is one-hot. Branches (BEQ / BNE) and the
-/// future FENCE / ECALL / EBREAK rows are excluded; they contribute
+/// write indicator vector is one-hot. Branches (BEQ / BNE), FENCE,
+/// and the future ECALL / EBREAK rows are excluded; they contribute
 /// to `is_real` but not to this sum, and their write-indicator
 /// columns are all zero.
 fn writeful_aggregate<AB: AirBuilder>(local: &[AB::Var]) -> AB::Expr {
@@ -1499,7 +1577,8 @@ fn writeful_aggregate<AB: AirBuilder>(local: &[AB::Var]) -> AB::Expr {
 fn eval_family_aggregate<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     let aggregate: AB::Expr = writeful_aggregate::<AB>(local)
         + AB::Expr::from(local[COL_IS_BEQ])
-        + AB::Expr::from(local[COL_IS_BNE]);
+        + AB::Expr::from(local[COL_IS_BNE])
+        + AB::Expr::from(local[COL_IS_FENCE]);
     builder.assert_eq(AB::Expr::from(local[COL_IS_REAL]), aggregate);
 }
 
@@ -1537,20 +1616,21 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// Build a [`CpuAir`] trace from a sequence of real instruction
 /// executions.
 ///
-/// At M8-H slice 8 the trace builder dispatches on the encoded
-/// opcode (and funct3 for OP-IMM and BRANCH): LUI rows set
-/// `is_lui = 1` and derive `rd_val = imm20 << 12`; OP-IMM rows set
-/// the relevant `is_<op>` selector, read the source register from
-/// the running state into `rs1_val`, decode the sign-extended I-type
-/// immediate into `imm`, and compute `rd_val` via the per-op rule
-/// (field addition for ADDI; bit-by-bit reconstruction for ANDI /
-/// ORI / XORI). AUIPC rows add the shifted U-type immediate to `pc`,
-/// JAL rows write the link address, and BEQ / BNE rows read a second
-/// source register, populate the equality witness, and route the PC
-/// transition through the taken / not-taken split. The builder
-/// maintains a running exact BabyBear-native register state across
-/// rows; a malformed encoding is caught by the AIR rather than the
-/// builder.
+/// At M8-H slice 9 the trace builder dispatches on the encoded
+/// opcode (and funct3 for OP-IMM, BRANCH, and MISC-MEM): LUI rows
+/// set `is_lui = 1` and derive `rd_val = imm20 << 12`; OP-IMM rows
+/// set the relevant `is_<op>` selector, read the source register
+/// from the running state into `rs1_val`, decode the sign-extended
+/// I-type immediate into `imm`, and compute `rd_val` via the per-op
+/// rule (field addition for ADDI; bit-by-bit reconstruction for
+/// ANDI / ORI / XORI). AUIPC rows add the shifted U-type immediate
+/// to `pc`, JAL rows write the link address, BEQ / BNE rows read a
+/// second source register, populate the equality witness, and route
+/// the PC transition through the taken / not-taken split, and FENCE
+/// rows simply advance `pc` by four without touching the register
+/// file. The builder maintains a running exact BabyBear-native
+/// register state across rows; a malformed encoding is caught by
+/// the AIR rather than the builder.
 ///
 /// Every row's `rs1_val` / `rs2_val` cells are populated from the
 /// running register state, and the 32 `rs1_bit_*` cells from
@@ -1572,10 +1652,12 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// Panics if `pc_base`, any instruction PC / next PC, or any computed
 /// destination / branch target value would alias in BabyBear; if a
 /// branch instruction's `next_pc` does not match the runtime outcome
-/// of comparing the read registers; if a trace index does not fit in
-/// `u64`; or if `program` contains an opcode this slice does not yet
-/// support (anything outside LUI, AUIPC, JAL, BEQ, BNE, ADDI, ANDI,
-/// ORI, XORI).
+/// of comparing the read registers; if a FENCE-like row carries a
+/// non-zero funct3 (FENCE.I and other MISC-MEM reservations are
+/// unsupported) or a `next_pc` other than `pc + 4`; if a trace index
+/// does not fit in `u64`; or if `program` contains an opcode this
+/// slice does not yet support (anything outside LUI, AUIPC, JAL, BEQ,
+/// BNE, FENCE, ADDI, ANDI, ORI, XORI).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> RowMajorMatrix<F> {
@@ -1785,6 +1867,28 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
                 if rd_idx != 0 {
                     regs[rd_idx_usize] = rd_val_u32;
                 }
+            }
+            x if x == FENCE_OPCODE => {
+                // MISC-MEM FENCE: straight-line no-op. Non-writeful,
+                // so no `wi_j` is set. The AIR's funct3 = 0 check
+                // rejects FENCE.I; the trace builder catches it
+                // earlier with an explicit panic so the user gets
+                // a clear error.
+                let funct3 = (insn.insn >> 12) & 0x7;
+                assert_eq!(
+                    funct3, 0,
+                    "cpu_trace: FENCE.I (funct3=1) and other MISC-MEM funct3 reservations are not supported"
+                );
+                values[base + COL_IS_FENCE] = F::ONE;
+                let expected_next_pc = insn
+                    .pc
+                    .checked_add(4)
+                    .expect("cpu_trace: FENCE pc + 4 overflows u32");
+                assert_eq!(
+                    insn.next_pc, expected_next_pc,
+                    "cpu_trace: FENCE next_pc must equal pc + 4"
+                );
+                assert_babybear_native_u32("cpu_trace: FENCE next_pc", expected_next_pc);
             }
             x if x == BRANCH_OPCODE => {
                 // BEQ / BNE do not write a register, so the write
@@ -3749,6 +3853,217 @@ mod tests {
         let pc_base = 0x10000;
         let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
         trace.values[COL_RS2_IND_START] = Val::from_u64(2);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    // -------- Slice 9 tests (FENCE / MISC-MEM) --------
+
+    #[test]
+    fn fence_constructor_encodes_canonical_bytes() {
+        let insn = CpuInstruction::fence(0x10000);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10004);
+        assert_eq!(insn.insn, 0x0000_000F);
+    }
+
+    #[test]
+    fn fence_trace_sets_is_fence_and_no_writes() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
+        assert_eq!(trace.values[COL_IS_FENCE], Val::ONE);
+        assert_eq!(trace.values[COL_IS_REAL], Val::ONE);
+        assert_eq!(trace.values[COL_NEXT_PC], Val::from_u64(0x10004));
+        // No writeful selector active.
+        for col in [
+            COL_IS_LUI,
+            COL_IS_ADDI,
+            COL_IS_ANDI,
+            COL_IS_ORI,
+            COL_IS_XORI,
+            COL_IS_AUIPC,
+            COL_IS_JAL,
+            COL_IS_BEQ,
+            COL_IS_BNE,
+        ] {
+            assert_eq!(trace.values[col], Val::ZERO, "selector {col}");
+        }
+        // No write or read indicator set.
+        for j in 0..NUM_REGS {
+            assert_eq!(trace.values[COL_WI_START + j], Val::ZERO, "wi[{j}]");
+            assert_eq!(trace.values[COL_RS1_IND_START + j], Val::ZERO, "ri[{j}]");
+            assert_eq!(trace.values[COL_RS2_IND_START + j], Val::ZERO, "ri2[{j}]");
+        }
+    }
+
+    #[test]
+    fn single_fence_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(pc_base, &[CpuInstruction::fence(pc_base)]);
+    }
+
+    #[test]
+    fn multiple_fence_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::fence(pc_base),
+                CpuInstruction::fence(pc_base + 4),
+                CpuInstruction::fence(pc_base + 8),
+            ],
+        );
+    }
+
+    #[test]
+    fn fence_between_addi_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::fence(pc_base + 4),
+                CpuInstruction::addi(pc_base + 8, 2, 1, 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn fence_preserves_running_register_state() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x10),
+                CpuInstruction::fence(pc_base + 4),
+            ],
+        );
+        // After FENCE, r3 still holds 0x10 and every other register
+        // is unchanged.
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_REG_START + 3], Val::from_u64(0x10));
+        for j in 0..NUM_REGS {
+            if j == 3 {
+                continue;
+            }
+            assert_eq!(
+                trace.values[row2 + COL_REG_START + j],
+                Val::ZERO,
+                "r{j} should be zero across the FENCE row",
+            );
+        }
+    }
+
+    #[test]
+    fn fence_after_branch_proves() {
+        let pc_base = 0x10000;
+        // BEQ x0, x0 is always taken; verify FENCE still proves at
+        // the jump target.
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::beq_taken(pc_base, 0, 0, 8),
+                CpuInstruction::fence(pc_base + 8),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "FENCE.I (funct3=1) and other MISC-MEM funct3 reservations are not supported"
+    )]
+    fn trace_builder_panics_on_fence_i_encoding() {
+        // FENCE.I has funct3 = 001 (Zifencei extension). Construct it
+        // manually because `CpuInstruction::fence` only emits the
+        // canonical RV32I encoding.
+        let pc_base = 0x10000;
+        let fence_i = CpuInstruction::straight(pc_base, 0x0000_100F);
+        let _ = cpu_trace::<Val>(pc_base, &[fence_i]);
+    }
+
+    #[test]
+    fn prover_refuses_fence_with_wrong_opcode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
+        // FENCE opcode = 0x0F = 0000_1111. Flip b0_bit_0 to drop it
+        // to 0x0E and compensate b0 so the byte-sum still holds.
+        trace.values[COL_B0_BITS_START] = Val::ZERO;
+        trace.values[COL_B0] -= Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_fence_with_nonzero_funct3() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
+        // Force funct3 bit 0 (insn bit 12 = b1_bit_4) to 1. This is
+        // the FENCE.I encoding the AIR must reject.
+        trace.values[COL_B1_BITS_START + 4] = Val::ONE;
+        trace.values[COL_B1] += Val::from_u64(16);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_fence_with_wrong_next_pc() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::fence(pc_base),
+                CpuInstruction::addi(pc_base + 4, 1, 0, 1),
+            ],
+        );
+        // Force FENCE next_pc = pc + 8.
+        trace.values[COL_NEXT_PC] = Val::from_u64(0x10008);
+        // Patch the following row so the inter-row transition rule
+        // stays consistent, isolating the FENCE-active PC rule.
+        let row1 = CPU_TRACE_WIDTH;
+        trace.values[row1 + COL_PC] = Val::from_u64(0x10008);
+        trace.values[row1 + COL_NEXT_PC] = Val::from_u64(0x1000C);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_fence_writing_a_register() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
+        // Setting wi_5 on a FENCE row breaks the writeful aggregate
+        // rule `Σ wi_j = is_writeful = 0` and the indicator-match
+        // rule `wi_5 * (rd_idx - 5) = 0` (rd_idx = 0 for canonical
+        // FENCE, so the product is -5 ≠ 0).
+        trace.values[COL_WI_START + 5] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_fence_set_on_padding_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[]);
+        trace.values[COL_IS_FENCE] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_fence_and_is_addi_both_set() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
+        // Family aggregate becomes 2 while is_real = 1.
+        trace.values[COL_IS_ADDI] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_fence_set_with_branch_selector() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::beq_taken(pc_base, 0, 0, 8)]);
+        trace.values[COL_IS_FENCE] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_non_boolean_is_fence() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
+        trace.values[COL_IS_FENCE] = Val::from_u64(2);
         assert_prover_rejects(pc_base, trace);
     }
 }

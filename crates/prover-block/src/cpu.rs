@@ -42,26 +42,35 @@
 //!   or `pc + 4` based on the comparison. Branches do not write a
 //!   register, so the slice also splits the write-indicator-sum rule
 //!   away from `is_real` and into a new "writeful" aggregate.
-//! - **Slice 9** (this slice) adds the MISC-MEM family FENCE. FENCE is
-//!   a non-writeful straight-line no-op with the canonical encoding
-//!   `0x0000_000F`. The slice only needs a new selector column; the
-//!   slice-8 writeful split already covers non-writeful semantics.
+//! - **Slice 9** added the MISC-MEM family FENCE. FENCE is a
+//!   non-writeful straight-line no-op with the canonical encoding
+//!   `0x0000_000F`. The slice only needed a new selector column; the
+//!   slice-8 writeful split already covered non-writeful semantics.
+//! - **Slice 10** (this slice) adds the OP-family R-type ALU
+//!   instructions ADD, SUB, AND, OR, and XOR. The slice reuses the
+//!   slice-8 rs2 read port and introduces a 32-bit decomposition of
+//!   `rs2_val` so the bitwise ops can be reconstructed bit-by-bit
+//!   (mirroring slice 5's OP-IMM treatment). ADD and SUB use field
+//!   arithmetic with a BabyBear-native result guarantee; AND / OR /
+//!   XOR use the same `rs1_bit_i ⊙ rs2_bit_i` per-bit shape as
+//!   slice 5.
 //!
 //! The remaining OP-IMM operations (SLTI / SLTIU / SLLI / SRLI /
-//! SRAI) and the ordered branches (BLT / BGE / BLTU / BGEU) all
-//! require `mod 2^32` semantics that BabyBear cannot enforce locally
-//! without range-checking against the field modulus `p`. The standard
-//! borrow-witness construction for SLTI / SLTIU has a real soundness
-//! gap in this setup: the field equation
-//! `rs1 + lt·2^32 = imm_unsigned + diff` admits two valid `(lt, diff)`
-//! integer solutions, both representable as 32-bit bit decompositions
-//! and both passing the AIR check. The shifts have the analogous
-//! problem with `rs1 << shamt` overflowing the field. Both families,
-//! together with the ordered branches and JALR's `& !1` low-bit
-//! masking, are deferred to a later M8-H pass that lands after M8-L's
-//! range tables and lookup bus are wired in. Subsequent sub-slices
-//! proceed with the families that work without u32 wraparound (ECALL
-//! and EBREAK; trap and gas accounting move to M8-J).
+//! SRAI), the R-type ordered comparisons and shifts (SLT / SLTU /
+//! SLL / SRL / SRA), and the ordered branches (BLT / BGE / BLTU /
+//! BGEU) all require `mod 2^32` semantics that BabyBear cannot
+//! enforce locally without range-checking against the field modulus
+//! `p`. The standard borrow-witness construction for SLT / SLTU /
+//! SLTI / SLTIU has a real soundness gap in this setup: the field
+//! equation `rs1 + lt·2^32 = rs2 + diff` admits two valid `(lt,
+//! diff)` integer solutions, both representable as 32-bit bit
+//! decompositions and both passing the AIR check. The shifts have
+//! the analogous problem with `rs1 << shamt` overflowing the field.
+//! All of these, together with JALR's `& !1` low-bit masking, are
+//! deferred to a later M8-H pass that lands after M8-L's range
+//! tables and lookup bus are wired in. Subsequent sub-slices proceed
+//! with the families that work without u32 wraparound (ECALL and
+//! EBREAK; trap and gas accounting move to M8-J).
 //!
 //! ## Trace layout
 //!
@@ -106,6 +115,12 @@
 //! | 217      | `is_beq`       | `1` if this row is the BEQ instruction                             |
 //! | 218      | `is_bne`       | `1` if this row is the BNE instruction                             |
 //! | 219      | `is_fence`     | `1` if this row is the canonical RV32I FENCE instruction           |
+//! | 220..252 | `rs2_bit_0..31`| bit decomposition of `rs2_val` (32 boolean cells)                  |
+//! | 252      | `is_add`       | `1` if this row is the R-type ADD instruction                      |
+//! | 253      | `is_sub`       | `1` if this row is the R-type SUB instruction                      |
+//! | 254      | `is_and`       | `1` if this row is the R-type AND instruction                      |
+//! | 255      | `is_or`        | `1` if this row is the R-type OR instruction                       |
+//! | 256      | `is_xor`       | `1` if this row is the R-type XOR instruction                      |
 //!
 //! Real rows describe an executed RV32I instruction; padding rows
 //! follow the halt and hold the PC in place with the all-zero
@@ -294,6 +309,49 @@
 //! - **Family aggregate** extended:
 //!   `is_real = is_writeful + is_beq + is_bne + is_fence`.
 //!
+//! Slice 10 additions:
+//!
+//! - **`rs2` bit booleans**: each of `rs2_bit_0..31` is in `{0, 1}`.
+//! - **`rs2` bit sum**: `rs2_val = Σ rs2_bit_i * 2^i` (unconditional).
+//!   Mirrors the slice-5 decomposition of `rs1_val`; padding and
+//!   non-rs2-reading rows have `rs2_val = 0` and a zero bit vector.
+//! - **rs2 read aggregate** extended: `Σ ri2_j = is_beq + is_bne +
+//!   is_add + is_sub + is_and + is_or + is_xor`. Every new R-type
+//!   ALU op reads `rs2` and so contributes one indicator per row.
+//! - **rs1 read aggregate** extended: `Σ ri_j = is_addi + is_andi +
+//!   is_ori + is_xori + is_add + is_sub + is_and + is_or + is_xor`.
+//!   R-type ALU rows also read `rs1`.
+//! - **`is_add` / `is_sub` / `is_and` / `is_or` / `is_xor` booleans**.
+//! - **Writeful aggregate** extended:
+//!   `is_writeful = is_lui + is_addi + is_andi + is_ori + is_xori +
+//!   is_auipc + is_jal + is_add + is_sub + is_and + is_or + is_xor`.
+//! - **OP opcode** (gated by the union of the five new R-type
+//!   selectors): low 7 bits of `b0` equal `0x33`.
+//! - **funct3 per op** (gated by the respective selector):
+//!   - ADD / SUB: `b1_bit_4 = 0`, `b1_bit_5 = 0`, `b1_bit_6 = 0`.
+//!   - XOR: `b1_bit_4 = 0`, `b1_bit_5 = 0`, `b1_bit_6 = 1`.
+//!   - OR:  `b1_bit_4 = 0`, `b1_bit_5 = 1`, `b1_bit_6 = 1`.
+//!   - AND: `b1_bit_4 = 1`, `b1_bit_5 = 1`, `b1_bit_6 = 1`.
+//! - **funct7 per op** (gated by the respective selector). The
+//!   architectural funct7 occupies instruction bits 25..31, which
+//!   map to `b3_bit_1..b3_bit_7`; `b3_bit_0` is the MSB of `rs2`
+//!   and is not part of funct7.
+//!   - ADD / AND / OR / XOR: `funct7 = 0`, i.e. `b3_bit_1..7 = 0`.
+//!   - SUB: `funct7 = 0b0100000 = 0x20`, i.e. `b3_bit_6 = 1` and
+//!     `b3_bit_1..5 = b3_bit_7 = 0`.
+//! - **PC** (gated by each selector): `next_pc = pc + 4`.
+//! - **`rd_val` per op** (gated by the respective selector):
+//!   - ADD: `rd_val = rs1_val + rs2_val` (field arithmetic). The
+//!     trace builder pins both operands and the result to the
+//!     BabyBear-native subset so the field sum matches `mod 2^32`.
+//!   - SUB: `rd_val = rs1_val - rs2_val` (field arithmetic). Same
+//!     BabyBear-native guarantee.
+//!   - AND: `rd_val = Σ_i (rs1_bit_i * rs2_bit_i) * 2^i`.
+//!   - OR:  `rd_val = Σ_i (rs1_bit_i + rs2_bit_i - rs1_bit_i *
+//!     rs2_bit_i) * 2^i`.
+//!   - XOR: `rd_val = Σ_i (rs1_bit_i + rs2_bit_i - 2 * rs1_bit_i *
+//!     rs2_bit_i) * 2^i`.
+//!
 //! ## What this slice does NOT yet constrain
 //!
 //! - **Full `u32` register and PC semantics.** This standalone CPU AIR
@@ -335,13 +393,13 @@ use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 /// Number of registers in the RV32I register file (`x0..x31`).
 pub const NUM_REGS: usize = 32;
 
-/// Number of trace columns the CPU AIR uses at M8-H slice 9.
+/// Number of trace columns the CPU AIR uses at M8-H slice 10.
 ///
 /// Each later sub-slice extends the layout (additional decoded
 /// fields, more opcode selectors, memory records) by appending
 /// columns. The width changes per slice; downstream code should refer
 /// to this constant rather than hard-coding a number.
-pub const CPU_TRACE_WIDTH: usize = COL_IS_FENCE + 1;
+pub const CPU_TRACE_WIDTH: usize = COL_IS_XOR + 1;
 
 /// BabyBear modulus as a `u32`, used in `const fn` guards.
 const BABY_BEAR_MODULUS_U32: u32 = 0x7800_0001;
@@ -386,6 +444,12 @@ const COL_BRANCH_DIFF_INV: usize = COL_BRANCH_EQ + 1;
 const COL_IS_BEQ: usize = COL_BRANCH_DIFF_INV + 1;
 const COL_IS_BNE: usize = COL_IS_BEQ + 1;
 const COL_IS_FENCE: usize = COL_IS_BNE + 1;
+const COL_RS2_BIT_START: usize = COL_IS_FENCE + 1;
+const COL_IS_ADD: usize = COL_RS2_BIT_START + 32;
+const COL_IS_SUB: usize = COL_IS_ADD + 1;
+const COL_IS_AND: usize = COL_IS_SUB + 1;
+const COL_IS_OR: usize = COL_IS_AND + 1;
+const COL_IS_XOR: usize = COL_IS_OR + 1;
 
 /// Minimum trace height the FRI configuration accepts.
 ///
@@ -414,6 +478,34 @@ const BRANCH_OPCODE: u32 = 0x63;
 /// FENCE.I (funct3 = 001, Zifencei extension) is rejected by the
 /// decoder and likewise rejected by this AIR.
 const FENCE_OPCODE: u32 = 0x0F;
+
+/// RV32I OP opcode (`0b0110011`). funct3 and funct7 together select
+/// the R-type ALU operation (ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA,
+/// OR, AND, plus the M-extension multiplies). M8-H slice 10 only
+/// constrains ADD / SUB / AND / OR / XOR; ordered comparisons and
+/// shifts defer to M8-L, and M-extension to M8-I.
+const OP_OPCODE: u32 = 0x33;
+
+/// funct7 value used by the additive form (ADD, SRL, SRLI).
+const FUNCT7_OP_BASE: u32 = 0;
+
+/// funct7 value used by the subtractive form (SUB, SRA, SRAI).
+const FUNCT7_OP_ALT: u32 = 0x20;
+
+/// funct3 value for the R-type ADD / SUB instructions (`0b000`).
+const FUNCT3_ADD_SUB: u32 = 0;
+
+/// funct3 value for the R-type XOR instruction (`0b100`). Shares its
+/// numeric value with [`FUNCT3_XORI`].
+const FUNCT3_XOR: u32 = 4;
+
+/// funct3 value for the R-type OR instruction (`0b110`). Shares its
+/// numeric value with [`FUNCT3_ORI`].
+const FUNCT3_OR: u32 = 6;
+
+/// funct3 value for the R-type AND instruction (`0b111`). Shares its
+/// numeric value with [`FUNCT3_ANDI`].
+const FUNCT3_AND: u32 = 7;
 
 /// funct3 value for the BEQ instruction (`0b000`).
 const FUNCT3_BEQ: u32 = 0;
@@ -720,6 +812,78 @@ impl CpuInstruction {
     pub const fn fence(pc: u32) -> Self {
         Self::straight(pc, FENCE_INSN_CANONICAL)
     }
+
+    /// Encode `add rd, rs1, rs2` at the given `pc`.
+    ///
+    /// Computes `rd = rs1 + rs2` with `u32` wrap. M8-H slice 10
+    /// constrains the field-arithmetic equation; the trace builder
+    /// pins both operands and the result to the BabyBear-native
+    /// subset so the field sum matches `mod 2^32`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rd >= 32`, `rs1 >= 32`, `rs2 >= 32`, or `pc + 4`
+    /// overflows `u32`.
+    #[must_use]
+    pub const fn add(pc: u32, rd: u32, rs1: u32, rs2: u32) -> Self {
+        Self::straight(
+            pc,
+            encode_r_type(rd, rs1, rs2, FUNCT3_ADD_SUB, FUNCT7_OP_BASE),
+        )
+    }
+
+    /// Encode `sub rd, rs1, rs2` at the given `pc`.
+    ///
+    /// Computes `rd = rs1 - rs2` with `u32` wrap. Same
+    /// BabyBear-native guarantee as [`Self::add`].
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`Self::add`].
+    #[must_use]
+    pub const fn sub(pc: u32, rd: u32, rs1: u32, rs2: u32) -> Self {
+        Self::straight(
+            pc,
+            encode_r_type(rd, rs1, rs2, FUNCT3_ADD_SUB, FUNCT7_OP_ALT),
+        )
+    }
+
+    /// Encode `and rd, rs1, rs2` at the given `pc`.
+    ///
+    /// Bit-by-bit AND of `rs1_val` and `rs2_val`, reconstructed
+    /// through the row's 32-bit decompositions.
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`Self::add`].
+    #[must_use]
+    pub const fn and(pc: u32, rd: u32, rs1: u32, rs2: u32) -> Self {
+        Self::straight(pc, encode_r_type(rd, rs1, rs2, FUNCT3_AND, FUNCT7_OP_BASE))
+    }
+
+    /// Encode `or rd, rs1, rs2` at the given `pc`.
+    ///
+    /// Bit-by-bit OR of `rs1_val` and `rs2_val`.
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`Self::add`].
+    #[must_use]
+    pub const fn or(pc: u32, rd: u32, rs1: u32, rs2: u32) -> Self {
+        Self::straight(pc, encode_r_type(rd, rs1, rs2, FUNCT3_OR, FUNCT7_OP_BASE))
+    }
+
+    /// Encode `xor rd, rs1, rs2` at the given `pc`.
+    ///
+    /// Bit-by-bit XOR of `rs1_val` and `rs2_val`.
+    ///
+    /// # Panics
+    ///
+    /// Same panic surface as [`Self::add`].
+    #[must_use]
+    pub const fn xor(pc: u32, rd: u32, rs1: u32, rs2: u32) -> Self {
+        Self::straight(pc, encode_r_type(rd, rs1, rs2, FUNCT3_XOR, FUNCT7_OP_BASE))
+    }
 }
 
 /// Canonical encoding of `fence` with all hint fields zero.
@@ -727,6 +891,22 @@ impl CpuInstruction {
 /// `bits 6:0 = 0x0F` opcode, every other bit zero. The decoder accepts
 /// this as a base-RV32I `FENCE` (`funct3 = 0`).
 const FENCE_INSN_CANONICAL: u32 = 0x0000_000F;
+
+/// Encode a generic R-type instruction (`rd`, `rs1`, `rs2`, `funct3`,
+/// `funct7`, opcode = OP) as a 32-bit word.
+///
+/// # Panics
+///
+/// Panics if `rd >= 32`, `rs1 >= 32`, `rs2 >= 32`, `funct3 >= 8`, or
+/// `funct7 >= 128`.
+const fn encode_r_type(rd: u32, rs1: u32, rs2: u32, funct3: u32, funct7: u32) -> u32 {
+    assert!(rd < 32, "encode_r_type: rd must be in [0, 31]");
+    assert!(rs1 < 32, "encode_r_type: rs1 must be in [0, 31]");
+    assert!(rs2 < 32, "encode_r_type: rs2 must be in [0, 31]");
+    assert!(funct3 < 8, "encode_r_type: funct3 must be in [0, 7]");
+    assert!(funct7 < 128, "encode_r_type: funct7 must be in [0, 127]");
+    (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | OP_OPCODE
+}
 
 /// Encode a generic I-type instruction (`rd`, `rs1`, signed 12-bit
 /// immediate, `funct3`, opcode = OP-IMM) as a 32-bit word.
@@ -908,6 +1088,8 @@ impl<AB: AirBuilder> Air<AB> for CpuAir {
         eval_branch_eq_witness::<AB>(builder, local);
         eval_beq_bne::<AB>(builder, local);
         eval_fence::<AB>(builder, local);
+        eval_rs2_bits::<AB>(builder, local);
+        eval_op_alu::<AB>(builder, local);
         eval_family_aggregate::<AB>(builder, local);
     }
 }
@@ -1116,7 +1298,12 @@ fn eval_high_bytes_and_addi<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var])
     let rs1_reading_families: AB::Expr = is_addi.clone()
         + AB::Expr::from(local[COL_IS_ANDI])
         + AB::Expr::from(local[COL_IS_ORI])
-        + AB::Expr::from(local[COL_IS_XORI]);
+        + AB::Expr::from(local[COL_IS_XORI])
+        + AB::Expr::from(local[COL_IS_ADD])
+        + AB::Expr::from(local[COL_IS_SUB])
+        + AB::Expr::from(local[COL_IS_AND])
+        + AB::Expr::from(local[COL_IS_OR])
+        + AB::Expr::from(local[COL_IS_XOR]);
     builder.assert_eq(ri_sum, rs1_reading_families);
 
     // Each read indicator agrees with `rs1_idx`. Mirror of the
@@ -1435,8 +1622,13 @@ fn eval_rs2_skeleton<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     for j in 0..NUM_REGS {
         ri2_sum += AB::Expr::from(local[COL_RS2_IND_START + j]);
     }
-    let rs2_reading_families: AB::Expr =
-        AB::Expr::from(local[COL_IS_BEQ]) + AB::Expr::from(local[COL_IS_BNE]);
+    let rs2_reading_families: AB::Expr = AB::Expr::from(local[COL_IS_BEQ])
+        + AB::Expr::from(local[COL_IS_BNE])
+        + AB::Expr::from(local[COL_IS_ADD])
+        + AB::Expr::from(local[COL_IS_SUB])
+        + AB::Expr::from(local[COL_IS_AND])
+        + AB::Expr::from(local[COL_IS_OR])
+        + AB::Expr::from(local[COL_IS_XOR]);
     builder.assert_eq(ri2_sum, rs2_reading_families);
 
     // Each ri2 indicator agrees with rs2_idx, and the read value
@@ -1555,6 +1747,147 @@ fn eval_fence<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
     builder.assert_zero(is_fence * (AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four));
 }
 
+/// Slice 10 part 1: 32-bit decomposition of `rs2_val`.
+///
+/// Mirrors slice 5's `rs1` decomposition. Every cell is boolean and
+/// the unconditional sum constraint pins the byte composition to
+/// `rs2_val`. Padding and non-rs2-reading rows have `rs2_val = 0`
+/// and zero bits.
+fn eval_rs2_bits<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    for offset in 0..32 {
+        builder.assert_bool(local[COL_RS2_BIT_START + offset]);
+    }
+    let mut rs2_bit_sum: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    let mut weight: u64 = 1;
+    for offset in 0..32 {
+        rs2_bit_sum += AB::Expr::from(AB::F::from_u64(weight))
+            * AB::Expr::from(local[COL_RS2_BIT_START + offset]);
+        weight <<= 1;
+    }
+    builder.assert_eq(AB::Expr::from(local[COL_RS2_VAL]), rs2_bit_sum);
+}
+
+/// Slice 10 part 2: OP-family R-type ALU instructions ADD, SUB, AND,
+/// OR, and XOR.
+///
+/// ADD and SUB use field arithmetic and rely on the trace builder's
+/// BabyBear-native guarantee for both operands and the result. AND /
+/// OR / XOR reconstruct `rd_val` bit-by-bit from `rs1_bit_i` and
+/// `rs2_bit_i`, mirroring slice 5's OP-IMM bitwise treatment.
+///
+/// The R-type funct7 bit selects ADD vs. SUB (`0` vs. `0x20`) and is
+/// likewise constrained to zero for AND / OR / XOR. M8-H slice 10
+/// rejects every other funct7 value under OP, including the
+/// M-extension funct7 = 1 that M8-I will pick up.
+#[allow(clippy::similar_names)]
+fn eval_op_alu<AB: AirBuilder>(builder: &mut AB, local: &[AB::Var]) {
+    builder.assert_bool(local[COL_IS_ADD]);
+    builder.assert_bool(local[COL_IS_SUB]);
+    builder.assert_bool(local[COL_IS_AND]);
+    builder.assert_bool(local[COL_IS_OR]);
+    builder.assert_bool(local[COL_IS_XOR]);
+
+    let is_add: AB::Expr = local[COL_IS_ADD].into();
+    let is_sub: AB::Expr = local[COL_IS_SUB].into();
+    let is_and: AB::Expr = local[COL_IS_AND].into();
+    let is_or: AB::Expr = local[COL_IS_OR].into();
+    let is_xor: AB::Expr = local[COL_IS_XOR].into();
+    let any_r_alu: AB::Expr =
+        is_add.clone() + is_sub.clone() + is_and.clone() + is_or.clone() + is_xor.clone();
+
+    // OP opcode = 0x33 when any R-type ALU selector is active.
+    let opcode_target: AB::Expr = AB::Expr::from(AB::F::from_u64(u64::from(OP_OPCODE)));
+    let b0_low_7: AB::Expr = AB::Expr::from(local[COL_B0])
+        - AB::Expr::from(AB::F::from_u64(128)) * AB::Expr::from(local[COL_B0_BITS_START + 7]);
+    builder.assert_zero(any_r_alu.clone() * (b0_low_7 - opcode_target));
+
+    // funct3 per op. funct3 bits live at b1_bit_4..b1_bit_6.
+    let one: AB::Expr = AB::Expr::from(AB::F::ONE);
+    // ADD / SUB: funct3 = 000.
+    let add_or_sub: AB::Expr = is_add.clone() + is_sub.clone();
+    builder.assert_zero(add_or_sub.clone() * AB::Expr::from(local[COL_B1_BITS_START + 4]));
+    builder.assert_zero(add_or_sub.clone() * AB::Expr::from(local[COL_B1_BITS_START + 5]));
+    builder.assert_zero(add_or_sub * AB::Expr::from(local[COL_B1_BITS_START + 6]));
+    // AND: funct3 = 111.
+    builder
+        .assert_zero(is_and.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 4])));
+    builder
+        .assert_zero(is_and.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 5])));
+    builder
+        .assert_zero(is_and.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 6])));
+    // OR: funct3 = 110.
+    builder.assert_zero(is_or.clone() * AB::Expr::from(local[COL_B1_BITS_START + 4]));
+    builder
+        .assert_zero(is_or.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 5])));
+    builder
+        .assert_zero(is_or.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 6])));
+    // XOR: funct3 = 100.
+    builder.assert_zero(is_xor.clone() * AB::Expr::from(local[COL_B1_BITS_START + 4]));
+    builder.assert_zero(is_xor.clone() * AB::Expr::from(local[COL_B1_BITS_START + 5]));
+    builder
+        .assert_zero(is_xor.clone() * (one.clone() - AB::Expr::from(local[COL_B1_BITS_START + 6])));
+
+    // funct7. The 7 bits of funct7 occupy instruction bits 25..31,
+    // which map to b3_bit_1..b3_bit_7.
+    //   ADD / AND / OR / XOR: funct7 = 0  → every bit zero.
+    //   SUB:                  funct7 = 0x20 → b3_bit_5 = 1, others = 0.
+    let funct7_zero_families: AB::Expr =
+        is_add.clone() + is_and.clone() + is_or.clone() + is_xor.clone();
+    for bit_offset in 1..=7 {
+        builder.assert_zero(
+            funct7_zero_families.clone() * AB::Expr::from(local[COL_B3_BITS_START + bit_offset]),
+        );
+    }
+    // SUB: funct7 = 0x20 → bit 5 of funct7 set (= insn bit 30 =
+    // b3_bit_6). Every other funct7 bit must be zero. Bits 1..5
+    // and bit 7 of b3 are the remaining funct7 bits; b3_bit_0 is
+    // outside funct7 (insn bit 24, rs2's MSB).
+    builder.assert_zero(is_sub.clone() * AB::Expr::from(local[COL_B3_BITS_START + 1]));
+    builder.assert_zero(is_sub.clone() * AB::Expr::from(local[COL_B3_BITS_START + 2]));
+    builder.assert_zero(is_sub.clone() * AB::Expr::from(local[COL_B3_BITS_START + 3]));
+    builder.assert_zero(is_sub.clone() * AB::Expr::from(local[COL_B3_BITS_START + 4]));
+    builder.assert_zero(is_sub.clone() * AB::Expr::from(local[COL_B3_BITS_START + 5]));
+    builder.assert_zero(is_sub.clone() * (one - AB::Expr::from(local[COL_B3_BITS_START + 6])));
+    builder.assert_zero(is_sub.clone() * AB::Expr::from(local[COL_B3_BITS_START + 7]));
+
+    // PC: every R-type ALU op is straight-line.
+    let four: AB::Expr = AB::Expr::from(AB::F::from_u64(4));
+    let pc_plus_four: AB::Expr = AB::Expr::from(local[COL_PC]) + four;
+    let pc_diff: AB::Expr = AB::Expr::from(local[COL_NEXT_PC]) - pc_plus_four;
+    builder.assert_zero(any_r_alu * pc_diff);
+
+    // ADD / SUB rd_val rules (field arithmetic; trace builder pins
+    // BabyBear-native operands and results).
+    let add_sum: AB::Expr = AB::Expr::from(local[COL_RS1_VAL]) + AB::Expr::from(local[COL_RS2_VAL]);
+    builder.assert_zero(is_add * (AB::Expr::from(local[COL_RD_VAL]) - add_sum));
+    let sub_diff: AB::Expr =
+        AB::Expr::from(local[COL_RS1_VAL]) - AB::Expr::from(local[COL_RS2_VAL]);
+    builder.assert_zero(is_sub * (AB::Expr::from(local[COL_RD_VAL]) - sub_diff));
+
+    // Bitwise rd_val rules. For each bit index, combine rs1_bit_i
+    // and rs2_bit_i per the operator and weight by 2^i.
+    let mut and_expr: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    let mut or_expr: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    let mut xor_expr: AB::Expr = AB::Expr::from(AB::F::ZERO);
+    let mut weight: u64 = 1;
+    for i in 0..32usize {
+        let rs1_bit: AB::Expr = local[COL_RS1_BIT_START + i].into();
+        let rs2_bit: AB::Expr = local[COL_RS2_BIT_START + i].into();
+        let weight_expr: AB::Expr = AB::Expr::from(AB::F::from_u64(weight));
+        let two: AB::Expr = AB::Expr::from(AB::F::from_u64(2));
+        let and_term: AB::Expr = rs1_bit.clone() * rs2_bit.clone();
+        let or_term: AB::Expr = rs1_bit.clone() + rs2_bit.clone() - and_term.clone();
+        let xor_term: AB::Expr = rs1_bit + rs2_bit - two * and_term.clone();
+        and_expr += weight_expr.clone() * and_term;
+        or_expr += weight_expr.clone() * or_term;
+        xor_expr += weight_expr * xor_term;
+        weight <<= 1;
+    }
+    builder.assert_zero(is_and * (AB::Expr::from(local[COL_RD_VAL]) - and_expr));
+    builder.assert_zero(is_or * (AB::Expr::from(local[COL_RD_VAL]) - or_expr));
+    builder.assert_zero(is_xor * (AB::Expr::from(local[COL_RD_VAL]) - xor_expr));
+}
+
 /// Sum of every writeful-family selector currently constrained.
 ///
 /// "Writeful" = the row updates exactly one register, so the row's
@@ -1570,6 +1903,11 @@ fn writeful_aggregate<AB: AirBuilder>(local: &[AB::Var]) -> AB::Expr {
         + AB::Expr::from(local[COL_IS_XORI])
         + AB::Expr::from(local[COL_IS_AUIPC])
         + AB::Expr::from(local[COL_IS_JAL])
+        + AB::Expr::from(local[COL_IS_ADD])
+        + AB::Expr::from(local[COL_IS_SUB])
+        + AB::Expr::from(local[COL_IS_AND])
+        + AB::Expr::from(local[COL_IS_OR])
+        + AB::Expr::from(local[COL_IS_XOR])
 }
 
 /// Family aggregate: `is_real = is_writeful + Σ non-writeful`. Each
@@ -1616,21 +1954,25 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// Build a [`CpuAir`] trace from a sequence of real instruction
 /// executions.
 ///
-/// At M8-H slice 9 the trace builder dispatches on the encoded
-/// opcode (and funct3 for OP-IMM, BRANCH, and MISC-MEM): LUI rows
-/// set `is_lui = 1` and derive `rd_val = imm20 << 12`; OP-IMM rows
-/// set the relevant `is_<op>` selector, read the source register
-/// from the running state into `rs1_val`, decode the sign-extended
-/// I-type immediate into `imm`, and compute `rd_val` via the per-op
-/// rule (field addition for ADDI; bit-by-bit reconstruction for
-/// ANDI / ORI / XORI). AUIPC rows add the shifted U-type immediate
-/// to `pc`, JAL rows write the link address, BEQ / BNE rows read a
-/// second source register, populate the equality witness, and route
-/// the PC transition through the taken / not-taken split, and FENCE
-/// rows simply advance `pc` by four without touching the register
-/// file. The builder maintains a running exact BabyBear-native
-/// register state across rows; a malformed encoding is caught by
-/// the AIR rather than the builder.
+/// At M8-H slice 10 the trace builder dispatches on the encoded
+/// opcode (and funct3 / funct7 for OP-IMM, OP, BRANCH, and
+/// MISC-MEM): LUI rows set `is_lui = 1` and derive
+/// `rd_val = imm20 << 12`; OP-IMM rows set the relevant
+/// `is_<op>` selector, read `rs1` from the running state, decode
+/// the sign-extended I-type immediate into `imm`, and compute
+/// `rd_val` via the per-op rule (field addition for ADDI;
+/// bit-by-bit reconstruction for ANDI / ORI / XORI). AUIPC rows add
+/// the shifted U-type immediate to `pc`; JAL rows write the link
+/// address; BEQ / BNE rows read a second source register, populate
+/// the equality witness, and route the PC transition through the
+/// taken / not-taken split; FENCE rows simply advance `pc` by four
+/// without touching the register file; and OP (R-type ALU) rows
+/// read `rs1` plus `rs2`, dispatch on `funct3` / `funct7`, and
+/// compute `rd_val` via field addition / subtraction for ADD / SUB
+/// or per-bit AND / OR / XOR through the row's `rs1` / `rs2`
+/// decompositions. The builder maintains a running exact
+/// BabyBear-native register state across rows; a malformed encoding
+/// is caught by the AIR rather than the builder.
 ///
 /// Every row's `rs1_val` / `rs2_val` cells are populated from the
 /// running register state, and the 32 `rs1_bit_*` cells from
@@ -1654,10 +1996,12 @@ pub fn cpu_trace_height(instruction_count: usize) -> usize {
 /// branch instruction's `next_pc` does not match the runtime outcome
 /// of comparing the read registers; if a FENCE-like row carries a
 /// non-zero funct3 (FENCE.I and other MISC-MEM reservations are
-/// unsupported) or a `next_pc` other than `pc + 4`; if a trace index
-/// does not fit in `u64`; or if `program` contains an opcode this
-/// slice does not yet support (anything outside LUI, AUIPC, JAL, BEQ,
-/// BNE, FENCE, ADDI, ANDI, ORI, XORI).
+/// unsupported) or a `next_pc` other than `pc + 4`; if an OP row
+/// uses a `funct3` / `funct7` pair this slice does not yet support;
+/// if a trace index does not fit in `u64`; or if `program` contains
+/// an opcode this slice does not yet support (anything outside LUI,
+/// AUIPC, JAL, BEQ, BNE, FENCE, ADDI, ANDI, ORI, XORI, ADD, SUB,
+/// AND, OR, XOR).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> RowMajorMatrix<F> {
@@ -1734,15 +2078,20 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
                 F::from_u64(u64::from((rs1_val_u32 >> bit) & 1));
         }
 
-        // rs2 read port (slice 8). The AIR decodes rs2_idx and
-        // populates rs2_val unconditionally; non-rs2-reading rows
-        // just leave the read indicators at zero.
+        // rs2 read port (slice 8 + slice 10). The AIR decodes
+        // rs2_idx and populates rs2_val plus its 32-bit
+        // decomposition unconditionally; non-rs2-reading rows just
+        // leave the read indicators at zero.
         let rs2_idx = (insn.insn >> 20) & 0x1F;
         let rs2_idx_usize = usize::try_from(rs2_idx).expect("rs2_idx fits in usize");
         values[base + COL_RS2_IDX] = F::from_u64(u64::from(rs2_idx));
         let rs2_val_u32 = regs[rs2_idx_usize];
         let rs2_val_field = F::from_u64(u64::from(rs2_val_u32));
         values[base + COL_RS2_VAL] = rs2_val_field;
+        for bit in 0..32 {
+            values[base + COL_RS2_BIT_START + bit] =
+                F::from_u64(u64::from((rs2_val_u32 >> bit) & 1));
+        }
 
         // B-type signed branch immediate (slice 8). Decoded for every
         // row; only BEQ / BNE rows route it into PC arithmetic.
@@ -1922,6 +2271,36 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
                     "cpu_trace: branch next_pc does not match runtime outcome (taken={taken})"
                 );
                 assert_babybear_native_u32("cpu_trace: branch next_pc", expected_next_pc);
+            }
+            x if x == OP_OPCODE => {
+                // R-type ALU: ADD / SUB / AND / OR / XOR. All five
+                // are writeful and read both rs1 and rs2.
+                let funct3 = (insn.insn >> 12) & 0x7;
+                let funct7 = (insn.insn >> 25) & 0x7F;
+                values[base + COL_RS1_IND_START + rs1_idx_usize] = F::ONE;
+                values[base + COL_RS2_IND_START + rs2_idx_usize] = F::ONE;
+                let (selector_col, rd_val_u32) = match (funct3, funct7) {
+                    (FUNCT3_ADD_SUB, FUNCT7_OP_BASE) => {
+                        (COL_IS_ADD, rs1_val_u32.wrapping_add(rs2_val_u32))
+                    }
+                    (FUNCT3_ADD_SUB, FUNCT7_OP_ALT) => {
+                        (COL_IS_SUB, rs1_val_u32.wrapping_sub(rs2_val_u32))
+                    }
+                    (FUNCT3_AND, FUNCT7_OP_BASE) => (COL_IS_AND, rs1_val_u32 & rs2_val_u32),
+                    (FUNCT3_OR, FUNCT7_OP_BASE) => (COL_IS_OR, rs1_val_u32 | rs2_val_u32),
+                    (FUNCT3_XOR, FUNCT7_OP_BASE) => (COL_IS_XOR, rs1_val_u32 ^ rs2_val_u32),
+                    _ => panic!(
+                        "cpu_trace: unsupported OP funct3={funct3:#05b} funct7={funct7:#09b}"
+                    ),
+                };
+                assert_babybear_native_u32("cpu_trace: OP rd_val", rd_val_u32);
+                values[base + selector_col] = F::ONE;
+                let rd_val_field = F::from_u64(u64::from(rd_val_u32));
+                values[base + COL_RD_VAL] = rd_val_field;
+                values[base + COL_WI_START + rd_idx_usize] = F::ONE;
+                if rd_idx != 0 {
+                    regs[rd_idx_usize] = rd_val_u32;
+                }
             }
             _ => panic!("cpu_trace: unsupported opcode 0x{opcode:02X}"),
         }
@@ -4065,5 +4444,519 @@ mod tests {
         let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::fence(pc_base)]);
         trace.values[COL_IS_FENCE] = Val::from_u64(2);
         assert_prover_rejects(pc_base, trace);
+    }
+
+    // -------- Slice 10 tests (R-type ALU: ADD / SUB / AND / OR / XOR) --------
+
+    #[test]
+    fn add_constructor_encodes_canonical_bytes() {
+        // `add x5, x3, x4`: opcode = 0x33, rd = 5, funct3 = 0,
+        // rs1 = 3, rs2 = 4, funct7 = 0.
+        // insn = (0 << 25) | (4 << 20) | (3 << 15) | (0 << 12) |
+        //        (5 << 7) | 0x33
+        //      = 0x0041_8000 | 0x0000_0280 | 0x33
+        //      = 0x0041_82B3
+        let insn = CpuInstruction::add(0x10000, 5, 3, 4);
+        assert_eq!(insn.pc, 0x10000);
+        assert_eq!(insn.next_pc, 0x10004);
+        assert_eq!(insn.insn, 0x0041_82B3);
+    }
+
+    #[test]
+    fn sub_constructor_encodes_canonical_bytes() {
+        // `sub x5, x3, x4`: same as ADD but funct7 = 0x20.
+        let insn = CpuInstruction::sub(0x10000, 5, 3, 4);
+        assert_eq!(insn.insn, 0x4041_82B3);
+    }
+
+    #[test]
+    fn and_constructor_encodes_canonical_bytes() {
+        // `and x5, x3, x4`: funct3 = 0b111 = 7.
+        let insn = CpuInstruction::and(0x10000, 5, 3, 4);
+        assert_eq!(insn.insn, 0x0041_F2B3);
+    }
+
+    #[test]
+    fn or_constructor_encodes_canonical_bytes() {
+        // `or x5, x3, x4`: funct3 = 0b110 = 6.
+        let insn = CpuInstruction::or(0x10000, 5, 3, 4);
+        assert_eq!(insn.insn, 0x0041_E2B3);
+    }
+
+    #[test]
+    fn xor_constructor_encodes_canonical_bytes() {
+        // `xor x5, x3, x4`: funct3 = 0b100 = 4.
+        let insn = CpuInstruction::xor(0x10000, 5, 3, 4);
+        assert_eq!(insn.insn, 0x0041_C2B3);
+    }
+
+    #[test]
+    #[should_panic(expected = "rd must be in [0, 31]")]
+    fn add_constructor_panics_on_oob_rd() {
+        let _ = CpuInstruction::add(0x10000, 32, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "rs1 must be in [0, 31]")]
+    fn add_constructor_panics_on_oob_rs1() {
+        let _ = CpuInstruction::add(0x10000, 0, 32, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "rs2 must be in [0, 31]")]
+    fn add_constructor_panics_on_oob_rs2() {
+        let _ = CpuInstruction::add(0x10000, 0, 0, 32);
+    }
+
+    #[test]
+    fn add_writes_sum_to_destination_register() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x100),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::add(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        // Row 2 is the ADD; rs1_val = 0x100, rs2_val = 0x23.
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_ADD], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_RS1_VAL], Val::from_u64(0x100));
+        assert_eq!(trace.values[row2 + COL_RS2_VAL], Val::from_u64(0x023));
+        assert_eq!(trace.values[row2 + COL_RD_VAL], Val::from_u64(0x123));
+        // Row 3 is the first padding row; r5 should hold 0x123.
+        let row3 = 3 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row3 + COL_REG_START + 5], Val::from_u64(0x123));
+    }
+
+    #[test]
+    fn sub_writes_difference_to_destination_register() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x123),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::sub(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_SUB], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_RD_VAL], Val::from_u64(0x100));
+    }
+
+    #[test]
+    fn and_writes_bitwise_and_to_destination_register() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x6A5),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x5A5),
+                CpuInstruction::and(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_AND], Val::ONE);
+        // 0x6A5 & 0x5A5 = 0x4A5.
+        assert_eq!(trace.values[row2 + COL_RD_VAL], Val::from_u64(0x4A5));
+    }
+
+    #[test]
+    fn or_writes_bitwise_or_to_destination_register() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x300),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x055),
+                CpuInstruction::or(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_OR], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_RD_VAL], Val::from_u64(0x355));
+    }
+
+    #[test]
+    fn xor_writes_bitwise_xor_to_destination_register() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x3FF),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x0FF),
+                CpuInstruction::xor(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        assert_eq!(trace.values[row2 + COL_IS_XOR], Val::ONE);
+        assert_eq!(trace.values[row2 + COL_RD_VAL], Val::from_u64(0x300));
+    }
+
+    #[test]
+    fn rs2_bit_decomposition_round_trips_through_trace() {
+        // `addi x3, x0, 0x6A5` then ANDed with x0 should expose
+        // rs2's bit decomposition. The bit cells must match `rs2_val`
+        // (which is the running register state for `rs2_idx`).
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 4, 0, 0x6A5),
+                CpuInstruction::and(pc_base + 4, 5, 0, 4),
+            ],
+        );
+        let row1 = CPU_TRACE_WIDTH;
+        let expected_bits = 0x6A5_u32;
+        for bit in 0..32 {
+            let expected = Val::from_u64(u64::from((expected_bits >> bit) & 1));
+            assert_eq!(
+                trace.values[row1 + COL_RS2_BIT_START + bit],
+                expected,
+                "rs2_bit {bit}",
+            );
+        }
+    }
+
+    #[test]
+    fn add_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x100),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::add(pc_base + 8, 5, 3, 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn sub_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x123),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::sub(pc_base + 8, 5, 3, 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn and_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x6A5),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x5A5),
+                CpuInstruction::and(pc_base + 8, 5, 3, 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn or_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x300),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x055),
+                CpuInstruction::or(pc_base + 8, 5, 3, 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn xor_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x3FF),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x0FF),
+                CpuInstruction::xor(pc_base + 8, 5, 3, 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn add_with_rd_zero_does_not_modify_x0() {
+        let pc_base = 0x10000;
+        prove_and_verify(pc_base, &[CpuInstruction::add(pc_base, 0, 0, 0)]);
+    }
+
+    #[test]
+    fn sub_to_zero_proves() {
+        // `sub x5, x3, x3` → r5 = 0.
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x123),
+                CpuInstruction::sub(pc_base + 4, 5, 3, 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn and_with_full_mask_returns_rs1_value() {
+        // R-type AND requires both operands to be BabyBear-native;
+        // an all-ones (= 0xFFFF_FFFF) mask is not available without
+        // M8-L's range argument. Use a mask whose set bits cover the
+        // source register so the result equals the source.
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x6A5),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x7FF),
+                CpuInstruction::and(pc_base + 8, 5, 3, 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn xor_with_self_returns_zero() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x6A5),
+                CpuInstruction::xor(pc_base + 4, 5, 3, 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn mixed_r_type_alu_program_proves() {
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 0x555),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 0x0F0),
+                CpuInstruction::add(pc_base + 8, 3, 1, 2),
+                CpuInstruction::sub(pc_base + 12, 4, 3, 2),
+                CpuInstruction::and(pc_base + 16, 5, 1, 2),
+                CpuInstruction::or(pc_base + 20, 6, 1, 2),
+                CpuInstruction::xor(pc_base + 24, 7, 1, 2),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "OP rd_val must fit below the BabyBear modulus")]
+    fn trace_builder_panics_when_add_result_aliases_babybear() {
+        // r1 = 0x4000_0000, r2 = 0x4000_0000. ADD gives 0x8000_0000
+        // which is ≥ BabyBear modulus (0x7800_0001).
+        let pc_base = 0x10000;
+        // We need to load 0x4000_0000 into a register. LUI x1, 0x40000
+        // is rejected by the LUI constructor (BabyBear-native U-type
+        // bound). Use AUIPC instead is also rejected for the same
+        // reason. So we have to take an `add of large values` route
+        // via the cpu_trace builder being able to construct the
+        // values somehow. Cheat by using straight LUI bytes manually.
+        //
+        // Easier: pick rs1 = 0 and rs2 = ... wait, both registers
+        // start at 0, and we cannot easily load a value > BabyBear.
+        //
+        // The cleanest demonstration is to start with `addi x1, x0, 1`
+        // and add it to itself enough times to overflow, but that
+        // would require many rows. Instead, use a single SUB that
+        // wraps below zero: `sub x5, x0, x1` with x1 = 1 produces
+        // u32::MAX, which is ≥ BabyBear modulus.
+        let _ = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 1),
+                CpuInstruction::sub(pc_base + 4, 5, 0, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn prover_refuses_add_with_wrong_rd_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x100),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::add(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        // Correct ADD result is 0x123; tamper to 0x124.
+        trace.values[row2 + COL_RD_VAL] = Val::from_u64(0x124);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_sub_with_wrong_rd_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x123),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::sub(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        trace.values[row2 + COL_RD_VAL] = Val::from_u64(0x101);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_and_with_wrong_rd_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x6A5),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x5A5),
+                CpuInstruction::and(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        trace.values[row2 + COL_RD_VAL] = Val::from_u64(0x4A4);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_r_type_with_wrong_opcode() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::add(pc_base, 5, 0, 0)]);
+        // OP opcode = 0x33 = 0011_0011. Flip b0_bit_1 to drop it
+        // to 0x31, breaking the OP opcode check.
+        trace.values[COL_B0_BITS_START + 1] = Val::ZERO;
+        trace.values[COL_B0] -= Val::from_u64(2);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_add_with_subtractive_funct7() {
+        // ADD's funct7 must be 0; tamper to set bit 5 (the SUB
+        // discriminator) and patch b3. The AIR's funct7-zero clause
+        // for ADD must reject the row.
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::add(pc_base, 5, 0, 0)]);
+        trace.values[COL_B3_BITS_START + 5] = Val::ONE;
+        trace.values[COL_B3] += Val::from_u64(32);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_sub_without_funct7_bit() {
+        // SUB requires b3_bit_5 = 1; tamper to 0.
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::sub(pc_base, 5, 0, 0)]);
+        trace.values[COL_B3_BITS_START + 5] = Val::ZERO;
+        trace.values[COL_B3] -= Val::from_u64(32);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_add_with_wrong_funct3() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::add(pc_base, 5, 0, 0)]);
+        // ADD funct3 = 000; force bit 4 → 1.
+        trace.values[COL_B1_BITS_START + 4] = Val::ONE;
+        trace.values[COL_B1] += Val::from_u64(16);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_r_type_with_wrong_next_pc() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::add(pc_base, 5, 0, 0),
+                CpuInstruction::addi(pc_base + 4, 1, 0, 1),
+            ],
+        );
+        // Force next_pc = pc + 8 on the ADD row.
+        trace.values[COL_NEXT_PC] = Val::from_u64(0x10008);
+        let row1 = CPU_TRACE_WIDTH;
+        trace.values[row1 + COL_PC] = Val::from_u64(0x10008);
+        trace.values[row1 + COL_NEXT_PC] = Val::from_u64(0x1000C);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_add_set_on_padding_row() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[]);
+        trace.values[COL_IS_ADD] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_is_add_and_is_sub_both_set() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::add(pc_base, 5, 0, 0)]);
+        trace.values[COL_IS_SUB] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_tampered_rs2_bit_sum() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 4, 0, 0x010),
+                CpuInstruction::and(pc_base + 4, 5, 0, 4),
+            ],
+        );
+        // Row 1's rs2 is r4 = 0x010 (rs2_bit_4 = 1, others = 0).
+        // Flip rs2_bit_5 from 0 to 1 without touching rs2_val. The
+        // rs2 bit-sum constraint then fails.
+        let row1 = CPU_TRACE_WIDTH;
+        trace.values[row1 + COL_RS2_BIT_START + 5] = Val::ONE;
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn prover_refuses_r_type_with_wrong_rs2_val() {
+        let pc_base = 0x10000;
+        let mut trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 3, 0, 0x100),
+                CpuInstruction::addi(pc_base + 4, 4, 0, 0x023),
+                CpuInstruction::add(pc_base + 8, 5, 3, 4),
+            ],
+        );
+        let row2 = 2 * CPU_TRACE_WIDTH;
+        // The ADD row reads r4 (= 0x023); tamper rs2_val to 0x024.
+        trace.values[row2 + COL_RS2_VAL] = Val::from_u64(0x024);
+        assert_prover_rejects(pc_base, trace);
+    }
+
+    #[test]
+    fn r_type_alu_after_branch_proves() {
+        // The trace lists executed instructions in order, so the
+        // skipped fall-through instruction does not appear after a
+        // taken BEQ.
+        let pc_base = 0x10000;
+        prove_and_verify(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 5),
+                // r1 == r2 → BEQ taken; jumps to pc + 0xC.
+                CpuInstruction::beq_taken(pc_base + 8, 1, 2, 0xC),
+                // Branch target — ADD must prove with r1 + r2.
+                CpuInstruction::add(pc_base + 0x14, 3, 1, 2),
+            ],
+        );
     }
 }

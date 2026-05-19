@@ -322,6 +322,51 @@ where
     RowMajorMatrix::new(values, MEM_CONSISTENCY_TRACE_WIDTH)
 }
 
+/// Bus records the memory-consistency AIR contributes at each row
+/// of its main trace, packaged as `Vec<Vec<BusRecord>>` aligned to
+/// the trace height.
+///
+/// Each real row (`is_real = 1`) holds exactly one
+/// [`BusChannel::MemoryAccess`] send carrying the row's
+/// `(addr, ts, op, val)` payload; padding rows have an empty inner
+/// `Vec`. Pairs with [`crate::logup::permutation_trace`] to produce
+/// the per-AIR permutation column the future
+/// [`p3_air::PermutationAirBuilder`] hook will commit to. The CPU
+/// side of this channel arrives once loads / stores land in the CPU
+/// AIR under the M8-L byte-bus.
+///
+/// # Panics
+///
+/// Panics if `trace.values.len()` is not a multiple of
+/// [`MEM_CONSISTENCY_TRACE_WIDTH`].
+#[must_use]
+pub fn per_row_bus_records<F: PrimeField32 + Copy>(
+    trace: &RowMajorMatrix<F>,
+) -> Vec<Vec<BusRecord<F>>> {
+    assert_eq!(
+        trace.values.len() % MEM_CONSISTENCY_TRACE_WIDTH,
+        0,
+        "per_row_bus_records: trace length is not a multiple of MEM_CONSISTENCY_TRACE_WIDTH",
+    );
+    let height = trace.values.len() / MEM_CONSISTENCY_TRACE_WIDTH;
+    let mut rows = vec![Vec::new(); height];
+    for (row_idx, row_slot) in rows.iter_mut().enumerate() {
+        let base = row_idx * MEM_CONSISTENCY_TRACE_WIDTH;
+        if trace.values[base + COL_IS_REAL] != F::ONE {
+            continue;
+        }
+        let addr = trace.values[base + COL_ADDR];
+        let ts = trace.values[base + COL_TS];
+        let op = trace.values[base + COL_OP];
+        let val = trace.values[base + COL_VAL];
+        *row_slot = vec![BusRecord::send(
+            BusChannel::MemoryAccess,
+            vec![addr, ts, op, val],
+        )];
+    }
+    rows
+}
+
 /// Bus records the memory-consistency AIR sends on the
 /// [`BusChannel::MemoryAccess`] channel, one per real row of the
 /// trace.
@@ -764,6 +809,40 @@ mod tests {
         let trace = memory_consistency_trace::<Val>(&[]);
         let records = memory_access_send_records::<Val>(&trace);
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn per_row_bus_records_align_with_trace_rows() {
+        let trace = memory_consistency_trace::<Val>(&[
+            MemoryAccess::write(0x100, 1, 0xDEAD),
+            MemoryAccess::read(0x100, 2, 0xDEAD),
+        ]);
+        let height = trace.values.len() / MEM_CONSISTENCY_TRACE_WIDTH;
+        let rows = per_row_bus_records::<Val>(&trace);
+        assert_eq!(rows.len(), height);
+        // Real rows (sorted): write then read at addr 0x100.
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[0][0].channel, BusChannel::MemoryAccess);
+        assert_eq!(rows[0][0].multiplicity, 1);
+        assert_eq!(rows[0][0].payload[0], Val::from_u64(0x100));
+        assert_eq!(rows[0][0].payload[2], Val::ONE); // write
+        assert_eq!(rows[1].len(), 1);
+        assert_eq!(rows[1][0].payload[2], Val::ZERO); // read
+        // Padding rows emit none.
+        for row in &rows[2..] {
+            assert!(row.is_empty());
+        }
+    }
+
+    #[test]
+    fn per_row_bus_records_empty_trace() {
+        let trace = memory_consistency_trace::<Val>(&[]);
+        let rows = per_row_bus_records::<Val>(&trace);
+        let height = trace.values.len() / MEM_CONSISTENCY_TRACE_WIDTH;
+        assert_eq!(rows.len(), height);
+        for row in &rows {
+            assert!(row.is_empty());
+        }
     }
 
     #[test]

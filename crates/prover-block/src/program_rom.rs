@@ -225,6 +225,36 @@ pub fn program_rom_trace<F: Field>(pc_base: u32, instructions: &[u32]) -> RowMaj
     RowMajorMatrix::new(values, PROGRAM_ROM_TRACE_WIDTH)
 }
 
+/// Bus records this ROM contributes at each row of its main trace,
+/// packaged as `Vec<Vec<BusRecord>>` aligned to the table height.
+///
+/// Each row of the ROM trace holds exactly one [`BusRecord`] on
+/// [`BusChannel::ProgramRom`] carrying the row's `(pc, instruction)`
+/// pair and multiplicity `-multiplicities[row]`. Rows whose
+/// multiplicity is zero still get a record so the future AIR-side
+/// permutation constraint can fire on every trace row without
+/// gating on multiplicity.
+///
+/// Combined with [`crate::logup::permutation_trace`], this helper
+/// produces the per-AIR permutation column the future
+/// [`p3_air::PermutationAirBuilder`] hook will commit to. The
+/// resulting cumulative value pairs with the matching CPU AIR's
+/// cumulative value to close the global bus.
+///
+/// # Panics
+///
+/// Same panic surface as [`program_rom_receive_records`].
+#[must_use]
+pub fn per_row_bus_records<F: PrimeField32 + Copy>(
+    rom_trace: &RowMajorMatrix<F>,
+    multiplicities: &[i64],
+) -> Vec<Vec<BusRecord<F>>> {
+    program_rom_receive_records::<F>(rom_trace, multiplicities)
+        .into_iter()
+        .map(|record| vec![record])
+        .collect()
+}
+
 /// Bus records this ROM contributes for a given per-row send histogram.
 ///
 /// For each row `r` of the ROM trace the AIR emits one
@@ -706,5 +736,25 @@ mod tests {
             ],
         )];
         let _ = program_rom_send_multiplicities::<Val>(&sends, &trace);
+    }
+
+    #[test]
+    fn per_row_bus_records_wrap_each_receive_in_singleton_vec() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP, NOP]);
+        let height = trace.values.len() / PROGRAM_ROM_TRACE_WIDTH;
+        let mut multiplicities = vec![0_i64; height];
+        multiplicities[0] = 3;
+        multiplicities[1] = 1;
+        let rows = per_row_bus_records::<Val>(&trace, &multiplicities);
+        assert_eq!(rows.len(), height);
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 1, "row {row_idx} should hold one record");
+            assert_eq!(row[0].channel, BusChannel::ProgramRom);
+            assert_eq!(row[0].payload.len(), 2);
+        }
+        assert_eq!(rows[0][0].multiplicity, -3);
+        assert_eq!(rows[1][0].multiplicity, -1);
+        assert_eq!(rows[2][0].multiplicity, 0);
     }
 }

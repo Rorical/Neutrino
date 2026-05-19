@@ -138,6 +138,41 @@ pub fn range_check_trace<F: PrimeCharacteristicRing + Copy + Send + Sync>(
     RowMajorMatrix::new(values, RANGE_CHECK_TRACE_WIDTH)
 }
 
+/// Bus records this range table contributes at each row of its main
+/// trace, packaged as `Vec<Vec<BusRecord>>` aligned to the table
+/// height.
+///
+/// Each row of the canonical ascending table holds exactly one
+/// [`BusRecord`] on `channel` carrying the row's value as its
+/// payload and multiplicity `-multiplicities[row]`. Rows whose
+/// multiplicity is zero still get a record (the inner `Vec` always
+/// contains a single record per row) so the future AIR-side
+/// permutation constraint can fire on every trace row without
+/// gating on multiplicity.
+///
+/// Combined with [`crate::logup::permutation_trace`], this helper
+/// produces the per-AIR permutation column the future
+/// [`p3_air::PermutationAirBuilder`] hook will commit to. The
+/// resulting cumulative value pairs with the matching sender AIR's
+/// cumulative value to close the global bus.
+///
+/// Only the single-element range channels [`BusChannel::U8Range`]
+/// and [`BusChannel::U16Range`] are accepted; other channels panic.
+///
+/// # Panics
+///
+/// Same panic surface as [`range_receive_records`].
+#[must_use]
+pub fn per_row_bus_records<F: PrimeField32>(
+    channel: BusChannel,
+    multiplicities: &[i64],
+) -> Vec<Vec<BusRecord<F>>> {
+    range_receive_records::<F>(channel, multiplicities)
+        .into_iter()
+        .map(|record| vec![record])
+        .collect()
+}
+
 /// Bus receive records this range table contributes for a given send
 /// histogram.
 ///
@@ -346,5 +381,22 @@ mod tests {
     fn range_receive_records_panics_on_wrong_length() {
         let multiplicities = vec![0_i64; 128];
         let _ = range_receive_records::<Val>(BusChannel::U8Range, &multiplicities);
+    }
+
+    #[test]
+    fn per_row_bus_records_wrap_each_receive_in_singleton_vec() {
+        let mut multiplicities = vec![0_i64; 256];
+        multiplicities[0x05] = 2;
+        multiplicities[0xFF] = 1;
+        let rows = per_row_bus_records::<Val>(BusChannel::U8Range, &multiplicities);
+        assert_eq!(rows.len(), 256);
+        for (value, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 1, "row {value} should hold exactly one record");
+            assert_eq!(row[0].channel, BusChannel::U8Range);
+            assert_eq!(row[0].payload, vec![Val::from_u64(value as u64)]);
+        }
+        assert_eq!(rows[0x05][0].multiplicity, -2);
+        assert_eq!(rows[0xFF][0].multiplicity, -1);
+        assert_eq!(rows[0x00][0].multiplicity, 0);
     }
 }

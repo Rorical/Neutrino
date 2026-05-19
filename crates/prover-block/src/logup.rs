@@ -800,6 +800,55 @@ mod tests {
     }
 
     #[test]
+    fn multi_air_closure_via_per_row_helpers_for_both_channels() {
+        // Threads every AIR's `per_row_bus_records` helper through
+        // `logup::permutation_trace`, then sums the per-AIR
+        // cumulative values across all four AIRs. Honest traces must
+        // close to zero for every channel simultaneously.
+        let pc_base = 0x10000;
+        let cpu_insns = [
+            CpuInstruction::addi(pc_base, 1, 0, 5),
+            CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+            CpuInstruction::add(pc_base + 8, 3, 1, 2),
+            CpuInstruction::fence(pc_base + 12),
+        ];
+        let cpu_t = cpu_trace::<Val>(pc_base, &cpu_insns);
+        let rom_words: Vec<u32> = cpu_insns.iter().map(|i| i.insn).collect();
+        let rom_t = program_rom_trace::<Val>(pc_base, &rom_words);
+
+        let alpha = test_alpha();
+        let beta = test_beta();
+
+        // CPU side: combined byte-range + program-rom records per
+        // row, via the new helper.
+        let cpu_rows = crate::cpu::per_row_bus_records::<Val>(&cpu_t);
+        let (_cpu_perm, cpu_cumulative) =
+            permutation_trace::<Val, Challenge>(&cpu_rows, alpha, beta);
+
+        // u8 table receives: aggregate the CPU's byte-range sends
+        // into per-value multiplicities, then build the table's
+        // per-row records.
+        let byte_sends = byte_range_send_records::<Val>(&cpu_t);
+        let u8_mult = range_send_multiplicities::<Val>(&byte_sends, BusChannel::U8Range, 256);
+        let u8_rows = crate::range_check::per_row_bus_records::<Val>(BusChannel::U8Range, &u8_mult);
+        let (_u8_perm, u8_cumulative) = permutation_trace::<Val, Challenge>(&u8_rows, alpha, beta);
+
+        // ROM receives.
+        let pc_sends = program_rom_send_records::<Val>(&cpu_t);
+        let rom_mult = program_rom_send_multiplicities::<Val>(&pc_sends, &rom_t);
+        let rom_rows = crate::program_rom::per_row_bus_records::<Val>(&rom_t, &rom_mult);
+        let (_rom_perm, rom_cumulative) =
+            permutation_trace::<Val, Challenge>(&rom_rows, alpha, beta);
+
+        // Global closure: sum of every AIR's cumulative value across
+        // both bus channels must be zero.
+        assert_eq!(
+            cpu_cumulative + u8_cumulative + rom_cumulative,
+            Challenge::ZERO,
+        );
+    }
+
+    #[test]
     fn permutation_trace_detects_imbalance_via_nonzero_cumulative_sum() {
         // Same byte-range setup as the closing test, but drop one
         // CPU send before computing the trace. The two AIRs' final

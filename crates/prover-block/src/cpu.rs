@@ -2374,6 +2374,65 @@ pub fn instruction_from_bytes<F: PrimeField32 + Copy>(b0: F, b1: F, b2: F, b3: F
     b0 + b1 * F::from_u64(256) + b2 * F::from_u64(1 << 16) + b3 * F::from_u64(1 << 24)
 }
 
+/// Bus records the CPU AIR contributes at each row of its main
+/// trace, packaged as `Vec<Vec<BusRecord>>` aligned to the trace
+/// height.
+///
+/// Each real row emits four [`BusChannel::U8Range`] sends (the
+/// instruction byte cells `b0..b3`) plus one
+/// [`BusChannel::ProgramRom`] send carrying the row's
+/// `(pc, instruction)` pair. Padding rows emit no records, so their
+/// inner `Vec` is empty.
+///
+/// Combined with [`crate::logup::permutation_trace`], this helper
+/// produces the per-AIR permutation column the future
+/// [`p3_air::PermutationAirBuilder`] hook will commit to. Splitting
+/// records per channel for per-channel constraints is the caller's
+/// responsibility — the future AIR-side hook filters by
+/// [`BusRecord::channel`] when materialising per-column deltas.
+///
+/// # Panics
+///
+/// Panics if `trace.values.len()` is not a multiple of
+/// [`CPU_TRACE_WIDTH`].
+#[must_use]
+pub fn per_row_bus_records<F: PrimeField32 + Copy>(
+    trace: &RowMajorMatrix<F>,
+) -> Vec<Vec<BusRecord<F>>> {
+    assert_eq!(
+        trace.values.len() % CPU_TRACE_WIDTH,
+        0,
+        "per_row_bus_records: trace length is not a multiple of CPU_TRACE_WIDTH",
+    );
+    let height = trace.values.len() / CPU_TRACE_WIDTH;
+    let mut rows = vec![Vec::new(); height];
+    for (row_idx, row_slot) in rows.iter_mut().enumerate() {
+        let base = row_idx * CPU_TRACE_WIDTH;
+        if trace.values[base + COL_IS_REAL] != F::ONE {
+            continue;
+        }
+        let mut row_records = Vec::with_capacity(5);
+        // Byte-range sends for b0..b3.
+        for col in [COL_B0, COL_B1, COL_B2, COL_B3] {
+            row_records.push(BusRecord::send(
+                BusChannel::U8Range,
+                vec![trace.values[base + col]],
+            ));
+        }
+        // Program-ROM send carrying the row's (pc, instruction) pair.
+        let pc = trace.values[base + COL_PC];
+        let insn = instruction_from_bytes(
+            trace.values[base + COL_B0],
+            trace.values[base + COL_B1],
+            trace.values[base + COL_B2],
+            trace.values[base + COL_B3],
+        );
+        row_records.push(BusRecord::send(BusChannel::ProgramRom, vec![pc, insn]));
+        *row_slot = row_records;
+    }
+    rows
+}
+
 /// Bus records the CPU AIR sends on the [`BusChannel::ProgramRom`]
 /// channel, one `(pc, instruction)` send per real row.
 ///
@@ -5308,6 +5367,53 @@ mod tests {
         balance.extend(&sends);
         balance.extend(&receives);
         assert!(balance.is_balanced());
+    }
+
+    #[test]
+    fn per_row_bus_records_combine_byte_range_and_program_rom() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+            ],
+        );
+        let rows = per_row_bus_records::<Val>(&trace);
+        let height = trace.values.len() / CPU_TRACE_WIDTH;
+        assert_eq!(rows.len(), height);
+
+        // Real rows emit 4 U8Range + 1 ProgramRom = 5 records.
+        assert_eq!(rows[0].len(), 5);
+        assert_eq!(rows[1].len(), 5);
+
+        // Padding rows emit none.
+        for row in &rows[2..] {
+            assert!(row.is_empty(), "padding row should emit no records");
+        }
+
+        // Inspect row 0: four U8Range sends followed by one
+        // ProgramRom send.
+        for record in &rows[0][..4] {
+            assert_eq!(record.channel, BusChannel::U8Range);
+            assert_eq!(record.multiplicity, 1);
+            assert_eq!(record.payload.len(), 1);
+        }
+        assert_eq!(rows[0][4].channel, BusChannel::ProgramRom);
+        assert_eq!(rows[0][4].multiplicity, 1);
+        assert_eq!(rows[0][4].payload.len(), 2);
+    }
+
+    #[test]
+    fn per_row_bus_records_skip_all_rows_on_empty_trace() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[]);
+        let rows = per_row_bus_records::<Val>(&trace);
+        let height = trace.values.len() / CPU_TRACE_WIDTH;
+        assert_eq!(rows.len(), height);
+        for row in &rows {
+            assert!(row.is_empty(), "empty trace must emit no records");
+        }
     }
 
     #[test]

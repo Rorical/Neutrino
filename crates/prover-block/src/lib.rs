@@ -80,7 +80,9 @@ pub use cpu::{
     cpu_trace_height, instruction_from_bytes, program_rom_send_records,
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
-pub use logup::{balance, encode_record, is_balanced, running_sum};
+pub use logup::{
+    balance, encode_record, is_balanced, permutation_trace, row_contribution, running_sum,
+};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
     memory_access_send_records, memory_consistency_trace,

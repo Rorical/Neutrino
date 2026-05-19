@@ -58,6 +58,7 @@
 //! of [`running_sum`].
 
 use p3_field::{ExtensionField, PrimeCharacteristicRing, PrimeField32};
+use p3_matrix::dense::RowMajorMatrix;
 
 use crate::bus::BusRecord;
 
@@ -165,6 +166,85 @@ where
     EF: ExtensionField<F>,
 {
     balance(records, alpha, beta) == EF::ZERO
+}
+
+/// Field-arithmetic contribution a single trace row makes to its
+/// AIR's logUp permutation column.
+///
+/// Sums `multiplicity / (α − encode(record, β))` over every record
+/// the row emits. Empty record slices return `EF::ZERO`. The future
+/// AIR constraint then enforces
+///
+/// ```text
+///   next.perm - local.perm = row_contribution(next_row.records, α, β)
+/// ```
+///
+/// per row, so the AIR commits exactly to the running sum of these
+/// per-row deltas.
+///
+/// # Panics
+///
+/// Panics if `α` collides with any record's encoding under `β`.
+#[must_use]
+pub fn row_contribution<F, EF>(records: &[BusRecord<F>], alpha: EF, beta: EF) -> EF
+where
+    F: PrimeField32,
+    EF: ExtensionField<F>,
+{
+    let mut delta = EF::ZERO;
+    for record in records {
+        let encoded = encode_record::<F, EF>(record, beta);
+        let denom = alpha - encoded;
+        let inv = denom.try_inverse().expect(
+            "logUp row_contribution: random challenge α collided with a record encoding under β",
+        );
+        let mult = ef_from_i64::<EF>(record.multiplicity);
+        delta += mult * inv;
+    }
+    delta
+}
+
+/// Build a one-column extension-field permutation trace aligned to
+/// an AIR's main trace, plus the AIR's cumulative bus value.
+///
+/// Each entry of `row_records` carries the [`BusRecord`]s emitted at
+/// the corresponding row of the main trace. The returned matrix has
+/// `row_records.len()` rows and width 1; row `i` holds the cumulative
+/// running sum `Σ_{j ≤ i} row_contribution(row_records[j], α, β)`,
+/// matching what Plonky3's [`p3_air::PermutationAirBuilder`] will
+/// consume once the AIR-side hook lands.
+///
+/// The second return value is the trace's final cumulative cell —
+/// the per-AIR "cumulative value" that the multi-AIR proof commits
+/// publicly. Summing this across every AIR in the shard yields the
+/// global bus closure check: the sum must equal `EF::ZERO` iff the
+/// bus is honest.
+///
+/// Padding (or otherwise inert) rows pass an empty record slice and
+/// keep the running sum constant — the future AIR constraint reads
+/// this as "delta = 0 on this row".
+///
+/// # Panics
+///
+/// Panics if `α` collides with any record's encoding under `β`.
+#[must_use]
+pub fn permutation_trace<F, EF>(
+    row_records: &[Vec<BusRecord<F>>],
+    alpha: EF,
+    beta: EF,
+) -> (RowMajorMatrix<EF>, EF)
+where
+    F: PrimeField32,
+    EF: ExtensionField<F>,
+{
+    let mut values = Vec::with_capacity(row_records.len());
+    let mut cumulative = EF::ZERO;
+    for records in row_records {
+        cumulative += row_contribution::<F, EF>(records, alpha, beta);
+        values.push(cumulative);
+    }
+    let matrix = RowMajorMatrix::new(values, 1);
+    (matrix, cumulative)
 }
 
 /// Lift a signed integer multiplicity into an algebra over a prime
@@ -552,5 +632,208 @@ mod tests {
             alt_alpha(),
             alt_beta()
         ));
+    }
+
+    // -------- Per-row contribution + permutation trace --------
+
+    #[test]
+    fn row_contribution_of_empty_row_is_zero() {
+        assert_eq!(
+            row_contribution::<Val, Challenge>(&[], test_alpha(), test_beta()),
+            Challenge::ZERO,
+        );
+    }
+
+    #[test]
+    fn row_contribution_of_single_send_matches_inverse_form() {
+        let record = BusRecord::send(BusChannel::U8Range, payload_u8(0x12));
+        let alpha = test_alpha();
+        let beta = test_beta();
+        let computed =
+            row_contribution::<Val, Challenge>(std::slice::from_ref(&record), alpha, beta);
+        let expected = (alpha - encode_record::<Val, Challenge>(&record, beta))
+            .try_inverse()
+            .expect("non-degenerate denominator");
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn row_contribution_with_send_and_matching_receive_cancels_within_one_row() {
+        let payload = payload_u8(0x55);
+        let send = BusRecord::send(BusChannel::U8Range, payload.clone());
+        let recv = BusRecord::receive(BusChannel::U8Range, payload);
+        let delta = row_contribution::<Val, Challenge>(&[send, recv], test_alpha(), test_beta());
+        assert_eq!(delta, Challenge::ZERO);
+    }
+
+    #[test]
+    fn permutation_trace_empty_input_has_zero_height_and_zero_cumulative() {
+        let (matrix, cumulative) =
+            permutation_trace::<Val, Challenge>(&[], test_alpha(), test_beta());
+        assert!(matrix.values.is_empty());
+        assert_eq!(cumulative, Challenge::ZERO);
+    }
+
+    #[test]
+    fn permutation_trace_cells_match_running_sum() {
+        // Build per-row records that include a no-op row in the
+        // middle so the running sum stays put on that row.
+        let payload_a = payload_u8(0x10);
+        let payload_b = payload_u8(0x20);
+        let row_records = vec![
+            vec![BusRecord::send(BusChannel::U8Range, payload_a.clone())],
+            vec![],
+            vec![BusRecord::send(BusChannel::U8Range, payload_b.clone())],
+            vec![BusRecord::receive(BusChannel::U8Range, payload_a)],
+            vec![BusRecord::receive(BusChannel::U8Range, payload_b)],
+        ];
+        let alpha = test_alpha();
+        let beta = test_beta();
+        let (matrix, cumulative) = permutation_trace::<Val, Challenge>(&row_records, alpha, beta);
+        assert_eq!(matrix.values.len(), row_records.len());
+        assert_eq!(matrix.width, 1);
+
+        // Independently compute the expected cumulative trace.
+        let mut expected = Challenge::ZERO;
+        for (row, records) in row_records.iter().enumerate() {
+            expected += row_contribution::<Val, Challenge>(records, alpha, beta);
+            assert_eq!(matrix.values[row], expected, "row {row}");
+        }
+        assert_eq!(cumulative, expected);
+        // The honest, fully-matched multiset must close to zero.
+        assert_eq!(cumulative, Challenge::ZERO);
+    }
+
+    #[test]
+    fn permutation_trace_padding_rows_preserve_running_sum() {
+        let row_records = vec![
+            vec![BusRecord::send(BusChannel::U8Range, payload_u8(0x07))],
+            vec![],
+            vec![],
+            vec![BusRecord::receive(BusChannel::U8Range, payload_u8(0x07))],
+        ];
+        let (matrix, cumulative) =
+            permutation_trace::<Val, Challenge>(&row_records, test_alpha(), test_beta());
+        // Rows 1 and 2 are inert padding; their cells must equal
+        // row 0's cell.
+        assert_eq!(matrix.values[0], matrix.values[1]);
+        assert_eq!(matrix.values[1], matrix.values[2]);
+        // After the matching receive at row 3, the cumulative drops
+        // back to zero.
+        assert_eq!(matrix.values[3], Challenge::ZERO);
+        assert_eq!(cumulative, Challenge::ZERO);
+    }
+
+    #[test]
+    fn permutation_traces_across_two_airs_sum_to_zero_for_byte_range() {
+        // CPU AIR emits the sends; RangeCheckAir emits the receives.
+        // Each AIR builds its own permutation trace; the two
+        // cumulative values must sum to zero across the bus.
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::addi(pc_base, 1, 0, 5),
+                CpuInstruction::add(pc_base + 4, 2, 0, 1),
+                CpuInstruction::fence(pc_base + 8),
+            ],
+        );
+        let alpha = test_alpha();
+        let beta = test_beta();
+
+        // CPU side: four byte sends per real row; padding rows
+        // contribute an empty record slice.
+        let sends = byte_range_send_records::<Val>(&trace);
+        let cpu_height = trace.values.len() / crate::cpu::CPU_TRACE_WIDTH;
+        let mut cpu_rows: Vec<Vec<BusRecord<Val>>> = vec![vec![]; cpu_height];
+        for (i, chunk) in sends.chunks(4).enumerate() {
+            cpu_rows[i] = chunk.to_vec();
+        }
+        let (_cpu_perm, cpu_cumulative) =
+            permutation_trace::<Val, Challenge>(&cpu_rows, alpha, beta);
+
+        // RangeCheck side: one receive per row (256 rows in the
+        // canonical u8 table).
+        let multiplicities = range_send_multiplicities::<Val>(&sends, BusChannel::U8Range, 256);
+        let receives = range_receive_records::<Val>(BusChannel::U8Range, &multiplicities);
+        let table_rows: Vec<Vec<BusRecord<Val>>> = receives.into_iter().map(|r| vec![r]).collect();
+        let (_table_perm, table_cumulative) =
+            permutation_trace::<Val, Challenge>(&table_rows, alpha, beta);
+
+        // Global bus closure: the two AIRs' cumulative values must
+        // sum to zero.
+        assert_eq!(cpu_cumulative + table_cumulative, Challenge::ZERO);
+    }
+
+    #[test]
+    fn permutation_traces_across_two_airs_sum_to_zero_for_program_rom() {
+        let pc_base = 0x10000;
+        let cpu_insns = [
+            CpuInstruction::addi(pc_base, 1, 0, 5),
+            CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+            CpuInstruction::add(pc_base + 8, 3, 1, 2),
+        ];
+        let cpu_t = cpu_trace::<Val>(pc_base, &cpu_insns);
+        let rom_words: Vec<u32> = cpu_insns.iter().map(|i| i.insn).collect();
+        let rom_t = program_rom_trace::<Val>(pc_base, &rom_words);
+        let alpha = test_alpha();
+        let beta = test_beta();
+
+        // CPU side: one ProgramRom send per real row, none on padding.
+        let sends = program_rom_send_records::<Val>(&cpu_t);
+        let cpu_height = cpu_t.values.len() / crate::cpu::CPU_TRACE_WIDTH;
+        let mut cpu_rows: Vec<Vec<BusRecord<Val>>> = vec![vec![]; cpu_height];
+        for (i, record) in sends.iter().enumerate() {
+            cpu_rows[i] = vec![record.clone()];
+        }
+        let (_cpu_perm, cpu_cumulative) =
+            permutation_trace::<Val, Challenge>(&cpu_rows, alpha, beta);
+
+        // ROM side: one receive per row.
+        let multiplicities = program_rom_send_multiplicities::<Val>(&sends, &rom_t);
+        let receives = program_rom_receive_records::<Val>(&rom_t, &multiplicities);
+        let rom_rows: Vec<Vec<BusRecord<Val>>> = receives.into_iter().map(|r| vec![r]).collect();
+        let (_rom_perm, rom_cumulative) =
+            permutation_trace::<Val, Challenge>(&rom_rows, alpha, beta);
+
+        assert_eq!(cpu_cumulative + rom_cumulative, Challenge::ZERO);
+    }
+
+    #[test]
+    fn permutation_trace_detects_imbalance_via_nonzero_cumulative_sum() {
+        // Same byte-range setup as the closing test, but drop one
+        // CPU send before computing the trace. The two AIRs' final
+        // cumulative values must NOT sum to zero.
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::addi(pc_base, 1, 0, 10)]);
+        let alpha = test_alpha();
+        let beta = test_beta();
+
+        let mut sends = byte_range_send_records::<Val>(&trace);
+        let _dropped = sends.pop().expect("at least one send");
+
+        let cpu_height = trace.values.len() / crate::cpu::CPU_TRACE_WIDTH;
+        let mut cpu_rows: Vec<Vec<BusRecord<Val>>> = vec![vec![]; cpu_height];
+        // After dropping one record, the real row has 3 sends; the
+        // remaining padding rows stay empty.
+        cpu_rows[0] = sends.clone();
+        let (_cpu_perm, cpu_cumulative) =
+            permutation_trace::<Val, Challenge>(&cpu_rows, alpha, beta);
+
+        // The receives are still built from the full table — we
+        // compute multiplicities from the (now short) `sends` list,
+        // simulating an honest verifier table that doesn't know about
+        // the dropped record.
+        // Bump one of the receive multiplicities by +1 to model a
+        // verifier that thinks the dropped send should be there.
+        let mut tampered = range_send_multiplicities::<Val>(&sends, BusChannel::U8Range, 256);
+        tampered[0x00] += 1;
+        let receives = range_receive_records::<Val>(BusChannel::U8Range, &tampered);
+        let table_rows: Vec<Vec<BusRecord<Val>>> = receives.into_iter().map(|r| vec![r]).collect();
+        let (_table_perm, table_cumulative) =
+            permutation_trace::<Val, Challenge>(&table_rows, alpha, beta);
+
+        // The mismatch surfaces as a non-zero global cumulative.
+        assert_ne!(cpu_cumulative + table_cumulative, Challenge::ZERO);
     }
 }

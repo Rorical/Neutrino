@@ -8,17 +8,26 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SP1_PROVER: cpu
 
 jobs:
   rust:
     name: rust
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Install Rust toolchain
         run: rustup show
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install SP1 toolchain
+        run: |
+          curl -fsSL https://sp1up.succinct.xyz | bash
+          echo "$HOME/.sp1/bin" >> $GITHUB_PATH
+          "$HOME/.sp1/bin/sp1up"
 
       - name: Build
         run: cargo build --locked

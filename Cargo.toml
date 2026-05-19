@@ -23,7 +23,12 @@ members = [
     "crates/rpc",
     "crates/node",
     "crates/cli",
+    "crates/runtime-host",
+    "crates/runtimes/neutrino-default/core",
+    "crates/runtimes/neutrino-default/master",
 ]
+# Guest crate at crates/runtimes/neutrino-default/guest is built by
+# runtime-host's build script under the `succinct` toolchain; not a member.
 
 default-members = [
     "crates/primitives",
@@ -48,6 +53,9 @@ default-members = [
     "crates/rpc",
     "crates/node",
     "crates/cli",
+    "crates/runtime-host",
+    "crates/runtimes/neutrino-default/core",
+    "crates/runtimes/neutrino-default/master",
 ]
 
 [workspace.package]
@@ -108,12 +116,17 @@ neutrino-sync                   = { path = "crates/sync",                   vers
 neutrino-mempool                = { path = "crates/mempool",                version = "0.1.0" }
 neutrino-light-client           = { path = "crates/light-client",           version = "0.1.0", default-features = false }
 neutrino-rpc                    = { path = "crates/rpc",                    version = "0.1.0" }
+neutrino-runtime-host           = { path = "crates/runtime-host",           version = "0.1.0", default-features = false }
+neutrino-default-runtime-core   = { path = "crates/runtimes/neutrino-default/core",   version = "0.1.0", default-features = false }
+neutrino-default-runtime-master = { path = "crates/runtimes/neutrino-default/master", version = "0.1.0", default-features = false }
 
 # External — pinned at major versions; cargo update controls minor/patch.
-# Canonical wire codec. Borsh is chosen over SCALE because its fixed-width
-# u32 length prefixes produce smaller, simpler in-circuit decoders for the
-# SP1 and Plonky3 backends. See docs/design/07-block-format.md.
+# Canonical wire codec. See docs/design/07-block-format.md.
 borsh               = { version = "1.5",  default-features = false, features = ["derive"] }
+
+# SP1 zkVM — hard environment dependency (see AGENTS.md).
+sp1-sdk             = { version = "=6.2.1", default-features = false, features = ["blocking"] }
+sp1-build           = { version = "=6.2.1" }
 
 blake3              = { version = "1.5",  default-features = false }
 sha2                = { version = "0.10", default-features = false }

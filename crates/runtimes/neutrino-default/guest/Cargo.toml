@@ -1,0 +1,25 @@
+# Standalone crate built by runtime-host/build.rs under the `succinct`
+# toolchain. The empty [workspace] opts it out of the parent workspace.
+[workspace]
+
+[package]
+name        = "neutrino-default-runtime-guest"
+version     = "0.1.0"
+edition     = "2024"
+publish     = false
+description = "SP1 Guest binary for the Neutrino default runtime."
+
+[[bin]]
+name = "neutrino-default-runtime-guest"
+path = "src/main.rs"
+
+[dependencies]
+sp1-zkvm                       = "=6.2.1"
+neutrino-default-runtime-core  = { path = "../core", default-features = false }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+debug         = false
+panic         = "abort"

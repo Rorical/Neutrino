@@ -1,0 +1,25 @@
+[package]
+name          = "neutrino-runtime-host"
+description   = "SP1 prover/verifier host for the Neutrino runtime."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+authors       = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+documentation = { workspace = true }
+readme        = { workspace = true }
+publish       = { workspace = true }
+
+[lib]
+
+[dependencies]
+sp1-sdk    = { workspace = true }
+thiserror  = { workspace = true }
+
+[build-dependencies]
+sp1-build  = { workspace = true }
+
+[lints]
+workspace = true

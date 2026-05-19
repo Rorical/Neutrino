@@ -14,6 +14,12 @@ proof code.
   reserves `gen` as a keyword, so use names such as `gen_sk()` in tests.
 - `Cargo.lock` is committed. Always build and test with `--locked`; do not
   casually run `cargo update`.
+- **SP1 is a hard environment dependency.** The `succinct` rustup
+  toolchain and `cargo-prove` must be installed via `sp1up` before any
+  `cargo build --locked`. `runtime-host`'s build script unconditionally
+  compiles the default-runtime guest ELF and embeds it; there is no
+  feature flag to disable this. Pinned SP1 version: **6.2.1**.
+  Install with: `curl -fsSL https://sp1up.succinct.xyz | bash && sp1up`.
 
 ## Build, test, lint
 
@@ -44,6 +50,23 @@ have passed.
   `prover-chunk` and `prover-checkpoint` crates are scaffold markers only.
 - `docs/design/15-legacy-runtime-functionality.md` records what the deleted
   runtime stack used to do so it can be rebuilt on the new architecture.
+
+## Runtime crate layout
+
+- `crates/runtime-host/` — SP1 prover/verifier host. Embeds the default-
+  runtime guest ELF via `sp1_sdk::include_elf!` and exposes
+  `prove`/`verify`. SP1-only; no fall-back.
+- `crates/runtimes/neutrino-default/core/` — shared STF logic.
+  `no_std`, no `alloc` until forced. The same source compiles into the
+  WASM master, the SP1 Guest, and host-native unit tests. Must remain
+  ecosystem-agnostic.
+- `crates/runtimes/neutrino-default/master/` — `cdylib + rlib` target
+  built for `wasm32-unknown-unknown`. Wraps the shared core and adds
+  non-proven RPC service entrypoints (e.g. `validate_tx`, `query`).
+  Loaded by the WASM dynamic runtime host introduced in M2-new.
+- `crates/runtimes/neutrino-default/guest/` — SP1 Guest binary. **Not** a
+  workspace member; `runtime-host/build.rs` builds it via `sp1-build`
+  under the `succinct` toolchain. Edition 2024.
 
 ## Lint posture
 

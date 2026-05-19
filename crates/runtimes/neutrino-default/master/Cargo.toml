@@ -1,0 +1,22 @@
+[package]
+name          = "neutrino-default-runtime-master"
+description   = "Neutrino default runtime master binary. Built for wasm32-unknown-unknown, loaded by the WASM dynamic runtime host."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+authors       = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+documentation = { workspace = true }
+readme        = { workspace = true }
+publish       = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+neutrino-default-runtime-core = { workspace = true }
+
+[lints]
+workspace = true

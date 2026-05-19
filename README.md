@@ -49,6 +49,20 @@ SP1 Compressed STARK per-block proving plus a wasmtime dynamic runtime.
 | 14 | [SP1 rewrite roadmap](docs/design/14-sp1-rewrite-roadmap.md)         | Accepted rewrite roadmap                                               |
 | 15 | [legacy runtime functionality](docs/design/15-legacy-runtime-functionality.md) | Deleted runtime behavior to rebuild                                    |
 
+## Prerequisites
+
+Neutrino has a **hard dependency on the SP1 zkVM toolchain**. Before any
+`cargo build --locked` you must install `sp1up`, which provisions the
+`succinct` rustup toolchain and the `cargo-prove` CLI used to compile the
+runtime guest ELF.
+
+```text
+curl -fsSL https://sp1up.succinct.xyz | bash
+sp1up
+```
+
+Pinned SP1 version: `6.2.1`.
+
 ## Building
 
 ```text

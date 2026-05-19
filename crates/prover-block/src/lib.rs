@@ -48,6 +48,14 @@
 //!   argument replaces the balance check in a follow-up slice; the
 //!   record shape lands first so AIR-side wiring can settle against
 //!   a stable surface.
+//! - [`logup`] — field-arithmetic core of the logUp lookup argument.
+//!   Encodes records into a single extension-field element via
+//!   Horner expansion in β, computes the per-record running sum that
+//!   future permutation traces will commit to, and exposes
+//!   [`logup::is_balanced`] as the field-arithmetic mirror of
+//!   [`bus::BusBalance::is_balanced`]. Later M8-L slices wire this
+//!   computation into Plonky3's `PermutationAirBuilder` and the
+//!   multi-AIR commit / open pipeline.
 //!
 //! Later M8 slices (M8-I onwards) grow the crate one AIR at a time
 //! against this scaffold.
@@ -56,6 +64,7 @@ pub mod bus;
 pub mod config;
 pub mod cpu;
 pub mod fibonacci;
+pub mod logup;
 pub mod memory_consistency;
 pub mod program_rom;
 pub mod public_inputs;
@@ -71,6 +80,7 @@ pub use cpu::{
     cpu_trace_height, instruction_from_bytes, program_rom_send_records,
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
+pub use logup::{balance, encode_record, is_balanced, running_sum};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
     memory_access_send_records, memory_consistency_trace,

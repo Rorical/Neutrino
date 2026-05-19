@@ -388,6 +388,7 @@ use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
 
+use crate::bus::{BusChannel, BusRecord};
 use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
 
 /// Number of registers in the RV32I register file (`x0..x31`).
@@ -2307,6 +2308,52 @@ pub fn cpu_trace<F: PrimeField32>(pc_base: u32, program: &[CpuInstruction]) -> R
     }
 
     RowMajorMatrix::new(values, CPU_TRACE_WIDTH)
+}
+
+/// Bus records the CPU AIR sends for byte cells `b0..b3` on every
+/// real row.
+///
+/// Each real row produces exactly four [`BusChannel::U8Range`] send
+/// records, one per instruction byte. Padding rows produce none —
+/// their byte cells are pinned to zero by the AIR but represent no
+/// real fetch, so emitting a send would inflate the bus on the
+/// sender side.
+///
+/// The returned list pairs with
+/// [`crate::range_check::range_receive_records`] over the u8 table.
+/// Tests can feed both sides into a [`crate::bus::BusBalance`] to
+/// confirm every byte cell is range-checked; the future logUp
+/// argument will replace the balance check with a permutation
+/// argument that proves the same closure under FRI commitments.
+///
+/// # Panics
+///
+/// Panics if `trace.values.len()` is not a multiple of
+/// [`CPU_TRACE_WIDTH`].
+#[must_use]
+pub fn byte_range_send_records<F: PrimeField32 + Copy>(
+    trace: &RowMajorMatrix<F>,
+) -> Vec<BusRecord<F>> {
+    assert_eq!(
+        trace.values.len() % CPU_TRACE_WIDTH,
+        0,
+        "byte_range_send_records: trace length is not a multiple of CPU_TRACE_WIDTH",
+    );
+    let height = trace.values.len() / CPU_TRACE_WIDTH;
+    let mut records = Vec::new();
+    for row in 0..height {
+        let base = row * CPU_TRACE_WIDTH;
+        if trace.values[base + COL_IS_REAL] != F::ONE {
+            continue;
+        }
+        for col in [COL_B0, COL_B1, COL_B2, COL_B3] {
+            records.push(BusRecord::send(
+                BusChannel::U8Range,
+                vec![trace.values[base + col]],
+            ));
+        }
+    }
+    records
 }
 
 fn assert_babybear_native_u32(label: &str, value: u32) {
@@ -4958,5 +5005,120 @@ mod tests {
                 CpuInstruction::add(pc_base + 0x14, 3, 1, 2),
             ],
         );
+    }
+
+    // -------- M8-L groundwork: byte-range send records --------
+
+    #[test]
+    fn byte_range_records_emit_four_per_real_row() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20),
+                CpuInstruction::addi(pc_base + 4, 1, 0, 7),
+            ],
+        );
+        let records = byte_range_send_records::<Val>(&trace);
+        // Two real rows × four byte cells = eight send records.
+        assert_eq!(records.len(), 8);
+        for record in &records {
+            assert_eq!(record.channel, BusChannel::U8Range);
+            assert_eq!(record.multiplicity, 1);
+            assert_eq!(record.payload.len(), 1);
+        }
+    }
+
+    #[test]
+    fn byte_range_records_skip_padding_rows() {
+        let pc_base = 0x10000;
+        // Empty program: every row is padding, no real bytes to range
+        // check.
+        let trace = cpu_trace::<Val>(pc_base, &[]);
+        let records = byte_range_send_records::<Val>(&trace);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn byte_range_records_match_instruction_bytes() {
+        // `lui x5, SAFE_U_IMM20` encodes 0x1234_52B7 → bytes
+        // 0xB7, 0x52, 0x34, 0x12 in little-endian order.
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
+        let records = byte_range_send_records::<Val>(&trace);
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].payload, vec![Val::from_u64(0xB7)]);
+        assert_eq!(records[1].payload, vec![Val::from_u64(0x52)]);
+        assert_eq!(records[2].payload, vec![Val::from_u64(0x34)]);
+        assert_eq!(records[3].payload, vec![Val::from_u64(0x12)]);
+    }
+
+    #[test]
+    fn cpu_byte_range_balances_against_u8_table() {
+        use crate::bus::{BusBalance, range_send_multiplicities};
+        use crate::range_check::range_receive_records;
+
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20),
+                CpuInstruction::addi(pc_base + 4, 1, 0, 10),
+                CpuInstruction::add(pc_base + 8, 2, 0, 1),
+                CpuInstruction::fence(pc_base + 12),
+            ],
+        );
+        let sends = byte_range_send_records::<Val>(&trace);
+        // Four real rows × four byte cells per row.
+        assert_eq!(sends.len(), 16);
+
+        let multiplicities = range_send_multiplicities::<Val>(&sends, BusChannel::U8Range, 256);
+        // Total send count across the histogram equals the number of
+        // send records.
+        let total_sends: i64 = multiplicities.iter().sum();
+        assert_eq!(total_sends, 16);
+
+        let receives = range_receive_records::<Val>(BusChannel::U8Range, &multiplicities);
+        assert_eq!(receives.len(), 256);
+
+        let mut balance = BusBalance::<Val>::new();
+        balance.extend(&sends);
+        balance.extend(&receives);
+        assert!(
+            balance.is_balanced(),
+            "u8 byte-range bus must close: leftover = {:?}",
+            balance.unbalanced().collect::<Vec<_>>(),
+        );
+        // Every value [0, 256) is tracked even if its net multiplicity
+        // is zero.
+        assert_eq!(balance.unique_keys(), 256);
+    }
+
+    #[test]
+    fn cpu_byte_range_imbalance_is_detected() {
+        // Sanity check: dropping one send record breaks the balance.
+        use crate::bus::{BusBalance, range_send_multiplicities};
+        use crate::range_check::range_receive_records;
+
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20)]);
+        let mut sends = byte_range_send_records::<Val>(&trace);
+        let dropped = sends.pop().expect("at least one send record");
+
+        let multiplicities = range_send_multiplicities::<Val>(&sends, BusChannel::U8Range, 256);
+        let receives = range_receive_records::<Val>(BusChannel::U8Range, &multiplicities);
+
+        let mut balance = BusBalance::<Val>::new();
+        // The dropped record's slot count is therefore one short
+        // relative to what `receives` will refund.
+        balance.extend(&sends);
+        balance.extend(&receives);
+        // Re-introducing the dropped sender on top of an already
+        // balanced pairing must leave exactly one leftover.
+        balance.add(&dropped);
+        assert!(!balance.is_balanced());
+        let leftover: Vec<_> = balance.unbalanced().collect();
+        assert_eq!(leftover.len(), 1);
+        assert_eq!(leftover[0].2, 1);
     }
 }

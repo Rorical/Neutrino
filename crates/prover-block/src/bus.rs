@@ -308,6 +308,62 @@ impl<F: PrimeField32> BusBalance<F> {
     }
 }
 
+/// Aggregate per-value send multiplicities for a single-element
+/// range-table channel.
+///
+/// Records on `channel` whose payload value is `v` contribute their
+/// signed multiplicity to slot `v` of the returned histogram. Records
+/// on other channels are skipped. The returned slot count `len` must
+/// match the table width (256 for u8, 65536 for u16). Send records
+/// whose payload value falls outside `[0, len)` panic — the AIR side
+/// is supposed to range-check those cells before reaching this
+/// helper.
+///
+/// The output is intended for callers that build the matching
+/// [`range_check::range_receive_records`] vector and assert
+/// [`BusBalance::is_balanced`] for round-trip tests. The future logUp
+/// argument folds the same multiplicities into the table AIR's
+/// permutation trace.
+///
+/// [`range_check::range_receive_records`]: super::range_check::range_receive_records
+///
+/// # Panics
+///
+/// Panics if `channel` is not a single-element range channel (i.e.
+/// not [`BusChannel::U8Range`] or [`BusChannel::U16Range`]) or if a
+/// sender's payload value is outside `[0, len)`.
+#[must_use]
+pub fn range_send_multiplicities<F: PrimeField32>(
+    records: &[BusRecord<F>],
+    channel: BusChannel,
+    len: usize,
+) -> Vec<i64> {
+    assert!(
+        matches!(channel, BusChannel::U8Range | BusChannel::U16Range),
+        "range_send_multiplicities: {channel:?} is not a single-element range channel"
+    );
+    assert_eq!(
+        channel.payload_width(),
+        1,
+        "range_send_multiplicities: channel must have payload width 1"
+    );
+    let mut multiplicities = vec![0_i64; len];
+    for record in records {
+        if record.channel != channel {
+            continue;
+        }
+        let value_u32 = record.payload[0].as_canonical_u32();
+        let slot = usize::try_from(value_u32)
+            .expect("range_send_multiplicities: payload value exceeds usize");
+        assert!(
+            slot < len,
+            "range_send_multiplicities: payload value {slot} is outside the table range [0, {len})",
+        );
+        multiplicities[slot] = multiplicities[slot].saturating_add(record.multiplicity);
+    }
+    multiplicities
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +562,59 @@ mod tests {
         // Key still tracked so callers can verify "every byte cell
         // emitted a record" via unique_keys().
         assert_eq!(balance.unique_keys(), 1);
+    }
+
+    #[test]
+    fn range_send_multiplicities_aggregates_u8_sends() {
+        let sends = [
+            BusRecord::send(BusChannel::U8Range, vec![Val::from_u64(0)]),
+            BusRecord::send(BusChannel::U8Range, vec![Val::from_u64(0xFF)]),
+            BusRecord::send(BusChannel::U8Range, vec![Val::from_u64(0xFF)]),
+            BusRecord::send(BusChannel::U8Range, vec![Val::from_u64(0x42)]),
+        ];
+        let mult = range_send_multiplicities::<Val>(&sends, BusChannel::U8Range, 256);
+        assert_eq!(mult[0], 1);
+        assert_eq!(mult[0x42], 1);
+        assert_eq!(mult[0xFF], 2);
+        // Other slots are zero.
+        assert_eq!(mult.iter().filter(|&&m| m != 0).count(), 3);
+    }
+
+    #[test]
+    fn range_send_multiplicities_ignores_other_channels() {
+        let mixed = [
+            BusRecord::send(BusChannel::U8Range, vec![Val::from_u64(0x10)]),
+            BusRecord::send(BusChannel::U16Range, vec![Val::from_u64(0x10)]),
+            BusRecord::send(BusChannel::ProgramRom, vec![Val::ZERO, Val::ZERO]),
+        ];
+        let mult = range_send_multiplicities::<Val>(&mixed, BusChannel::U8Range, 256);
+        assert_eq!(mult[0x10], 1);
+        assert_eq!(mult.iter().filter(|&&m| m != 0).count(), 1);
+    }
+
+    #[test]
+    fn range_send_multiplicities_accepts_signed_contributions() {
+        let records = [
+            BusRecord::new(BusChannel::U8Range, 3, vec![Val::from_u64(0x07)]),
+            BusRecord::new(BusChannel::U8Range, -1, vec![Val::from_u64(0x07)]),
+        ];
+        let mult = range_send_multiplicities::<Val>(&records, BusChannel::U8Range, 256);
+        assert_eq!(mult[0x07], 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a single-element range channel")]
+    fn range_send_multiplicities_panics_on_memory_channel() {
+        let _ = range_send_multiplicities::<Val>(&[], BusChannel::MemoryAccess, 256);
+    }
+
+    #[test]
+    #[should_panic(expected = "payload value 256 is outside the table range [0, 256)")]
+    fn range_send_multiplicities_panics_when_payload_overflows_table() {
+        let sends = [BusRecord::send(
+            BusChannel::U8Range,
+            vec![Val::from_u64(256)],
+        )];
+        let _ = range_send_multiplicities::<Val>(&sends, BusChannel::U8Range, 256);
     }
 }

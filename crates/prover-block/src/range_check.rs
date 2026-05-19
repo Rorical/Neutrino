@@ -20,8 +20,10 @@
 //! cross-AIR composition.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
+
+use crate::bus::{BusChannel, BusRecord};
 
 /// Largest power-of-two table that is injective in BabyBear.
 ///
@@ -136,6 +138,54 @@ pub fn range_check_trace<F: PrimeCharacteristicRing + Copy + Send + Sync>(
     RowMajorMatrix::new(values, RANGE_CHECK_TRACE_WIDTH)
 }
 
+/// Bus receive records this range table contributes for a given send
+/// histogram.
+///
+/// For each value `v` in `[0, 2^log_size)` the AIR emits one receive
+/// record with payload `[v]` and multiplicity `-multiplicities[v]`.
+/// Combined with the matching senders (e.g.
+/// [`crate::bus::range_send_multiplicities`] applied to the CPU AIR's
+/// byte-cell sends), the bus closes when [`BusBalance::is_balanced`]
+/// returns `true`.
+///
+/// Only the single-element range channels [`BusChannel::U8Range`]
+/// (8-bit, `log_size = 8`) and [`BusChannel::U16Range`] (16-bit,
+/// `log_size = 16`) are valid receivers; the helper panics on any
+/// other channel.
+///
+/// [`BusBalance::is_balanced`]: crate::bus::BusBalance::is_balanced
+///
+/// # Panics
+///
+/// Panics if `channel` is not a range channel, if the channel's
+/// table width does not match `multiplicities.len()`, or if
+/// `multiplicities.len() - 1` cannot be expressed in the field.
+#[must_use]
+pub fn range_receive_records<F: PrimeField32>(
+    channel: BusChannel,
+    multiplicities: &[i64],
+) -> Vec<BusRecord<F>> {
+    let expected_len = match channel {
+        BusChannel::U8Range => 1_usize << 8,
+        BusChannel::U16Range => 1_usize << 16,
+        other => panic!("range_receive_records: {other:?} is not a range channel"),
+    };
+    assert_eq!(
+        multiplicities.len(),
+        expected_len,
+        "range_receive_records: expected {expected_len} multiplicities for {channel:?}, got {given}",
+        given = multiplicities.len(),
+    );
+    multiplicities
+        .iter()
+        .enumerate()
+        .map(|(value, &mult)| {
+            let value_u64 = u64::try_from(value).expect("table index fits in u64");
+            BusRecord::new(channel, -mult, vec![F::from_u64(value_u64)])
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +297,54 @@ mod tests {
             result.is_err(),
             "prover accepted a trace whose first row was not zero",
         );
+    }
+
+    #[test]
+    fn u8_receive_records_match_table_width_and_zero_total() {
+        let zeros = vec![0_i64; 256];
+        let records = range_receive_records::<Val>(BusChannel::U8Range, &zeros);
+        assert_eq!(records.len(), 256);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.channel, BusChannel::U8Range);
+            assert_eq!(record.multiplicity, 0);
+            assert_eq!(record.payload, vec![Val::from_u64(i as u64)]);
+        }
+    }
+
+    #[test]
+    fn u8_receive_records_negate_send_multiplicities() {
+        let mut multiplicities = vec![0_i64; 256];
+        multiplicities[0x10] = 3;
+        multiplicities[0xFF] = 1;
+        let records = range_receive_records::<Val>(BusChannel::U8Range, &multiplicities);
+        assert_eq!(records[0x10].multiplicity, -3);
+        assert_eq!(records[0xFF].multiplicity, -1);
+        assert_eq!(records[0x42].multiplicity, 0);
+    }
+
+    #[test]
+    fn u16_receive_records_match_table_width() {
+        let multiplicities = vec![0_i64; 1 << 16];
+        let records = range_receive_records::<Val>(BusChannel::U16Range, &multiplicities);
+        assert_eq!(records.len(), 1 << 16);
+        assert_eq!(records[0].payload, vec![Val::ZERO]);
+        assert_eq!(
+            records[(1 << 16) - 1].payload,
+            vec![Val::from_u64(u64::from(u16::MAX))],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a range channel")]
+    fn range_receive_records_rejects_memory_channel() {
+        let multiplicities = vec![0_i64; 256];
+        let _ = range_receive_records::<Val>(BusChannel::MemoryAccess, &multiplicities);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 256 multiplicities for U8Range")]
+    fn range_receive_records_panics_on_wrong_length() {
+        let multiplicities = vec![0_i64; 128];
+        let _ = range_receive_records::<Val>(BusChannel::U8Range, &multiplicities);
     }
 }

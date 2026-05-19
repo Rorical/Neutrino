@@ -61,12 +61,15 @@ pub mod program_rom;
 pub mod public_inputs;
 pub mod range_check;
 
-pub use bus::{BusBalance, BusChannel, BusRecord};
+pub use bus::{BusBalance, BusChannel, BusRecord, range_send_multiplicities};
 pub use config::{
     BABY_BEAR_MODULUS, Challenge, Challenger, Compress, Dft, Hash, POSEIDON2_SEED, Pcs, Perm,
     StarkCfg, Val, ValMmcs, build_poseidon2_hasher, build_poseidon2_perm, build_stark_config,
 };
-pub use cpu::{CPU_TRACE_WIDTH, CpuAir, CpuInstruction, NUM_REGS, cpu_trace, cpu_trace_height};
+pub use cpu::{
+    CPU_TRACE_WIDTH, CpuAir, CpuInstruction, NUM_REGS, byte_range_send_records, cpu_trace,
+    cpu_trace_height,
+};
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use memory_consistency::{
     MEM_CONSISTENCY_TRACE_WIDTH, MemoryAccess, MemoryConsistencyAir, MemoryOp,
@@ -79,4 +82,6 @@ pub use public_inputs::{
     BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,
     commit_block_public_inputs,
 };
-pub use range_check::{RANGE_CHECK_TRACE_WIDTH, RangeCheckAir, range_check_trace};
+pub use range_check::{
+    RANGE_CHECK_TRACE_WIDTH, RangeCheckAir, range_check_trace, range_receive_records,
+};

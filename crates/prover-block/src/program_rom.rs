@@ -58,11 +58,15 @@
 //! height is rounded up to the FRI-imposed [`MIN_TRACE_HEIGHT`] and
 //! then to the next power of two.
 
+use std::collections::HashMap;
+
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::{Field, PrimeCharacteristicRing};
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
 
+use crate::bus::{BusChannel, BusRecord};
 use crate::config::{BABY_BEAR_MODULUS, FRI_LOG_FINAL_POLY_LEN};
+use crate::cpu::instruction_from_bytes;
 
 /// Number of trace columns the program ROM AIR uses.
 pub const PROGRAM_ROM_TRACE_WIDTH: usize = 5;
@@ -219,6 +223,127 @@ pub fn program_rom_trace<F: Field>(pc_base: u32, instructions: &[u32]) -> RowMaj
     }
 
     RowMajorMatrix::new(values, PROGRAM_ROM_TRACE_WIDTH)
+}
+
+/// Bus records this ROM contributes for a given per-row send histogram.
+///
+/// For each row `r` of the ROM trace the AIR emits one
+/// [`BusChannel::ProgramRom`] receive carrying
+/// `(pc_r, instruction_r)` with multiplicity `-multiplicities[r]`.
+/// `instruction_r` is reconstructed from the row's byte cells via
+/// [`instruction_from_bytes`] so it matches the CPU AIR's
+/// [`crate::cpu::program_rom_send_records`] output exactly.
+///
+/// Combined with the matching senders, the bus closes when
+/// [`BusBalance::is_balanced`] returns `true`.
+///
+/// [`BusBalance::is_balanced`]: crate::bus::BusBalance::is_balanced
+///
+/// # Panics
+///
+/// Panics if `rom_trace.values.len()` is not a multiple of
+/// [`PROGRAM_ROM_TRACE_WIDTH`] or if `multiplicities.len()` does not
+/// match the trace height.
+#[must_use]
+pub fn program_rom_receive_records<F: PrimeField32 + Copy>(
+    rom_trace: &RowMajorMatrix<F>,
+    multiplicities: &[i64],
+) -> Vec<BusRecord<F>> {
+    assert_eq!(
+        rom_trace.values.len() % PROGRAM_ROM_TRACE_WIDTH,
+        0,
+        "program_rom_receive_records: trace length is not a multiple of PROGRAM_ROM_TRACE_WIDTH",
+    );
+    let height = rom_trace.values.len() / PROGRAM_ROM_TRACE_WIDTH;
+    assert_eq!(
+        multiplicities.len(),
+        height,
+        "program_rom_receive_records: expected {height} multiplicities, got {given}",
+        given = multiplicities.len(),
+    );
+    let mut records = Vec::with_capacity(height);
+    for (row, &mult) in multiplicities.iter().enumerate() {
+        let base = row * PROGRAM_ROM_TRACE_WIDTH;
+        let pc = rom_trace.values[base + COL_PC];
+        let insn = instruction_from_bytes(
+            rom_trace.values[base + COL_B0],
+            rom_trace.values[base + COL_B1],
+            rom_trace.values[base + COL_B2],
+            rom_trace.values[base + COL_B3],
+        );
+        records.push(BusRecord::new(
+            BusChannel::ProgramRom,
+            -mult,
+            vec![pc, insn],
+        ));
+    }
+    records
+}
+
+/// Aggregate program-ROM sends into a per-ROM-row histogram.
+///
+/// Builds an in-process index of every `(pc, instruction)` key the
+/// ROM trace contains, then walks the send record list and bins each
+/// matching send into its ROM row's slot. The returned `Vec<i64>` is
+/// the multiplicity vector
+/// [`program_rom_receive_records`] expects, so callers chain the two
+/// to feed a [`BusBalance`].
+///
+/// [`BusBalance`]: crate::bus::BusBalance
+///
+/// # Panics
+///
+/// Panics if `rom_trace.values.len()` is not a multiple of
+/// [`PROGRAM_ROM_TRACE_WIDTH`], or if any send carries a
+/// `(pc, instruction)` pair that is not in the ROM (the bus cannot
+/// close honestly in that case — the helper rejects the input rather
+/// than silently dropping the send).
+#[must_use]
+pub fn program_rom_send_multiplicities<F: PrimeField32 + Copy>(
+    sends: &[BusRecord<F>],
+    rom_trace: &RowMajorMatrix<F>,
+) -> Vec<i64> {
+    assert_eq!(
+        rom_trace.values.len() % PROGRAM_ROM_TRACE_WIDTH,
+        0,
+        "program_rom_send_multiplicities: trace length is not a multiple of PROGRAM_ROM_TRACE_WIDTH",
+    );
+    let height = rom_trace.values.len() / PROGRAM_ROM_TRACE_WIDTH;
+
+    // Each ROM row contributes a unique (pc, instruction) key because
+    // pc strictly increases by 4 across the trace and the AIR pins
+    // every PC below the BabyBear modulus. Padding rows have
+    // instruction = 0; their (pc, 0) key remains unique because pc
+    // still differs.
+    let mut index: HashMap<(u32, u32), usize> = HashMap::with_capacity(height);
+    for row in 0..height {
+        let base = row * PROGRAM_ROM_TRACE_WIDTH;
+        let pc_u32 = rom_trace.values[base + COL_PC].as_canonical_u32();
+        let insn_field = instruction_from_bytes(
+            rom_trace.values[base + COL_B0],
+            rom_trace.values[base + COL_B1],
+            rom_trace.values[base + COL_B2],
+            rom_trace.values[base + COL_B3],
+        );
+        let insn_u32 = insn_field.as_canonical_u32();
+        index.insert((pc_u32, insn_u32), row);
+    }
+
+    let mut multiplicities = vec![0_i64; height];
+    for send in sends {
+        if send.channel != BusChannel::ProgramRom {
+            continue;
+        }
+        let pc_u32 = send.payload[0].as_canonical_u32();
+        let insn_u32 = send.payload[1].as_canonical_u32();
+        let row = index.get(&(pc_u32, insn_u32)).copied().unwrap_or_else(|| {
+            panic!(
+                "program_rom_send_multiplicities: send (pc={pc_u32:#010x}, insn={insn_u32:#010x}) is not in the ROM trace"
+            )
+        });
+        multiplicities[row] = multiplicities[row].saturating_add(send.multiplicity);
+    }
+    multiplicities
 }
 
 fn validate_pc_range(pc_base: u32, trace_height: usize) -> u64 {
@@ -469,5 +594,117 @@ mod tests {
         let row2_pc_idx = 2 * PROGRAM_ROM_TRACE_WIDTH + COL_PC;
         trace.values[row2_pc_idx] = Val::from_u64(u64::from(pc_base));
         assert_prover_rejects(pc_base, trace);
+    }
+
+    // -------- M8-L groundwork: ProgramRom bus emitters --------
+
+    #[test]
+    fn receive_records_match_table_height_and_zero_total() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP, NOP]);
+        let height = trace.values.len() / PROGRAM_ROM_TRACE_WIDTH;
+        let zeros = vec![0_i64; height];
+        let records = program_rom_receive_records::<Val>(&trace, &zeros);
+        assert_eq!(records.len(), height);
+        for (row, record) in records.iter().enumerate() {
+            assert_eq!(record.channel, BusChannel::ProgramRom);
+            assert_eq!(record.multiplicity, 0);
+            assert_eq!(record.payload.len(), 2);
+            let expected_pc = u64::from(pc_base) + 4 * row as u64;
+            assert_eq!(record.payload[0], Val::from_u64(expected_pc));
+            let expected_insn = if row < 2 { NOP } else { 0 };
+            assert_eq!(record.payload[1], Val::from_u64(u64::from(expected_insn)));
+        }
+    }
+
+    #[test]
+    fn receive_records_negate_supplied_multiplicities() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP]);
+        let height = trace.values.len() / PROGRAM_ROM_TRACE_WIDTH;
+        let mut multiplicities = vec![0_i64; height];
+        multiplicities[0] = 5;
+        let records = program_rom_receive_records::<Val>(&trace, &multiplicities);
+        assert_eq!(records[0].multiplicity, -5);
+        for record in &records[1..] {
+            assert_eq!(record.multiplicity, 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 8 multiplicities, got 4")]
+    fn receive_records_panics_on_wrong_multiplicity_length() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP]);
+        let _ = program_rom_receive_records::<Val>(&trace, &[0; 4]);
+    }
+
+    #[test]
+    fn send_multiplicities_bins_into_rom_rows() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP, NOP, NOP]);
+        let height = trace.values.len() / PROGRAM_ROM_TRACE_WIDTH;
+        // Synthesize sends that hit row 0 twice and row 2 once.
+        let row0_pc = Val::from_u64(u64::from(pc_base));
+        let row2_pc = Val::from_u64(u64::from(pc_base) + 8);
+        let insn = Val::from_u64(u64::from(NOP));
+        let sends = [
+            BusRecord::send(BusChannel::ProgramRom, vec![row0_pc, insn]),
+            BusRecord::send(BusChannel::ProgramRom, vec![row0_pc, insn]),
+            BusRecord::send(BusChannel::ProgramRom, vec![row2_pc, insn]),
+        ];
+        let mult = program_rom_send_multiplicities::<Val>(&sends, &trace);
+        assert_eq!(mult.len(), height);
+        assert_eq!(mult[0], 2);
+        assert_eq!(mult[1], 0);
+        assert_eq!(mult[2], 1);
+        assert_eq!(mult[3..].iter().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn send_multiplicities_ignores_other_channels() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP]);
+        let sends = [
+            BusRecord::send(BusChannel::U8Range, vec![Val::from_u64(0x42)]),
+            BusRecord::send(
+                BusChannel::ProgramRom,
+                vec![
+                    Val::from_u64(u64::from(pc_base)),
+                    Val::from_u64(u64::from(NOP)),
+                ],
+            ),
+        ];
+        let mult = program_rom_send_multiplicities::<Val>(&sends, &trace);
+        assert_eq!(mult[0], 1);
+        assert_eq!(mult[1..].iter().sum::<i64>(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not in the ROM trace")]
+    fn send_multiplicities_panics_on_unknown_pc() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP]);
+        let sends = [BusRecord::send(
+            BusChannel::ProgramRom,
+            vec![Val::from_u64(0x20000), Val::from_u64(u64::from(NOP))],
+        )];
+        let _ = program_rom_send_multiplicities::<Val>(&sends, &trace);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not in the ROM trace")]
+    fn send_multiplicities_panics_on_mismatched_instruction() {
+        let pc_base = 0x10000;
+        let trace = program_rom_trace::<Val>(pc_base, &[NOP]);
+        // Same pc as row 0, but a different instruction word.
+        let sends = [BusRecord::send(
+            BusChannel::ProgramRom,
+            vec![
+                Val::from_u64(u64::from(pc_base)),
+                Val::from_u64(0xDEAD_BEEF),
+            ],
+        )];
+        let _ = program_rom_send_multiplicities::<Val>(&sends, &trace);
     }
 }

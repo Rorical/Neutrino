@@ -68,7 +68,7 @@ pub use config::{
 };
 pub use cpu::{
     CPU_TRACE_WIDTH, CpuAir, CpuInstruction, NUM_REGS, byte_range_send_records, cpu_trace,
-    cpu_trace_height,
+    cpu_trace_height, instruction_from_bytes, program_rom_send_records,
 };
 pub use fibonacci::{FIB_NUM_PUBLIC_VALUES, FIB_TRACE_WIDTH, FibonacciAir, fibonacci_trace};
 pub use memory_consistency::{
@@ -76,7 +76,8 @@ pub use memory_consistency::{
     memory_consistency_trace,
 };
 pub use program_rom::{
-    PROGRAM_ROM_TRACE_WIDTH, ProgramRomAir, program_rom_trace, program_rom_trace_height,
+    PROGRAM_ROM_TRACE_WIDTH, ProgramRomAir, program_rom_receive_records,
+    program_rom_send_multiplicities, program_rom_trace, program_rom_trace_height,
 };
 pub use public_inputs::{
     BLOCK_PUBLIC_INPUTS_DOMAIN, PUBLIC_INPUTS_DIGEST_LEN, PublicInputsDigest,

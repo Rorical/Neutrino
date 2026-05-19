@@ -2356,6 +2356,70 @@ pub fn byte_range_send_records<F: PrimeField32 + Copy>(
     records
 }
 
+/// Reconstruct a 32-bit instruction word from its four little-endian
+/// byte cells.
+///
+/// Returns `b0 + 256·b1 + 65 536·b2 + 16 777 216·b3` evaluated in `F`.
+/// The result is the same field element a row's instruction word
+/// produces under [`PrimeField32::from_u64`] when the byte cells lie
+/// in `[0, 256)` — but the computation deliberately stays in field
+/// arithmetic so the future logUp argument can verify it directly.
+///
+/// Both [`crate::cpu::program_rom_send_records`] and
+/// [`crate::program_rom::program_rom_receive_records`] use this
+/// helper so the bus closes exactly when the byte cells on the two
+/// AIRs match.
+#[must_use]
+pub fn instruction_from_bytes<F: PrimeField32 + Copy>(b0: F, b1: F, b2: F, b3: F) -> F {
+    b0 + b1 * F::from_u64(256) + b2 * F::from_u64(1 << 16) + b3 * F::from_u64(1 << 24)
+}
+
+/// Bus records the CPU AIR sends on the [`BusChannel::ProgramRom`]
+/// channel, one `(pc, instruction)` send per real row.
+///
+/// `instruction` is the field-arithmetic recomposition of the row's
+/// `b0..b3` byte cells via [`instruction_from_bytes`]. Padding rows
+/// produce no records — their PC is pinned but they represent no
+/// real fetch on the bus.
+///
+/// Pairs with [`crate::program_rom::program_rom_receive_records`].
+/// Combined with the byte-range bus from
+/// [`byte_range_send_records`], a closed lookup proves both that the
+/// CPU fetched the right instruction word at each PC and that every
+/// instruction byte lies in `[0, 256)`.
+///
+/// # Panics
+///
+/// Panics if `trace.values.len()` is not a multiple of
+/// [`CPU_TRACE_WIDTH`].
+#[must_use]
+pub fn program_rom_send_records<F: PrimeField32 + Copy>(
+    trace: &RowMajorMatrix<F>,
+) -> Vec<BusRecord<F>> {
+    assert_eq!(
+        trace.values.len() % CPU_TRACE_WIDTH,
+        0,
+        "program_rom_send_records: trace length is not a multiple of CPU_TRACE_WIDTH",
+    );
+    let height = trace.values.len() / CPU_TRACE_WIDTH;
+    let mut records = Vec::new();
+    for row in 0..height {
+        let base = row * CPU_TRACE_WIDTH;
+        if trace.values[base + COL_IS_REAL] != F::ONE {
+            continue;
+        }
+        let pc = trace.values[base + COL_PC];
+        let insn = instruction_from_bytes(
+            trace.values[base + COL_B0],
+            trace.values[base + COL_B1],
+            trace.values[base + COL_B2],
+            trace.values[base + COL_B3],
+        );
+        records.push(BusRecord::send(BusChannel::ProgramRom, vec![pc, insn]));
+    }
+    records
+}
+
 fn assert_babybear_native_u32(label: &str, value: u32) {
     assert_babybear_native_u64(label, u64::from(value));
 }
@@ -5120,5 +5184,166 @@ mod tests {
         let leftover: Vec<_> = balance.unbalanced().collect();
         assert_eq!(leftover.len(), 1);
         assert_eq!(leftover[0].2, 1);
+    }
+
+    // -------- M8-L groundwork: ProgramRom send records --------
+
+    #[test]
+    fn instruction_from_bytes_recomposes_le_word() {
+        // insn = 0x1234_5678 → bytes [0x78, 0x56, 0x34, 0x12].
+        let result = instruction_from_bytes::<Val>(
+            Val::from_u64(0x78),
+            Val::from_u64(0x56),
+            Val::from_u64(0x34),
+            Val::from_u64(0x12),
+        );
+        assert_eq!(result, Val::from_u64(0x1234_5678));
+    }
+
+    #[test]
+    fn program_rom_records_emit_one_per_real_row() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(
+            pc_base,
+            &[
+                CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20),
+                CpuInstruction::addi(pc_base + 4, 1, 0, 7),
+                CpuInstruction::add(pc_base + 8, 2, 0, 1),
+            ],
+        );
+        let records = program_rom_send_records::<Val>(&trace);
+        assert_eq!(records.len(), 3);
+        for record in &records {
+            assert_eq!(record.channel, BusChannel::ProgramRom);
+            assert_eq!(record.multiplicity, 1);
+            assert_eq!(record.payload.len(), 2);
+        }
+        // First record covers the LUI row.
+        assert_eq!(records[0].payload[0], Val::from_u64(u64::from(pc_base)));
+        // insn = (SAFE_U_IMM20 << 12) | (5 << 7) | LUI_OPCODE = 0x1234_52B7.
+        assert_eq!(records[0].payload[1], Val::from_u64(0x1234_52B7));
+    }
+
+    #[test]
+    fn program_rom_records_skip_padding_rows() {
+        let pc_base = 0x10000;
+        let trace = cpu_trace::<Val>(pc_base, &[]);
+        let records = program_rom_send_records::<Val>(&trace);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn cpu_program_rom_balances_against_rom_table() {
+        use crate::bus::BusBalance;
+        use crate::program_rom::{
+            program_rom_receive_records, program_rom_send_multiplicities, program_rom_trace,
+        };
+
+        let pc_base = 0x10000;
+        let cpu_insns = [
+            CpuInstruction::lui(pc_base, 5, SAFE_U_IMM20),
+            CpuInstruction::addi(pc_base + 4, 1, 0, 7),
+            CpuInstruction::add(pc_base + 8, 2, 0, 1),
+            CpuInstruction::fence(pc_base + 12),
+        ];
+        let cpu_t = cpu_trace::<Val>(pc_base, &cpu_insns);
+        let rom_words: Vec<u32> = cpu_insns.iter().map(|insn| insn.insn).collect();
+        let rom_t = program_rom_trace::<Val>(pc_base, &rom_words);
+
+        let sends = program_rom_send_records::<Val>(&cpu_t);
+        assert_eq!(sends.len(), 4);
+
+        let multiplicities = program_rom_send_multiplicities::<Val>(&sends, &rom_t);
+        // Total send count equals the number of real CPU rows.
+        let total_sends: i64 = multiplicities.iter().sum();
+        assert_eq!(total_sends, 4);
+        // First four rows of the ROM each see exactly one send;
+        // padding rows see none.
+        for (row, &mult) in multiplicities.iter().take(4).enumerate() {
+            assert_eq!(mult, 1, "row {row}");
+        }
+        for (row, &mult) in multiplicities.iter().enumerate().skip(4) {
+            assert_eq!(mult, 0, "padding row {row}");
+        }
+
+        let receives = program_rom_receive_records::<Val>(&rom_t, &multiplicities);
+
+        let mut balance = BusBalance::<Val>::new();
+        balance.extend(&sends);
+        balance.extend(&receives);
+        assert!(
+            balance.is_balanced(),
+            "ProgramRom bus must close: leftover = {:?}",
+            balance.unbalanced().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn cpu_program_rom_loop_balances_via_repeated_sends() {
+        // A tight two-instruction loop: `addi x1, x1, 1` followed by
+        // an unconditional backward `beq x0, x0, -4`. Each ROM row is
+        // hit twice over two iterations; the bus balances iff the
+        // receive multiplicities match the per-row send counts.
+        use crate::bus::BusBalance;
+        use crate::program_rom::{
+            program_rom_receive_records, program_rom_send_multiplicities, program_rom_trace,
+        };
+
+        let pc_base = 0x10000;
+        let body = CpuInstruction::addi(pc_base, 1, 1, 1);
+        let back_branch = CpuInstruction::beq_taken(pc_base + 4, 0, 0, -4);
+        let cpu_t = cpu_trace::<Val>(pc_base, &[body, back_branch, body, back_branch]);
+        let rom_t = program_rom_trace::<Val>(pc_base, &[body.insn, back_branch.insn]);
+
+        let sends = program_rom_send_records::<Val>(&cpu_t);
+        assert_eq!(sends.len(), 4);
+
+        let multiplicities = program_rom_send_multiplicities::<Val>(&sends, &rom_t);
+        assert_eq!(multiplicities[0], 2, "body row visited twice");
+        assert_eq!(multiplicities[1], 2, "back-branch row visited twice");
+        assert_eq!(multiplicities[2..].iter().sum::<i64>(), 0);
+
+        let receives = program_rom_receive_records::<Val>(&rom_t, &multiplicities);
+        let mut balance = BusBalance::<Val>::new();
+        balance.extend(&sends);
+        balance.extend(&receives);
+        assert!(balance.is_balanced());
+    }
+
+    #[test]
+    fn cpu_program_rom_imbalance_surfaces_on_dropped_send() {
+        use crate::bus::BusBalance;
+        use crate::program_rom::{
+            program_rom_receive_records, program_rom_send_multiplicities, program_rom_trace,
+        };
+
+        let pc_base = 0x10000;
+        let cpu_insns = [
+            CpuInstruction::addi(pc_base, 1, 0, 5),
+            CpuInstruction::addi(pc_base + 4, 2, 0, 7),
+        ];
+        let cpu_t = cpu_trace::<Val>(pc_base, &cpu_insns);
+        let rom_words: Vec<u32> = cpu_insns.iter().map(|insn| insn.insn).collect();
+        let rom_t = program_rom_trace::<Val>(pc_base, &rom_words);
+
+        let mut sends = program_rom_send_records::<Val>(&cpu_t);
+        let dropped = sends.pop().expect("at least one send record");
+
+        let multiplicities = program_rom_send_multiplicities::<Val>(&sends, &rom_t);
+        let receives = program_rom_receive_records::<Val>(&rom_t, &multiplicities);
+
+        let mut balance = BusBalance::<Val>::new();
+        balance.extend(&sends);
+        balance.extend(&receives);
+        // Re-introducing the dropped send must leave exactly one
+        // leftover at row 1 of the ROM.
+        balance.add(&dropped);
+        assert!(!balance.is_balanced());
+        let leftover: Vec<_> = balance.unbalanced().collect();
+        assert_eq!(leftover.len(), 1);
+        assert_eq!(leftover[0].2, 1);
+        // The leftover payload should be (pc_base + 4, dropped insn).
+        assert_eq!(leftover[0].1[0], pc_base + 4);
+        assert_eq!(leftover[0].1[1], cpu_insns[1].insn);
     }
 }

@@ -394,6 +394,10 @@ Exit criteria (status):
 
 ## M6-new - Networking with SP1 block proof gossip
 
+Status: data plane landed and tested end-to-end with real SP1 proof
+envelopes. `SyncDriver`-on-real-`ChainBackend` libp2p coverage is
+explicitly deferred to a follow-on.
+
 Goal: restore multi-node gossip and sync around per-block proofs.
 
 Keep:
@@ -410,12 +414,89 @@ Change:
    until TODO designs are accepted.
 3. proof retrieval endpoints serve per-block SP1 proofs only.
 
-Exit criteria:
+Landed (M3-new + M5-new + M6-new combined):
 
-1. Three local nodes agree on a chain with SP1 block proofs.
-2. A syncing node catches up by fetching headers, bodies, state, and block
-   proofs.
-3. Invalid proof gossip does not poison fork choice.
+1. Producer publishes `Topic::BlockProofs` carrying borsh-encoded
+   `BlockProof { height, block_hash, public_inputs, proof_bytes }`,
+   where `proof_bytes` is the borsh-encoded `Sp1BlockProof`
+   (bincode of `SP1ProofWithPublicValues`).
+2. `SyncDriver::handle_block_proof_gossip` (in `crates/sync/`)
+   decodes the envelope and routes it through
+   `ChainBackend::verify_and_import_block_proofs`, the same backend
+   method the sync FSM's `ProofBackfill` state uses for batch
+   backfill. Both gossip and backfill exercise the same
+   `Engine::import_block_proof` path with the same
+   `Sp1ProofSystem::verify_block` check.
+3. `chunk_proofs` / `checkpoints` topics are explicitly ignored at
+   the driver layer (`MessageAcceptance::Ignore`); the legacy
+   handlers were removed in M3-new.
+4. `block_proofs_by_hash` and `block_proofs_by_height` RPC handlers
+   serve persisted SP1 proofs to syncing peers; `blocks_by_range`
+   and `blocks_by_root` serve headers + bodies.
+
+Coverage (`crates/node/tests/`):
+
+- `three_node_sp1_gossip.rs` — three libp2p nodes, all running real
+  `Sp1ProofSystem<MockProver>` + `WasmExecutor`. Producer drives the
+  production path (`try_produce_block` → `prove_block`) and gossips
+  block + proof. Followers ingest via `verify_and_import_gossip_block`
+  and `verify_and_import_block_proofs`. All three converge on the
+  same head hash and `proven_height = 1`. Buffers proofs that race
+  their blocks so delivery-order is deterministic-tolerant.
+- `block_proof_gossip_rejection.rs` — single node, three adversarial
+  inputs: tampered envelope (`height`), tampered public inputs
+  (`state_root_after`), tampered `proof_bytes`. Each is rejected
+  with `SyncBackendError::Rejected`, the block FSM stays at
+  `BlockProduced`, and `proven_height` does not advance. The
+  subsequent legitimate proof is accepted and advances FSM and
+  proven height as if no rejections had occurred.
+- `snap_sync_via_rpc.rs` — producer builds a 3-block chain through
+  the production path; follower boots empty, fetches headers via
+  `blocks_by_range` and proofs via `block_proofs_by_height`,
+  imports both via the matching `verify_and_import_*` paths.
+  Asserts both nodes converge on `head_height = 3`,
+  `proven_height = 3`, and identical head hash.
+
+Deferred to follow-on milestones:
+
+1. End-to-end test wiring the real `SyncDriver` against a real
+   `ChainBackend` over libp2p. The data plane is covered by the
+   three tests above; the missing piece is the FSM state machine
+   walking `CheckpointBackfill → HeaderBackfill → StateFetch →
+   ProofBackfill → Following` against live peers. Adding this
+   requires a new test harness — every existing multi-node test
+   hand-rolls its own gossip driver instead of using `SyncDriver`.
+2. `producer.rs::attempt_slot` runs `prove_block` synchronously
+   inside the slot loop. Under a real `CpuProver` this blocks the
+   tokio runtime for seconds; under a slot duration measured in
+   single-digit seconds this misses the next production slot. The
+   M6-new tests use `MockProver` (sub-millisecond) so they don't
+   hit this; M7-new or earlier should move `prove_block` into
+   `tokio::task::spawn_blocking`.
+3. Buffering proofs that race their blocks. Today the
+   `SyncDriver`'s gossip handler drops a `ChainBehind` proof and
+   relies on a later `ProofBackfill` round to refetch it. The
+   M6-new test buffers manually; production gossip recovery is
+   correct but adds latency.
+
+Exit criteria (status):
+
+1. Three local nodes agree on a chain with SP1 block proofs —
+   **met** by `three_node_sp1_gossip.rs`. Producer drives the real
+   `try_produce_block` + `prove_block` path and both followers
+   converge through gossip ingest.
+2. A syncing node catches up by fetching headers, bodies, state,
+   and block proofs — **data plane met** by `snap_sync_via_rpc.rs`
+   (the RPC handlers serve real SP1 artifacts, the follower
+   imports them through `verify_and_import_headers` /
+   `verify_and_import_block_proofs`, the two nodes converge).
+   The `SyncDriver` FSM still walks all transitions in the
+   synthetic-backend tests (`crates/sync/tests/driver_loop.rs`)
+   but end-to-end on a real `ChainBackend` is deferred.
+3. Invalid proof gossip does not poison fork choice — **met** by
+   `block_proof_gossip_rejection.rs`. Three adversarial input
+   classes are rejected without advancing the block FSM or the
+   proven height; a subsequent legitimate proof recovers cleanly.
 
 ## M7-new - Multi-validator finality with SP1 block proofs
 

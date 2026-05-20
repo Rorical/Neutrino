@@ -3921,6 +3921,7 @@ dependencies = [
  "borsh",
  "neutrino-consensus-types",
  "neutrino-primitives",
+ "neutrino-runtime-abi",
  "neutrino-trie",
 ]
 

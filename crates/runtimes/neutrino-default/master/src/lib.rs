@@ -167,18 +167,52 @@ mod wasm_abi {
         ((ptr as u64) << 32) | (len as u64)
     }
 
-    /// Placeholder transaction-admission entrypoint exposed only by
-    /// the master (not the SP1 Guest). Real logic arrives in M4-new.
+    /// Placeholder transaction-admission entrypoint. Exposed under
+    /// the ABI-defined symbol `_neutrino_validate_tx`. The body still
+    /// returns `0` (Valid) for every transaction; admission rules
+    /// will land alongside future runtime work and replace this with
+    /// a real fixed-width `TxValidity` result.
     #[unsafe(no_mangle)]
-    const extern "C" fn validate_tx(_tx_ptr: u32, _tx_len: u32) -> u32 {
+    const extern "C" fn _neutrino_validate_tx(_tx_ptr: u32, _tx_len: u32) -> u32 {
         0
     }
 
-    /// Placeholder read-only query entrypoint exposed only by the
-    /// master (not the SP1 Guest). Real logic arrives in M4-new.
+    /// Read-only query entrypoint. Exposed under the ABI-defined
+    /// symbol [`neutrino_runtime_abi::QUERY_ENTRYPOINT`].
+    ///
+    /// The host writes a borsh-encoded
+    /// [`neutrino_runtime_abi::QueryRequest`] into linear memory at
+    /// `req_ptr..req_ptr+req_len`, then calls this function. The
+    /// returned `u64` is packed: high 32 bits = output pointer, low
+    /// 32 bits = output length. The payload at the output pointer
+    /// is a borsh-encoded [`neutrino_runtime_abi::QueryResponse`].
+    ///
+    /// State writes attempted by the runtime are intercepted by the
+    /// host (`state_write` and `state_delete` no-op in query mode and
+    /// the host overrides the response with
+    /// [`neutrino_runtime_abi::QueryStatus::PermissionDenied`]); this
+    /// entrypoint trusts the host to enforce that invariant and does
+    /// not gate writes itself.
     #[unsafe(no_mangle)]
-    const extern "C" fn query(_req_ptr: u32, _req_len: u32) -> u32 {
-        0
+    extern "C" fn _neutrino_query(req_ptr: u32, req_len: u32) -> u64 {
+        use neutrino_default_runtime_core::query as core_query;
+        use neutrino_runtime_abi::{QueryRequest, QueryResponse, QueryStatus};
+
+        let req_bytes =
+            unsafe { core::slice::from_raw_parts(req_ptr as *const u8, req_len as usize) };
+        let response = borsh::from_slice::<QueryRequest>(req_bytes).map_or_else(
+            |_| QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]),
+            |req| {
+                let mut backend = WasmHostBackend;
+                core_query(&req, &mut backend)
+            },
+        );
+
+        let bytes = borsh::to_vec(&response).expect("encode QueryResponse");
+        let ptr = bytes.as_ptr() as u32;
+        let len = bytes.len() as u32;
+        mem::forget(bytes);
+        ((ptr as u64) << 32) | (len as u64)
     }
 
     // -----------------------------------------------------------------

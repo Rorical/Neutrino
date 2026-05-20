@@ -18,6 +18,7 @@ use core::fmt;
 
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{Hash, StateRoot};
+use neutrino_runtime_abi::{QueryRequest, QueryResponse};
 use neutrino_trie::{Blake3Hasher, Trie};
 
 /// Outcome of a successful [`BlockExecutor::execute_block`] call.
@@ -69,6 +70,28 @@ pub trait BlockExecutor {
         body: &Body,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error>;
+
+    /// Run a read-only [`QueryRequest`] against `state`.
+    ///
+    /// Implementations MUST NOT mutate `state`; queries that
+    /// attempt writes are rejected by the runtime host with
+    /// [`neutrino_runtime_abi::QueryStatus::PermissionDenied`].
+    /// The returned [`QueryResponse`] carries the runtime-defined
+    /// status code and payload (status `0` = success per
+    /// [`neutrino_runtime_abi::QueryStatus::Ok`]).
+    ///
+    /// # Errors
+    /// Returns [`Self::Error`] if the runtime fails to load, the
+    /// query traps inside the runtime, or codec failure prevents the
+    /// host from decoding the response. Runtime-defined query
+    /// failures (unknown method, malformed args, etc.) are surfaced
+    /// as non-zero [`QueryResponse::code`] values, not as
+    /// `Self::Error`.
+    fn query(
+        &self,
+        request: &QueryRequest,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<QueryResponse, Self::Error>;
 }
 
 /// Dyn-friendly companion to [`BlockExecutor`].
@@ -93,6 +116,17 @@ pub trait ErasedBlockExecutor: Send + Sync {
         body: &Body,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String>;
+
+    /// Type-erased counterpart to [`BlockExecutor::query`].
+    ///
+    /// # Errors
+    /// Surfaces the underlying executor's error rendered as a
+    /// human-readable string.
+    fn query(
+        &self,
+        request: &QueryRequest,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<QueryResponse, String>;
 }
 
 impl<X> ErasedBlockExecutor for X
@@ -106,6 +140,14 @@ where
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String> {
         BlockExecutor::execute_block(self, chain_id, body, state).map_err(|err| err.to_string())
+    }
+
+    fn query(
+        &self,
+        request: &QueryRequest,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<QueryResponse, String> {
+        BlockExecutor::query(self, request, state).map_err(|err| err.to_string())
     }
 }
 
@@ -126,6 +168,14 @@ impl BlockExecutor for UnsupportedExecutor {
         _body: &Body,
         _state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error> {
+        Err(String::from("block executor not configured"))
+    }
+
+    fn query(
+        &self,
+        _request: &QueryRequest,
+        _state: &Trie<Blake3Hasher>,
+    ) -> Result<QueryResponse, Self::Error> {
         Err(String::from("block executor not configured"))
     }
 }

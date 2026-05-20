@@ -16,6 +16,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::Body;
 use neutrino_default_runtime_core::{StfInput, Transaction};
 use neutrino_proof_system::executor::{BlockExecutor, ExecutionOutcome};
+use neutrino_runtime_abi::{QueryRequest, QueryResponse};
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Blake3Hasher, Trie};
 use thiserror::Error;
@@ -132,6 +133,19 @@ impl BlockExecutor for WasmExecutor {
             gas_used: 0, // M5 has no gas accounting yet.
             witness_bytes,
         })
+    }
+
+    fn query(
+        &self,
+        request: &QueryRequest,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<QueryResponse, ExecutorError> {
+        // Snapshot the trie into a read-only LiveTrie view. The
+        // WasmRuntime's query path clones the scratch trie internally
+        // and discards it after the call so no mutation can leak
+        // back into `state`.
+        let live = LiveTrie::from_trie(state.clone());
+        Ok(self.wasm.query(request, &live)?)
     }
 }
 

@@ -615,6 +615,118 @@ fn apply_leak<B: StateBackend>(state: &mut B, tx: &LeakTx) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Read-only queries
+// ---------------------------------------------------------------------------
+
+/// Query method: return the [`Account`] at the supplied address, or
+/// `None` if absent.
+///
+/// Args wire format: the raw 32-byte address (`borsh([u8; 32])`,
+/// which is identical to the literal 32 bytes).
+/// Payload wire format: `borsh(Option<Account>)`.
+pub const QUERY_METHOD_ACCOUNT_GET: &str = "account_get";
+
+/// Query method: return the runtime-side [`Validator`] record at the
+/// supplied address, or `None` if the validator does not exist.
+///
+/// Args wire format: the raw 32-byte address.
+/// Payload wire format: `borsh(Option<Validator>)`.
+///
+/// Note: this returns the *runtime* [`Validator`] (stake + active
+/// flag), not the consensus-side
+/// `neutrino_primitives::Validator` (which carries the BLS pubkey
+/// and consensus metadata). The consensus-side view is served by
+/// the RPC `active_validator_set` method.
+pub const QUERY_METHOD_VALIDATOR_GET: &str = "validator_get";
+
+/// Query method: return the canonical [`ValidatorSet`] snapshot,
+/// sorted by address ascending.
+///
+/// Args wire format: empty (no payload expected).
+/// Payload wire format: `borsh(ValidatorSet)`.
+pub const QUERY_METHOD_VALIDATOR_SET: &str = "validator_set";
+
+/// Query method: return the runtime version advertised by this
+/// runtime ELF.
+///
+/// Args wire format: empty.
+/// Payload wire format:
+/// `borsh(neutrino_primitives::RuntimeVersion)`.
+pub const QUERY_METHOD_RUNTIME_VERSION: &str = "runtime_version";
+
+/// Dispatch a [`neutrino_runtime_abi::QueryRequest`] against `state`.
+///
+/// Returns a [`neutrino_runtime_abi::QueryResponse`] carrying the
+/// runtime-defined result. Implementations MUST be read-only: this
+/// function never writes to `state` (`StateBackend::read` is the
+/// only access used). The host additionally enforces the read-only
+/// invariant by rejecting any `state_write` / `state_delete` call
+/// from the WASM guest with `QueryStatus::PermissionDenied`.
+///
+/// Unknown methods return [`neutrino_runtime_abi::QueryStatus::UnknownMethod`]
+/// with the offending method name as the payload bytes.
+pub fn query<B: neutrino_runtime_core::StateBackend>(
+    request: &neutrino_runtime_abi::QueryRequest,
+    state: &mut B,
+) -> neutrino_runtime_abi::QueryResponse {
+    use neutrino_runtime_abi::{QueryResponse, QueryStatus};
+
+    match request.method.as_str() {
+        QUERY_METHOD_ACCOUNT_GET => query_account_get(&request.args, state),
+        QUERY_METHOD_VALIDATOR_GET => query_validator_get(&request.args, state),
+        QUERY_METHOD_VALIDATOR_SET => query_validator_set(state),
+        QUERY_METHOD_RUNTIME_VERSION => query_runtime_version(),
+        unknown => QueryResponse::err(QueryStatus::UnknownMethod, unknown.as_bytes().to_vec()),
+    }
+}
+
+fn query_account_get<B: neutrino_runtime_core::StateBackend>(
+    args: &[u8],
+    state: &mut B,
+) -> neutrino_runtime_abi::QueryResponse {
+    use neutrino_runtime_abi::{QueryResponse, QueryStatus};
+
+    let Ok(addr) = <Address as BorshDeserialize>::try_from_slice(args) else {
+        return QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]);
+    };
+    let account = state
+        .read(&account_key(&addr))
+        .and_then(|bytes| decode_account(&bytes));
+    let payload = borsh::to_vec(&account).expect("borsh encode Option<Account> never fails");
+    QueryResponse::ok(payload)
+}
+
+fn query_validator_get<B: neutrino_runtime_core::StateBackend>(
+    args: &[u8],
+    state: &mut B,
+) -> neutrino_runtime_abi::QueryResponse {
+    use neutrino_runtime_abi::{QueryResponse, QueryStatus};
+
+    let Ok(addr) = <Address as BorshDeserialize>::try_from_slice(args) else {
+        return QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]);
+    };
+    let validator = state
+        .read(&validator_key(&addr))
+        .and_then(|bytes| decode_validator(&bytes));
+    let payload = borsh::to_vec(&validator).expect("borsh encode Option<Validator> never fails");
+    neutrino_runtime_abi::QueryResponse::ok(payload)
+}
+
+fn query_validator_set<B: neutrino_runtime_core::StateBackend>(
+    state: &mut B,
+) -> neutrino_runtime_abi::QueryResponse {
+    let set = load_validator_set(state);
+    let payload = borsh::to_vec(&set).expect("borsh encode ValidatorSet never fails");
+    neutrino_runtime_abi::QueryResponse::ok(payload)
+}
+
+fn query_runtime_version() -> neutrino_runtime_abi::QueryResponse {
+    let version = neutrino_primitives::RuntimeVersion::default();
+    let payload = borsh::to_vec(&version).expect("borsh encode RuntimeVersion never fails");
+    neutrino_runtime_abi::QueryResponse::ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

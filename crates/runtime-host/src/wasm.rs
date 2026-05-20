@@ -25,7 +25,10 @@ use std::sync::Mutex;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput};
 use neutrino_primitives::StateRoot;
-use neutrino_runtime_abi::{StateWitness, TrieNodeBytes, TrieValueBytes};
+use neutrino_runtime_abi::{
+    QUERY_ENTRYPOINT, QueryRequest, QueryResponse, QueryStatus, StateWitness, TrieNodeBytes,
+    TrieValueBytes,
+};
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Blake3Hasher, Trie};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
@@ -112,6 +115,8 @@ impl WasmRuntime {
             scratch: live.trie().clone(),
             accessed: BTreeSet::new(),
             pending_read_value: None,
+            read_only: false,
+            write_attempted: false,
         };
         let mut store = Store::new(&self.engine, Mutex::new(host));
 
@@ -174,6 +179,99 @@ impl WasmRuntime {
             post_state,
         })
     }
+
+    /// Execute a read-only query against `live`. The runtime's
+    /// `_neutrino_query` export is invoked with the borsh-encoded
+    /// [`QueryRequest`]; the returned [`QueryResponse`] carries the
+    /// runtime-defined result.
+    ///
+    /// The host runs the call in read-only mode: any `state_write`
+    /// or `state_delete` from the guest is silently dropped and the
+    /// response is replaced with
+    /// [`QueryStatus::PermissionDenied`]. The scratch trie is
+    /// discarded after the call so no overlay mutation can leak into
+    /// `live`.
+    ///
+    /// # Errors
+    /// Returns [`WasmError`] if linking, instantiation, or trap
+    /// recovery fails. Codec errors during input/output encoding are
+    /// surfaced the same way.
+    pub fn query(
+        &self,
+        request: &QueryRequest,
+        live: &LiveTrie,
+    ) -> Result<QueryResponse, WasmError> {
+        let host = HostState {
+            live: live.clone(),
+            scratch: live.trie().clone(),
+            accessed: BTreeSet::new(),
+            pending_read_value: None,
+            read_only: true,
+            write_attempted: false,
+        };
+        let mut store = Store::new(&self.engine, Mutex::new(host));
+
+        let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
+        register_host_imports(&mut linker)?;
+
+        let instance = linker
+            .instantiate(&mut store, &self.module)
+            .map_err(wt_err)?;
+
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
+
+        let mut req_bytes = Vec::new();
+        BorshSerialize::serialize(request, &mut req_bytes).map_err(codec_err)?;
+
+        let allocate: TypedFunc<u32, u32> = instance
+            .get_typed_func(&mut store, "neutrino_allocate")
+            .map_err(wt_err)?;
+        let req_ptr = allocate
+            .call(&mut store, req_bytes.len() as u32)
+            .map_err(wt_err)?;
+        memory
+            .write(&mut store, req_ptr as usize, &req_bytes)
+            .map_err(wt_err)?;
+
+        let query_fn: TypedFunc<(u32, u32), u64> = instance
+            .get_typed_func(&mut store, QUERY_ENTRYPOINT)
+            .map_err(wt_err)?;
+        let packed = query_fn
+            .call(&mut store, (req_ptr, req_bytes.len() as u32))
+            .map_err(wt_err)?;
+        let resp_ptr = (packed >> 32) as u32;
+        let resp_len = (packed & 0xFFFF_FFFF) as u32;
+
+        let mut resp_bytes = vec![0u8; resp_len as usize];
+        memory
+            .read(&store, resp_ptr as usize, &mut resp_bytes)
+            .map_err(wt_err)?;
+        let response: QueryResponse =
+            BorshDeserialize::try_from_slice(&resp_bytes).map_err(codec_err)?;
+
+        if let Ok(deallocate) =
+            instance.get_typed_func::<(u32, u32), ()>(&mut store, "neutrino_deallocate")
+        {
+            let _ = deallocate.call(&mut store, (req_ptr, req_bytes.len() as u32));
+            let _ = deallocate.call(&mut store, (resp_ptr, resp_len));
+        }
+
+        // The scratch trie is dropped here implicitly when `host`
+        // goes out of scope; queries never mutate `live`. Any
+        // write attempt poisons the response so the caller cannot
+        // confuse a write-attempted query with a successful one.
+        let host = store.into_data().into_inner().expect("HostState mutex");
+        if host.write_attempted {
+            return Ok(QueryResponse::err(
+                QueryStatus::PermissionDenied,
+                b"runtime attempted state write during query".to_vec(),
+            ));
+        }
+
+        Ok(response)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +285,8 @@ struct HostState {
     live: LiveTrie,
     /// Scratch trie initialised from `live`. Writes go here so we can
     /// report the correct `post_state_root` to the guest without
-    /// mutating `live`.
+    /// mutating `live`. Discarded after read-only query calls so no
+    /// mutation can leak from the runtime back to `live`.
     scratch: Trie<Blake3Hasher>,
     /// Keys the STF has read or written. Becomes the witness key set
     /// and drives node extraction.
@@ -195,6 +294,15 @@ struct HostState {
     /// Value bytes stashed by `state_read_len` so the follow-up
     /// `state_read_into` call can copy them into guest memory.
     pending_read_value: Option<Vec<u8>>,
+    /// `true` for query-mode invocations: `state_write` and
+    /// `state_delete` calls from the guest are silently dropped and
+    /// flip [`Self::write_attempted`].
+    read_only: bool,
+    /// Set by [`register_host_imports`] when the guest attempts a
+    /// write in read-only mode. The caller substitutes
+    /// [`neutrino_runtime_abi::QueryStatus::PermissionDenied`] for the
+    /// runtime's response when this flag is set.
+    write_attempted: bool,
 }
 
 impl HostState {
@@ -282,6 +390,10 @@ fn write_bytes(
     Ok(())
 }
 
+// Six host imports registered as inline closures keeps each handler
+// next to its description and avoids name-pollution helper functions;
+// the resulting body is one line over the default clippy threshold.
+#[allow(clippy::too_many_lines)]
 fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), WasmError> {
     linker
         .func_wrap(
@@ -334,6 +446,13 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
                 let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
                 let value = read_bytes(&mut caller, value_ptr, value_len).expect("read value");
                 let mut host = caller.data().lock().expect("HostState mutex");
+                if host.read_only {
+                    // Query mode: drop the write silently and flag the
+                    // attempt so the caller substitutes
+                    // PermissionDenied for the runtime's response.
+                    host.write_attempted = true;
+                    return;
+                }
                 host.write(&key, value);
             },
         )
@@ -346,6 +465,12 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
             |mut caller: Caller<'_, Mutex<HostState>>, key_ptr: u32, key_len: u32| {
                 let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
                 let mut host = caller.data().lock().expect("HostState mutex");
+                if host.read_only {
+                    // Query mode: drop the delete silently and flag
+                    // the attempt; see `state_write`.
+                    host.write_attempted = true;
+                    return;
+                }
                 host.delete(&key);
             },
         )

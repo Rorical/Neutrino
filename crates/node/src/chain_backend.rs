@@ -1570,11 +1570,19 @@ where
     }
 
     fn runtime_abi_version(&self) -> Option<u32> {
-        None
+        // Mirror what the runtime advertises in its
+        // `_neutrino_query` `runtime_version` response: a node with
+        // an installed executor speaks the same ABI version this
+        // build of the host links against.
+        if self.block_executor_snapshot().is_some() {
+            Some(neutrino_runtime_abi::VERSION)
+        } else {
+            None
+        }
     }
 
     fn runtime_available(&self) -> bool {
-        false
+        self.block_executor_snapshot().is_some()
     }
 
     fn mempool_len(&self) -> usize {
@@ -1715,8 +1723,45 @@ where
         args: Vec<u8>,
         at: &BlockId,
     ) -> Result<RuntimeCallResponse, RuntimeCallError> {
-        let _ = (at, method, args);
-        Err(RuntimeCallError::RuntimeNotConfigured)
+        // v1 supports only the live head trie. Historical state
+        // would need reconstruction from persisted nodes (M12
+        // territory); see `storage_at` for the matching limitation.
+        // `Finalized` falls through to `Latest` because the engine
+        // commits state inline today — the same fallback used by
+        // `storage_at`.
+        match at {
+            BlockId::Latest | BlockId::Finalized => {}
+            BlockId::Hash(_) | BlockId::Height(_) => {
+                return Err(RuntimeCallError::HistoricalStateNotSupported);
+            }
+        }
+
+        let Some(executor) = self.block_executor_snapshot() else {
+            return Err(RuntimeCallError::RuntimeNotConfigured);
+        };
+
+        // Clone the trie inside the engine lock so the runtime call
+        // observes a consistent snapshot of state. The clone itself
+        // is a BTreeMap copy — heavier than `storage_at` but on the
+        // same order of magnitude as a single block dry-run.
+        let state_snapshot = self.with_engine(|engine| engine.state().clone());
+
+        // Wasmtime's `query` path is sync; run it off the async
+        // executor so the RPC reactor thread is not blocked while
+        // the runtime evaluates. This mirrors how `producer.rs`
+        // wraps `prove_block` calls.
+        let request = neutrino_runtime_abi::QueryRequest { method, args };
+        let response =
+            tokio::task::spawn_blocking(move || executor.query(&request, &state_snapshot))
+                .await
+                .map_err(|err| RuntimeCallError::Runtime(format!("query join error: {err}")))?
+                .map_err(RuntimeCallError::Runtime)?;
+
+        Ok(RuntimeCallResponse {
+            code: response.code,
+            payload: response.payload,
+            gas_used: 0,
+        })
     }
 }
 

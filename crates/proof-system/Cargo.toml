@@ -15,15 +15,17 @@ default = ["std"]
 std = [
     "neutrino-primitives/std",
     "neutrino-consensus-types/std",
+    "neutrino-runtime-abi/std",
     "neutrino-trie/std",
     "borsh/std",
 ]
 
 [dependencies]
 neutrino-consensus-types = { workspace = true }
-neutrino-primitives = { workspace = true }
-neutrino-trie       = { workspace = true }
-borsh               = { workspace = true }
+neutrino-primitives      = { workspace = true }
+neutrino-runtime-abi     = { workspace = true }
+neutrino-trie            = { workspace = true }
+borsh                    = { workspace = true }
 
 [lints]
 workspace = true

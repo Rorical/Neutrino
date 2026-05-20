@@ -377,14 +377,18 @@ Deferred to follow-on milestones:
    substance of the regression. Scaling to literal 1000 slots
    is straightforward but adds CI wall-clock without changing
    what is being asserted.
-2. RPC served through the WASM dynamic runtime — `RpcBackend`'s
-   `runtime_call` still returns `RuntimeNotConfigured`. The
-   `WasmExecutor` is wired only for production, not RPC. The
-   wasmtime instance can be re-used here once the runtime
-   exposes a `query` ABI worth surfacing — design work that
-   belongs alongside future runtime-method definitions
-   ("`get_balance`", "`get_validator_stake`", etc.), not this
-   milestone.
+2. ~~RPC served through the WASM dynamic runtime.~~ **Landed**
+   (`RuntimeQuery` follow-on). `RpcBackend::runtime_call` now
+   routes through the installed `WasmExecutor` to the master
+   cdylib's `_neutrino_query` entrypoint. The default runtime
+   dispatches on four methods (`account_get`, `validator_get`,
+   `validator_set`, `runtime_version`); host-side
+   read-only enforcement (`state_write` / `state_delete` are
+   silently dropped and the response is replaced with
+   `QueryStatus::PermissionDenied`) is wired through
+   `HostState::read_only`. Coverage:
+   `crates/runtime-host/tests/runtime_query.rs` and
+   `crates/node/tests/runtime_call_rpc.rs`.
 
 Exit criteria (status):
 
@@ -403,8 +407,13 @@ Exit criteria (status):
    the same database, assert head_hash / head_state_root /
    finalized_seed round-trip; the block-proof column survives
    the close / open cycle).
-4. RPC queries work through the WASM runtime — deferred (see
-   above).
+4. RPC queries work through the WASM runtime — **met** by
+   `runtime_call_rpc.rs`. `RpcBackend::runtime_call` is wired
+   to `WasmExecutor::query` via the new `BlockExecutor::query`
+   trait method; the four canonical query methods round-trip
+   end-to-end under the mock prover (which exercises the same
+   wasmtime instance the CPU prover does). `runtime_available`
+   and `runtime_abi_version` reflect the executor install state.
 
 ## M6-new - Networking with SP1 block proof gossip
 

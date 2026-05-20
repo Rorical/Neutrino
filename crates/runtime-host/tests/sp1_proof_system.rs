@@ -16,7 +16,7 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_primitives::ZERO_HASH;
 use neutrino_proof_system::{ProofError, ProofSystem};
-use neutrino_runtime_core::host::LiveStateMap;
+use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{ProverCtx, Sp1BlockProof, Sp1ProofSystem, dry_run, prove_with};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -60,9 +60,9 @@ fn signed_transfer(
     tx
 }
 
-fn live_with_account(addr: Address, account: Account) -> LiveStateMap {
-    let mut live = LiveStateMap::default();
-    live.insert(account_key(&addr), encode_account(&account));
+fn live_with_account(addr: Address, account: Account) -> LiveTrie {
+    let mut live = LiveTrie::default();
+    live.insert(&account_key(&addr), encode_account(&account));
     live
 }
 

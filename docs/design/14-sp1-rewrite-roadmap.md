@@ -225,9 +225,10 @@ Exit criteria:
 
 ## M4-new - Default runtime equivalent rewrite
 
-Status: M4-A landed (accounts + Ed25519 transfers). M4-B (real Merkle
-witnesses), M4-C (validator set + staking lifecycle), and M4-D
-(inactivity leak + slashing application) are still pending.
+Status: M4-A + M4-B landed (accounts + Ed25519 transfers + real
+Merkle witnesses via `neutrino-trie`). M4-C (validator set + staking
+lifecycle) and M4-D (inactivity leak + slashing application) are
+still pending.
 
 Goal: port the existing default runtime semantics into shared STF core form.
 
@@ -240,7 +241,25 @@ Port (M4-A landed):
 3. nonce and balance checks — strict equality on nonce, `>=` on
    balance, both enforced inside `apply_block` before any state write.
 
-Port (M4-B and later):
+Witness model (M4-B landed):
+
+- `StateWitness` carries the minimal sparse subtree of the state trie
+  needed to cover every key the STF reads or writes: `nodes:
+  Vec<TrieNodeBytes>`, `values: Vec<TrieValueBytes>`, plus an explicit
+  `witnessed_keys` set.
+- `WitnessState::new` (used inside the SP1 Guest) verifies each
+  supplied `(hash, bytes)` pair against the trie's canonical hash
+  functions and asserts the `pre_state_root` is present in the
+  reconstructed subtree before any STF read.
+- `Trie::collect_path_nodes` (new accessor on `neutrino-trie`) walks
+  root→terminal for a key and harvests the on-path nodes plus the
+  terminal leaf value. The host calls it once per accessed key during
+  dry-run to assemble the witness.
+- `host::TracingState::into_witness` always includes the live root
+  node when present so empty-access blocks still bind to
+  `pre_state_root` cryptographically.
+
+Port (M4-C and later):
 
 4. stake and unstake
 5. deposits

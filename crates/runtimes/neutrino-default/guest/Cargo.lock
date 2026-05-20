@@ -580,6 +580,15 @@ dependencies = [
  "blake3",
  "neutrino-primitives",
  "neutrino-runtime-abi",
+ "neutrino-trie",
+]
+
+[[package]]
+name = "neutrino-trie"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "neutrino-primitives",
 ]
 
 [[package]]

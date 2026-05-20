@@ -8,8 +8,8 @@ use neutrino_default_runtime_core::{
     Account, Address, StfInput, StfPublicOutput, Transaction, TransferTx, account_key,
     encode_account, transfer_sig_message,
 };
-use neutrino_runtime_abi::{StateWitness, WitnessEntry};
-use neutrino_runtime_core::{empty_state_root, host::LiveStateMap};
+use neutrino_runtime_abi::{StateWitness, TrieNodeBytes};
+use neutrino_runtime_core::{empty_state_root, host::LiveTrie};
 use neutrino_runtime_host::{ProverCtx, Sp1HostError, dry_run};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -53,9 +53,9 @@ fn signed_transfer(
     tx
 }
 
-fn live_with_account(addr: Address, account: Account) -> LiveStateMap {
-    let mut live = LiveStateMap::default();
-    live.insert(account_key(&addr), encode_account(&account));
+fn live_with_account(addr: Address, account: Account) -> LiveTrie {
+    let mut live = LiveTrie::default();
+    live.insert(&account_key(&addr), encode_account(&account));
     live
 }
 
@@ -100,7 +100,7 @@ fn full_pipeline_signed_transfer_mock() {
 #[test]
 fn tampered_post_state_root_is_rejected() {
     let ctx = mock_ctx();
-    let live = LiveStateMap::default();
+    let live = LiveTrie::default();
     let input = input_with_transfers(vec![]);
     let dry = dry_run(&input, &live);
     let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
@@ -120,16 +120,21 @@ fn tampered_post_state_root_is_rejected() {
     }
 }
 
-/// M2-new exit criterion 3: a witness missing the key the STF needs
-/// causes the guest to panic on the unwitnessed read.
+/// M2-new exit criterion 3 + M4-B Merkle witness: a witness whose
+/// `witnessed_keys` set excludes a key the STF reads causes the guest
+/// to panic on the unwitnessed read.
 #[test]
 fn missing_witness_entry_makes_guest_abort() {
     let ctx = mock_ctx();
     let alice = signing_key(202);
 
+    // Empty live state + empty witness. The STF will try to read
+    // alice's account, which is not in `witnessed_keys` → panic.
     let witness = StateWitness {
         pre_state_root: empty_state_root(),
-        entries: vec![],
+        nodes: vec![],
+        values: vec![],
+        witnessed_keys: vec![],
     };
     let tx = signed_transfer(&alice, [0xCC; 32], 1, 0, CHAIN_ID);
     let input = input_with_transfers(vec![tx]);
@@ -140,30 +145,29 @@ fn missing_witness_entry_makes_guest_abort() {
     );
 }
 
-/// M2-new exit criterion 4: a tampered witness (here: a wrong account
-/// payload with a stale `pre_state_root`) makes the guest's
-/// `WitnessState::new` reject the witness and abort proving.
+/// M2-new exit criterion 4 + M4-B Merkle witness: a witness whose
+/// `pre_state_root` cannot be reconstructed from the supplied trie
+/// nodes makes the guest's `WitnessState::new` reject and abort.
 #[test]
 fn tampered_witness_value_makes_guest_abort() {
     let ctx = mock_ctx();
-    let alice = signing_key(303);
-    let alice_addr = address_of(&alice);
 
-    let claimed_account = Account {
-        nonce: 0,
-        balance: 100,
-    };
-    let claimed_live = live_with_account(alice_addr, claimed_account);
-    let actual_value = encode_account(&Account {
-        nonce: 0,
-        balance: 999,
-    });
+    // Claim a non-empty pre_state_root but supply node bytes that
+    // hash to a *different* root. The host's verification
+    // (`Blake3Hasher::hash_node(bytes) == hash`) passes for each
+    // supplied node, but the *root* the witness claims is not among
+    // them, so `WitnessState::new` returns `PreRootMissing`.
+    let bogus_bytes = b"definitely-not-a-canonical-trie-node".to_vec();
+    let bogus_hash =
+        <neutrino_trie::Blake3Hasher as neutrino_trie::Hasher>::hash_node(&bogus_bytes);
     let witness = StateWitness {
-        pre_state_root: claimed_live.state_root(),
-        entries: vec![WitnessEntry {
-            key: account_key(&alice_addr),
-            value: Some(actual_value),
+        pre_state_root: [0xAA; 32],
+        nodes: vec![TrieNodeBytes {
+            hash: bogus_hash,
+            bytes: bogus_bytes,
         }],
+        values: vec![],
+        witnessed_keys: vec![],
     };
     let input = input_with_transfers(vec![]);
     let (_pv, report) = ctx.execute(&input, &witness).expect("executor runs");

@@ -27,7 +27,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
-    ABI_VERSION, BlockHash, BlsSignature, Height, Seed, Slot, StateRoot, ValidatorIndex,
+    ABI_VERSION, BlockHash, BlsSignature, Hash, Height, Seed, Slot, StateRoot, ValidatorIndex,
 };
 
 pub mod status;
@@ -333,36 +333,56 @@ impl QueryStatus {
     }
 }
 
-/// One key in a [`StateWitness`].
+/// One trie node carried in a [`StateWitness`].
 ///
-/// `value = None` means the key is asserted to be absent from the
-/// pre-state. Any key the STF reads must be witnessed; an unwitnessed
-/// read panics inside the SP1 Guest, which prevents proof generation.
+/// `bytes` is the canonical encoded form of a `neutrino_trie::Node`
+/// whose BLAKE3 hash equals `hash`. The SP1 Guest reconstructs a
+/// partial `Trie` from the collected `(hash, bytes)` pairs via
+/// `Trie::from_persisted`.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
-pub struct WitnessEntry {
-    /// Raw state-trie key. Length is runtime-defined.
-    pub key: Vec<u8>,
-    /// Value at this key in the pre-state, or `None` if absent.
-    pub value: Option<Vec<u8>>,
+pub struct TrieNodeBytes {
+    /// BLAKE3 hash of `bytes`.
+    pub hash: Hash,
+    /// Canonical node encoding.
+    pub bytes: Vec<u8>,
+}
+
+/// One trie value (leaf payload) carried in a [`StateWitness`].
+///
+/// `bytes` is the raw value stored at the corresponding leaf; `hash`
+/// is `BLAKE3(value_bytes)` exactly as the trie computes it.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct TrieValueBytes {
+    /// BLAKE3 hash of `bytes`.
+    pub hash: Hash,
+    /// Raw value bytes referenced by leaves in [`TrieNodeBytes`].
+    pub bytes: Vec<u8>,
 }
 
 /// Witness handed to the SP1 Guest before it replays the STF.
 ///
-/// The guest computes the canonical hash of the witnessed entries (see
-/// `neutrino-runtime-core::state_root_of`) and compares it against
-/// `pre_state_root`. A mismatch is non-recoverable and aborts proving.
+/// The witness is a Merkle subtree of the state trie that covers every
+/// key the STF reads or writes. The Guest builds a `Trie` via
+/// `Trie::from_persisted(pre_state_root, nodes, values)`, asserts the
+/// reconstructed root equals `pre_state_root`, then runs the STF
+/// against that partial trie. After the STF finishes the Guest reads
+/// the new root from the (now-updated) trie and commits it as the
+/// `post_state_root` in `StfPublicOutput`.
 ///
-/// For M2-new the witness carries the entire pre-state visible to the
-/// STF. When real Merkle-trie witnesses arrive (M4-new) this envelope
-/// gains per-entry inclusion/exclusion proofs against `pre_state_root`.
+/// Any STF read whose key is not in `witnessed_keys` panics inside the
+/// Guest, which surfaces as a non-zero exit code and rejects the
+/// proof. Writes implicitly witness their key.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct StateWitness {
-    /// Canonical state root the witnessed entries must hash to.
+    /// Trie root the supplied nodes / values must reconstruct.
     pub pre_state_root: StateRoot,
-    /// Entries the STF is allowed to access. Order is not significant
-    /// for the canonical hash, but the host emits them in sorted-key
-    /// order for determinism.
-    pub entries: Vec<WitnessEntry>,
+    /// Trie nodes (`hash -> bytes`) covering every read / write path.
+    pub nodes: Vec<TrieNodeBytes>,
+    /// Trie values (`hash -> bytes`) referenced by the witnessed leaves.
+    pub values: Vec<TrieValueBytes>,
+    /// Raw runtime keys the STF is permitted to read. The host sorts
+    /// the set ascending for determinism.
+    pub witnessed_keys: Vec<Vec<u8>>,
 }
 
 /// Returns the [`RuntimeVersion`] this crate advertises by default. It
@@ -465,16 +485,15 @@ mod tests {
     fn state_witness_round_trips_through_borsh() {
         let witness = StateWitness {
             pre_state_root: [7; 32],
-            entries: vec![
-                WitnessEntry {
-                    key: b"counter".to_vec(),
-                    value: Some(b"\x05\x00\x00\x00".to_vec()),
-                },
-                WitnessEntry {
-                    key: b"absent".to_vec(),
-                    value: None,
-                },
-            ],
+            nodes: vec![TrieNodeBytes {
+                hash: [1; 32],
+                bytes: b"node-bytes".to_vec(),
+            }],
+            values: vec![TrieValueBytes {
+                hash: [2; 32],
+                bytes: b"value-bytes".to_vec(),
+            }],
+            witnessed_keys: vec![b"k".to_vec()],
         };
         let bytes = borsh::to_vec(&witness).expect("encode");
         let decoded: StateWitness = borsh::from_slice(&bytes).expect("decode");

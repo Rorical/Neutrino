@@ -4,7 +4,7 @@
 //!
 //! Exposes the M2-new orchestration entry points:
 //!
-//! - [`dry_run`] — native dry-run against a [`LiveStateMap`] using a
+//! - [`dry_run`] — native dry-run against a [`LiveTrie`] using a
 //!   [`TracingState`]; returns the recorded [`StateWitness`] plus the
 //!   candidate [`StfPublicOutput`]. Convenient for tests.
 //! - [`wasm::WasmRuntime::dry_run`] — the production dry-run path:
@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block};
 use neutrino_runtime_abi::StateWitness;
-use neutrino_runtime_core::host::{LiveStateMap, TracingState};
+use neutrino_runtime_core::host::{LiveTrie, TracingState};
 use sp1_sdk::{
     Elf, ExecutionReport, HashableKey, ProvingKey, SP1_CIRCUIT_VERSION, SP1ProofWithPublicValues,
     SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey,
@@ -315,7 +315,7 @@ fn codec_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
 /// SP1 Guest needs to replay the same transition. Pure dry-run — no
 /// writes are committed to `live`.
 #[must_use]
-pub fn dry_run(input: &StfInput, live: &LiveStateMap) -> DryRun {
+pub fn dry_run(input: &StfInput, live: &LiveTrie) -> DryRun {
     let mut tracer = TracingState::new(live);
     let output = apply_block(input, &mut tracer);
     let witness = tracer.into_witness();
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn dry_run_of_empty_block_is_noop() {
-        let live = LiveStateMap::default();
+        let live = LiveTrie::default();
         let DryRun { output, witness } = dry_run(
             &StfInput {
                 chain_id: 1,
@@ -441,6 +441,7 @@ mod tests {
         assert_eq!(output.applied, 0);
         assert_eq!(output.failed, 0);
         assert_eq!(output.pre_state_root, output.post_state_root);
-        assert!(witness.entries.is_empty());
+        assert!(witness.nodes.is_empty());
+        assert!(witness.witnessed_keys.is_empty());
     }
 }

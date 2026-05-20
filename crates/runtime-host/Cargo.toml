@@ -32,6 +32,7 @@ neutrino-runtime-abi          = { workspace = true }
 neutrino-primitives           = { workspace = true }
 neutrino-proof-system         = { workspace = true }
 neutrino-consensus-types      = { workspace = true }
+neutrino-trie                 = { workspace = true }
 
 [build-dependencies]
 sp1-build = { workspace = true }

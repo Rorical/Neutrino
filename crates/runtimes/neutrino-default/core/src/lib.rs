@@ -254,8 +254,10 @@ fn apply_transfer<B: StateBackend>(state: &mut B, chain_id: u64, tx: &TransferTx
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use neutrino_runtime_abi::{StateWitness, WitnessEntry};
-    use neutrino_runtime_core::{WitnessState, empty_state_root, state_root_of};
+    use neutrino_runtime_core::{
+        WitnessState,
+        host::{LiveTrie, TracingState},
+    };
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
@@ -284,49 +286,44 @@ mod tests {
             nonce,
             signature: [0u8; 64],
         };
-        let msg = transfer_sig_message(chain_id, &tx);
-        let sig = sk.sign(&msg);
-        tx.signature = sig.to_bytes();
+        tx.signature = sk.sign(&transfer_sig_message(chain_id, &tx)).to_bytes();
         tx
     }
 
-    fn witness_with_account(addr: Address, account: Account) -> StateWitness {
-        let key = account_key(&addr);
-        let value = encode_account(&account);
-        let pre_state_root = state_root_of([(key.as_slice(), value.as_slice())]);
-        StateWitness {
-            pre_state_root,
-            entries: alloc::vec![
-                WitnessEntry {
-                    key,
-                    value: Some(value),
-                },
-                // Recipient account witnessed as absent so the STF can read it.
-                WitnessEntry {
-                    key: account_key(&[0xAB; 32]),
-                    value: None,
-                },
-            ],
-        }
+    fn live_with_account(addr: Address, account: Account) -> LiveTrie {
+        let mut live = LiveTrie::default();
+        live.insert(&account_key(&addr), encode_account(&account));
+        live
+    }
+
+    /// Drive one block through the dry-run path and then replay it
+    /// against the recorded `StateWitness`, mirroring the consensus
+    /// engine's host-then-guest flow.
+    fn dry_run_then_replay(
+        input: &StfInput,
+        live: &LiveTrie,
+    ) -> (StfPublicOutput, StfPublicOutput) {
+        let mut tracer = TracingState::new(live);
+        let host_out = apply_block(input, &mut tracer);
+        let witness = tracer.into_witness();
+
+        let mut guest = WitnessState::new(&witness).expect("witness round-trips");
+        let guest_out = apply_block(input, &mut guest);
+        (host_out, guest_out)
     }
 
     #[test]
     fn empty_block_is_a_noop() {
-        let witness = StateWitness {
-            pre_state_root: empty_state_root(),
-            entries: alloc::vec![],
+        let live = LiveTrie::default();
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![],
         };
-        let mut state = WitnessState::new(&witness).unwrap();
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![],
-            },
-            &mut state,
-        );
-        assert_eq!(out.applied, 0);
-        assert_eq!(out.failed, 0);
-        assert_eq!(out.pre_state_root, out.post_state_root);
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 0);
+        assert_eq!(host_out.failed, 0);
+        assert_eq!(host_out.pre_state_root, host_out.post_state_root);
     }
 
     #[test]
@@ -334,168 +331,138 @@ mod tests {
         let alice = signing_key(1);
         let alice_addr = address_of(&alice);
         let bob_addr = [0xAB_u8; 32];
-
-        let witness = witness_with_account(
+        let live = live_with_account(
             alice_addr,
             Account {
                 nonce: 0,
                 balance: 100,
             },
         );
-        let mut state = WitnessState::new(&witness).unwrap();
 
         let tx = signed_transfer(&alice, bob_addr, 30, 0, CHAIN_ID);
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![Transaction::Transfer(tx)],
-            },
-            &mut state,
-        );
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![Transaction::Transfer(tx)],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
 
-        assert_eq!(out.applied, 1);
-        assert_eq!(out.failed, 0);
-        let alice_after = decode_account(&state.read(&account_key(&alice_addr)).unwrap()).unwrap();
-        let bob_after = decode_account(&state.read(&account_key(&bob_addr)).unwrap()).unwrap();
-        assert_eq!(alice_after.balance, 70);
-        assert_eq!(alice_after.nonce, 1);
-        assert_eq!(bob_after.balance, 30);
-        assert_eq!(bob_after.nonce, 0);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.failed, 0);
     }
 
     #[test]
     fn wrong_nonce_is_dropped() {
         let alice = signing_key(2);
         let alice_addr = address_of(&alice);
-        let witness = witness_with_account(
+        let live = live_with_account(
             alice_addr,
             Account {
                 nonce: 5,
                 balance: 100,
             },
         );
-        let mut state = WitnessState::new(&witness).unwrap();
 
-        // Sign with a stale nonce (3 instead of 5).
         let tx = signed_transfer(&alice, [0xAB; 32], 10, 3, CHAIN_ID);
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![Transaction::Transfer(tx)],
-            },
-            &mut state,
-        );
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![Transaction::Transfer(tx)],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
 
-        assert_eq!(out.applied, 0);
-        assert_eq!(out.failed, 1);
-        let alice_after = decode_account(&state.read(&account_key(&alice_addr)).unwrap()).unwrap();
-        assert_eq!(alice_after.balance, 100);
-        assert_eq!(alice_after.nonce, 5);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 0);
+        assert_eq!(host_out.failed, 1);
+        assert_eq!(host_out.pre_state_root, host_out.post_state_root);
     }
 
     #[test]
     fn insufficient_balance_is_dropped() {
         let alice = signing_key(3);
         let alice_addr = address_of(&alice);
-        let witness = witness_with_account(
+        let live = live_with_account(
             alice_addr,
             Account {
                 nonce: 0,
                 balance: 10,
             },
         );
-        let mut state = WitnessState::new(&witness).unwrap();
 
         let tx = signed_transfer(&alice, [0xAB; 32], 50, 0, CHAIN_ID);
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![Transaction::Transfer(tx)],
-            },
-            &mut state,
-        );
-
-        assert_eq!(out.applied, 0);
-        assert_eq!(out.failed, 1);
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![Transaction::Transfer(tx)],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 0);
+        assert_eq!(host_out.failed, 1);
     }
 
     #[test]
     fn bad_signature_is_dropped() {
         let alice = signing_key(4);
         let alice_addr = address_of(&alice);
-        let witness = witness_with_account(
+        let live = live_with_account(
             alice_addr,
             Account {
                 nonce: 0,
                 balance: 100,
             },
         );
-        let mut state = WitnessState::new(&witness).unwrap();
 
         let mut tx = signed_transfer(&alice, [0xAB; 32], 10, 0, CHAIN_ID);
-        tx.signature[0] ^= 0xFF; // tamper.
-
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![Transaction::Transfer(tx)],
-            },
-            &mut state,
-        );
-        assert_eq!(out.applied, 0);
-        assert_eq!(out.failed, 1);
+        tx.signature[0] ^= 0xFF;
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![Transaction::Transfer(tx)],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.failed, 1);
     }
 
     #[test]
     fn cross_chain_replay_is_dropped() {
         let alice = signing_key(5);
         let alice_addr = address_of(&alice);
-        let witness = witness_with_account(
+        let live = live_with_account(
             alice_addr,
             Account {
                 nonce: 0,
                 balance: 100,
             },
         );
-        let mut state = WitnessState::new(&witness).unwrap();
 
-        // Sign for a different chain id.
         let tx = signed_transfer(&alice, [0xAB; 32], 10, 0, CHAIN_ID + 1);
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![Transaction::Transfer(tx)],
-            },
-            &mut state,
-        );
-        assert_eq!(out.applied, 0);
-        assert_eq!(out.failed, 1);
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![Transaction::Transfer(tx)],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.failed, 1);
     }
 
     #[test]
     fn self_transfer_only_bumps_nonce() {
         let alice = signing_key(6);
         let alice_addr = address_of(&alice);
-        let witness = witness_with_account(
+        let live = live_with_account(
             alice_addr,
             Account {
                 nonce: 0,
                 balance: 100,
             },
         );
-        let mut state = WitnessState::new(&witness).unwrap();
 
         let tx = signed_transfer(&alice, alice_addr, 30, 0, CHAIN_ID);
-        let out = apply_block(
-            &StfInput {
-                chain_id: CHAIN_ID,
-                transactions: alloc::vec![Transaction::Transfer(tx)],
-            },
-            &mut state,
-        );
-        assert_eq!(out.applied, 1);
-        let alice_after = decode_account(&state.read(&account_key(&alice_addr)).unwrap()).unwrap();
-        assert_eq!(alice_after.balance, 100);
-        assert_eq!(alice_after.nonce, 1);
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            transactions: alloc::vec![Transaction::Transfer(tx)],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
     }
 }

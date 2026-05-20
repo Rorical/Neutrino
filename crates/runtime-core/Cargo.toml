@@ -23,9 +23,10 @@ default = []
 host    = []
 
 [dependencies]
-blake3              = { workspace = true }
-neutrino-primitives = { workspace = true }
+blake3               = { workspace = true }
+neutrino-primitives  = { workspace = true }
 neutrino-runtime-abi = { workspace = true }
+neutrino-trie        = { workspace = true }
 
 [lints]
 workspace = true

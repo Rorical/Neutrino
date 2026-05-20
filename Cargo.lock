@@ -3962,6 +3962,7 @@ dependencies = [
  "blake3",
  "neutrino-primitives",
  "neutrino-runtime-abi",
+ "neutrino-trie",
 ]
 
 [[package]]
@@ -3979,6 +3980,7 @@ dependencies = [
  "neutrino-proof-system",
  "neutrino-runtime-abi",
  "neutrino-runtime-core",
+ "neutrino-trie",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "sp1-build",

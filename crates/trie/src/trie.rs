@@ -291,6 +291,80 @@ impl<H: Hasher> Trie<H> {
         }
     }
 
+    /// Look up the canonical encoded bytes of a node by hash. Returns
+    /// `None` for hashes not in the content-addressed store.
+    #[must_use]
+    pub fn node_bytes(&self, hash: &Hash) -> Option<&[u8]> {
+        self.nodes.get(hash).map(Vec::as_slice)
+    }
+
+    /// Look up the canonical bytes of a value by hash.
+    #[must_use]
+    pub fn value_bytes(&self, hash: &Hash) -> Option<&[u8]> {
+        self.values.get(hash).map(Vec::as_slice)
+    }
+
+    /// Walk the trie from root to the terminal for `key`, accumulating
+    /// every visited node's `(hash, bytes)` into `out_nodes` and the
+    /// terminal leaf's `(value_hash, value_bytes)` (when present) into
+    /// `out_values`.
+    ///
+    /// Used by witness builders: the resulting subset is the minimum
+    /// data needed for a `Trie::from_persisted` reconstruction that
+    /// can both *read* `key` and *insert / remove* at `key` (writes
+    /// only need on-path nodes; siblings are referenced by hash).
+    ///
+    /// Calling this method many times with disjoint keys is the
+    /// standard way to assemble a Merkle witness covering the read /
+    /// write set of one block.
+    pub fn collect_path_nodes(
+        &self,
+        key: &[u8],
+        out_nodes: &mut BTreeMap<Hash, Vec<u8>>,
+        out_values: &mut BTreeMap<Hash, Vec<u8>>,
+    ) {
+        let path = BitPath::for_key(key);
+        let mut current = self.root;
+        let mut consumed: u32 = 0;
+        loop {
+            if current == ZERO_HASH {
+                return;
+            }
+            if let Some(bytes) = self.nodes.get(&current) {
+                out_nodes.insert(current, bytes.clone());
+            }
+            let node = self.fetch_node(&current);
+            match node {
+                Node::Leaf { value_hash, .. } => {
+                    if let Some(bytes) = self.values.get(&value_hash) {
+                        out_values.insert(value_hash, bytes.clone());
+                    }
+                    return;
+                }
+                Node::Branch { left, right } => {
+                    if consumed >= path.bit_len() {
+                        return;
+                    }
+                    let bit = path.bit(consumed);
+                    consumed += 1;
+                    current = if bit { right } else { left };
+                }
+                Node::Extension { prefix, child } => {
+                    let len = prefix.bit_len();
+                    if consumed + len > path.bit_len() {
+                        return;
+                    }
+                    let segment = path.suffix(consumed).prefix(len);
+                    if segment != prefix {
+                        return;
+                    }
+                    consumed += len;
+                    current = child;
+                }
+            }
+        }
+    }
+
     fn fetch_node(&self, hash: &Hash) -> Node {
         let bytes = self
             .nodes
@@ -1007,5 +1081,53 @@ mod tests {
                 .verify_exclusion::<Blake3Hasher>(&trie.root(), key)
                 .expect("random exclusion proof");
         }
+    }
+
+    #[test]
+    fn collect_path_nodes_yields_a_partial_subtree_that_round_trips() {
+        // Populate a small trie and verify that the nodes collected for
+        // one key are enough to reconstruct a partial trie supporting
+        // both read and write on that key.
+        let mut trie: Trie<Blake3Hasher> = Trie::new();
+        for (k, v) in [
+            (b"alpha".as_ref(), b"1".to_vec()),
+            (b"beta".as_ref(), b"2".to_vec()),
+            (b"gamma".as_ref(), b"3".to_vec()),
+            (b"delta".as_ref(), b"4".to_vec()),
+        ] {
+            trie.insert(k, v).unwrap();
+        }
+        let root = trie.root();
+
+        let mut nodes = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        // Touch alpha (read) and a fresh key (write). The witness must
+        // cover both paths.
+        trie.collect_path_nodes(b"alpha", &mut nodes, &mut values);
+        trie.collect_path_nodes(b"epsilon", &mut nodes, &mut values);
+
+        let partial = Trie::<Blake3Hasher>::from_persisted(
+            root,
+            nodes.iter().map(|(h, b)| (*h, b.clone())),
+            values.iter().map(|(h, b)| (*h, b.clone())),
+        );
+        // Read of a witnessed key returns the same value.
+        assert_eq!(partial.get(b"alpha").as_deref(), Some(b"1".as_ref()));
+        // Insert at the fresh key bumps the root.
+        let mut writable = partial;
+        writable.insert(b"epsilon", b"5".to_vec()).unwrap();
+        let mut reference = trie;
+        reference.insert(b"epsilon", b"5".to_vec()).unwrap();
+        assert_eq!(writable.root(), reference.root());
+    }
+
+    #[test]
+    fn collect_path_nodes_on_empty_trie_yields_nothing() {
+        let trie: Trie<Blake3Hasher> = Trie::new();
+        let mut nodes = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        trie.collect_path_nodes(b"alpha", &mut nodes, &mut values);
+        assert!(nodes.is_empty());
+        assert!(values.is_empty());
     }
 }

@@ -6,7 +6,7 @@ use neutrino_default_runtime_core::{
     Account, Address, StfInput, Transaction, TransferTx, account_key, encode_account,
     transfer_sig_message,
 };
-use neutrino_runtime_core::host::LiveStateMap;
+use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{dry_run, wasm::WasmRuntime};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -40,9 +40,9 @@ fn signed_transfer(
     tx
 }
 
-fn live_with_account(addr: Address, account: Account) -> LiveStateMap {
-    let mut live = LiveStateMap::default();
-    live.insert(account_key(&addr), encode_account(&account));
+fn live_with_account(addr: Address, account: Account) -> LiveTrie {
+    let mut live = LiveTrie::default();
+    live.insert(&account_key(&addr), encode_account(&account));
     live
 }
 
@@ -76,7 +76,7 @@ fn wasm_dry_run_matches_native_on_signed_transfer() {
 
 #[test]
 fn wasm_dry_run_matches_native_on_empty_block() {
-    let live = LiveStateMap::default();
+    let live = LiveTrie::default();
     let input = StfInput {
         chain_id: CHAIN_ID,
         transactions: vec![],

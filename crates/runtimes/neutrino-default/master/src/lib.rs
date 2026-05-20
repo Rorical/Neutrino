@@ -208,7 +208,9 @@ mod tests {
         };
         let witness = StateWitness {
             pre_state_root: empty_state_root(),
-            entries: alloc::vec![],
+            nodes: alloc::vec![],
+            values: alloc::vec![],
+            witnessed_keys: alloc::vec![],
         };
         let bytes = borsh::to_vec(&(input, witness)).unwrap();
         let out_bytes = apply_block_with_witness(&bytes);

@@ -1,17 +1,17 @@
-//! Host-side `TracingState`/`LiveStateMap` coverage. Gated by the
-//! `host` feature so the default `no_std` test surface stays untouched.
+//! Host-side `TracingState`/`LiveTrie` coverage. Gated by the `host`
+//! feature so the default `no_std` test surface stays untouched.
 
 #![cfg(feature = "host")]
 
 use neutrino_runtime_core::{
     StateBackend, WitnessState,
-    host::{LiveStateMap, TracingState},
+    host::{LiveTrie, TracingState},
 };
 
 #[test]
 fn dry_run_records_read_set_and_replays_under_witness() {
-    let mut live = LiveStateMap::default();
-    live.insert(b"counter".to_vec(), 5u32.to_le_bytes().to_vec());
+    let mut live = LiveTrie::default();
+    live.insert(b"counter", 5u32.to_le_bytes().to_vec());
     let pre_root = live.state_root();
 
     let mut tracer = TracingState::new(&live);
@@ -37,9 +37,9 @@ fn dry_run_records_read_set_and_replays_under_witness() {
 
 #[test]
 fn tracing_state_post_root_reflects_overlay_writes_and_deletes() {
-    let mut live = LiveStateMap::default();
-    live.insert(b"a".to_vec(), b"1".to_vec());
-    live.insert(b"b".to_vec(), b"2".to_vec());
+    let mut live = LiveTrie::default();
+    live.insert(b"a", b"1".to_vec());
+    live.insert(b"b", b"2".to_vec());
     let pre = live.state_root();
 
     let mut tracer = TracingState::new(&live);
@@ -48,8 +48,8 @@ fn tracing_state_post_root_reflects_overlay_writes_and_deletes() {
     assert_eq!(tracer.pre_state_root(), pre);
     let post = tracer.post_state_root();
 
-    let mut expected = LiveStateMap::default();
-    expected.insert(b"b".to_vec(), b"2".to_vec());
-    expected.insert(b"c".to_vec(), b"3".to_vec());
+    let mut expected = LiveTrie::default();
+    expected.insert(b"b", b"2".to_vec());
+    expected.insert(b"c", b"3".to_vec());
     assert_eq!(post, expected.state_root());
 }

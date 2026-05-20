@@ -1,8 +1,9 @@
 //! WASM dynamic runtime host.
 //!
 //! Loads the `neutrino-default-runtime-master` cdylib in wasmtime,
-//! drives `apply_block` against a [`LiveStateMap`], and collects the
-//! read set as a [`StateWitness`] that the SP1 Guest can replay.
+//! drives `apply_block` against a [`LiveTrie`], and collects the
+//! read / write set as a [`StateWitness`] (with on-path trie nodes)
+//! that the SP1 Guest can replay.
 //!
 //! This is the non-proven execution path full nodes use for RPC,
 //! mempool tx admission, and dry-run / witness generation. The proven
@@ -18,14 +19,15 @@
     clippy::cast_lossless
 )]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput};
 use neutrino_primitives::StateRoot;
-use neutrino_runtime_abi::{StateWitness, WitnessEntry};
-use neutrino_runtime_core::{host::LiveStateMap, state_root_of};
-use std::collections::{BTreeMap, BTreeSet};
+use neutrino_runtime_abi::{StateWitness, TrieNodeBytes, TrieValueBytes};
+use neutrino_runtime_core::host::LiveTrie;
+use neutrino_trie::{Blake3Hasher, Trie};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 use crate::{DryRun, Sp1HostError};
@@ -101,14 +103,14 @@ impl WasmRuntime {
     /// Returns [`WasmError`] if linking, instantiation, or trap
     /// recovery fails. Codec errors during input/output encoding are
     /// surfaced the same way.
-    pub fn dry_run(&self, input: &StfInput, live: &LiveStateMap) -> Result<DryRun, WasmError> {
-        // The wasm guest calls back through linker-bound host functions.
-        // We park the host state (tracing live ∪ overlay) behind a
-        // Mutex inside the Store so the trampolines can take `&mut`.
+    pub fn dry_run(&self, input: &StfInput, live: &LiveTrie) -> Result<DryRun, WasmError> {
+        // Cloning the trie is a BTreeMap clone — fine for tests; M5-new
+        // can switch this to a reference-counted snapshot when blocks
+        // grow large.
         let host = HostState {
             live: live.clone(),
-            overlay: BTreeMap::new(),
-            reads: BTreeSet::new(),
+            scratch: live.trie().clone(),
+            accessed: BTreeSet::new(),
             pending_read_value: None,
         };
         let mut store = Store::new(&self.engine, Mutex::new(host));
@@ -124,11 +126,9 @@ impl WasmRuntime {
             .get_memory(&mut store, "memory")
             .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
 
-        // 1. Encode input.
         let mut input_bytes = Vec::new();
         BorshSerialize::serialize(input, &mut input_bytes).map_err(codec_err)?;
 
-        // 2. Allocate input buffer in linear memory.
         let allocate: TypedFunc<u32, u32> = instance
             .get_typed_func(&mut store, "neutrino_allocate")
             .map_err(wt_err)?;
@@ -139,7 +139,6 @@ impl WasmRuntime {
             .write(&mut store, input_ptr as usize, &input_bytes)
             .map_err(wt_err)?;
 
-        // 3. Call apply_block.
         let apply_block: TypedFunc<(u32, u32), u64> = instance
             .get_typed_func(&mut store, "apply_block")
             .map_err(wt_err)?;
@@ -149,7 +148,6 @@ impl WasmRuntime {
         let output_ptr = (packed >> 32) as u32;
         let output_len = (packed & 0xFFFF_FFFF) as u32;
 
-        // 4. Read encoded output.
         let mut output_bytes = vec![0u8; output_len as usize];
         memory
             .read(&store, output_ptr as usize, &mut output_bytes)
@@ -157,7 +155,6 @@ impl WasmRuntime {
         let output: StfPublicOutput =
             BorshDeserialize::try_from_slice(&output_bytes).map_err(codec_err)?;
 
-        // 5. Free wasm-side buffers (best-effort).
         if let Ok(deallocate) =
             instance.get_typed_func::<(u32, u32), ()>(&mut store, "neutrino_deallocate")
         {
@@ -165,66 +162,89 @@ impl WasmRuntime {
             let _ = deallocate.call(&mut store, (output_ptr, output_len));
         }
 
-        // 6. Materialise the witness from the recorded read set.
+        // Materialise the witness from the recorded accesses against
+        // the live trie.
         let host = store.into_data().into_inner().expect("HostState mutex");
-        let entries: Vec<WitnessEntry> = host
-            .reads
-            .iter()
-            .map(|k| WitnessEntry {
-                key: k.clone(),
-                value: host.live.state.get(k).cloned(),
-            })
-            .collect();
-        let witness = StateWitness {
-            pre_state_root: host.live.state_root(),
-            entries,
-        };
+        let witness = host.into_witness();
 
         Ok(DryRun { output, witness })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Host-import implementations.
+// Host-import state and implementations.
 // ---------------------------------------------------------------------------
 
 struct HostState {
-    live: LiveStateMap,
-    overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    reads: BTreeSet<Vec<u8>>,
+    /// Read-only snapshot of the pre-state trie. Used both for
+    /// reading values and for extracting witness nodes after the STF
+    /// finishes.
+    live: LiveTrie,
+    /// Scratch trie initialised from `live`. Writes go here so we can
+    /// report the correct `post_state_root` to the guest without
+    /// mutating `live`.
+    scratch: Trie<Blake3Hasher>,
+    /// Keys the STF has read or written. Becomes the witness key set
+    /// and drives node extraction.
+    accessed: BTreeSet<Vec<u8>>,
     /// Value bytes stashed by `state_read_len` so the follow-up
     /// `state_read_into` call can copy them into guest memory.
     pending_read_value: Option<Vec<u8>>,
 }
 
 impl HostState {
-    /// Effective root: live ⨁ overlay.
-    fn effective_state_root(&self) -> StateRoot {
-        let mut merged: BTreeMap<&[u8], &[u8]> = self
-            .live
-            .state
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-            .collect();
-        for (k, slot) in &self.overlay {
-            match slot {
-                Some(v) => {
-                    merged.insert(k.as_slice(), v.as_slice());
-                }
-                None => {
-                    merged.remove(k.as_slice());
-                }
-            }
-        }
-        state_root_of(merged)
+    const fn pre_state_root(&self) -> StateRoot {
+        self.live.state_root()
     }
 
-    /// Read a key through the (overlay-aware) view used by the guest.
+    const fn post_state_root(&self) -> StateRoot {
+        self.scratch.root()
+    }
+
     fn read_effective(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(slot) = self.overlay.get(key) {
-            return slot.clone();
+        // Reads honour the scratch trie because that captures both
+        // live state and any overlay writes the guest already made.
+        self.scratch.get(key)
+    }
+
+    fn write(&mut self, key: &[u8], value: Vec<u8>) {
+        self.accessed.insert(key.to_vec());
+        self.scratch
+            .insert(key, value)
+            .expect("trie insert never fails for length-prefixed keys");
+    }
+
+    fn delete(&mut self, key: &[u8]) {
+        self.accessed.insert(key.to_vec());
+        let _ = self.scratch.remove(key);
+    }
+
+    fn into_witness(self) -> StateWitness {
+        let mut nodes = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        for key in &self.accessed {
+            self.live
+                .trie()
+                .collect_path_nodes(key, &mut nodes, &mut values);
         }
-        self.live.state.get(key).cloned()
+        let pre_root = self.pre_state_root();
+        if pre_root != neutrino_trie::EMPTY_TRIE_ROOT {
+            if let Some(bytes) = self.live.trie().node_bytes(&pre_root) {
+                nodes.entry(pre_root).or_insert_with(|| bytes.to_vec());
+            }
+        }
+        StateWitness {
+            pre_state_root: pre_root,
+            nodes: nodes
+                .into_iter()
+                .map(|(hash, bytes)| TrieNodeBytes { hash, bytes })
+                .collect(),
+            values: values
+                .into_iter()
+                .map(|(hash, bytes)| TrieValueBytes { hash, bytes })
+                .collect(),
+            witnessed_keys: self.accessed.into_iter().collect(),
+        }
     }
 }
 
@@ -266,7 +286,7 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
                     return -1;
                 };
                 let mut host = caller.data().lock().expect("HostState mutex");
-                host.reads.insert(key.clone());
+                host.accessed.insert(key.clone());
                 if let Some(v) = host.read_effective(&key) {
                     let len = v.len() as i32;
                     host.pending_read_value = Some(v);
@@ -308,8 +328,7 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
                 let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
                 let value = read_bytes(&mut caller, value_ptr, value_len).expect("read value");
                 let mut host = caller.data().lock().expect("HostState mutex");
-                host.reads.insert(key.clone());
-                host.overlay.insert(key, Some(value));
+                host.write(&key, value);
             },
         )
         .map_err(wt_err)?;
@@ -321,8 +340,7 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
             |mut caller: Caller<'_, Mutex<HostState>>, key_ptr: u32, key_len: u32| {
                 let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
                 let mut host = caller.data().lock().expect("HostState mutex");
-                host.reads.insert(key.clone());
-                host.overlay.insert(key, None);
+                host.delete(&key);
             },
         )
         .map_err(wt_err)?;
@@ -336,8 +354,7 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
                     .data()
                     .lock()
                     .expect("HostState mutex")
-                    .live
-                    .state_root();
+                    .pre_state_root();
                 let _ = write_bytes(&mut caller, out_ptr, &root);
             },
         )
@@ -352,7 +369,7 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
                     .data()
                     .lock()
                     .expect("HostState mutex")
-                    .effective_state_root();
+                    .post_state_root();
                 let _ = write_bytes(&mut caller, out_ptr, &root);
             },
         )

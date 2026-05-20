@@ -26,6 +26,7 @@ async-trait                       = "0.1.89"
 borsh.workspace                   = true
 neutrino-consensus-engine.workspace = true
 neutrino-consensus-types.workspace  = true
+neutrino-default-runtime-core.workspace = true
 neutrino-mempool.workspace        = true
 neutrino-network.workspace        = true
 neutrino-primitives.workspace     = true
@@ -45,5 +46,4 @@ tracing                           = "0.1.44"
 tracing-subscriber                = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
-neutrino-default-runtime-core = { workspace = true }
 tokio = { version = "1.52.3", features = ["full", "test-util"] }

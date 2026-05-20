@@ -36,6 +36,7 @@ use neutrino_consensus_types::{
     Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
     SlashingEvidence,
 };
+use neutrino_default_runtime_core::{LeakTx, SlashTx, Transaction as RuntimeTransaction};
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
 use neutrino_network::rpc::{
@@ -83,19 +84,31 @@ const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 3_500;
 /// pool to the limit.
 const DEFAULT_BODY_SLASHING_BUDGET: usize = 32;
 
-/// Default cap on the number of inactivity-leak batches pulled into
-/// a single block body. Each batch already carries up to 32
-/// validators; a value of 4 lets the producer drain a small
-/// backlog without exceeding the runtime's input buffer.
-const DEFAULT_BODY_INACTIVITY_BATCH_BUDGET: usize = 4;
+/// Default cap on the number of inactivity-leak transactions pulled
+/// into a single block body. Each entry is a borsh-encoded
+/// `Transaction::InactivityLeak` per non-participating validator;
+/// 128 leaves comfortable headroom for the largest realistic
+/// inactivity report from a chunk's worth of missed precommits.
+const DEFAULT_BODY_INACTIVITY_BATCH_BUDGET: usize = 128;
 
-/// Maximum validators per [`TX_INACTIVITY_LEAK_BATCH`] transaction.
-/// Mirrors the runtime-side `MAX_LEAK_BATCH_COUNT` so the encoder
-/// silently splits an over-sized report into chunks of this size.
-const MAX_INACTIVITY_BATCH_COUNT: usize = 32;
+/// Per-occurrence amount deducted from a validator's stake when the
+/// runtime applies a consensus-driven `Transaction::Slash`. The
+/// runtime clamps to current stake, so `u128::MAX` effectively
+/// burns the entire bond — appropriate for objectively-attributable
+/// equivocations (`DoubleProposal`, `DoublePrevote`,
+/// `DoublePrecommit`, `LockViolation`, `InvalidVrfClaim`).
+///
+/// The full-stake policy is a placeholder. A real chain would set
+/// graduated penalties per offence in the chain spec; that lever
+/// belongs alongside the slashing-amount params planned for a later
+/// milestone.
+const CONSENSUS_SLASH_AMOUNT: u128 = u128::MAX;
 
-/// Runtime wire tag for the inactivity-leak batch transaction.
-const TX_INACTIVITY_LEAK_BATCH: u8 = 0x06;
+/// Per-occurrence amount deducted from a validator's stake when the
+/// runtime applies a `Transaction::InactivityLeak`. One missed
+/// precommit deducts this many stake units. Conservative default;
+/// production chains pick a value calibrated to their stake unit.
+const CONSENSUS_INACTIVITY_LEAK_AMOUNT: u128 = 1;
 
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
@@ -141,21 +154,61 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     block_executor: Mutex<Option<Arc<dyn ErasedBlockExecutor>>>,
 }
 
-/// Encode a single `TX_INACTIVITY_LEAK_BATCH` runtime transaction
-/// for the given chunk id and validator BLS pubkeys.
+/// Encode a single inactivity-leak transaction for a validator
+/// identified by their 32-byte runtime address (the
+/// `withdrawal_credentials` field on the consensus-side `Validator`).
 ///
-/// Wire format mirrors the runtime side:
-/// `tag (1) || chunk_id (8 LE) || count (4 LE) || pubkey × count`.
-fn encode_inactivity_batch(chunk_id: ChunkId, pubkeys: &[[u8; 48]]) -> Vec<u8> {
-    let count = u32::try_from(pubkeys.len()).expect("batch count fits u32");
-    let mut tx = Vec::with_capacity(1 + 8 + 4 + pubkeys.len() * 48);
-    tx.push(TX_INACTIVITY_LEAK_BATCH);
-    tx.extend_from_slice(&chunk_id.to_le_bytes());
-    tx.extend_from_slice(&count.to_le_bytes());
-    for pk in pubkeys {
-        tx.extend_from_slice(pk);
-    }
-    tx
+/// The wire layout is `borsh(Transaction::InactivityLeak(LeakTx { validator,
+/// amount }))` — exactly what [`WasmExecutor::execute_block`] decodes
+/// from each `body.transactions[i]` entry. The matching
+/// `apply_leak` in the default runtime deducts `amount` from the
+/// validator's stake, clamping to the current stake, and removes
+/// the validator from the active set when the resulting stake
+/// reaches zero.
+fn encode_inactivity_leak_tx(validator_address: [u8; 32]) -> Vec<u8> {
+    borsh::to_vec(&RuntimeTransaction::InactivityLeak(LeakTx {
+        validator: validator_address,
+        amount: CONSENSUS_INACTIVITY_LEAK_AMOUNT,
+    }))
+    .expect("borsh encode Transaction::InactivityLeak never fails")
+}
+
+/// Encode a single slash transaction for the validator at the
+/// supplied index in the active set. Returns `None` for evidence
+/// variants the consensus engine does not currently surface to the
+/// runtime (e.g. `LongRangeForkParticipation`, `DaCommitmentFraud`),
+/// or when the offender index is outside the active set.
+///
+/// The wire layout is `borsh(Transaction::Slash(SlashTx { validator,
+/// amount }))`, where `validator` is the offender's
+/// `withdrawal_credentials` — the 32-byte runtime address mapped to
+/// their consensus BLS pubkey through the chain spec's validator
+/// declaration.
+fn encode_slashing_as_tx(evidence: &SlashingEvidence, active_set: &[Validator]) -> Option<Vec<u8>> {
+    let offender_index = match evidence {
+        SlashingEvidence::DoubleProposal { proposer_index, .. }
+        | SlashingEvidence::InvalidVrfClaim { proposer_index, .. } => *proposer_index,
+        SlashingEvidence::DoublePrevote {
+            validator_index, ..
+        }
+        | SlashingEvidence::DoublePrecommit {
+            validator_index, ..
+        }
+        | SlashingEvidence::LockViolation {
+            validator_index, ..
+        } => *validator_index,
+        _ => return None,
+    };
+    let position = usize::try_from(offender_index).ok()?;
+    let validator = active_set.get(position)?;
+    let address = validator.withdrawal_credentials;
+    Some(
+        borsh::to_vec(&RuntimeTransaction::Slash(SlashTx {
+            validator: address,
+            amount: CONSENSUS_SLASH_AMOUNT,
+        }))
+        .expect("borsh encode Transaction::Slash never fails"),
+    )
 }
 
 /// FIFO pool of [`SlashingEvidence`] with dedup-by-content. Two
@@ -391,16 +444,25 @@ where
         slot: Slot,
         proposer: &ProposerKey,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
-        // Inactivity-leak batches are prepended to the mempool drain
-        // so a saturated mempool cannot starve them out of the body.
-        // Each batch is already an opaque runtime transaction
-        // (TX_INACTIVITY_LEAK_BATCH); the runtime applies it
-        // alongside any other tx in body.transactions.
+        // Body transaction order: slash transactions (from drained
+        // slashing evidence) first, then inactivity-leak transactions,
+        // then mempool transactions. Consensus-driven entries are
+        // prepended so a saturated mempool cannot starve them out.
+        // Each entry is a borsh-encoded `Transaction` envelope the
+        // WASM executor decodes one-by-one; `body.slashings` is also
+        // kept on the wire for header-root commitment and peer
+        // verification.
         let drained_inactivity = self.drain_inactivity_pool(DEFAULT_BODY_INACTIVITY_BATCH_BUDGET);
         let drained_mempool = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
         let drained_hashes: Vec<Hash> = drained_mempool.iter().map(|tx| blake3_256(tx)).collect();
         let drained_slashings = self.drain_slashing_pool(DEFAULT_BODY_SLASHING_BUDGET);
-        let mut all_txs = drained_inactivity.clone();
+        let active_set = self.with_engine(|e| e.active_validator_set().to_vec());
+        let slash_txs: Vec<Vec<u8>> = drained_slashings
+            .iter()
+            .filter_map(|evidence| encode_slashing_as_tx(evidence, &active_set))
+            .collect();
+        let mut all_txs = slash_txs;
+        all_txs.extend(drained_inactivity.iter().cloned());
         all_txs.extend(drained_mempool.iter().cloned());
         let body = Body {
             transactions: all_txs,
@@ -482,10 +544,15 @@ where
         pool.drain(..take).collect()
     }
 
-    /// Compute and pool the inactivity-leak batch for `chunk_id`.
-    /// Splits the non-participant set into batches of at most
-    /// [`MAX_INACTIVITY_BATCH_COUNT`] validators so each fits
-    /// comfortably inside the runtime input buffer.
+    /// Compute and pool the inactivity-leak transactions for `chunk_id`.
+    ///
+    /// One borsh-encoded `Transaction::InactivityLeak(LeakTx)` is
+    /// produced per non-participating validator, keyed by that
+    /// validator's `withdrawal_credentials` (the 32-byte runtime
+    /// address mapped to their consensus BLS pubkey through the
+    /// chain spec). Each transaction lands in the next produced
+    /// block's `body.transactions` lane where the WASM executor
+    /// decodes and applies it through `apply_leak`.
     fn pool_inactivity_leak_for(&self, chunk_id: ChunkId) {
         let report = self.with_engine(|e| e.compute_inactivity_report(chunk_id));
         let Ok(report) = report else {
@@ -494,25 +561,25 @@ where
         if report.is_empty() {
             return;
         }
-        let pubkeys = self.with_engine(|e| {
+        let addresses = self.with_engine(|e| {
             let active = e.active_validator_set();
             report
                 .iter()
                 .filter_map(|idx| {
                     let pos = usize::try_from(*idx).ok()?;
-                    active.get(pos).map(|v| v.pubkey)
+                    active.get(pos).map(|v| v.withdrawal_credentials)
                 })
                 .collect::<Vec<_>>()
         });
-        if pubkeys.is_empty() {
+        if addresses.is_empty() {
             return;
         }
         let mut pool = self
             .inactivity_pool
             .lock()
             .expect("ChainBackend inactivity_pool poisoned");
-        for chunk_pubkeys in pubkeys.chunks(MAX_INACTIVITY_BATCH_COUNT) {
-            pool.push(encode_inactivity_batch(chunk_id, chunk_pubkeys));
+        for address in addresses {
+            pool.push(encode_inactivity_leak_tx(address));
         }
     }
 
@@ -1598,5 +1665,167 @@ where
     ) -> Result<RuntimeCallResponse, RuntimeCallError> {
         let _ = (at, method, args);
         Err(RuntimeCallError::RuntimeNotConfigured)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neutrino_consensus_types::{Header, IndexedVote, VrfRejectionReason};
+    use neutrino_primitives::HEADER_VERSION;
+
+    fn make_validator(address: [u8; 32]) -> Validator {
+        Validator {
+            pubkey: [0xAB; 48],
+            withdrawal_credentials: address,
+            effective_stake: 32_000_000_000,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }
+    }
+
+    fn sample_header(proposer_index: u32) -> Header {
+        Header {
+            version: HEADER_VERSION,
+            height: 1,
+            slot: 1,
+            parent_hash: [0; 32],
+            proposer_index,
+            vrf_proof: [0; 96],
+            state_root: [0; 32],
+            transactions_root: [0; 32],
+            votes_root: [0; 32],
+            slashings_root: [0; 32],
+            validator_ops_root: [0; 32],
+            da_root: [0; 32],
+            runtime_extra: [0; 32],
+            gas_used: 0,
+            gas_limit: 0,
+            timestamp: 0,
+            signature: [0; 96],
+        }
+    }
+
+    fn sample_indexed_vote() -> IndexedVote {
+        IndexedVote {
+            data: neutrino_consensus_types::FinalityVoteData {
+                chunk_id: 0,
+                round: 0,
+                chunk_hash: [0; 32],
+                phase: neutrino_consensus_types::FinalityVotePhase::Prevote,
+            },
+            signature: [0; 96],
+        }
+    }
+
+    fn decode_transaction(bytes: &[u8]) -> RuntimeTransaction {
+        borsh::from_slice(bytes).expect("borsh decodes as Transaction")
+    }
+
+    #[test]
+    fn encode_slashing_as_tx_emits_borsh_slash_for_double_proposal() {
+        let address = [0x11; 32];
+        let active_set = vec![make_validator(address)];
+        let evidence = SlashingEvidence::DoubleProposal {
+            proposer_index: 0,
+            header_a: sample_header(0),
+            header_b: sample_header(0),
+        };
+        let blob = encode_slashing_as_tx(&evidence, &active_set).expect("encoded");
+        match decode_transaction(&blob) {
+            RuntimeTransaction::Slash(SlashTx { validator, amount }) => {
+                assert_eq!(
+                    validator, address,
+                    "offender's runtime address from withdrawal_credentials"
+                );
+                assert_eq!(amount, CONSENSUS_SLASH_AMOUNT);
+            }
+            other => panic!("expected Transaction::Slash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_slashing_as_tx_handles_all_supported_variants() {
+        let address = [0x22; 32];
+        let active_set = vec![make_validator(address)];
+
+        // Every variant the consensus engine actively pools should
+        // map to a borsh-encoded Transaction::Slash.
+        let evidences = vec![
+            SlashingEvidence::DoubleProposal {
+                proposer_index: 0,
+                header_a: sample_header(0),
+                header_b: sample_header(0),
+            },
+            SlashingEvidence::DoublePrevote {
+                validator_index: 0,
+                vote_a: sample_indexed_vote(),
+                vote_b: sample_indexed_vote(),
+            },
+            SlashingEvidence::DoublePrecommit {
+                validator_index: 0,
+                vote_a: sample_indexed_vote(),
+                vote_b: sample_indexed_vote(),
+            },
+            SlashingEvidence::InvalidVrfClaim {
+                proposer_index: 0,
+                header: sample_header(0),
+                reason: VrfRejectionReason::ThresholdNotMet,
+            },
+        ];
+
+        for evidence in evidences {
+            let blob = encode_slashing_as_tx(&evidence, &active_set).expect("encoded");
+            match decode_transaction(&blob) {
+                RuntimeTransaction::Slash(SlashTx { validator, amount }) => {
+                    assert_eq!(validator, address);
+                    assert_eq!(amount, CONSENSUS_SLASH_AMOUNT);
+                }
+                other => panic!("expected Slash, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_slashing_as_tx_skips_unsupported_variants() {
+        let active_set = vec![make_validator([0x33; 32])];
+        let evidence = SlashingEvidence::DaCommitmentFraud {
+            proposer_index: 0,
+            header: sample_header(0),
+            fraud_proof: neutrino_consensus_types::DaFraudProof {
+                expected_da_root: [0; 32],
+                computed_da_root: [0; 32],
+                bundle_hash: [0; 32],
+                offending_bundle: vec![],
+            },
+        };
+        assert!(encode_slashing_as_tx(&evidence, &active_set).is_none());
+    }
+
+    #[test]
+    fn encode_slashing_as_tx_skips_out_of_range_offender_index() {
+        // Offender index points at validator 5; active set only has 1.
+        let active_set = vec![make_validator([0x44; 32])];
+        let evidence = SlashingEvidence::DoubleProposal {
+            proposer_index: 5,
+            header_a: sample_header(5),
+            header_b: sample_header(5),
+        };
+        assert!(encode_slashing_as_tx(&evidence, &active_set).is_none());
+    }
+
+    #[test]
+    fn encode_inactivity_leak_tx_emits_borsh_inactivity_leak() {
+        let address = [0x55; 32];
+        let blob = encode_inactivity_leak_tx(address);
+        match decode_transaction(&blob) {
+            RuntimeTransaction::InactivityLeak(LeakTx { validator, amount }) => {
+                assert_eq!(validator, address);
+                assert_eq!(amount, CONSENSUS_INACTIVITY_LEAK_AMOUNT);
+            }
+            other => panic!("expected InactivityLeak, got {other:?}"),
+        }
     }
 }

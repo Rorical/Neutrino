@@ -568,21 +568,26 @@ Coverage (`crates/node/tests/`):
 
 Deferred to follow-on milestones:
 
-1. **Cross-layer slashing / inactivity-leak wire bridge.** The
-   consensus engine emits `body.slashings` and inactivity-leak
-   batches in legacy wire formats (`encode_slashing` writes
-   `0x05 || pubkey[48]`; `encode_inactivity_batch` writes
-   `0x06 || chunk_id || pubkey[48]×N`). The new runtime decoder in
-   `WasmExecutor::execute_block` borsh-decodes each entry as
-   `Transaction` and silently drops anything that doesn't fit —
-   so no on-chain slash or leak has ever applied. The fix
-   requires both (a) rewriting the encoders to emit
-   `borsh(Transaction::Slash(SlashTx))` / `borsh(Transaction::
-   InactivityLeak(LeakTx))` and (b) a BLS-pubkey → Ed25519-address
-   mapping (the consensus validator set uses 48-byte BLS pubkeys;
-   the runtime uses 32-byte Ed25519 addresses). The detection /
-   pool / gossip / body-inclusion paths already work — only the
-   final consensus → runtime hand-off needs to land.
+1. ~~Cross-layer slashing / inactivity-leak wire bridge.~~
+   **Landed in M7-new follow-on.** `chain_backend::try_produce_block`
+   now encodes each drained `SlashingEvidence` as
+   `borsh(Transaction::Slash(SlashTx))` keyed by the offender's
+   `withdrawal_credentials` (the consensus validator's 32-byte
+   runtime address) and prepends the resulting blobs to
+   `body.transactions`. `pool_inactivity_leak_for` similarly emits
+   one `borsh(Transaction::InactivityLeak(LeakTx))` per
+   non-participating validator. The dead legacy
+   `encode_runtime_body*` / `encode_slashing` / `BodyEncodeError`
+   surface in `consensus-engine::body` was removed. Coverage:
+   - `crates/runtime-host/tests/wire_bridge.rs` — borsh-encoded
+     `Transaction::Slash` and `Transaction::InactivityLeak` in
+     `body.transactions` round-trip through
+     `WasmExecutor::execute_block` and mutate the runtime
+     validator state; legacy blobs are silently dropped.
+   - `crates/node/src/chain_backend.rs::tests` — every supported
+     `SlashingEvidence` variant maps to a borsh-decodable
+     `Transaction::Slash` keyed by the offender's runtime address;
+     unsupported variants and out-of-range indices return `None`.
 2. **`InvalidProofSigning` slashing pipeline.** The variant exists
    in `consensus-types::SlashingEvidence` but has no detector, no
    verifier (`Engine::verify_slashing_evidence` returns

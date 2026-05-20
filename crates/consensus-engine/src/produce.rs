@@ -38,7 +38,7 @@ use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
 use crate::block_state::BlockState;
-use crate::body::{BodyEncodeError, apply_body_roots, compute_body_roots};
+use crate::body::{apply_body_roots, compute_body_roots};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::proposer::ProposerKey;
@@ -60,8 +60,6 @@ pub enum ProductionError<E> {
     },
     /// Block height counter would overflow `u64`.
     HeightOverflow,
-    /// Body encoding rejected the supplied transactions.
-    BodyEncode(BodyEncodeError),
     /// The dynamic runtime ([`BlockExecutor`]) failed during the
     /// dry-run path.
     Executor(String),
@@ -92,7 +90,6 @@ impl<E: fmt::Display + fmt::Debug> fmt::Display for ProductionError<E> {
                 "proposer index {index} is outside active set of length {active_set_len}"
             ),
             Self::HeightOverflow => f.write_str("block height counter overflowed"),
-            Self::BodyEncode(e) => write!(f, "body encode failed: {e}"),
             Self::Executor(msg) => write!(f, "block executor failed: {msg}"),
             Self::ProposerKeyMismatch { index } => {
                 write!(f, "proposer key does not match validator at index {index}")
@@ -120,12 +117,6 @@ impl<E> From<EngineError<E>> for ProductionError<E> {
 impl<E> From<StoreError<E>> for ProductionError<E> {
     fn from(value: StoreError<E>) -> Self {
         Self::Engine(EngineError::Store(value))
-    }
-}
-
-impl<E> From<BodyEncodeError> for ProductionError<E> {
-    fn from(value: BodyEncodeError) -> Self {
-        Self::BodyEncode(value)
     }
 }
 
@@ -192,8 +183,7 @@ impl<DB: Database> Engine<DB> {
     /// - [`ProductionError::HeightOverflow`] if the block height
     ///   counter would overflow `u64`.
     /// - [`ProductionError::Executor`] if the dynamic runtime fails.
-    /// - [`ProductionError::Engine`] / [`ProductionError::BodyEncode`]
-    ///   on persistence or encoding failures.
+    /// - [`ProductionError::Engine`] on persistence failures.
     pub fn try_produce_block(
         &mut self,
         slot: Slot,

@@ -30,9 +30,7 @@ pub mod validator_set;
 
 pub use bft_loop::{BftAction, BftLoopError, BftSession};
 pub use block_state::{BlockState, InvalidTransition};
-pub use body::{
-    BodyEncodeError, BodyRoots, apply_body_roots, compute_body_roots, encode_runtime_body,
-};
+pub use body::{BodyRoots, apply_body_roots, compute_body_roots};
 pub use checkpoint::{CheckpointError, CheckpointOutcome};
 pub use clock::SlotClock;
 pub use engine::Engine;

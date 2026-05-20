@@ -197,6 +197,7 @@ mod wasm_abi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neutrino_default_runtime_core::VALIDATOR_SET_KEY;
     use neutrino_runtime_abi::StateWitness;
     use neutrino_runtime_core::empty_state_root;
 
@@ -206,11 +207,15 @@ mod tests {
             chain_id: 1,
             transactions: alloc::vec![],
         };
+        // `apply_block` reads the validator-set key for the canonical
+        // `validator_set_root` commitment even on empty blocks, so the
+        // witness must include it; the value is absent so the read
+        // returns `None`.
         let witness = StateWitness {
             pre_state_root: empty_state_root(),
             nodes: alloc::vec![],
             values: alloc::vec![],
-            witnessed_keys: alloc::vec![],
+            witnessed_keys: alloc::vec![VALIDATOR_SET_KEY.to_vec()],
         };
         let bytes = borsh::to_vec(&(input, witness)).unwrap();
         let out_bytes = apply_block_with_witness(&bytes);

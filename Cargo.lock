@@ -3886,6 +3886,7 @@ dependencies = [
  "borsh",
  "neutrino-consensus-engine",
  "neutrino-consensus-types",
+ "neutrino-default-runtime-core",
  "neutrino-mempool",
  "neutrino-network",
  "neutrino-primitives",
@@ -3920,6 +3921,7 @@ dependencies = [
  "borsh",
  "neutrino-consensus-types",
  "neutrino-primitives",
+ "neutrino-trie",
 ]
 
 [[package]]

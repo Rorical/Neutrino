@@ -18,9 +18,10 @@ use neutrino_default_runtime_core::StfPublicOutput;
 use neutrino_proof_system::{ProofError, ProofSystem, public_inputs::BlockPublicInputs};
 use sp1_sdk::{
     SP1ProofWithPublicValues, SP1ProvingKey, SP1VerifyingKey,
-    blocking::{MockProver, Prover, ProverClient},
+    blocking::{MockProver, ProveRequest, Prover, ProverClient},
 };
 
+use crate::executor::decode_witness_bundle;
 use crate::{ProverCtx, Sp1HostError};
 
 /// Wire form of an SP1 block proof.
@@ -124,14 +125,66 @@ where
 
     fn prove_block(
         &self,
-        _witness: &[u8],
-        _public_inputs: &BlockPublicInputs,
+        witness: &[u8],
+        public_inputs: &BlockPublicInputs,
     ) -> Result<Self::BlockProof, ProofError> {
-        // Production wiring lands in M5-new. Until then the engine's
-        // `try_produce_block` returns `RuntimeUnavailable` so this
-        // method is unreachable from the running node; tests that need
-        // a proof can use the `runtime_host::prove` helper directly.
-        Err(ProofError::Unsupported)
+        // 1. Decode the witness bundle the executor wrote during
+        //    block production. The wire format is owned by
+        //    `runtime_host::executor`; any decode failure means the
+        //    stored bytes are not the canonical
+        //    `borsh(StfInput) || borsh(StateWitness)` shape and the
+        //    proof system cannot proceed.
+        let (input, witness) =
+            decode_witness_bundle(witness).map_err(|_| ProofError::InvalidWitness)?;
+
+        // 2. Bind the witness's pre-state-root to the consensus
+        //    engine's `state_root_before`. The cryptographic check
+        //    happens inside the guest (`WitnessState::new` rebuilds
+        //    the partial trie and rejects a mismatch), but failing
+        //    fast here avoids a wasted proof.
+        if witness.pre_state_root != public_inputs.state_root_before {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if input.chain_id != public_inputs.chain_id {
+            return Err(ProofError::PublicInputMismatch);
+        }
+
+        // 3. Serialize for SP1's stdin. The witness bundle is already
+        //    in the layout the guest reads (input || witness); we
+        //    only need to wrap it in an `SP1Stdin`.
+        let mut stdin = sp1_sdk::SP1Stdin::new();
+        let mut payload = Vec::new();
+        BorshSerialize::serialize(&input, &mut payload).map_err(|_| ProofError::InvalidWitness)?;
+        BorshSerialize::serialize(&witness, &mut payload)
+            .map_err(|_| ProofError::InvalidWitness)?;
+        stdin.write_vec(payload);
+
+        // 4. Drive the configured prover (mock / cpu / cuda / network)
+        //    to produce a Compressed STARK bound to the embedded
+        //    guest ELF's verifying key.
+        let proof = self
+            .ctx
+            .prover
+            .prove(&self.ctx.pk, stdin)
+            .compressed()
+            .run()
+            .map_err(|_| ProofError::BackendRejected)?;
+
+        // 5. Cross-check the committed StfPublicOutput against the
+        //    consensus public inputs before handing the proof back.
+        //    `verify_block` re-checks this too, but doing it here as
+        //    well surfaces a state-root divergence as a proving
+        //    failure rather than a downstream verification failure.
+        let committed: StfPublicOutput =
+            BorshDeserialize::deserialize_reader(&mut proof.public_values.as_slice())
+                .map_err(|_| ProofError::MalformedProof)?;
+        if committed.pre_state_root != public_inputs.state_root_before
+            || committed.post_state_root != public_inputs.state_root_after
+        {
+            return Err(ProofError::PublicInputMismatch);
+        }
+
+        Sp1BlockProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof)
     }
 
     fn verify_block(

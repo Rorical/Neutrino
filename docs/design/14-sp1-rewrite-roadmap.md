@@ -315,23 +315,82 @@ Exit criteria:
 
 ## M5-new - Single-validator node with SP1 block proofs
 
+Status: production / proof path landed. Replay coverage for long
+chains and WASM-driven RPC are pending follow-on work.
+
 Goal: restore end-to-end single-node behavior after the rewrite.
 
-Implement:
+Landed:
 
-1. block production through WASM execution
-2. witness generation from the WASM dry-run trace
-3. SP1 proof generation for produced blocks
-4. SP1 proof verification on import
-5. RocksDB storage for SP1 block proofs and public values
-6. RPC served through the WASM dynamic runtime
+1. `BlockExecutor` trait in `proof-system`, paired with a
+   dyn-friendly `ErasedBlockExecutor` so the engine's
+   `try_produce_block` can take the dynamic-runtime seam without a
+   third generic parameter.
+2. `runtime-host::WasmExecutor` drives the embedded default-runtime
+   master cdylib through wasmtime, mutates the engine's
+   authoritative state trie in place with the block's writes, and
+   emits the borsh-encoded `(StfInput, StateWitness)` blob the SP1
+   guest replays.
+3. `Engine::try_produce_block` is no longer a stub: it validates
+   slot monotonicity + VRF eligibility, snapshots the engine's
+   trie into a `LiveTrie`, delegates to the installed
+   `ErasedBlockExecutor`, computes body Merkle roots, assembles
+   and proposer-signs the canonical `Header` (wiring the runtime's
+   `validator_set_root` into `header.runtime_extra`), persists
+   header / body / witness / FSM state / tip pointer, and advances
+   the in-memory head + state trie atomically.
+4. `Sp1ProofSystem::prove_block` is implemented end-to-end: it
+   decodes the witness blob, pre-validates `pre_state_root` and
+   `chain_id` against the consensus public inputs, drives the
+   configured SP1 prover (mock / cpu / cuda / network), and
+   cross-checks the committed `StfPublicOutput` before handing the
+   wire proof back. `verify_block` remains symmetric.
+5. `ChainBackend` exposes `set_block_executor`; the node binary
+   installs `WasmExecutor::default_runtime()` at startup. Tests
+   that don't exercise local production simply skip the install
+   and `try_produce_block` surfaces a clear
+   `ProductionError::Executor` instead of silently failing.
+6. RocksDB storage for SP1 block proofs and witnesses is unchanged
+   from M3-new and now actually carries data: every produced block
+   persists `(header, body, BlockState::BlockProduced, witness)`
+   under the existing column families.
+7. `header.runtime_extra` carries the runtime's
+   `validator_set_root` for every produced block so chunk BFT and
+   the future M7-new finality path observe the post-block stake
+   distribution without re-running the runtime.
 
-Exit criteria:
+Coverage:
 
-1. One node produces and imports blocks for 1000 slots.
-2. Every non-empty block has a verified SP1 Compressed STARK proof.
-3. Replay from genesis matches header hashes and state roots.
-4. RPC queries work through the WASM runtime.
+- `crates/node/tests/single_validator_production.rs` exercises the
+  full pipeline: produce → witness persist → SP1 mock-prove →
+  state advance → produce-again → SP1 mock-prove. Asserts that
+  `header.runtime_extra` matches the canonical empty validator-set
+  commitment and that block 2's `state_root_before` equals block
+  1's `state_root_after`.
+
+Deferred to follow-on milestones:
+
+1. 1000-slot replay regression — long-horizon test depends on
+   chunk-BFT advance through real proofs, gated on M6-new gossip.
+2. RPC served through the WASM dynamic runtime — `RpcBackend`'s
+   `runtime_call` still returns `RuntimeNotConfigured`; the
+   `WasmExecutor` is wired only for production, not RPC. The
+   wasmtime instance can be re-used here once the runtime exposes
+   a `query` ABI worth surfacing.
+
+Exit criteria (status):
+
+1. One node produces and imports blocks for 1000 slots — partial.
+   The single-validator integration test produces and proves
+   multiple consecutive blocks; the 1000-slot regression is
+   deferred pending M6-new.
+2. Every non-empty block has a verified SP1 Compressed STARK proof
+   — met for the production path; the M5-new test exercises
+   `prove_block` end-to-end under the mock prover. CPU prover
+   coverage is exercised by `crates/runtime-host/tests/`.
+3. Replay from genesis matches header hashes and state roots —
+   deferred to M6-new along with the gossip pipeline.
+4. RPC queries work through the WASM runtime — deferred.
 
 ## M6-new - Networking with SP1 block proof gossip
 

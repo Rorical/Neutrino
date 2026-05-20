@@ -363,6 +363,17 @@ impl<DB: Database> Engine<DB> {
         self.head_state_root = state_root;
     }
 
+    /// Swap the in-memory state trie for the post-execution trie a
+    /// [`BlockExecutor`](neutrino_proof_system::BlockExecutor)
+    /// returned during production.
+    ///
+    /// Crate-internal — only [`Engine::try_produce_block`] may call
+    /// this, in lock-step with [`Self::update_head_internal`] so the
+    /// committed `head_state_root` always matches `state.root()`.
+    pub(crate) fn replace_state_internal(&mut self, next: Trie) {
+        self.state = next;
+    }
+
     /// Advance the in-memory finalization pointers after chunk
     /// finalization has persisted everything. Crate-internal — the
     /// finalize module is the only legitimate caller.

@@ -50,7 +50,7 @@ use neutrino_primitives::{
     BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
     Validator, ZERO_HASH, blake3_256,
 };
-use neutrino_proof_system::ProofSystem;
+use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
 use neutrino_rpc::{
     BlockId, FinalizedInfo, HeadInfo, RpcBackend, RuntimeCallError, RuntimeCallResponse,
     SubmitError as RpcSubmitError,
@@ -132,6 +132,13 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// double-application is enforced by the runtime's
     /// `leak:through` pointer.
     inactivity_pool: Mutex<Vec<Vec<u8>>>,
+    /// Dynamic-runtime executor used by [`Self::try_produce_block`].
+    /// `None` leaves the producer disabled (any production attempt
+    /// surfaces [`ProductionError::Executor`]); the node binary
+    /// installs a [`neutrino_runtime_host::WasmExecutor`] at
+    /// startup. Tests that exercise gossip / BFT but not local
+    /// production deliberately leave this unset.
+    block_executor: Mutex<Option<Arc<dyn ErasedBlockExecutor>>>,
 }
 
 /// Encode a single `TX_INACTIVITY_LEAK_BATCH` runtime transaction
@@ -206,7 +213,32 @@ where
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(SlashingPool::default()),
             inactivity_pool: Mutex::new(Vec::new()),
+            block_executor: Mutex::new(None),
         }
+    }
+
+    /// Install the dynamic-runtime [`ErasedBlockExecutor`] the
+    /// producer hands to [`Engine::try_produce_block`].
+    ///
+    /// The node binary calls this with a
+    /// [`neutrino_runtime_host::WasmExecutor`] at startup. Tests
+    /// that exercise gossip / BFT but never call
+    /// [`Self::try_produce_block`] can leave this unset.
+    pub fn set_block_executor<X>(&self, executor: X)
+    where
+        X: ErasedBlockExecutor + 'static,
+    {
+        *self
+            .block_executor
+            .lock()
+            .expect("ChainBackend block_executor poisoned") = Some(Arc::new(executor));
+    }
+
+    fn block_executor_snapshot(&self) -> Option<Arc<dyn ErasedBlockExecutor>> {
+        self.block_executor
+            .lock()
+            .expect("ChainBackend block_executor poisoned")
+            .clone()
     }
 
     /// Enable the multi-validator chunk-BFT loop by installing the
@@ -375,11 +407,24 @@ where
             slashings: drained_slashings.clone(),
             ..Body::default()
         };
-        let result = self.with_engine_mut(|e| {
-            let gas_limit = e.chain_spec().genesis_gas_limit;
-            let cfg = ProductionConfig { proposer };
-            e.try_produce_block(slot, cfg, body, gas_limit)
-        });
+        // The executor lives behind an `Arc<dyn ErasedBlockExecutor>`
+        // so we can hold a snapshot across the engine mutex without
+        // poisoning. Production fails fast if no executor has been
+        // installed; the node binary always installs one.
+        let result = self.block_executor_snapshot().map_or_else(
+            || {
+                Err(ProductionError::Executor(
+                    "no block executor configured".to_string(),
+                ))
+            },
+            |executor| {
+                self.with_engine_mut(|e| {
+                    let gas_limit = e.chain_spec().genesis_gas_limit;
+                    let cfg = ProductionConfig { proposer };
+                    e.try_produce_block(slot, cfg, body, gas_limit, executor.as_ref())
+                })
+            },
+        );
         // On Ok(Some) the engine consumed the body — the drained
         // transactions, slashings, and inactivity leaks are now
         // committed. On Ok(None) (not eligible) the engine did not
@@ -570,6 +615,25 @@ where
     /// Current head height, snapshotted under the engine mutex.
     pub fn head_height(&self) -> neutrino_primitives::Height {
         self.with_engine(neutrino_consensus_engine::Engine::head_height)
+    }
+
+    /// FSM state of the block at `hash`, if it has been observed.
+    ///
+    /// Used by the M5-new production integration test and by
+    /// debugging tooling that wants to know whether a block has
+    /// progressed past [`BlockState::BlockProduced`].
+    pub fn block_state(&self, hash: &BlockHash) -> Option<neutrino_consensus_engine::BlockState> {
+        self.with_engine(|e| e.store().get_block_state(hash).ok().flatten())
+    }
+
+    /// Raw execution witness bytes persisted for `hash`.
+    ///
+    /// The producer writes the borsh-encoded
+    /// `(StfInput, StateWitness)` blob here so [`Self::prove_block`]
+    /// can replay it. Returns `None` for blocks imported through the
+    /// gossip path (peers do not gossip witnesses).
+    pub fn witness_bytes(&self, hash: &BlockHash) -> Option<Vec<u8>> {
+        self.with_engine(|e| e.store().get_witness(hash).ok().flatten())
     }
 
     /// Chunk size declared by the active chain spec. Used by the

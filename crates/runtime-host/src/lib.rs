@@ -17,9 +17,11 @@
 //!   [`StfPublicOutput`], and check it equals the caller's expected
 //!   output (covers the "tampered `post_state_root`" exit criterion).
 
+pub mod executor;
 pub mod proof_system;
 pub mod wasm;
 
+pub use executor::{ExecutorError, WasmExecutor, decode_witness_bundle};
 pub use proof_system::{Sp1BlockProof, Sp1ProofSystem};
 
 use std::fs;
@@ -30,6 +32,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block};
 use neutrino_runtime_abi::StateWitness;
 use neutrino_runtime_core::host::{LiveTrie, TracingState};
+use neutrino_trie::{Blake3Hasher, Trie};
 use sp1_sdk::{
     Elf, ExecutionReport, HashableKey, ProvingKey, SP1_CIRCUIT_VERSION, SP1ProofWithPublicValues,
     SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey,
@@ -98,6 +101,14 @@ pub struct DryRun {
     pub output: StfPublicOutput,
     /// Witness captured during dry-run; pass this to [`prove`].
     pub witness: StateWitness,
+    /// Post-execution state trie with every overlay write applied.
+    ///
+    /// The block producer swaps this back into the engine's
+    /// authoritative state trie after a successful dry-run so the
+    /// in-memory head advances in lock-step with the witnessed
+    /// transition. Read-only blocks return a clone of the live
+    /// snapshot so the swap is unconditional.
+    pub post_state: Trie<Blake3Hasher>,
 }
 
 /// Cached prover + proving/verifying keys for a single guest ELF.
@@ -318,8 +329,12 @@ fn codec_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
 pub fn dry_run(input: &StfInput, live: &LiveTrie) -> DryRun {
     let mut tracer = TracingState::new(live);
     let output = apply_block(input, &mut tracer);
-    let witness = tracer.into_witness();
-    DryRun { output, witness }
+    let (post_state, witness) = tracer.into_committed_and_witness();
+    DryRun {
+        output,
+        witness,
+        post_state,
+    }
 }
 
 fn encode_stdin(input: &StfInput, witness: &StateWitness) -> Result<Vec<u8>, Sp1HostError> {
@@ -431,7 +446,11 @@ mod tests {
     #[test]
     fn dry_run_of_empty_block_is_noop() {
         let live = LiveTrie::default();
-        let DryRun { output, witness } = dry_run(
+        let DryRun {
+            output,
+            witness,
+            post_state,
+        } = dry_run(
             &StfInput {
                 chain_id: 1,
                 transactions: Vec::new(),
@@ -445,5 +464,8 @@ mod tests {
         // `validator_set_root` commitment, so even empty blocks witness
         // exactly that one key.
         assert_eq!(witness.witnessed_keys.len(), 1);
+        // Read-only blocks fall back to a clone of the live trie so
+        // the producer's swap path remains unconditional.
+        assert_eq!(post_state.root(), live.state_root());
     }
 }

@@ -214,6 +214,14 @@ pub mod host {
     }
 
     impl LiveTrie {
+        /// Wrap an existing trie as a read-only snapshot. Used by the
+        /// block producer to take a [`LiveTrie`] view of the engine's
+        /// authoritative state trie before invoking the runtime.
+        #[must_use]
+        pub const fn from_trie(trie: Trie<Blake3Hasher>) -> Self {
+            Self { trie }
+        }
+
         /// Insert (or overwrite) a value.
         pub fn insert(&mut self, key: &[u8], value: Vec<u8>) {
             self.trie
@@ -287,6 +295,25 @@ pub mod host {
         /// reads no state.
         #[must_use]
         pub fn into_witness(self) -> StateWitness {
+            self.into_committed_and_witness().1
+        }
+
+        /// Consume the tracer and return both the **post-state trie**
+        /// (with every overlay write applied) and the
+        /// [`StateWitness`].
+        ///
+        /// The block producer uses this to advance the engine's
+        /// authoritative state trie in lock-step with the witness it
+        /// hands to the SP1 prover. The returned trie's
+        /// `drain_pending_*` lists carry exactly the new content-
+        /// addressed nodes and values produced by this block, so the
+        /// engine can flush only the diff to RocksDB.
+        ///
+        /// If the STF performed no writes the returned trie is a
+        /// clone of the live snapshot; the pending lists are empty
+        /// and the root equals `pre_state_root`.
+        #[must_use]
+        pub fn into_committed_and_witness(self) -> (Trie<Blake3Hasher>, StateWitness) {
             let mut nodes = BTreeMap::new();
             let mut values = BTreeMap::new();
             for key in &self.accessed {
@@ -302,7 +329,7 @@ pub mod host {
                     nodes.entry(self.pre_root).or_insert_with(|| bytes.to_vec());
                 }
             }
-            StateWitness {
+            let witness = StateWitness {
                 pre_state_root: self.pre_root,
                 nodes: nodes
                     .into_iter()
@@ -313,7 +340,13 @@ pub mod host {
                     .map(|(hash, bytes)| TrieValueBytes { hash, bytes })
                     .collect(),
                 witnessed_keys: self.accessed.into_iter().collect(),
-            }
+            };
+            // Read-only blocks fall back to a clone of the live trie
+            // so the producer can swap the result back into the
+            // engine unconditionally without inspecting the
+            // scratch-was-initialised flag.
+            let post_state = self.scratch.unwrap_or_else(|| self.live.trie().clone());
+            (post_state, witness)
         }
 
         fn ensure_scratch(&mut self) -> &mut Trie<Blake3Hasher> {

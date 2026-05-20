@@ -163,11 +163,16 @@ impl WasmRuntime {
         }
 
         // Materialise the witness from the recorded accesses against
-        // the live trie.
+        // the live trie and return the post-state scratch trie so the
+        // producer can swap it into the engine's authoritative state.
         let host = store.into_data().into_inner().expect("HostState mutex");
-        let witness = host.into_witness();
+        let (post_state, witness) = host.into_state_and_witness();
 
-        Ok(DryRun { output, witness })
+        Ok(DryRun {
+            output,
+            witness,
+            post_state,
+        })
     }
 }
 
@@ -219,7 +224,7 @@ impl HostState {
         let _ = self.scratch.remove(key);
     }
 
-    fn into_witness(self) -> StateWitness {
+    fn into_state_and_witness(self) -> (Trie<Blake3Hasher>, StateWitness) {
         let mut nodes = BTreeMap::new();
         let mut values = BTreeMap::new();
         for key in &self.accessed {
@@ -233,7 +238,7 @@ impl HostState {
                 nodes.entry(pre_root).or_insert_with(|| bytes.to_vec());
             }
         }
-        StateWitness {
+        let witness = StateWitness {
             pre_state_root: pre_root,
             nodes: nodes
                 .into_iter()
@@ -244,7 +249,8 @@ impl HostState {
                 .map(|(hash, bytes)| TrieValueBytes { hash, bytes })
                 .collect(),
             witnessed_keys: self.accessed.into_iter().collect(),
-        }
+        };
+        (self.scratch, witness)
     }
 }
 

@@ -13,7 +13,7 @@ use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::ChainSpec;
-use neutrino_runtime_host::Sp1ProofSystem;
+use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use sp1_sdk::blocking::CpuProver;
 
 /// Concrete `ChainBackend` parameterisation used by the production
@@ -189,6 +189,14 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         "using real engine backend"
     );
     let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
+    // Install the WASM block executor so the producer loop's
+    // dry-run path can build SP1 witnesses. The embedded default-
+    // runtime master cdylib is the only runtime today; on-chain
+    // upgrades will install a different `WasmExecutor` per
+    // activation epoch.
+    let block_executor =
+        WasmExecutor::default_runtime().map_err(|err| NodeError::ProofSystem(err.to_string()))?;
+    concrete_backend.set_block_executor(block_executor);
     let producer_job: Option<(Arc<NodeBackend>, BlockProducerConfig)> =
         production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;

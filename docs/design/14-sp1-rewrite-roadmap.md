@@ -225,10 +225,12 @@ Exit criteria:
 
 ## M4-new - Default runtime equivalent rewrite
 
-Status: M4-A + M4-B landed (accounts + Ed25519 transfers + real
-Merkle witnesses via `neutrino-trie`). M4-C (validator set + staking
-lifecycle) and M4-D (inactivity leak + slashing application) are
-still pending.
+Status: M4-A, M4-B, M4-C, and M4-D landed. The default runtime now
+ports accounts + transfers, the staking lifecycle (stake / unstake),
+on-chain slashing application, and inactivity-leak application against
+real Merkle witnesses. Deposits, voluntary exits, and unbonding delays
+remain pending; their wire/state layout will track real production
+needs in later milestones.
 
 Goal: port the existing default runtime semantics into shared STF core form.
 
@@ -259,15 +261,41 @@ Witness model (M4-B landed):
   node when present so empty-access blocks still bind to
   `pre_state_root` cryptographically.
 
-Port (M4-C and later):
+Port (M4-C landed): staking lifecycle
 
-4. stake and unstake
+- `Validator { stake: u128, active: bool }` stored under
+  `b"val:" || addr` (36-byte keys).
+- `ValidatorSet { entries: Vec<(addr, stake)> }` stored under the
+  fixed key `b"validator_set"`, kept sorted by address. The canonical
+  commitment is `BLAKE3(DOMAIN_VALIDATOR_SET_ROOT || count_le ||
+  (addr || stake_le)*)`.
+- `Transaction::Stake` / `Transaction::Unstake` — Ed25519-signed over
+  a fixed 80-byte canonical payload
+  `(domain, chain_id, validator, amount, nonce)`. Both atomically move
+  funds between `Account.balance` and `Validator.stake` and
+  upsert / remove the validator from the canonical set.
+- No unbonding delay yet; unstake returns funds in the same block.
+- `StfPublicOutput` gains a `validator_set_root: StateRoot` field
+  committed by the SP1 Guest. The consensus engine will wire it into
+  `header.runtime_extra` in M5-new.
+
+Port (M4-D landed): inactivity leak + on-chain slashing
+
+- `Transaction::Slash(SlashTx { validator, amount })` and
+  `Transaction::InactivityLeak(LeakTx { validator, amount })` are
+  consensus-driven (no Ed25519 signature). Both clamp `amount` to the
+  validator's current stake and deduct, mark the validator inactive
+  if the resulting stake is zero, and update the canonical set. The
+  STF trusts the block-level inclusion gate (which validates the
+  underlying evidence / inactivity report); real evidence proofs land
+  alongside multi-validator finality in M7-new.
+
+Port (M4-C+ and later):
+
 5. deposits
 6. voluntary exits
-7. validator-set accumulator/root
-8. inactivity leak application
-9. on-chain slashing application
-10. counter-key compatibility only if still needed by active tests
+7. unbonding delay
+10. counter-key compatibility (intentionally dropped; not needed)
 
 Requirements:
 

@@ -441,7 +441,9 @@ mod tests {
         assert_eq!(output.applied, 0);
         assert_eq!(output.failed, 0);
         assert_eq!(output.pre_state_root, output.post_state_root);
-        assert!(witness.nodes.is_empty());
-        assert!(witness.witnessed_keys.is_empty());
+        // `apply_block` reads the validator-set key for the canonical
+        // `validator_set_root` commitment, so even empty blocks witness
+        // exactly that one key.
+        assert_eq!(witness.witnessed_keys.len(), 1);
     }
 }

@@ -277,19 +277,6 @@ pub enum ProofRejectionReason {
     VerifierRejected,
 }
 
-/// Evidence that a block proof was invalid.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct BlockProofRejection {
-    /// Block hash the proof claimed to cover.
-    pub block_hash: BlockHash,
-    /// Hash or backend commitment to the rejected proof bytes.
-    pub proof_hash: Hash,
-    /// Verifier version that produced the rejection.
-    pub verifier_version: u32,
-    /// Rejection reason.
-    pub reason: ProofRejectionReason,
-}
-
 /// Evidence for a Tendermint lock violation.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct LockEvidence {

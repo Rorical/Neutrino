@@ -225,13 +225,23 @@ Exit criteria:
 
 ## M4-new - Default runtime equivalent rewrite
 
+Status: M4-A landed (accounts + Ed25519 transfers). M4-B (real Merkle
+witnesses), M4-C (validator set + staking lifecycle), and M4-D
+(inactivity leak + slashing application) are still pending.
+
 Goal: port the existing default runtime semantics into shared STF core form.
 
-Port:
+Port (M4-A landed):
 
-1. accounts
-2. Ed25519 transfers
-3. nonce and balance checks
+1. accounts — `Account { nonce: u64, balance: u128 }` stored under
+   `b"acct:" || ed25519_pk` (37-byte keys).
+2. Ed25519 transfers — `Transaction::Transfer` signed over a 112-byte
+   canonical payload `(domain_tag, chain_id, from, to, amount, nonce)`.
+3. nonce and balance checks — strict equality on nonce, `>=` on
+   balance, both enforced inside `apply_block` before any state write.
+
+Port (M4-B and later):
+
 4. stake and unstake
 5. deposits
 6. voluntary exits

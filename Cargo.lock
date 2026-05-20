@@ -3829,9 +3829,12 @@ name = "neutrino-default-runtime-core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "ed25519-dalek",
  "neutrino-primitives",
  "neutrino-runtime-abi",
  "neutrino-runtime-core",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -3968,6 +3971,7 @@ dependencies = [
  "bincode",
  "blake3",
  "borsh",
+ "ed25519-dalek",
  "neutrino-consensus-types",
  "neutrino-default-runtime-core",
  "neutrino-default-runtime-master",
@@ -3975,6 +3979,8 @@ dependencies = [
  "neutrino-proof-system",
  "neutrino-runtime-abi",
  "neutrino-runtime-core",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
  "sp1-build",
  "sp1-sdk",
  "thiserror 2.0.18",

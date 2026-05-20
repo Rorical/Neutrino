@@ -17,9 +17,14 @@ crate-type = ["rlib"]
 
 [dependencies]
 borsh                = { workspace = true }
+ed25519-dalek        = { workspace = true }
 neutrino-runtime-core = { workspace = true }
 neutrino-runtime-abi  = { workspace = true }
 neutrino-primitives   = { workspace = true }
+
+[dev-dependencies]
+rand_core            = { workspace = true }
+rand_chacha          = { workspace = true }
 
 [lints]
 workspace = true

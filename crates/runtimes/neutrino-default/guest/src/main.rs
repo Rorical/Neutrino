@@ -28,7 +28,7 @@ fn main() {
     let mut state =
         WitnessState::new(&witness).expect("witness must match claimed pre_state_root");
 
-    let output: StfPublicOutput = apply_block(input, &mut state);
+    let output: StfPublicOutput = apply_block(&input, &mut state);
 
     let output_bytes = borsh::to_vec(&output).expect("encode StfPublicOutput");
     sp1_zkvm::io::commit_slice(&output_bytes);

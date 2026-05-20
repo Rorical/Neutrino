@@ -132,7 +132,7 @@ impl<P: Prover> ProverCtx<P> {
     /// See [`prove_with`].
     pub fn prove(
         &self,
-        input: StfInput,
+        input: &StfInput,
         witness: StateWitness,
     ) -> Result<BlockProof, Sp1HostError> {
         let mut stdin = SP1Stdin::new();
@@ -181,7 +181,7 @@ impl<P: Prover> ProverCtx<P> {
     /// input could not be borsh-encoded.
     pub fn execute(
         &self,
-        input: StfInput,
+        input: &StfInput,
         witness: &StateWitness,
     ) -> Result<(SP1PublicValues, ExecutionReport), Sp1HostError> {
         let mut stdin = SP1Stdin::new();
@@ -315,16 +315,16 @@ fn codec_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
 /// SP1 Guest needs to replay the same transition. Pure dry-run — no
 /// writes are committed to `live`.
 #[must_use]
-pub fn dry_run(input: StfInput, live: &LiveStateMap) -> DryRun {
+pub fn dry_run(input: &StfInput, live: &LiveStateMap) -> DryRun {
     let mut tracer = TracingState::new(live);
     let output = apply_block(input, &mut tracer);
     let witness = tracer.into_witness();
     DryRun { output, witness }
 }
 
-fn encode_stdin(input: StfInput, witness: &StateWitness) -> Result<Vec<u8>, Sp1HostError> {
+fn encode_stdin(input: &StfInput, witness: &StateWitness) -> Result<Vec<u8>, Sp1HostError> {
     let mut bytes = Vec::new();
-    BorshSerialize::serialize(&input, &mut bytes).map_err(codec_err)?;
+    BorshSerialize::serialize(input, &mut bytes).map_err(codec_err)?;
     BorshSerialize::serialize(witness, &mut bytes).map_err(codec_err)?;
     Ok(bytes)
 }
@@ -337,7 +337,7 @@ fn encode_stdin(input: StfInput, witness: &StateWitness) -> Result<Vec<u8>, Sp1H
 /// [`Sp1HostError::Codec`] when the input cannot be borsh-encoded.
 pub fn prove_with<P>(
     prover: &P,
-    input: StfInput,
+    input: &StfInput,
     witness: StateWitness,
 ) -> Result<BlockProof, Sp1HostError>
 where
@@ -396,7 +396,7 @@ where
 ///
 /// # Errors
 /// See [`prove_with`].
-pub fn prove(input: StfInput, witness: StateWitness) -> Result<BlockProof, Sp1HostError> {
+pub fn prove(input: &StfInput, witness: StateWitness) -> Result<BlockProof, Sp1HostError> {
     prove_with(&ProverClient::from_env(), input, witness)
 }
 
@@ -421,8 +421,6 @@ pub fn vk_fingerprint(vk: &SP1VerifyingKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_default_runtime_core::COUNTER_KEY;
-    use neutrino_runtime_core::state_root_of;
 
     #[test]
     fn errors_implement_std_error() {
@@ -431,23 +429,18 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_records_counter_read_and_write() {
-        let mut live = LiveStateMap::default();
-        live.insert(COUNTER_KEY.to_vec(), 4u32.to_le_bytes().to_vec());
-
-        let DryRun { output, witness } = dry_run(StfInput { delta: 6 }, &live);
-        assert_eq!(output.counter, 10);
-        assert_eq!(
-            output.post_state_root,
-            state_root_of([(COUNTER_KEY, 10u32.to_le_bytes().as_slice())])
+    fn dry_run_of_empty_block_is_noop() {
+        let live = LiveStateMap::default();
+        let DryRun { output, witness } = dry_run(
+            &StfInput {
+                chain_id: 1,
+                transactions: Vec::new(),
+            },
+            &live,
         );
-
-        // Witness must include the counter key with its pre-state value.
-        let entry = witness
-            .entries
-            .iter()
-            .find(|e| e.key == COUNTER_KEY)
-            .unwrap();
-        assert_eq!(entry.value.as_deref(), Some(&4u32.to_le_bytes()[..]));
+        assert_eq!(output.applied, 0);
+        assert_eq!(output.failed, 0);
+        assert_eq!(output.pre_state_root, output.post_state_root);
+        assert!(witness.entries.is_empty());
     }
 }

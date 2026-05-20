@@ -33,10 +33,9 @@ pub fn apply_block_with_witness(input_bytes: &[u8]) -> Vec<u8> {
     let (input, witness): (StfInput, StateWitness) =
         borsh::from_slice(input_bytes).expect("decode (StfInput, StateWitness)");
     let mut state = WitnessState::new(&witness).expect("witness must match claimed pre_state_root");
-    let output: StfPublicOutput = core_apply_block(input, &mut state);
+    let output: StfPublicOutput = core_apply_block(&input, &mut state);
     borsh::to_vec(&output).expect("encode StfPublicOutput")
 }
-
 // ---------------------------------------------------------------------------
 // WASM dynamic runtime path.
 // ---------------------------------------------------------------------------
@@ -159,7 +158,7 @@ mod wasm_abi {
         let input: StfInput = borsh::from_slice(input_bytes).expect("decode StfInput");
 
         let mut backend = WasmHostBackend;
-        let output: StfPublicOutput = core_apply_block(input, &mut backend);
+        let output: StfPublicOutput = core_apply_block(&input, &mut backend);
 
         let bytes = borsh::to_vec(&output).expect("encode StfPublicOutput");
         let ptr = bytes.as_ptr() as u32;
@@ -198,28 +197,24 @@ mod wasm_abi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_default_runtime_core::COUNTER_KEY;
-    use neutrino_runtime_abi::{StateWitness, WitnessEntry};
-    use neutrino_runtime_core::{empty_state_root, state_root_of};
+    use neutrino_runtime_abi::StateWitness;
+    use neutrino_runtime_core::empty_state_root;
 
     #[test]
-    fn apply_block_with_witness_matches_shared_core() {
-        let input = StfInput { delta: 11 };
+    fn apply_block_with_witness_runs_an_empty_block() {
+        let input = StfInput {
+            chain_id: 1,
+            transactions: alloc::vec![],
+        };
         let witness = StateWitness {
             pre_state_root: empty_state_root(),
-            entries: alloc::vec![WitnessEntry {
-                key: COUNTER_KEY.to_vec(),
-                value: None,
-            }],
+            entries: alloc::vec![],
         };
         let bytes = borsh::to_vec(&(input, witness)).unwrap();
         let out_bytes = apply_block_with_witness(&bytes);
         let out: StfPublicOutput = borsh::from_slice(&out_bytes).unwrap();
-        assert_eq!(out.counter, 11);
-        assert_eq!(out.pre_state_root, empty_state_root());
-        assert_eq!(
-            out.post_state_root,
-            state_root_of([(COUNTER_KEY, 11u32.to_le_bytes().as_slice())])
-        );
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.failed, 0);
+        assert_eq!(out.pre_state_root, out.post_state_root);
     }
 }

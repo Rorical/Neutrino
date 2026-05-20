@@ -101,7 +101,7 @@ impl WasmRuntime {
     /// Returns [`WasmError`] if linking, instantiation, or trap
     /// recovery fails. Codec errors during input/output encoding are
     /// surfaced the same way.
-    pub fn dry_run(&self, input: StfInput, live: &LiveStateMap) -> Result<DryRun, WasmError> {
+    pub fn dry_run(&self, input: &StfInput, live: &LiveStateMap) -> Result<DryRun, WasmError> {
         // The wasm guest calls back through linker-bound host functions.
         // We park the host state (tracing live ∪ overlay) behind a
         // Mutex inside the Store so the trampolines can take `&mut`.
@@ -126,7 +126,7 @@ impl WasmRuntime {
 
         // 1. Encode input.
         let mut input_bytes = Vec::new();
-        BorshSerialize::serialize(&input, &mut input_bytes).map_err(codec_err)?;
+        BorshSerialize::serialize(input, &mut input_bytes).map_err(codec_err)?;
 
         // 2. Allocate input buffer in linear memory.
         let allocate: TypedFunc<u32, u32> = instance

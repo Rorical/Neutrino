@@ -38,6 +38,9 @@ sp1-build = { workspace = true }
 
 [dev-dependencies]
 neutrino-default-runtime-master = { workspace = true }
+ed25519-dalek                   = { workspace = true }
+rand_core                       = { workspace = true }
+rand_chacha                     = { workspace = true }
 
 [lints]
 workspace = true

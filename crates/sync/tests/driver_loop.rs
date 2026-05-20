@@ -747,8 +747,12 @@ fn sample_slashing_evidence() -> SlashingEvidence {
     }
 }
 
+/// Chunk-proof aggregation is explicitly deferred by the SP1 rewrite
+/// (see `docs/design/13-sp1-runtime-proof-rewrite.md`), so the sync
+/// driver now ignores `Topic::ChunkProofs` gossip without dispatching
+/// it to the backend. The test pins that contract.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn gossipped_chunk_proof_is_routed_to_backend() {
+async fn gossipped_chunk_proof_is_ignored_by_sync_driver() {
     let backend = MockBackend::default();
     backend.set_status(Status::default());
     let backend_handle = backend.clone();
@@ -775,7 +779,10 @@ async fn gossipped_chunk_proof_is_routed_to_backend() {
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(backend_handle.chunk_proof_imports(), vec![42]);
+    assert!(
+        backend_handle.chunk_proof_imports().is_empty(),
+        "chunk-proof gossip must not reach the backend in M3-new"
+    );
 
     drop(event_tx);
     handle.await.unwrap().unwrap();

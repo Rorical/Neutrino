@@ -9,7 +9,8 @@ use borsh::to_vec;
 use neutrino_consensus_engine::{ProductionError, ProposerKey};
 use neutrino_network::Topic;
 use neutrino_network::service::NetworkCommand;
-use neutrino_proof_system::MockProofSystem;
+use neutrino_runtime_host::Sp1ProofSystem;
+use sp1_sdk::blocking::CpuProver;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -29,7 +30,7 @@ pub(crate) struct BlockProducerConfig {
 /// Run validator production until the network command channel closes or the
 /// task is aborted during node shutdown.
 pub(crate) async fn run_block_producer(
-    backend: Arc<ChainBackend<NodeDb, MockProofSystem>>,
+    backend: Arc<ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
     config: BlockProducerConfig,
 ) {
@@ -64,7 +65,7 @@ pub(crate) async fn run_block_producer(
 }
 
 async fn attempt_slot(
-    backend: &ChainBackend<NodeDb, MockProofSystem>,
+    backend: &ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>,
     cmd_tx: &mpsc::Sender<NetworkCommand>,
     config: &BlockProducerConfig,
     slot: u64,
@@ -148,14 +149,18 @@ async fn attempt_slot(
 }
 
 /// Close every chunk whose end-height the local head has reached but
-/// has not yet been finalized + checkpointed. The producer drives this
-/// loop because chunk finality requires a validator's BLS signature.
+/// has not yet been finalized. Chunk proof aggregation and recursive
+/// checkpoint proving are explicitly deferred by the SP1 rewrite, so
+/// this loop only drives the local BFT vote + `Finalized` transition;
+/// no chunk-proof or recursive-checkpoint gossip is produced.
+#[allow(clippy::unused_async)] // `.await`'d by the producer slot loop; signature preserved.
 async fn close_due_chunks(
-    backend: &ChainBackend<NodeDb, MockProofSystem>,
+    backend: &ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>,
     cmd_tx: &mpsc::Sender<NetworkCommand>,
     proposer: &ProposerKey,
     slot: u64,
 ) {
+    let _ = cmd_tx; // Reserved for future M3-new gossip needs.
     let chunk_size = backend.chunk_size().max(1);
     loop {
         let head_height = backend.head_height();
@@ -173,62 +178,11 @@ async fn close_due_chunks(
                 return;
             }
         };
-        let chunk_proof_bytes = match to_vec(&finalize_outcome.chunk_proof) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!(slot, error = %err, "failed to encode chunk proof");
-                return;
-            }
-        };
-        if cmd_tx
-            .send(NetworkCommand::Publish {
-                topic: Topic::ChunkProofs,
-                data: chunk_proof_bytes,
-            })
-            .await
-            .is_err()
-        {
-            warn!(
-                slot,
-                "network command channel closed; stopping chunk proof publication"
-            );
-            return;
-        }
-
-        let checkpoint_outcome = match backend.checkpoint_chunk(next_chunk_id) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                warn!(slot, chunk_id = next_chunk_id, error = %err, "chunk checkpoint failed");
-                return;
-            }
-        };
-        let recursive_bytes = match to_vec(&checkpoint_outcome.recursive_proof) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!(slot, error = %err, "failed to encode recursive proof");
-                return;
-            }
-        };
-        if cmd_tx
-            .send(NetworkCommand::Publish {
-                topic: Topic::Checkpoints,
-                data: recursive_bytes,
-            })
-            .await
-            .is_err()
-        {
-            warn!(
-                slot,
-                "network command channel closed; stopping checkpoint publication"
-            );
-            return;
-        }
         info!(
             slot,
             chunk_id = next_chunk_id,
             end_height = finalize_outcome.chunk.end_height,
-            checkpoint_index = checkpoint_outcome.checkpoint.index,
-            "closed chunk and published recursive checkpoint"
+            "closed chunk"
         );
     }
 }

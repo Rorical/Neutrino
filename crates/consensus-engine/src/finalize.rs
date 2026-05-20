@@ -399,9 +399,21 @@ impl<DB: Database> Engine<DB> {
             da_root: merkle_root_of_hashes(&inputs.da_leaves),
         };
 
-        let backend_chunk_proof = proof_system.prove_chunk(&inputs.block_proofs, &public_inputs)?;
-        proof_system.verify_chunk(&backend_chunk_proof, &public_inputs)?;
-        let chunk_proof_bytes = borsh::to_vec(&backend_chunk_proof)?;
+        // The SP1 rewrite explicitly defers chunk-proof aggregation
+        // (see docs/design/13-sp1-runtime-proof-rewrite.md). Backends
+        // that have not implemented `prove_chunk` return
+        // `ProofError::Unsupported`; we tolerate that and persist an
+        // empty `proof_bytes` so the rest of the finalization flow
+        // (Finalized FSM transition, FinalityCert) still works.
+        let chunk_proof_bytes = match proof_system.prove_chunk(&inputs.block_proofs, &public_inputs)
+        {
+            Ok(backend_chunk_proof) => {
+                proof_system.verify_chunk(&backend_chunk_proof, &public_inputs)?;
+                borsh::to_vec(&backend_chunk_proof)?
+            }
+            Err(ProofError::Unsupported) => Vec::new(),
+            Err(other) => return Err(other.into()),
+        };
 
         let chunk = Chunk {
             chunk_id,

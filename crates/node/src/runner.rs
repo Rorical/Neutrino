@@ -13,7 +13,12 @@ use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::ChainSpec;
-use neutrino_proof_system::MockProofSystem;
+use neutrino_runtime_host::Sp1ProofSystem;
+use sp1_sdk::blocking::CpuProver;
+
+/// Concrete `ChainBackend` parameterisation used by the production
+/// node binary: RocksDB-backed `NodeDb` storage + SP1 CPU prover.
+type NodeBackend = ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>;
 use neutrino_rpc::{RpcBackend, RpcStartError};
 use neutrino_storage::Database;
 use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
@@ -81,6 +86,9 @@ pub enum NodeError {
     /// Failed to start the JSON-RPC server.
     #[error("rpc server failed to start: {0}")]
     Rpc(#[from] RpcStartError),
+    /// Failed to initialise the SP1 proof system (vk setup or disk cache I/O).
+    #[error("proof system error: {0}")]
+    ProofSystem(String),
 }
 
 /// Run the node until `SIGINT` or `SIGTERM` arrive.
@@ -168,7 +176,12 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     let chain_spec_slot_duration = chain_spec.consensus.slot_duration_secs;
     let db = open_node_db(&config)?;
     let engine = open_or_initialise_engine(db, chain_spec)?;
-    let proof_system = MockProofSystem::new();
+    // SP1 CPU prover for production. Setup is paid once (then cached
+    // to disk by `Sp1ProofSystem::new`), so subsequent node restarts
+    // are fast. CudaProver / NetworkProver swap in here later.
+    let cpu_prover = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+    let proof_system =
+        Sp1ProofSystem::new(cpu_prover).map_err(|err| NodeError::ProofSystem(err.to_string()))?;
     info!(
         chain_id = config.chain_id,
         backend = "ChainBackend",
@@ -176,10 +189,8 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         "using real engine backend"
     );
     let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
-    let producer_job: Option<(
-        Arc<ChainBackend<NodeDb, MockProofSystem>>,
-        BlockProducerConfig,
-    )> = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
+    let producer_job: Option<(Arc<NodeBackend>, BlockProducerConfig)> =
+        production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = concrete_backend;
 

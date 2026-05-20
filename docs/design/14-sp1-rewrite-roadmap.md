@@ -159,6 +159,8 @@ Exit criteria:
 
 ## M3-new - Consensus rewire to per-block SP1 proofs
 
+Status: landed.
+
 Goal: keep the existing consensus model but remove real dependencies on chunk
 and recursive proof artifacts.
 
@@ -180,12 +182,46 @@ Change:
 5. Finality certificates still finalize chunks, but they do not imply recursive
    succinct history coverage.
 
+Landed:
+
+1. `runtime-host::Sp1ProofSystem` implements `proof-system::ProofSystem`
+   over any `sp1_sdk::blocking::Prover` (cpu / mock / cuda / light /
+   network). `verify_block` runs the real SP1 verifier and cross-checks
+   the committed `StfPublicOutput.{pre,post}_state_root` against
+   `BlockProofPublicInputs.state_root_{before,after}`.
+2. The node binary instantiates `Sp1ProofSystem<CpuProver>` in
+   `runner.rs`; the `ChainBackend` is now generic over the SP1-backed
+   proof system. `MockProofSystem` is still used by engine unit tests
+   and integration tests that don't need real SP1.
+3. `Engine::finalize_chunk` tolerates `ProofError::Unsupported` from
+   `prove_chunk` so chunks still BFT-finalize without producing a
+   chunk proof; `proof_bytes` becomes empty in that case.
+4. `ChainBackend::handle_quorum_reached` no longer calls
+   `checkpoint_chunk` and no longer gossips `Topic::ChunkProofs` or
+   `Topic::Checkpoints`. The block-producer's `close_due_chunks` is
+   reduced to just the BFT finalisation path.
+5. The sync driver explicitly ignores inbound `Topic::ChunkProofs` and
+   `Topic::Checkpoints` gossip; the legacy `handle_chunk_proof_gossip`
+   / `handle_checkpoint_gossip` handlers were removed.
+6. `Status` and `LocalProgress` route `finalized_checkpoint_index` from
+   `Engine::latest_finalized_chunk_id()` (genesis = 0, chunk N done =
+   N+1) so the wire shape is preserved while the recursive checkpoint
+   index is no longer consulted.
+
 Exit criteria:
 
-1. Fork choice excludes blocks with invalid SP1 public outputs.
-2. Chunk BFT finalizes only chunks whose blocks are all `Proven`.
-3. Old chunk-proof and recursive-proof import paths are not exercised by the
-   normal node.
+1. Fork choice excludes blocks with invalid SP1 public outputs. (Met:
+   `Sp1ProofSystem::verify_block` returns `ProofError::PublicInputMismatch`
+   for any pre/post-root tamper; the `import_block_proof` path refuses
+   to advance `BlockState::Proven` on rejection. Covered by
+   `tests/sp1_proof_system.rs::sp1_proof_system_rejects_*`.)
+2. Chunk BFT finalizes only chunks whose blocks are all `Proven`. (Met
+   via `Engine::assemble_chunk`'s pre-existing `Proven`-or-beyond gate,
+   now backed by real SP1 verification under `Sp1ProofSystem`.)
+3. Old chunk-proof and recursive-proof import paths are not exercised
+   by the normal node. (Met: producer no longer publishes those
+   topics, BFT quorum handler no longer calls `checkpoint_chunk`,
+   sync driver ignores inbound gossip on those topics.)
 
 ## M4-new - Default runtime equivalent rewrite
 

@@ -60,14 +60,16 @@ have passed.
   `StateBackend` trait, `WitnessState` (no_std, guest-side),
   `TracingState` (host feature only), canonical `state_root_of` hash.
   `no_std + alloc`.
-- `crates/runtime-host/` — SP1 prover/verifier host **and** WASM
-  dynamic runtime host. Embeds the default-runtime guest ELF via
-  `sp1_sdk::include_elf!` and the master cdylib via `include_bytes!`
-  (built by `build.rs`). Exposes `ProverCtx`, `prove`/`verify`/`execute`
-  for SP1, `wasm::WasmRuntime` for wasmtime-driven dry-run, and a
-  disk-backed vk cache keyed by
-  `(SP1_CIRCUIT_VERSION, BLAKE3(elf_bytes))`. SP1 + wasmtime are both
-  hard environment dependencies (sp1up + wasm32 rustup target).
+- `crates/runtime-host/` — SP1 prover/verifier host, WASM dynamic
+  runtime host, and consensus-engine adapter. Embeds the
+  default-runtime guest ELF via `sp1_sdk::include_elf!` and the master
+  cdylib via `include_bytes!` (built by `build.rs`). Exposes
+  `ProverCtx`, `prove`/`verify`/`execute` for SP1,
+  `wasm::WasmRuntime` for wasmtime-driven dry-run,
+  `Sp1ProofSystem` (the `proof-system::ProofSystem` impl the node
+  binary plugs into `ChainBackend`), and a disk-backed vk cache keyed
+  by `(SP1_CIRCUIT_VERSION, BLAKE3(elf_bytes))`. SP1 + wasmtime are
+  both hard environment dependencies (sp1up + wasm32 rustup target).
 - `crates/runtimes/neutrino-default/core/` — this runtime's STF.
   `no_std + alloc`. Defines `apply_block<B: StateBackend>`, `StfInput`,
   `StfPublicOutput`, counter semantics. Compiles into native, wasm32,

@@ -797,25 +797,25 @@ where
 
     /// Drive [`Engine::finalize_chunk`] now that the BFT session for
     /// `chunk_id` has reached its 2/3 precommit quorum, persist the
-    /// resulting chunk proof and recursive checkpoint, and gossip
-    /// both. After persistence, pool a `TX_INACTIVITY_LEAK_BATCH`
-    /// for every validator that missed the precommit quorum so the
-    /// next produced block applies the M7-D.3 inactivity penalty
-    /// on-chain.
+    /// Drive the engine through chunk finalization once the BFT loop
+    /// reports a 2/3 precommit quorum. The chunk proof aggregation and
+    /// recursive checkpoint paths are explicitly deferred by the SP1
+    /// rewrite (see `docs/design/13-sp1-runtime-proof-rewrite.md`), so
+    /// this handler no longer produces or gossips those artifacts; it
+    /// just transitions the chunk's blocks to `BlockState::Finalized`
+    /// and pools any inactivity-leak transactions.
+    #[allow(clippy::unused_async)] // Trait contract preserves async signature for future host I/O.
     async fn handle_quorum_reached(&self, chunk_id: ChunkId) {
         let Some(voter) = self.local_voter() else {
             debug!(chunk_id, "QuorumReached but no local voter configured");
             return;
         };
-        let finalize_outcome = match self
-            .with_engine_mut(|e| e.finalize_chunk(chunk_id, &[], &self.proof_system, &voter))
+        if let Err(err) =
+            self.with_engine_mut(|e| e.finalize_chunk(chunk_id, &[], &self.proof_system, &voter))
         {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                warn!(chunk_id, error = %err, "chunk finalisation failed");
-                return;
-            }
-        };
+            warn!(chunk_id, error = %err, "chunk finalisation failed");
+            return;
+        }
 
         // M7-D.3: derive the inactivity report from the freshly-
         // persisted finality cert and pool a leak batch so the next
@@ -824,49 +824,6 @@ where
         // against multi-producer double-application across the
         // network.
         self.pool_inactivity_leak_for(chunk_id);
-
-        if let Some(publisher) = self.publisher_snapshot() {
-            match borsh::to_vec(&finalize_outcome.chunk_proof) {
-                Ok(bytes) => {
-                    if let Err(err) = publisher
-                        .send(NetworkCommand::Publish {
-                            topic: Topic::ChunkProofs,
-                            data: bytes,
-                        })
-                        .await
-                    {
-                        debug!(?err, "chunk-proof publish channel closed");
-                    }
-                }
-                Err(err) => warn!(?err, "failed to encode chunk proof for gossip"),
-            }
-        }
-
-        let checkpoint_outcome =
-            match self.with_engine_mut(|e| e.checkpoint_chunk(chunk_id, &[], &self.proof_system)) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    warn!(chunk_id, error = %err, "chunk checkpoint failed");
-                    return;
-                }
-            };
-
-        if let Some(publisher) = self.publisher_snapshot() {
-            match borsh::to_vec(&checkpoint_outcome.recursive_proof) {
-                Ok(bytes) => {
-                    if let Err(err) = publisher
-                        .send(NetworkCommand::Publish {
-                            topic: Topic::Checkpoints,
-                            data: bytes,
-                        })
-                        .await
-                    {
-                        debug!(?err, "recursive-proof publish channel closed");
-                    }
-                }
-                Err(err) => warn!(?err, "failed to encode recursive proof for gossip"),
-            }
-        }
     }
 
     fn map_store_err<E: core::fmt::Display>(err: E) -> SyncBackendError {
@@ -899,13 +856,23 @@ where
                 .ok()
                 .flatten()
                 .map_or(0, |h| h.slot);
-            let finalized_index = e.latest_checkpoint_index();
-            let finalized_hash = e
-                .store()
-                .get_checkpoint(finalized_index)
-                .ok()
-                .flatten()
-                .map_or(ZERO_HASH, |cp| cp.hash());
+            // M3-new: chunk-BFT finality is now the only finality
+            // signal. The wire `finalized_checkpoint_*` field
+            // semantics are preserved (0 = genesis only, N = chunks
+            // 0..N have been BFT-finalized) by adding 1 to the latest
+            // finalized chunk id when present. Recursive checkpoint
+            // proofs are deferred (see
+            // docs/design/13-sp1-runtime-proof-rewrite.md).
+            let (finalized_index, finalized_chunk) =
+                e.latest_finalized_chunk_id().map_or((0, None), |chunk_id| {
+                    (
+                        chunk_id.saturating_add(1),
+                        e.store().get_chunk(chunk_id).ok().flatten(),
+                    )
+                });
+            let finalized_hash = finalized_chunk
+                .as_ref()
+                .map_or(ZERO_HASH, neutrino_consensus_types::Chunk::hash);
             Status {
                 chain_id: e.chain_spec().chain_id,
                 chain_spec_hash: e.chain_spec_hash(),
@@ -927,15 +894,25 @@ where
                 .ok()
                 .flatten()
                 .map_or(0, |h| h.slot);
-            let finalized_index = e.latest_checkpoint_index();
-            let finalized = e.store().get_checkpoint(finalized_index).ok().flatten();
-            let (finalized_hash, finalized_state_root, finalized_block_hash, finalized_height) =
-                finalized.map_or((ZERO_HASH, ZERO_HASH, ZERO_HASH, 0), |cp| {
+            // M3-new: chunk-BFT finality drives the `finalized_*`
+            // fields directly; recursive checkpoint proofs are
+            // deferred. The `finalized_checkpoint_index` wire field
+            // preserves "0 = genesis only" by adding 1 to the
+            // latest finalized chunk id when present.
+            let (finalized_index, finalized_chunk) =
+                e.latest_finalized_chunk_id().map_or((0, None), |chunk_id| {
                     (
-                        cp.hash(),
-                        cp.end_state_root,
-                        cp.end_block_hash,
-                        cp.end_height,
+                        chunk_id.saturating_add(1),
+                        e.store().get_chunk(chunk_id).ok().flatten(),
+                    )
+                });
+            let (finalized_hash, finalized_state_root, finalized_block_hash, finalized_height) =
+                finalized_chunk.map_or((ZERO_HASH, ZERO_HASH, ZERO_HASH, 0), |chunk| {
+                    (
+                        chunk.hash(),
+                        chunk.end_state_root,
+                        chunk.end_block_hash,
+                        chunk.end_height,
                     )
                 });
 

@@ -196,11 +196,13 @@ impl SyncDriver {
         if topic == Topic::BlockProofs {
             return self.handle_block_proof_gossip(data).await;
         }
-        if topic == Topic::ChunkProofs {
-            return self.handle_chunk_proof_gossip(data).await;
-        }
-        if topic == Topic::Checkpoints {
-            return self.handle_checkpoint_gossip(data).await;
+        if topic == Topic::ChunkProofs || topic == Topic::Checkpoints {
+            // The SP1 rewrite defers chunk-proof aggregation and
+            // checkpoint recursion; the node never produces these
+            // gossip messages anymore. Any inbound message on these
+            // topics is ignored (accepted to keep peer scoring
+            // neutral but not imported).
+            return neutrino_network::libp2p::gossipsub::MessageAcceptance::Ignore;
         }
         if topic == Topic::Transactions {
             self.backend.submit_transaction(data).await;
@@ -306,36 +308,6 @@ impl SyncDriver {
         }
     }
 
-    async fn handle_chunk_proof_gossip(
-        &self,
-        data: Vec<u8>,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
-        let proof = match borsh::from_slice::<neutrino_consensus_types::ChunkProof>(&data) {
-            Ok(p) => p,
-            Err(err) => {
-                warn!(?err, "failed to decode gossipped chunk proof; rejecting");
-                return MessageAcceptance::Reject;
-            }
-        };
-        let chunk_id = proof.chunk_id;
-        match self.backend.verify_and_import_chunk_proof(proof).await {
-            Ok(outcome) => {
-                debug!(
-                    chunk_id = outcome.chunk_id,
-                    end_height = outcome.end_height,
-                    "imported gossipped chunk proof"
-                );
-                MessageAcceptance::Accept
-            }
-            Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
-            Err(err) => {
-                debug!(chunk_id, ?err, "ignoring gossipped chunk proof");
-                MessageAcceptance::Ignore
-            }
-        }
-    }
-
     async fn handle_finality_vote_gossip(
         &self,
         data: Vec<u8>,
@@ -397,55 +369,6 @@ impl SyncDriver {
         // evidence for runtime application via a dedicated pool.
         self.backend.ingest_slashing_evidence(evidence).await;
         MessageAcceptance::Accept
-    }
-
-    async fn handle_checkpoint_gossip(
-        &mut self,
-        data: Vec<u8>,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
-        let proof =
-            match borsh::from_slice::<neutrino_consensus_types::RecursiveCheckpointProof>(&data) {
-                Ok(p) => p,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "failed to decode gossipped recursive checkpoint; rejecting"
-                    );
-                    return MessageAcceptance::Reject;
-                }
-            };
-        let checkpoint = proof.public_inputs.clone();
-        match self
-            .backend
-            .verify_and_import_checkpoints(vec![(checkpoint, proof)])
-            .await
-        {
-            Ok(cp) => {
-                info!(
-                    new_finalized_index = cp.new_finalized_index,
-                    new_finalized_height = cp.new_finalized_height,
-                    "imported gossipped recursive checkpoint"
-                );
-                let cmds = self.fsm.on_event(SyncEvent::CheckpointsAdvanced {
-                    new_finalized_index: cp.new_finalized_index,
-                    new_finalized_hash: cp.new_finalized_hash,
-                    new_finalized_state_root: cp.new_finalized_state_root,
-                    new_finalized_height: cp.new_finalized_height,
-                    new_finalized_block_hash: cp.new_finalized_block_hash,
-                });
-                self.dispatch_sync_commands(cmds).await;
-                MessageAcceptance::Accept
-            }
-            Err(SyncBackendError::Rejected(reason)) => {
-                warn!(%reason, "rejecting gossipped recursive checkpoint");
-                MessageAcceptance::Reject
-            }
-            Err(err) => {
-                debug!(?err, "ignoring gossipped recursive checkpoint");
-                MessageAcceptance::Ignore
-            }
-        }
     }
 
     async fn handle_inbound_rpc(

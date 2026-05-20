@@ -30,6 +30,8 @@ neutrino-default-runtime-core = { workspace = true }
 neutrino-runtime-core         = { workspace = true, features = ["host"] }
 neutrino-runtime-abi          = { workspace = true }
 neutrino-primitives           = { workspace = true }
+neutrino-proof-system         = { workspace = true }
+neutrino-consensus-types      = { workspace = true }
 
 [build-dependencies]
 sp1-build = { workspace = true }

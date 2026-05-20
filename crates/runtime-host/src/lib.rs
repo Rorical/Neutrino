@@ -17,7 +17,10 @@
 //!   [`StfPublicOutput`], and check it equals the caller's expected
 //!   output (covers the "tampered `post_state_root`" exit criterion).
 
+pub mod proof_system;
 pub mod wasm;
+
+pub use proof_system::{Sp1BlockProof, Sp1ProofSystem};
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -363,14 +363,27 @@ pub enum SlashingEvidence {
         /// Lock and unlock evidence.
         lock_evidence: LockEvidence,
     },
-    /// A validator signed a block whose proof was later rejected.
+    /// A validator signed a chunk-precommit containing a block whose
+    /// SP1 proof the local engine independently rejected.
+    ///
+    /// The evidence is self-contained: any verifier can re-run
+    /// `proof_system.verify_block` against [`Self::InvalidProofSigning::rejected_proof`]
+    /// and confirm the rejection without needing the proof to be
+    /// stored locally.
     InvalidProofSigning {
         /// Offending validator index.
         validator_index: ValidatorIndex,
-        /// Vote or signature associated with the invalid proof.
+        /// Per-validator precommit the offender signed. The vote's
+        /// chunk_id must cover the height of `rejected_proof`.
         vote: IndexedVote,
-        /// Proof rejection evidence.
-        invalid_proof_evidence: BlockProofRejection,
+        /// Block proof the offender allegedly signed off on. Any
+        /// verifier re-runs `proof_system.verify_block` on this and
+        /// expects rejection.
+        rejected_proof: BlockProof,
+        /// Reason the emitting node's verifier rejected
+        /// `rejected_proof`. Carried as a diagnostic; verifiers
+        /// re-derive their own classification while re-verifying.
+        reason: ProofRejectionReason,
     },
     /// A validator participated in a fork diverging from finalized history.
     LongRangeForkParticipation {
@@ -748,12 +761,25 @@ mod tests {
             SlashingEvidence::InvalidProofSigning {
                 validator_index: 5,
                 vote: indexed_vote(FinalityVotePhase::Precommit),
-                invalid_proof_evidence: BlockProofRejection {
+                rejected_proof: BlockProof {
+                    height: 9,
                     block_hash: hash(48),
-                    proof_hash: hash(49),
-                    verifier_version: 50,
-                    reason: ProofRejectionReason::PublicInputsMismatch,
+                    public_inputs: BlockProofPublicInputs {
+                        chain_id: 1,
+                        height: 9,
+                        parent_block_hash: hash(50),
+                        block_hash: hash(48),
+                        state_root_before: hash(51),
+                        state_root_after: hash(52),
+                        transactions_root: hash(53),
+                        receipt_root: hash(54),
+                        da_root: hash(55),
+                        vm_code_hash: hash(56),
+                        abi_version: 1,
+                    },
+                    proof_bytes: vec![0xFF; 8],
                 },
+                reason: ProofRejectionReason::PublicInputsMismatch,
             },
             SlashingEvidence::LongRangeForkParticipation {
                 validator_index: 6,

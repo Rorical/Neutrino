@@ -409,9 +409,30 @@ impl<DB: Database> Engine<DB> {
 
         let backend_proof: PS::BlockProof =
             borsh::from_slice(&proof.proof_bytes).map_err(ImportError::Codec)?;
-        proof_system
-            .verify_block(&backend_proof, &proof.public_inputs)
-            .map_err(ImportError::InvalidBlockProof)?;
+        if let Err(err) = proof_system.verify_block(&backend_proof, &proof.public_inputs) {
+            // Cache the rejected proof envelope so the
+            // `InvalidProofSigning` detector can surface evidence
+            // when a peer precommit later arrives for a chunk
+            // covering this block. The cache is opt-out: legitimate
+            // peers re-publish corrected proofs and the cache entry
+            // is cleared on the next successful import (above).
+            let reason = match err {
+                neutrino_proof_system::ProofError::MalformedProof => {
+                    neutrino_consensus_types::ProofRejectionReason::MalformedProof
+                }
+                neutrino_proof_system::ProofError::PublicInputMismatch => {
+                    neutrino_consensus_types::ProofRejectionReason::PublicInputsMismatch
+                }
+                _ => neutrino_consensus_types::ProofRejectionReason::VerifierRejected,
+            };
+            self.rejected_proofs
+                .insert(canonical_hash, (proof.clone(), reason));
+            return Err(ImportError::InvalidBlockProof(err));
+        }
+        // Successful import — clear any stale rejected-proof entry
+        // for this block (a peer's earlier corrupted gossip should
+        // not slash any future signer once an honest proof lands).
+        self.rejected_proofs.remove(&canonical_hash);
 
         self.store_mut().put_block_proof(&canonical_hash, proof)?;
         match self.store().get_block_state(&canonical_hash)? {

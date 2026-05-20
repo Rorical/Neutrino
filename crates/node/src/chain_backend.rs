@@ -196,6 +196,9 @@ fn encode_slashing_as_tx(evidence: &SlashingEvidence, active_set: &[Validator]) 
         }
         | SlashingEvidence::LockViolation {
             validator_index, ..
+        }
+        | SlashingEvidence::InvalidProofSigning {
+            validator_index, ..
         } => *validator_index,
         _ => return None,
     };
@@ -285,6 +288,23 @@ where
             .block_executor
             .lock()
             .expect("ChainBackend block_executor poisoned") = Some(Arc::new(executor));
+    }
+
+    /// Re-run the configured `ProofSystem::verify_block` against a
+    /// peer-supplied `BlockProof` envelope. Returns `true` iff the
+    /// proof passes verification.
+    ///
+    /// Used by [`Self::ingest_slashing_evidence`] to drop dishonest
+    /// `InvalidProofSigning` claims: if the carried proof actually
+    /// verifies, the evidence's claim that it was rejected is
+    /// false.
+    fn block_proof_verifies(&self, proof: &BlockProof) -> bool {
+        let Ok(backend_proof) = borsh::from_slice::<P::BlockProof>(&proof.proof_bytes) else {
+            return false;
+        };
+        self.proof_system
+            .verify_block(&backend_proof, &proof.public_inputs)
+            .is_ok()
     }
 
     fn block_executor_snapshot(&self) -> Option<Arc<dyn ErasedBlockExecutor>> {
@@ -1448,6 +1468,17 @@ where
         if let Ok(Some(evidence)) = self.with_engine_mut(|e| e.observe_vote_for_slashing(&vote)) {
             self.pool_and_gossip_slashing(evidence).await;
         }
+        // M7-new InvalidProofSigning detector: a peer precommit
+        // that names a chunk covering a locally-rejected proof is
+        // slashable. Each detected entry carries the rejected
+        // `BlockProof` so any replayer can independently re-run
+        // `proof_system.verify_block` and confirm the rejection.
+        let invalid_proof_evidence = self
+            .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
+            .unwrap_or_default();
+        for evidence in invalid_proof_evidence {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
         let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
             Ok(actions) => actions,
             Err(err) => {
@@ -1473,6 +1504,12 @@ where
         if let Ok(Some(evidence)) = self.with_engine_mut(|e| e.observe_vote_for_slashing(&vote)) {
             self.pool_and_gossip_slashing(evidence).await;
         }
+        let invalid_proof_evidence = self
+            .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
+            .unwrap_or_default();
+        for evidence in invalid_proof_evidence {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
         let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
             Ok(actions) => actions,
             Err(err) => {
@@ -1494,6 +1531,21 @@ where
         if let Err(err) = self.with_engine(|e| e.verify_slashing_evidence(&evidence)) {
             debug!(?err, "rejected peer-supplied slashing evidence");
             return;
+        }
+        // InvalidProofSigning evidence carries the rejected proof
+        // envelope so any replayer can independently re-run the
+        // SP1 verifier. The engine's signature check passed; now
+        // confirm the carried proof actually fails our backend's
+        // `verify_block`. If it succeeds, the emitter was wrong
+        // (or malicious) about the rejection — drop the evidence.
+        if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence {
+            if self.block_proof_verifies(rejected_proof) {
+                debug!(
+                    block_hash = ?rejected_proof.block_hash,
+                    "rejected peer-supplied InvalidProofSigning evidence: carried proof verifies",
+                );
+                return;
+            }
         }
         let inserted = self
             .slashing_pool

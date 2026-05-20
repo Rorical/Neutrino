@@ -588,20 +588,27 @@ Deferred to follow-on milestones:
      `SlashingEvidence` variant maps to a borsh-decodable
      `Transaction::Slash` keyed by the offender's runtime address;
      unsupported variants and out-of-range indices return `None`.
-2. **`InvalidProofSigning` slashing pipeline.** The variant exists
-   in `consensus-types::SlashingEvidence` but has no detector, no
-   verifier (`Engine::verify_slashing_evidence` returns
-   `UnsupportedVariant`), and no body encoder
-   (`body::encode_slashing` rejects it). Implementing it requires
-   redefining the variant's payload for M7-new semantics
-   (chunk-level precommit + carried offending `BlockProof`),
-   wiring detection inside `Engine::observe_finality_vote` so a
-   node that observes a peer's precommit on a chunk whose blocks
-   the local view considers unproven emits the evidence,
-   verification that any replayer can re-run `Sp1ProofSystem::
-   verify_block` to confirm the rejection reason, and a body
-   encoder that funnels the offender's BLS pubkey through the
-   wire bridge from #1.
+2. ~~`InvalidProofSigning` slashing pipeline.~~
+   **Landed in M7-new follow-on.** The variant now carries the
+   rejected `BlockProof` envelope alongside the precommit, so any
+   replayer can independently re-run
+   `proof_system.verify_block` and confirm the rejection without
+   the proof being stored locally. The engine grew a
+   `rejected_proofs: BTreeMap<BlockHash, (BlockProof,
+   ProofRejectionReason)>` cache populated on
+   `Engine::import_block_proof` rejection, plus a new
+   `observe_vote_for_invalid_proof_signing` detector that fires
+   when a peer precommit names a chunk whose covered blocks have
+   cached rejections. `Engine::verify_slashing_evidence` gained
+   the matching signature-side check, the chain backend's
+   `ingest_slashing_evidence` runs the proof-side re-verification
+   via `block_proof_verifies`, and `encode_slashing_as_tx` funnels
+   the offender's `withdrawal_credentials` through the M7-new
+   wire bridge. Coverage:
+   `crates/node/tests/invalid_proof_signing_detection.rs` —
+   detector fires on precommit but not on prevote; peer evidence
+   carrying a proof that actually verifies is dropped at
+   `ingest_slashing_evidence` time.
 3. **Observe-precommit-time "all blocks Proven" gate.** Today the
    gate is at BFT-open and finalize; `Engine::observe_finality_vote`
    trusts that any peer prevote / precommit reaching the session

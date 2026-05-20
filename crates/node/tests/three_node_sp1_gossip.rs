@@ -175,7 +175,10 @@ async fn wait_for_listen_addr(rx: &mut mpsc::Receiver<NetworkEvent>) -> Multiadd
 }
 
 async fn wait_for_peer_connected(rx: &mut mpsc::Receiver<NetworkEvent>, expected: PeerId) {
-    timeout(Duration::from_secs(10), async {
+    // Generous timeout to absorb CPU / libp2p mesh-formation contention
+    // when this test runs concurrently with other multi-node libp2p
+    // tests under `cargo test --workspace`.
+    timeout(Duration::from_secs(20), async {
         loop {
             if let NetworkEvent::PeerConnected(peer) = rx.recv().await.expect("event stream open") {
                 if peer == expected {

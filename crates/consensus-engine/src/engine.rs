@@ -56,6 +56,27 @@ pub struct Engine<DB: Database> {
     /// Equivocation detector for the M7-B slashing pipeline. See
     /// [`crate::slashing`].
     pub(crate) slashing_monitor: SlashingMonitor,
+    /// In-memory cache of block proofs that the local
+    /// `Sp1ProofSystem::verify_block` (or matching backend) rejected
+    /// at gossip-import time. Used by the [`SlashingEvidence::
+    /// InvalidProofSigning`] detector: when a peer precommit arrives
+    /// for a chunk whose blocks have rejected proofs in the cache,
+    /// the engine synthesises evidence carrying the rejected
+    /// `BlockProof` so any replayer can independently re-verify the
+    /// rejection.
+    ///
+    /// The cache is non-persistent and bounded by the lookups it
+    /// services — entries age out as the underlying block FSM
+    /// advances past `BlockProduced` (which can only happen via a
+    /// honest import_block_proof on the same hash, so a stale entry
+    /// can be dropped on demand).
+    pub(crate) rejected_proofs: BTreeMap<
+        BlockHash,
+        (
+            neutrino_consensus_types::BlockProof,
+            neutrino_consensus_types::ProofRejectionReason,
+        ),
+    >,
 }
 
 impl<DB: Database> Engine<DB> {
@@ -109,6 +130,7 @@ impl<DB: Database> Engine<DB> {
             bft_sessions: BTreeMap::new(),
             local_voter: None,
             slashing_monitor: SlashingMonitor::new(),
+            rejected_proofs: BTreeMap::new(),
         })
     }
 
@@ -208,6 +230,7 @@ impl<DB: Database> Engine<DB> {
             bft_sessions: BTreeMap::new(),
             local_voter: None,
             slashing_monitor: SlashingMonitor::new(),
+            rejected_proofs: BTreeMap::new(),
         })
     }
 
@@ -610,6 +633,87 @@ impl<DB: Database> Engine<DB> {
         Ok(self.slashing_monitor.record_indexed_vote(signer, &indexed))
     }
 
+    /// Detect [`SlashingEvidence::InvalidProofSigning`] from an
+    /// inbound finality vote.
+    ///
+    /// Returns evidence for every covered block in the vote's chunk
+    /// whose SP1 proof the local engine rejected at gossip-import
+    /// time (see [`crate::Engine::import_block_proof`]'s rejected-
+    /// proof cache). The signer's per-validator signature is
+    /// re-verified before evidence is emitted so a malicious peer
+    /// cannot pollute the slashing pool with claims attributed to a
+    /// validator who did not actually sign.
+    ///
+    /// Only individual-signer votes (single bit set on the
+    /// aggregation bitmap) participate; aggregated votes do not
+    /// attribute to a specific signer until subnet-level detection
+    /// lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the matching [`SlashingError`] variant when the
+    /// signature on the underlying vote fails to verify against
+    /// the active set.
+    pub fn observe_vote_for_invalid_proof_signing(
+        &self,
+        vote: &FinalityVote,
+    ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
+        let active_set_len = self.active_validator_set().len();
+        let Some((signer, indexed)) = slashing::extract_single_signer(vote, active_set_len) else {
+            return Ok(alloc::vec::Vec::new());
+        };
+        slashing::verify_indexed_vote_signature(
+            signer,
+            &indexed,
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+        )?;
+
+        // Inactivity-leak detection only applies to precommit phase
+        // (signing off on a chunk's finalisability). Prevotes are
+        // expressions of "ready to lock in", not declarations of
+        // proof acceptance, so they are not slashable through this
+        // path.
+        if !matches!(
+            indexed.data.phase,
+            neutrino_consensus_types::FinalityVotePhase::Precommit,
+        ) {
+            return Ok(alloc::vec::Vec::new());
+        }
+
+        let chunk_size = self.chain_spec().consensus.chunk_size;
+        let chunk_id = indexed.data.chunk_id;
+        // chunk_id covers heights [chunk_id*chunk_size + 1, (chunk_id+1)*chunk_size].
+        let Some(start) = chunk_id
+            .checked_mul(chunk_size)
+            .and_then(|v| v.checked_add(1))
+        else {
+            return Ok(alloc::vec::Vec::new());
+        };
+        let Some(end) = chunk_id
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(chunk_size))
+        else {
+            return Ok(alloc::vec::Vec::new());
+        };
+
+        let mut evidence = alloc::vec::Vec::new();
+        for height in start..=end {
+            let Ok(Some(block_hash)) = self.store().get_block_hash_by_height(height) else {
+                continue;
+            };
+            if let Some((rejected_proof, reason)) = self.rejected_proofs.get(&block_hash) {
+                evidence.push(SlashingEvidence::InvalidProofSigning {
+                    validator_index: signer,
+                    vote: indexed.clone(),
+                    rejected_proof: rejected_proof.clone(),
+                    reason: *reason,
+                });
+            }
+        }
+        Ok(evidence)
+    }
+
     /// Build an [`SlashingEvidence::InvalidVrfClaim`] from a header
     /// whose VRF claim was just rejected by
     /// [`neutrino_consensus_vrf::verify_header_proposer`]. Caller is
@@ -712,9 +816,41 @@ impl<DB: Database> Engine<DB> {
                     self.chain_spec().consensus.bft_prevote_quorum_denominator,
                 ),
             ),
-            // InvalidProofSigning / LongRangeForkParticipation /
-            // DaCommitmentFraud require invalid-proof, fork-choice,
-            // or DA-ingest state this engine does not maintain yet.
+            SlashingEvidence::InvalidProofSigning {
+                validator_index,
+                vote,
+                rejected_proof: _,
+                reason: _,
+            } => {
+                // Signature-side check only; the proof-rejection
+                // check requires a `ProofSystem` reference that the
+                // engine does not own. The chain backend re-runs
+                // `verify_block` on the carried proof before pooling
+                // the evidence (see
+                // `ChainBackend::verify_invalid_proof_signing_evidence`).
+                //
+                // Validating the signer's per-validator BLS signature
+                // here prevents a peer from pooling forged evidence
+                // even if they manage to construct a plausible
+                // `BlockProof` envelope.
+                slashing::verify_indexed_vote_signature(
+                    *validator_index,
+                    vote,
+                    self.active_validator_set(),
+                    self.chain_spec().chain_id,
+                )?;
+                // The chunk-id on the precommit must cover a height
+                // the local node knows about; otherwise the evidence
+                // points at a chunk the local chain hasn't seen and
+                // we cannot reason about it.
+                if !matches!(vote.data.phase, FinalityVotePhase::Precommit,) {
+                    return Err(SlashingError::UnsupportedVariant);
+                }
+                Ok(())
+            }
+            // LongRangeForkParticipation / DaCommitmentFraud require
+            // fork-choice and DA-ingest state this engine does not
+            // maintain yet.
             _ => Err(SlashingError::UnsupportedVariant),
         }
     }

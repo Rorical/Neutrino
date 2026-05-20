@@ -46,6 +46,20 @@ struct MockState {
     finality_vote_count: u32,
     aggregate_finality_vote_count: u32,
     slashing_evidence_count: u32,
+    /// Heights for which a block has been imported via
+    /// `verify_and_import_gossip_block`. Consulted by
+    /// `verify_and_import_block_proofs` when `simulate_block_proof_race`
+    /// is true so we can return `ChainBehind` for proofs whose
+    /// matching block has not yet arrived.
+    imported_block_heights: std::collections::BTreeSet<Height>,
+    /// Cumulative count of proofs successfully imported. Lets the
+    /// proof-race test observe the buffered-retry path indirectly.
+    proofs_imported_count: u32,
+    /// When true, `verify_and_import_block_proofs` returns
+    /// `ChainBehind` for proofs whose matching block height has not
+    /// been imported. Existing tests leave it false so they keep the
+    /// always-accept behaviour.
+    simulate_block_proof_race: bool,
 }
 
 #[derive(Clone, Default)]
@@ -84,6 +98,14 @@ impl MockBackend {
 
     fn slashing_evidence_count(&self) -> u32 {
         self.inner.lock().unwrap().slashing_evidence_count
+    }
+
+    fn proofs_imported_count(&self) -> u32 {
+        self.inner.lock().unwrap().proofs_imported_count
+    }
+
+    fn enable_block_proof_race_simulation(&self) {
+        self.inner.lock().unwrap().simulate_block_proof_race = true;
     }
 }
 
@@ -236,6 +258,24 @@ impl SyncBackend for MockBackend {
                 "proof height moved backwards in mock".to_owned(),
             ));
         }
+        // Optional race simulation: when enabled, reject proofs
+        // whose matching block has not yet been imported via
+        // `verify_and_import_gossip_block`. Mirrors the real engine
+        // behaviour (`Engine::import_block_proof` returns
+        // `UnknownBlock`, which the chain backend maps to
+        // `ChainBehind`).
+        {
+            let state = self.inner.lock().unwrap();
+            if state.simulate_block_proof_race
+                && !state.imported_block_heights.contains(&last.height)
+            {
+                return Err(SyncBackendError::ChainBehind(format!(
+                    "no block imported at height {} yet",
+                    last.height
+                )));
+            }
+        }
+        self.inner.lock().unwrap().proofs_imported_count += 1;
         Ok(ProofsImported {
             new_proven_height: last.height,
         })
@@ -245,6 +285,11 @@ impl SyncBackend for MockBackend {
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .imported_block_heights
+            .insert(block.header.height);
         Ok(HeadersImported {
             new_head_height: block.header.height,
             new_head_hash: block.hash(),
@@ -895,6 +940,74 @@ async fn gossipped_slashing_evidence_is_routed_to_backend() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(backend_handle.slashing_evidence_count(), 1);
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn block_proof_that_arrives_before_its_block_is_buffered_and_retried() {
+    // M6-new follow-on: when gossipsub delivers `Topic::BlockProofs`
+    // before the matching `Topic::Blocks` message, the driver must
+    // buffer the proof and retry import after the block lands.
+    // Without this, the proof is dropped and the receiver has to
+    // wait for the next `ProofBackfill` round to recover.
+    let backend = MockBackend::default();
+    backend.set_status(Status::default());
+    backend.enable_block_proof_race_simulation();
+    let backend_handle = backend.clone();
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    // Step 1: gossip a block proof for height 1 BEFORE its block.
+    // The mock returns ChainBehind; the driver should buffer.
+    let proof = sample_block_proof(1);
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::BlockProofs,
+            data: borsh::to_vec(&proof).unwrap(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"proof-1".to_vec()),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // The proof did not import (no block at height 1 in the mock).
+    assert_eq!(
+        backend_handle.proofs_imported_count(),
+        0,
+        "proof must not be imported before its block arrives"
+    );
+
+    // Step 2: gossip the matching block. The driver's block-import
+    // success path drains the pending-proof buffer and retries.
+    let block = sample_block(1, 1, 0);
+    event_tx
+        .send(NetworkEvent::GossipMessage {
+            propagation_source: random_peer(),
+            topic: neutrino_network::Topic::Blocks,
+            data: borsh::to_vec(&block).unwrap(),
+            message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"block-1".to_vec()),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // After the block lands, the buffered proof retried and imported.
+    assert_eq!(
+        backend_handle.proofs_imported_count(),
+        1,
+        "buffered proof must import after its block arrives",
+    );
 
     drop(event_tx);
     handle.await.unwrap().unwrap();

@@ -16,6 +16,7 @@
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use neutrino_network::rpc::{
@@ -51,6 +52,13 @@ impl Default for SyncDriverConfig {
     }
 }
 
+/// Maximum number of in-flight gossipped block proofs the driver
+/// will buffer while waiting for the matching block to arrive. Caps
+/// the worst-case memory growth from a Byzantine peer flooding
+/// future-height proofs onto the wire. The buffer is FIFO; the
+/// oldest entries get evicted when the cap is reached.
+const PENDING_PROOF_BUFFER_LIMIT: usize = 256;
+
 /// Stage 5 sync driver — the engine-side bridge between the libp2p
 /// network service and the sync state machine.
 pub struct SyncDriver {
@@ -64,6 +72,15 @@ pub struct SyncDriver {
     /// peer after a sync FSM reset (e.g. when gossip arrives that the
     /// local chain cannot extend).
     connected_peers: BTreeSet<neutrino_network::PeerId>,
+    /// Proofs that arrived via gossip before the matching block.
+    /// Stored as a small FIFO buffer; every successful block import
+    /// drains the buffer and retries each entry. Production gossipsub
+    /// typically delivers `Topic::Blocks` and `Topic::BlockProofs` in
+    /// near-simultaneous bursts; without this buffer the receiver
+    /// would drop a racing proof and rely on a later `ProofBackfill`
+    /// round to refetch it, costing one BFT-mesh-settle's worth of
+    /// latency on every reorder.
+    pending_proofs: Vec<neutrino_consensus_types::BlockProof>,
 }
 
 impl SyncDriver {
@@ -86,6 +103,7 @@ impl SyncDriver {
             outbound_rx,
             outbound_tx,
             connected_peers: BTreeSet::new(),
+            pending_proofs: Vec::new(),
         }
     }
 
@@ -255,6 +273,13 @@ impl SyncDriver {
                     new_head_slot,
                 });
                 self.dispatch_sync_commands(cmds).await;
+                // A block just landed — retry any proofs that arrived
+                // earlier and were waiting for it. Production
+                // gossipsub commonly delivers `Topic::Blocks` and
+                // `Topic::BlockProofs` in interleaved bursts; this
+                // call collapses both into the same `ProofsAdvanced`
+                // path without a `ProofBackfill` round-trip.
+                self.retry_pending_proofs().await;
                 MessageAcceptance::Accept
             }
             Err(SyncBackendError::ChainBehind(reason)) => {
@@ -279,7 +304,7 @@ impl SyncDriver {
     }
 
     async fn handle_block_proof_gossip(
-        &self,
+        &mut self,
         data: Vec<u8>,
     ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
         use neutrino_network::libp2p::gossipsub::MessageAcceptance;
@@ -293,7 +318,7 @@ impl SyncDriver {
         let height = proof.height;
         match self
             .backend
-            .verify_and_import_block_proofs(height, vec![proof])
+            .verify_and_import_block_proofs(height, vec![proof.clone()])
             .await
         {
             Ok(_) => {
@@ -301,9 +326,59 @@ impl SyncDriver {
                 MessageAcceptance::Accept
             }
             Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
+            Err(SyncBackendError::ChainBehind(_)) => {
+                // The proof arrived before its block. Buffer for a
+                // retry after the next successful block import.
+                // FIFO eviction when the cap is reached protects the
+                // driver against a Byzantine peer flooding
+                // future-height proofs onto the wire.
+                if self.pending_proofs.len() >= PENDING_PROOF_BUFFER_LIMIT {
+                    self.pending_proofs.remove(0);
+                }
+                self.pending_proofs.push(proof);
+                debug!(
+                    height,
+                    "buffering gossipped block proof until its block arrives"
+                );
+                MessageAcceptance::Ignore
+            }
             Err(err) => {
                 debug!(height, ?err, "ignoring gossipped block proof");
                 MessageAcceptance::Ignore
+            }
+        }
+    }
+
+    /// Drain every buffered proof and re-attempt the import. Proofs
+    /// that still fail with `ChainBehind` go back into the buffer;
+    /// everything else (Accept or Reject) is dropped. Called after
+    /// every successful block import.
+    async fn retry_pending_proofs(&mut self) {
+        if self.pending_proofs.is_empty() {
+            return;
+        }
+        let drained: Vec<neutrino_consensus_types::BlockProof> =
+            core::mem::take(&mut self.pending_proofs);
+        for proof in drained {
+            let height = proof.height;
+            match self
+                .backend
+                .verify_and_import_block_proofs(height, vec![proof.clone()])
+                .await
+            {
+                Ok(_) => {
+                    debug!(height, "imported previously-buffered block proof");
+                }
+                Err(SyncBackendError::ChainBehind(_)) => {
+                    self.pending_proofs.push(proof);
+                }
+                Err(err) => {
+                    debug!(
+                        height,
+                        ?err,
+                        "dropping previously-buffered block proof on retry"
+                    );
+                }
             }
         }
     }

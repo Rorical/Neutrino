@@ -197,6 +197,17 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     let block_executor =
         WasmExecutor::default_runtime().map_err(|err| NodeError::ProofSystem(err.to_string()))?;
     concrete_backend.set_block_executor(block_executor);
+    // Enable the multi-validator chunk-BFT loop. Every node installs
+    // the network publisher so peer-detected slashing evidence and
+    // aggregator emissions can broadcast; validator nodes
+    // additionally install their local voter so the engine signs
+    // prevotes / precommits and routes through `QuorumReached`.
+    // Non-validator nodes leave `local_voter` unset; the engine
+    // still ingests peer votes but emits nothing.
+    concrete_backend.set_network_publisher(cmd_tx.clone());
+    if let Some(cfg) = production_config.as_ref() {
+        concrete_backend.set_local_voter(cfg.proposer.clone());
+    }
     let producer_job: Option<(Arc<NodeBackend>, BlockProducerConfig)> =
         production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;

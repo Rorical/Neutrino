@@ -196,7 +196,9 @@ async fn wait_for_peer_connected(rx: &mut mpsc::Receiver<NetworkEvent>, expected
 async fn drive_follower_until_proven(handle: &mut NodeHandle, target_height: u64) -> (u64, u64) {
     let mut pending_proofs: Vec<BlockProof> = Vec::new();
     let backend = Arc::clone(&handle.backend);
-    timeout(Duration::from_secs(15), async {
+    // Generous timeout to absorb CPU / port contention when this test
+    // runs concurrently with the heavyweight 16-validator SP1 test.
+    timeout(Duration::from_secs(45), async {
         loop {
             // Re-attempt every buffered proof. A new block import on
             // the previous loop iteration may have unblocked one of

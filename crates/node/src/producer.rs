@@ -65,7 +65,7 @@ pub(crate) async fn run_block_producer(
 }
 
 async fn attempt_slot(
-    backend: &ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>,
+    backend: &Arc<ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>>,
     cmd_tx: &mpsc::Sender<NetworkCommand>,
     config: &BlockProducerConfig,
     slot: u64,
@@ -74,15 +74,55 @@ async fn attempt_slot(
         return;
     }
 
-    match backend.try_produce_block(slot, &config.proposer) {
+    // `try_produce_block` drives a wasmtime dry-run and `prove_block`
+    // drives the SP1 prover; both are CPU-bound and the SP1 SDK
+    // spins up its own internal tokio runtime that clashes with the
+    // outer producer task. Hand the calls to a dedicated blocking
+    // thread so the slot loop's runtime stays unblocked.
+    let production = {
+        let backend = Arc::clone(backend);
+        let proposer = config.proposer.clone();
+        match tokio::task::spawn_blocking(move || backend.try_produce_block(slot, &proposer)).await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(slot, error = %err, "block production task panicked");
+                return;
+            }
+        }
+    };
+
+    match production {
         Ok(Some(outcome)) => {
-            let proof = match backend.prove_block(&outcome.block_hash) {
-                Ok(proof) => proof.block_proof,
-                Err(err) => {
-                    warn!(slot, error = %err, "block proof generation failed");
-                    return;
+            let proof = {
+                let backend = Arc::clone(backend);
+                let block_hash = outcome.block_hash;
+                match tokio::task::spawn_blocking(move || backend.prove_block(&block_hash)).await {
+                    Ok(Ok(prove)) => prove.block_proof,
+                    Ok(Err(err)) => {
+                        warn!(slot, error = %err, "block proof generation failed");
+                        return;
+                    }
+                    Err(err) => {
+                        warn!(slot, error = %err, "block proof task panicked");
+                        return;
+                    }
                 }
             };
+
+            // Trigger the local BFT session for the chunk this block
+            // closes (when chunk_size = 1 every block ends its own
+            // chunk; for larger chunks this is a no-op until the
+            // closing block lands). The engine emits the local
+            // prevote here and the chain_backend gossips it on the
+            // canonical finality-vote topic. Without this the
+            // producer never enters its own BFT session — its proof
+            // only goes out as gossip, and peers can finalise without
+            // it.
+            backend
+                .maybe_open_bft_session_for_height(outcome.block.header.height)
+                .await;
+
             let data = match to_vec(&outcome.block) {
                 Ok(data) => data,
                 Err(err) => {
@@ -134,11 +174,14 @@ async fn attempt_slot(
             );
 
             // Close every chunk whose final height the new head has
-            // just reached. Crossing one boundary per slot is the
-            // common case (single-validator); the loop handles the
-            // rare overlap where multiple boundaries get reached in a
-            // single production step.
-            close_due_chunks(backend, cmd_tx, &config.proposer, slot).await;
+            // just reached. With the BFT loop enabled, the BFT path
+            // typically finalises first and this becomes a no-op
+            // (`next_chunk_to_close` returns a chunk whose end height
+            // is still ahead). The fallback is retained for single-
+            // validator runs where no peer prevote/precommit ever
+            // arrives, and for chunk boundaries the BFT loop hasn't
+            // yet observed.
+            close_due_chunks(backend.as_ref(), cmd_tx, &config.proposer, slot).await;
         }
         Ok(None) => debug!(slot, "validator not eligible for slot"),
         Err(ProductionError::NonMonotonicSlot { parent_slot, .. }) => {

@@ -500,6 +500,13 @@ Exit criteria (status):
 
 ## M7-new - Multi-validator finality with SP1 block proofs
 
+Status: BFT-driven multi-validator finality landed for both
+honest-mesh convergence and bad-proof rejection over real SP1 proof
+envelopes. Cross-layer slashing / inactivity-leak runtime
+application is explicitly deferred (the consensus engine emits
+wire-format-incompatible body lanes today; the runtime decoder
+silently drops them).
+
 Goal: restore the M7 behavior on top of the new proof model.
 
 Keep:
@@ -517,11 +524,114 @@ Change:
 2. Finality does not wait for a chunk aggregation proof.
 3. Checkpoint recursion is not part of the exit criteria.
 
-Exit criteria:
+Landed:
 
-1. 16 validators finalize chunks whose blocks all have valid SP1 proofs.
-2. Injected invalid block proofs prevent finality for the affected chunk.
-3. Slashing and inactivity tests pass against the new default runtime core.
+1. Production node binary enables the multi-validator BFT loop:
+   `runner.rs` now calls `set_network_publisher` on every node and
+   `set_local_voter` on validator nodes after `ChainBackend::new`.
+   Followers ingest peer votes; validators sign and emit prevotes /
+   precommits through the canonical finality-vote topics.
+2. `producer.rs::attempt_slot` wraps `try_produce_block` and
+   `prove_block` in `tokio::task::spawn_blocking` so the SP1 SDK's
+   internal tokio runtime no longer collides with the producer
+   task's outer runtime. After `prove_block` succeeds the producer
+   calls `maybe_open_bft_session_for_height` so the local node
+   enters its own BFT session in lock-step with the gossip publish.
+3. Engine-level "all blocks Proven" gates remain at chunk-assembly
+   time (`Engine::assemble_chunk`) and chunk-finalize time
+   (`Engine::collect_chunk_inputs` re-runs `verify_block` on every
+   stored proof). Bad-proof rejection works through the existing
+   M6-new gossip-ingest gate: any peer that gossips an invalid
+   proof has the import rejected by `Sp1ProofSystem::verify_block`,
+   the receiving validator's block FSM stays at `BlockProduced`,
+   and `assemble_chunk` refuses to open a BFT session.
+
+Coverage (`crates/node/tests/`):
+
+- `multi_validator_sp1_localnet.rs` — M7-new exit criterion 1. 16
+  validators on libp2p loopback, all running real
+  `Sp1ProofSystem<MockProver>` + `WasmExecutor`. v0 drives the real
+  production path (`try_produce_block` → `prove_block`) and gossips
+  block + proof. All 16 reach `finalized_checkpoint_index >= 1`
+  within the test budget. Confirms BFT, aggregator subnet
+  selection, and SP1 envelope verification all work end-to-end.
+- `bad_proof_blocks_chunk_finality.rs` — M7-new exit criterion 2.
+  Two validators; v0 produces + proves legitimately but gossips a
+  **tampered** `BlockProof` (state_root_after mutated). v1 rejects
+  the proof at `Sp1ProofSystem::verify_block`; its block FSM stays
+  at `BlockProduced`; its `maybe_open_bft_session_for_height` is a
+  no-op because `assemble_chunk` finds the block unproven. v0
+  alone has 1/2 stake (50%) which falls short of the 2/3 quorum.
+  Neither validator's `finalized_checkpoint_index` advances past
+  genesis. Demonstrates that an invalid proof gossiped onto the
+  wire cannot push finality through.
+
+Deferred to follow-on milestones:
+
+1. **Cross-layer slashing / inactivity-leak wire bridge.** The
+   consensus engine emits `body.slashings` and inactivity-leak
+   batches in legacy wire formats (`encode_slashing` writes
+   `0x05 || pubkey[48]`; `encode_inactivity_batch` writes
+   `0x06 || chunk_id || pubkey[48]×N`). The new runtime decoder in
+   `WasmExecutor::execute_block` borsh-decodes each entry as
+   `Transaction` and silently drops anything that doesn't fit —
+   so no on-chain slash or leak has ever applied. The fix
+   requires both (a) rewriting the encoders to emit
+   `borsh(Transaction::Slash(SlashTx))` / `borsh(Transaction::
+   InactivityLeak(LeakTx))` and (b) a BLS-pubkey → Ed25519-address
+   mapping (the consensus validator set uses 48-byte BLS pubkeys;
+   the runtime uses 32-byte Ed25519 addresses). The detection /
+   pool / gossip / body-inclusion paths already work — only the
+   final consensus → runtime hand-off needs to land.
+2. **`InvalidProofSigning` slashing pipeline.** The variant exists
+   in `consensus-types::SlashingEvidence` but has no detector, no
+   verifier (`Engine::verify_slashing_evidence` returns
+   `UnsupportedVariant`), and no body encoder
+   (`body::encode_slashing` rejects it). Implementing it requires
+   redefining the variant's payload for M7-new semantics
+   (chunk-level precommit + carried offending `BlockProof`),
+   wiring detection inside `Engine::observe_finality_vote` so a
+   node that observes a peer's precommit on a chunk whose blocks
+   the local view considers unproven emits the evidence,
+   verification that any replayer can re-run `Sp1ProofSystem::
+   verify_block` to confirm the rejection reason, and a body
+   encoder that funnels the offender's BLS pubkey through the
+   wire bridge from #1.
+3. **Observe-precommit-time "all blocks Proven" gate.** Today the
+   gate is at BFT-open and finalize; `Engine::observe_finality_vote`
+   trusts that any peer prevote / precommit reaching the session
+   was emitted in good faith. A malicious validator that signs a
+   precommit for a chunk whose blocks are not all Proven (in
+   their local view) cannot push finality through (because the
+   2/3 stake quorum requires the majority of honest validators to
+   agree the chunk is finalisable, which they won't be able to do
+   until they see a valid proof) — but the malicious vote will
+   still be counted toward the local quorum. Tightening this
+   becomes meaningful once #2's detector is in place.
+
+Exit criteria (status):
+
+1. 16 validators finalize chunks whose blocks all have valid SP1
+   proofs — **met** by `multi_validator_sp1_localnet.rs`. Real SP1
+   envelopes verified at every follower, 2/3 stake quorum
+   reached, all 16 validators advance their finalized checkpoint
+   index past genesis.
+2. Injected invalid block proofs prevent finality for the
+   affected chunk — **met** by `bad_proof_blocks_chunk_finality.rs`.
+   The receiving validator's block FSM stays at `BlockProduced`,
+   `assemble_chunk` refuses to open the session, and no BFT
+   quorum forms.
+3. Slashing and inactivity tests pass against the new default
+   runtime core — **partially met**. The runtime-side tests
+   (`apply_slash`, `apply_leak`, validator-set commitment) landed
+   in M4-D and continue to pass; the consensus-side detection /
+   pool / gossip tests (`slashing_detection.rs`) also pass. The
+   cross-layer integration — evidence pooled → block body →
+   `WasmExecutor` → on-chain state change — is blocked by the
+   wire-bridge gap above and is deferred. M7-new explicitly
+   accepts this scope split because the runtime+consensus halves
+   are individually correct; only the bridge code needs to land
+   before integration tests can assert state changes.
 
 ## Deferred - Chunk proof aggregation
 

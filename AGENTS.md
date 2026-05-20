@@ -60,19 +60,25 @@ have passed.
   `StateBackend` trait, `WitnessState` (no_std, guest-side),
   `TracingState` (host feature only), canonical `state_root_of` hash.
   `no_std + alloc`.
-- `crates/runtime-host/` — SP1 prover/verifier host. Embeds the
-  default-runtime guest ELF via `sp1_sdk::include_elf!`, exposes
-  `ProverCtx`, `prove`/`verify`/`execute`, and a disk-backed vk cache
-  keyed by `(SP1_CIRCUIT_VERSION, BLAKE3(elf_bytes))`. SP1-only; no
-  fall-back.
+- `crates/runtime-host/` — SP1 prover/verifier host **and** WASM
+  dynamic runtime host. Embeds the default-runtime guest ELF via
+  `sp1_sdk::include_elf!` and the master cdylib via `include_bytes!`
+  (built by `build.rs`). Exposes `ProverCtx`, `prove`/`verify`/`execute`
+  for SP1, `wasm::WasmRuntime` for wasmtime-driven dry-run, and a
+  disk-backed vk cache keyed by
+  `(SP1_CIRCUIT_VERSION, BLAKE3(elf_bytes))`. SP1 + wasmtime are both
+  hard environment dependencies (sp1up + wasm32 rustup target).
 - `crates/runtimes/neutrino-default/core/` — this runtime's STF.
   `no_std + alloc`. Defines `apply_block<B: StateBackend>`, `StfInput`,
   `StfPublicOutput`, counter semantics. Compiles into native, wasm32,
   and the SP1 Guest target.
-- `crates/runtimes/neutrino-default/master/` — `cdylib + rlib` target
-  built for `wasm32-unknown-unknown`. Wraps the shared STF in the WASM
-  ABI and adds non-proven RPC service entrypoints (`validate_tx`,
-  `query`). Loaded by the WASM dynamic runtime host (Phase B of M2-new).
+- `crates/runtimes/neutrino-default/master/` — `cdylib + rlib` target.
+  `rlib` path (`apply_block_with_witness`) is used for native parity
+  tests. `cdylib` path is the wasm32-unknown-unknown binary loaded by
+  `runtime-host::wasm::WasmRuntime`; it imports state ops from the
+  `neutrino` module (host-supplied) and exports `apply_block`,
+  `neutrino_allocate`, `neutrino_deallocate`, `validate_tx`, `query`.
+  Uses `dlmalloc` as its global allocator on wasm32.
 - `crates/runtimes/neutrino-default/guest/` — SP1 Guest binary. **Not** a
   workspace member; `runtime-host/build.rs` builds it via `sp1-build`
   under the `succinct` toolchain. Edition 2024.

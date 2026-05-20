@@ -1,34 +1,35 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
-#![allow(unsafe_code)] // WASM ABI exports require `#[unsafe(no_mangle)]`.
+#![allow(unsafe_code)] // WASM ABI exports use `#[unsafe(no_mangle)]` and raw FFI.
 
 //! Default-runtime master binary.
 //!
-//! Compiled to `wasm32-unknown-unknown` and loaded by the WASM dynamic
-//! runtime host (M2-new follow-up). Wraps the shared STF in the same
-//! `apply_block` function the SP1 Guest uses, and adds the non-proven
-//! RPC entrypoints (`validate_tx`, `query`) the SP1 Guest does not
-//! expose.
+//! Two link targets:
 //!
-//! M2-new scope: `apply_block` operates against a `WitnessState` built
-//! from a borsh-encoded `(StfInput, StateWitness)` passed in via WASM
-//! linear memory. The host-import backend that calls back into wasmtime
-//! for live storage I/O is introduced in the M2-new wasmtime follow-up.
+//! - `rlib` (native): used by host-side parity tests that exercise the
+//!   shared STF against a pre-built [`StateWitness`].
+//! - `cdylib` for `wasm32-unknown-unknown`: loaded by the WASM dynamic
+//!   runtime host. State access goes through host imports declared in
+//!   the `neutrino` import module.
+//!
+//! Both paths call the same `neutrino_default_runtime_core::apply_block`
+//! function; only the [`StateBackend`] implementation differs.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block as core_apply_block};
-use neutrino_runtime_abi::StateWitness;
-use neutrino_runtime_core::WitnessState;
 
-/// Run the STF against a witness-backed state and return the public
-/// output.
+/// Run the STF natively against a witness-backed state. Used by host-
+/// side parity tests; the SP1 Guest is the production consumer of the
+/// witness path.
 ///
-/// This is the non-`extern` Rust API used by the `rlib` build (tests,
-/// host-side dry-run replays). The `cdylib` build wraps it in
-/// `apply_block` below.
-pub fn apply_block(input_bytes: &[u8]) -> Vec<u8> {
+/// Encoded input is `borsh((StfInput, StateWitness))`; encoded output
+/// is `borsh(StfPublicOutput)`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_block_with_witness(input_bytes: &[u8]) -> Vec<u8> {
+    use neutrino_runtime_abi::StateWitness;
+    use neutrino_runtime_core::WitnessState;
     let (input, witness): (StfInput, StateWitness) =
         borsh::from_slice(input_bytes).expect("decode (StfInput, StateWitness)");
     let mut state = WitnessState::new(&witness).expect("witness must match claimed pre_state_root");
@@ -36,48 +37,173 @@ pub fn apply_block(input_bytes: &[u8]) -> Vec<u8> {
     borsh::to_vec(&output).expect("encode StfPublicOutput")
 }
 
-/// WASM-exported `apply_block`. The host passes a pointer/length pair
-/// into linear memory; the master decodes the borsh blob and returns
-/// the output blob via the same pointer/length convention the WASM
-/// host expects.
-///
-/// The pointer/length ABI is intentionally minimal in M2-new; the
-/// wasmtime host introduced in the follow-up replaces this with the
-/// real host-import binding.
+// ---------------------------------------------------------------------------
+// WASM dynamic runtime path.
+// ---------------------------------------------------------------------------
+
+/// WASM ABI exports. Compiled only into the `wasm32-unknown-unknown`
+/// cdylib. State access is delegated to the WASM runtime host through
+/// the `neutrino` import module.
 #[cfg(target_arch = "wasm32")]
-#[unsafe(no_mangle)]
-pub extern "C" fn apply_block_wasm(input_ptr: u32, input_len: u32) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize) };
-    let out = apply_block(slice);
-    let len = out.len() as u32;
-    let ptr = out.as_ptr() as u32;
-    core::mem::forget(out);
-    ((ptr as u64) << 32) | u64::from(len)
-}
+#[allow(
+    clippy::cast_possible_truncation, // usize == u32 on wasm32, casts are lossless here.
+    clippy::cast_sign_loss,           // i32 returned by host imports is non-negative on the success path.
+    clippy::cast_lossless,            // `as` is idiomatic for FFI plumbing.
+    clippy::same_length_and_capacity, // `Vec::from_raw_parts` matches the leaking `vec!` pattern.
+    clippy::wildcard_imports,         // FFI module is a closed surface; explicit imports add noise.
+)]
+mod wasm_abi {
+    use super::*;
+    use core::mem;
+    use neutrino_primitives::StateRoot;
+    use neutrino_runtime_core::StateBackend;
 
-/// Placeholder transaction-admission entrypoint exposed only by the
-/// master (not the SP1 Guest). Real logic arrives in M4-new.
-#[unsafe(no_mangle)]
-pub const extern "C" fn validate_tx(_tx_ptr: u32, _tx_len: u32) -> u32 {
-    0
-}
+    #[link(wasm_import_module = "neutrino")]
+    unsafe extern "C" {
+        /// Return the length of the value at `key`, or `-1` if absent.
+        /// Records the read in the host's tracing set. The host stashes
+        /// the value bytes pending a follow-up `state_read_into` call.
+        fn state_read_len(key_ptr: u32, key_len: u32) -> i32;
 
-/// Placeholder read-only query entrypoint exposed only by the master
-/// (not the SP1 Guest). Real logic arrives in M4-new.
-#[unsafe(no_mangle)]
-pub const extern "C" fn query(_req_ptr: u32, _req_len: u32) -> u32 {
-    0
+        /// Copy the value stashed by the preceding `state_read_len`
+        /// call into `value_ptr..value_ptr+len` in guest memory.
+        fn state_read_into(value_ptr: u32);
+
+        /// Write `value` at `key` in the host's overlay.
+        fn state_write(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32);
+
+        /// Delete `key` from the host's overlay.
+        fn state_delete(key_ptr: u32, key_len: u32);
+
+        /// Write the live (pre-write) state root into `out_ptr..out_ptr+32`.
+        fn pre_state_root(out_ptr: u32);
+
+        /// Write the effective (post-write) state root into
+        /// `out_ptr..out_ptr+32`.
+        fn post_state_root(out_ptr: u32);
+    }
+
+    /// `StateBackend` that delegates to the WASM runtime host.
+    struct WasmHostBackend;
+
+    impl StateBackend for WasmHostBackend {
+        fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            unsafe {
+                let len = state_read_len(key.as_ptr() as u32, key.len() as u32);
+                if len < 0 {
+                    return None;
+                }
+                let mut buf = alloc::vec![0u8; len as usize];
+                state_read_into(buf.as_mut_ptr() as u32);
+                Some(buf)
+            }
+        }
+
+        fn write(&mut self, key: &[u8], value: Vec<u8>) {
+            unsafe {
+                state_write(
+                    key.as_ptr() as u32,
+                    key.len() as u32,
+                    value.as_ptr() as u32,
+                    value.len() as u32,
+                );
+            }
+        }
+
+        fn delete(&mut self, key: &[u8]) {
+            unsafe {
+                state_delete(key.as_ptr() as u32, key.len() as u32);
+            }
+        }
+
+        fn pre_state_root(&self) -> StateRoot {
+            let mut out = [0u8; 32];
+            unsafe { pre_state_root(out.as_mut_ptr() as u32) };
+            out
+        }
+
+        fn post_state_root(&self) -> StateRoot {
+            let mut out = [0u8; 32];
+            unsafe { post_state_root(out.as_mut_ptr() as u32) };
+            out
+        }
+    }
+
+    /// Allocate `len` bytes of zeroed memory and return a pointer.
+    /// The host calls this before writing `StfInput` bytes into linear
+    /// memory so the wasm side can later read them by pointer.
+    #[unsafe(no_mangle)]
+    extern "C" fn neutrino_allocate(len: u32) -> u32 {
+        let mut buf = alloc::vec![0u8; len as usize];
+        let ptr = buf.as_mut_ptr() as u32;
+        mem::forget(buf);
+        ptr
+    }
+
+    /// Drop a buffer previously returned by `neutrino_allocate`.
+    #[unsafe(no_mangle)]
+    extern "C" fn neutrino_deallocate(ptr: u32, len: u32) {
+        unsafe {
+            let _ = Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
+        }
+    }
+
+    /// Apply a block. The host writes a borsh-encoded `StfInput` into
+    /// linear memory at `input_ptr..input_ptr+input_len`, then calls
+    /// this function. Returns a packed `u64`: high 32 bits = output
+    /// pointer, low 32 bits = output length.
+    #[unsafe(no_mangle)]
+    extern "C" fn apply_block(input_ptr: u32, input_len: u32) -> u64 {
+        let input_bytes =
+            unsafe { core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize) };
+        let input: StfInput = borsh::from_slice(input_bytes).expect("decode StfInput");
+
+        let mut backend = WasmHostBackend;
+        let output: StfPublicOutput = core_apply_block(input, &mut backend);
+
+        let bytes = borsh::to_vec(&output).expect("encode StfPublicOutput");
+        let ptr = bytes.as_ptr() as u32;
+        let len = bytes.len() as u32;
+        mem::forget(bytes);
+        ((ptr as u64) << 32) | (len as u64)
+    }
+
+    /// Placeholder transaction-admission entrypoint exposed only by
+    /// the master (not the SP1 Guest). Real logic arrives in M4-new.
+    #[unsafe(no_mangle)]
+    const extern "C" fn validate_tx(_tx_ptr: u32, _tx_len: u32) -> u32 {
+        0
+    }
+
+    /// Placeholder read-only query entrypoint exposed only by the
+    /// master (not the SP1 Guest). Real logic arrives in M4-new.
+    #[unsafe(no_mangle)]
+    const extern "C" fn query(_req_ptr: u32, _req_len: u32) -> u32 {
+        0
+    }
+
+    // -----------------------------------------------------------------
+    // Allocator + panic handler for `wasm32-unknown-unknown`.
+    // -----------------------------------------------------------------
+
+    #[global_allocator]
+    static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
+    #[panic_handler]
+    fn on_panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+        core::arch::wasm32::unreachable()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use neutrino_default_runtime_core::COUNTER_KEY;
-    use neutrino_runtime_abi::WitnessEntry;
+    use neutrino_runtime_abi::{StateWitness, WitnessEntry};
     use neutrino_runtime_core::{empty_state_root, state_root_of};
 
     #[test]
-    fn apply_block_matches_shared_core_via_borsh_envelope() {
+    fn apply_block_with_witness_matches_shared_core() {
         let input = StfInput { delta: 11 };
         let witness = StateWitness {
             pre_state_root: empty_state_root(),
@@ -87,7 +213,7 @@ mod tests {
             }],
         };
         let bytes = borsh::to_vec(&(input, witness)).unwrap();
-        let out_bytes = apply_block(&bytes);
+        let out_bytes = apply_block_with_witness(&bytes);
         let out: StfPublicOutput = borsh::from_slice(&out_bytes).unwrap();
         assert_eq!(out.counter, 11);
         assert_eq!(out.pre_state_root, empty_state_root());
@@ -95,11 +221,5 @@ mod tests {
             out.post_state_root,
             state_root_of([(COUNTER_KEY, 11u32.to_le_bytes().as_slice())])
         );
-    }
-
-    #[test]
-    fn placeholder_entrypoints_return_ok() {
-        assert_eq!(validate_tx(0, 0), 0);
-        assert_eq!(query(0, 0), 0);
     }
 }

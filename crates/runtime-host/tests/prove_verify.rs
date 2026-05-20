@@ -118,15 +118,15 @@ fn tampered_witness_value_makes_guest_abort() {
     );
 }
 
-/// Sanity: the master crate's `apply_block` (same generic interface)
+/// Sanity: the master crate's native rlib `apply_block_with_witness`
 /// produces the same public output as the dry-run path. No SP1 work.
 #[test]
-fn master_apply_block_matches_dry_run() {
+fn master_apply_block_with_witness_matches_dry_run() {
     let live = live_with_counter(7);
     let dry = dry_run(StfInput { delta: 4 }, &live);
 
     let bytes = borsh::to_vec(&(StfInput { delta: 4 }, dry.witness.clone())).unwrap();
-    let out_bytes = neutrino_default_runtime_master::apply_block(&bytes);
+    let out_bytes = neutrino_default_runtime_master::apply_block_with_witness(&bytes);
     let out: StfPublicOutput = borsh::from_slice(&out_bytes).unwrap();
 
     assert_eq!(out, dry.output);

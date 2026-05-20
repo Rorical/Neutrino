@@ -1,6 +1,6 @@
 [package]
 name          = "neutrino-runtime-host"
-description   = "SP1 prover/verifier host for the Neutrino runtime."
+description   = "SP1 prover/verifier host plus WASM dynamic runtime host for the Neutrino runtime."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -16,12 +16,12 @@ publish       = { workspace = true }
 
 # SP1 is a hard environment dependency of Neutrino: every contributor and
 # every CI runner installs the `succinct` rustup toolchain via `sp1up`
-# before `cargo build --locked`. The guest ELF build is always wired in;
-# there is no feature flag to disable it. See `AGENTS.md` and
-# `docs/design/13-sp1-runtime-proof-rewrite.md` for the rationale.
+# before `cargo build --locked`. The guest ELF and the master WASM are
+# both compiled by `build.rs`.
 
 [dependencies]
 sp1-sdk                       = { workspace = true }
+wasmtime                      = { workspace = true }
 borsh                         = { workspace = true }
 bincode                       = { workspace = true }
 blake3                        = { workspace = true }
@@ -29,6 +29,7 @@ thiserror                     = { workspace = true }
 neutrino-default-runtime-core = { workspace = true }
 neutrino-runtime-core         = { workspace = true, features = ["host"] }
 neutrino-runtime-abi          = { workspace = true }
+neutrino-primitives           = { workspace = true }
 
 [build-dependencies]
 sp1-build = { workspace = true }

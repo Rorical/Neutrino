@@ -1,18 +1,23 @@
 #![deny(unsafe_code)]
 
-//! SP1 prover/verifier host for the Neutrino runtime.
+//! SP1 prover/verifier and WASM dynamic runtime host for Neutrino.
 //!
 //! Exposes the M2-new orchestration entry points:
 //!
-//! - [`dry_run`] — execute the STF natively against a [`LiveStateMap`]
-//!   using a [`TracingState`] and return the recorded [`StateWitness`]
-//!   plus the candidate [`StfPublicOutput`].
+//! - [`dry_run`] — native dry-run against a [`LiveStateMap`] using a
+//!   [`TracingState`]; returns the recorded [`StateWitness`] plus the
+//!   candidate [`StfPublicOutput`]. Convenient for tests.
+//! - [`wasm::WasmRuntime::dry_run`] — the production dry-run path:
+//!   loads the master cdylib in wasmtime, runs `apply_block` against
+//!   live state through host imports, and captures the witness the
+//!   SP1 Guest will replay.
 //! - [`prove_with`] / [`prove`] — borsh-encode `(StfInput, StateWitness)`
 //!   into the SP1 stdin, run the guest, and return the proof bundle.
 //! - [`verify_with`] / [`verify`] — verify a proof, decode the committed
 //!   [`StfPublicOutput`], and check it equals the caller's expected
-//!   output (mismatch detection covers the "tampered `post_state_root`"
-//!   exit criterion).
+//!   output (covers the "tampered `post_state_root`" exit criterion).
+
+pub mod wasm;
 
 use std::fs;
 use std::path::{Path, PathBuf};

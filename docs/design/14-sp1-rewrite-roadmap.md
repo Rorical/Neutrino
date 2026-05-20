@@ -86,9 +86,11 @@ Exit criteria:
 
 ## M2-new - Shared STF core and witness protocol
 
-Status: Phase A landed. The wasmtime dynamic-runtime host is the remaining
-follow-up; the native dry-run path satisfies the architectural property
-("same code runs both ways") until then.
+Status: complete. Phase A and Phase B both landed. Real Merkle-trie
+witnesses are still deferred to M4-new because the placeholder STF
+does not need them; the current `state_root_of` canonical hash will
+be replaced by trie-backed witnesses alongside the real account/state
+model.
 
 Goal: one state-transition implementation runs in both WASM and SP1 Guest.
 
@@ -106,12 +108,25 @@ Added (Phase A):
    `ProverCtx::new_cached_for(prover, elf)` so future on-chain runtime
    upgrades can pass non-default ELFs without API churn.
 
-Deferred (Phase B):
+Added (Phase B):
 
-1. `runtime-wasm-host` with wasmtime execution support.
-2. The WASM-driven dry-run that builds the witness through host imports
-   into the master binary, replacing the current native dry-run.
-3. Real Merkle-trie witnesses (currently the witness carries the full
+1. `runtime-host::wasm::WasmRuntime` loads the master cdylib in
+   wasmtime and drives `apply_block` through host imports.
+2. The master cdylib exports `apply_block`, `neutrino_allocate`, and
+   `neutrino_deallocate`; it imports state operations
+   (`state_read_len`/`state_read_into`/`state_write`/`state_delete`)
+   and root accessors (`pre_state_root`/`post_state_root`) from the
+   `neutrino` import module.
+3. `runtime-host/build.rs` compiles `master.wasm` into an isolated
+   target directory and embeds it via
+   `runtime-host::wasm::DEFAULT_MASTER_WASM`.
+4. `WasmRuntime::dry_run` produces the same `StfPublicOutput` and
+   `StateWitness` as the native `dry_run`, verified by the
+   `wasm_dry_run` integration tests.
+
+Deferred:
+
+1. Real Merkle-trie witnesses (currently the witness carries the full
    visible pre-state hashed canonically via `state_root_of`). Will land
    alongside the real account/state model in M4-new.
 
@@ -128,8 +143,10 @@ Exit criteria:
    `apply_block` lives in `runtimes/neutrino-default/core`; the master
    `cdylib` and the SP1 guest both link it.)
 2. A block-level test executes WASM dry-run, builds witness, proves in SP1,
-   and verifies public output. (Met via the native dry-run path;
-   wasmtime-driven dry-run is the Phase B follow-up.)
+   and verifies public output. (Met: `WasmRuntime::dry_run` runs the
+   master cdylib in wasmtime, returns the same `(output, witness)` as
+   the native `dry_run`, which is then proved and verified in the
+   `full_pipeline_dry_run_prove_verify_mock` test.)
 3. A missing witness entry makes SP1 proving fail. (Met: the guest's
    `WitnessState::read` panics on unwitnessed keys; surfaced via
    `ProverCtx::execute().exit_code != 0`.)

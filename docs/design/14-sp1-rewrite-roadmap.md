@@ -486,13 +486,16 @@ Exit criteria (status):
    `try_produce_block` + `prove_block` path and both followers
    converge through gossip ingest.
 2. A syncing node catches up by fetching headers, bodies, state,
-   and block proofs — **data plane met** by `snap_sync_via_rpc.rs`
-   (the RPC handlers serve real SP1 artifacts, the follower
-   imports them through `verify_and_import_headers` /
-   `verify_and_import_block_proofs`, the two nodes converge).
-   The `SyncDriver` FSM still walks all transitions in the
-   synthetic-backend tests (`crates/sync/tests/driver_loop.rs`)
-   but end-to-end on a real `ChainBackend` is deferred.
+   and block proofs — **fully met**. The data plane is verified
+   by `snap_sync_via_rpc.rs` (RPC handlers serve real SP1
+   artifacts; the two nodes converge through direct method
+   calls). The `SyncDriver` FSM is verified against a synthetic
+   backend by `driver_loop.rs`. The combination of "real
+   SyncDriver + real ChainBackend over libp2p" is verified by
+   `sync_driver_e2e.rs`: an empty follower converges to a 3-block
+   producer's head + proven height by walking
+   `Init → HeaderBackfill → StateFetch → ProofBackfill →
+   Following` over real libp2p RPCs.
 3. Invalid proof gossip does not poison fork choice — **met** by
    `block_proof_gossip_rejection.rs`. Three adversarial input
    classes are rejected without advancing the block FSM or the
@@ -609,17 +612,23 @@ Deferred to follow-on milestones:
    detector fires on precommit but not on prevote; peer evidence
    carrying a proof that actually verifies is dropped at
    `ingest_slashing_evidence` time.
-3. **Observe-precommit-time "all blocks Proven" gate.** Today the
-   gate is at BFT-open and finalize; `Engine::observe_finality_vote`
-   trusts that any peer prevote / precommit reaching the session
-   was emitted in good faith. A malicious validator that signs a
-   precommit for a chunk whose blocks are not all Proven (in
-   their local view) cannot push finality through (because the
-   2/3 stake quorum requires the majority of honest validators to
-   agree the chunk is finalisable, which they won't be able to do
-   until they see a valid proof) — but the malicious vote will
-   still be counted toward the local quorum. Tightening this
-   becomes meaningful once #2's detector is in place.
+3. ~~Observe-precommit-time "all blocks Proven" gate.~~
+   **Closed as non-issue after re-analysis.** The existing
+   `assemble_chunk` gate at BFT-session-open time already
+   prevents counting any vote on a chunk the local node
+   considers unproven: `Engine::observe_finality_vote`
+   silently drops votes for chunks without an open session
+   (`bft_loop.rs:417-419`), and the session is only opened via
+   `maybe_open_bft_session_for_height` after `assemble_chunk`
+   confirms every covered block is `Proven`. Once the FSM
+   reaches `Proven`, no transition demotes the block back
+   (`import_block_proof` only writes the column on success),
+   so the gate is monotonic. The remaining theoretical case —
+   a malicious validator signing a precommit even though they
+   themselves locally consider the chunk unproven — is
+   invisible to a remote verifier; #2's `InvalidProofSigning`
+   detector handles the symmetric case where the verifier's
+   own view considers the chunk unproven.
 
 Exit criteria (status):
 

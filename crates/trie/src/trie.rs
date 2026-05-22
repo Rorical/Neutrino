@@ -305,18 +305,39 @@ impl<H: Hasher> Trie<H> {
     }
 
     /// Walk the trie from root to the terminal for `key`, accumulating
-    /// every visited node's `(hash, bytes)` into `out_nodes` and the
+    /// every visited node's `(hash, bytes)` into `out_nodes`, the
     /// terminal leaf's `(value_hash, value_bytes)` (when present) into
-    /// `out_values`.
+    /// `out_values`, and the sibling node at every on-path Branch
+    /// into `out_nodes` as well.
+    ///
+    /// # Why siblings are included
+    ///
+    /// Reads and inserts only walk the path to `key`; siblings are
+    /// referenced by hash and never fetched. Deletes are different:
+    /// when a Branch loses one child to `ZERO_HASH`, the trie
+    /// inspects the surviving sibling's node bytes via
+    /// `absorb_into_parent` to decide whether to fold the parent
+    /// away (Leaf/Extension siblings merge into the parent path;
+    /// Branch siblings get re-wrapped in an Extension). That top-
+    /// level inspection is the only sibling access the trie ever
+    /// performs, so harvesting one node per on-path Branch is
+    /// sufficient — we do not need the sibling's subtree.
+    ///
+    /// Sibling *values* are not collected: `absorb_into_parent`
+    /// builds the merged node from `value_hash` alone and never
+    /// reads the value bytes. Callers that also need to *read* the
+    /// sibling's value should call `collect_path_nodes` on the
+    /// sibling's key separately.
     ///
     /// Used by witness builders: the resulting subset is the minimum
     /// data needed for a `Trie::from_persisted` reconstruction that
-    /// can both *read* `key` and *insert / remove* at `key` (writes
-    /// only need on-path nodes; siblings are referenced by hash).
+    /// can read `key`, insert at `key`, and remove `key` (with the
+    /// guest's `Trie::remove` walking the same path and consulting
+    /// the same sibling for collapse decisions).
     ///
     /// Calling this method many times with disjoint keys is the
     /// standard way to assemble a Merkle witness covering the read /
-    /// write set of one block.
+    /// write / delete set of one block.
     pub fn collect_path_nodes(
         &self,
         key: &[u8],
@@ -346,8 +367,18 @@ impl<H: Hasher> Trie<H> {
                         return;
                     }
                     let bit = path.bit(consumed);
+                    let (sibling, descended) = if bit { (left, right) } else { (right, left) };
+                    // Harvest the sibling so a future `Trie::remove`
+                    // in the partial trie can call
+                    // `absorb_into_parent` without panicking on a
+                    // missing node fetch.
+                    if sibling != ZERO_HASH {
+                        if let Some(bytes) = self.nodes.get(&sibling) {
+                            out_nodes.insert(sibling, bytes.clone());
+                        }
+                    }
                     consumed += 1;
-                    current = if bit { right } else { left };
+                    current = descended;
                 }
                 Node::Extension { prefix, child } => {
                     let len = prefix.bit_len();
@@ -1129,5 +1160,92 @@ mod tests {
         trie.collect_path_nodes(b"alpha", &mut nodes, &mut values);
         assert!(nodes.is_empty());
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn collect_path_nodes_includes_branch_siblings_so_remove_round_trips() {
+        // Original bug: `Trie::remove` calls `absorb_into_parent` when
+        // a branch loses one child to `ZERO_HASH`; that path fetches
+        // the surviving sibling's node bytes. Without sibling harvest
+        // the partial trie panics on the fetch.
+        //
+        // Setup a trie with `left` + `right` keys whose paths diverge
+        // at a Branch close to the root, take a witness covering only
+        // `left`, reconstruct a partial trie, and remove `left`. The
+        // removal must complete because the sibling `right` was
+        // included in the witness; the post-remove root must equal
+        // the root of a trie that only ever contained `right`.
+        let mut full: Trie<Blake3Hasher> = Trie::new();
+        full.insert(b"left-key", b"L".to_vec()).unwrap();
+        full.insert(b"right-key", b"R".to_vec()).unwrap();
+        let root_full = full.root();
+
+        // Witness covering only the left key (the one we'll remove).
+        let mut nodes = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        full.collect_path_nodes(b"left-key", &mut nodes, &mut values);
+
+        let mut partial = Trie::<Blake3Hasher>::from_persisted(
+            root_full,
+            nodes.iter().map(|(h, b)| (*h, b.clone())),
+            values.iter().map(|(h, b)| (*h, b.clone())),
+        );
+        // Sanity: partial trie can read `left-key`.
+        assert_eq!(partial.get(b"left-key").as_deref(), Some(b"L".as_ref()));
+
+        // Removing `left-key` must succeed and trigger sibling absorb.
+        let removed = partial.remove(b"left-key");
+        assert_eq!(removed.as_deref(), Some(b"L".as_ref()));
+
+        // Post-remove root equals a trie that only ever held `right-key`.
+        let mut reference: Trie<Blake3Hasher> = Trie::new();
+        reference.insert(b"right-key", b"R".to_vec()).unwrap();
+        assert_eq!(partial.root(), reference.root());
+    }
+
+    #[test]
+    fn collect_path_nodes_includes_siblings_along_a_deep_path() {
+        // Multiple branches between the root and the target should
+        // each contribute a sibling to the witness. Build a deeper
+        // trie and remove a leaf; the partial trie must reach
+        // `ZERO_HASH` when its only inhabitant is the target.
+        let mut full: Trie<Blake3Hasher> = Trie::new();
+        let pairs: [(&[u8], &[u8]); 5] = [
+            (b"alpha", b"1"),
+            (b"beta", b"2"),
+            (b"gamma", b"3"),
+            (b"delta", b"4"),
+            (b"epsilon", b"5"),
+        ];
+        for (k, v) in pairs {
+            full.insert(k, v.to_vec()).unwrap();
+        }
+        let root_full = full.root();
+
+        // Witness for every key — this is what the host's
+        // TracingState would assemble if every key were touched.
+        let mut nodes = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        for (k, _) in pairs {
+            full.collect_path_nodes(k, &mut nodes, &mut values);
+        }
+
+        let mut partial = Trie::<Blake3Hasher>::from_persisted(
+            root_full,
+            nodes.iter().map(|(h, b)| (*h, b.clone())),
+            values.iter().map(|(h, b)| (*h, b.clone())),
+        );
+
+        // Remove every key one at a time. None of the removes should
+        // panic; the final root is the empty-trie root.
+        for (k, expected) in pairs {
+            let got = partial.remove(k);
+            assert_eq!(
+                got.as_deref(),
+                Some(expected),
+                "removing {k:?} must return its stored value",
+            );
+        }
+        assert_eq!(partial.root(), ZERO_HASH);
     }
 }

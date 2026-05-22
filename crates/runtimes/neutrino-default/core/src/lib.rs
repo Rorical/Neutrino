@@ -1300,14 +1300,16 @@ fn apply_withdraw<B: StateBackend>(
     signer.nonce = signer.nonce.saturating_add(1);
 
     store_account(state, &tx.validator, &signer);
-    // Always store the (possibly empty) queue rather than deleting
-    // the key. Trie deletes require sibling-path witness data the
-    // dry-run access set doesn't otherwise capture; the cost of
-    // keeping an empty `WithdrawalQueue { entries: vec![] }` in
-    // state is a few bytes per validator, which we accept in
-    // exchange for keeping the witness shape uniform across the
-    // withdraw lifecycle.
-    store_withdrawal_queue(state, &tx.validator, &queue);
+    // Drop the queue entirely when it's empty so the trie footprint
+    // stays minimal. The witness builder's `Trie::collect_path_nodes`
+    // emits the sibling node at every on-path Branch, so the SP1
+    // guest's `Trie::remove` has the data it needs to call
+    // `absorb_into_parent` (the trie's collapse path).
+    if queue.entries.is_empty() {
+        state.delete(&withdrawal_key(&tx.validator));
+    } else {
+        store_withdrawal_queue(state, &tx.validator, &queue);
+    }
     true
 }
 
@@ -2627,12 +2629,11 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_drains_empty_queue_leaves_empty_record() {
-        // Post-M8 invariant: the withdrawal-queue key stays in state
-        // as `WithdrawalQueue { entries: vec![] }` after a drain.
-        // Trie deletes would require sibling-path witness data the
-        // dry-run access set does not capture; the few-byte cost of
-        // an empty record per validator is the agreed trade-off.
+    fn withdraw_drains_empty_queue_removes_state_entry() {
+        // The trie's `collect_path_nodes` harvests on-path sibling
+        // nodes, so the SP1 guest's `Trie::remove` has the data it
+        // needs to collapse the parent branch. apply_withdraw can
+        // safely drop the queue key when empty.
         let alice = signing_key(48);
         let addr = address_of(&alice);
         let mut live = LiveTrie::default();
@@ -2659,9 +2660,8 @@ mod tests {
             transactions: alloc::vec![tx],
         };
         let (_, post) = apply_against(&live, &input);
-        // Queue drained, but the state record stays (empty entries).
-        let queue_after = read_withdrawal_queue(&post, &addr);
-        assert!(queue_after.entries.is_empty());
+        // Queue drained -> key removed from state.
+        assert!(post.get(&withdrawal_key(&addr)).is_none());
     }
 
     #[test]

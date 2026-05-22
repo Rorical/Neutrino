@@ -742,6 +742,8 @@ mod tests {
                 da_root: ZERO_HASH,
                 vm_code_hash: h(50),
                 abi_version: 1,
+                gas_used: 0,
+                gas_limit: 1_000_000,
             },
             proof_bytes: vec![1, 2, 3, 4],
         };

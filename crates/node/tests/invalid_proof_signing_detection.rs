@@ -154,6 +154,8 @@ fn bad_mock_proof(block: &Block) -> BlockProof {
         da_root: block.header.da_root,
         vm_code_hash: [0xCC; 32],
         abi_version: 1,
+        gas_used: block.header.gas_used,
+        gas_limit: block.header.gas_limit,
     };
     // Commitment doesn't match what MockProofSystem would compute,
     // so verify_block fails with PublicInputMismatch.
@@ -186,6 +188,8 @@ fn good_mock_proof(block: &Block) -> BlockProof {
         da_root: block.header.da_root,
         vm_code_hash: [0xCC; 32],
         abi_version: 1,
+        gas_used: block.header.gas_used,
+        gas_limit: block.header.gas_limit,
     };
     let mock_proof = MockProofSystem::new()
         .prove_block_for_test(&public_inputs)

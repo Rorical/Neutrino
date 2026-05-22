@@ -18,7 +18,7 @@ use core::fmt;
 
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{Hash, StateRoot};
-use neutrino_runtime_abi::{QueryRequest, QueryResponse};
+use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidationCode, TxValidity};
 use neutrino_trie::{Blake3Hasher, Trie};
 
 /// Outcome of a successful [`BlockExecutor::execute_block`] call.
@@ -32,8 +32,11 @@ pub struct ExecutionOutcome {
     /// canonical `validator_set_root` so the next chunk BFT picks up
     /// the updated stake distribution.
     pub runtime_extra: Hash,
-    /// Gas the runtime claims to have consumed. M5 does not enforce
-    /// a metric; the value flows directly into `header.gas_used`.
+    /// Sum of [`tx_gas`](../../neutrino_default_runtime_core/fn.tx_gas.html)
+    /// across every successfully applied transaction. The engine
+    /// wires this into `header.gas_used` and
+    /// `BlockProofPublicInputs.gas_used` so the SP1 proof commits to
+    /// the same value the header carries.
     pub gas_used: u64,
     /// Opaque blob suitable for the matching
     /// `ProofSystem::prove_block`. For the SP1 + default-runtime
@@ -60,6 +63,13 @@ pub trait BlockExecutor {
     /// Execute a block body against `state` and return the post-state
     /// commitments + witness bytes.
     ///
+    /// `gas_limit` is the block-level ceiling the consensus header
+    /// committed to (`header.gas_limit`). The runtime applies
+    /// transactions until the next one would push gas consumption
+    /// past this limit; remaining transactions are counted as
+    /// failed without state mutation. The runtime returns the
+    /// actual gas it consumed inside [`ExecutionOutcome::gas_used`].
+    ///
     /// # Errors
     ///
     /// Returns [`Self::Error`] if the runtime fails to load, the
@@ -68,6 +78,7 @@ pub trait BlockExecutor {
         &self,
         chain_id: u64,
         body: &Body,
+        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error>;
 
@@ -92,6 +103,34 @@ pub trait BlockExecutor {
         request: &QueryRequest,
         state: &Trie<Blake3Hasher>,
     ) -> Result<QueryResponse, Self::Error>;
+
+    /// Mempool / RPC admission check for a single candidate
+    /// transaction.
+    ///
+    /// Runs the runtime's `_neutrino_validate_tx` entrypoint
+    /// against a read-only view of `state`. Returns the canonical
+    /// [`TxValidity`] result the runtime emitted: a [`TxValidationCode`]
+    /// describing whether (and why not) the transaction is
+    /// admissible, plus a mempool priority for the `Valid` case.
+    ///
+    /// Implementations MUST NOT mutate `state` and MUST NOT depend on
+    /// non-deterministic inputs: the same `(tx, state, chain_id,
+    /// block_gas_limit)` tuple must always produce the same result so
+    /// peers cannot disagree about admission outcomes.
+    ///
+    /// # Errors
+    /// Returns [`Self::Error`] when the runtime traps or the host
+    /// fails to decode the runtime's 12-byte response.
+    /// Runtime-defined rejections (bad signature, nonce mismatch,
+    /// ...) are surfaced through [`TxValidity::code`], not as
+    /// `Self::Error`.
+    fn validate_tx(
+        &self,
+        tx_bytes: &[u8],
+        chain_id: u64,
+        block_gas_limit: u64,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<TxValidity, Self::Error>;
 }
 
 /// Dyn-friendly companion to [`BlockExecutor`].
@@ -114,6 +153,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
         &self,
         chain_id: u64,
         body: &Body,
+        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String>;
 
@@ -127,6 +167,19 @@ pub trait ErasedBlockExecutor: Send + Sync {
         request: &QueryRequest,
         state: &Trie<Blake3Hasher>,
     ) -> Result<QueryResponse, String>;
+
+    /// Type-erased counterpart to [`BlockExecutor::validate_tx`].
+    ///
+    /// # Errors
+    /// Surfaces the underlying executor's error rendered as a
+    /// human-readable string.
+    fn validate_tx(
+        &self,
+        tx_bytes: &[u8],
+        chain_id: u64,
+        block_gas_limit: u64,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<TxValidity, String>;
 }
 
 impl<X> ErasedBlockExecutor for X
@@ -137,9 +190,11 @@ where
         &self,
         chain_id: u64,
         body: &Body,
+        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String> {
-        BlockExecutor::execute_block(self, chain_id, body, state).map_err(|err| err.to_string())
+        BlockExecutor::execute_block(self, chain_id, body, gas_limit, state)
+            .map_err(|err| err.to_string())
     }
 
     fn query(
@@ -148,6 +203,17 @@ where
         state: &Trie<Blake3Hasher>,
     ) -> Result<QueryResponse, String> {
         BlockExecutor::query(self, request, state).map_err(|err| err.to_string())
+    }
+
+    fn validate_tx(
+        &self,
+        tx_bytes: &[u8],
+        chain_id: u64,
+        block_gas_limit: u64,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<TxValidity, String> {
+        BlockExecutor::validate_tx(self, tx_bytes, chain_id, block_gas_limit, state)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -166,6 +232,7 @@ impl BlockExecutor for UnsupportedExecutor {
         &self,
         _chain_id: u64,
         _body: &Body,
+        _gas_limit: u64,
         _state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error> {
         Err(String::from("block executor not configured"))
@@ -176,6 +243,21 @@ impl BlockExecutor for UnsupportedExecutor {
         _request: &QueryRequest,
         _state: &Trie<Blake3Hasher>,
     ) -> Result<QueryResponse, Self::Error> {
+        Err(String::from("block executor not configured"))
+    }
+
+    fn validate_tx(
+        &self,
+        _tx_bytes: &[u8],
+        _chain_id: u64,
+        _block_gas_limit: u64,
+        _state: &Trie<Blake3Hasher>,
+    ) -> Result<TxValidity, Self::Error> {
+        // Without an executor the system has no way to interpret the
+        // bytes, so report a definitive failure rather than silently
+        // admitting an opaque blob. Mempool admission keys on the
+        // returned `TxValidationCode`, not on the error path.
+        let _ = TxValidationCode::StateReadFailed;
         Err(String::from("block executor not configured"))
     }
 }

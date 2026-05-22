@@ -86,7 +86,7 @@ fn body_transactions_with_borsh_slash_apply_through_wasm_executor() {
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     let outcome = executor
-        .execute_block(CHAIN_ID, &body, &mut state)
+        .execute_block(CHAIN_ID, &body, 30_000_000, &mut state)
         .expect("execute_block succeeds");
 
     // Validator stake is now zero; `active` flipped to false.
@@ -161,7 +161,7 @@ fn body_transactions_with_borsh_inactivity_leak_apply_through_wasm_executor() {
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     let outcome = executor
-        .execute_block(CHAIN_ID, &body, &mut state)
+        .execute_block(CHAIN_ID, &body, 30_000_000, &mut state)
         .expect("execute_block succeeds");
 
     // addr_a lost 2 stake total; addr_b unchanged.
@@ -212,7 +212,7 @@ fn body_transactions_with_unknown_blob_are_silently_dropped() {
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     let _ = executor
-        .execute_block(CHAIN_ID, &body, &mut state)
+        .execute_block(CHAIN_ID, &body, 30_000_000, &mut state)
         .expect("execute_block succeeds");
 
     // Only the real Slash applied; legacy entry was dropped.

@@ -56,6 +56,7 @@ use neutrino_rpc::{
     BlockId, FinalizedInfo, HeadInfo, RpcBackend, RuntimeCallError, RuntimeCallResponse,
     SubmitError as RpcSubmitError,
 };
+use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 use neutrino_storage::Database;
 use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
@@ -605,14 +606,62 @@ where
 
     /// Submit a peer-supplied transaction into the local mempool.
     ///
-    /// Rejects transactions until the WASM runtime precheck path is rebuilt.
-    /// Duplicate or oversized txs are surfaced via [`InsertError`] once
-    /// runtime-backed admission is available again.
+    /// Runs the installed dynamic-runtime executor's
+    /// [`BlockExecutor::validate_tx`](neutrino_proof_system::BlockExecutor::validate_tx)
+    /// against a snapshot of the engine's current state trie. The
+    /// runtime returns a canonical [`TxValidity`] result; on
+    /// [`TxValidationCode::Valid`] the bytes enter the mempool with
+    /// the runtime-supplied priority, otherwise the call surfaces
+    /// [`InsertError::RejectedByValidator`].
+    ///
+    /// Without an installed executor the call rejects every
+    /// submission as `RejectedByValidator`; the node binary installs
+    /// one at startup, but tests that exercise gossip without a
+    /// running runtime intentionally leave it unset.
     pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
-        debug!("WASM runtime is not implemented yet; rejecting transaction admission");
-        let valid = false;
+        // Capture chain_id + gas_limit + state snapshot under the
+        // engine mutex so the executor sees a consistent view. The
+        // mempool itself takes its own lock below; serialising them
+        // through one critical section would deadlock with concurrent
+        // gossip + production paths.
+        let (chain_id, gas_limit, state_snapshot, executor) = {
+            let executor = self.block_executor_snapshot();
+            self.with_engine(|e| {
+                (
+                    e.chain_spec().chain_id,
+                    e.chain_spec().genesis_gas_limit,
+                    e.state().clone(),
+                    executor,
+                )
+            })
+        };
+        let Some(executor) = executor else {
+            debug!("submit_transaction: no executor installed; rejecting");
+            let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
+            return pool.insert_validated(bytes, |_| false);
+        };
+
+        // Run admission. Host trap / codec failures degrade to
+        // `RejectedByValidator` so a misbehaving runtime never poisons
+        // the mempool; the runtime owns the soft-reject codes
+        // (BadSignature / NonceMismatch / ...).
+        let validity = match executor.validate_tx(&bytes, chain_id, gas_limit, &state_snapshot) {
+            Ok(v) => v,
+            Err(err) => {
+                debug!(%err, "validate_tx executor trap; rejecting tx");
+                TxValidity::invalid(TxValidationCode::StateReadFailed)
+            }
+        };
+
         let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
-        pool.insert_validated(bytes, |_| valid)
+        if validity.is_valid() {
+            pool.insert_with_priority(bytes, validity.priority)
+        } else {
+            // Insert through the validated path with a refusing
+            // closure so the mempool surfaces a uniform error and
+            // does not store the rejected bytes.
+            pool.insert_validated(bytes, |_| false)
+        }
     }
 
     /// Drain up to `byte_budget` bytes of transactions from the mempool

@@ -605,6 +605,8 @@ impl<DB: Database> Engine<DB> {
             da_root: header.da_root,
             vm_code_hash: self.chain_spec().runtime_code_hash,
             abi_version: self.chain_spec().runtime_version.abi_version,
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
         }
     }
 }
@@ -907,6 +909,8 @@ mod tests {
             da_root: ZERO_HASH,
             vm_code_hash: ZERO_HASH,
             abi_version: 1,
+            gas_used: 0,
+            gas_limit: 1_000_000,
         };
         let block_proof = proof_system
             .prove_block(&[], &block_inputs)

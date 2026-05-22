@@ -180,6 +180,8 @@ mod tests {
             da_root: [7; 32],
             vm_code_hash: [8; 32],
             abi_version: 1,
+            gas_used: 0,
+            gas_limit: 1_000_000,
         }
     }
 

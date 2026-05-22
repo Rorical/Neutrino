@@ -27,7 +27,7 @@ use neutrino_default_runtime_core::{StfInput, StfPublicOutput};
 use neutrino_primitives::StateRoot;
 use neutrino_runtime_abi::{
     QUERY_ENTRYPOINT, QueryRequest, QueryResponse, QueryStatus, StateWitness, TrieNodeBytes,
-    TrieValueBytes,
+    TrieValueBytes, TxValidity, TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Blake3Hasher, Trie};
@@ -47,12 +47,18 @@ pub enum WasmError {
     /// Borsh codec error on the host side.
     #[error("borsh codec error: {0}")]
     Codec(String),
+    /// The runtime returned a [`TxValidity`] blob the host could not
+    /// decode (wrong length, unknown code, ...). Indicates a host /
+    /// runtime ABI skew.
+    #[error("invalid TxValidity from runtime: {0:?}")]
+    InvalidTxValidity(TxValidityDecodeError),
 }
 
 impl From<WasmError> for Sp1HostError {
     fn from(err: WasmError) -> Self {
         match err {
             WasmError::Wasmtime(msg) | WasmError::Codec(msg) => Self::Codec(msg),
+            WasmError::InvalidTxValidity(decode_err) => Self::Codec(format!("{decode_err:?}")),
         }
     }
 }
@@ -98,6 +104,10 @@ impl WasmRuntime {
     /// Execute `apply_block` inside the WASM runtime against a tracing
     /// view of `live`, then materialise the witness the SP1 Guest needs
     /// to replay the same transition.
+    ///
+    /// `input.block_gas_limit` must be set by the caller to the
+    /// header's `gas_limit`; the runtime stops applying transactions
+    /// once their cumulative cost would exceed that ceiling.
     ///
     /// Equivalent in result to [`crate::dry_run`] but goes through the
     /// real wasmtime ABI used in production.
@@ -271,6 +281,110 @@ impl WasmRuntime {
         }
 
         Ok(response)
+    }
+
+    /// Run the runtime's `_neutrino_validate_tx` entrypoint against a
+    /// read-only view of `live`.
+    ///
+    /// The host writes the bound `chain_id` + `block_gas_limit` + raw
+    /// transaction bytes into linear memory, invokes the runtime, and
+    /// decodes the canonical 12-byte [`TxValidity`] result the
+    /// runtime emitted. The scratch trie is discarded after the call
+    /// so admission cannot mutate `live`; the host runs in read-only
+    /// mode and forces `TxValidationCode::Unauthorized`-equivalent
+    /// behavior at the WASM ABI boundary if the runtime attempts a
+    /// write (it should not for a correctly-implemented runtime).
+    ///
+    /// # Errors
+    /// Returns [`WasmError`] when linking, instantiation, or trap
+    /// recovery fails; or [`WasmError::InvalidTxValidity`] when the
+    /// runtime's response cannot be decoded as a [`TxValidity`].
+    pub fn validate_tx(
+        &self,
+        tx_bytes: &[u8],
+        chain_id: u64,
+        block_gas_limit: u64,
+        live: &LiveTrie,
+    ) -> Result<TxValidity, WasmError> {
+        let host = HostState {
+            live: live.clone(),
+            scratch: live.trie().clone(),
+            accessed: BTreeSet::new(),
+            pending_read_value: None,
+            read_only: true,
+            write_attempted: false,
+        };
+        let mut store = Store::new(&self.engine, Mutex::new(host));
+
+        let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
+        register_host_imports(&mut linker)?;
+
+        let instance = linker
+            .instantiate(&mut store, &self.module)
+            .map_err(wt_err)?;
+
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
+
+        // Canonical admission envelope:
+        //   16B chain_id || 8B block_gas_limit || tx_bytes
+        // The runtime's _neutrino_validate_tx decodes the prefix
+        // before parsing the tx itself. Putting the gas limit on
+        // the wire means a runtime that wraps multiple chain
+        // configurations can pick the right one even when the host
+        // does not surface BlockContext.
+        let chain_id_bytes = chain_id.to_le_bytes();
+        let gas_limit_bytes = block_gas_limit.to_le_bytes();
+        let mut input_bytes = Vec::with_capacity(16 + tx_bytes.len());
+        input_bytes.extend_from_slice(&chain_id_bytes);
+        input_bytes.extend_from_slice(&gas_limit_bytes);
+        input_bytes.extend_from_slice(tx_bytes);
+
+        let allocate: TypedFunc<u32, u32> = instance
+            .get_typed_func(&mut store, "neutrino_allocate")
+            .map_err(wt_err)?;
+        let in_ptr = allocate
+            .call(&mut store, input_bytes.len() as u32)
+            .map_err(wt_err)?;
+        memory
+            .write(&mut store, in_ptr as usize, &input_bytes)
+            .map_err(wt_err)?;
+
+        let validate_fn: TypedFunc<(u32, u32), u64> = instance
+            .get_typed_func(&mut store, VALIDATE_TX_ENTRYPOINT)
+            .map_err(wt_err)?;
+        let packed = validate_fn
+            .call(&mut store, (in_ptr, input_bytes.len() as u32))
+            .map_err(wt_err)?;
+        let out_ptr = (packed >> 32) as u32;
+        let out_len = (packed & 0xFFFF_FFFF) as u32;
+
+        let mut out_bytes = vec![0u8; out_len as usize];
+        memory
+            .read(&store, out_ptr as usize, &mut out_bytes)
+            .map_err(wt_err)?;
+
+        if let Ok(deallocate) =
+            instance.get_typed_func::<(u32, u32), ()>(&mut store, "neutrino_deallocate")
+        {
+            let _ = deallocate.call(&mut store, (in_ptr, input_bytes.len() as u32));
+            let _ = deallocate.call(&mut store, (out_ptr, out_len));
+        }
+
+        let host = store.into_data().into_inner().expect("HostState mutex");
+        if host.write_attempted {
+            // A correctly-implemented runtime never writes during
+            // admission, so a write attempt is a hard ABI violation;
+            // we surface it as Unauthorized (the consensus-driven
+            // rejection code) so callers cannot accidentally treat
+            // the bytes as admissible.
+            return Ok(TxValidity::invalid(
+                neutrino_runtime_abi::TxValidationCode::Unauthorized,
+            ));
+        }
+
+        TxValidity::decode(&out_bytes).map_err(WasmError::InvalidTxValidity)
     }
 }
 

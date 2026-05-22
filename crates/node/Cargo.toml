@@ -46,4 +46,8 @@ tracing                           = "0.1.44"
 tracing-subscriber                = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["full", "test-util"] }
+tokio                 = { version = "1.52.3", features = ["full", "test-util"] }
+ed25519-dalek         = { workspace = true }
+neutrino-runtime-core = { workspace = true, features = ["host"] }
+rand_chacha           = { workspace = true }
+rand_core             = { workspace = true }

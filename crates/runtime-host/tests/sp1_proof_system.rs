@@ -66,7 +66,12 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     live
 }
 
-const fn public_inputs(pre: [u8; 32], post: [u8; 32]) -> BlockProofPublicInputs {
+const fn public_inputs(
+    pre: [u8; 32],
+    post: [u8; 32],
+    gas_used: u64,
+    gas_limit: u64,
+) -> BlockProofPublicInputs {
     BlockProofPublicInputs {
         chain_id: 1,
         height: 1,
@@ -79,10 +84,13 @@ const fn public_inputs(pre: [u8; 32], post: [u8; 32]) -> BlockProofPublicInputs 
         da_root: ZERO_HASH,
         vm_code_hash: ZERO_HASH,
         abi_version: 1,
+        gas_used,
+        gas_limit,
     }
 }
 
 fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
+    const BLOCK_GAS_LIMIT: u64 = 30_000_000;
     let alice = signing_key(seed);
     let alice_addr = address_of(&alice);
     let live = live_with_account(
@@ -95,6 +103,7 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
     let tx = signed_transfer(&alice, [0xCC; 32], 25, 0, CHAIN_ID);
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_gas_limit: BLOCK_GAS_LIMIT,
         transactions: vec![Transaction::Transfer(tx)],
     };
     let dry = dry_run(&input, &live);
@@ -102,7 +111,12 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
         .expect("mock prove succeeds")
         .proof;
     let sp1_bp = Sp1BlockProof::from_sp1(&bundle).expect("encode");
-    let pi = public_inputs(dry.output.pre_state_root, dry.output.post_state_root);
+    let pi = public_inputs(
+        dry.output.pre_state_root,
+        dry.output.post_state_root,
+        dry.output.gas_used,
+        BLOCK_GAS_LIMIT,
+    );
     (sp1_bp, pi)
 }
 
@@ -151,7 +165,7 @@ fn sp1_proof_system_rejects_malformed_proof_bytes() {
     let bad_proof = Sp1BlockProof {
         bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
     };
-    let pi = public_inputs([0; 32], [1; 32]);
+    let pi = public_inputs([0; 32], [1; 32], 0, 1_000_000);
     let err = proof_system
         .verify_block(&bad_proof, &pi)
         .expect_err("malformed bytes must reject");

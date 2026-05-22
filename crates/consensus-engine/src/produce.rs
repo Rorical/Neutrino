@@ -237,7 +237,7 @@ impl<DB: Database> Engine<DB> {
             gas_used,
             witness_bytes,
         } = executor
-            .execute_block(chain_id, &body, &mut next_state)
+            .execute_block(chain_id, &body, gas_limit, &mut next_state)
             .map_err(ProductionError::Executor)?;
 
         // Compute body roots from the supplied body. The executor

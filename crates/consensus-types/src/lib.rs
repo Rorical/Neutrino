@@ -455,6 +455,14 @@ pub struct BlockProofPublicInputs {
     pub vm_code_hash: Hash,
     /// ABI version expected by the runtime.
     pub abi_version: u32,
+    /// Sum of per-transaction gas the runtime charged inside the block.
+    /// Cross-checked against `header.gas_used` so a malicious prover
+    /// cannot understate the block's gas consumption.
+    pub gas_used: u64,
+    /// Block-level gas ceiling the runtime executed under. Cross-checked
+    /// against `header.gas_limit` so the proof's STF input cannot
+    /// declare a different limit than the header committed to.
+    pub gas_limit: u64,
 }
 
 /// Public inputs committed by a single chunk proof.
@@ -763,6 +771,8 @@ mod tests {
                         da_root: hash(55),
                         vm_code_hash: hash(56),
                         abi_version: 1,
+                        gas_used: 0,
+                        gas_limit: 1_000_000,
                     },
                     proof_bytes: vec![0xFF; 8],
                 },
@@ -806,6 +816,8 @@ mod tests {
             da_root: hash(62),
             vm_code_hash: hash(63),
             abi_version: 1,
+            gas_used: 0,
+            gas_limit: 1_000_000,
         };
         let block_proof = BlockProof {
             height: block_inputs.height,

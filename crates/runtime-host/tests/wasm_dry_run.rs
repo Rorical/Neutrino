@@ -61,6 +61,7 @@ fn wasm_dry_run_matches_native_on_signed_transfer() {
     let tx = signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID);
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_gas_limit: 30_000_000,
         transactions: vec![Transaction::Transfer(tx)],
     };
 
@@ -79,6 +80,7 @@ fn wasm_dry_run_matches_native_on_empty_block() {
     let live = LiveTrie::default();
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_gas_limit: 30_000_000,
         transactions: vec![],
     };
 

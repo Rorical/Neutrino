@@ -27,7 +27,42 @@ use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use neutrino_primitives::StateRoot;
+use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 use neutrino_runtime_core::StateBackend;
+
+// ---------------------------------------------------------------------------
+// Gas schedule
+// ---------------------------------------------------------------------------
+
+/// Fixed per-transaction gas cost for a [`Transaction::Transfer`].
+///
+/// The values in this module are placeholder constants tuned to feel
+/// like EVM-style "one transfer ~ 21k gas". A real chain would surface
+/// them through the chain spec; doing so is a non-consensus refactor
+/// because the cost is deterministic per kind regardless of source.
+pub const GAS_TRANSFER: u64 = 21_000;
+/// Fixed per-transaction gas cost for a [`Transaction::Stake`].
+pub const GAS_STAKE: u64 = 50_000;
+/// Fixed per-transaction gas cost for a [`Transaction::Unstake`].
+pub const GAS_UNSTAKE: u64 = 50_000;
+/// Fixed per-transaction gas cost for a [`Transaction::Slash`].
+pub const GAS_SLASH: u64 = 5_000;
+/// Fixed per-transaction gas cost for a [`Transaction::InactivityLeak`].
+pub const GAS_INACTIVITY_LEAK: u64 = 5_000;
+
+/// Per-kind gas cost lookup. The cost is independent of the
+/// transaction's outcome: only successful executions consume gas, but
+/// the cost charged is the kind's full cost (no partial refunds).
+#[must_use]
+pub const fn tx_gas(tx: &Transaction) -> u64 {
+    match tx {
+        Transaction::Transfer(_) => GAS_TRANSFER,
+        Transaction::Stake(_) => GAS_STAKE,
+        Transaction::Unstake(_) => GAS_UNSTAKE,
+        Transaction::Slash(_) => GAS_SLASH,
+        Transaction::InactivityLeak(_) => GAS_INACTIVITY_LEAK,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Domain tags & key layout
@@ -390,6 +425,13 @@ pub struct StfInput {
     /// Chain identifier the transactions are bound to. Required for
     /// cross-chain replay protection of the Ed25519 signature.
     pub chain_id: u64,
+    /// Block-level gas ceiling. The STF stops applying transactions
+    /// once the next [`tx_gas`] cost would push the running total past
+    /// this limit; remaining transactions are counted as `failed`
+    /// without state mutation. The host plumbs this from
+    /// `header.gas_limit` so the SP1 proof binds the same ceiling the
+    /// consensus header committed to.
+    pub block_gas_limit: u64,
     /// Block's transaction list, in canonical order.
     pub transactions: Vec<Transaction>,
 }
@@ -406,13 +448,18 @@ pub struct StfPublicOutput {
     /// Number of transactions whose state mutations were committed.
     pub applied: u32,
     /// Number of transactions silently dropped (bad signature, nonce
-    /// mismatch, insufficient balance, ...).
+    /// mismatch, insufficient balance, gas-limit overflow, ...).
     pub failed: u32,
     /// Canonical commitment to the active validator set after the
     /// block's state transition. The consensus engine wires this into
     /// `header.runtime_extra` so the next block's chunk BFT uses the
     /// updated stake distribution.
     pub validator_set_root: StateRoot,
+    /// Sum of [`tx_gas`] across every successfully applied transaction
+    /// in this block. The consensus engine wires this into
+    /// `header.gas_used` and `BlockProofPublicInputs.gas_used`, so the
+    /// SP1 proof binds the same value the header committed to.
+    pub gas_used: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,16 +468,36 @@ pub struct StfPublicOutput {
 
 /// Apply a block of transactions to the supplied state backend.
 ///
-/// Returns the pre/post state roots plus per-block transaction counts.
-/// Invalid transactions are skipped without affecting state and counted
-/// in `failed`; this keeps the STF deterministic without requiring a
-/// gas / fee mechanism in M4-A.
+/// Returns the pre/post state roots plus per-block transaction counts
+/// and the total gas consumed by applied transactions.
+///
+/// Gas semantics:
+///
+/// - Each [`Transaction`] kind has a fixed cost (see [`tx_gas`]).
+/// - A transaction whose cost would push `gas_used` past
+///   `input.block_gas_limit` is rejected as `failed` without state
+///   mutation; the running total is not advanced. Subsequent
+///   transactions in the same block are still attempted (they may
+///   have a smaller cost and still fit).
+/// - Failed transactions consume no gas. There is no fee mechanism
+///   yet; charging failures would require debiting an explicit fee
+///   payer, which the wire format does not yet carry.
 pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPublicOutput {
     let pre = state.pre_state_root();
     let mut applied: u32 = 0;
     let mut failed: u32 = 0;
+    let mut gas_used: u64 = 0;
 
     for tx in &input.transactions {
+        // Pre-flight: refuse to start a tx whose full cost would
+        // overflow the block's gas budget. Saturating add keeps the
+        // comparison well-defined at u64::MAX.
+        let cost = tx_gas(tx);
+        if gas_used.saturating_add(cost) > input.block_gas_limit {
+            failed = failed.saturating_add(1);
+            continue;
+        }
+
         let ok = match tx {
             Transaction::Transfer(transfer) => apply_transfer(state, input.chain_id, transfer),
             Transaction::Stake(stake_tx) => apply_stake(state, input.chain_id, stake_tx),
@@ -440,6 +507,7 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
         };
         if ok {
             applied = applied.saturating_add(1);
+            gas_used = gas_used.saturating_add(cost);
         } else {
             failed = failed.saturating_add(1);
         }
@@ -457,7 +525,115 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
         applied,
         failed,
         validator_set_root,
+        gas_used,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transaction admission
+// ---------------------------------------------------------------------------
+
+/// Run mempool / RPC admission against a candidate transaction.
+///
+/// `validate_tx` is the read-only sibling of [`apply_block`]: it
+/// performs every check `apply_*` would perform up to the first
+/// state mutation, then returns a [`TxValidity`] carrying either
+/// [`TxValidationCode::Valid`] (and a mempool priority) or the
+/// matching rejection code. Reads honour the supplied
+/// [`StateBackend`] so the host's tracing layer can capture the
+/// access set if it wants to.
+///
+/// Slash and inactivity-leak transactions are consensus-driven and
+/// therefore rejected here with [`TxValidationCode::Unauthorized`];
+/// they cannot enter the mempool through user RPC submission.
+///
+/// The check is intentionally a strict subset of `apply_*` so a
+/// transaction that passes admission cannot subsequently be silently
+/// dropped by the STF for the same checked condition.
+pub fn validate_tx<B: StateBackend>(
+    tx_bytes: &[u8],
+    state: &mut B,
+    chain_id: u64,
+    block_gas_limit: u64,
+) -> TxValidity {
+    // Reject obviously malformed payloads before reaching the per-kind
+    // checks. `try_from_slice` enforces that the *whole* buffer
+    // decodes; trailing junk is treated as malformed.
+    let Ok(tx) = Transaction::try_from_slice(tx_bytes) else {
+        return TxValidity::invalid(TxValidationCode::Malformed);
+    };
+
+    // Refuse to admit a transaction whose cost alone exceeds the
+    // block-level gas ceiling: it could never be included in a block.
+    if tx_gas(&tx) > block_gas_limit {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+
+    match &tx {
+        Transaction::Transfer(transfer) => validate_transfer(state, chain_id, transfer),
+        Transaction::Stake(stake_tx) => validate_stake(state, chain_id, stake_tx),
+        Transaction::Unstake(unstake_tx) => validate_unstake(state, chain_id, unstake_tx),
+        // Consensus-driven transactions are never user-submittable.
+        // The producer injects them directly into `body.transactions`
+        // without ever passing them through the mempool.
+        Transaction::Slash(_) | Transaction::InactivityLeak(_) => {
+            TxValidity::invalid(TxValidationCode::Unauthorized)
+        }
+    }
+}
+
+fn validate_transfer<B: StateBackend>(state: &mut B, chain_id: u64, tx: &TransferTx) -> TxValidity {
+    if !verify_transfer_signature(tx, chain_id) {
+        return TxValidity::invalid(TxValidationCode::BadSignature);
+    }
+    let sender = load_account(state, &tx.from);
+    if sender.nonce != tx.nonce {
+        return TxValidity::invalid(TxValidationCode::NonceMismatch);
+    }
+    if sender.balance < tx.amount {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    // Self-transfers and cross-account transfers both admit; the STF
+    // handles overflow on the receive side and would re-reject there
+    // if needed. Admission keeps the read-set minimal so the mempool
+    // does not pay for the receiver's account load.
+    TxValidity::valid(0)
+}
+
+fn validate_stake<B: StateBackend>(state: &mut B, chain_id: u64, tx: &StakeTx) -> TxValidity {
+    if !verify_stake_signature(tx, chain_id) {
+        return TxValidity::invalid(TxValidationCode::BadSignature);
+    }
+    let signer = load_account(state, &tx.validator);
+    if signer.nonce != tx.nonce {
+        return TxValidity::invalid(TxValidationCode::NonceMismatch);
+    }
+    if signer.balance < tx.amount {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    let validator = load_validator(state, &tx.validator);
+    if validator.stake.checked_add(tx.amount).is_none() {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    TxValidity::valid(0)
+}
+
+fn validate_unstake<B: StateBackend>(state: &mut B, chain_id: u64, tx: &UnstakeTx) -> TxValidity {
+    if !verify_unstake_signature(tx, chain_id) {
+        return TxValidity::invalid(TxValidationCode::BadSignature);
+    }
+    let signer = load_account(state, &tx.validator);
+    if signer.nonce != tx.nonce {
+        return TxValidity::invalid(TxValidationCode::NonceMismatch);
+    }
+    let validator = load_validator(state, &tx.validator);
+    if validator.stake < tx.amount {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    if signer.balance.checked_add(tx.amount).is_none() {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    TxValidity::valid(0)
 }
 
 fn load_account<B: StateBackend>(state: &mut B, addr: &Address) -> Account {
@@ -739,6 +915,11 @@ mod tests {
     use rand_core::SeedableRng;
 
     const CHAIN_ID: u64 = 42;
+    /// Generous default block gas limit for STF unit tests. Sized so a
+    /// handful of `Stake` / `Unstake` (50_000 each) transactions fit
+    /// without bumping into the ceiling; per-test code overrides this
+    /// when exercising the limit's enforcement.
+    const TEST_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
     fn signing_key(seed: u64) -> SigningKey {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -794,6 +975,7 @@ mod tests {
         let live = LiveTrie::default();
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -819,6 +1001,7 @@ mod tests {
         let tx = signed_transfer(&alice, bob_addr, 30, 0, CHAIN_ID);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Transfer(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -843,6 +1026,7 @@ mod tests {
         let tx = signed_transfer(&alice, [0xAB; 32], 10, 3, CHAIN_ID);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Transfer(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -868,6 +1052,7 @@ mod tests {
         let tx = signed_transfer(&alice, [0xAB; 32], 50, 0, CHAIN_ID);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Transfer(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -892,6 +1077,7 @@ mod tests {
         tx.signature[0] ^= 0xFF;
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Transfer(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -914,6 +1100,7 @@ mod tests {
         let tx = signed_transfer(&alice, [0xAB; 32], 10, 0, CHAIN_ID + 1);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Transfer(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -936,6 +1123,7 @@ mod tests {
         let tx = signed_transfer(&alice, alice_addr, 30, 0, CHAIN_ID);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Transfer(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -984,6 +1172,7 @@ mod tests {
         let pre_root = ValidatorSet::default().root();
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Stake(signed_stake(&alice, 60, 0, CHAIN_ID))],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -1015,6 +1204,7 @@ mod tests {
         let unstake = signed_unstake(&alice, 40, 1, CHAIN_ID);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Stake(stake), Transaction::Unstake(unstake)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -1040,6 +1230,7 @@ mod tests {
         let stake = signed_stake(&alice, 1_000, 0, CHAIN_ID);
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Stake(stake)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -1065,6 +1256,7 @@ mod tests {
         tx.signature[0] ^= 0xFF;
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Stake(tx)],
         };
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
@@ -1099,6 +1291,7 @@ mod tests {
 
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Slash(SlashTx {
                 validator: addr,
                 amount: 30,
@@ -1132,6 +1325,7 @@ mod tests {
         // Burn more than the stake — clamped to the current stake.
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Slash(SlashTx {
                 validator: addr,
                 amount: 999,
@@ -1161,6 +1355,7 @@ mod tests {
 
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::InactivityLeak(LeakTx {
                 validator: addr,
                 amount: 20,
@@ -1180,6 +1375,7 @@ mod tests {
         let live = LiveTrie::default();
         let input = StfInput {
             chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             transactions: alloc::vec![Transaction::Slash(SlashTx {
                 validator: [0xFF; 32],
                 amount: 10,
@@ -1190,5 +1386,281 @@ mod tests {
         assert_eq!(host_out.applied, 0);
         assert_eq!(host_out.failed, 1);
         assert_eq!(host_out.validator_set_root, ValidatorSet::default().root());
+    }
+
+    // -----------------------------------------------------------------
+    // Gas accounting
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn applied_transfer_consumes_transfer_gas() {
+        let alice = signing_key(20);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            transactions: alloc::vec![Transaction::Transfer(signed_transfer(
+                &alice, [0xAB; 32], 30, 0, CHAIN_ID,
+            ))],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.gas_used, GAS_TRANSFER);
+    }
+
+    #[test]
+    fn failed_transfer_consumes_no_gas() {
+        let alice = signing_key(21);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 10, // insufficient for amount=50
+            },
+        );
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            transactions: alloc::vec![Transaction::Transfer(signed_transfer(
+                &alice, [0xAB; 32], 50, 0, CHAIN_ID,
+            ))],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 0);
+        assert_eq!(host_out.failed, 1);
+        assert_eq!(host_out.gas_used, 0);
+    }
+
+    #[test]
+    fn gas_limit_clamps_transactions_per_block() {
+        // Two valid transfers; gas_limit fits exactly one. The second
+        // is dropped as failed; the first one's state mutation lands.
+        let alice = signing_key(22);
+        let alice_addr = address_of(&alice);
+        let live = live_with_account(
+            alice_addr,
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let tx0 = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
+        let tx1 = Transaction::Transfer(signed_transfer(&alice, [0xCD; 32], 20, 1, CHAIN_ID));
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            // Room for exactly one transfer; the second would push
+            // gas_used past the ceiling.
+            block_gas_limit: GAS_TRANSFER,
+            transactions: alloc::vec![tx0, tx1],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.failed, 1);
+        assert_eq!(host_out.gas_used, GAS_TRANSFER);
+    }
+
+    #[test]
+    fn gas_limit_zero_drops_every_transaction() {
+        let alice = signing_key(23);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_gas_limit: 0,
+            transactions: alloc::vec![Transaction::Transfer(signed_transfer(
+                &alice, [0xAB; 32], 1, 0, CHAIN_ID,
+            ))],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 0);
+        assert_eq!(host_out.failed, 1);
+        assert_eq!(host_out.gas_used, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Transaction admission (validate_tx)
+    // -----------------------------------------------------------------
+
+    fn live_with_validator(addr: Address, stake: u128) -> LiveTrie {
+        let mut live = LiveTrie::default();
+        live.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake,
+                active: stake > 0,
+            }),
+        );
+        let mut set = ValidatorSet::default();
+        if stake > 0 {
+            set.upsert(addr, stake);
+        }
+        live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+        live
+    }
+
+    fn validate_against(live: &LiveTrie, tx: &Transaction) -> TxValidity {
+        let bytes = borsh::to_vec(tx).expect("encode tx");
+        let mut tracer = TracingState::new(live);
+        validate_tx(&bytes, &mut tracer, CHAIN_ID, TEST_BLOCK_GAS_LIMIT)
+    }
+
+    #[test]
+    fn validate_tx_accepts_well_formed_transfer() {
+        let alice = signing_key(30);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
+        let validity = validate_against(&live, &tx);
+        assert_eq!(validity.code, TxValidationCode::Valid);
+    }
+
+    #[test]
+    fn validate_tx_rejects_bad_signature() {
+        let alice = signing_key(31);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let mut transfer = signed_transfer(&alice, [0xAB; 32], 10, 0, CHAIN_ID);
+        transfer.signature[0] ^= 0xFF;
+        let validity = validate_against(&live, &Transaction::Transfer(transfer));
+        assert_eq!(validity.code, TxValidationCode::BadSignature);
+    }
+
+    #[test]
+    fn validate_tx_rejects_wrong_nonce() {
+        let alice = signing_key(32);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 5,
+                balance: 100,
+            },
+        );
+        // Sign with nonce=3 against an account whose next nonce is 5.
+        let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 10, 3, CHAIN_ID));
+        let validity = validate_against(&live, &tx);
+        assert_eq!(validity.code, TxValidationCode::NonceMismatch);
+    }
+
+    #[test]
+    fn validate_tx_rejects_insufficient_balance() {
+        let alice = signing_key(33);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 5,
+            },
+        );
+        let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 50, 0, CHAIN_ID));
+        let validity = validate_against(&live, &tx);
+        assert_eq!(validity.code, TxValidationCode::InsufficientBalance);
+    }
+
+    #[test]
+    fn validate_tx_rejects_malformed_bytes() {
+        let live = LiveTrie::default();
+        let mut tracer = TracingState::new(&live);
+        let validity = validate_tx(
+            &[0xFF, 0xFF, 0xFF],
+            &mut tracer,
+            CHAIN_ID,
+            TEST_BLOCK_GAS_LIMIT,
+        );
+        assert_eq!(validity.code, TxValidationCode::Malformed);
+    }
+
+    #[test]
+    fn validate_tx_rejects_consensus_driven_transactions() {
+        let live = LiveTrie::default();
+        let slash = Transaction::Slash(SlashTx {
+            validator: [0xFF; 32],
+            amount: 10,
+        });
+        let leak = Transaction::InactivityLeak(LeakTx {
+            validator: [0xFF; 32],
+            amount: 10,
+        });
+        assert_eq!(
+            validate_against(&live, &slash).code,
+            TxValidationCode::Unauthorized,
+        );
+        assert_eq!(
+            validate_against(&live, &leak).code,
+            TxValidationCode::Unauthorized,
+        );
+    }
+
+    #[test]
+    fn validate_tx_rejects_tx_larger_than_block_limit() {
+        let alice = signing_key(34);
+        let live = live_with_account(
+            address_of(&alice),
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
+        let bytes = borsh::to_vec(&tx).expect("encode tx");
+        let mut tracer = TracingState::new(&live);
+        // gas_limit is one short of GAS_TRANSFER, so the tx can never
+        // be included in a block at this ceiling.
+        let validity = validate_tx(&bytes, &mut tracer, CHAIN_ID, GAS_TRANSFER - 1);
+        assert_eq!(validity.code, TxValidationCode::InsufficientBalance);
+    }
+
+    #[test]
+    fn validate_tx_accepts_stake_when_balance_covers_it() {
+        let alice = signing_key(35);
+        let addr = address_of(&alice);
+        let live = live_with_validator(addr, 0);
+        // Need an account too so the stake has a balance to draw on.
+        let mut live = live;
+        live.insert(
+            &account_key(&addr),
+            encode_account(&Account {
+                nonce: 0,
+                balance: 100,
+            }),
+        );
+        let tx = Transaction::Stake(signed_stake(&alice, 60, 0, CHAIN_ID));
+        let validity = validate_against(&live, &tx);
+        assert_eq!(validity.code, TxValidationCode::Valid);
+    }
+
+    #[test]
+    fn validate_tx_rejects_unstake_without_stake() {
+        let alice = signing_key(36);
+        let addr = address_of(&alice);
+        // Validator exists but stake = 0.
+        let live = live_with_validator(addr, 0);
+        let tx = Transaction::Unstake(signed_unstake(&alice, 10, 0, CHAIN_ID));
+        let validity = validate_against(&live, &tx);
+        assert_eq!(validity.code, TxValidationCode::InsufficientBalance);
     }
 }

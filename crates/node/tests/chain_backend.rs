@@ -149,6 +149,8 @@ fn build_recursive_proof(
         da_root: ZERO_HASH,
         vm_code_hash: ZERO_HASH,
         abi_version: 1,
+        gas_used: 0,
+        gas_limit: 1_000_000,
     };
     let block_proof = ps.prove_block(&[], &block_inputs).unwrap();
     let chunk_inputs = ChunkProofPublicInputs {

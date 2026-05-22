@@ -148,6 +148,13 @@ where
         if input.chain_id != public_inputs.chain_id {
             return Err(ProofError::PublicInputMismatch);
         }
+        // Bind the STF input's gas ceiling to the consensus header.
+        // The guest will execute against `input.block_gas_limit`; if
+        // it diverged from the header's `gas_limit` the prover could
+        // build a proof for a transition the header didn't authorize.
+        if input.block_gas_limit != public_inputs.gas_limit {
+            return Err(ProofError::PublicInputMismatch);
+        }
 
         // 3. Serialize for SP1's stdin. The witness bundle is already
         //    in the layout the guest reads (input || witness); we
@@ -183,6 +190,9 @@ where
         {
             return Err(ProofError::PublicInputMismatch);
         }
+        if committed.gas_used != public_inputs.gas_used {
+            return Err(ProofError::PublicInputMismatch);
+        }
 
         Sp1BlockProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof)
     }
@@ -213,6 +223,9 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
         if stf_output.post_state_root != public_inputs.state_root_after {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.gas_used != public_inputs.gas_used {
             return Err(ProofError::PublicInputMismatch);
         }
 

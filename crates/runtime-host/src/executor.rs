@@ -16,7 +16,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::Body;
 use neutrino_default_runtime_core::{StfInput, Transaction};
 use neutrino_proof_system::executor::{BlockExecutor, ExecutionOutcome};
-use neutrino_runtime_abi::{QueryRequest, QueryResponse};
+use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Blake3Hasher, Trie};
 use thiserror::Error;
@@ -82,6 +82,7 @@ impl BlockExecutor for WasmExecutor {
         &self,
         chain_id: u64,
         body: &Body,
+        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         // Decode body.transactions into typed STF transactions.
@@ -89,9 +90,7 @@ impl BlockExecutor for WasmExecutor {
         // otherwise count them as `failed`, but a borsh-decode
         // failure means the runtime ABI doesn't even recognise the
         // byte string as a transaction so we exclude it from
-        // `StfInput.transactions` entirely. Block production
-        // semantics for malformed entries can be tightened in M7-new
-        // when admission rules go through WASM precheck.
+        // `StfInput.transactions` entirely.
         let mut txs = Vec::with_capacity(body.transactions.len());
         for raw in &body.transactions {
             if let Ok(tx) = <Transaction as BorshDeserialize>::try_from_slice(raw.as_slice()) {
@@ -100,6 +99,7 @@ impl BlockExecutor for WasmExecutor {
         }
         let input = StfInput {
             chain_id,
+            block_gas_limit: gas_limit,
             transactions: txs,
         };
 
@@ -130,7 +130,7 @@ impl BlockExecutor for WasmExecutor {
         Ok(ExecutionOutcome {
             state_root_after: output.post_state_root,
             runtime_extra: output.validator_set_root,
-            gas_used: 0, // M5 has no gas accounting yet.
+            gas_used: output.gas_used,
             witness_bytes,
         })
     }
@@ -146,6 +146,19 @@ impl BlockExecutor for WasmExecutor {
         // back into `state`.
         let live = LiveTrie::from_trie(state.clone());
         Ok(self.wasm.query(request, &live)?)
+    }
+
+    fn validate_tx(
+        &self,
+        tx_bytes: &[u8],
+        chain_id: u64,
+        block_gas_limit: u64,
+        state: &Trie<Blake3Hasher>,
+    ) -> Result<TxValidity, ExecutorError> {
+        let live = LiveTrie::from_trie(state.clone());
+        Ok(self
+            .wasm
+            .validate_tx(tx_bytes, chain_id, block_gas_limit, &live)?)
     }
 }
 

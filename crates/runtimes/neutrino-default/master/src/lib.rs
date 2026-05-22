@@ -167,14 +167,53 @@ mod wasm_abi {
         ((ptr as u64) << 32) | (len as u64)
     }
 
-    /// Placeholder transaction-admission entrypoint. Exposed under
-    /// the ABI-defined symbol `_neutrino_validate_tx`. The body still
-    /// returns `0` (Valid) for every transaction; admission rules
-    /// will land alongside future runtime work and replace this with
-    /// a real fixed-width `TxValidity` result.
+    /// Transaction-admission entrypoint. Exposed under the ABI-defined
+    /// symbol [`neutrino_runtime_abi::VALIDATE_TX_ENTRYPOINT`].
+    ///
+    /// The host writes a flat byte string at `in_ptr..in_ptr+in_len`:
+    ///
+    /// ```text
+    ///   8B  chain_id (little-endian u64)
+    ///   8B  block_gas_limit (little-endian u64)
+    ///   N   borsh-encoded Transaction bytes
+    /// ```
+    ///
+    /// The runtime decodes the prefix, runs the shared
+    /// [`neutrino_default_runtime_core::validate_tx`] against a
+    /// [`WasmHostBackend`] (the host pins itself to read-only mode
+    /// for admission), and writes the canonical 12-byte
+    /// [`neutrino_runtime_abi::TxValidity`] encoding into a new
+    /// allocation. Returns a packed `u64`: high 32 bits = output
+    /// pointer, low 32 bits = output length (always
+    /// [`neutrino_runtime_abi::TX_VALIDITY_ENCODED_LEN`]).
     #[unsafe(no_mangle)]
-    const extern "C" fn _neutrino_validate_tx(_tx_ptr: u32, _tx_len: u32) -> u32 {
-        0
+    extern "C" fn _neutrino_validate_tx(in_ptr: u32, in_len: u32) -> u64 {
+        use neutrino_default_runtime_core::validate_tx as core_validate_tx;
+        use neutrino_runtime_abi::{TX_VALIDITY_ENCODED_LEN, TxValidationCode, TxValidity};
+
+        let bytes = unsafe { core::slice::from_raw_parts(in_ptr as *const u8, in_len as usize) };
+        // Need at least 16 bytes of header (chain_id + gas_limit).
+        let validity = if bytes.len() < 16 {
+            TxValidity::invalid(TxValidationCode::Malformed)
+        } else {
+            let mut chain_id_buf = [0u8; 8];
+            chain_id_buf.copy_from_slice(&bytes[0..8]);
+            let chain_id = u64::from_le_bytes(chain_id_buf);
+            let mut gas_buf = [0u8; 8];
+            gas_buf.copy_from_slice(&bytes[8..16]);
+            let block_gas_limit = u64::from_le_bytes(gas_buf);
+            let tx_bytes = &bytes[16..];
+            let mut backend = WasmHostBackend;
+            core_validate_tx(tx_bytes, &mut backend, chain_id, block_gas_limit)
+        };
+
+        let encoded = validity.encode();
+        let mut out: alloc::vec::Vec<u8> = alloc::vec![0u8; TX_VALIDITY_ENCODED_LEN];
+        out.copy_from_slice(&encoded);
+        let ptr = out.as_ptr() as u32;
+        let len = out.len() as u32;
+        mem::forget(out);
+        ((ptr as u64) << 32) | (len as u64)
     }
 
     /// Read-only query entrypoint. Exposed under the ABI-defined
@@ -239,6 +278,7 @@ mod tests {
     fn apply_block_with_witness_runs_an_empty_block() {
         let input = StfInput {
             chain_id: 1,
+            block_gas_limit: 30_000_000,
             transactions: alloc::vec![],
         };
         // `apply_block` reads the validator-set key for the canonical

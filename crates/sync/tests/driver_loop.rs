@@ -729,6 +729,8 @@ fn sample_block_proof(height: Height) -> BlockProof {
             da_root: ZERO_HASH,
             vm_code_hash: ZERO_HASH,
             abi_version: 1,
+            gas_used: 0,
+            gas_limit: 1_000_000,
         },
         proof_bytes: vec![0xAA],
     }

@@ -217,6 +217,8 @@ impl<DB: Database> Engine<DB> {
             da_root: header.da_root,
             vm_code_hash: self.chain_spec().runtime_code_hash,
             abi_version: self.chain_spec().runtime_version.abi_version,
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
         }
     }
 }

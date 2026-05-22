@@ -518,6 +518,58 @@ impl WithdrawalQueue {
     }
 }
 
+/// Per-transaction receipt status code.
+///
+/// Wire-stable `u32` mapped one-way through [`Self::as_u32`]. Values
+/// are part of the consensus-bound receipts-root commitment; new
+/// variants must append, never reorder. `Success` is always `0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptStatus {
+    /// The transaction's state mutations were committed.
+    Success,
+    /// Ed25519 signature failed verification (also covers
+    /// cross-chain replay rejection because `chain_id` is bound
+    /// into every signed message).
+    BadSignature,
+    /// The signer's `Account.nonce` did not match the transaction's
+    /// declared nonce.
+    NonceMismatch,
+    /// Sender lacked the balance / stake to satisfy the transaction.
+    /// Folds in "no validator to slash / exit" because the
+    /// semantically-equivalent condition is "validator has zero stake
+    /// to deduct."
+    InsufficientBalance,
+    /// The transaction was skipped pre-flight because including it
+    /// would push the block's running `gas_used` past
+    /// `StfInput.block_gas_limit`.
+    OutOfBlockGas,
+    /// Arithmetic overflow while computing a new balance or stake.
+    /// Defensive; in practice unreachable for any realistic
+    /// transaction volume.
+    Overflow,
+}
+
+impl ReceiptStatus {
+    /// Stable wire encoding. `Success` is always `0`.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::Success => 0,
+            Self::BadSignature => 1,
+            Self::NonceMismatch => 2,
+            Self::InsufficientBalance => 3,
+            Self::OutOfBlockGas => 4,
+            Self::Overflow => 5,
+        }
+    }
+
+    /// `true` when this status reports a successful application.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(self, Self::Success)
+    }
+}
+
 /// Per-transaction receipt emitted by [`apply_block`].
 ///
 /// The [`StfPublicOutput::receipts_root`] commits to the borsh-encoded
@@ -526,10 +578,9 @@ impl WithdrawalQueue {
 /// produced.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Receipt {
-    /// `0` on success; `1` when the STF dropped the transaction
-    /// (bad signature, nonce mismatch, insufficient balance, ...).
-    /// Future revisions may carry richer codes; the wire is a `u32`
-    /// for forward-compat.
+    /// [`ReceiptStatus`] encoded as a wire-stable `u32`. `0` means
+    /// success; non-zero values identify a specific failure reason
+    /// (see the [`ReceiptStatus`] variants).
     pub status_code: u32,
     /// Gas the transaction actually consumed. Equals [`tx_gas`] of
     /// the matching transaction on success, `0` on failure.
@@ -799,14 +850,14 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
         if gas_used.saturating_add(cost) > input.block_gas_limit {
             failed = failed.saturating_add(1);
             receipts.push(Receipt {
-                status_code: 1,
+                status_code: ReceiptStatus::OutOfBlockGas.as_u32(),
                 gas_used: 0,
                 kind,
             });
             continue;
         }
 
-        let ok = match tx {
+        let result = match tx {
             Transaction::Transfer(transfer) => apply_transfer(state, input.chain_id, transfer),
             Transaction::Stake(stake_tx) => apply_stake(state, input.chain_id, stake_tx),
             Transaction::Unstake(unstake_tx) => {
@@ -822,21 +873,24 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
                 apply_withdraw(state, input.chain_id, input.block_height, withdraw_tx)
             }
         };
-        if ok {
-            applied = applied.saturating_add(1);
-            gas_used = gas_used.saturating_add(cost);
-            receipts.push(Receipt {
-                status_code: 0,
-                gas_used: cost,
-                kind,
-            });
-        } else {
-            failed = failed.saturating_add(1);
-            receipts.push(Receipt {
-                status_code: 1,
-                gas_used: 0,
-                kind,
-            });
+        match result {
+            Ok(()) => {
+                applied = applied.saturating_add(1);
+                gas_used = gas_used.saturating_add(cost);
+                receipts.push(Receipt {
+                    status_code: ReceiptStatus::Success.as_u32(),
+                    gas_used: cost,
+                    kind,
+                });
+            }
+            Err(status) => {
+                failed = failed.saturating_add(1);
+                receipts.push(Receipt {
+                    status_code: status.as_u32(),
+                    gas_used: 0,
+                    kind,
+                });
+            }
         }
     }
 
@@ -1053,17 +1107,21 @@ fn store_account<B: StateBackend>(state: &mut B, addr: &Address, account: &Accou
     state.write(&account_key(addr), encode_account(account));
 }
 
-fn apply_transfer<B: StateBackend>(state: &mut B, chain_id: u64, tx: &TransferTx) -> bool {
+fn apply_transfer<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    tx: &TransferTx,
+) -> Result<(), ReceiptStatus> {
     if !verify_transfer_signature(tx, chain_id) {
-        return false;
+        return Err(ReceiptStatus::BadSignature);
     }
 
     let mut sender = load_account(state, &tx.from);
     if sender.nonce != tx.nonce {
-        return false;
+        return Err(ReceiptStatus::NonceMismatch);
     }
     if sender.balance < tx.amount {
-        return false;
+        return Err(ReceiptStatus::InsufficientBalance);
     }
 
     // Both sides committed before any state write so a self-transfer
@@ -1076,13 +1134,12 @@ fn apply_transfer<B: StateBackend>(state: &mut B, chain_id: u64, tx: &TransferTx
         sender.balance = new_sender_balance.saturating_add(tx.amount);
         sender.nonce = new_sender_nonce;
         store_account(state, &tx.from, &sender);
-        return true;
+        return Ok(());
     }
 
     let mut receiver = load_account(state, &tx.to);
     let Some(new_receiver_balance) = receiver.balance.checked_add(tx.amount) else {
-        // Overflow on the receive side. Drop the transaction.
-        return false;
+        return Err(ReceiptStatus::Overflow);
     };
     receiver.balance = new_receiver_balance;
     sender.balance = new_sender_balance;
@@ -1090,23 +1147,27 @@ fn apply_transfer<B: StateBackend>(state: &mut B, chain_id: u64, tx: &TransferTx
 
     store_account(state, &tx.from, &sender);
     store_account(state, &tx.to, &receiver);
-    true
+    Ok(())
 }
 
-fn apply_stake<B: StateBackend>(state: &mut B, chain_id: u64, tx: &StakeTx) -> bool {
+fn apply_stake<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    tx: &StakeTx,
+) -> Result<(), ReceiptStatus> {
     if !verify_stake_signature(tx, chain_id) {
-        return false;
+        return Err(ReceiptStatus::BadSignature);
     }
     let mut signer = load_account(state, &tx.validator);
     if signer.nonce != tx.nonce {
-        return false;
+        return Err(ReceiptStatus::NonceMismatch);
     }
     if signer.balance < tx.amount {
-        return false;
+        return Err(ReceiptStatus::InsufficientBalance);
     }
     let mut validator = load_validator(state, &tx.validator);
     let Some(new_stake) = validator.stake.checked_add(tx.amount) else {
-        return false;
+        return Err(ReceiptStatus::Overflow);
     };
 
     signer.balance -= tx.amount;
@@ -1124,7 +1185,7 @@ fn apply_stake<B: StateBackend>(state: &mut B, chain_id: u64, tx: &StakeTx) -> b
     store_account(state, &tx.validator, &signer);
     store_validator(state, &tx.validator, &validator);
     store_validator_set(state, &set);
-    true
+    Ok(())
 }
 
 fn apply_unstake<B: StateBackend>(
@@ -1132,24 +1193,24 @@ fn apply_unstake<B: StateBackend>(
     chain_id: u64,
     block_height: u64,
     tx: &UnstakeTx,
-) -> bool {
+) -> Result<(), ReceiptStatus> {
     if !verify_unstake_signature(tx, chain_id) {
-        return false;
+        return Err(ReceiptStatus::BadSignature);
     }
     let mut signer = load_account(state, &tx.validator);
     if signer.nonce != tx.nonce {
-        return false;
+        return Err(ReceiptStatus::NonceMismatch);
     }
     let mut validator = load_validator(state, &tx.validator);
     if validator.stake < tx.amount {
-        return false;
+        return Err(ReceiptStatus::InsufficientBalance);
     }
     // Unstake no longer credits balance immediately: the amount moves
     // out of slashable stake (so a slash after this block cannot reach
     // it) and into the per-validator withdrawal queue. Subsequent
     // `WithdrawTx` claims drain matured entries back into balance.
     let Some(mature_at_height) = block_height.checked_add(UNBONDING_DELAY_BLOCKS) else {
-        return false;
+        return Err(ReceiptStatus::Overflow);
     };
     let mut queue = load_withdrawal_queue(state, &tx.validator);
     queue.entries.push(Withdrawal {
@@ -1172,23 +1233,27 @@ fn apply_unstake<B: StateBackend>(
     store_validator(state, &tx.validator, &validator);
     store_validator_set(state, &set);
     store_withdrawal_queue(state, &tx.validator, &queue);
-    true
+    Ok(())
 }
 
-fn apply_deposit<B: StateBackend>(state: &mut B, chain_id: u64, tx: &DepositTx) -> bool {
+fn apply_deposit<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    tx: &DepositTx,
+) -> Result<(), ReceiptStatus> {
     if !verify_deposit_signature(tx, chain_id) {
-        return false;
+        return Err(ReceiptStatus::BadSignature);
     }
     let mut depositor = load_account(state, &tx.depositor);
     if depositor.nonce != tx.nonce {
-        return false;
+        return Err(ReceiptStatus::NonceMismatch);
     }
     if depositor.balance < tx.amount {
-        return false;
+        return Err(ReceiptStatus::InsufficientBalance);
     }
     let mut validator = load_validator(state, &tx.validator);
     let Some(new_stake) = validator.stake.checked_add(tx.amount) else {
-        return false;
+        return Err(ReceiptStatus::Overflow);
     };
 
     // Self-deposit (`depositor == validator`) overlaps with the
@@ -1210,7 +1275,7 @@ fn apply_deposit<B: StateBackend>(state: &mut B, chain_id: u64, tx: &DepositTx) 
     store_account(state, &tx.depositor, &depositor);
     store_validator(state, &tx.validator, &validator);
     store_validator_set(state, &set);
-    true
+    Ok(())
 }
 
 fn apply_voluntary_exit<B: StateBackend>(
@@ -1218,17 +1283,17 @@ fn apply_voluntary_exit<B: StateBackend>(
     chain_id: u64,
     block_height: u64,
     tx: &VoluntaryExitTx,
-) -> bool {
+) -> Result<(), ReceiptStatus> {
     if !verify_voluntary_exit_signature(tx, chain_id) {
-        return false;
+        return Err(ReceiptStatus::BadSignature);
     }
     let mut signer = load_account(state, &tx.validator);
     if signer.nonce != tx.nonce {
-        return false;
+        return Err(ReceiptStatus::NonceMismatch);
     }
     let validator = load_validator(state, &tx.validator);
     if validator.stake == 0 {
-        return false;
+        return Err(ReceiptStatus::InsufficientBalance);
     }
     let amount = validator.stake;
 
@@ -1238,7 +1303,7 @@ fn apply_voluntary_exit<B: StateBackend>(
     // so we bypass the inner signature check by directly applying
     // the bookkeeping the unstake path would otherwise perform.
     let Some(mature_at_height) = block_height.checked_add(UNBONDING_DELAY_BLOCKS) else {
-        return false;
+        return Err(ReceiptStatus::Overflow);
     };
     let mut queue = load_withdrawal_queue(state, &tx.validator);
     queue.entries.push(Withdrawal {
@@ -1258,7 +1323,7 @@ fn apply_voluntary_exit<B: StateBackend>(
     store_validator(state, &tx.validator, &validator);
     store_validator_set(state, &set);
     store_withdrawal_queue(state, &tx.validator, &queue);
-    true
+    Ok(())
 }
 
 fn apply_withdraw<B: StateBackend>(
@@ -1266,13 +1331,13 @@ fn apply_withdraw<B: StateBackend>(
     chain_id: u64,
     block_height: u64,
     tx: &WithdrawTx,
-) -> bool {
+) -> Result<(), ReceiptStatus> {
     if !verify_withdraw_signature(tx, chain_id) {
-        return false;
+        return Err(ReceiptStatus::BadSignature);
     }
     let mut signer = load_account(state, &tx.validator);
     if signer.nonce != tx.nonce {
-        return false;
+        return Err(ReceiptStatus::NonceMismatch);
     }
     let mut queue = load_withdrawal_queue(state, &tx.validator);
 
@@ -1294,7 +1359,7 @@ fn apply_withdraw<B: StateBackend>(
     queue.entries = remaining;
 
     let Some(new_balance) = signer.balance.checked_add(matured) else {
-        return false;
+        return Err(ReceiptStatus::Overflow);
     };
     signer.balance = new_balance;
     signer.nonce = signer.nonce.saturating_add(1);
@@ -1310,7 +1375,7 @@ fn apply_withdraw<B: StateBackend>(
     } else {
         store_withdrawal_queue(state, &tx.validator, &queue);
     }
-    true
+    Ok(())
 }
 
 fn load_withdrawal_queue<B: StateBackend>(state: &mut B, addr: &Address) -> WithdrawalQueue {
@@ -1324,10 +1389,10 @@ fn store_withdrawal_queue<B: StateBackend>(state: &mut B, addr: &Address, queue:
     state.write(&withdrawal_key(addr), encode_withdrawal_queue(queue));
 }
 
-fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> bool {
+fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> Result<(), ReceiptStatus> {
     let mut validator = load_validator(state, &tx.validator);
     if validator.stake == 0 {
-        return false;
+        return Err(ReceiptStatus::InsufficientBalance);
     }
     let burn = validator.stake.min(tx.amount);
     validator.stake -= burn;
@@ -1342,10 +1407,10 @@ fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> bool {
 
     store_validator(state, &tx.validator, &validator);
     store_validator_set(state, &set);
-    true
+    Ok(())
 }
 
-fn apply_leak<B: StateBackend>(state: &mut B, tx: &LeakTx) -> bool {
+fn apply_leak<B: StateBackend>(state: &mut B, tx: &LeakTx) -> Result<(), ReceiptStatus> {
     // Inactivity leak shares the deduction semantics of `Slash`; the
     // distinction is purely in how the consensus engine selects which
     // validator to penalise. Real production may treat slashed funds
@@ -2746,6 +2811,134 @@ mod tests {
         let expected = compute_receipts_root(&[]);
         assert_eq!(out.receipts_root, expected);
         assert_ne!(out.receipts_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn receipts_root_pins_specific_status_codes_per_failure_mode() {
+        // Build a block whose four transactions each fail differently
+        // (or succeed). The expected receipts vector is constructed
+        // from the canonical [`ReceiptStatus`] codes and hashed via
+        // `compute_receipts_root`; the STF's emitted root must
+        // match. This pins every status code into the consensus-
+        // bound receipts-root commitment.
+        let alice = signing_key(70);
+        let bob = signing_key(71);
+        let alice_addr = address_of(&alice);
+        let mut live = LiveTrie::default();
+        live.insert(
+            &account_key(&alice_addr),
+            encode_account(&Account {
+                nonce: 0,
+                balance: 100,
+            }),
+        );
+        live.insert(
+            &account_key(&address_of(&bob)),
+            encode_account(&Account {
+                nonce: 5,
+                balance: 100,
+            }),
+        );
+
+        let kind_transfer = tx_kind_code(&Transaction::Transfer(TransferTx {
+            from: alice_addr,
+            to: [0; 32],
+            amount: 0,
+            nonce: 0,
+            signature: [0u8; 64],
+        }));
+
+        // [0] success
+        let ok_tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
+        // [1] bad signature: tamper after signing
+        let mut bad_sig = signed_transfer(&alice, [0xCD; 32], 1, 1, CHAIN_ID);
+        bad_sig.signature[0] ^= 0xFF;
+        // [2] wrong nonce: bob's account is at nonce 5 but the tx uses 0
+        let wrong_nonce = signed_transfer(&bob, [0xEF; 32], 10, 0, CHAIN_ID);
+        // [3] insufficient balance: alice has 100 - 30 = 70 after tx[0] commits.
+        //     transferring 1_000 fails. Sign at nonce=1 because tx[0]
+        //     bumped alice's nonce.
+        let insufficient = signed_transfer(&alice, [0xFE; 32], 1_000, 1, CHAIN_ID);
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_height: TEST_BLOCK_HEIGHT,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            transactions: alloc::vec![
+                ok_tx,
+                Transaction::Transfer(bad_sig),
+                Transaction::Transfer(wrong_nonce),
+                Transaction::Transfer(insufficient),
+            ],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.failed, 3);
+        // Successful transfer charges its gas; failures charge none.
+        assert_eq!(host_out.gas_used, GAS_TRANSFER);
+
+        let expected = compute_receipts_root(&[
+            Receipt {
+                status_code: ReceiptStatus::Success.as_u32(),
+                gas_used: GAS_TRANSFER,
+                kind: kind_transfer,
+            },
+            Receipt {
+                status_code: ReceiptStatus::BadSignature.as_u32(),
+                gas_used: 0,
+                kind: kind_transfer,
+            },
+            Receipt {
+                status_code: ReceiptStatus::NonceMismatch.as_u32(),
+                gas_used: 0,
+                kind: kind_transfer,
+            },
+            Receipt {
+                status_code: ReceiptStatus::InsufficientBalance.as_u32(),
+                gas_used: 0,
+                kind: kind_transfer,
+            },
+        ]);
+        assert_eq!(host_out.receipts_root, expected);
+    }
+
+    #[test]
+    fn receipts_root_pins_out_of_block_gas_status() {
+        // Two transfers, block_gas_limit fits exactly one. The second
+        // is rejected pre-flight with `OutOfBlockGas`.
+        let alice = signing_key(72);
+        let alice_addr = address_of(&alice);
+        let live = live_with_account(
+            alice_addr,
+            Account {
+                nonce: 0,
+                balance: 100,
+            },
+        );
+        let tx0 = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
+        let tx1 = Transaction::Transfer(signed_transfer(&alice, [0xCD; 32], 20, 1, CHAIN_ID));
+        let kind_transfer = tx_kind_code(&tx0);
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_height: TEST_BLOCK_HEIGHT,
+            block_gas_limit: GAS_TRANSFER,
+            transactions: alloc::vec![tx0, tx1],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        let expected = compute_receipts_root(&[
+            Receipt {
+                status_code: ReceiptStatus::Success.as_u32(),
+                gas_used: GAS_TRANSFER,
+                kind: kind_transfer,
+            },
+            Receipt {
+                status_code: ReceiptStatus::OutOfBlockGas.as_u32(),
+                gas_used: 0,
+                kind: kind_transfer,
+            },
+        ]);
+        assert_eq!(host_out.receipts_root, expected);
     }
 
     #[test]

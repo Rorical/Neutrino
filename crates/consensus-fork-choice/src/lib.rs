@@ -371,6 +371,7 @@ mod tests {
             validator_ops_root: hash(5),
             da_root: hash(6),
             runtime_extra: hash(7),
+            receipts_root: hash(11),
             gas_used: 8,
             gas_limit: 9,
             timestamp: 10,

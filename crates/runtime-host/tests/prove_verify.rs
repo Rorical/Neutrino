@@ -62,6 +62,7 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
 fn input_with_transfers(txs: Vec<TransferTx>) -> StfInput {
     StfInput {
         chain_id: CHAIN_ID,
+        block_height: 1,
         block_gas_limit: 30_000_000,
         transactions: txs.into_iter().map(Transaction::Transfer).collect(),
     }

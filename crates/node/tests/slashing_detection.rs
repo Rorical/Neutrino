@@ -141,6 +141,7 @@ fn signed_block(
         validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
+        receipts_root: ZERO_HASH,
         gas_used: 0,
         gas_limit: 1_000_000,
         timestamp: slot * 4,

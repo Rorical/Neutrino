@@ -71,6 +71,7 @@ const fn public_inputs(
     post: [u8; 32],
     gas_used: u64,
     gas_limit: u64,
+    receipt_root: [u8; 32],
 ) -> BlockProofPublicInputs {
     BlockProofPublicInputs {
         chain_id: 1,
@@ -80,7 +81,7 @@ const fn public_inputs(
         state_root_before: pre,
         state_root_after: post,
         transactions_root: ZERO_HASH,
-        receipt_root: ZERO_HASH,
+        receipt_root,
         da_root: ZERO_HASH,
         vm_code_hash: ZERO_HASH,
         abi_version: 1,
@@ -103,6 +104,7 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
     let tx = signed_transfer(&alice, [0xCC; 32], 25, 0, CHAIN_ID);
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_height: 1,
         block_gas_limit: BLOCK_GAS_LIMIT,
         transactions: vec![Transaction::Transfer(tx)],
     };
@@ -116,6 +118,7 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
         dry.output.post_state_root,
         dry.output.gas_used,
         BLOCK_GAS_LIMIT,
+        dry.output.receipts_root,
     );
     (sp1_bp, pi)
 }
@@ -165,7 +168,7 @@ fn sp1_proof_system_rejects_malformed_proof_bytes() {
     let bad_proof = Sp1BlockProof {
         bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
     };
-    let pi = public_inputs([0; 32], [1; 32], 0, 1_000_000);
+    let pi = public_inputs([0; 32], [1; 32], 0, 1_000_000, ZERO_HASH);
     let err = proof_system
         .verify_block(&bad_proof, &pi)
         .expect_err("malformed bytes must reject");

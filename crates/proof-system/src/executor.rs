@@ -32,6 +32,11 @@ pub struct ExecutionOutcome {
     /// canonical `validator_set_root` so the next chunk BFT picks up
     /// the updated stake distribution.
     pub runtime_extra: Hash,
+    /// Runtime-emitted per-block receipts-root commitment. The engine
+    /// wires this into `header.receipts_root` and
+    /// `BlockProofPublicInputs.receipt_root` so the SP1 proof binds
+    /// the same value the header carries.
+    pub receipts_root: Hash,
     /// Sum of [`tx_gas`](../../neutrino_default_runtime_core/fn.tx_gas.html)
     /// across every successfully applied transaction. The engine
     /// wires this into `header.gas_used` and
@@ -63,6 +68,11 @@ pub trait BlockExecutor {
     /// Execute a block body against `state` and return the post-state
     /// commitments + witness bytes.
     ///
+    /// `block_height` is the height of the block being executed
+    /// (`header.height`). The runtime consults it when scheduling
+    /// withdrawal maturity and claiming matured queue entries; the
+    /// SP1 proof's witness blob is bound to the same value.
+    ///
     /// `gas_limit` is the block-level ceiling the consensus header
     /// committed to (`header.gas_limit`). The runtime applies
     /// transactions until the next one would push gas consumption
@@ -78,6 +88,7 @@ pub trait BlockExecutor {
         &self,
         chain_id: u64,
         body: &Body,
+        block_height: u64,
         gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error>;
@@ -153,6 +164,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
         &self,
         chain_id: u64,
         body: &Body,
+        block_height: u64,
         gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String>;
@@ -190,10 +202,11 @@ where
         &self,
         chain_id: u64,
         body: &Body,
+        block_height: u64,
         gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String> {
-        BlockExecutor::execute_block(self, chain_id, body, gas_limit, state)
+        BlockExecutor::execute_block(self, chain_id, body, block_height, gas_limit, state)
             .map_err(|err| err.to_string())
     }
 
@@ -232,6 +245,7 @@ impl BlockExecutor for UnsupportedExecutor {
         &self,
         _chain_id: u64,
         _body: &Body,
+        _block_height: u64,
         _gas_limit: u64,
         _state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error> {

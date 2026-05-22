@@ -403,6 +403,7 @@ mod tests {
             validator_ops_root: [0x06; 32],
             da_root: [0x07; 32],
             runtime_extra: [0x08; 32],
+            receipts_root: [0x0A; 32],
             gas_used: 9,
             gas_limit: 10,
             timestamp: 12,

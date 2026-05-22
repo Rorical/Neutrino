@@ -82,6 +82,7 @@ impl BlockExecutor for WasmExecutor {
         &self,
         chain_id: u64,
         body: &Body,
+        block_height: u64,
         gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
@@ -99,6 +100,7 @@ impl BlockExecutor for WasmExecutor {
         }
         let input = StfInput {
             chain_id,
+            block_height,
             block_gas_limit: gas_limit,
             transactions: txs,
         };
@@ -130,6 +132,7 @@ impl BlockExecutor for WasmExecutor {
         Ok(ExecutionOutcome {
             state_root_after: output.post_state_root,
             runtime_extra: output.validator_set_root,
+            receipts_root: output.receipts_root,
             gas_used: output.gas_used,
             witness_bytes,
         })

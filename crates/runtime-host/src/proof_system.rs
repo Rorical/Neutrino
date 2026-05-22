@@ -155,6 +155,14 @@ where
         if input.block_gas_limit != public_inputs.gas_limit {
             return Err(ProofError::PublicInputMismatch);
         }
+        // Bind the STF input's block height to the consensus header.
+        // Withdrawal maturity is `mature_at_height = block_height +
+        // UNBONDING_DELAY_BLOCKS`; a prover that supplied a forged
+        // height could otherwise unlock funds earlier than the header
+        // permits.
+        if input.block_height != public_inputs.height {
+            return Err(ProofError::PublicInputMismatch);
+        }
 
         // 3. Serialize for SP1's stdin. The witness bundle is already
         //    in the layout the guest reads (input || witness); we
@@ -193,6 +201,9 @@ where
         if committed.gas_used != public_inputs.gas_used {
             return Err(ProofError::PublicInputMismatch);
         }
+        if committed.receipts_root != public_inputs.receipt_root {
+            return Err(ProofError::PublicInputMismatch);
+        }
 
         Sp1BlockProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof)
     }
@@ -226,6 +237,9 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
         if stf_output.gas_used != public_inputs.gas_used {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.receipts_root != public_inputs.receipt_root {
             return Err(ProofError::PublicInputMismatch);
         }
 

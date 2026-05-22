@@ -278,6 +278,7 @@ mod tests {
     fn apply_block_with_witness_runs_an_empty_block() {
         let input = StfInput {
             chain_id: 1,
+            block_height: 1,
             block_gas_limit: 30_000_000,
             transactions: alloc::vec![],
         };

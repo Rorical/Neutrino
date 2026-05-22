@@ -8,7 +8,7 @@
 use core::fmt;
 
 use neutrino_consensus_types::{BlockProof as WireBlockProof, BlockProofPublicInputs, Header};
-use neutrino_primitives::{BlockHash, StateRoot, ZERO_HASH};
+use neutrino_primitives::{BlockHash, StateRoot};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
@@ -211,9 +211,7 @@ impl<DB: Database> Engine<DB> {
             state_root_before,
             state_root_after: header.state_root,
             transactions_root: header.transactions_root,
-            // M5 runtime does not emit receipts; the chunk-prover seam
-            // in M7+ will start carrying a non-zero receipt root.
-            receipt_root: ZERO_HASH,
+            receipt_root: header.receipts_root,
             da_root: header.da_root,
             vm_code_hash: self.chain_spec().runtime_code_hash,
             abi_version: self.chain_spec().runtime_version.abi_version,

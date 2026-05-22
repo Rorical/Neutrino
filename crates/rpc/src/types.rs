@@ -121,6 +121,8 @@ pub struct HeaderJson {
     pub da_root: HashHex,
     /// Runtime-defined commitment (typically the validator-set root).
     pub runtime_extra: HashHex,
+    /// Runtime-emitted per-block receipts commitment.
+    pub receipts_root: HashHex,
     /// Gas consumed by the block.
     pub gas_used: u64,
     /// Gas limit the block was run with.
@@ -145,6 +147,7 @@ impl From<&Header> for HeaderJson {
             validator_ops_root: HashHex(h.validator_ops_root),
             da_root: HashHex(h.da_root),
             runtime_extra: HashHex(h.runtime_extra),
+            receipts_root: HashHex(h.receipts_root),
             gas_used: h.gas_used,
             gas_limit: h.gas_limit,
             timestamp: h.timestamp,

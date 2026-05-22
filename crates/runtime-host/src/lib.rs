@@ -453,6 +453,7 @@ mod tests {
         } = dry_run(
             &StfInput {
                 chain_id: 1,
+                block_height: 1,
                 block_gas_limit: 30_000_000,
                 transactions: Vec::new(),
             },

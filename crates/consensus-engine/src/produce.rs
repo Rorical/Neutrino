@@ -234,10 +234,11 @@ impl<DB: Database> Engine<DB> {
         let ExecutionOutcome {
             state_root_after,
             runtime_extra,
+            receipts_root,
             gas_used,
             witness_bytes,
         } = executor
-            .execute_block(chain_id, &body, gas_limit, &mut next_state)
+            .execute_block(chain_id, &body, height, gas_limit, &mut next_state)
             .map_err(ProductionError::Executor)?;
 
         // Compute body roots from the supplied body. The executor
@@ -272,6 +273,10 @@ impl<DB: Database> Engine<DB> {
             // into `runtime_extra` so the chunk BFT and consensus
             // layer see the post-block stake distribution.
             runtime_extra,
+            // Wire the runtime's per-block receipts commitment into
+            // `header.receipts_root`. Verifiers cross-check this
+            // against the SP1 proof's committed receipts_root.
+            receipts_root,
             gas_used,
             gas_limit,
             timestamp,

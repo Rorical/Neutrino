@@ -751,6 +751,7 @@ mod tests {
             validator_ops_root: [8; 32],
             da_root: [9; 32],
             runtime_extra: [10; 32],
+            receipts_root: [12; 32],
             gas_used: 100,
             gas_limit: 1_000_000,
             timestamp: 1_800_000_000,

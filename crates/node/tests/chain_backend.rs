@@ -106,6 +106,7 @@ fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> 
         validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
+        receipts_root: ZERO_HASH,
         gas_used: 0,
         gas_limit: 1_000_000,
         timestamp: slot * 4,

@@ -97,6 +97,7 @@ fn stake_pipeline_prove_verify_mock() {
 
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_height: 1,
         block_gas_limit: 30_000_000,
         transactions: vec![Transaction::Stake(signed_stake(&alice, 60, 0))],
     };
@@ -127,6 +128,7 @@ fn slash_pipeline_prove_verify_mock() {
 
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_height: 1,
         block_gas_limit: 30_000_000,
         transactions: vec![Transaction::Slash(SlashTx {
             validator: addr,
@@ -160,6 +162,7 @@ fn inactivity_leak_pipeline_prove_verify_mock() {
 
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_height: 1,
         block_gas_limit: 30_000_000,
         transactions: vec![Transaction::InactivityLeak(LeakTx {
             validator: addr,
@@ -192,6 +195,7 @@ fn stake_then_unstake_round_trip() {
 
     let input = StfInput {
         chain_id: CHAIN_ID,
+        block_height: 1,
         block_gas_limit: 30_000_000,
         transactions: vec![
             Transaction::Stake(signed_stake(&alice, 40, 0)),

@@ -44,6 +44,11 @@ pub struct Header {
     pub da_root: [u8; 32],
     /// Runtime-defined commitment.
     pub runtime_extra: [u8; 32],
+    /// Runtime-emitted per-block receipts commitment. The runtime
+    /// computes this over its per-transaction [`Receipt`]s; the
+    /// SP1 proof's `BlockProofPublicInputs.receipt_root` must match
+    /// this field exactly.
+    pub receipts_root: [u8; 32],
     /// Gas consumed by the block.
     pub gas_used: u64,
     /// Block gas limit.
@@ -83,6 +88,7 @@ struct HeaderHashPayload {
     validator_ops_root: Hash,
     da_root: Hash,
     runtime_extra: Hash,
+    receipts_root: Hash,
     gas_used: u64,
     gas_limit: u64,
     timestamp: u64,
@@ -104,6 +110,7 @@ impl From<&Header> for HeaderHashPayload {
             validator_ops_root: header.validator_ops_root,
             da_root: header.da_root,
             runtime_extra: header.runtime_extra,
+            receipts_root: header.receipts_root,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
             timestamp: header.timestamp,
@@ -575,6 +582,7 @@ mod tests {
             validator_ops_root: hash(8),
             da_root: hash(9),
             runtime_extra: hash(10),
+            receipts_root: hash(15),
             gas_used: 11,
             gas_limit: 12,
             timestamp: 13,

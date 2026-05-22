@@ -470,7 +470,7 @@ impl<DB: Database> Engine<DB> {
             state_root_before,
             state_root_after: header.state_root,
             transactions_root: header.transactions_root,
-            receipt_root: ZERO_HASH,
+            receipt_root: header.receipts_root,
             da_root: header.da_root,
             vm_code_hash: self.chain_spec().runtime_code_hash,
             abi_version: self.chain_spec().runtime_version.abi_version,

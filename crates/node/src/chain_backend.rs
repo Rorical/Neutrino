@@ -96,6 +96,18 @@ const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 3_500;
 /// pool to the limit.
 const DEFAULT_BODY_SLASHING_BUDGET: usize = 32;
 
+/// Maximum number of slashing-evidence items the pool retains at any
+/// time. Once exceeded, the oldest entry (FIFO) is evicted both
+/// in-memory and from `Column::SlashingPool`. Sized to comfortably
+/// cover even an adversarial network where every validator
+/// equivocates every chunk: 1024 entries at ~16 KiB worst-case
+/// gossip size caps RAM/disk pressure at ~16 MiB. Pending-fix #5
+/// (doc 17) calls for a "configurable max-entries cap"; today this
+/// is a node-local const matching `DEFAULT_BODY_SLASHING_BUDGET`'s
+/// style. Promote to `ConsensusParams` when there is a concrete
+/// reason to vary it per chain.
+const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
+
 /// Default cap on the number of inactivity-leak transactions pulled
 /// into a single block body. Each entry is a borsh-encoded
 /// `Transaction::InactivityLeak` per non-participating validator;
@@ -216,42 +228,100 @@ fn encode_slashing_as_tx(
     )
 }
 
-/// FIFO pool of [`SlashingEvidence`] with dedup-by-content. Two
-/// detectors that observe the same equivocation produce
-/// byte-identical evidence, so the BLAKE3 of the borsh encoding is
-/// a safe canonical key.
+/// Outcome of a single `SlashingPool::insert`. Returned to the
+/// caller (a `ChainBackend` helper) so the on-disk
+/// [`Column::SlashingPool`] can be kept in lockstep with the
+/// in-memory pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SlashingInsert {
+    /// Already pooled. Caller does nothing.
+    Duplicate,
+    /// Borsh encoding failed. Caller does nothing.
+    EncodingFailed,
+    /// Newly added. Caller persists `key`.
+    Inserted {
+        /// BLAKE3 of `borsh(evidence)`. Stable canonical key under
+        /// [`Column::SlashingPool`].
+        key: Hash,
+        /// If the pool was full, the FIFO-oldest entry that was
+        /// evicted to make room. Caller deletes this key from disk.
+        evicted_key: Option<Hash>,
+    },
+}
+
+/// FIFO pool of [`SlashingEvidence`] with dedup-by-content and a
+/// hard `SLASHING_POOL_MAX_ENTRIES` cap. Two detectors that observe
+/// the same equivocation produce byte-identical evidence, so the
+/// BLAKE3 of the borsh encoding is a safe canonical key.
+///
+/// `evidence` is `(key, evidence)` rather than just `evidence` so
+/// the drain path can hand the keys to the on-disk delete without
+/// re-hashing every item.
 #[derive(Default)]
 struct SlashingPool {
-    evidence: Vec<SlashingEvidence>,
+    evidence: Vec<(Hash, SlashingEvidence)>,
     seen: BTreeSet<Hash>,
 }
 
 impl SlashingPool {
-    fn insert(&mut self, evidence: SlashingEvidence) -> bool {
+    fn insert(&mut self, evidence: SlashingEvidence) -> SlashingInsert {
         let Ok(encoded) = borsh::to_vec(&evidence) else {
-            return false;
+            return SlashingInsert::EncodingFailed;
         };
-        let hash = blake3_256(&encoded);
-        if !self.seen.insert(hash) {
-            return false;
+        let key = blake3_256(&encoded);
+        if !self.seen.insert(key) {
+            return SlashingInsert::Duplicate;
         }
-        self.evidence.push(evidence);
-        true
+        self.evidence.push((key, evidence));
+        let evicted_key = if self.evidence.len() > SLASHING_POOL_MAX_ENTRIES {
+            // FIFO eviction: pop the oldest entry. `len() == MAX + 1`
+            // here because we just pushed one item past the cap.
+            let (evicted_key, _) = self.evidence.remove(0);
+            self.seen.remove(&evicted_key);
+            Some(evicted_key)
+        } else {
+            None
+        };
+        SlashingInsert::Inserted { key, evicted_key }
     }
 
     fn len(&self) -> usize {
         self.evidence.len()
     }
 
-    fn drain(&mut self, max: usize) -> Vec<SlashingEvidence> {
+    /// Drain up to `max` entries in FIFO order. Returns each as
+    /// `(key, evidence)` so the caller can delete the persisted
+    /// copy under `Column::SlashingPool` without re-hashing.
+    fn drain(&mut self, max: usize) -> Vec<(Hash, SlashingEvidence)> {
         let take = max.min(self.evidence.len());
         let drained: Vec<_> = self.evidence.drain(..take).collect();
-        for evidence in &drained {
-            if let Ok(bytes) = borsh::to_vec(evidence) {
-                self.seen.remove(&blake3_256(&bytes));
-            }
+        for (key, _) in &drained {
+            self.seen.remove(key);
         }
         drained
+    }
+
+    /// Bulk-append loaded-from-disk entries at the FIFO tail. Used
+    /// by [`ChainBackend::new`] to rehydrate the pool from
+    /// [`Column::SlashingPool`] on restart.
+    ///
+    /// Skips items whose key is already in `seen` (defensive against
+    /// a malformed on-disk state with two rows hashing the same
+    /// key). The cap is enforced post-load — if disk somehow holds
+    /// more rows than `SLASHING_POOL_MAX_ENTRIES`, the oldest
+    /// (front-of-vector) entries are dropped from memory only; the
+    /// next drain cycle re-syncs the on-disk view.
+    fn load_from_disk(&mut self, entries: Vec<(Hash, SlashingEvidence)>) {
+        for (key, evidence) in entries {
+            if !self.seen.insert(key) {
+                continue;
+            }
+            self.evidence.push((key, evidence));
+        }
+        while self.evidence.len() > SLASHING_POOL_MAX_ENTRIES {
+            let (evicted_key, _) = self.evidence.remove(0);
+            self.seen.remove(&evicted_key);
+        }
     }
 }
 
@@ -262,14 +332,38 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     /// Wrap an already-initialised [`Engine`].
+    ///
+    /// Pending-fix #5: rehydrates the in-memory slashing pool from
+    /// any [`Column::SlashingPool`] rows persisted by a prior node
+    /// session, so locally-detected equivocation survives a
+    /// restart and reaches the next produced block.
+    ///
+    /// Items that fail to borsh-decode (e.g. the on-disk format
+    /// pre-dates a node upgrade) are silently skipped. The
+    /// in-memory pool is rebuilt in disk-iteration order; the
+    /// original FIFO order is not preserved across restart, which
+    /// is semantically fine because slashing outcomes do not depend
+    /// on the order evidence is observed.
     pub fn new(engine: Engine<DB>, proof_system: P) -> Self {
+        let mut slashing_pool = SlashingPool::default();
+        let persisted = engine
+            .store()
+            .iter_slashing_evidence()
+            .unwrap_or_else(|err| {
+                warn!(
+                    ?err,
+                    "failed to load persisted slashing pool; continuing with empty pool"
+                );
+                Vec::new()
+            });
+        slashing_pool.load_from_disk(persisted);
         Self {
             engine: Mutex::new(engine),
             proof_system,
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
-            slashing_pool: Mutex::new(SlashingPool::default()),
+            slashing_pool: Mutex::new(slashing_pool),
             inactivity_pool: Mutex::new(Vec::new()),
             block_executor: Mutex::new(None),
         }
@@ -391,11 +485,70 @@ where
     /// Drain up to `max` pooled slashing evidence items in FIFO
     /// insertion order. Used by the producer when assembling a
     /// block body's `slashings` field.
+    ///
+    /// Mirrors the in-memory drain on disk: every drained item is
+    /// removed from [`Column::SlashingPool`] so the persisted view
+    /// matches the in-memory view. Disk-delete failures are logged
+    /// and swallowed — the in-memory drain has already happened, so
+    /// the producer either commits the drained items in the next
+    /// block (the disk row will be overwritten / deleted on the
+    /// next drain), or `restore_to_slashing_pool` re-persists them.
     pub fn drain_slashing_pool(&self, max: usize) -> Vec<SlashingEvidence> {
-        self.slashing_pool
+        let drained = self
+            .slashing_pool
             .lock()
             .expect("ChainBackend slashing_pool poisoned")
-            .drain(max)
+            .drain(max);
+        if !drained.is_empty() {
+            self.with_engine_mut(|engine| {
+                for (key, _) in &drained {
+                    if let Err(err) = engine.store_mut().delete_slashing_evidence(key) {
+                        warn!(?err, ?key, "failed to delete drained slashing evidence");
+                    }
+                }
+            });
+        }
+        drained.into_iter().map(|(_, evidence)| evidence).collect()
+    }
+
+    /// Insert one evidence item into the in-memory pool and persist
+    /// the change to [`Column::SlashingPool`]. Returns `true` if a
+    /// new entry was added (i.e. the caller should gossip), `false`
+    /// for duplicates / encoding failures.
+    ///
+    /// Holds the pool lock for the full pool+disk transaction so a
+    /// concurrent `drain_slashing_pool` cannot observe a torn
+    /// in-memory / on-disk state. Lock ordering is always
+    /// `slashing_pool → engine` across the file, so this never
+    /// deadlocks.
+    fn insert_persistent(&self, evidence: &SlashingEvidence) -> bool {
+        let outcome = {
+            let mut pool = self
+                .slashing_pool
+                .lock()
+                .expect("ChainBackend slashing_pool poisoned");
+            pool.insert(evidence.clone())
+        };
+        match outcome {
+            SlashingInsert::Duplicate | SlashingInsert::EncodingFailed => false,
+            SlashingInsert::Inserted { key, evicted_key } => {
+                self.with_engine_mut(|engine| {
+                    if let Err(err) = engine.store_mut().put_slashing_evidence(evidence) {
+                        warn!(?err, ?key, "failed to persist slashing evidence");
+                    }
+                    if let Some(evicted_key) = evicted_key
+                        && let Err(err) = engine.store_mut().delete_slashing_evidence(&evicted_key)
+                    {
+                        warn!(
+                            ?err,
+                            ?evicted_key,
+                            "failed to delete FIFO-evicted slashing evidence"
+                        );
+                    }
+                });
+                true
+            }
+        }
     }
 
     /// Add an [`SlashingEvidence`] to the local pool and, when a
@@ -404,14 +557,10 @@ where
     ///
     /// Deduplicates by `blake3(borsh(evidence))` so two detection
     /// paths that produce the same canonical evidence only enqueue
-    /// it once.
+    /// it once. Persists the new entry to [`Column::SlashingPool`]
+    /// so it survives a node restart (pending-fix #5).
     async fn pool_and_gossip_slashing(&self, evidence: SlashingEvidence) {
-        let inserted = self
-            .slashing_pool
-            .lock()
-            .expect("ChainBackend slashing_pool poisoned")
-            .insert(evidence.clone());
-        if !inserted {
+        if !self.insert_persistent(&evidence) {
             return;
         }
         let Some(publisher) = self.publisher_snapshot() else {
@@ -522,20 +671,23 @@ where
         // can retry them.
         if !matches!(&result, Ok(Some(_))) {
             self.restore_to_mempool(drained_mempool);
-            self.restore_to_slashing_pool(drained_slashings);
+            self.restore_to_slashing_pool(&drained_slashings);
             self.restore_to_inactivity_pool(drained_inactivity);
         }
         let _ = drained_hashes; // hashes are only useful for log filtering today
         result
     }
 
-    fn restore_to_slashing_pool(&self, evidence: Vec<SlashingEvidence>) {
-        let mut pool = self
-            .slashing_pool
-            .lock()
-            .expect("ChainBackend slashing_pool poisoned");
+    /// Re-pool evidence that was drained for production but the
+    /// engine refused to commit. Re-persists each item to
+    /// [`Column::SlashingPool`] so a crash between drain and
+    /// production still preserves the evidence on disk.
+    fn restore_to_slashing_pool(&self, evidence: &[SlashingEvidence]) {
         for item in evidence {
-            pool.insert(item);
+            // `insert_persistent` already handles in-memory dedup,
+            // FIFO cap eviction, and on-disk sync — the same path
+            // every other pool-write site uses.
+            let _ = self.insert_persistent(item);
         }
     }
 
@@ -1195,6 +1347,27 @@ where
     }
 }
 
+impl<DB, P> ChainBackend<DB, P>
+where
+    DB: Database + Clone + Send + 'static,
+    DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
+    P: ProofSystem + Send + Sync + 'static,
+{
+    /// Clone the underlying database. Available only for cloneable
+    /// backends (today: [`neutrino_storage::MemoryDatabase`]); the
+    /// RocksDB backend deliberately is not `Clone` because file
+    /// handles cannot be duplicated.
+    ///
+    /// Used by restart-recovery integration tests to simulate a
+    /// process restart: snapshot the DB, drop the backend, build a
+    /// fresh backend on the snapshot, and assert the new backend
+    /// observes everything the old one persisted.
+    #[must_use]
+    pub fn snapshot_database(&self) -> DB {
+        self.with_engine(|e| e.store().db().clone())
+    }
+}
+
 #[async_trait]
 impl<DB, P> SyncBackend for ChainBackend<DB, P>
 where
@@ -1750,12 +1923,7 @@ where
                 return;
             }
         }
-        let inserted = self
-            .slashing_pool
-            .lock()
-            .expect("ChainBackend slashing_pool poisoned")
-            .insert(evidence);
-        if inserted {
+        if self.insert_persistent(&evidence) {
             trace!("pooled peer-supplied slashing evidence");
         }
     }

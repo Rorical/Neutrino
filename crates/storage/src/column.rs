@@ -38,12 +38,18 @@ pub enum Column {
     Finalized,
     /// Best-effort mempool state. Not consensus-critical.
     Mempool,
+    /// Node-local persisted slashing-evidence pool. Key is BLAKE3
+    /// of the borsh-encoded `SlashingEvidence`; value is the
+    /// borsh-encoded evidence itself. Loaded into memory on
+    /// startup so a node that crashes after detecting equivocation
+    /// still emits the evidence in its next produced block.
+    SlashingPool,
     /// Node-local metadata such as DB version and chain-spec hash.
     Meta,
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 18] = [
+pub const ALL_COLUMNS: [Column; 19] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -61,6 +67,7 @@ pub const ALL_COLUMNS: [Column; 18] = [
     Column::ValidatorSetSnapshots,
     Column::Finalized,
     Column::Mempool,
+    Column::SlashingPool,
     Column::Meta,
 ];
 
@@ -86,6 +93,7 @@ impl Column {
             Self::ValidatorSetSnapshots => "validator_set_snap",
             Self::Finalized => "finalized",
             Self::Mempool => "mempool",
+            Self::SlashingPool => "slashing_pool",
             Self::Meta => "meta",
         }
     }
@@ -97,7 +105,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 18);
+        assert_eq!(ALL_COLUMNS.len(), 19);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -107,7 +115,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 18] = [
+        let names: [&str; 19] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -125,6 +133,7 @@ mod tests {
             "validator_set_snap",
             "finalized",
             "mempool",
+            "slashing_pool",
             "meta",
         ];
         for (column, expected) in ALL_COLUMNS.iter().zip(names) {

@@ -321,7 +321,9 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
   materialisation is split out as new pending-fix #7.
 - **#3 Multi-slot multi-validator integration test** — closed by
   `dc2c445` (`test(node): autonomous multi-slot multi-validator localnet`).
-- **#4 BFT round timeouts** — closed by this commit.
+- **#4 BFT round timeouts** — closed by `b056436`
+  (`feat(consensus,node): BFT round timeouts`).
+- **#5 Slashing pool persistence** — closed by this commit.
 
 ---
 

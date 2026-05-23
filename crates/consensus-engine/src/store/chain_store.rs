@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::{
     BlockProof, Body, Chunk, ChunkProof, FinalityCert, Header, RecursiveCheckpointProof,
+    SlashingEvidence,
 };
 use neutrino_primitives::{
     BlockHash, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Seed, Slot, Validator,
@@ -543,6 +544,73 @@ impl<DB: Database> ChainStore<DB> {
         Ok(out)
     }
 
+    // ---------- Slashing pool ----------
+
+    /// Persist one slashing-evidence item under
+    /// [`Column::SlashingPool`]. Key is BLAKE3 of the borsh-encoded
+    /// evidence so two detectors that observe the same equivocation
+    /// produce the same key (de-dup is free).
+    ///
+    /// Pending-fix #5 (doc 17): a node that detects equivocation
+    /// and crashes before its next produced block must not lose the
+    /// evidence. Every `pool_and_gossip_slashing` / restore site in
+    /// `ChainBackend` mirrors its in-memory write here so a fresh
+    /// `ChainBackend::new` rehydrates the prior observations via
+    /// [`Self::iter_slashing_evidence`].
+    ///
+    /// Returns `Ok(())` for new and duplicate inserts alike; the
+    /// caller is responsible for de-duplicating in memory.
+    pub fn put_slashing_evidence(
+        &mut self,
+        evidence: &SlashingEvidence,
+    ) -> Result<Hash, StoreError<DB::Error>> {
+        let bytes = borsh::to_vec(evidence)?;
+        let key = neutrino_primitives::blake3_256(&bytes);
+        self.put_raw(Column::SlashingPool, &key, &bytes)?;
+        Ok(key)
+    }
+
+    /// Delete one persisted slashing-evidence item. `key` is the
+    /// BLAKE3 of the borsh-encoded evidence returned by
+    /// [`Self::put_slashing_evidence`]. Deleting a missing key is a
+    /// no-op so restart loops never trip over already-drained items.
+    pub fn delete_slashing_evidence(&mut self, key: &Hash) -> Result<(), StoreError<DB::Error>> {
+        self.db
+            .delete(Column::SlashingPool, key)
+            .map_err(StoreError::Database)
+    }
+
+    /// Iterate every persisted slashing-evidence item. Returns
+    /// `(content_hash, evidence)` pairs. Items that fail to decode
+    /// are skipped (the borsh layout may have evolved across a node
+    /// upgrade).
+    ///
+    /// Iteration order is implementation-defined. Callers that need
+    /// FIFO order must track it separately; the in-memory pool's
+    /// `Vec` already preserves it within a single session and the
+    /// load-from-disk path uses arbitrary order (post-restart all
+    /// loaded items become an unordered batch — semantically fine
+    /// because evidence ordering does not affect slashing outcomes).
+    pub fn iter_slashing_evidence(
+        &self,
+    ) -> Result<Vec<(Hash, SlashingEvidence)>, StoreError<DB::Error>> {
+        let mut out = Vec::new();
+        for (key, value) in self
+            .db
+            .iter_column(Column::SlashingPool)
+            .map_err(StoreError::Database)?
+        {
+            let Ok(hash) = Hash::try_from(key.as_slice()) else {
+                continue;
+            };
+            let Ok(evidence) = SlashingEvidence::try_from_slice(&value) else {
+                continue;
+            };
+            out.push((hash, evidence));
+        }
+        Ok(out)
+    }
+
     // ---------- Meta ----------
 
     /// Write the chain-spec hash to metadata.
@@ -911,6 +979,48 @@ mod tests {
         store.put_tip(h(1)).expect("put");
         store.put_tip(h(2)).expect("put");
         assert_eq!(store.get_tip().expect("get"), Some(h(2)));
+    }
+
+    #[test]
+    fn slashing_evidence_roundtrips_and_iterates_in_column() {
+        let mut store = ChainStore::new(MemoryDatabase::new());
+        let a = SlashingEvidence::DoubleProposal {
+            proposer_index: 1,
+            header_a: header(7, 9, h(0xAA)),
+            header_b: header(7, 9, h(0xBB)),
+        };
+        let b = SlashingEvidence::DoubleProposal {
+            proposer_index: 2,
+            header_a: header(8, 10, h(0xCC)),
+            header_b: header(8, 10, h(0xDD)),
+        };
+        let key_a = store
+            .put_slashing_evidence(&a)
+            .expect("put slashing evidence a");
+        let key_b = store
+            .put_slashing_evidence(&b)
+            .expect("put slashing evidence b");
+        assert_ne!(
+            key_a, key_b,
+            "distinct evidence content must yield distinct keys",
+        );
+
+        let mut listed = store.iter_slashing_evidence().expect("iter");
+        listed.sort_by_key(|(k, _)| *k);
+        let mut expected = vec![(key_a, a), (key_b, b.clone())];
+        expected.sort_by_key(|(k, _)| *k);
+        assert_eq!(listed, expected, "iter returns the persisted set");
+
+        store
+            .delete_slashing_evidence(&key_b)
+            .expect("delete b removes the row");
+        let remaining = store.iter_slashing_evidence().expect("iter after delete");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "delete shrinks the column (got {remaining:?})",
+        );
+        assert_eq!(remaining[0].0, key_a, "the wrong row was deleted");
     }
 
     #[test]

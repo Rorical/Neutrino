@@ -225,12 +225,15 @@ Exit criteria:
 
 ## M4-new - Default runtime equivalent rewrite
 
-Status: M4-A, M4-B, M4-C, and M4-D landed. The default runtime now
-ports accounts + transfers, the staking lifecycle (stake / unstake),
-on-chain slashing application, and inactivity-leak application against
-real Merkle witnesses. Deposits, voluntary exits, and unbonding delays
-remain pending; their wire/state layout will track real production
-needs in later milestones.
+Status: M4-A, M4-B, M4-C, M4-D, and M4-E all landed. The default
+runtime now ports accounts + transfers, the staking lifecycle
+(stake / unstake), on-chain slashing application, inactivity-leak
+application against real Merkle witnesses, deposits, voluntary exits,
+unbonding delay (`UNBONDING_DELAY_BLOCKS = 32`, surfaced through
+`ChainSpec.runtime`), and the matured-withdrawal claim path. Mempool
+admission, per-block gas accounting, per-tx receipts (with stable
+status codes), and a flat per-gas fee market with proposer crediting
+are also live and bound through `BlockProofPublicInputs`.
 
 Goal: port the existing default runtime semantics into shared STF core form.
 
@@ -290,12 +293,44 @@ Port (M4-D landed): inactivity leak + on-chain slashing
   underlying evidence / inactivity report); real evidence proofs land
   alongside multi-validator finality in M7-new.
 
-Port (M4-C+ and later):
+Port (M4-E landed): deposits, voluntary exits, unbonding delay, receipts, fees
 
-5. deposits
-6. voluntary exits
-7. unbonding delay
-10. counter-key compatibility (intentionally dropped; not needed)
+- `Transaction::Deposit(DepositTx)` — Ed25519-signed deposit where the
+  depositor credits `amount` from `account_key(depositor)` into
+  `validator_key(validator).stake`. Withdrawal credentials are the
+  validator address; the depositor has no claim against the validator's
+  stake / withdrawal queue.
+- `Transaction::VoluntaryExit(VoluntaryExitTx)` — Ed25519-signed, drains
+  the validator's entire current stake into the withdrawal queue (same
+  effect as `Unstake(full_stake)` under the `DOMAIN_VOLUNTARY_EXIT`
+  tag).
+- `Transaction::Withdraw(WithdrawTx)` — drains every queue entry whose
+  `mature_at_height <= current_block_height` into spendable balance.
+- `WithdrawalQueue` stored under `wdr:` || `addr`. Entries created in
+  block `H` mature at `H + UNBONDING_DELAY_BLOCKS`.
+- `StfInput.block_height` plumbed by the host from `header.height`;
+  the SP1 proof binds it through `BlockProofPublicInputs.height`.
+- Per-tx `Receipt { status_code, gas_used, kind }` emitted by
+  `apply_block`. Status codes are wire-stable: `Success(0)`,
+  `BadSignature(1)`, `NonceMismatch(2)`, `InsufficientBalance(3)`,
+  `OutOfBlockGas(4)`, `Overflow(5)`. The receipts commitment is
+  `BLAKE3(DOMAIN_RECEIPTS_ROOT || count_le || (status_le || gas_le ||
+  kind)*)`. The consensus engine wires it into `header.receipts_root`
+  and `BlockProofPublicInputs.receipt_root`.
+- `RuntimeParams { gas_price, unbonding_delay_blocks, slash_amount,
+  inactivity_leak_amount }` on `ChainSpec`. The engine reads
+  `chain_spec.runtime.gas_price` and `chain_spec.runtime.proposer_address`
+  (derived from the active validator set at `header.proposer_index`).
+  `BlockProofPublicInputs.gas_price` and `proposer_address` are
+  cross-checked by `Sp1ProofSystem::{prove,verify}_block`. Consensus-
+  driven `Transaction::Slash` and `Transaction::InactivityLeak` pay no
+  fee; signed user transactions pay `tx_gas(tx) * gas_price` to the
+  proposer.
+
+Intentionally dropped:
+
+- Counter-key compatibility from the legacy default runtime (no current
+  test or migration requirement).
 
 Requirements:
 

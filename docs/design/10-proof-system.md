@@ -1,10 +1,26 @@
-# 10 — Proof System
+# 10 — Proof System (historical)
 
-> Rewrite note: the accepted proof direction is SP1 Compressed STARK per-block
-> proving, documented in
-> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). Chunk proof
-> aggregation and checkpoint recursion are TODO/deferred. The custom Plonky3
-> proof hierarchy below is historical pre-rewrite design.
+> **HISTORICAL.** The accepted proof direction is SP1 Compressed STARK
+> per-block proving, documented in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md) and tracked
+> in [14-sp1-rewrite-roadmap](14-sp1-rewrite-roadmap.md). Chunk proof
+> aggregation and checkpoint recursion are explicit TODOs; `prover-chunk` and
+> `prover-checkpoint` are scaffold-only crates. The three-tier Plonky3
+> hierarchy described below — block, chunk, recursive checkpoint — and the
+> RV32IM-AIR / Poseidon2 / BabyBear stack do not exist in code. The
+> implemented proof surface is:
+>
+> - `proof-system::ProofSystem` trait (chunk + recursive default to `Unsupported`)
+> - `proof-system::MockProofSystem` (retained for fast consensus tests)
+> - `runtime-host::Sp1ProofSystem<Prover>` wrapping `sp1-sdk` 6.2.1
+> - `BlockProof { height, block_hash, public_inputs, proof_bytes }`
+>   where `proof_bytes = borsh(Sp1BlockProof { bytes:
+>   bincode(SP1ProofWithPublicValues) })`
+> - `BlockProofPublicInputs` defined in `consensus-types`, bound by the
+>   SP1 host's `prove_block` / `verify_block` against the committed
+>   `StfPublicOutput`
+>
+> Read this file only for archaeological context; do not use it as a spec.
 
 Neutrino is a **proof-aware** chain. Every block's state transition must be
 covered by a zero-knowledge proof; chunk proofs aggregate block proofs;

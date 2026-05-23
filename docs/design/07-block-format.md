@@ -109,8 +109,20 @@ pub struct Header {
     pub da_root:            [u8; 32],
 
     /// 32-byte runtime-defined extra. Lets the runtime commit to additional
-    /// data without forcing engine schema changes. Engine ignores contents.
+    /// data without forcing engine schema changes. The default runtime
+    /// uses this field to publish its post-block `validator_set_root`
+    /// (`runtime::ValidatorSet::root`); the engine treats the contents as
+    /// opaque outside that convention.
     pub runtime_extra:      [u8; 32],
+
+    /// Runtime-emitted per-block receipts commitment.
+    ///
+    /// The default runtime hashes its per-transaction `Receipt` vector
+    /// under `DOMAIN_RECEIPTS_ROOT` and exposes the digest here. The
+    /// SP1 proof's `BlockProofPublicInputs.receipt_root` must match
+    /// this field exactly; the consensus engine and the prover
+    /// cross-check it on import.
+    pub receipts_root:      [u8; 32],
 
     /// Gas used by this block.
     pub gas_used:           u64,
@@ -156,17 +168,24 @@ pub struct Body {
     /// Finality votes on past chunks. Aggregated BLS sigs.
     pub finality_votes:   Vec<FinalityVote>,
 
-    /// Slashing evidence detected by the proposer.
+    /// Slashing evidence detected by the proposer. The chain backend
+    /// re-encodes each accepted variant as a
+    /// `runtime::Transaction::Slash` and prepends those blobs to
+    /// `transactions` before the runtime executes the block.
     pub slashings:        Vec<SlashingEvidence>,
-
-    /// Validator activation/exit ops.
-    pub deposits:         Vec<Deposit>,
-    pub voluntary_exits:  Vec<VoluntaryExit>,
 }
 ```
 
-The engine builds the five roots from these vectors and verifies them against
-the header. Mismatch → block invalid, dropped from fork choice.
+The engine builds the four roots (`transactions_root`, `votes_root`,
+`slashings_root`, `da_root`) from these vectors and verifies them against
+the header. Mismatch → block invalid, dropped from fork choice. The
+header's `validator_ops_root` is reserved for a future body lane and is
+populated as the zero hash in v1 because the active default runtime
+expresses deposits and voluntary exits as in-band Ed25519
+`Transaction::Deposit` / `Transaction::VoluntaryExit` payloads inside
+`transactions`. The BLS-PoP deposit / voluntary-exit shapes in §7.6
+remain reserved for a future revision that surfaces them through a body
+lane; do not rely on them in v1.
 
 ---
 
@@ -333,7 +352,7 @@ consensus/networking crates.
 
 ---
 
-## 7.6 Deposit / VoluntaryExit
+## 7.6 Deposit / VoluntaryExit (reserved BLS lane)
 
 ```rust
 pub struct Deposit {
@@ -350,9 +369,13 @@ pub struct VoluntaryExit {
 }
 ```
 
-The engine surfaces these to the runtime via the block body; the runtime
-applies activation/exit semantics and updates the validator-set entry in
-state.
+These shapes are reserved for a future revision that surfaces deposits
+and voluntary exits through dedicated body lanes (with BLS PoP
+verification at the consensus layer). In v1 the default runtime uses
+in-band Ed25519 `Transaction::Deposit` / `Transaction::VoluntaryExit`
+payloads inside `Body.transactions` — see doc 13 §"Default runtime
+transaction shapes". Block bodies in v1 do not carry the structs
+above; if they did, the engine would ignore them.
 
 ---
 

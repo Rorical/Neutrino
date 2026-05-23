@@ -1,10 +1,16 @@
-# 11. Light Client
+# 11 — Light Client (historical)
 
-> Rewrite note: the previous light-client design depends on recursive
-> checkpoint proofs. Checkpoint recursion is TODO/deferred under the accepted
-> SP1 rewrite, so this document is historical until the light-client protocol is
-> redesigned. See
-> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md).
+> **HISTORICAL.** The protocol described here depends on recursive checkpoint
+> proofs, which are explicitly deferred under
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md) (no SNARK
+> wrapper, no recursive checkpoint in the accepted plan). The `light-client`
+> crate is a 16-line `SyncState` enum stub. Until a successor protocol is
+> accepted, do not implement against this file. A future light-client design
+> will most likely follow a chain of SP1 block proofs anchored at a
+> weak-subjectivity checkpoint, but the wire shapes, bootstrap flow, and
+> verifier API have not been designed yet.
+>
+> Read this file only for archaeological context; do not use it as a spec.
 
 This document defines Neutrino's light-client protocol: how a resource-
 constrained verifier (browser, mobile, embedded device, another chain) can

@@ -1,9 +1,22 @@
-# 03 — Execution Runtime
+# 03 — Execution Runtime (historical)
 
-> Rewrite note: the SP1/WASM runtime rewrite is accepted in
-> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md). This file
-> describes the pre-rewrite RV32IM ELF/runtime-host design and is retained as
-> historical context until the old runtime code is removed.
+> **HISTORICAL.** This file describes the deleted pre-rewrite RV32IM ELF /
+> runtime-host design. The accepted architecture is in
+> [13-sp1-runtime-proof-rewrite](13-sp1-runtime-proof-rewrite.md) and the
+> implemented behavior is summarized in
+> [14-sp1-rewrite-roadmap](14-sp1-rewrite-roadmap.md). Nothing in this file
+> describes code that exists today: there is no in-tree RV32IM VM, no syscall
+> ABI, no `_neutrino_init`/`_neutrino_execute_block` entrypoint, no
+> `vm_code_hash` on-chain key, no per-instruction gas table, and no JIT
+> roadmap. The corresponding implementation lives in:
+>
+> - `runtimes/neutrino-default/core` — shared STF (`apply_block`, `validate_tx`)
+> - `runtimes/neutrino-default/master` — WASM cdylib + native rlib
+> - `runtimes/neutrino-default/guest` — SP1 Guest binary
+> - `runtime-host::WasmRuntime` / `WasmExecutor` — wasmtime host
+> - `runtime-host::Sp1ProofSystem` — SP1 SDK wrapper
+>
+> Read this file only for archaeological context; do not use it as a spec.
 
 The runtime is a single **RV32IM ELF binary**. The node loads it, places it in
 a sandboxed memory, and invokes well-known entrypoints by name.

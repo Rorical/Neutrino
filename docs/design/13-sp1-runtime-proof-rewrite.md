@@ -290,49 +290,158 @@ validity is still established by the SP1 proof and its public output.
 
 ## Witness data model
 
-The exact Rust shapes live in `runtime-abi` and the runtime core crates, but the
-logical data is:
+The exact Rust shapes live in `runtime-abi`, `runtime-core`, and the
+default runtime's `core` crate. The implemented shapes are:
 
 ```rust
+// runtime-abi: shared wire types
+pub struct StateWitness {
+    pub nodes: Vec<TrieNodeBytes>,
+    pub values: Vec<TrieValueBytes>,
+    pub witnessed_keys: Vec<Vec<u8>>,
+}
+
+// runtimes/neutrino-default/core: STF I/O
 pub struct StfInput {
     pub chain_id: u64,
-    pub block_hash: [u8; 32],
-    pub pre_state_root: [u8; 32],
-    pub block_context: BlockContext,
+    pub block_height: u64,
+    pub block_gas_limit: u64,
+    pub gas_price: u128,
+    pub proposer_address: [u8; 32],
     pub transactions: Vec<Transaction>,
-    pub slashings: Vec<SlashingEvidence>,
-    pub validator_ops: Vec<ValidatorOp>,
-    pub state_witness: StateWitness,
-    pub runtime_version: RuntimeVersion,
-    pub sp1_program_vkey_hash: [u8; 32],
-}
-
-pub struct StateWitness {
-    pub entries: Vec<WitnessEntry>,
-}
-
-pub struct WitnessEntry {
-    pub key: Vec<u8>,
-    pub value: Option<Vec<u8>>,
-    pub proof: TrieProof,
 }
 
 pub struct StfPublicOutput {
-    pub chain_id: u64,
-    pub height: u64,
-    pub block_hash: [u8; 32],
     pub pre_state_root: [u8; 32],
     pub post_state_root: [u8; 32],
+    pub applied: u32,
+    pub failed: u32,
     pub validator_set_root: [u8; 32],
+    pub gas_used: u64,
     pub receipts_root: [u8; 32],
-    pub events_root: [u8; 32],
-    pub runtime_version: RuntimeVersion,
-    pub sp1_program_vkey_hash: [u8; 32],
 }
 ```
 
-The public output must be part of the proof object and must be checked against
-the block header on import.
+`StfInput` is the per-block STF input. The runtime-host fans it out to
+both the WASM dry-run and the SP1 Guest as a borsh-encoded `(StfInput,
+StateWitness)` pair. `pre_state_root` and `block_hash` are not part of
+`StfInput` itself: the host binds them through
+`BlockProofPublicInputs`, which the SP1 host cross-checks against the
+committed `StfPublicOutput` before handing the proof back to the engine.
+
+Runtime versioning (`runtime_version`, `sp1_program_vkey_hash`,
+`events_root`) is not currently part of the wire shape:
+
+- `vm_code_hash` (`BLAKE3(embedded master cdylib)`) and `abi_version`
+  are bound through `BlockProofPublicInputs` rather than through the
+  STF I/O.
+- The SP1 verifying-key hash lives on the cached `Sp1VerifyingKey`
+  (keyed by `(SP1_CIRCUIT_VERSION, BLAKE3(elf_bytes))`).
+- Events are not modelled in v1; only per-tx `Receipt { status_code,
+  gas_used, kind }` is emitted and committed via `receipts_root`.
+
+The public output must be part of the proof object and must be checked
+against the block header on import.
+
+## Block-proof wire envelope
+
+The on-wire `BlockProof` artifact gossiped on `Topic::BlockProofs` and
+persisted under `Column::BlockProofs` is:
+
+```rust
+pub struct BlockProof {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub public_inputs: BlockProofPublicInputs,
+    pub proof_bytes: Vec<u8>,
+}
+
+pub struct BlockProofPublicInputs {
+    pub chain_id: u64,
+    pub height: u64,
+    pub parent_block_hash: [u8; 32],
+    pub block_hash: [u8; 32],
+    pub state_root_before: [u8; 32],
+    pub state_root_after: [u8; 32],
+    pub transactions_root: [u8; 32],
+    pub receipt_root: [u8; 32],
+    pub da_root: [u8; 32],
+    pub vm_code_hash: [u8; 32],
+    pub abi_version: u32,
+    pub gas_used: u64,
+    pub gas_limit: u64,
+    pub gas_price: u128,
+    pub proposer_address: [u8; 32],
+}
+```
+
+`proof_bytes` is the borsh-encoded `Sp1BlockProof { bytes:
+bincode(SP1ProofWithPublicValues) }`. The SP1 host's `prove_block`
+cross-checks the witness-encoded `StfInput` against every relevant
+field of `BlockProofPublicInputs` (chain_id, block_height,
+block_gas_limit, gas_price, proposer_address, pre_state_root) before
+producing the proof; `verify_block` does the symmetric check against
+the committed `StfPublicOutput` (pre/post state roots, gas_used,
+receipts_root).
+
+There is no `ProofKind` enum on the envelope and no
+`program_vkey_hash` field; the proof system is determined by the
+selected backend at node-build time, and the SP1 verifying key is
+re-derived locally from the embedded master ELF.
+
+## Default runtime transaction shapes
+
+The implemented default runtime (`runtimes/neutrino-default/core`)
+exposes a single `Transaction` enum keyed by Ed25519 public keys. The
+shapes below are the v1 canonical wire format; new variants must
+append, never reorder, because `tx_kind_code(tx)` becomes part of every
+[`Receipt`] and the receipts-root commitment depends on the variant
+index.
+
+```rust
+pub enum Transaction {
+    Transfer(TransferTx),
+    Stake(StakeTx),
+    Unstake(UnstakeTx),
+    Slash(SlashTx),               // consensus-driven, no signature
+    InactivityLeak(LeakTx),       // consensus-driven, no signature
+    Deposit(DepositTx),
+    VoluntaryExit(VoluntaryExitTx),
+    Withdraw(WithdrawTx),
+}
+```
+
+Properties:
+
+- `Transfer`, `Stake`, `Unstake`, `Deposit`, `VoluntaryExit`, and
+  `Withdraw` carry an Ed25519 signature over a fixed canonical payload
+  prefixed by a 16-byte domain tag and the chain id, so cross-chain
+  and cross-kind replay are both rejected.
+- `Slash` and `InactivityLeak` carry no signature. The chain backend
+  re-encodes each accepted `SlashingEvidence` / inactivity report as
+  one of these two variants and prepends the borsh-encoded blobs to
+  `Body.transactions` before the runtime executes the block. Users
+  cannot submit them through the mempool — `validate_tx` returns
+  `TxValidationCode::Unauthorized`.
+- Signed user variants pay `tx_gas(tx) * StfInput.gas_price` to the
+  block proposer. Consensus-driven variants pay nothing.
+
+`Body.deposits` and `Body.voluntary_exits` are reserved BLS lanes
+(see doc 07 §7.6) and are populated as empty vectors in v1.
+
+## Withdrawal queue
+
+Unstakes and voluntary exits do not return funds to the signer
+immediately. Each `Unstake` / `VoluntaryExit` appends a
+`Withdrawal { amount, mature_at_height = block_height +
+ChainSpec.runtime.unbonding_delay_blocks }` entry to the validator's
+per-address queue. A subsequent `Withdraw` transaction signed by the
+validator drains every entry with `mature_at_height <=
+current_block_height` into spendable balance. Empty queues remain
+in state with `entries: vec![]` rather than being deleted (deleting
+sibling-path nodes requires witness data the dry-run access set does
+not capture, and the few-byte overhead is acceptable for witness
+uniformity).
 
 ## Block production flow
 

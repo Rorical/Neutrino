@@ -106,6 +106,8 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: BLOCK_GAS_LIMIT,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
         transactions: vec![Transaction::Transfer(tx)],
     };
     let dry = dry_run(&input, &live);

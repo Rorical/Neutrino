@@ -173,9 +173,10 @@ mod wasm_abi {
     /// The host writes a flat byte string at `in_ptr..in_ptr+in_len`:
     ///
     /// ```text
-    ///   8B  chain_id (little-endian u64)
-    ///   8B  block_gas_limit (little-endian u64)
-    ///   N   borsh-encoded Transaction bytes
+    ///    8B  chain_id (little-endian u64)
+    ///    8B  block_gas_limit (little-endian u64)
+    ///   16B  gas_price (little-endian u128)
+    ///   N    borsh-encoded Transaction bytes
     /// ```
     ///
     /// The runtime decodes the prefix, runs the shared
@@ -186,14 +187,17 @@ mod wasm_abi {
     /// allocation. Returns a packed `u64`: high 32 bits = output
     /// pointer, low 32 bits = output length (always
     /// [`neutrino_runtime_abi::TX_VALIDITY_ENCODED_LEN`]).
+    /// Header length of the `_neutrino_validate_tx` envelope:
+    /// 8 (`chain_id`) + 8 (`block_gas_limit`) + 16 (`gas_price`).
+    const VALIDATE_TX_HEADER_LEN: usize = 8 + 8 + 16;
+
     #[unsafe(no_mangle)]
     extern "C" fn _neutrino_validate_tx(in_ptr: u32, in_len: u32) -> u64 {
         use neutrino_default_runtime_core::validate_tx as core_validate_tx;
         use neutrino_runtime_abi::{TX_VALIDITY_ENCODED_LEN, TxValidationCode, TxValidity};
 
         let bytes = unsafe { core::slice::from_raw_parts(in_ptr as *const u8, in_len as usize) };
-        // Need at least 16 bytes of header (chain_id + gas_limit).
-        let validity = if bytes.len() < 16 {
+        let validity = if bytes.len() < VALIDATE_TX_HEADER_LEN {
             TxValidity::invalid(TxValidationCode::Malformed)
         } else {
             let mut chain_id_buf = [0u8; 8];
@@ -202,9 +206,12 @@ mod wasm_abi {
             let mut gas_buf = [0u8; 8];
             gas_buf.copy_from_slice(&bytes[8..16]);
             let block_gas_limit = u64::from_le_bytes(gas_buf);
-            let tx_bytes = &bytes[16..];
+            let mut price_buf = [0u8; 16];
+            price_buf.copy_from_slice(&bytes[16..32]);
+            let gas_price = u128::from_le_bytes(price_buf);
+            let tx_bytes = &bytes[VALIDATE_TX_HEADER_LEN..];
             let mut backend = WasmHostBackend;
-            core_validate_tx(tx_bytes, &mut backend, chain_id, block_gas_limit)
+            core_validate_tx(tx_bytes, &mut backend, chain_id, block_gas_limit, gas_price)
         };
 
         let encoded = validity.encode();
@@ -280,6 +287,8 @@ mod tests {
             chain_id: 1,
             block_height: 1,
             block_gas_limit: 30_000_000,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
             transactions: alloc::vec![],
         };
         // `apply_block` reads the validator-set key for the canonical

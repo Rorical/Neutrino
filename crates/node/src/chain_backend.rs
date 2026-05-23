@@ -641,17 +641,24 @@ where
             return pool.insert_validated(bytes, |_| false);
         };
 
+        // `gas_price` is hardcoded to 0 in the admission path until
+        // ChainSpec gains a `runtime.gas_price` field. The fee
+        // mechanism is fully wired through the STF; this is purely
+        // the configuration knob.
+        let gas_price: u128 = 0;
+
         // Run admission. Host trap / codec failures degrade to
         // `RejectedByValidator` so a misbehaving runtime never poisons
         // the mempool; the runtime owns the soft-reject codes
         // (BadSignature / NonceMismatch / ...).
-        let validity = match executor.validate_tx(&bytes, chain_id, gas_limit, &state_snapshot) {
-            Ok(v) => v,
-            Err(err) => {
-                debug!(%err, "validate_tx executor trap; rejecting tx");
-                TxValidity::invalid(TxValidationCode::StateReadFailed)
-            }
-        };
+        let validity =
+            match executor.validate_tx(&bytes, chain_id, gas_limit, gas_price, &state_snapshot) {
+                Ok(v) => v,
+                Err(err) => {
+                    debug!(%err, "validate_tx executor trap; rejecting tx");
+                    TxValidity::invalid(TxValidationCode::StateReadFailed)
+                }
+            };
 
         let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
         if validity.is_valid() {

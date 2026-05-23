@@ -286,14 +286,15 @@ impl WasmRuntime {
     /// Run the runtime's `_neutrino_validate_tx` entrypoint against a
     /// read-only view of `live`.
     ///
-    /// The host writes the bound `chain_id` + `block_gas_limit` + raw
-    /// transaction bytes into linear memory, invokes the runtime, and
-    /// decodes the canonical 12-byte [`TxValidity`] result the
-    /// runtime emitted. The scratch trie is discarded after the call
-    /// so admission cannot mutate `live`; the host runs in read-only
-    /// mode and forces `TxValidationCode::Unauthorized`-equivalent
-    /// behavior at the WASM ABI boundary if the runtime attempts a
-    /// write (it should not for a correctly-implemented runtime).
+    /// The host writes the bound `chain_id` + `block_gas_limit` +
+    /// `gas_price` + raw transaction bytes into linear memory, invokes
+    /// the runtime, and decodes the canonical 12-byte [`TxValidity`]
+    /// result the runtime emitted. The scratch trie is discarded
+    /// after the call so admission cannot mutate `live`; the host
+    /// runs in read-only mode and forces
+    /// `TxValidationCode::Unauthorized`-equivalent behavior at the
+    /// WASM ABI boundary if the runtime attempts a write (it should
+    /// not for a correctly-implemented runtime).
     ///
     /// # Errors
     /// Returns [`WasmError`] when linking, instantiation, or trap
@@ -304,6 +305,7 @@ impl WasmRuntime {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
+        gas_price: u128,
         live: &LiveTrie,
     ) -> Result<TxValidity, WasmError> {
         let host = HostState {
@@ -328,17 +330,19 @@ impl WasmRuntime {
             .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
 
         // Canonical admission envelope:
-        //   16B chain_id || 8B block_gas_limit || tx_bytes
+        //   8B chain_id || 8B block_gas_limit || 16B gas_price || tx_bytes
         // The runtime's _neutrino_validate_tx decodes the prefix
-        // before parsing the tx itself. Putting the gas limit on
-        // the wire means a runtime that wraps multiple chain
+        // before parsing the tx itself. Putting the gas limit + price
+        // on the wire means a runtime that wraps multiple chain
         // configurations can pick the right one even when the host
         // does not surface BlockContext.
         let chain_id_bytes = chain_id.to_le_bytes();
         let gas_limit_bytes = block_gas_limit.to_le_bytes();
-        let mut input_bytes = Vec::with_capacity(16 + tx_bytes.len());
+        let gas_price_bytes = gas_price.to_le_bytes();
+        let mut input_bytes = Vec::with_capacity(8 + 8 + 16 + tx_bytes.len());
         input_bytes.extend_from_slice(&chain_id_bytes);
         input_bytes.extend_from_slice(&gas_limit_bytes);
+        input_bytes.extend_from_slice(&gas_price_bytes);
         input_bytes.extend_from_slice(tx_bytes);
 
         let allocate: TypedFunc<u32, u32> = instance

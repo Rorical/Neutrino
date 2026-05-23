@@ -33,7 +33,7 @@ use neutrino_consensus_vrf::{VrfError, total_active_stake};
 use neutrino_primitives::{
     BlockHash, BlsSignature, HEADER_VERSION, Slot, StateRoot, Validator, ZERO_HASH,
 };
-use neutrino_proof_system::{ErasedBlockExecutor, ExecutionOutcome};
+use neutrino_proof_system::{BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome};
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
@@ -231,6 +231,29 @@ impl<DB: Database> Engine<DB> {
         let mut next_state = self.state().clone();
         next_state.drain_pending_nodes();
         next_state.drain_pending_values();
+        // The proposer's runtime account receives any per-tx fees.
+        // We source it from the active validator set rather than from
+        // the chain spec's initial set so on-chain validator changes
+        // (deposits, exits) propagate to fee routing automatically.
+        let proposer_index = cfg.proposer.validator_index();
+        let proposer_position = usize::try_from(proposer_index)
+            .expect("u32 validator index fits usize on supported targets");
+        let proposer_address = self
+            .active_validator_set()
+            .get(proposer_position)
+            .map(|v| v.withdrawal_credentials)
+            .unwrap_or_default();
+        // `gas_price` is hardcoded to 0 in the production path until
+        // ChainSpec gains a `runtime.gas_price` field. The fee
+        // mechanism is fully wired through the STF and proof; this
+        // is purely the configuration knob.
+        let ctx = BlockExecutionContext {
+            chain_id,
+            block_height: height,
+            gas_limit,
+            gas_price: 0,
+            proposer_address,
+        };
         let ExecutionOutcome {
             state_root_after,
             runtime_extra,
@@ -238,7 +261,7 @@ impl<DB: Database> Engine<DB> {
             gas_used,
             witness_bytes,
         } = executor
-            .execute_block(chain_id, &body, height, gas_limit, &mut next_state)
+            .execute_block(&ctx, &body, &mut next_state)
             .map_err(ProductionError::Executor)?;
 
         // Compute body roots from the supplied body. The executor

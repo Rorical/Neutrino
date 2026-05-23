@@ -455,6 +455,8 @@ mod tests {
                 chain_id: 1,
                 block_height: 1,
                 block_gas_limit: 30_000_000,
+                gas_price: 0,
+                proposer_address: [0u8; 32],
                 transactions: Vec::new(),
             },
             &live,

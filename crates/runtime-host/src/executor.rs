@@ -15,7 +15,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::Body;
 use neutrino_default_runtime_core::{StfInput, Transaction};
-use neutrino_proof_system::executor::{BlockExecutor, ExecutionOutcome};
+use neutrino_proof_system::executor::{BlockExecutionContext, BlockExecutor, ExecutionOutcome};
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Blake3Hasher, Trie};
@@ -80,10 +80,8 @@ impl BlockExecutor for WasmExecutor {
 
     fn execute_block(
         &self,
-        chain_id: u64,
+        ctx: &BlockExecutionContext,
         body: &Body,
-        block_height: u64,
-        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         // Decode body.transactions into typed STF transactions.
@@ -99,9 +97,11 @@ impl BlockExecutor for WasmExecutor {
             }
         }
         let input = StfInput {
-            chain_id,
-            block_height,
-            block_gas_limit: gas_limit,
+            chain_id: ctx.chain_id,
+            block_height: ctx.block_height,
+            block_gas_limit: ctx.gas_limit,
+            gas_price: ctx.gas_price,
+            proposer_address: ctx.proposer_address,
             transactions: txs,
         };
 
@@ -156,12 +156,13 @@ impl BlockExecutor for WasmExecutor {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
+        gas_price: u128,
         state: &Trie<Blake3Hasher>,
     ) -> Result<TxValidity, ExecutorError> {
         let live = LiveTrie::from_trie(state.clone());
         Ok(self
             .wasm
-            .validate_tx(tx_bytes, chain_id, block_gas_limit, &live)?)
+            .validate_tx(tx_bytes, chain_id, block_gas_limit, gas_price, &live)?)
     }
 }
 

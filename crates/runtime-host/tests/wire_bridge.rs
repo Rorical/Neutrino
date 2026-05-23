@@ -17,11 +17,21 @@ use neutrino_default_runtime_core::{
     Account, Address, LeakTx, SlashTx, Transaction, VALIDATOR_SET_KEY, Validator, ValidatorSet,
     account_key, decode_validator, encode_account, encode_validator, validator_key,
 };
-use neutrino_proof_system::BlockExecutor;
+use neutrino_proof_system::{BlockExecutionContext, BlockExecutor};
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::WasmExecutor;
 
 const CHAIN_ID: u64 = 0x6157_4153_4D31; // "WASM1"
+
+const fn ctx() -> BlockExecutionContext {
+    BlockExecutionContext {
+        chain_id: CHAIN_ID,
+        block_height: 1,
+        gas_limit: 30_000_000,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
+    }
+}
 
 const fn validator_address(seed: u8) -> Address {
     [seed; 32]
@@ -86,7 +96,7 @@ fn body_transactions_with_borsh_slash_apply_through_wasm_executor() {
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     let outcome = executor
-        .execute_block(CHAIN_ID, &body, 1, 30_000_000, &mut state)
+        .execute_block(&ctx(), &body, &mut state)
         .expect("execute_block succeeds");
 
     // Validator stake is now zero; `active` flipped to false.
@@ -161,7 +171,7 @@ fn body_transactions_with_borsh_inactivity_leak_apply_through_wasm_executor() {
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     let outcome = executor
-        .execute_block(CHAIN_ID, &body, 1, 30_000_000, &mut state)
+        .execute_block(&ctx(), &body, &mut state)
         .expect("execute_block succeeds");
 
     // addr_a lost 2 stake total; addr_b unchanged.
@@ -212,7 +222,7 @@ fn body_transactions_with_unknown_blob_are_silently_dropped() {
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     let _ = executor
-        .execute_block(CHAIN_ID, &body, 1, 30_000_000, &mut state)
+        .execute_block(&ctx(), &body, &mut state)
         .expect("execute_block succeeds");
 
     // Only the real Slash applied; legacy entry was dropped.

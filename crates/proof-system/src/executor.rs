@@ -21,6 +21,29 @@ use neutrino_primitives::{Hash, StateRoot};
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidationCode, TxValidity};
 use neutrino_trie::{Blake3Hasher, Trie};
 
+/// Per-block consensus context passed to [`BlockExecutor::execute_block`].
+///
+/// Bundles the engine-supplied fields the runtime needs to execute
+/// one block correctly: chain identity, header height, gas ceiling,
+/// per-gas fee, and the proposer's runtime account address (fee
+/// recipient). Grouping them keeps the trait signature compact and
+/// stable as more consensus context is added later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockExecutionContext {
+    /// Chain identifier the transactions are bound to.
+    pub chain_id: u64,
+    /// Height of the block being executed (`header.height`).
+    pub block_height: u64,
+    /// Block-level gas ceiling (`header.gas_limit`).
+    pub gas_limit: u64,
+    /// Native-token cost per gas unit. `0` disables fees.
+    pub gas_price: u128,
+    /// Runtime account that receives the block's accumulated fees.
+    /// The engine sources it from
+    /// `active_validator_set[header.proposer_index].withdrawal_credentials`.
+    pub proposer_address: Hash,
+}
+
 /// Outcome of a successful [`BlockExecutor::execute_block`] call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionOutcome {
@@ -68,17 +91,10 @@ pub trait BlockExecutor {
     /// Execute a block body against `state` and return the post-state
     /// commitments + witness bytes.
     ///
-    /// `block_height` is the height of the block being executed
-    /// (`header.height`). The runtime consults it when scheduling
-    /// withdrawal maturity and claiming matured queue entries; the
-    /// SP1 proof's witness blob is bound to the same value.
-    ///
-    /// `gas_limit` is the block-level ceiling the consensus header
-    /// committed to (`header.gas_limit`). The runtime applies
-    /// transactions until the next one would push gas consumption
-    /// past this limit; remaining transactions are counted as
-    /// failed without state mutation. The runtime returns the
-    /// actual gas it consumed inside [`ExecutionOutcome::gas_used`].
+    /// `ctx` carries the engine-supplied consensus context (chain
+    /// id, block height, gas ceiling, per-gas fee, proposer fee
+    /// recipient). See [`BlockExecutionContext`] for the per-field
+    /// meaning and how the engine sources each value.
     ///
     /// # Errors
     ///
@@ -86,10 +102,8 @@ pub trait BlockExecutor {
     /// body cannot be decoded, or the dry-run traps.
     fn execute_block(
         &self,
-        chain_id: u64,
+        ctx: &BlockExecutionContext,
         body: &Body,
-        block_height: u64,
-        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error>;
 
@@ -124,10 +138,16 @@ pub trait BlockExecutor {
     /// describing whether (and why not) the transaction is
     /// admissible, plus a mempool priority for the `Valid` case.
     ///
+    /// `gas_price` is the chain's current per-gas fee (typically
+    /// surfaced through `ChainSpec`); the runtime uses it to extend
+    /// the balance check to `sender.balance >= tx.amount + tx_gas *
+    /// gas_price`. `gas_price = 0` disables fee admission and
+    /// preserves the legacy "amount only" behaviour.
+    ///
     /// Implementations MUST NOT mutate `state` and MUST NOT depend on
     /// non-deterministic inputs: the same `(tx, state, chain_id,
-    /// block_gas_limit)` tuple must always produce the same result so
-    /// peers cannot disagree about admission outcomes.
+    /// block_gas_limit, gas_price)` tuple must always produce the
+    /// same result so peers cannot disagree about admission outcomes.
     ///
     /// # Errors
     /// Returns [`Self::Error`] when the runtime traps or the host
@@ -140,6 +160,7 @@ pub trait BlockExecutor {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
+        gas_price: u128,
         state: &Trie<Blake3Hasher>,
     ) -> Result<TxValidity, Self::Error>;
 }
@@ -162,10 +183,8 @@ pub trait ErasedBlockExecutor: Send + Sync {
     /// human-readable string.
     fn execute_block(
         &self,
-        chain_id: u64,
+        ctx: &BlockExecutionContext,
         body: &Body,
-        block_height: u64,
-        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String>;
 
@@ -190,6 +209,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
+        gas_price: u128,
         state: &Trie<Blake3Hasher>,
     ) -> Result<TxValidity, String>;
 }
@@ -200,14 +220,11 @@ where
 {
     fn execute_block(
         &self,
-        chain_id: u64,
+        ctx: &BlockExecutionContext,
         body: &Body,
-        block_height: u64,
-        gas_limit: u64,
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, String> {
-        BlockExecutor::execute_block(self, chain_id, body, block_height, gas_limit, state)
-            .map_err(|err| err.to_string())
+        BlockExecutor::execute_block(self, ctx, body, state).map_err(|err| err.to_string())
     }
 
     fn query(
@@ -223,9 +240,10 @@ where
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
+        gas_price: u128,
         state: &Trie<Blake3Hasher>,
     ) -> Result<TxValidity, String> {
-        BlockExecutor::validate_tx(self, tx_bytes, chain_id, block_gas_limit, state)
+        BlockExecutor::validate_tx(self, tx_bytes, chain_id, block_gas_limit, gas_price, state)
             .map_err(|err| err.to_string())
     }
 }
@@ -243,10 +261,8 @@ impl BlockExecutor for UnsupportedExecutor {
 
     fn execute_block(
         &self,
-        _chain_id: u64,
+        _ctx: &BlockExecutionContext,
         _body: &Body,
-        _block_height: u64,
-        _gas_limit: u64,
         _state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error> {
         Err(String::from("block executor not configured"))
@@ -265,6 +281,7 @@ impl BlockExecutor for UnsupportedExecutor {
         _tx_bytes: &[u8],
         _chain_id: u64,
         _block_gas_limit: u64,
+        _gas_price: u128,
         _state: &Trie<Blake3Hasher>,
     ) -> Result<TxValidity, Self::Error> {
         // Without an executor the system has no way to interpret the

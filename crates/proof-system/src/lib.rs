@@ -27,7 +27,10 @@ pub mod public_inputs;
 pub mod system;
 
 pub use error::ProofError;
-pub use executor::{BlockExecutor, ErasedBlockExecutor, ExecutionOutcome, UnsupportedExecutor};
+pub use executor::{
+    BlockExecutionContext, BlockExecutor, ErasedBlockExecutor, ExecutionOutcome,
+    UnsupportedExecutor,
+};
 pub use mock::{
     MOCK_BLOCK_DOMAIN, MOCK_CHUNK_DOMAIN, MOCK_RECURSIVE_DOMAIN, MockBlockProof, MockChunkProof,
     MockProofSystem, MockRecursiveProof,

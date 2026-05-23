@@ -99,6 +99,8 @@ fn stake_pipeline_prove_verify_mock() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
         transactions: vec![Transaction::Stake(signed_stake(&alice, 60, 0))],
     };
     let dry = dry_run(&input, &live);
@@ -130,6 +132,8 @@ fn slash_pipeline_prove_verify_mock() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
         transactions: vec![Transaction::Slash(SlashTx {
             validator: addr,
             amount: 25,
@@ -164,6 +168,8 @@ fn inactivity_leak_pipeline_prove_verify_mock() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
         transactions: vec![Transaction::InactivityLeak(LeakTx {
             validator: addr,
             amount: 15,
@@ -197,6 +203,8 @@ fn stake_then_unstake_round_trip() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
         transactions: vec![
             Transaction::Stake(signed_stake(&alice, 40, 0)),
             Transaction::Unstake(signed_unstake(&alice, 40, 1)),

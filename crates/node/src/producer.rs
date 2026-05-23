@@ -227,6 +227,18 @@ async fn close_due_chunks(
             end_height = finalize_outcome.chunk.end_height,
             "closed chunk"
         );
+        // Pending-fix #1: bridge runtime stake mutations into the
+        // consensus active validator set so the next chunk's
+        // VRF eligibility + BFT quorum weighting observe the
+        // post-chunk distribution.
+        if let Err(err) = backend.rotate_active_validator_set_for_chunk(next_chunk_id) {
+            warn!(
+                slot,
+                chunk_id = next_chunk_id,
+                error = %err,
+                "active-set rotation failed",
+            );
+        }
     }
 }
 

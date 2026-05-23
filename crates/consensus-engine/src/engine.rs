@@ -454,6 +454,41 @@ impl<DB: Database> Engine<DB> {
         self.state = reconstructed;
     }
 
+    /// Replace the in-memory active validator set with `new_set` and
+    /// persist a snapshot indexed at `effective_at`.
+    ///
+    /// Called by the chain backend at chunk-close to bridge runtime
+    /// stake mutations into consensus proposer eligibility / BFT
+    /// quorum weighting. `effective_at` is the chunk index at which
+    /// the new set begins driving consensus (typically
+    /// `latest_finalized_chunk_id + 1`).
+    ///
+    /// The transition is monotonic per `effective_at`: re-calling
+    /// with a stale (smaller) index is a no-op so a duplicate finalize
+    /// signal cannot rewind the active set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Store`] when the snapshot fails to persist.
+    pub fn set_active_validator_set(
+        &mut self,
+        effective_at: CheckpointIndex,
+        new_set: Vec<Validator>,
+    ) -> Result<(), EngineError<DB::Error>> {
+        // Reject backwards transitions so a late-arriving finalize
+        // signal cannot un-rotate the set.
+        if let Some(latest) = self.store.get_latest_validator_set_index()? {
+            if effective_at <= latest {
+                return Ok(());
+            }
+        }
+        self.store
+            .put_validator_set_snapshot(effective_at, &new_set)?;
+        self.store.put_latest_validator_set_index(effective_at)?;
+        self.active_validator_set = new_set;
+        Ok(())
+    }
+
     /// Advance the in-memory head pointers after a block has been
     /// produced and persisted. Crate-internal — block production is
     /// the only legitimate caller.

@@ -45,7 +45,9 @@ use neutrino_consensus_types::{
     Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
     SlashingEvidence,
 };
-use neutrino_default_runtime_core::{LeakTx, SlashTx, Transaction as RuntimeTransaction};
+use neutrino_default_runtime_core::{
+    LeakTx, QUERY_METHOD_VALIDATOR_SET, SlashTx, Transaction as RuntimeTransaction, ValidatorSet,
+};
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
 use neutrino_network::rpc::{
@@ -609,6 +611,104 @@ where
         }
     }
 
+    /// Pending-fix #1: rebuild the engine's active validator set from
+    /// the runtime's post-chunk stake distribution and persist the
+    /// snapshot effective at `chunk_id + 1`.
+    ///
+    /// Joins the runtime's `ValidatorSet` (queried via the installed
+    /// executor's `validator_set` method) into the existing consensus
+    /// active set by matching
+    /// `runtime_entry.address == consensus_validator.withdrawal_credentials`.
+    /// The runtime's `stake` (a `u128`) is copied into
+    /// `Validator.effective_stake` (a `u64`, saturated at `u64::MAX`).
+    /// Validators absent from the runtime's set keep their previous
+    /// `effective_stake` — chain-spec validators that have never been
+    /// staked through the runtime remain at their genesis weight.
+    ///
+    /// New validators present only in the runtime (no matching
+    /// withdrawal-credential in the consensus set) are silently
+    /// ignored: registering a fresh consensus identity requires a
+    /// `Transaction::RegisterValidator` that carries the BLS pubkey,
+    /// which is pending-fix #8. The chain-spec initial validator
+    /// registry remains authoritative for who can propose / vote.
+    ///
+    /// Returns silently when the local node has no executor installed
+    /// (test backends that exercise gossip without a runtime).
+    ///
+    /// # Errors
+    ///
+    /// Surfaces store / query failures as descriptive strings so the
+    /// caller can log them without re-deriving the error type.
+    pub fn rotate_active_validator_set_for_chunk(&self, chunk_id: ChunkId) -> Result<(), String> {
+        let Some(executor) = self.block_executor_snapshot() else {
+            // No runtime attached (e.g. gossip-only test backend).
+            // The active set stays at its previous value.
+            return Ok(());
+        };
+
+        // Capture the live trie + existing active set under one
+        // engine-mutex acquisition so the query observes a consistent
+        // post-finalize-chunk snapshot.
+        let (state_snapshot, existing_active) =
+            self.with_engine(|e| (e.state().clone(), e.active_validator_set().to_vec()));
+
+        let request = neutrino_runtime_abi::QueryRequest {
+            method: QUERY_METHOD_VALIDATOR_SET.to_string(),
+            args: Vec::new(),
+        };
+        let response = executor
+            .query(&request, &state_snapshot)
+            .map_err(|err| format!("runtime validator_set query failed: {err}"))?;
+        if response.code != neutrino_runtime_abi::QueryStatus::Ok.as_u32() {
+            return Err(format!(
+                "runtime validator_set query returned status {}",
+                response.code
+            ));
+        }
+        let runtime_set: ValidatorSet = borsh::from_slice(&response.payload)
+            .map_err(|err| format!("runtime validator_set borsh decode failed: {err}"))?;
+
+        // Join runtime stake onto existing consensus entries.
+        // Validators absent from the runtime keep their previous
+        // weight; this avoids accidentally zeroing chain-spec
+        // validators who never interacted with the runtime.
+        let new_active: Vec<Validator> = existing_active
+            .iter()
+            .map(|validator| {
+                let runtime_stake = runtime_set
+                    .entries
+                    .iter()
+                    .find(|entry| entry.address == validator.withdrawal_credentials)
+                    .map(|entry| u64::try_from(entry.stake).unwrap_or(u64::MAX));
+                Validator {
+                    pubkey: validator.pubkey,
+                    withdrawal_credentials: validator.withdrawal_credentials,
+                    effective_stake: runtime_stake.unwrap_or(validator.effective_stake),
+                    slashed: validator.slashed,
+                    activation_epoch: validator.activation_epoch,
+                    exit_epoch: validator.exit_epoch,
+                    last_active_chunk: chunk_id.saturating_add(1),
+                }
+            })
+            .collect();
+
+        // No-op if the new set is byte-identical to the previous one
+        // (steady-state common case: chunk had no runtime stake
+        // mutations). Saves a snapshot write per chunk.
+        if new_active == existing_active {
+            return Ok(());
+        }
+
+        let effective_at = chunk_id.saturating_add(1);
+        self.with_engine_mut(|e| e.set_active_validator_set(effective_at, new_active))
+            .map_err(|err| format!("set_active_validator_set failed: {err}"))?;
+        trace!(
+            chunk_id,
+            effective_at, "rotated consensus active validator set"
+        );
+        Ok(())
+    }
+
     /// Submit a peer-supplied transaction into the local mempool.
     ///
     /// Runs the installed dynamic-runtime executor's
@@ -1002,15 +1102,15 @@ where
         }
     }
 
-    /// Drive [`Engine::finalize_chunk`] now that the BFT session for
-    /// `chunk_id` has reached its 2/3 precommit quorum, persist the
     /// Drive the engine through chunk finalization once the BFT loop
     /// reports a 2/3 precommit quorum. The chunk proof aggregation and
     /// recursive checkpoint paths are explicitly deferred by the SP1
     /// rewrite (see `docs/design/13-sp1-runtime-proof-rewrite.md`), so
     /// this handler no longer produces or gossips those artifacts; it
-    /// just transitions the chunk's blocks to `BlockState::Finalized`
-    /// and pools any inactivity-leak transactions.
+    /// transitions the chunk's blocks to `BlockState::Finalized`,
+    /// pools any inactivity-leak transactions, and (per pending-fix
+    /// #1) rotates the consensus active validator set against the
+    /// runtime's post-chunk stake distribution.
     #[allow(clippy::unused_async)] // Trait contract preserves async signature for future host I/O.
     async fn handle_quorum_reached(&self, chunk_id: ChunkId) {
         let Some(voter) = self.local_voter() else {
@@ -1031,6 +1131,15 @@ where
         // against multi-producer double-application across the
         // network.
         self.pool_inactivity_leak_for(chunk_id);
+
+        // Pending-fix #1: cross-layer validator-set rotation. After
+        // chunk K finalises, the runtime's stake mutations through
+        // the chunk's transactions are committed; query the runtime
+        // for the post-chunk validator set and update the consensus
+        // active set effective at chunk K+1.
+        if let Err(err) = self.rotate_active_validator_set_for_chunk(chunk_id) {
+            warn!(chunk_id, error = %err, "active-set rotation failed");
+        }
     }
 
     fn map_store_err<E: core::fmt::Display>(err: E) -> SyncBackendError {

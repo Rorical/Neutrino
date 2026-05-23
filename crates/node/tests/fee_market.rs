@@ -136,6 +136,7 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         light_client: LightClientParams::default(),
         runtime: RuntimeParams {
             gas_price: GAS_PRICE,
+            ..RuntimeParams::default()
         },
         initial_validators: validators(),
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),

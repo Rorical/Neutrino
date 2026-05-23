@@ -24,6 +24,63 @@ pub mod wasm;
 pub use executor::{ExecutorError, WasmExecutor, decode_witness_bundle};
 pub use proof_system::{Sp1BlockProof, Sp1ProofSystem};
 
+/// BLAKE3 hash of the embedded default-runtime master WASM cdylib.
+///
+/// This is the value a chain spec's `runtime_code_hash` must match
+/// for a node compiled with this binary to accept the spec. The hash
+/// covers the WASM cdylib (the runtime the WASM full-node path
+/// executes), not the SP1 Guest ELF — the two come from the same
+/// source tree but go through different toolchains, and the chain's
+/// identity is the value users see at RPC time.
+///
+/// Use [`expect_runtime_code_hash`] for the matching consistency
+/// check at node startup.
+#[must_use]
+pub fn default_runtime_code_hash() -> [u8; 32] {
+    neutrino_primitives::blake3_256(wasm::DEFAULT_MASTER_WASM)
+}
+
+/// BLAKE3 hash of the embedded default-runtime SP1 Guest ELF.
+///
+/// Exposed alongside [`default_runtime_code_hash`] for observability
+/// (`system_version` RPC, log lines, debugging tooling). The Guest
+/// ELF's identity is captured separately by the SP1 verifying-key
+/// cache, so this is informational.
+#[must_use]
+pub fn default_guest_elf_hash() -> [u8; 32] {
+    neutrino_primitives::blake3_256(&DEFAULT_GUEST_ELF)
+}
+
+/// Validate a chain-spec `runtime_code_hash` against the embedded
+/// master cdylib.
+///
+/// Returns `Ok(())` when:
+/// - `chain_spec_hash == ZERO_HASH` (placeholder, opt-out for tests
+///   and pre-v1 bring-up), or
+/// - `chain_spec_hash == default_runtime_code_hash()`.
+///
+/// Returns `Err((expected, actual))` otherwise, with `expected` the
+/// chain-spec-declared value and `actual` the embedded ELF's hash.
+///
+/// # Errors
+///
+/// Returns `Err` when the chain spec advertises a non-zero
+/// `runtime_code_hash` that does not match the embedded master
+/// cdylib. The node binary must refuse to start in that case so a
+/// silent runtime-vs-spec mismatch cannot quietly produce a divergent
+/// chain.
+pub fn expect_runtime_code_hash(chain_spec_hash: [u8; 32]) -> Result<(), ([u8; 32], [u8; 32])> {
+    if chain_spec_hash == neutrino_primitives::ZERO_HASH {
+        return Ok(());
+    }
+    let actual = default_runtime_code_hash();
+    if chain_spec_hash == actual {
+        Ok(())
+    } else {
+        Err((chain_spec_hash, actual))
+    }
+}
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

@@ -124,6 +124,20 @@ pub struct ChainSpecFile {
     /// market entirely.
     #[serde(default)]
     pub gas_price: Option<u128>,
+    /// Optional override for [`RuntimeParams::unbonding_delay_blocks`].
+    /// Defaults to `32` (the runtime's `UNBONDING_DELAY_BLOCKS`
+    /// placeholder); production chains typically configure much
+    /// longer delays.
+    #[serde(default)]
+    pub unbonding_delay_blocks: Option<u64>,
+    /// Optional override for [`RuntimeParams::slash_amount`]. Defaults
+    /// to `u128::MAX` (burn whatever stake remains on equivocation).
+    #[serde(default)]
+    pub slash_amount: Option<u128>,
+    /// Optional override for [`RuntimeParams::inactivity_leak_amount`].
+    /// Defaults to `1` per missed precommit.
+    #[serde(default)]
+    pub inactivity_leak_amount: Option<u128>,
     /// Optional free-form metadata (≤ 256 bytes).
     #[serde(default)]
     pub metadata: Option<String>,
@@ -162,6 +176,7 @@ impl ChainSpecFile {
     ///
     /// Returns [`ChainSpecError`] when any hex field is invalid or the
     /// resulting spec fails canonical validation.
+    #[allow(clippy::too_many_lines)]
     pub fn to_chain_spec(&self) -> Result<ChainSpec, ChainSpecError> {
         let name_bytes = self.name.as_bytes().to_vec();
         let name = BoundedBytes::new(name_bytes)
@@ -224,6 +239,15 @@ impl ChainSpecFile {
         }
         if let Some(gas_price) = self.gas_price {
             runtime.gas_price = gas_price;
+        }
+        if let Some(unbonding) = self.unbonding_delay_blocks {
+            runtime.unbonding_delay_blocks = unbonding;
+        }
+        if let Some(slash) = self.slash_amount {
+            runtime.slash_amount = slash;
+        }
+        if let Some(leak) = self.inactivity_leak_amount {
+            runtime.inactivity_leak_amount = leak;
         }
 
         let genesis_validator_set_root =

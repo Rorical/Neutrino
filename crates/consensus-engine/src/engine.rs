@@ -4,7 +4,7 @@
 //! bootstrap (this file) and per-slot block production (later phases
 //! reuse this struct via additional `impl` blocks).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 
 use neutrino_consensus_types::{
     FinalityVote, FinalityVotePhase, Header, SlashingEvidence, VrfRejectionReason,
@@ -56,20 +56,22 @@ pub struct Engine<DB: Database> {
     /// Equivocation detector for the M7-B slashing pipeline. See
     /// [`crate::slashing`].
     pub(crate) slashing_monitor: SlashingMonitor,
-    /// In-memory cache of block proofs that the local
-    /// `Sp1ProofSystem::verify_block` (or matching backend) rejected
-    /// at gossip-import time. Used by the [`SlashingEvidence::
-    /// InvalidProofSigning`] detector: when a peer precommit arrives
-    /// for a chunk whose blocks have rejected proofs in the cache,
-    /// the engine synthesises evidence carrying the rejected
-    /// `BlockProof` so any replayer can independently re-verify the
-    /// rejection.
+    /// In-memory cache of rejected block proofs.
     ///
-    /// The cache is non-persistent and bounded by the lookups it
-    /// services — entries age out as the underlying block FSM
-    /// advances past `BlockProduced` (which can only happen via a
-    /// honest import_block_proof on the same hash, so a stale entry
-    /// can be dropped on demand).
+    /// Populated by the local
+    /// [`Sp1ProofSystem::verify_block`](crate::Engine::import_block_proof)
+    /// (or matching backend) at gossip-import time. Used by the
+    /// [`SlashingEvidence::InvalidProofSigning`] detector: when a
+    /// peer precommit arrives for a chunk whose blocks have rejected
+    /// proofs in the cache, the engine synthesises evidence carrying
+    /// the rejected `BlockProof` so any replayer can independently
+    /// re-verify the rejection.
+    ///
+    /// Bounded by [`MAX_REJECTED_PROOFS_CACHED`]: once the map is
+    /// full, the oldest insertion is evicted to make room. Honest
+    /// `import_block_proof` on the same block hash also clears its
+    /// entry (a peer's earlier corrupted gossip should not slash
+    /// any future signer once an honest proof lands).
     pub(crate) rejected_proofs: BTreeMap<
         BlockHash,
         (
@@ -77,7 +79,20 @@ pub struct Engine<DB: Database> {
             neutrino_consensus_types::ProofRejectionReason,
         ),
     >,
+    /// FIFO companion to `rejected_proofs`. Carries the BlockHash of
+    /// each cached entry in insertion order so the cache evicts the
+    /// oldest entry when it fills up. Strictly bounded by
+    /// [`MAX_REJECTED_PROOFS_CACHED`].
+    pub(crate) rejected_proofs_order: VecDeque<BlockHash>,
 }
+
+/// Maximum cached rejected `BlockProof` envelopes.
+///
+/// The cache lives on [`Engine::rejected_proofs`]. Sized to
+/// comfortably cover the `InvalidProofSigning` detector's lookup
+/// window (a few chunks of blocks each); older entries get evicted
+/// FIFO.
+pub const MAX_REJECTED_PROOFS_CACHED: usize = 512;
 
 impl<DB: Database> Engine<DB> {
     /// Initialise a brand new engine on an empty `db`.
@@ -131,6 +146,7 @@ impl<DB: Database> Engine<DB> {
             local_voter: None,
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
+            rejected_proofs_order: VecDeque::new(),
         })
     }
 
@@ -231,7 +247,73 @@ impl<DB: Database> Engine<DB> {
             local_voter: None,
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
+            rejected_proofs_order: VecDeque::new(),
         })
+    }
+
+    /// Insert a rejected `BlockProof` into the bounded cache.
+    ///
+    /// Honest re-import of the same block hash clears its entry via
+    /// [`Self::clear_rejected_proof`]; otherwise the cache is FIFO
+    /// and bounded at [`MAX_REJECTED_PROOFS_CACHED`] entries so a
+    /// long-running node never grows the cache unboundedly.
+    pub(crate) fn record_rejected_proof(
+        &mut self,
+        block_hash: BlockHash,
+        proof: neutrino_consensus_types::BlockProof,
+        reason: neutrino_consensus_types::ProofRejectionReason,
+    ) {
+        use alloc::collections::btree_map::Entry;
+        // Eviction step first: drop the oldest cached entry until
+        // there's headroom for the new insertion (or the FIFO is
+        // already empty). The bound applies to both the map and the
+        // FIFO companion.
+        while self.rejected_proofs_order.len() >= MAX_REJECTED_PROOFS_CACHED
+            && !self.rejected_proofs.contains_key(&block_hash)
+        {
+            if let Some(oldest) = self.rejected_proofs_order.pop_front() {
+                let _ = self.rejected_proofs.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        // Same block hash arrived again: refresh the entry in place
+        // but keep the FIFO position so a flood of duplicates cannot
+        // starve genuine newcomers out of the cache.
+        match self.rejected_proofs.entry(block_hash) {
+            Entry::Occupied(mut existing) => {
+                existing.insert((proof, reason));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert((proof, reason));
+                self.rejected_proofs_order.push_back(block_hash);
+            }
+        }
+    }
+
+    /// Clear a previously-cached rejected `BlockProof` (called when
+    /// the same block hash subsequently imports cleanly).
+    pub(crate) fn clear_rejected_proof(&mut self, block_hash: &BlockHash) {
+        if self.rejected_proofs.remove(block_hash).is_some() {
+            // Removing from VecDeque is O(n) but the queue is bounded
+            // at MAX_REJECTED_PROOFS_CACHED so the constant is small.
+            if let Some(idx) = self
+                .rejected_proofs_order
+                .iter()
+                .position(|h| h == block_hash)
+            {
+                self.rejected_proofs_order.remove(idx);
+            }
+        }
+    }
+
+    /// Number of rejected `BlockProof` envelopes currently cached.
+    /// Exposed for tests; never panics, never depends on the cache's
+    /// FIFO order.
+    #[must_use]
+    pub fn rejected_proof_cache_len(&self) -> usize {
+        debug_assert_eq!(self.rejected_proofs.len(), self.rejected_proofs_order.len());
+        self.rejected_proofs.len()
     }
 
     /// Persist trie nodes and state values produced since the previous
@@ -568,6 +650,74 @@ impl<DB: Database> Engine<DB> {
     pub fn subnet_for_chunk(&self, chunk_id: ChunkId) -> u8 {
         let subnets = u64::from(self.chain_spec.consensus.vote_subnets.max(1));
         u8::try_from(chunk_id % subnets).expect("modulo by u16 fits u8")
+    }
+
+    /// Per-validator subnet membership for `chunk_id`.
+    ///
+    /// Returns the subnet indices a validator at `validator_index`
+    /// listens on for partial-vote aggregation when participating in
+    /// chunk-BFT for `chunk_id`. The mapping is deterministic across
+    /// the network (it consults only chain-spec constants plus the
+    /// finalized seed) so every other node derives the same answer.
+    ///
+    /// `subnets_per_validator` comes from
+    /// `chain_spec.consensus.validator_subnets_per_chunk`; the
+    /// returned indices are sorted ascending and free of duplicates.
+    /// Doc 06 §"Vote subnet membership" specifies that each validator
+    /// monitors a configurable handful of subnets so a peer never
+    /// needs to subscribe to every subnet of every chunk just to
+    /// observe its own quorum.
+    ///
+    /// The function is `O(subnets_per_validator)` and allocates a
+    /// small `Vec`; callers should cache results per `chunk_id` when
+    /// they iterate over many validators.
+    #[must_use]
+    pub fn subnets_for_validator(
+        &self,
+        validator_index: neutrino_primitives::ValidatorIndex,
+        chunk_id: ChunkId,
+    ) -> alloc::vec::Vec<u8> {
+        let total_subnets = u64::from(self.chain_spec.consensus.vote_subnets.max(1));
+        let per_validator = u64::from(self.chain_spec.consensus.validator_subnets_per_chunk.max(1));
+        // `per_validator` and `total_subnets` are derived from u16
+        // chain-spec fields so the saturating cast to usize is
+        // exact on every supported platform.
+        let take =
+            usize::try_from(per_validator.min(total_subnets)).expect("u16 product fits usize");
+
+        // Hash (domain || chunk_id || validator_index || finalized_seed)
+        // so every node derives the same mapping but the choice
+        // rotates each chunk and per validator. Aggregator load is
+        // spread across the validator set rather than pinned to a
+        // few unlucky operators.
+        let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(16 + 8 + 4 + 32);
+        bytes.extend_from_slice(b"NTRO/vsubnet\x00\x00\x00\x00");
+        bytes.extend_from_slice(&chunk_id.to_le_bytes());
+        bytes.extend_from_slice(&validator_index.to_le_bytes());
+        bytes.extend_from_slice(&self.finalized_seed());
+        let digest = neutrino_primitives::blake3_256(&bytes);
+
+        // Walk the digest in u32 strides, mapping each into a subnet
+        // index, and accumulate the first `take` *distinct* values.
+        // 32 bytes ÷ 4 bytes/step = 8 candidates; for the canonical
+        // `validator_subnets_per_chunk = 2` that is far more than
+        // needed even when collisions force us to skip a step.
+        let mut out = alloc::vec::Vec::with_capacity(take);
+        for stride in 0..8usize {
+            if out.len() == take {
+                break;
+            }
+            let lo = stride * 4;
+            let raw =
+                u32::from_le_bytes([digest[lo], digest[lo + 1], digest[lo + 2], digest[lo + 3]]);
+            let candidate = u64::from(raw) % total_subnets;
+            let subnet = u8::try_from(candidate).expect("modulo by u16 fits u8");
+            if !out.contains(&subnet) {
+                out.push(subnet);
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Whether the local validator is part of the VRF-elected

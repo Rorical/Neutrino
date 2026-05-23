@@ -57,28 +57,109 @@ use crate::signature::{SignatureError, verify_header_signature};
 
 extern crate alloc;
 
-/// Indices of headers and votes already observed by this node,
-/// keyed for fast equivocation lookup.
+/// Default retention window for [`SlashingMonitor`].
 ///
-/// Memory is currently unbounded: M7-B retains every observed
-/// header and single-signer vote in-process. Bounded retention by
-/// recent slot or chunk-id window lands in M7-D alongside the
-/// runtime application path, where the monitor needs to coexist
-/// with on-disk evidence history.
-#[derive(Debug, Default)]
+/// Sized as a few epochs' worth of slots / chunks so cross-epoch
+/// equivocations (the only ones a finality detector can act on)
+/// remain caught while older entries get garbage-collected to bound
+/// memory on long-running nodes.
+pub const DEFAULT_SLASHING_RETENTION_WINDOW: u64 = 4096;
+
+/// Indices of headers and votes already observed by this node.
+///
+/// Keyed for fast equivocation lookup. Memory is bounded by the
+/// monitor's retention window: the monitor garbage-collects header
+/// / vote entries older than the current high-water-mark minus the
+/// window. Cross-epoch equivocations are still caught because the
+/// window covers the chain's typical finality horizon (a few epochs);
+/// equivocations older than the window are unactionable for live
+/// slashing anyway because the offender's stake either rotated out of
+/// the active set or already finalized through chunk BFT.
+#[derive(Debug)]
 pub struct SlashingMonitor {
     /// `(proposer_index, slot) → header` previously accepted.
     seen_headers: BTreeMap<(ValidatorIndex, Slot), Header>,
     /// `(validator_index, chunk_id, round, phase) → vote` previously
     /// accepted from a single-signer aggregation bit set.
     seen_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedVote>,
+    /// Largest slot value observed by `record_header`. Drives the
+    /// header retention sliding window.
+    high_water_slot: Slot,
+    /// Largest chunk id observed by `record_vote`. Drives the vote
+    /// retention sliding window.
+    high_water_chunk: ChunkId,
+    /// Number of slots / chunk-ids the monitor retains entries for.
+    retention_window: u64,
+}
+
+impl Default for SlashingMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SlashingMonitor {
-    /// Create an empty monitor.
+    /// Create an empty monitor using [`DEFAULT_SLASHING_RETENTION_WINDOW`].
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self::with_retention_window(DEFAULT_SLASHING_RETENTION_WINDOW)
+    }
+
+    /// Create an empty monitor with a custom retention window in
+    /// slots / chunk-ids. `0` keeps every entry (the legacy
+    /// unbounded behaviour); production deployments should leave it
+    /// at the default.
+    #[must_use]
+    pub const fn with_retention_window(retention_window: u64) -> Self {
+        Self {
+            seen_headers: BTreeMap::new(),
+            seen_votes: BTreeMap::new(),
+            high_water_slot: 0,
+            high_water_chunk: 0,
+            retention_window,
+        }
+    }
+
+    /// Number of header entries currently retained. Exposed for
+    /// tests; production code should not depend on this.
+    #[must_use]
+    pub fn header_entry_count(&self) -> usize {
+        self.seen_headers.len()
+    }
+
+    /// Number of vote entries currently retained. Exposed for
+    /// tests; production code should not depend on this.
+    #[must_use]
+    pub fn vote_entry_count(&self) -> usize {
+        self.seen_votes.len()
+    }
+
+    /// Garbage-collect header entries whose `slot` is older than
+    /// `high_water_slot - retention_window`. Called after every
+    /// successful `record_header` insertion so the working set
+    /// stays bounded.
+    fn prune_headers(&mut self) {
+        if self.retention_window == 0 {
+            return;
+        }
+        let Some(cutoff) = self.high_water_slot.checked_sub(self.retention_window) else {
+            return;
+        };
+        self.seen_headers.retain(|(_, slot), _| *slot >= cutoff);
+    }
+
+    /// Garbage-collect vote entries whose `chunk_id` is older than
+    /// `high_water_chunk - retention_window`. Called after every
+    /// successful `record_vote` insertion.
+    fn prune_votes(&mut self) {
+        if self.retention_window == 0 {
+            return;
+        }
+        let Some(cutoff) = self.high_water_chunk.checked_sub(self.retention_window) else {
+            return;
+        };
+        self.seen_votes
+            .retain(|(_, chunk_id, _, _), _| *chunk_id >= cutoff);
     }
 
     /// Record a signed header. If the same proposer has previously
@@ -92,7 +173,10 @@ impl SlashingMonitor {
     /// this automatically.
     pub fn record_header(&mut self, header: &Header) -> Option<SlashingEvidence> {
         let key = (header.proposer_index, header.slot);
-        match self.seen_headers.get(&key) {
+        if header.slot > self.high_water_slot {
+            self.high_water_slot = header.slot;
+        }
+        let evidence = match self.seen_headers.get(&key) {
             Some(existing) if existing.hash() != header.hash() => {
                 Some(SlashingEvidence::DoubleProposal {
                     proposer_index: header.proposer_index,
@@ -105,7 +189,9 @@ impl SlashingMonitor {
                 self.seen_headers.insert(key, header.clone());
                 None
             }
-        }
+        };
+        self.prune_headers();
+        evidence
     }
 
     /// Record a single-signer indexed vote.
@@ -134,6 +220,9 @@ impl SlashingMonitor {
             vote.data.round,
             vote.data.phase,
         );
+        if vote.data.chunk_id > self.high_water_chunk {
+            self.high_water_chunk = vote.data.chunk_id;
+        }
         if let Some(existing) = self.seen_votes.get(&key) {
             if existing.data.chunk_hash != vote.data.chunk_hash {
                 let evidence = match vote.data.phase {
@@ -148,11 +237,14 @@ impl SlashingMonitor {
                         vote_b: vote.clone(),
                     },
                 };
+                self.prune_votes();
                 return Some(evidence);
             }
+            self.prune_votes();
             return None;
         }
         self.seen_votes.insert(key, vote.clone());
+        self.prune_votes();
 
         None
     }

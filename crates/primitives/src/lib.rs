@@ -586,18 +586,43 @@ impl Default for LightClientParams {
     }
 }
 
+/// Default unbonding delay used when a chain spec does not override
+/// `runtime.unbonding_delay_blocks`. Matches the default-runtime's
+/// historical `UNBONDING_DELAY_BLOCKS` constant of 32.
+pub const DEFAULT_UNBONDING_DELAY_BLOCKS: u64 = 32;
+
+/// Default per-occurrence consensus-slash amount.
+///
+/// `u128::MAX` instructs the runtime to clamp to the validator's
+/// current stake, effectively burning the entire bond for any
+/// objectively-attributable equivocation. Real chains override this
+/// through `chain_spec.runtime.slash_amount` to publish graduated
+/// penalties.
+pub const DEFAULT_SLASH_AMOUNT: u128 = u128::MAX;
+
+/// Default per-missed-precommit inactivity-leak amount.
+///
+/// Set to `1` so a reasonable absolute-tiny default does not
+/// accidentally burn a fresh validator's whole stake; production
+/// chains pick a value calibrated to their stake unit.
+pub const DEFAULT_INACTIVITY_LEAK_AMOUNT: u128 = 1;
+
 /// Runtime-execution constants covered by the chain-spec hash.
 ///
-/// Captures the chain's fee-market knobs. Today the only knob is
-/// `gas_price` (flat per-gas cost in the native token); future
-/// extensions (`base_fee` + `priority_tip`, burn split, etc.) will
-/// append fields to this struct.
+/// Captures the chain's fee-market and consensus-economics knobs.
+/// Adding new fields is non-breaking on the wire format because
+/// borsh deserialization is positional and new entries must append.
+/// `Default` returns the canonical no-fee, full-stake-slash, 32-block
+/// unbonding configuration that preserves legacy behavior. Real
+/// chains override individual fields through `chain-spec.toml`:
 ///
-/// `Default` returns the canonical no-fee configuration
-/// (`gas_price = 0`) which preserves the legacy pre-fee-market
-/// behavior. Real chains override this through their chain-spec
-/// TOML (`gas_price = "<n>"` in the top-level table).
-#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+/// ```toml
+/// gas_price = "3"
+/// unbonding_delay_blocks = 2048
+/// slash_amount = "1000000000000000000000"
+/// inactivity_leak_amount = "1000000000"
+/// ```
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RuntimeParams {
     /// Native-token cost per gas unit. `0` disables fees entirely
     /// (the canonical pre-fee-market configuration). The runtime
@@ -605,6 +630,35 @@ pub struct RuntimeParams {
     /// transaction's sender and credits the accumulated sum to the
     /// block proposer's runtime account.
     pub gas_price: u128,
+    /// Number of blocks an unstaked / exited amount waits in the
+    /// per-validator withdrawal queue before becoming claimable by
+    /// a [`Transaction::Withdraw`]. Surfaced through
+    /// `StfInput.block_height` and the queue's `mature_at_height`
+    /// arithmetic.
+    pub unbonding_delay_blocks: u64,
+    /// Per-occurrence stake deduction applied by a consensus-driven
+    /// `Transaction::Slash`. Clamped by the runtime to the offender's
+    /// current stake. `u128::MAX` means "burn whatever remains".
+    pub slash_amount: u128,
+    /// Per-missed-precommit stake deduction applied by a consensus-
+    /// driven `Transaction::InactivityLeak`. Also clamped to current
+    /// stake.
+    pub inactivity_leak_amount: u128,
+}
+
+impl Default for RuntimeParams {
+    fn default() -> Self {
+        // Mirrors the legacy hard-coded constants in
+        // `crates/node/src/chain_backend.rs` so chains that omit a
+        // `runtime` block from their chain-spec keep the pre-existing
+        // behavior.
+        Self {
+            gas_price: 0,
+            unbonding_delay_blocks: DEFAULT_UNBONDING_DELAY_BLOCKS,
+            slash_amount: DEFAULT_SLASH_AMOUNT,
+            inactivity_leak_amount: DEFAULT_INACTIVITY_LEAK_AMOUNT,
+        }
+    }
 }
 
 /// Recursive-checkpoint public inputs stored at genesis and after finalized chunks.

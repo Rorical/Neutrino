@@ -132,7 +132,7 @@ fn signed_block(slot: u64, parent: BlockHash, height: Height, signer: &ProposerK
         receipts_root: ZERO_HASH,
         gas_used: 0,
         gas_limit: 1_000_000,
-        timestamp: slot * 4,
+        timestamp: 1_700_000_000 + slot * 4,
         signature: [0; 96],
     };
     let header_hash = header.hash();
@@ -143,6 +143,12 @@ fn signed_block(slot: u64, parent: BlockHash, height: Height, signer: &ProposerK
 /// Construct a wire `BlockProof` whose inner `MockBlockProof` carries
 /// a deliberately-wrong commitment so `MockProofSystem::verify_block`
 /// rejects with `PublicInputMismatch`.
+///
+/// `proposer_address` must match `chain_spec.initial_validators[0].withdrawal_credentials`
+/// (`[0x44; 32]` per the test's `validators()` helper) so the
+/// engine's `block_proof_public_inputs` cross-check at
+/// `Engine::import_block_proof` accepts the envelope and only the
+/// inner backend proof bytes get rejected.
 fn bad_mock_proof(block: &Block) -> BlockProof {
     let public_inputs = BlockProofPublicInputs {
         chain_id: TEST_CHAIN_ID,
@@ -159,7 +165,7 @@ fn bad_mock_proof(block: &Block) -> BlockProof {
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
         gas_price: 0,
-        proposer_address: [0u8; 32],
+        proposer_address: [0x44; 32],
     };
     // Commitment doesn't match what MockProofSystem would compute,
     // so verify_block fails with PublicInputMismatch.
@@ -195,7 +201,7 @@ fn good_mock_proof(block: &Block) -> BlockProof {
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
         gas_price: 0,
-        proposer_address: [0u8; 32],
+        proposer_address: [0x44; 32],
     };
     let mock_proof = MockProofSystem::new()
         .prove_block_for_test(&public_inputs)

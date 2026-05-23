@@ -716,8 +716,6 @@ mod tests {
                 signature: sig(7),
             }],
             slashings: Vec::new(),
-            deposits: Vec::new(),
-            voluntary_exits: Vec::new(),
         };
         let hash = h(123);
         store.put_body(&hash, &body).expect("put");

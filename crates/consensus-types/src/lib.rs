@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use neutrino_primitives::Checkpoint;
 use neutrino_primitives::{
-    BitVec, BlockHash, BlsPublicKey, BlsSignature, ChainId, CheckpointIndex, ChunkHash, ChunkId,
-    Epoch, Hash, Height, Slot, StateRoot, ValidatorIndex, blake3_256,
+    BitVec, BlockHash, BlsSignature, ChainId, CheckpointIndex, ChunkHash, ChunkId, Hash, Height,
+    Slot, StateRoot, ValidatorIndex, blake3_256,
 };
 
 /// Engine-canonical block header.
@@ -175,19 +175,25 @@ pub struct FinalityVote {
     pub signature: BlsSignature,
 }
 
-/// Opaque block body scaffold.
+/// Engine-canonical block body.
+///
+/// v1 carries three live lanes (`transactions`, `finality_votes`,
+/// `slashings`) plus the matching header roots. Deposits and voluntary
+/// exits travel as in-band `Transaction::Deposit` / `Transaction::VoluntaryExit`
+/// payloads inside `transactions`; the BLS PoP body lanes documented in
+/// doc 07 §7.6 are reserved for a future revision. `header.validator_ops_root`
+/// is therefore always [`neutrino_primitives::ZERO_HASH`] in v1.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Body {
     /// Runtime-defined transaction blobs.
     pub transactions: Vec<Vec<u8>>,
     /// Aggregated finality votes.
     pub finality_votes: Vec<FinalityVote>,
-    /// Objective slashing evidence included by the proposer.
+    /// Objective slashing evidence included by the proposer. The
+    /// chain backend re-encodes each accepted variant as a
+    /// `Transaction::Slash` and prepends those blobs to
+    /// `transactions` before the runtime executes the block.
     pub slashings: Vec<SlashingEvidence>,
-    /// Validator deposits to surface to the runtime.
-    pub deposits: Vec<Deposit>,
-    /// Voluntary validator exits to surface to the runtime.
-    pub voluntary_exits: Vec<VoluntaryExit>,
 }
 
 /// Aggregated vote signature and signer bitmap.
@@ -223,30 +229,6 @@ pub struct FinalityCert {
     pub precommit: AggregatedVote,
     /// Active validator-set root used for quorum weighting.
     pub active_validator_set_root: Hash,
-}
-
-/// Validator deposit operation.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Deposit {
-    /// Validator BLS public key.
-    pub pubkey: BlsPublicKey,
-    /// Runtime-defined withdrawal credential commitment.
-    pub withdrawal_credentials: Hash,
-    /// Deposited amount in the runtime's base unit.
-    pub amount: u64,
-    /// BLS proof-of-possession signature.
-    pub signature: BlsSignature,
-}
-
-/// Validator voluntary-exit operation.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct VoluntaryExit {
-    /// Validator leaving the active set.
-    pub validator_index: ValidatorIndex,
-    /// Epoch at which the exit was signed.
-    pub epoch: Epoch,
-    /// Validator BLS signature.
-    pub signature: BlsSignature,
 }
 
 /// A finality vote with signer identity carried separately.
@@ -689,17 +671,6 @@ mod tests {
                 transactions: vec![vec![1, 2, 3]],
                 finality_votes: vec![finality_vote()],
                 slashings: vec![evidence],
-                deposits: vec![Deposit {
-                    pubkey: [34; 48],
-                    withdrawal_credentials: hash(35),
-                    amount: 36,
-                    signature: sig(37),
-                }],
-                voluntary_exits: vec![VoluntaryExit {
-                    validator_index: 38,
-                    epoch: 39,
-                    signature: sig(40),
-                }],
             },
         };
 

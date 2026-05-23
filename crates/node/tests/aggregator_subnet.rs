@@ -143,7 +143,7 @@ fn signed_block_for_slot(
         receipts_root: ZERO_HASH,
         gas_used: 0,
         gas_limit: 1_000_000,
-        timestamp: slot * 4,
+        timestamp: 1_700_000_000 + slot * 4,
         signature: [0; 96],
     };
     let header_hash = header.hash();

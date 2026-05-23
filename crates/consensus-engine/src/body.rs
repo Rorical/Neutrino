@@ -22,7 +22,13 @@ use crate::merkle::{merkle_root, merkle_root_of_hashes};
 
 extern crate alloc;
 
-/// Five header-level Merkle roots committed by the [`Header`].
+/// Header-level Merkle roots committed by the [`Header`].
+///
+/// v1 carries three live body lanes (`transactions`, `finality_votes`,
+/// `slashings`); `validator_ops_root` is reserved at
+/// [`neutrino_primitives::ZERO_HASH`] because deposits and voluntary
+/// exits travel as in-band `Transaction::Deposit` / `Transaction::VoluntaryExit`
+/// payloads inside `transactions` (see doc 07 §7.6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BodyRoots {
     /// Root over `body.transactions`.
@@ -31,7 +37,8 @@ pub struct BodyRoots {
     pub votes_root: Hash,
     /// Root over `body.slashings`.
     pub slashings_root: Hash,
-    /// Root over `body.deposits || body.voluntary_exits` in that order.
+    /// Reserved BLS deposit / voluntary-exit lane root. Always
+    /// [`neutrino_primitives::ZERO_HASH`] in v1.
     pub validator_ops_root: Hash,
     /// Per-block DA commitment. For M5 we hash the encoded transactions
     /// payload plus all non-transaction body lanes. Production builds
@@ -39,23 +46,16 @@ pub struct BodyRoots {
     pub da_root: Hash,
 }
 
-/// Derive the five header roots from a body. Empty lanes use
-/// [`crate::merkle::EMPTY_MERKLE_ROOT`].
+/// Derive the header roots from a body. Empty lanes use
+/// [`crate::merkle::EMPTY_MERKLE_ROOT`]; the reserved
+/// `validator_ops_root` is always [`neutrino_primitives::ZERO_HASH`].
 #[must_use]
 pub fn compute_body_roots(body: &Body, _encoded_runtime_body: &[u8]) -> BodyRoots {
-    let mut ops: Vec<Vec<u8>> =
-        Vec::with_capacity(body.deposits.len() + body.voluntary_exits.len());
-    for deposit in &body.deposits {
-        ops.push(borsh::to_vec(deposit).expect("deposit serializes"));
-    }
-    for exit in &body.voluntary_exits {
-        ops.push(borsh::to_vec(exit).expect("exit serializes"));
-    }
     BodyRoots {
         transactions_root: merkle_root(&body.transactions),
         votes_root: merkle_root(&body.finality_votes),
         slashings_root: merkle_root(&body.slashings),
-        validator_ops_root: merkle_root(&ops),
+        validator_ops_root: neutrino_primitives::ZERO_HASH,
         da_root: full_body_da_root(body),
     }
 }
@@ -65,8 +65,6 @@ fn full_body_da_root(body: &Body) -> Hash {
         lane_leaf(0, &body.transactions),
         lane_leaf(1, &body.finality_votes),
         lane_leaf(2, &body.slashings),
-        lane_leaf(3, &body.deposits),
-        lane_leaf(4, &body.voluntary_exits),
     ];
     merkle_root_of_hashes(&leaves)
 }
@@ -102,7 +100,10 @@ mod tests {
         assert_eq!(roots.transactions_root, EMPTY_MERKLE_ROOT);
         assert_eq!(roots.votes_root, EMPTY_MERKLE_ROOT);
         assert_eq!(roots.slashings_root, EMPTY_MERKLE_ROOT);
-        assert_eq!(roots.validator_ops_root, EMPTY_MERKLE_ROOT);
+        // `validator_ops_root` is the reserved BLS body lane root.
+        // Doc 07 §7.6 pins it at `ZERO_HASH` in v1 because deposits
+        // and voluntary exits travel as in-band runtime transactions.
+        assert_eq!(roots.validator_ops_root, neutrino_primitives::ZERO_HASH);
         // da_root = BLAKE3("") which is not zero.
         assert_ne!(roots.da_root, EMPTY_MERKLE_ROOT);
     }

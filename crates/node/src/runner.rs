@@ -13,7 +13,7 @@ use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::ChainSpec;
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor, expect_runtime_code_hash};
 use sp1_sdk::blocking::CpuProver;
 
 /// Concrete `ChainBackend` parameterisation used by the production
@@ -170,6 +170,41 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
             "chain spec chain_id {} does not match node config chain_id {}",
             chain_spec.chain_id, config.chain_id
+        ))));
+    }
+    // Refuse to start when the chain spec advertises a
+    // `runtime_code_hash` that does not match the WASM cdylib this
+    // binary embeds. A silent mismatch would let the node compute
+    // post-state-roots against a different runtime than the network
+    // agreed on, producing a divergent chain at proof time.
+    //
+    // The all-zero placeholder is allowed so existing test fixtures
+    // (and pre-v1 bring-up deployments) keep working until they pin
+    // a real value.
+    if let Err((spec, actual)) = expect_runtime_code_hash(chain_spec.runtime_code_hash) {
+        return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
+            "chain spec runtime_code_hash {} does not match embedded runtime {}; \
+             refusing to start so the chain cannot diverge silently",
+            hex_short(&spec),
+            hex_short(&actual),
+        ))));
+    }
+    // Same idea for the runtime's unbonding delay: the runtime
+    // hard-codes `UNBONDING_DELAY_BLOCKS = 32` because plumbing it
+    // through `StfInput` is a larger surface change. The chain spec
+    // is allowed to *declare* a different value, but bumping it
+    // requires a matching runtime release; we refuse to start when
+    // the two disagree so the runtime cannot silently apply a
+    // different delay than the chain spec promised users.
+    if chain_spec.runtime.unbonding_delay_blocks
+        != neutrino_default_runtime_core::UNBONDING_DELAY_BLOCKS
+    {
+        return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
+            "chain spec runtime.unbonding_delay_blocks = {spec} disagrees with the \
+             embedded runtime's UNBONDING_DELAY_BLOCKS = {runtime}; rebuild the \
+             runtime to match before bumping the chain spec",
+            spec = chain_spec.runtime.unbonding_delay_blocks,
+            runtime = neutrino_default_runtime_core::UNBONDING_DELAY_BLOCKS,
         ))));
     }
     let production_config = build_block_producer_config(&config, &chain_spec)?;
@@ -387,6 +422,18 @@ fn build_block_producer_config(
         genesis_time_secs: chain_spec.genesis_time,
         slot_duration_secs: chain_spec.consensus.slot_duration_secs,
     }))
+}
+
+/// Short hex preview for log lines / error messages. Truncates to
+/// the first 8 bytes so a `Display::fmt` of a hash stays readable.
+fn hex_short(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(18);
+    for b in &bytes[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s.push_str("..");
+    s
 }
 
 async fn wait_for_shutdown() -> Result<(), std::io::Error> {

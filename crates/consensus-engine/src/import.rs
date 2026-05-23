@@ -39,6 +39,18 @@ use crate::engine::Engine;
 use crate::signature::{SignatureError, verify_header_signature};
 use crate::store::StoreError;
 
+/// Maximum allowed drift between a header's `timestamp` and the
+/// slot-clock's expectation for `header.slot`, in seconds.
+///
+/// Sized generously enough to swallow modest NTP drift between
+/// honest operators (~12s) plus a few seconds of network jitter,
+/// while still rejecting a proposer that tries to fake liveness for
+/// a future slot or back-date a header by hours. The local node's
+/// clock is consulted indirectly via the [`crate::clock::SlotClock`]
+/// anchor (genesis time + slot duration), so a clock drift of `Δ`
+/// seconds shows up as `Δ` of error in this comparison.
+pub const MAX_HEADER_TIMESTAMP_DRIFT_SECS: u64 = 60;
+
 /// Successful outcome of [`Engine::import_block`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportBlockOutcome {
@@ -100,6 +112,29 @@ pub enum ImportError<E> {
     HeaderSignature(SignatureError),
     /// Header proposer VRF claim failed to verify.
     HeaderVrf(VrfError),
+    /// Header `timestamp` is implausibly far from the slot's clock
+    /// expectation (covers both severe clock skew and a malicious
+    /// proposer trying to backdate or postdate a block).
+    HeaderTimestampOutOfRange {
+        /// Timestamp on the imported header.
+        actual: u64,
+        /// Expected slot timestamp from the local slot clock.
+        expected: u64,
+        /// Tolerance window in seconds applied to the comparison.
+        tolerance_secs: u64,
+    },
+    /// Header `runtime_extra` does not match the runtime's committed
+    /// validator-set root for the parent's active set (the only field
+    /// the engine knows how to predict pre-execution). The mismatch
+    /// is caught before SP1 proof arrival so a proposer cannot
+    /// silently advance the head against a forged runtime commitment.
+    HeaderRuntimeExtraMismatch {
+        /// Expected `runtime_extra` derived from the engine's
+        /// authoritative active validator set.
+        expected: [u8; 32],
+        /// Value carried by the imported header.
+        actual: [u8; 32],
+    },
     /// Block proof references a block header that is not stored locally.
     UnknownBlock(BlockHash),
     /// Body lane roots derived from the supplied body do not match the header.
@@ -202,6 +237,19 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
             }
             Self::HeaderSignature(err) => write!(f, "header signature rejected: {err}"),
             Self::HeaderVrf(err) => write!(f, "header VRF claim rejected: {err}"),
+            Self::HeaderTimestampOutOfRange {
+                actual,
+                expected,
+                tolerance_secs,
+            } => write!(
+                f,
+                "header timestamp {actual} is outside ±{tolerance_secs}s of expected slot timestamp {expected}"
+            ),
+            Self::HeaderRuntimeExtraMismatch { expected, actual } => write!(
+                f,
+                "header runtime_extra {actual:?} does not match expected {expected:?} \
+                 (validator-set root for the parent active set)"
+            ),
             Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
             Self::BodyRootsMismatch { header, computed } => write!(
                 f,
@@ -302,6 +350,62 @@ impl<DB: Database> Engine<DB> {
                 expected: self.head_hash(),
                 actual: block.header.parent_hash,
             });
+        }
+
+        // Bound the header's timestamp against the slot clock's
+        // expectation for its declared slot. Tolerance is large
+        // enough to swallow modest cross-host drift (and any
+        // bring-up clock skew between operators) while still
+        // rejecting headers that are obviously back- or post-dated.
+        // A malicious proposer cannot fake liveness for a slot they
+        // didn't actually win because the VRF check immediately
+        // below binds (proposer_index, slot, finalized_seed).
+        let expected_timestamp = self.clock().timestamp_for(block.header.slot);
+        let drift = block.header.timestamp.abs_diff(expected_timestamp);
+        if drift > MAX_HEADER_TIMESTAMP_DRIFT_SECS {
+            return Err(ImportError::HeaderTimestampOutOfRange {
+                actual: block.header.timestamp,
+                expected: expected_timestamp,
+                tolerance_secs: MAX_HEADER_TIMESTAMP_DRIFT_SECS,
+            });
+        }
+
+        // Cross-check the header's `runtime_extra` for the empty-body
+        // case on every non-genesis parent: the default runtime
+        // publishes its post-block `validator_set_root` here, an
+        // empty body cannot rotate the active set, so `runtime_extra`
+        // must equal the parent's. We deliberately skip block 1
+        // (parent = genesis) because the engine's
+        // `genesis_validator_set_root` (a hash over the chain-spec
+        // initial validators) and the runtime's empty-state
+        // `ValidatorSet::root()` (a commitment to count 0) are
+        // intentionally different commitments — the runtime treats
+        // those validators as pre-existing consensus identities, not
+        // as runtime-staked accounts. Bodies that touch state
+        // cannot be predicted without re-execution; the SP1 proof
+        // binds the real value via `BlockProofPublicInputs` so a
+        // proposer cannot lie in the long run.
+        let parent_is_non_genesis =
+            block.header.parent_hash != self.chain_spec().genesis_block_hash;
+        let body_is_empty = block.body.transactions.is_empty()
+            && block.body.slashings.is_empty()
+            && block.body.finality_votes.is_empty();
+        if parent_is_non_genesis && body_is_empty {
+            let parent_extra = self
+                .store()
+                .get_header(&block.header.parent_hash)?
+                .map_or(neutrino_primitives::ZERO_HASH, |h| h.runtime_extra);
+            // ZERO_HASH stays accepted as the runtime's "no
+            // commitment" marker still used by tests and pre-runtime
+            // bring-up fixtures.
+            if block.header.runtime_extra != neutrino_primitives::ZERO_HASH
+                && block.header.runtime_extra != parent_extra
+            {
+                return Err(ImportError::HeaderRuntimeExtraMismatch {
+                    expected: parent_extra,
+                    actual: block.header.runtime_extra,
+                });
+            }
         }
 
         // Authenticate the header before doing any further work: a
@@ -425,14 +529,13 @@ impl<DB: Database> Engine<DB> {
                 }
                 _ => neutrino_consensus_types::ProofRejectionReason::VerifierRejected,
             };
-            self.rejected_proofs
-                .insert(canonical_hash, (proof.clone(), reason));
+            self.record_rejected_proof(canonical_hash, proof.clone(), reason);
             return Err(ImportError::InvalidBlockProof(err));
         }
         // Successful import — clear any stale rejected-proof entry
         // for this block (a peer's earlier corrupted gossip should
         // not slash any future signer once an honest proof lands).
-        self.rejected_proofs.remove(&canonical_hash);
+        self.clear_rejected_proof(&canonical_hash);
 
         self.store_mut().put_block_proof(&canonical_hash, proof)?;
         match self.store().get_block_state(&canonical_hash)? {
@@ -644,6 +747,10 @@ mod tests {
     const TEST_CHAIN_ID: u64 = 7;
     const TEST_GENESIS_SEED: [u8; 32] = [0xDD; 32];
     const TEST_IKM: [u8; 32] = [0xAA; 32];
+    /// Anchor for the in-test slot clock. Test fixtures use this to
+    /// build header timestamps the post-M5-new import validator
+    /// accepts (`abs(header.ts - clock.timestamp_for(slot)) <= 60s`).
+    const TEST_GENESIS_TIME: u64 = 1_700_000_000;
 
     fn proposer() -> ProposerKey {
         ProposerKey::from_ikm(&TEST_IKM, 0).expect("derive proposer key")
@@ -682,7 +789,7 @@ mod tests {
             spec_version: CHAIN_SPEC_VERSION,
             name: BoundedBytes::new(b"m6-import-test".to_vec()).expect("name fits"),
             chain_id: TEST_CHAIN_ID,
-            genesis_time: 1_700_000_000,
+            genesis_time: TEST_GENESIS_TIME,
             genesis_gas_limit: 30_000_000,
             runtime_version: RuntimeVersion::default(),
             runtime_code_hash: [0xCC; 32],
@@ -740,7 +847,7 @@ mod tests {
             receipts_root: ZERO_HASH,
             gas_used: 0,
             gas_limit: 1_000_000,
-            timestamp: slot * 4,
+            timestamp: TEST_GENESIS_TIME + slot * 4,
             signature: [0; 96],
         };
         let header_hash = header.hash();

@@ -1,15 +1,26 @@
 //! SP1-backed implementation of the [`ProofSystem`] trait used by the
 //! consensus engine.
 //!
-//! `verify_block` runs the real SP1 verifier against the embedded
-//! verifying key and cross-checks the committed `StfPublicOutput`
-//! against the `BlockProofPublicInputs.state_root_{before, after}`
-//! fields the engine validates. `prove_block` is a stub for now;
-//! block production wiring lands in M5-new.
+//! [`Sp1ProofSystem::prove_block`] decodes the borsh-encoded
+//! `(StfInput, StateWitness)` blob the producer hands off,
+//! pre-validates every cross-checked field of
+//! [`BlockProofPublicInputs`] (`chain_id`, `height`, `block_gas_limit`,
+//! `gas_price`, `proposer_address`, `pre_state_root`) against the SP1
+//! input, drives the configured SP1 prover (mock / cpu / cuda /
+//! network), and cross-checks the committed [`StfPublicOutput`]
+//! (`pre_state_root`, `post_state_root`, `gas_used`, `receipts_root`)
+//! against the same `BlockProofPublicInputs` before returning the
+//! wire proof.
+//!
+//! [`Sp1ProofSystem::verify_block`] runs the real SP1 verifier
+//! against the embedded verifying key and re-runs every output-side
+//! cross-check so a malicious prover cannot lie about `gas_used`,
+//! `receipts_root`, or either state root and have the engine accept
+//! the proof.
 //!
 //! Chunk and recursive proof methods inherit the trait's default
-//! `ProofError::Unsupported` because the SP1 rewrite explicitly
-//! defers those layers.
+//! [`ProofError::Unsupported`] because the SP1 rewrite explicitly
+//! defers those layers (see doc 14).
 
 use std::sync::Mutex;
 

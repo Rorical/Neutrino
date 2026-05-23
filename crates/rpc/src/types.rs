@@ -167,10 +167,6 @@ pub struct BodyJson {
     pub finality_votes: u32,
     /// Number of slashing-evidence entries.
     pub slashings: u32,
-    /// Number of validator deposits surfaced to the runtime.
-    pub deposits: u32,
-    /// Number of voluntary exits surfaced to the runtime.
-    pub voluntary_exits: u32,
 }
 
 impl From<&Body> for BodyJson {
@@ -179,8 +175,6 @@ impl From<&Body> for BodyJson {
             transactions: b.transactions.iter().cloned().map(BytesHex).collect(),
             finality_votes: u32::try_from(b.finality_votes.len()).unwrap_or(u32::MAX),
             slashings: u32::try_from(b.slashings.len()).unwrap_or(u32::MAX),
-            deposits: u32::try_from(b.deposits.len()).unwrap_or(u32::MAX),
-            voluntary_exits: u32::try_from(b.voluntary_exits.len()).unwrap_or(u32::MAX),
         }
     }
 }

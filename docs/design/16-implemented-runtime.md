@@ -196,9 +196,15 @@ whose `mature_at_height <= current_block_height` into the signer's
 spendable balance. The transaction succeeds (consuming its full gas)
 even when zero entries are matured.
 
-`ChainSpec.runtime.unbonding_delay_blocks` defaults to `32` blocks.
-Real chains pick a much longer delay (Ethereum's exit queue is roughly
-a day).
+`ChainSpec.runtime.unbonding_delay_blocks` defaults to `32` blocks
+and is consumed indirectly today: the runtime hard-codes
+`UNBONDING_DELAY_BLOCKS = 32` to keep the wire shape of `StfInput`
+stable, and the node startup path (`runner.rs`) refuses to start when
+the chain-spec value disagrees with the runtime constant. Bumping the
+unbonding delay therefore requires a coordinated `RuntimeParams`
+update *and* a runtime release whose constant matches. Real chains
+pick a much longer delay (Ethereum's exit queue is roughly a day);
+that change lands as a single coordinated upgrade.
 
 `VoluntaryExit` is equivalent to `Unstake(validator.stake)` under the
 `DOMAIN_VOLUNTARY_EXIT` tag: it always drains the validator's full

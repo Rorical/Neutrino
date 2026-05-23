@@ -32,8 +32,8 @@ use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
+    ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -105,6 +105,7 @@ fn chain_spec() -> ChainSpec {
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
+        runtime: RuntimeParams::default(),
         initial_validators: validators,
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     }

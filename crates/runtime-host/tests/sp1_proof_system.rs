@@ -87,6 +87,8 @@ const fn public_inputs(
         abi_version: 1,
         gas_used,
         gas_limit,
+        gas_price: 0,
+        proposer_address: ZERO_HASH,
     }
 }
 
@@ -159,6 +161,34 @@ fn sp1_proof_system_rejects_post_root_mismatch() {
     let err = proof_system
         .verify_block(&proof, &pi)
         .expect_err("tampered post_state_root must reject");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+/// A proof whose committed `gas_used` diverges from the consensus
+/// public input is rejected with `PublicInputMismatch`. The fee
+/// commit added the cross-check; this pins it.
+#[test]
+fn sp1_proof_system_rejects_gas_used_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(14);
+    pi.gas_used = pi.gas_used.wrapping_add(1);
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered gas_used must reject");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+/// Receipts-root tamper at the public-inputs side. The runtime
+/// commits a specific receipts root inside the proof; flipping the
+/// public-input field must reject.
+#[test]
+fn sp1_proof_system_rejects_receipt_root_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(15);
+    pi.receipt_root[0] ^= 0xFF;
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered receipt_root must reject");
     assert_eq!(err, ProofError::PublicInputMismatch);
 }
 

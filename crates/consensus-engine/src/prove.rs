@@ -197,7 +197,7 @@ impl<DB: Database> Engine<DB> {
         Ok(parent.state_root)
     }
 
-    const fn public_inputs_for(
+    fn public_inputs_for(
         &self,
         header: &Header,
         state_root_before: StateRoot,
@@ -217,6 +217,23 @@ impl<DB: Database> Engine<DB> {
             abi_version: self.chain_spec().runtime_version.abi_version,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
+            gas_price: self.chain_spec().runtime.gas_price,
+            proposer_address: self.proposer_runtime_address(header.proposer_index),
         }
+    }
+
+    /// Look up the runtime account address (withdrawal credentials)
+    /// for the validator at `proposer_index` in the current active
+    /// set. Returns `ZERO_HASH` if the index is out of range — the
+    /// proof verifier will treat that as a public-input mismatch
+    /// and reject the block.
+    fn proposer_runtime_address(
+        &self,
+        proposer_index: neutrino_primitives::ValidatorIndex,
+    ) -> neutrino_primitives::Hash {
+        usize::try_from(proposer_index)
+            .ok()
+            .and_then(|i| self.active_validator_set().get(i))
+            .map_or(neutrino_primitives::ZERO_HASH, |v| v.withdrawal_credentials)
     }
 }

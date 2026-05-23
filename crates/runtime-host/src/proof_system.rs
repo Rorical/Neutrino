@@ -163,6 +163,16 @@ where
         if input.block_height != public_inputs.height {
             return Err(ProofError::PublicInputMismatch);
         }
+        // Bind the STF input's fee parameters to the consensus
+        // header. A prover that diverged from the chain spec's
+        // configured `gas_price` could otherwise redirect fees
+        // away from the proposer or skip them entirely.
+        if input.gas_price != public_inputs.gas_price {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if input.proposer_address != public_inputs.proposer_address {
+            return Err(ProofError::PublicInputMismatch);
+        }
 
         // 3. Serialize for SP1's stdin. The witness bundle is already
         //    in the layout the guest reads (input || witness); we

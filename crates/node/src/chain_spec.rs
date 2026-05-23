@@ -14,7 +14,7 @@ use std::path::Path;
 
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, ConsensusParams, Hash, LightClientParams,
-    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -119,6 +119,11 @@ pub struct ChainSpecFile {
     /// canonical chain-spec validator keeps the two in lock-step.
     #[serde(default)]
     pub chunk_size: Option<u64>,
+    /// Optional override for [`RuntimeParams::gas_price`] (per-gas
+    /// native-token fee). Defaults to `0`, which disables the fee
+    /// market entirely.
+    #[serde(default)]
+    pub gas_price: Option<u128>,
     /// Optional free-form metadata (≤ 256 bytes).
     #[serde(default)]
     pub metadata: Option<String>,
@@ -207,6 +212,7 @@ impl ChainSpecFile {
         let mut consensus = ConsensusParams::default();
         let state = StateParams::default();
         let light_client = LightClientParams::default();
+        let mut runtime = RuntimeParams::default();
         let runtime_version = RuntimeVersion::default();
 
         if let Some(slot_duration_secs) = self.slot_duration_secs {
@@ -215,6 +221,9 @@ impl ChainSpecFile {
         if let Some(chunk_size) = self.chunk_size {
             consensus.chunk_size = chunk_size;
             proof_params.slot_budget_per_chunk = chunk_size;
+        }
+        if let Some(gas_price) = self.gas_price {
+            runtime.gas_price = gas_price;
         }
 
         let genesis_validator_set_root =
@@ -251,6 +260,7 @@ impl ChainSpecFile {
             proof: proof_params,
             state,
             light_client,
+            runtime,
             initial_validators: validators,
             metadata,
         };

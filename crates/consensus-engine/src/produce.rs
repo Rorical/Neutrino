@@ -243,15 +243,11 @@ impl<DB: Database> Engine<DB> {
             .get(proposer_position)
             .map(|v| v.withdrawal_credentials)
             .unwrap_or_default();
-        // `gas_price` is hardcoded to 0 in the production path until
-        // ChainSpec gains a `runtime.gas_price` field. The fee
-        // mechanism is fully wired through the STF and proof; this
-        // is purely the configuration knob.
         let ctx = BlockExecutionContext {
             chain_id,
             block_height: height,
             gas_limit,
-            gas_price: 0,
+            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address,
         };
         let ExecutionOutcome {

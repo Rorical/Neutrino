@@ -456,7 +456,7 @@ impl<DB: Database> Engine<DB> {
         Ok(parent.state_root)
     }
 
-    const fn block_public_inputs_for_chunk(
+    fn block_public_inputs_for_chunk(
         &self,
         header: &Header,
         state_root_before: StateRoot,
@@ -476,7 +476,23 @@ impl<DB: Database> Engine<DB> {
             abi_version: self.chain_spec().runtime_version.abi_version,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
+            gas_price: self.chain_spec().runtime.gas_price,
+            proposer_address: self.proposer_runtime_address_for_finalize(header.proposer_index),
         }
+    }
+
+    /// Resolve the runtime account address for the proposer at
+    /// `proposer_index` in the current active validator set. Used
+    /// by the finalize path when re-deriving block-proof public
+    /// inputs for each block in the chunk.
+    fn proposer_runtime_address_for_finalize(
+        &self,
+        proposer_index: neutrino_primitives::ValidatorIndex,
+    ) -> neutrino_primitives::Hash {
+        usize::try_from(proposer_index)
+            .ok()
+            .and_then(|i| self.active_validator_set().get(i))
+            .map_or(neutrino_primitives::ZERO_HASH, |v| v.withdrawal_credentials)
     }
 
     /// Drive the chunk-BFT module through one round, either by

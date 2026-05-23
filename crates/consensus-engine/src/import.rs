@@ -587,7 +587,7 @@ impl<DB: Database> Engine<DB> {
         Ok(parent.state_root)
     }
 
-    const fn block_proof_public_inputs(
+    fn block_proof_public_inputs(
         &self,
         header: &neutrino_consensus_types::Header,
         state_root_before: StateRoot,
@@ -607,7 +607,23 @@ impl<DB: Database> Engine<DB> {
             abi_version: self.chain_spec().runtime_version.abi_version,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
+            gas_price: self.chain_spec().runtime.gas_price,
+            proposer_address: self.proposer_runtime_address_for_import(header.proposer_index),
         }
+    }
+
+    /// Equivalent of `Engine::proposer_runtime_address` available
+    /// inside the import path; kept as a method on `Engine` rather
+    /// than a free function so the active validator set lookup
+    /// observes the same in-memory state as the rest of import.
+    fn proposer_runtime_address_for_import(
+        &self,
+        proposer_index: neutrino_primitives::ValidatorIndex,
+    ) -> neutrino_primitives::Hash {
+        usize::try_from(proposer_index)
+            .ok()
+            .and_then(|i| self.active_validator_set().get(i))
+            .map_or(neutrino_primitives::ZERO_HASH, |v| v.withdrawal_credentials)
     }
 }
 
@@ -619,7 +635,8 @@ mod tests {
     use neutrino_consensus_types::{BlockProofPublicInputs, Body, ChunkProofPublicInputs, Header};
     use neutrino_primitives::{
         BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, ConsensusParams, HEADER_VERSION,
-        LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+        LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
+        ZERO_HASH,
     };
     use neutrino_proof_system::MockProofSystem;
     use neutrino_storage::MemoryDatabase;
@@ -678,6 +695,7 @@ mod tests {
             proof,
             state: StateParams::default(),
             light_client: LightClientParams::default(),
+            runtime: RuntimeParams::default(),
             initial_validators: validators(),
             metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
         }
@@ -912,6 +930,8 @@ mod tests {
             abi_version: 1,
             gas_used: 0,
             gas_limit: 1_000_000,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
         };
         let block_proof = proof_system
             .prove_block(&[], &block_inputs)

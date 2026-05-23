@@ -597,7 +597,8 @@ mod tests {
     use neutrino_consensus_types::Chunk;
     use neutrino_primitives::{
         BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-        LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+        LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
+        ZERO_HASH,
     };
     use neutrino_storage::MemoryDatabase;
 
@@ -663,6 +664,7 @@ mod tests {
             proof,
             state: StateParams::default(),
             light_client: LightClientParams::default(),
+            runtime: RuntimeParams::default(),
             initial_validators: validators,
             metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
         }

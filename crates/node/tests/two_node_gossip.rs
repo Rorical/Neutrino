@@ -27,8 +27,8 @@ use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH,
+    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
+    StateParams, Validator, ZERO_HASH,
 };
 use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
@@ -90,6 +90,7 @@ fn spec() -> ChainSpec {
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
+        runtime: RuntimeParams::default(),
         initial_validators: validators(),
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     }

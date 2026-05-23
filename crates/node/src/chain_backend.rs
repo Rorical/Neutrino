@@ -619,17 +619,18 @@ where
     /// one at startup, but tests that exercise gossip without a
     /// running runtime intentionally leave it unset.
     pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
-        // Capture chain_id + gas_limit + state snapshot under the
-        // engine mutex so the executor sees a consistent view. The
-        // mempool itself takes its own lock below; serialising them
-        // through one critical section would deadlock with concurrent
-        // gossip + production paths.
-        let (chain_id, gas_limit, state_snapshot, executor) = {
+        // Capture chain_id + gas_limit + gas_price + state snapshot
+        // under the engine mutex so the executor sees a consistent
+        // view. The mempool itself takes its own lock below;
+        // serialising them through one critical section would
+        // deadlock with concurrent gossip + production paths.
+        let (chain_id, gas_limit, gas_price, state_snapshot, executor) = {
             let executor = self.block_executor_snapshot();
             self.with_engine(|e| {
                 (
                     e.chain_spec().chain_id,
                     e.chain_spec().genesis_gas_limit,
+                    e.chain_spec().runtime.gas_price,
                     e.state().clone(),
                     executor,
                 )
@@ -640,12 +641,6 @@ where
             let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
             return pool.insert_validated(bytes, |_| false);
         };
-
-        // `gas_price` is hardcoded to 0 in the admission path until
-        // ChainSpec gains a `runtime.gas_price` field. The fee
-        // mechanism is fully wired through the STF; this is purely
-        // the configuration knob.
-        let gas_price: u128 = 0;
 
         // Run admission. Host trap / codec failures degrade to
         // `RejectedByValidator` so a misbehaving runtime never poisons

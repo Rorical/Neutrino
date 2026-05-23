@@ -586,6 +586,27 @@ impl Default for LightClientParams {
     }
 }
 
+/// Runtime-execution constants covered by the chain-spec hash.
+///
+/// Captures the chain's fee-market knobs. Today the only knob is
+/// `gas_price` (flat per-gas cost in the native token); future
+/// extensions (`base_fee` + `priority_tip`, burn split, etc.) will
+/// append fields to this struct.
+///
+/// `Default` returns the canonical no-fee configuration
+/// (`gas_price = 0`) which preserves the legacy pre-fee-market
+/// behavior. Real chains override this through their chain-spec
+/// TOML (`gas_price = "<n>"` in the top-level table).
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct RuntimeParams {
+    /// Native-token cost per gas unit. `0` disables fees entirely
+    /// (the canonical pre-fee-market configuration). The runtime
+    /// debits `tx_gas(tx) * gas_price` from each successful signed
+    /// transaction's sender and credits the accumulated sum to the
+    /// block proposer's runtime account.
+    pub gas_price: u128,
+}
+
 /// Recursive-checkpoint public inputs stored at genesis and after finalized chunks.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Checkpoint {
@@ -656,6 +677,8 @@ pub struct ChainSpec {
     pub state: StateParams,
     /// Light-client constants.
     pub light_client: LightClientParams,
+    /// Runtime-execution constants (fee market, etc.).
+    pub runtime: RuntimeParams,
     /// Initial validator set.
     pub initial_validators: Vec<Validator>,
     /// Optional metadata URL or label.
@@ -993,6 +1016,7 @@ mod tests {
             proof,
             state: StateParams::default(),
             light_client: LightClientParams::default(),
+            runtime: RuntimeParams::default(),
             initial_validators: vec![Validator {
                 pubkey: [6; 48],
                 withdrawal_credentials: [7; 32],

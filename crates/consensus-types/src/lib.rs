@@ -470,6 +470,15 @@ pub struct BlockProofPublicInputs {
     /// against `header.gas_limit` so the proof's STF input cannot
     /// declare a different limit than the header committed to.
     pub gas_limit: u64,
+    /// Native-token cost per gas unit the runtime applied. Bound to
+    /// the chain-spec's `runtime.gas_price` through the proof's STF
+    /// input so a malicious prover cannot quietly disable fees.
+    pub gas_price: u128,
+    /// Runtime account that received this block's accumulated fees.
+    /// Bound to `active_validator_set[header.proposer_index].withdrawal_credentials`
+    /// so a malicious prover cannot redirect fees to a different
+    /// address than consensus committed to.
+    pub proposer_address: Hash,
 }
 
 /// Public inputs committed by a single chunk proof.
@@ -781,6 +790,8 @@ mod tests {
                         abi_version: 1,
                         gas_used: 0,
                         gas_limit: 1_000_000,
+                        gas_price: 0,
+                        proposer_address: [0u8; 32],
                     },
                     proof_bytes: vec![0xFF; 8],
                 },
@@ -826,6 +837,8 @@ mod tests {
             abi_version: 1,
             gas_used: 0,
             gas_limit: 1_000_000,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
         };
         let block_proof = BlockProof {
             height: block_inputs.height,

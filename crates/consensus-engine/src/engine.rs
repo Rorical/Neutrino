@@ -878,7 +878,7 @@ mod tests {
     use crate::validator_set::validator_set_root;
     use neutrino_primitives::{
         BoundedBytes, CHAIN_SPEC_VERSION, Checkpoint, ConsensusParams, LightClientParams,
-        ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+        ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
     };
     use neutrino_storage::MemoryDatabase;
 
@@ -929,6 +929,7 @@ mod tests {
             proof,
             state: StateParams::default(),
             light_client: LightClientParams::default(),
+            runtime: RuntimeParams::default(),
             initial_validators: validators(),
             metadata: BoundedBytes::new(Vec::new()).expect("empty metadata fits"),
         }

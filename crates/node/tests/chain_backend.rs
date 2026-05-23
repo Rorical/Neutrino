@@ -17,8 +17,8 @@ use neutrino_consensus_types::{Block, Body, Header, RecursiveCheckpointProof};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH, blake3_256,
+    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
+    StateParams, Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{MockProofSystem, ProofSystem};
 use neutrino_storage::MemoryDatabase;
@@ -77,6 +77,7 @@ fn spec() -> ChainSpec {
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
+        runtime: RuntimeParams::default(),
         initial_validators: validators(),
         metadata: BoundedBytes::new(Vec::new()).unwrap(),
     }
@@ -152,6 +153,8 @@ fn build_recursive_proof(
         abi_version: 1,
         gas_used: 0,
         gas_limit: 1_000_000,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
     };
     let block_proof = ps.prove_block(&[], &block_inputs).unwrap();
     let chunk_inputs = ChunkProofPublicInputs {

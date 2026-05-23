@@ -29,7 +29,8 @@ use neutrino_default_runtime_core::ValidatorSet;
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeVersion, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -101,6 +102,7 @@ fn chain_spec() -> ChainSpec {
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
+        runtime: RuntimeParams::default(),
         initial_validators: validators,
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     }

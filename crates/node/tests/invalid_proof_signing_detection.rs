@@ -29,8 +29,8 @@ use neutrino_consensus_types::{
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BitVec, BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH, fixed_u128_from_integer,
+    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
+    StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_proof_system::{MockBlockProof, MockProofSystem};
 use neutrino_storage::MemoryDatabase;
@@ -100,6 +100,7 @@ fn spec(count: u8) -> ChainSpec {
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
+        runtime: RuntimeParams::default(),
         initial_validators: validators,
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     }
@@ -157,6 +158,8 @@ fn bad_mock_proof(block: &Block) -> BlockProof {
         abi_version: 1,
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
     };
     // Commitment doesn't match what MockProofSystem would compute,
     // so verify_block fails with PublicInputMismatch.
@@ -191,6 +194,8 @@ fn good_mock_proof(block: &Block) -> BlockProof {
         abi_version: 1,
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
+        gas_price: 0,
+        proposer_address: [0u8; 32],
     };
     let mock_proof = MockProofSystem::new()
         .prove_block_for_test(&public_inputs)

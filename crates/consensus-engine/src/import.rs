@@ -35,6 +35,7 @@ use neutrino_proof_system::{
     BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome, ProofError, ProofSystem,
 };
 use neutrino_storage::Database;
+use neutrino_trie::Trie;
 
 use crate::block_state::BlockState;
 use crate::body::{BodyRoots, compute_body_roots};
@@ -596,23 +597,39 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
-        // Pending-fix #7: optional dry-run against the parent's
-        // state trie. Activates only when (a) a dry-run executor was
-        // supplied, (b) the block extends the materialised head, and
-        // (c) `self.state.root()` matches `head_state_root` (so the
-        // clone we hand the executor really is the parent's
-        // pre-execution state). On any mismatch the cross-checks
-        // surface as `StateRootMismatch` / `ReceiptsRootMismatch` /
+        // Pending-fix #7 (dry-run cross-check) + pending-fix #11
+        // (follower state replay): when an executor is supplied and
+        // the block extends the materialised head, re-execute the
+        // body against the parent's state trie. The executor's
+        // post-state trie is captured here and committed in the
+        // head-update branch below via `replace_state_internal`, so
+        // the invariant `self.state.root() == self.head_state_root()`
+        // is maintained across imports (the producer path already
+        // maintains it via the same dance in `try_produce_block`).
+        //
+        // On any mismatch the cross-checks surface as
+        // `StateRootMismatch` / `ReceiptsRootMismatch` /
         // `GasUsedMismatch` / `HeaderRuntimeExtraMismatch`; on an
         // executor-side trap as `DryRunFailed`. The check runs
-        // before fork-choice registration so a forged block leaves
-        // no DAG residue.
-        if let Some(executor) = executor {
-            let extends_materialised_head = parent_hash == self.head_hash();
-            if extends_materialised_head && self.state().root() == self.head_state_root() {
-                self.dry_run_block_against_head(executor, block)?;
+        // before fork-choice registration so a rejected block
+        // leaves no DAG / store residue.
+        //
+        // DAG siblings (parent != materialised head) skip the
+        // re-execution — they cannot be replayed without parent
+        // state reconstruction, which is the reorg materialisation
+        // sub-task.
+        let extends_materialised_head = parent_hash == self.head_hash();
+        let post_state: Option<Trie> = match (executor, extends_materialised_head) {
+            (Some(executor), true) => {
+                debug_assert_eq!(
+                    self.state().root(),
+                    self.head_state_root(),
+                    "engine state trie must match head_state_root on every executor-equipped import",
+                );
+                Some(self.dry_run_block_against_head(executor, block)?)
             }
-        }
+            _ => None,
+        };
 
         let hash = block.hash();
 
@@ -643,20 +660,27 @@ impl<DB: Database> Engine<DB> {
         // this block extends the current materialised tip. Branches
         // that fork off an earlier ancestor stay in the DAG and the
         // store but the in-memory state trie keeps following the
-        // linearly-applied chain. A future reorg materialisation
-        // pass (pending-fix #7) would walk the DAG and replay state
-        // from the new fork-choice head; today, an attempt to
-        // produce on top of a stale head would extend the existing
-        // chain — peers running the same fork-choice rule converge
-        // through gossip + vote weighting.
-        let extends_materialised_head = parent_hash == self.head_hash();
+        // linearly-applied chain. Reorg materialisation across the
+        // DAG (when `fork_choice_head()` outruns the linear head)
+        // is the remaining sub-task; today, an attempt to produce
+        // on top of a stale head would extend the existing chain —
+        // peers running the same fork-choice rule converge through
+        // gossip + vote weighting.
         if extends_materialised_head {
             self.store_mut().put_tip(hash)?;
+            // Commit the dry-run's post-state in lockstep with the
+            // head pointer update. After this step
+            // `self.state.root() == self.head_state_root()` holds,
+            // which is the invariant `dry_run_block_against_head`
+            // relies on for the *next* incoming block. Producers /
+            // executor-less imports skip the swap; in the
+            // executor-less case the trie remains a stale view of
+            // the chain (no production / dry-run will run against
+            // it).
+            if let Some(post_state) = post_state {
+                self.replace_state_internal(post_state);
+            }
             self.update_head_internal(block.header.height, hash, block.header.state_root);
-            // Followers do not re-execute (M8 territory) so this drains
-            // an empty trie buffer in practice. Producers replaying
-            // gossipped blocks could still have queued writes, so the
-            // call is unconditional.
             self.flush_trie_to_store()?;
         }
 
@@ -675,20 +699,22 @@ impl<DB: Database> Engine<DB> {
     }
 
     /// Re-execute `block` against the live state trie (which is the
-    /// parent's post-state because the caller guarded on
-    /// `parent_hash == self.head_hash()` and
+    /// parent's post-state because the caller already verified that
+    /// `parent_hash == self.head_hash()` and asserted the invariant
     /// `self.state.root() == self.head_state_root()`) and cross-check
     /// the resulting commitments against the header.
     ///
+    /// On success returns the post-execution trie. The caller
+    /// (`import_block_inner`) commits it via `replace_state_internal`
+    /// in lockstep with the head pointer update so the engine's
+    /// invariant survives import — pending-fix #11.
+    ///
     /// Used by [`Self::import_block_with_dry_run`] (pending-fix #7).
-    /// The clone of `self.state` is discarded after the check; the
-    /// engine does not commit the dry-run output. Subsequent
-    /// production / SP1 proof arrival is the canonical advancer.
     fn dry_run_block_against_head(
         &self,
         executor: &dyn ErasedBlockExecutor,
         block: &Block,
-    ) -> Result<(), ImportError<DB::Error>> {
+    ) -> Result<Trie, ImportError<DB::Error>> {
         let proposer_position = usize::try_from(block.header.proposer_index)
             .expect("u32 validator index fits usize on supported targets");
         let proposer_address = self
@@ -704,11 +730,12 @@ impl<DB: Database> Engine<DB> {
             proposer_address,
         };
 
-        // Snapshot the engine's state trie into a scratch buffer so
-        // the executor's mutations are not committed. The producer
-        // path does the same dance via `replace_state_internal`; we
-        // skip the swap because import is read-only with respect to
-        // the trie until SP1 proof arrival.
+        // Snapshot the engine's state trie into a scratch buffer.
+        // The executor advances the scratch on success; on every
+        // cross-check failure the scratch is dropped and the
+        // engine's `self.state` is untouched. On success the
+        // scratch is returned to the caller for commit via
+        // `replace_state_internal`.
         let mut scratch = self.state().clone();
         scratch.drain_pending_nodes();
         scratch.drain_pending_values();
@@ -747,7 +774,7 @@ impl<DB: Database> Engine<DB> {
                 computed: gas_used,
             });
         }
-        Ok(())
+        Ok(scratch)
     }
 
     /// Import a peer-supplied block proof for an already-stored block.

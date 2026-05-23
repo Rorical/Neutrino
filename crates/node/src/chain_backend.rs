@@ -386,6 +386,24 @@ where
             .expect("ChainBackend block_executor poisoned") = Some(Arc::new(executor));
     }
 
+    /// Diagnostic: does the engine's in-memory state trie agree
+    /// with the scalar `head_state_root`?
+    ///
+    /// Producers maintain this invariant by construction. Importers
+    /// maintain it only when a block executor is installed
+    /// (pending-fix #11): the dry-run executor's post-state trie
+    /// is committed in lockstep with the head pointer update.
+    /// Executor-less imports leave the trie stale relative to the
+    /// committed scalar, which the diagnostic surfaces.
+    ///
+    /// Used by integration tests to assert the invariant after a
+    /// gossip-driven import; also useful for operator-side health
+    /// probes.
+    #[must_use]
+    pub fn engine_state_invariant_holds(&self) -> bool {
+        self.with_engine(|e| e.state().root() == e.head_state_root())
+    }
+
     /// Re-run the configured `ProofSystem::verify_block` against a
     /// peer-supplied `BlockProof` envelope. Returns `true` iff the
     /// proof passes verification.

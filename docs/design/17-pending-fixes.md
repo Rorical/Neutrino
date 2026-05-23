@@ -297,57 +297,55 @@ that light clients verify in one shot.
 
 ---
 
-## #11 Follower state replay on import (new)
+## #12 Reorg materialisation across the DAG
 
-**Severity:** unlocks the dry-run hook landed for #7 on follower
-paths; correctness gap for any follower that itself wants to
-produce or RPC-serve post-import.
+**Severity:** liveness gap on multi-winner slots once executor
+mismatches happen.
 
-**Symptom.** `Engine::import_block` advances `head_state_root`
-(scalar) but does not call `replace_state_internal` — only
-`Engine::try_produce_block` advances the in-memory `self.state`
-trie. On every node that is not the producer of the imported
-block, `self.state.root() != head_state_root` after the import.
+**Symptom.** Pending-fix #2 wired fork choice into `Engine`, but
+the engine's linearly-materialised head (`head_hash` /
+`head_state_root` / `self.state`) only advances on blocks that
+extend the materialised tip. When the fork-choice DAG selects a
+different head (e.g. a sibling branch wins the vote-weighted
+contest), `Engine::fork_choice_head() != Engine::head_hash()` is
+observable but the engine does not re-org the materialised state
+trie to the new head.
 
 Consequences:
 
-- The pending-fix #7 dry-run hook
-  (`Engine::import_block_with_dry_run`) guards on the invariant
-  matching, so it silently no-ops on followers — defeating the
-  defense-in-depth on every gossip-arriving block.
-- If a follower then wins a future slot and calls
-  `try_produce_block`, it clones a stale `self.state`, the
-  executor runs against the wrong parent, and the produced block's
-  `state_root` does not match the previous head's
-  `state_root`. The current multi-validator tests skirt this
-  because all bodies are empty (genesis state is the fixed point
-  for empty bodies), but as soon as transactions land the bug
-  manifests.
+- RPC clients reading `head_state_root` see the linearly-applied
+  branch, not the canonical fork-choice branch.
+- The producer's next `try_produce_block` extends the
+  linearly-applied branch, not the canonical one — so a node
+  that lost its branch never recovers without an external
+  intervention.
 
-**Acceptance test.** Two validators on a localnet. v0 produces a
-block whose body mutates state (e.g. one runtime `Deposit`
-transaction in the body). v1 imports the block. v1 then wins the
-next slot and produces — its produced block's `state_root` must
-match v0's published `state_root` for that height. Repeat for
-4 alternating slots; final head must converge.
+**Acceptance test.** Three nodes. Force a multi-winner slot
+(pin VRF seeds so both v0 and v1 win slot 1). All three nodes
+observe both candidate blocks. After ~3 slots' worth of vote
+weighting, fork choice settles on one branch; assert all three
+nodes' materialised head matches the fork-choice head.
 
 **Approach.**
-1. After every successful `import_block` that extends the
-   materialised head, re-run the executor against `self.state` and
-   the imported body, and call `replace_state_internal` with the
-   resulting trie. This is the same dance `try_produce_block`
-   already does for self-produced blocks.
-2. With this in place, lift the second guard in
-   `Engine::import_block_with_dry_run` (the
-   `self.state.root() == head_state_root` check). The dry-run then
-   runs uniformly on every imported block.
-3. Fork-choice-driven reorgs (non-extending heads winning the
-   vote-weighted contest) still require trie reconstruction; that
-   is the "reorg materialisation" sub-task and lands as #12.
+1. After every fork-choice update (`add_block` /
+   `set_proof_status` / `record_vote`), call a new
+   `materialise_to_fork_choice_head` helper.
+2. If `fork_choice_head() == head_hash()`, no-op.
+3. Otherwise, walk the DAG from the common ancestor of the two
+   heads down to the new fork-choice head, replaying every
+   block's body through the executor against the ancestor's
+   state trie. Commit the resulting trie via
+   `replace_state_internal` and update head pointers.
+4. The ancestor's state trie must be reconstructable. Use
+   `Trie::from_persisted(root, nodes, values)` over the
+   persisted `TrieNodes` / `StateValues` columns — same
+   primitive snap-sync uses today.
 
-**Out of scope here.** Reorg materialisation across the DAG (when
-`fork_choice_head() != head_hash()`). The replay path covers
-linear extensions only.
+**Out of scope here.** Pruning state nodes for branches the
+fork-choice abandons. The naive approach keeps every branch's
+state on disk; a future garbage-collection pass would reclaim
+abandoned-branch nodes once the fork-choice's finalised pointer
+moves past them.
 
 ---
 
@@ -379,14 +377,13 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
   (`feat(consensus,node): BFT round timeouts`).
 - **#5 Slashing pool persistence** — closed by `eed3cad`
   (`feat(node,storage,engine): persist slashing pool`).
-- **#7 Followers re-execute on import** — closed by this commit.
-  The dry-run guards on
-  `self.state.root() == self.head_state_root()`, which is the
-  producer invariant; follower invariant is broken today (only
-  `try_produce_block` calls `replace_state_internal`), so on
-  follower paths the dry-run silently no-ops. The full
-  follower-state-replay-on-import pass is split out as the new
-  pending-fix #11 ("Follower state replay on import").
+- **#7 Followers re-execute on import** — closed by `8729be4`
+  (`feat(consensus,node): dry-run on import + cross-check`). At
+  landing time the dry-run was guarded on
+  `self.state.root() == self.head_state_root()` to preserve
+  the follower invariant; the guard is now lifted by #11.
+- **#11 Follower state replay on import** — closed by this
+  commit.
 
 ---
 
@@ -404,9 +401,8 @@ Active sprint (this iteration):
 
 Subsequent sprints (ordered):
 
-5. **#11 Follower state replay on import** — unblocks the #7
-   dry-run on follower paths, fixes the latent stale-trie bug for
-   non-empty-body follower production.
+5. **#12 Reorg materialisation across the DAG** — unblocks
+   fork-choice-driven head replacement.
 6. **#8 Validator activation/exit epoch FSM** — depends on #1 +
    `RegisterValidator` wire format.
 7. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`

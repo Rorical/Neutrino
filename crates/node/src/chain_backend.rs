@@ -1780,7 +1780,20 @@ where
             self.pool_and_gossip_slashing(evidence).await;
         }
 
-        let outcome = match self.with_engine_mut(|e| e.import_block(&block)) {
+        // Pending-fix #7: when a dynamic-runtime executor is
+        // installed, route the import through
+        // `import_block_with_dry_run` so the header's `state_root`
+        // / `runtime_extra` / `receipts_root` / `gas_used` are
+        // cross-checked against a local re-execution against the
+        // parent state. Tests / RPC-only nodes that leave the
+        // executor unset fall back to the no-dry-run path.
+        let import_result = self.block_executor_snapshot().map_or_else(
+            || self.with_engine_mut(|e| e.import_block(&block)),
+            |executor| {
+                self.with_engine_mut(|e| e.import_block_with_dry_run(&block, executor.as_ref()))
+            },
+        );
+        let outcome = match import_result {
             Ok(outcome) => outcome,
             Err(ImportError::HeaderVrf(vrf_err)) => {
                 // The header signature already verified above (the

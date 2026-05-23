@@ -31,7 +31,9 @@ use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
 use neutrino_primitives::{
     BlockHash, Checkpoint, CheckpointIndex, ChunkHash, ChunkId, Height, Slot, StateRoot,
 };
-use neutrino_proof_system::{ProofError, ProofSystem};
+use neutrino_proof_system::{
+    BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome, ProofError, ProofSystem,
+};
 use neutrino_storage::Database;
 
 use crate::block_state::BlockState;
@@ -136,6 +138,42 @@ pub enum ImportError<E> {
         /// Value carried by the imported header.
         actual: [u8; 32],
     },
+    /// Re-executing the block against the parent's state trie
+    /// produced a different post-state root than the header claims.
+    /// Surfaced by the optional dry-run hook of
+    /// [`Engine::import_block_with_dry_run`]; pending-fix #7
+    /// (doc 17): catches a malicious proposer that publishes a
+    /// header with a forged `state_root` before its SP1 proof
+    /// arrives.
+    StateRootMismatch {
+        /// Value carried by the imported header.
+        expected: StateRoot,
+        /// Value the local executor produced re-running the body.
+        computed: StateRoot,
+    },
+    /// Re-executing the block produced a different `receipts_root`
+    /// than the header claims. Companion to
+    /// [`Self::StateRootMismatch`].
+    ReceiptsRootMismatch {
+        /// Value carried by the imported header.
+        expected: [u8; 32],
+        /// Value the local executor produced re-running the body.
+        computed: [u8; 32],
+    },
+    /// Re-executing the block produced a different `gas_used` than
+    /// the header claims. Companion to [`Self::StateRootMismatch`].
+    GasUsedMismatch {
+        /// Value carried by the imported header.
+        expected: u64,
+        /// Value the local executor produced re-running the body.
+        computed: u64,
+    },
+    /// The dry-run executor itself failed (trap, codec error, etc.).
+    /// The block is rejected because the local node could not
+    /// independently verify the proposer's claim; the SP1 proof
+    /// path is the canonical authority but we refuse to advance
+    /// the head against an unverifiable claim.
+    DryRunFailed(String),
     /// Block proof references a block header that is not stored locally.
     UnknownBlock(BlockHash),
     /// Body lane roots derived from the supplied body do not match the header.
@@ -222,6 +260,7 @@ impl<E> From<StoreError<E>> for ImportError<E> {
 }
 
 impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
+    #[allow(clippy::too_many_lines)] // One arm per variant; the table is intentionally flat.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HeightMismatch { expected, actual } => {
@@ -251,6 +290,19 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                 "header runtime_extra {actual:?} does not match expected {expected:?} \
                  (validator-set root for the parent active set)"
             ),
+            Self::StateRootMismatch { expected, computed } => write!(
+                f,
+                "dry-run state_root {computed:?} does not match header state_root {expected:?}",
+            ),
+            Self::ReceiptsRootMismatch { expected, computed } => write!(
+                f,
+                "dry-run receipts_root {computed:?} does not match header receipts_root {expected:?}",
+            ),
+            Self::GasUsedMismatch { expected, computed } => write!(
+                f,
+                "dry-run gas_used {computed} does not match header gas_used {expected}",
+            ),
+            Self::DryRunFailed(msg) => write!(f, "dry-run executor failed: {msg}"),
             Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
             Self::BodyRootsMismatch { header, computed } => write!(
                 f,
@@ -362,10 +414,72 @@ impl<DB: Database> Engine<DB> {
     /// [`ImportError::HeaderVrf`] /
     /// [`ImportError::BodyRootsMismatch`] on individual validation
     /// failures, or [`ImportError::Store`] on persistence failure.
-    #[allow(clippy::too_many_lines)] // Validation pipeline is intentionally inlined.
+    /// Import a peer-supplied [`Block`] without re-executing it.
+    /// Equivalent to
+    /// `import_block_with_dry_run(block, None)`. Followers running
+    /// without a configured `ErasedBlockExecutor` use this entry
+    /// point.
     pub fn import_block(
         &mut self,
         block: &Block,
+    ) -> Result<ImportBlockOutcome, ImportError<DB::Error>> {
+        self.import_block_inner(block, None)
+    }
+
+    /// Import a peer-supplied [`Block`] and, when the block extends
+    /// the locally materialised head and the state trie is in sync
+    /// with `head_state_root`, re-execute the block against the
+    /// parent's state and cross-check the header's
+    /// `state_root` / `runtime_extra` / `receipts_root` / `gas_used`
+    /// commitments. Pending-fix #7 (doc 17): catches a malicious
+    /// proposer that publishes a header with forged commitments
+    /// before its SP1 proof arrives, so RPC clients never see
+    /// state from a block that will be retroactively dropped on
+    /// proof-arrival.
+    ///
+    /// The dry-run is skipped (silently, with a tracing warn) when:
+    ///
+    /// - The block is a DAG sibling (parent != materialised head):
+    ///   the engine does not yet support loading an arbitrary
+    ///   parent state on demand, so re-execution would need a trie
+    ///   reconstruction pass (future work).
+    /// - The local `self.state.root()` does not match
+    ///   `head_state_root`: today, followers do not advance their
+    ///   in-memory trie on `import_block` (only `try_produce_block`
+    ///   calls `replace_state_internal`), so the trie commonly
+    ///   lags the committed scalar. Activating the cross-check in
+    ///   that state would mass-reject every legitimate gossipped
+    ///   block. A future follower-side replay pass will close this
+    ///   gap; until then the guard avoids the regression.
+    ///
+    /// In both skip cases the block still passes through every
+    /// other validation step that [`Self::import_block`] performs.
+    ///
+    /// # Errors
+    ///
+    /// Returns every error variant [`Self::import_block`] does, plus
+    /// [`ImportError::StateRootMismatch`],
+    /// [`ImportError::ReceiptsRootMismatch`],
+    /// [`ImportError::GasUsedMismatch`],
+    /// [`ImportError::HeaderRuntimeExtraMismatch`] (for non-empty
+    /// bodies — the empty-body fast path already runs in
+    /// [`Self::import_block`]), and [`ImportError::DryRunFailed`]
+    /// when the executor itself surfaces an error.
+    pub fn import_block_with_dry_run(
+        &mut self,
+        block: &Block,
+        executor: &dyn ErasedBlockExecutor,
+    ) -> Result<ImportBlockOutcome, ImportError<DB::Error>> {
+        self.import_block_inner(block, Some(executor))
+    }
+
+    /// Shared body of [`Self::import_block`] and
+    /// [`Self::import_block_with_dry_run`].
+    #[allow(clippy::too_many_lines)] // Validation pipeline is intentionally inlined.
+    fn import_block_inner(
+        &mut self,
+        block: &Block,
+        executor: Option<&dyn ErasedBlockExecutor>,
     ) -> Result<ImportBlockOutcome, ImportError<DB::Error>> {
         // Look up the parent header so we can check height-vs-parent
         // and (later) runtime_extra-vs-parent. The genesis block
@@ -482,6 +596,24 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
+        // Pending-fix #7: optional dry-run against the parent's
+        // state trie. Activates only when (a) a dry-run executor was
+        // supplied, (b) the block extends the materialised head, and
+        // (c) `self.state.root()` matches `head_state_root` (so the
+        // clone we hand the executor really is the parent's
+        // pre-execution state). On any mismatch the cross-checks
+        // surface as `StateRootMismatch` / `ReceiptsRootMismatch` /
+        // `GasUsedMismatch` / `HeaderRuntimeExtraMismatch`; on an
+        // executor-side trap as `DryRunFailed`. The check runs
+        // before fork-choice registration so a forged block leaves
+        // no DAG residue.
+        if let Some(executor) = executor {
+            let extends_materialised_head = parent_hash == self.head_hash();
+            if extends_materialised_head && self.state().root() == self.head_state_root() {
+                self.dry_run_block_against_head(executor, block)?;
+            }
+        }
+
         let hash = block.hash();
 
         // Register in the fork-choice DAG. Any non-extending sibling
@@ -540,6 +672,82 @@ impl<DB: Database> Engine<DB> {
             new_head_height: self.head_height(),
             new_head_slot: block.header.slot,
         })
+    }
+
+    /// Re-execute `block` against the live state trie (which is the
+    /// parent's post-state because the caller guarded on
+    /// `parent_hash == self.head_hash()` and
+    /// `self.state.root() == self.head_state_root()`) and cross-check
+    /// the resulting commitments against the header.
+    ///
+    /// Used by [`Self::import_block_with_dry_run`] (pending-fix #7).
+    /// The clone of `self.state` is discarded after the check; the
+    /// engine does not commit the dry-run output. Subsequent
+    /// production / SP1 proof arrival is the canonical advancer.
+    fn dry_run_block_against_head(
+        &self,
+        executor: &dyn ErasedBlockExecutor,
+        block: &Block,
+    ) -> Result<(), ImportError<DB::Error>> {
+        let proposer_position = usize::try_from(block.header.proposer_index)
+            .expect("u32 validator index fits usize on supported targets");
+        let proposer_address = self
+            .active_validator_set()
+            .get(proposer_position)
+            .map(|v| v.withdrawal_credentials)
+            .unwrap_or_default();
+        let ctx = BlockExecutionContext {
+            chain_id: self.chain_spec().chain_id,
+            block_height: block.header.height,
+            gas_limit: block.header.gas_limit,
+            gas_price: self.chain_spec().runtime.gas_price,
+            proposer_address,
+        };
+
+        // Snapshot the engine's state trie into a scratch buffer so
+        // the executor's mutations are not committed. The producer
+        // path does the same dance via `replace_state_internal`; we
+        // skip the swap because import is read-only with respect to
+        // the trie until SP1 proof arrival.
+        let mut scratch = self.state().clone();
+        scratch.drain_pending_nodes();
+        scratch.drain_pending_values();
+
+        let ExecutionOutcome {
+            state_root_after,
+            runtime_extra,
+            receipts_root,
+            gas_used,
+            witness_bytes: _,
+        } = executor
+            .execute_block(&ctx, &block.body, &mut scratch)
+            .map_err(ImportError::DryRunFailed)?;
+
+        if state_root_after != block.header.state_root {
+            return Err(ImportError::StateRootMismatch {
+                expected: block.header.state_root,
+                computed: state_root_after,
+            });
+        }
+        if runtime_extra != block.header.runtime_extra {
+            return Err(ImportError::HeaderRuntimeExtraMismatch {
+                expected: block.header.runtime_extra,
+                actual: runtime_extra,
+            });
+        }
+        if receipts_root != block.header.receipts_root {
+            return Err(ImportError::ReceiptsRootMismatch {
+                expected: block.header.receipts_root,
+                computed: receipts_root,
+            });
+        }
+        if gas_used != block.header.gas_used {
+            return Err(ImportError::GasUsedMismatch {
+                expected: block.header.gas_used,
+                computed: gas_used,
+            });
+        }
+        Ok(())
     }
 
     /// Import a peer-supplied block proof for an already-stored block.

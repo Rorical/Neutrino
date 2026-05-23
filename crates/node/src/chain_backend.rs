@@ -860,6 +860,16 @@ where
         self.with_engine(neutrino_consensus_engine::Engine::head_height)
     }
 
+    /// Vote-weighted heaviest-proven-chain head per
+    /// [`Engine::fork_choice_head`](neutrino_consensus_engine::Engine::fork_choice_head).
+    /// May differ from the materialised `head_block_hash` returned
+    /// by [`Self::local_status`] when a competing branch has
+    /// accumulated more vote weight; full reorg materialisation is
+    /// pending-fix #7.
+    pub fn fork_choice_head(&self) -> BlockHash {
+        self.with_engine(neutrino_consensus_engine::Engine::fork_choice_head)
+    }
+
     /// FSM state of the block at `hash`, if it has been observed.
     ///
     /// Used by the M5-new production integration test and by

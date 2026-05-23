@@ -55,6 +55,15 @@ pub enum BftError {
     SignatureAggregationUnavailable,
     /// The chunk's active validator-set root does not match the previous checkpoint.
     ValidatorSetRootMismatch,
+    /// `advance_to_round` was called with a round equal to or below
+    /// the current one. Round advancement is strictly monotonic so
+    /// late timeout signals cannot rewind the BFT state.
+    RoundNotIncreased {
+        /// Current round before the failed advance.
+        current: u32,
+        /// Round the caller requested.
+        requested: u32,
+    },
 }
 
 impl fmt::Display for BftError {
@@ -77,6 +86,10 @@ impl fmt::Display for BftError {
             Self::ValidatorSetRootMismatch => {
                 f.write_str("active validator-set root does not match previous checkpoint")
             }
+            Self::RoundNotIncreased { current, requested } => write!(
+                f,
+                "advance_to_round({requested}) does not exceed current round {current}"
+            ),
         }
     }
 }
@@ -213,6 +226,38 @@ impl ChunkBft {
     #[must_use]
     pub fn active_set_len(&self) -> usize {
         self.active_set.len()
+    }
+
+    /// Advance the chunk-BFT state to a fresh round.
+    ///
+    /// Preserves the chain id, chunk, active set, validator-set root,
+    /// and quorum fractions. Vote accumulators are reset so the
+    /// caller starts collecting fresh prevotes / precommits on the
+    /// new round number. `new_round` must be strictly greater than
+    /// the current round.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BftError::RoundNotIncreased`] when `new_round <= self.round`.
+    pub fn advance_to_round(self, new_round: u32) -> Result<Self, BftError> {
+        if new_round <= self.round {
+            return Err(BftError::RoundNotIncreased {
+                current: self.round,
+                requested: new_round,
+            });
+        }
+        Ok(Self {
+            chain_id: self.chain_id,
+            chunk: self.chunk,
+            round: new_round,
+            active_set: self.active_set,
+            active_validator_set_root: self.active_validator_set_root,
+            total_stake: self.total_stake,
+            prevote_quorum: self.prevote_quorum,
+            precommit_quorum: self.precommit_quorum,
+            prevotes: VoteAccumulator::new(FinalityVotePhase::Prevote),
+            precommits: VoteAccumulator::new(FinalityVotePhase::Precommit),
+        })
     }
 
     /// Whether the carried active-validator-set root matches `root`.

@@ -55,6 +55,14 @@ pub(crate) async fn run_block_producer(
             last_attempted_slot = slot;
         }
 
+        // Pending-fix #4: drive every open BFT session's round
+        // timeout once per slot tick. Sessions whose
+        // `bft_round_timeout_base_secs + round * step` window has
+        // elapsed advance to the next round and re-publish their
+        // local prevote so a transient partition cannot stall
+        // finality.
+        backend.tick_bft_round_timeouts(now).await;
+
         tokio::time::sleep(sleep_until_next_slot(
             config.genesis_time_secs,
             config.slot_duration_secs,

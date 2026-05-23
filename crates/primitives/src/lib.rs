@@ -100,6 +100,16 @@ pub const DEFAULT_FALLBACK_PREMIUM: FixedU128 = FIXED_U128_ONE / 2;
 pub const DEFAULT_VOTE_SUBNETS: u16 = 16;
 /// Default number of validator vote subnets per chunk.
 pub const DEFAULT_VALIDATOR_SUBNETS_PER_CHUNK: u8 = 2;
+/// Default BFT round-0 timeout in seconds. Two slot durations
+/// (at the default 4s slot) gives comfortable propagation room.
+pub const DEFAULT_BFT_ROUND_TIMEOUT_BASE_SECS: u64 = 2 * DEFAULT_SLOT_DURATION_SECS;
+/// Default per-round linear backoff added to the BFT round timeout.
+/// Round N waits `base + N * step` seconds before timing out.
+pub const DEFAULT_BFT_ROUND_TIMEOUT_STEP_SECS: u64 = DEFAULT_SLOT_DURATION_SECS;
+/// Default maximum BFT round any session advances to before
+/// declaring the chunk stalled. Comfortably above realistic
+/// partition durations.
+pub const DEFAULT_BFT_MAX_ROUND: u32 = 32;
 /// Default withdrawal delay and weak-subjectivity period in seconds.
 pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 = 14 * 24 * 60 * 60;
 /// Default number of chunks to retain lock-violation evidence.
@@ -488,6 +498,25 @@ pub struct ConsensusParams {
     pub vote_subnets: u16,
     /// Validator subnets assigned per chunk.
     pub validator_subnets_per_chunk: u8,
+    /// BFT round-0 timeout in seconds.
+    ///
+    /// `Engine::tick_bft_round_timeouts` advances a session to
+    /// round + 1 when `now - round_started_at_secs` exceeds
+    /// `bft_round_timeout_base_secs + round * bft_round_timeout_step_secs`.
+    /// Sized comfortably larger than two slot durations so a single
+    /// slow gossip propagation does not force a round skip.
+    pub bft_round_timeout_base_secs: u64,
+    /// Linear per-round backoff added to the round timeout. Round N
+    /// waits `base + N * step` seconds before timing out so a
+    /// pathologically partitioned network still makes progress
+    /// after the partition heals.
+    pub bft_round_timeout_step_secs: u64,
+    /// Maximum BFT round any session advances to before declaring
+    /// the chunk stalled. Operators see a metric / log but the
+    /// session stops emitting new prevotes; finalisation requires
+    /// a separate operator intervention (or a partition heal that
+    /// lets earlier rounds reach quorum).
+    pub bft_max_round: u32,
 }
 
 impl Default for ConsensusParams {
@@ -510,6 +539,9 @@ impl Default for ConsensusParams {
             expected_aggregators_per_round: DEFAULT_EXPECTED_AGGREGATORS_PER_ROUND,
             vote_subnets: DEFAULT_VOTE_SUBNETS,
             validator_subnets_per_chunk: DEFAULT_VALIDATOR_SUBNETS_PER_CHUNK,
+            bft_round_timeout_base_secs: DEFAULT_BFT_ROUND_TIMEOUT_BASE_SECS,
+            bft_round_timeout_step_secs: DEFAULT_BFT_ROUND_TIMEOUT_STEP_SECS,
+            bft_max_round: DEFAULT_BFT_MAX_ROUND,
         }
     }
 }

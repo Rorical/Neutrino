@@ -1112,6 +1112,34 @@ where
         }
     }
 
+    /// Pending-fix #4: tick every open BFT session's round timeout
+    /// and drive any resulting round advance through the gossip
+    /// path.
+    ///
+    /// `now_secs` is the current wall-clock Unix-second timestamp.
+    /// The engine compares it against each session's
+    /// `round_started_at_secs` and advances to the next round when
+    /// the chain-spec `bft_round_timeout_base_secs + round * step`
+    /// budget has elapsed. Re-published prevotes go out on the
+    /// matching gossip topic so peers see the new round's vote.
+    ///
+    /// Production callers (e.g. the producer's slot loop) invoke
+    /// this every slot tick so a stalled chunk advances within one
+    /// timeout window. Tests pass a deterministic `now_secs` to
+    /// drive scenarios.
+    pub async fn tick_bft_round_timeouts(&self, now_secs: u64) {
+        let actions = match self.with_engine_mut(|e| e.tick_bft_round_timeouts(now_secs)) {
+            Ok(actions) => actions,
+            Err(err) => {
+                debug!(?err, "tick_bft_round_timeouts failed");
+                return;
+            }
+        };
+        if !actions.is_empty() {
+            self.handle_bft_actions(actions).await;
+        }
+    }
+
     /// Drive the engine through chunk finalization once the BFT loop
     /// reports a 2/3 precommit quorum. The chunk proof aggregation and
     /// recursive checkpoint paths are explicitly deferred by the SP1

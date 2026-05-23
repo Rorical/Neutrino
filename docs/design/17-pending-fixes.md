@@ -314,7 +314,14 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
 
 ## Items closed by recent commits
 
-Move closed items here with a back-reference. Empty for now.
+- **#1 Cross-layer validator-set rotation** — closed by
+  `cd6966a` (`feat(consensus,node): cross-layer validator-set rotation`).
+- **#2 Fork choice wiring** — closed by `d49458c`
+  (`feat(consensus): wire fork choice into Engine`). Reorg
+  materialisation is split out as new pending-fix #7.
+- **#3 Multi-slot multi-validator integration test** — closed by
+  `dc2c445` (`test(node): autonomous multi-slot multi-validator localnet`).
+- **#4 BFT round timeouts** — closed by this commit.
 
 ---
 

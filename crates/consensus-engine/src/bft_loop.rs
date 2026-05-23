@@ -85,8 +85,8 @@ pub struct BftSession {
     local: LocalVoteProgress,
     peer_quorum: PeerQuorumProgress,
     /// Whether the local validator was elected as an aggregator for
-    /// `(chunk_id, round=0)`. Cached at session-open time; round
-    /// timeouts (deferred to M7-D) will refresh this.
+    /// `(chunk_id, current_round)`. Re-derived inside
+    /// [`Engine::tick_bft_round_timeouts`] when a round advance fires.
     is_local_aggregator: bool,
     /// Subnet routing for the union-aggregated vote when this node
     /// publishes aggregate prevotes / precommits.
@@ -98,6 +98,14 @@ pub struct BftSession {
     /// Aggregate precommit stake last published as an aggregator
     /// action.
     last_published_aggregate_precommit_stake: u64,
+    /// Wall-clock anchor (Unix seconds) for the current round.
+    /// Driven by [`Engine::open_bft_session`] at session open and
+    /// reset by [`Engine::tick_bft_round_timeouts`] on every round
+    /// advance. The chain-spec's
+    /// `bft_round_timeout_base_secs + round * step` is compared
+    /// against `now - round_started_at_secs` to decide whether the
+    /// session needs to advance.
+    round_started_at_secs: u64,
 }
 
 impl BftSession {
@@ -166,6 +174,20 @@ impl BftSession {
     #[must_use]
     pub const fn subnet(&self) -> u8 {
         self.subnet
+    }
+
+    /// Current BFT round.
+    #[must_use]
+    pub const fn round(&self) -> u32 {
+        self.bft.round()
+    }
+
+    /// Wall-clock anchor (Unix seconds) for the current round. Used
+    /// by [`Engine::tick_bft_round_timeouts`] to decide whether the
+    /// round needs to advance.
+    #[must_use]
+    pub const fn round_started_at_secs(&self) -> u64 {
+        self.round_started_at_secs
     }
 }
 
@@ -319,6 +341,23 @@ impl<DB: Database> Engine<DB> {
         &mut self,
         chunk: Chunk,
     ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
+        self.open_bft_session_at(chunk, 0)
+    }
+
+    /// Like [`Self::open_bft_session`] but anchors the session's
+    /// round-timeout clock at `now_secs` instead of `0`. Production
+    /// callers should pass the current wall-clock Unix-second value
+    /// so [`Self::tick_bft_round_timeouts`] can compare against it.
+    /// Tests pass a deterministic value to drive timeout scenarios.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::open_bft_session`].
+    pub fn open_bft_session_at(
+        &mut self,
+        chunk: Chunk,
+        now_secs: u64,
+    ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
         let chunk_id = chunk.chunk_id;
         if self.bft_sessions.contains_key(&chunk_id) {
             return Err(BftLoopError::SessionAlreadyOpen { chunk_id });
@@ -357,6 +396,7 @@ impl<DB: Database> Engine<DB> {
             subnet,
             last_published_aggregate_prevote_stake: 0,
             last_published_aggregate_precommit_stake: 0,
+            round_started_at_secs: now_secs,
         };
 
         let mut actions = Vec::new();
@@ -454,6 +494,150 @@ impl<DB: Database> Engine<DB> {
             .get_checkpoint(previous_index)?
             .ok_or(BftLoopError::Engine(EngineError::NotInitialised))?;
         Ok(previous.end_validator_set_root)
+    }
+
+    /// Inspect every open BFT session and advance the round on
+    /// any whose current round has timed out.
+    ///
+    /// `now_secs` is the wall-clock Unix-second timestamp. A
+    /// session's round-timeout budget is
+    /// `bft_round_timeout_base_secs + round * bft_round_timeout_step_secs`
+    /// (both chain-spec constants). When the elapsed time since
+    /// `round_started_at_secs` exceeds that budget, the session's
+    /// `ChunkBft` advances to `round + 1`: vote accumulators reset,
+    /// the local validator's prevote on the new round is recorded
+    /// and emitted as [`BftAction::BroadcastPrevote`], the
+    /// aggregator role is re-derived, and the local
+    /// `round_started_at_secs` is reset to `now_secs`. The session
+    /// stays at `Stalled` (no further action) once
+    /// `bft_max_round` is reached so a partitioned network cannot
+    /// loop forever.
+    ///
+    /// Returns every action the caller must publish (re-broadcast
+    /// prevote per advancing session). Cheap when no session has
+    /// timed out — just a `BTreeMap` scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns any inner [`ChunkBft`] error from `advance_to_round`
+    /// (treated as fatal) or storage errors propagating from the
+    /// validator-set lookup.
+    #[allow(clippy::too_many_lines)] // Round-advance pipeline is intentionally inlined.
+    pub fn tick_bft_round_timeouts(
+        &mut self,
+        now_secs: u64,
+    ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
+        let consensus = &self.chain_spec().consensus;
+        let base = consensus.bft_round_timeout_base_secs;
+        let step = consensus.bft_round_timeout_step_secs;
+        let max_round = consensus.bft_max_round;
+        let chain_id = self.chain_spec().chain_id;
+        let active_validator_set_root = self.previous_validator_set_root()?;
+        let voter = self.local_voter.clone();
+        let finalized_seed = self.finalized_seed();
+        let expected_aggregators = consensus.expected_aggregators_per_round;
+        let active_set = self.active_validator_set().to_vec();
+
+        // Iterate `bft_sessions` mutably while computing aggregator
+        // membership against the engine's read-only state captured
+        // above. Collect chunk ids first to avoid a second borrow.
+        let chunk_ids: Vec<ChunkId> = self.bft_sessions.keys().copied().collect();
+        let mut actions = Vec::new();
+        for chunk_id in chunk_ids {
+            let Some(session) = self.bft_sessions.get_mut(&chunk_id) else {
+                continue;
+            };
+            if session.precommit_quorum_observed() {
+                // Already finalisable; round advance is moot.
+                continue;
+            }
+            let current_round = session.bft.round();
+            if current_round >= max_round {
+                continue;
+            }
+            let elapsed = now_secs.saturating_sub(session.round_started_at_secs);
+            let budget = base.saturating_add(u64::from(current_round).saturating_mul(step));
+            if elapsed < budget {
+                continue;
+            }
+            let new_round = current_round.saturating_add(1);
+            // Destructure the existing session so `bft` can be
+            // consumed by `advance_to_round` without partially
+            // moving out of `taken`. Reassemble the session with
+            // fresh accumulators and the advanced ChunkBft.
+            let taken = self
+                .bft_sessions
+                .remove(&chunk_id)
+                .expect("contains_key checked above");
+            let BftSession {
+                chunk_id: kept_chunk_id,
+                chunk_hash,
+                bft,
+                local: _,
+                peer_quorum: _,
+                is_local_aggregator: _,
+                subnet,
+                last_published_aggregate_prevote_stake: _,
+                last_published_aggregate_precommit_stake: _,
+                round_started_at_secs: _,
+            } = taken;
+            let advanced_bft = match bft.advance_to_round(new_round) {
+                Ok(b) => b,
+                Err(err) => return Err(BftLoopError::Bft(err)),
+            };
+            let is_local_aggregator = matches!(
+                neutrino_consensus_vrf::aggregator_committee(
+                    &active_set,
+                    &finalized_seed,
+                    kept_chunk_id,
+                    new_round,
+                    expected_aggregators,
+                ),
+                Ok(committee) if voter.as_ref().is_some_and(|v| {
+                    committee
+                        .iter()
+                        .any(|selection| selection.validator_index == v.validator_index())
+                })
+            );
+            let active_set_len = advanced_bft.active_set_len();
+            let mut session = BftSession {
+                chunk_id: kept_chunk_id,
+                chunk_hash,
+                bft: advanced_bft,
+                local: LocalVoteProgress::Idle,
+                peer_quorum: PeerQuorumProgress::BelowPrevote,
+                is_local_aggregator,
+                subnet,
+                last_published_aggregate_prevote_stake: 0,
+                last_published_aggregate_precommit_stake: 0,
+                round_started_at_secs: now_secs,
+            };
+            if let Some(local_voter) = voter.as_ref() {
+                let prevote = build_local_vote(
+                    kept_chunk_id,
+                    session.chunk_hash,
+                    new_round,
+                    FinalityVotePhase::Prevote,
+                    chain_id,
+                    local_voter,
+                    active_set_len,
+                );
+                session.bft.add_prevote(prevote.clone())?;
+                session.local = LocalVoteProgress::Prevoted;
+                actions.push(BftAction::BroadcastPrevote(prevote));
+            }
+            recompute_quorum_transitions(
+                &mut session,
+                voter.as_ref(),
+                chain_id,
+                active_validator_set_root,
+                active_set_len,
+                &mut actions,
+            )?;
+            emit_aggregator_actions(&mut session, &mut actions);
+            self.bft_sessions.insert(kept_chunk_id, session);
+        }
+        Ok(actions)
     }
 }
 
@@ -968,6 +1152,110 @@ mod tests {
         assert!(
             quorum_seen,
             "follower must observe quorum once 2/3 precommit stake arrives"
+        );
+    }
+
+    /// Pending-fix #4: a session whose round 0 fails to reach quorum
+    /// inside the chain spec's `bft_round_timeout_base_secs` budget
+    /// advances to round 1, re-publishes the local prevote on the
+    /// new round, and resets its accumulator. Idempotent: ticking
+    /// again before the round-1 timeout expires is a no-op.
+    #[test]
+    fn round_timeout_advances_session_and_emits_new_prevote() {
+        // 2 validators so a single prevote cannot reach the 2/3
+        // quorum and the round actually has to time out.
+        let spec = chain_spec_with(2);
+        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+
+        let chunk = dummy_chunk(0, engine.chain_spec().genesis_validator_set_root);
+
+        // Open session at t=0. Local voter prevotes on round 0.
+        let opening = engine
+            .open_bft_session_at(chunk, 0)
+            .expect("open bft session");
+        let round_0_prevotes = opening
+            .iter()
+            .filter(|a| matches!(a, BftAction::BroadcastPrevote(v) if v.data.round == 0))
+            .count();
+        assert_eq!(
+            round_0_prevotes, 1,
+            "session opens with a single round-0 prevote (got {opening:?})",
+        );
+
+        // Tick at t = base_timeout - 1 → no advance.
+        let base = engine.chain_spec().consensus.bft_round_timeout_base_secs;
+        let actions = engine
+            .tick_bft_round_timeouts(base.saturating_sub(1))
+            .expect("tick before timeout");
+        assert!(
+            actions.is_empty(),
+            "no actions before the timeout budget elapses (got {actions:?})",
+        );
+        assert_eq!(
+            engine.bft_session(0).expect("session present").round(),
+            0,
+            "still on round 0 before timeout"
+        );
+
+        // Tick at t = base_timeout → advance to round 1, re-publish
+        // the local prevote on the new round.
+        let actions = engine
+            .tick_bft_round_timeouts(base)
+            .expect("tick at timeout");
+        let round_1_prevote_count = actions
+            .iter()
+            .filter(|a| matches!(a, BftAction::BroadcastPrevote(v) if v.data.round == 1))
+            .count();
+        assert_eq!(
+            round_1_prevote_count, 1,
+            "round advance must re-emit a fresh prevote (got {actions:?})",
+        );
+        assert_eq!(
+            engine.bft_session(0).expect("session present").round(),
+            1,
+            "session advanced to round 1 after timeout"
+        );
+
+        // Tick again immediately → no advance (round-1 timeout has
+        // not elapsed yet).
+        let actions = engine.tick_bft_round_timeouts(base).expect("tick again");
+        assert!(
+            actions.is_empty(),
+            "no advance until round-1 timeout fires (got {actions:?})",
+        );
+    }
+
+    /// Confirm the max-round ceiling stops the session advancing
+    /// once it is reached. Useful so a chronically partitioned
+    /// network does not loop forever incrementing rounds.
+    #[test]
+    fn round_timeout_stops_advancing_past_max_round() {
+        let spec = chain_spec_with(2);
+        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+        let chunk = dummy_chunk(0, engine.chain_spec().genesis_validator_set_root);
+        engine.open_bft_session_at(chunk, 0).expect("open");
+
+        let max_round = engine.chain_spec().consensus.bft_max_round;
+        let base = engine.chain_spec().consensus.bft_round_timeout_base_secs;
+        let step = engine.chain_spec().consensus.bft_round_timeout_step_secs;
+
+        // Tick repeatedly with an ever-increasing now_secs so each
+        // round's `base + round * step` budget elapses. Advance
+        // until just past max_round.
+        let mut now = base;
+        for round in 0..(max_round.saturating_add(2)) {
+            engine.tick_bft_round_timeouts(now).expect("tick succeeds");
+            // Schedule next tick at the next round's budget.
+            now = now.saturating_add(
+                base.saturating_add(u64::from(round.saturating_add(1)).saturating_mul(step)),
+            );
+        }
+        let actual_round = engine.bft_session(0).expect("session present").round();
+        assert!(
+            actual_round <= max_round,
+            "session must not advance past max_round = {max_round}; got {actual_round}",
         );
     }
 }

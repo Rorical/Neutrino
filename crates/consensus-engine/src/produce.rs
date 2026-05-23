@@ -313,7 +313,16 @@ impl<DB: Database> Engine<DB> {
 
         // Persist: header, body, FSM state, witness, tip pointer.
         // Ordering mirrors `import_block` so a partial write is
-        // recoverable on restart (header → body → state → tip).
+        // recoverable on restart (header → body → state → tip). Also
+        // register the produced block in the fork-choice DAG so any
+        // sibling subsequently received by gossip lands in the same
+        // DAG and vote-driven head selection considers both.
+        // Should only fail if the parent is missing from the DAG
+        // (e.g. fresh-extending block built before the parent was
+        // visible). The local producer is the source of truth so we
+        // don't reject — fork-choice head() simply won't consider
+        // this block until the parent surfaces.
+        let _ = self.fork_choice.add_block(&block.header);
         self.store_mut().put_header(&block.header)?;
         self.store_mut().put_body(&block_hash, &block.body)?;
         self.store_mut()

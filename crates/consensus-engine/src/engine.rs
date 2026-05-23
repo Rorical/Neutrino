@@ -24,6 +24,7 @@ use crate::slashing::{
     verify_double_vote_evidence, verify_invalid_vrf_claim_evidence, verify_lock_violation_evidence,
 };
 use crate::store::{ChainStore, StoreError, pointers};
+use neutrino_consensus_fork_choice::ForkChoice;
 
 extern crate alloc;
 
@@ -84,6 +85,18 @@ pub struct Engine<DB: Database> {
     /// oldest entry when it fills up. Strictly bounded by
     /// [`MAX_REJECTED_PROOFS_CACHED`].
     pub(crate) rejected_proofs_order: VecDeque<BlockHash>,
+    /// Vote-weighted heaviest-proven-chain fork choice.
+    ///
+    /// Records every imported block — including non-extending
+    /// siblings and out-of-order arrivals — so multi-winner slots and
+    /// vote-driven head selection are representable. The engine's
+    /// `head_hash` / `head_state_root` continue to follow the
+    /// linearly-materialized chain (the in-memory state trie only
+    /// matches one tip); a divergent fork-choice head is observable
+    /// via [`Self::fork_choice_head`] but is not automatically
+    /// re-org'd. Full reorg materialisation is pending-fix #7 in
+    /// `docs/design/17-pending-fixes.md`.
+    pub(crate) fork_choice: ForkChoice,
 }
 
 /// Maximum cached rejected `BlockProof` envelopes.
@@ -147,6 +160,7 @@ impl<DB: Database> Engine<DB> {
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
+            fork_choice: ForkChoice::new(genesis_block_hash),
         })
     }
 
@@ -248,6 +262,13 @@ impl<DB: Database> Engine<DB> {
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
+            // Restart-resume rebuilds an empty fork-choice DAG anchored
+            // at the current finalized head; live siblings imported
+            // before the restart are dropped (they would not have been
+            // honest extensions anyway because the engine never had
+            // them in its materialized chain). The DAG re-populates as
+            // gossip catches up.
+            fork_choice: ForkChoice::new(finalized_head),
         })
     }
 
@@ -393,6 +414,44 @@ impl<DB: Database> Engine<DB> {
     #[must_use]
     pub fn active_validator_set(&self) -> &[Validator] {
         &self.active_validator_set
+    }
+
+    /// Borrow the fork-choice DAG.
+    ///
+    /// The DAG records every imported block including non-extending
+    /// siblings; the local materialized head ([`Self::head_hash`])
+    /// follows the linearly-applied chain. Callers that want the
+    /// vote-weighted heaviest-proven-chain head should call
+    /// [`Self::fork_choice_head`] instead of consulting the DAG
+    /// directly.
+    #[must_use]
+    pub const fn fork_choice(&self) -> &ForkChoice {
+        &self.fork_choice
+    }
+
+    /// Vote-weighted heaviest-proven-chain head per the fork-choice
+    /// DAG. May differ from [`Self::head_hash`] when a competing
+    /// branch has accumulated more vote weight than the locally
+    /// materialized chain; full reorg materialisation is pending-fix
+    /// #7 in `docs/design/17-pending-fixes.md`.
+    #[must_use]
+    pub fn fork_choice_head(&self) -> BlockHash {
+        self.fork_choice.head()
+    }
+
+    /// Mutable test-only hook into the fork-choice DAG.
+    ///
+    /// In production, fork-choice mutations are driven by
+    /// [`Self::import_block`], [`Self::import_block_proof`], and the
+    /// finalize-chunk path. Tests that want to inject votes or
+    /// promote proof status without round-tripping through a real
+    /// `ProofSystem` use this hook directly. The accessor is `pub`
+    /// because it is consumed by integration tests in `neutrino-node`
+    /// that live in a separate crate; production callers should
+    /// never reach for it.
+    #[doc(hidden)]
+    pub const fn fork_choice_mut_for_test(&mut self) -> &mut ForkChoice {
+        &mut self.fork_choice
     }
 
     /// Finalized seed currently used to evaluate VRF eligibility.

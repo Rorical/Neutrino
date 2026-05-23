@@ -22,6 +22,7 @@
 
 use core::fmt;
 
+use neutrino_consensus_fork_choice::{ForkChoiceError, ProofStatus};
 use neutrino_consensus_types::{
     Block, BlockProof, BlockProofPublicInputs, ChunkProof, RecursiveCheckpointProof,
     RecursiveProofPublicInputs,
@@ -320,35 +321,76 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
 impl<E: fmt::Debug + fmt::Display> std::error::Error for ImportError<E> {}
 
 impl<DB: Database> Engine<DB> {
-    /// Import a peer-supplied [`Block`] that extends the local head.
+    /// Import a peer-supplied [`Block`].
     ///
-    /// The block is stored in [`BlockState::BlockProduced`] (mirroring
-    /// the local-production path). Re-execution and state-root
-    /// verification are intentionally **not** performed; the trusted
-    /// state root from the peer header becomes the new local
-    /// `head_state_root`. Real verification arrives with M8.
+    /// Acceptance criteria:
+    ///
+    /// 1. The block's parent is either the genesis-block hash or
+    ///    already in the local store. Non-extending blocks (siblings
+    ///    of the local head, late arrivals on a competing branch) are
+    ///    now accepted into the fork-choice DAG; the previous strict
+    ///    "must extend the head" rule was a multi-winner-slot
+    ///    foot-gun and is removed.
+    /// 2. The header's slot timestamp is within
+    ///    [`MAX_HEADER_TIMESTAMP_DRIFT_SECS`] of the slot clock's
+    ///    expectation.
+    /// 3. Header signature + VRF eligibility verify against the
+    ///    active validator set.
+    /// 4. Body roots match the header's commitments.
+    /// 5. Empty-body blocks on a non-genesis parent have
+    ///    `runtime_extra == parent.runtime_extra` (defense-in-depth
+    ///    against forged validator-set roots; mutating bodies cannot
+    ///    be predicted without re-execution and rely on the SP1
+    ///    proof's cross-check).
+    ///
+    /// The block is persisted in [`BlockState::BlockProduced`].
+    /// Local head pointers (`head_hash`, `head_height`,
+    /// `head_state_root`) only advance when the block extends the
+    /// current materialized head — full reorg materialisation across
+    /// branches is pending-fix #7. The fork-choice DAG always
+    /// records the block so vote-driven head selection and BFT chunk
+    /// finalisation can target either branch.
     ///
     /// # Errors
     ///
-    /// Returns [`ImportError::HeightMismatch`] or
-    /// [`ImportError::ParentMismatch`] when the header does not extend
-    /// the local head, or [`ImportError::Store`] on a persistence
-    /// failure.
+    /// Returns [`ImportError::ParentMismatch`] when the parent is
+    /// unknown, [`ImportError::HeightMismatch`] when the block's
+    /// height is not `parent.height + 1`,
+    /// [`ImportError::HeaderTimestampOutOfRange`] /
+    /// [`ImportError::HeaderRuntimeExtraMismatch`] /
+    /// [`ImportError::HeaderSignature`] /
+    /// [`ImportError::HeaderVrf`] /
+    /// [`ImportError::BodyRootsMismatch`] on individual validation
+    /// failures, or [`ImportError::Store`] on persistence failure.
+    #[allow(clippy::too_many_lines)] // Validation pipeline is intentionally inlined.
     pub fn import_block(
         &mut self,
         block: &Block,
     ) -> Result<ImportBlockOutcome, ImportError<DB::Error>> {
-        let expected_height = self.head_height().saturating_add(1);
+        // Look up the parent header so we can check height-vs-parent
+        // and (later) runtime_extra-vs-parent. The genesis block
+        // hash is synthetic — there is no header for it — so it is
+        // handled as a special case below.
+        let parent_hash = block.header.parent_hash;
+        let parent_is_genesis = parent_hash == self.chain_spec().genesis_block_hash;
+        let parent_header = if parent_is_genesis {
+            None
+        } else {
+            let h = self.store().get_header(&parent_hash)?;
+            if h.is_none() {
+                return Err(ImportError::ParentMismatch {
+                    expected: self.head_hash(),
+                    actual: parent_hash,
+                });
+            }
+            h
+        };
+        let parent_height = parent_header.as_ref().map_or(0, |h| h.height);
+        let expected_height = parent_height.saturating_add(1);
         if block.header.height != expected_height {
             return Err(ImportError::HeightMismatch {
                 expected: expected_height,
                 actual: block.header.height,
-            });
-        }
-        if block.header.parent_hash != self.head_hash() {
-            return Err(ImportError::ParentMismatch {
-                expected: self.head_hash(),
-                actual: block.header.parent_hash,
             });
         }
 
@@ -385,15 +427,12 @@ impl<DB: Database> Engine<DB> {
         // cannot be predicted without re-execution; the SP1 proof
         // binds the real value via `BlockProofPublicInputs` so a
         // proposer cannot lie in the long run.
-        let parent_is_non_genesis =
-            block.header.parent_hash != self.chain_spec().genesis_block_hash;
         let body_is_empty = block.body.transactions.is_empty()
             && block.body.slashings.is_empty()
             && block.body.finality_votes.is_empty();
-        if parent_is_non_genesis && body_is_empty {
-            let parent_extra = self
-                .store()
-                .get_header(&block.header.parent_hash)?
+        if !parent_is_genesis && body_is_empty {
+            let parent_extra = parent_header
+                .as_ref()
                 .map_or(neutrino_primitives::ZERO_HASH, |h| h.runtime_extra);
             // ZERO_HASH stays accepted as the runtime's "no
             // commitment" marker still used by tests and pre-runtime
@@ -444,17 +483,50 @@ impl<DB: Database> Engine<DB> {
         }
 
         let hash = block.hash();
+
+        // Register in the fork-choice DAG. Any non-extending sibling
+        // imported in a multi-winner slot lands here so vote
+        // weighting can later pick the heaviest branch. Persist the
+        // header + body unconditionally; the FSM advances to
+        // `BlockProduced` regardless of whether this block extends
+        // the local materialised head.
+        self.fork_choice
+            .add_block(&block.header)
+            .map_err(|err| match err {
+                ForkChoiceError::UnknownParent(parent) => ImportError::ParentMismatch {
+                    expected: self.head_hash(),
+                    actual: parent,
+                },
+                _ => ImportError::ParentMismatch {
+                    expected: self.head_hash(),
+                    actual: parent_hash,
+                },
+            })?;
         self.store_mut().put_header(&block.header)?;
         self.store_mut().put_body(&hash, &block.body)?;
         self.store_mut()
             .put_block_state(&hash, BlockState::BlockProduced)?;
-        self.store_mut().put_tip(hash)?;
-        self.update_head_internal(block.header.height, hash, block.header.state_root);
-        // Followers do not re-execute (M8 territory) so this drains an
-        // empty trie buffer in practice. Producers replaying gossipped
-        // blocks could still have queued writes, so the call is
-        // unconditional.
-        self.flush_trie_to_store()?;
+
+        // Linear materialisation: advance the local head only when
+        // this block extends the current materialised tip. Branches
+        // that fork off an earlier ancestor stay in the DAG and the
+        // store but the in-memory state trie keeps following the
+        // linearly-applied chain. A future reorg materialisation
+        // pass (pending-fix #7) would walk the DAG and replay state
+        // from the new fork-choice head; today, an attempt to
+        // produce on top of a stale head would extend the existing
+        // chain — peers running the same fork-choice rule converge
+        // through gossip + vote weighting.
+        let extends_materialised_head = parent_hash == self.head_hash();
+        if extends_materialised_head {
+            self.store_mut().put_tip(hash)?;
+            self.update_head_internal(block.header.height, hash, block.header.state_root);
+            // Followers do not re-execute (M8 territory) so this drains
+            // an empty trie buffer in practice. Producers replaying
+            // gossipped blocks could still have queued writes, so the
+            // call is unconditional.
+            self.flush_trie_to_store()?;
+        }
 
         // If this header completes the covering range of a previously
         // imported recursive proof, advance the finalized seed now
@@ -465,7 +537,7 @@ impl<DB: Database> Engine<DB> {
 
         Ok(ImportBlockOutcome {
             block_hash: hash,
-            new_head_height: block.header.height,
+            new_head_height: self.head_height(),
             new_head_slot: block.header.slot,
         })
     }
@@ -530,6 +602,14 @@ impl<DB: Database> Engine<DB> {
                 _ => neutrino_consensus_types::ProofRejectionReason::VerifierRejected,
             };
             self.record_rejected_proof(canonical_hash, proof.clone(), reason);
+            // Notify the fork-choice DAG so the block (and every
+            // descendant) is excluded from `head()` candidates. The
+            // helper silently no-ops when the block hasn't been
+            // registered (e.g. unit tests that never called
+            // `import_block`).
+            let _ = self
+                .fork_choice
+                .on_block_proof(canonical_hash, ProofStatus::Invalid);
             return Err(ImportError::InvalidBlockProof(err));
         }
         // Successful import — clear any stale rejected-proof entry
@@ -546,6 +626,13 @@ impl<DB: Database> Engine<DB> {
             }
             Some(BlockState::ChunkProven | BlockState::Finalized | BlockState::Checkpointed) => {}
         }
+        // Promote the block from `PendingProof` to `Proven` in the
+        // fork-choice DAG. Branches built on top of unproven blocks
+        // are still excluded from `head()` — promotion to `Proven`
+        // lets them count.
+        let _ = self
+            .fork_choice
+            .on_block_proof(canonical_hash, ProofStatus::Proven);
 
         Ok(ImportBlockProofOutcome {
             block_hash: canonical_hash,

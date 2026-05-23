@@ -3766,6 +3766,7 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "neutrino-consensus-chunk-bft",
+ "neutrino-consensus-fork-choice",
  "neutrino-consensus-types",
  "neutrino-consensus-vrf",
  "neutrino-crypto",
@@ -3886,6 +3887,7 @@ dependencies = [
  "borsh",
  "ed25519-dalek",
  "neutrino-consensus-engine",
+ "neutrino-consensus-fork-choice",
  "neutrino-consensus-types",
  "neutrino-default-runtime-core",
  "neutrino-mempool",

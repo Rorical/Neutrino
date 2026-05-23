@@ -25,6 +25,7 @@ path = "src/main.rs"
 async-trait                       = "0.1.89"
 borsh.workspace                   = true
 neutrino-consensus-engine.workspace = true
+neutrino-consensus-fork-choice.workspace = true
 neutrino-consensus-types.workspace  = true
 neutrino-default-runtime-core.workspace = true
 neutrino-mempool.workspace        = true

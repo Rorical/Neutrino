@@ -89,13 +89,14 @@ pub struct Engine<DB: Database> {
     ///
     /// Records every imported block — including non-extending
     /// siblings and out-of-order arrivals — so multi-winner slots and
-    /// vote-driven head selection are representable. The engine's
-    /// `head_hash` / `head_state_root` continue to follow the
-    /// linearly-materialized chain (the in-memory state trie only
-    /// matches one tip); a divergent fork-choice head is observable
-    /// via [`Self::fork_choice_head`] but is not automatically
-    /// re-org'd. Full reorg materialisation is pending-fix #7 in
-    /// `docs/design/17-pending-fixes.md`.
+    /// vote-driven head selection are representable. After every
+    /// fork-choice mutation that could shift the head (block import,
+    /// proof import, vote ingest) the engine calls
+    /// [`Engine::materialise_to_fork_choice_head`] (pending-fix #12)
+    /// to replay the new branch through the executor and commit the
+    /// resulting state — so `head_hash` / `head_state_root` /
+    /// `self.state` track [`Self::fork_choice_head`] automatically on
+    /// nodes that have a block executor installed.
     pub(crate) fork_choice: ForkChoice,
 }
 

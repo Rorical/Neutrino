@@ -297,55 +297,60 @@ that light clients verify in one shot.
 
 ---
 
-## #12 Reorg materialisation across the DAG
+## #13 Wire `add_finalized_chunk` and `add_vote` into production
 
-**Severity:** liveness gap on multi-winner slots once executor
-mismatches happen.
+**Severity:** the reorg-materialisation hook landed for #12 only
+fires on `import_block` / `import_block_proof`. Two pieces of
+fork-choice plumbing remain test-only:
 
-**Symptom.** Pending-fix #2 wired fork choice into `Engine`, but
-the engine's linearly-materialised head (`head_hash` /
-`head_state_root` / `self.state`) only advances on blocks that
-extend the materialised tip. When the fork-choice DAG selects a
-different head (e.g. a sibling branch wins the vote-weighted
-contest), `Engine::fork_choice_head() != Engine::head_hash()` is
-observable but the engine does not re-org the materialised state
-trie to the new head.
+- `ForkChoice::add_finalized_chunk` is never called in production.
+  The DAG's finalised anchor stays at the genesis block hash for
+  the whole live session; chunks finalised via the BFT loop are
+  invisible to fork choice. The DAG grows unboundedly as sibling
+  branches accumulate.
+- `ForkChoice::add_vote` is never called in production. Vote-
+  weighted head selection is entirely test-driven via
+  `fork_choice_mut_for_test()`. In a live network the head
+  selection collapses to "extends-genesis-anchor + tie-break
+  (height, vrf, hash)" — finality votes from peers do not shift
+  the head.
 
-Consequences:
+**Symptom.** Without `add_vote` in production, the only way for
+fork choice to shift the head is via `ProofStatus::Invalid`
+demotion. Multi-winner slots where one branch attracts more
+votes than the other still resolve at the BFT layer (chunks
+finalise correctly) but the fork-choice's vote-weighted scoring
+sees no votes.
 
-- RPC clients reading `head_state_root` see the linearly-applied
-  branch, not the canonical fork-choice branch.
-- The producer's next `try_produce_block` extends the
-  linearly-applied branch, not the canonical one — so a node
-  that lost its branch never recovers without an external
-  intervention.
+Without `add_finalized_chunk`, the DAG's `block_extends` filter
+never gates out blocks below the finalised height, so a
+malicious peer could keep gossiping ancient siblings into the
+DAG forever.
 
-**Acceptance test.** Three nodes. Force a multi-winner slot
-(pin VRF seeds so both v0 and v1 win slot 1). All three nodes
-observe both candidate blocks. After ~3 slots' worth of vote
-weighting, fork choice settles on one branch; assert all three
-nodes' materialised head matches the fork-choice head.
+**Acceptance test.**
+1. Two-node localnet. Both validators sign / gossip prevotes +
+   precommits for slot 1's block as usual. After
+   `observe_finality_vote`, `Engine::fork_choice` must contain
+   a `ChunkVote` entry for that vote.
+2. After chunk 0 finalises, `Engine::fork_choice` must have
+   advanced its `finalized` anchor to the chunk's
+   `end_block_hash`, and `add_block` must reject a peer block
+   whose parent is below the new anchor.
 
 **Approach.**
-1. After every fork-choice update (`add_block` /
-   `set_proof_status` / `record_vote`), call a new
-   `materialise_to_fork_choice_head` helper.
-2. If `fork_choice_head() == head_hash()`, no-op.
-3. Otherwise, walk the DAG from the common ancestor of the two
-   heads down to the new fork-choice head, replaying every
-   block's body through the executor against the ancestor's
-   state trie. Commit the resulting trie via
-   `replace_state_internal` and update head pointers.
-4. The ancestor's state trie must be reconstructable. Use
-   `Trie::from_persisted(root, nodes, values)` over the
-   persisted `TrieNodes` / `StateValues` columns — same
-   primitive snap-sync uses today.
+1. In `Engine::observe_finality_vote` (or the per-call ingest
+   helpers it delegates to), after the BFT/slashing/quorum
+   bookkeeping, call `self.fork_choice.add_vote(validator_index,
+   ChunkVote { data: vote.data, weight })` where `weight` is the
+   stake-weighted contribution from the chain spec's active
+   validator set.
+2. In `Engine::finalize_chunk`, after `put_latest_finalized_chunk_id`
+   succeeds, call
+   `self.fork_choice.add_finalized_chunk(&chunk, &cert)`.
 
-**Out of scope here.** Pruning state nodes for branches the
-fork-choice abandons. The naive approach keeps every branch's
-state on disk; a future garbage-collection pass would reclaim
-abandoned-branch nodes once the fork-choice's finalised pointer
-moves past them.
+**Out of scope here.** Pruning state nodes for branches that the
+new finalised anchor invalidates — the materialised trie keeps
+serving but disk grows with each finalisation.
 
 ---
 
@@ -382,7 +387,9 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
   landing time the dry-run was guarded on
   `self.state.root() == self.head_state_root()` to preserve
   the follower invariant; the guard is now lifted by #11.
-- **#11 Follower state replay on import** — closed by this
+- **#11 Follower state replay on import** — closed by `4b4d9c8`
+  (`feat(consensus,node): follower state replay on import`).
+- **#12 Reorg materialisation across the DAG** — closed by this
   commit.
 
 ---
@@ -401,8 +408,10 @@ Active sprint (this iteration):
 
 Subsequent sprints (ordered):
 
-5. **#12 Reorg materialisation across the DAG** — unblocks
-   fork-choice-driven head replacement.
+5. **#13 Wire `add_finalized_chunk` and `add_vote` into production** —
+   makes fork-choice scoring + finalised-anchor handling actually
+   functional in a live network (until then the
+   reorg-materialisation hook only fires on Invalid demotion).
 6. **#8 Validator activation/exit epoch FSM** — depends on #1 +
    `RegisterValidator` wire format.
 7. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`

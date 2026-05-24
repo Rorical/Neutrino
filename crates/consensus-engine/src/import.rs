@@ -22,6 +22,8 @@
 
 use core::fmt;
 
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 use neutrino_consensus_fork_choice::{ForkChoiceError, ProofStatus};
 use neutrino_consensus_types::{
     Block, BlockProof, BlockProofPublicInputs, ChunkProof, RecursiveCheckpointProof,
@@ -34,8 +36,11 @@ use neutrino_primitives::{
 use neutrino_proof_system::{
     BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome, ProofError, ProofSystem,
 };
+
 use neutrino_storage::Database;
 use neutrino_trie::Trie;
+
+extern crate alloc;
 
 use crate::block_state::BlockState;
 use crate::body::{BodyRoots, compute_body_roots};
@@ -175,6 +180,20 @@ pub enum ImportError<E> {
     /// path is the canonical authority but we refuse to advance
     /// the head against an unverifiable claim.
     DryRunFailed(String),
+    /// Reorg materialisation refused because the lowest common
+    /// ancestor of the current head and the new fork-choice head
+    /// is below the finalised height. Pending-fix #12: the
+    /// engine never retracts finalised history, so a fork-choice
+    /// head that would require crossing the finalised line is
+    /// rejected and the materialised head stays put.
+    ReorgPastFinalized {
+        /// Height of the lowest common ancestor we would have
+        /// reorged back to.
+        lca_height: Height,
+        /// First height that is now finalised (and therefore
+        /// immutable). The LCA must be `>=` this value.
+        finalized_height: Height,
+    },
     /// Block proof references a block header that is not stored locally.
     UnknownBlock(BlockHash),
     /// Body lane roots derived from the supplied body do not match the header.
@@ -304,6 +323,14 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                 "dry-run gas_used {computed} does not match header gas_used {expected}",
             ),
             Self::DryRunFailed(msg) => write!(f, "dry-run executor failed: {msg}"),
+            Self::ReorgPastFinalized {
+                lca_height,
+                finalized_height,
+            } => write!(
+                f,
+                "reorg refused: lowest common ancestor at height {lca_height} \
+                 is below finalised height {finalized_height}",
+            ),
             Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
             Self::BodyRootsMismatch { header, computed } => write!(
                 f,
@@ -684,6 +711,17 @@ impl<DB: Database> Engine<DB> {
             self.flush_trie_to_store()?;
         }
 
+        // Pending-fix #12: the import may have shifted the
+        // fork-choice head off the linearly-materialised tip
+        // (e.g. a sibling that just arrived plus a vote-weight
+        // shift; in the no-vote case this branch is a no-op
+        // because tie-break favours the first-imported sibling).
+        // Materialise to the new head if the executor can replay.
+        // Errors abort the import; the head pointer + tip update
+        // above happens FIRST, so a failed reorg leaves the engine
+        // at the just-imported block, not at an inconsistent state.
+        self.materialise_to_fork_choice_head(executor)?;
+
         // If this header completes the covering range of a previously
         // imported recursive proof, advance the finalized seed now
         // so subsequent VRF-eligibility checks observe the right
@@ -777,7 +815,284 @@ impl<DB: Database> Engine<DB> {
         Ok(scratch)
     }
 
-    /// Import a peer-supplied block proof for an already-stored block.
+    /// Pending-fix #12: if the fork-choice DAG's head has diverged
+    /// from the linearly-materialised head, walk back to the lowest
+    /// common ancestor (LCA) of the two heads, reconstruct the
+    /// LCA's state trie from persisted nodes, then replay every
+    /// block on the new branch through `executor` against that
+    /// trie. The resulting trie + head pointers are committed in
+    /// lockstep so the engine's invariant
+    /// `self.state.root() == self.head_state_root()` survives the
+    /// reorg.
+    ///
+    /// No-op (returns `Ok(false)`) when:
+    ///
+    /// - `fork_choice.head() == self.head_hash()` — no divergence,
+    /// - `executor.is_none()` — followers without an executor cannot
+    ///   replay; the materialised head stays where it is (the
+    ///   fork-choice head is observable via
+    ///   [`Self::fork_choice_head`] for operators / RPC),
+    /// - the LCA is below the finalised height — refusing the
+    ///   reorg surfaces as `ImportError::ReorgPastFinalized`. The
+    ///   safety floor protects already-finalised history from any
+    ///   downstream bug in fork-choice scoring.
+    ///
+    /// Returns `Ok(true)` when the materialised head actually moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError::MissingParentHeader`] when the DAG
+    /// references a header the store does not have (corruption);
+    /// [`ImportError::ReorgPastFinalized`] when the LCA is below
+    /// the finalised height (refused reorg);
+    /// [`ImportError::DryRunFailed`] when the executor traps during
+    /// replay; [`ImportError::StateRootMismatch`] /
+    /// `ReceiptsRootMismatch` / `GasUsedMismatch` /
+    /// `HeaderRuntimeExtraMismatch` when a stored header's
+    /// commitments disagree with the local replay; or
+    /// [`ImportError::Store`] on persistence failure.
+    pub fn materialise_to_fork_choice_head(
+        &mut self,
+        executor: Option<&dyn ErasedBlockExecutor>,
+    ) -> Result<bool, ImportError<DB::Error>> {
+        let new_head = self.fork_choice.head();
+        if new_head == self.head_hash() {
+            return Ok(false);
+        }
+        let Some(executor) = executor else {
+            return Ok(false);
+        };
+
+        let (lca_hash, new_branch) = self.find_lca_and_path_to(new_head)?;
+        let (lca_state_root, lca_height) = self.lookup_block_state(lca_hash)?;
+
+        // Safety floor: refuse to retract finalised history. Today
+        // `fork_choice.add_finalized_chunk` is never called in
+        // production (a separate gap noted in the doc 17 audit), so
+        // the DAG's own anchor stays at genesis — meaning fork
+        // choice cannot itself enforce this. The check here is the
+        // engine-side belt to the DAG's missing braces.
+        if let Some(finalized_chunk_id) = self.latest_finalized_chunk_id() {
+            let chunk_size = self.chain_spec().consensus.chunk_size;
+            let finalized_height = finalized_chunk_id
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(chunk_size))
+                .unwrap_or(Height::MAX);
+            if lca_height < finalized_height {
+                return Err(ImportError::ReorgPastFinalized {
+                    lca_height,
+                    finalized_height,
+                });
+            }
+        }
+
+        // Reconstruct the LCA's state trie. The
+        // `iter_trie_nodes` / `iter_state_values` columns are
+        // content-addressed (union over every branch), so loading
+        // everything is correct — the trie only navigates nodes
+        // reachable from `lca_state_root`. Bigger working set than
+        // a per-root index would yield; acceptable for v1 because
+        // reorgs are rare.
+        let trie_nodes = self.store().iter_trie_nodes()?;
+        let state_values = self.store().iter_state_values()?;
+        let mut state = Trie::from_persisted(lca_state_root, trie_nodes, state_values);
+
+        // Replay forward through `new_branch`. On any cross-check
+        // mismatch we abandon the reorg — the materialised head
+        // stays where it was, the stored header is left as
+        // evidence, and the caller sees the variant-specific error.
+        let mut current_height = lca_height;
+        let mut current_hash = lca_hash;
+        let mut current_state_root = lca_state_root;
+        for block_hash in new_branch {
+            let header =
+                self.store()
+                    .get_header(&block_hash)?
+                    .ok_or(ImportError::MissingParentHeader {
+                        parent_hash: block_hash,
+                    })?;
+            let body =
+                self.store()
+                    .get_body(&block_hash)?
+                    .ok_or(ImportError::MissingParentHeader {
+                        parent_hash: block_hash,
+                    })?;
+
+            let proposer_position = usize::try_from(header.proposer_index)
+                .expect("u32 validator index fits usize on supported targets");
+            let proposer_address = self
+                .active_validator_set()
+                .get(proposer_position)
+                .map(|v| v.withdrawal_credentials)
+                .unwrap_or_default();
+            let ctx = BlockExecutionContext {
+                chain_id: self.chain_spec().chain_id,
+                block_height: header.height,
+                gas_limit: header.gas_limit,
+                gas_price: self.chain_spec().runtime.gas_price,
+                proposer_address,
+            };
+
+            let ExecutionOutcome {
+                state_root_after,
+                runtime_extra,
+                receipts_root,
+                gas_used,
+                witness_bytes: _,
+            } = executor
+                .execute_block(&ctx, &body, &mut state)
+                .map_err(ImportError::DryRunFailed)?;
+
+            if state_root_after != header.state_root {
+                return Err(ImportError::StateRootMismatch {
+                    expected: header.state_root,
+                    computed: state_root_after,
+                });
+            }
+            if runtime_extra != header.runtime_extra {
+                return Err(ImportError::HeaderRuntimeExtraMismatch {
+                    expected: header.runtime_extra,
+                    actual: runtime_extra,
+                });
+            }
+            if receipts_root != header.receipts_root {
+                return Err(ImportError::ReceiptsRootMismatch {
+                    expected: header.receipts_root,
+                    computed: receipts_root,
+                });
+            }
+            if gas_used != header.gas_used {
+                return Err(ImportError::GasUsedMismatch {
+                    expected: header.gas_used,
+                    computed: gas_used,
+                });
+            }
+
+            current_height = header.height;
+            current_hash = block_hash;
+            current_state_root = state_root_after;
+        }
+
+        // Commit. Replace state THEN advance the head pointers so
+        // the invariant `self.state.root() == self.head_state_root()`
+        // is maintained at every observable point.
+        self.replace_state_internal(state);
+        self.update_head_internal(current_height, current_hash, current_state_root);
+        self.store_mut().put_tip(current_hash)?;
+        self.flush_trie_to_store()?;
+        Ok(true)
+    }
+
+    /// Walk back from `new_head` and the current materialised head
+    /// via `parent_hash` until they meet at the lowest common
+    /// ancestor (LCA). Returns `(lca_hash, branch_from_lca_to_new_head)`
+    /// where the branch is ordered ancestor-first (LCA's immediate
+    /// child first, `new_head` last) and excludes the LCA itself.
+    ///
+    /// Both walks terminate at the chain-spec genesis block. The
+    /// genesis itself can be the LCA.
+    fn find_lca_and_path_to(
+        &self,
+        new_head: BlockHash,
+    ) -> Result<(BlockHash, Vec<BlockHash>), ImportError<DB::Error>> {
+        let current_head = self.head_hash();
+        let genesis = self.chain_spec().genesis_block_hash;
+
+        // Collect every ancestor of current_head (inclusive) so the
+        // walk from new_head can stop on first hit.
+        let mut current_ancestors: BTreeSet<BlockHash> = BTreeSet::new();
+        current_ancestors.insert(current_head);
+        let mut cursor = current_head;
+        while cursor != genesis {
+            let header =
+                self.store()
+                    .get_header(&cursor)?
+                    .ok_or(ImportError::MissingParentHeader {
+                        parent_hash: cursor,
+                    })?;
+            cursor = header.parent_hash;
+            current_ancestors.insert(cursor);
+        }
+
+        // Walk back from new_head until we hit a shared ancestor.
+        let mut new_branch_reversed: Vec<BlockHash> = Vec::new();
+        let mut cursor = new_head;
+        loop {
+            if current_ancestors.contains(&cursor) {
+                let mut new_branch = new_branch_reversed;
+                new_branch.reverse();
+                return Ok((cursor, new_branch));
+            }
+            new_branch_reversed.push(cursor);
+            if cursor == genesis {
+                // new_head's chain does not descend from genesis —
+                // should be impossible because every imported block
+                // is gated on parent presence in the store / DAG.
+                return Err(ImportError::MissingParentHeader {
+                    parent_hash: cursor,
+                });
+            }
+            let header =
+                self.store()
+                    .get_header(&cursor)?
+                    .ok_or(ImportError::MissingParentHeader {
+                        parent_hash: cursor,
+                    })?;
+            cursor = header.parent_hash;
+        }
+    }
+
+    /// Look up `(state_root, height)` for a block hash, returning
+    /// the genesis values when `hash` is the genesis-block hash
+    /// (which has no stored header).
+    fn lookup_block_state(
+        &self,
+        hash: BlockHash,
+    ) -> Result<(StateRoot, Height), ImportError<DB::Error>> {
+        if hash == self.chain_spec().genesis_block_hash {
+            return Ok((self.chain_spec().genesis_state_root, 0));
+        }
+        let header = self
+            .store()
+            .get_header(&hash)?
+            .ok_or(ImportError::MissingParentHeader { parent_hash: hash })?;
+        Ok((header.state_root, header.height))
+    }
+
+    /// Import a peer-supplied block proof for an already-stored
+    /// block. Equivalent to
+    /// `import_block_proof_with_dry_run_executor(proof, proof_system, None)`.
+    /// Followers / RPC-only nodes without a configured executor
+    /// use this entry point; the proof verifies but no reorg
+    /// materialisation runs on the (rare) case where the proof
+    /// shifts the fork-choice head.
+    pub fn import_block_proof<PS: ProofSystem>(
+        &mut self,
+        proof: &BlockProof,
+        proof_system: &PS,
+    ) -> Result<ImportBlockProofOutcome, ImportError<DB::Error>> {
+        self.import_block_proof_inner(proof, proof_system, None)
+    }
+
+    /// Companion to [`Self::import_block_proof`] that threads a
+    /// dynamic-runtime executor through to the post-proof reorg
+    /// materialisation step. Used by the production
+    /// [`ChainBackend`](../../../neutrino_node/struct.ChainBackend.html)
+    /// import path so a `ProofStatus::Invalid` mark (or, when
+    /// vote-feeding is wired up, a vote-weight shift triggered by
+    /// the proof's arrival) reorgs the materialised head to the
+    /// new fork-choice head automatically.
+    pub fn import_block_proof_with_dry_run<PS: ProofSystem>(
+        &mut self,
+        proof: &BlockProof,
+        proof_system: &PS,
+        executor: &dyn ErasedBlockExecutor,
+    ) -> Result<ImportBlockProofOutcome, ImportError<DB::Error>> {
+        self.import_block_proof_inner(proof, proof_system, Some(executor))
+    }
+
+    /// Shared body of [`Self::import_block_proof`] and
+    /// [`Self::import_block_proof_with_dry_run`].
     ///
     /// The proof envelope and public inputs are reconstructed against the
     /// canonical header in the local store before the active proof backend
@@ -790,10 +1105,11 @@ impl<DB: Database> Engine<DB> {
     /// Returns [`ImportError`] when the block is unknown, the proof is not
     /// bound to the canonical header, backend proof bytes fail to decode, proof
     /// verification fails, or persistence fails.
-    pub fn import_block_proof<PS: ProofSystem>(
+    fn import_block_proof_inner<PS: ProofSystem>(
         &mut self,
         proof: &BlockProof,
         proof_system: &PS,
+        executor: Option<&dyn ErasedBlockExecutor>,
     ) -> Result<ImportBlockProofOutcome, ImportError<DB::Error>> {
         let header = self
             .store()
@@ -845,6 +1161,13 @@ impl<DB: Database> Engine<DB> {
             let _ = self
                 .fork_choice
                 .on_block_proof(canonical_hash, ProofStatus::Invalid);
+            // Pending-fix #12: if our local materialised head was
+            // on the now-Invalid branch, the materialise step
+            // moves it off. Swallow materialise errors here so the
+            // caller sees the more important `InvalidBlockProof`
+            // error (the proof was bad; the materialise failure is
+            // a secondary symptom and the next import will retry).
+            let _ = self.materialise_to_fork_choice_head(executor);
             return Err(ImportError::InvalidBlockProof(err));
         }
         // Successful import — clear any stale rejected-proof entry
@@ -868,6 +1191,15 @@ impl<DB: Database> Engine<DB> {
         let _ = self
             .fork_choice
             .on_block_proof(canonical_hash, ProofStatus::Proven);
+
+        // Pending-fix #12: the proof status mutation may have
+        // promoted a non-canonical sibling above the linearly-
+        // materialised head in fork-choice scoring (e.g. our local
+        // head was Invalid'd above; or in the future,
+        // vote-weighted scoring shifts when a freshly proven
+        // chunk's votes start counting). Materialise to the new
+        // head if the executor can replay.
+        self.materialise_to_fork_choice_head(executor)?;
 
         Ok(ImportBlockProofOutcome {
             block_hash: canonical_hash,

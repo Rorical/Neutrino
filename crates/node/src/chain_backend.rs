@@ -404,6 +404,31 @@ where
         self.with_engine(|e| e.state().root() == e.head_state_root())
     }
 
+    /// Pending-fix #12: explicit trigger for reorg materialisation.
+    ///
+    /// Imports (block + proof) already call
+    /// `Engine::materialise_to_fork_choice_head` automatically;
+    /// this proxy is the operator-side / test-side surface for
+    /// situations where the fork-choice DAG has been mutated by
+    /// some other path (e.g. a chunk-level finalisation event, or
+    /// a future vote-feeding pipeline that runs out-of-band of an
+    /// import).
+    ///
+    /// Returns `true` when the materialised head actually moved.
+    /// Returns `false` when the fork-choice head already matches
+    /// the materialised head or when no executor is installed.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any [`SyncBackendError`] that the engine's
+    /// materialise step produces (executor trap, replay
+    /// mismatch, attempt to reorg past finalised history).
+    pub fn try_materialise_to_fork_choice_head(&self) -> Result<bool, SyncBackendError> {
+        let executor = self.block_executor_snapshot();
+        self.with_engine_mut(|e| e.materialise_to_fork_choice_head(executor.as_deref()))
+            .map_err(Self::map_import_err)
+    }
+
     /// Re-run the configured `ProofSystem::verify_block` against a
     /// peer-supplied `BlockProof` envelope. Returns `true` iff the
     /// proof passes verification.
@@ -1034,10 +1059,27 @@ where
     /// [`Engine::fork_choice_head`](neutrino_consensus_engine::Engine::fork_choice_head).
     /// May differ from the materialised `head_block_hash` returned
     /// by [`Self::local_status`] when a competing branch has
-    /// accumulated more vote weight; full reorg materialisation is
-    /// pending-fix #7.
+    /// accumulated more vote weight that has not yet been observed
+    /// by an import path. Imports auto-trigger
+    /// [`Self::try_materialise_to_fork_choice_head`]
+    /// (pending-fix #12) to converge the two heads.
     pub fn fork_choice_head(&self) -> BlockHash {
         self.with_engine(neutrino_consensus_engine::Engine::fork_choice_head)
+    }
+
+    /// Test-only mutable engine accessor. `#[doc(hidden)]` because
+    /// real callers should always go through the typed import /
+    /// production paths; this exists only so cross-crate
+    /// integration tests can drive low-level fork-choice
+    /// scenarios (e.g. inject votes via
+    /// [`Engine::fork_choice_mut_for_test`]) without bypassing
+    /// the backend's mutex.
+    #[doc(hidden)]
+    pub fn with_engine_mut_for_test<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut neutrino_consensus_engine::Engine<DB>) -> R,
+    {
+        self.with_engine_mut(f)
     }
 
     /// FSM state of the block at `hash`, if it has been observed.
@@ -1760,9 +1802,26 @@ where
                     proof.height, expected_height
                 )));
             }
-            let outcome = self
-                .with_engine_mut(|e| e.import_block_proof(&proof, &self.proof_system))
-                .map_err(Self::map_import_err)?;
+            // Pending-fix #12: route through the executor-equipped
+            // variant so a proof-driven `ProofStatus::Invalid`
+            // demotion of our materialised head (or, future,
+            // vote-weight shift) reorgs the materialised state
+            // trie to the new fork-choice head. Executor-less
+            // backends keep the prior behaviour.
+            let proof_ref = &proof;
+            let import_result = self.block_executor_snapshot().map_or_else(
+                || self.with_engine_mut(|e| e.import_block_proof(proof_ref, &self.proof_system)),
+                |executor| {
+                    self.with_engine_mut(|e| {
+                        e.import_block_proof_with_dry_run(
+                            proof_ref,
+                            &self.proof_system,
+                            executor.as_ref(),
+                        )
+                    })
+                },
+            );
+            let outcome = import_result.map_err(Self::map_import_err)?;
             last_height = Some(outcome.height);
             imported_heights.push(outcome.height);
             expected_height = expected_height.saturating_add(1);

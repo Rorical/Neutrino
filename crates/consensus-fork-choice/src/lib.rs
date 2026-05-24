@@ -234,6 +234,27 @@ impl ForkChoice {
         Ok(())
     }
 
+    /// Number of distinct validators with at least one recorded
+    /// vote in this fork-choice instance. Diagnostic helper used
+    /// by integration tests / operator probes to verify that the
+    /// vote ingestion pipeline is feeding fork-choice in
+    /// production (pending-fix #13).
+    #[must_use]
+    pub fn vote_count(&self) -> usize {
+        self.votes.len()
+    }
+
+    /// Lookup the latest recorded vote from `validator`, if any.
+    /// `#[doc(hidden)]` because production callers should drive
+    /// fork-choice through the typed API (`add_vote`, `head`,
+    /// `add_finalized_chunk`); this exists for tests that need
+    /// to assert which chunk a particular validator has voted on.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn vote_for_validator(&self, validator: ValidatorIndex) -> Option<&ChunkVote> {
+        self.votes.get(&validator)
+    }
+
     /// Returns the current fork-choice head.
     pub fn head(&self) -> BlockHash {
         self.blocks

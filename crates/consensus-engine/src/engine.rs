@@ -440,6 +440,31 @@ impl<DB: Database> Engine<DB> {
         self.fork_choice.head()
     }
 
+    /// Current fork-choice finalised anchor. Returns the
+    /// chain-spec genesis block hash before any chunk has been
+    /// finalised, and the most-recently-finalised chunk's
+    /// `end_block_hash` afterwards (pending-fix #13 wires
+    /// [`Engine::finalize_chunk`] to advance this).
+    ///
+    /// `head()` candidates that do not descend from this hash are
+    /// excluded from fork-choice scoring, so an operator that
+    /// observes a stale anchor here knows reorgs across already-
+    /// finalised history are still possible — useful for catching
+    /// the symptom if `add_finalized_chunk` regresses.
+    #[must_use]
+    pub const fn fork_choice_finalized(&self) -> BlockHash {
+        self.fork_choice.finalized()
+    }
+
+    /// Number of distinct validators whose latest vote is
+    /// recorded in fork-choice's scoring map. Diagnostic helper
+    /// for integration tests asserting the vote ingest path
+    /// (pending-fix #13) is wired.
+    #[must_use]
+    pub fn fork_choice_vote_count(&self) -> usize {
+        self.fork_choice.vote_count()
+    }
+
     /// Mutable test-only hook into the fork-choice DAG.
     ///
     /// In production, fork-choice mutations are driven by

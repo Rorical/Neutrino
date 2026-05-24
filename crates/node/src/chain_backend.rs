@@ -1067,6 +1067,23 @@ where
         self.with_engine(neutrino_consensus_engine::Engine::fork_choice_head)
     }
 
+    /// Current fork-choice finalised anchor (the hash below which
+    /// no DAG reorg is possible). Returns the chain-spec genesis
+    /// block hash until the first chunk finalises and pending-fix
+    /// #13's `add_finalized_chunk` wiring advances it.
+    ///
+    /// Used by integration tests + operator-side health probes
+    /// to confirm the finalisation pipeline is feeding fork choice.
+    pub fn fork_choice_finalized(&self) -> BlockHash {
+        self.with_engine(neutrino_consensus_engine::Engine::fork_choice_finalized)
+    }
+
+    /// Distinct-validator vote count currently recorded in
+    /// fork-choice's scoring map (pending-fix #13). Diagnostic.
+    pub fn fork_choice_vote_count(&self) -> usize {
+        self.with_engine(neutrino_consensus_engine::Engine::fork_choice_vote_count)
+    }
+
     /// Test-only mutable engine accessor. `#[doc(hidden)]` because
     /// real callers should always go through the typed import /
     /// production paths; this exists only so cross-crate

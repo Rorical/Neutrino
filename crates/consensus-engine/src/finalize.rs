@@ -250,6 +250,26 @@ impl<DB: Database> Engine<DB> {
         self.store_mut().put_finalized_head(end_block_hash)?;
         self.update_finalization_pointers(chunk_id, end_block_hash);
 
+        // Pending-fix #13: advance the fork-choice DAG's finalised
+        // anchor in lockstep with the engine's. After this call,
+        // `fork_choice.head()` candidates that do not descend from
+        // `end_block_hash` are filtered out, and any DAG sibling
+        // below the new anchor cannot win head selection.
+        //
+        // Errors are intentionally swallowed: by construction
+        // `chunk_hash` was just derived from `chunk.hash()` and
+        // bound into the same certificate (impossible to disagree),
+        // and `chunk.end_block_hash` was registered into the DAG
+        // by either the producer (`produce.rs:fork_choice.add_block`)
+        // or the importer (`import.rs:fork_choice.add_block`) before
+        // this chunk could reach `Finalized`. The persisted store
+        // pointers above have already committed — surfacing a
+        // post-persistence error here would leave on-disk state
+        // inconsistent with the in-memory DAG. Matches the
+        // existing pattern at `import.rs:870` for
+        // `fork_choice.on_block_proof`.
+        let _ = self.fork_choice.add_finalized_chunk(&chunk, &finality_cert);
+
         Ok(FinalizeOutcome {
             chunk,
             chunk_hash,

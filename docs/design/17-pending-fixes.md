@@ -297,63 +297,6 @@ that light clients verify in one shot.
 
 ---
 
-## #13 Wire `add_finalized_chunk` and `add_vote` into production
-
-**Severity:** the reorg-materialisation hook landed for #12 only
-fires on `import_block` / `import_block_proof`. Two pieces of
-fork-choice plumbing remain test-only:
-
-- `ForkChoice::add_finalized_chunk` is never called in production.
-  The DAG's finalised anchor stays at the genesis block hash for
-  the whole live session; chunks finalised via the BFT loop are
-  invisible to fork choice. The DAG grows unboundedly as sibling
-  branches accumulate.
-- `ForkChoice::add_vote` is never called in production. Vote-
-  weighted head selection is entirely test-driven via
-  `fork_choice_mut_for_test()`. In a live network the head
-  selection collapses to "extends-genesis-anchor + tie-break
-  (height, vrf, hash)" — finality votes from peers do not shift
-  the head.
-
-**Symptom.** Without `add_vote` in production, the only way for
-fork choice to shift the head is via `ProofStatus::Invalid`
-demotion. Multi-winner slots where one branch attracts more
-votes than the other still resolve at the BFT layer (chunks
-finalise correctly) but the fork-choice's vote-weighted scoring
-sees no votes.
-
-Without `add_finalized_chunk`, the DAG's `block_extends` filter
-never gates out blocks below the finalised height, so a
-malicious peer could keep gossiping ancient siblings into the
-DAG forever.
-
-**Acceptance test.**
-1. Two-node localnet. Both validators sign / gossip prevotes +
-   precommits for slot 1's block as usual. After
-   `observe_finality_vote`, `Engine::fork_choice` must contain
-   a `ChunkVote` entry for that vote.
-2. After chunk 0 finalises, `Engine::fork_choice` must have
-   advanced its `finalized` anchor to the chunk's
-   `end_block_hash`, and `add_block` must reject a peer block
-   whose parent is below the new anchor.
-
-**Approach.**
-1. In `Engine::observe_finality_vote` (or the per-call ingest
-   helpers it delegates to), after the BFT/slashing/quorum
-   bookkeeping, call `self.fork_choice.add_vote(validator_index,
-   ChunkVote { data: vote.data, weight })` where `weight` is the
-   stake-weighted contribution from the chain spec's active
-   validator set.
-2. In `Engine::finalize_chunk`, after `put_latest_finalized_chunk_id`
-   succeeds, call
-   `self.fork_choice.add_finalized_chunk(&chunk, &cert)`.
-
-**Out of scope here.** Pruning state nodes for branches that the
-new finalised anchor invalidates — the materialised trie keeps
-serving but disk grows with each finalisation.
-
----
-
 ## #10 Recursive checkpoint proof + light client
 
 **Severity:** deferred by design (per doc 14). Not required for
@@ -389,8 +332,10 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
   the follower invariant; the guard is now lifted by #11.
 - **#11 Follower state replay on import** — closed by `4b4d9c8`
   (`feat(consensus,node): follower state replay on import`).
-- **#12 Reorg materialisation across the DAG** — closed by this
-  commit.
+- **#12 Reorg materialisation across the DAG** — closed by `32272bf`
+  (`feat(consensus,node): reorg materialisation`).
+- **#13 Wire `add_finalized_chunk` and `add_vote` into production** —
+  closed by this commit.
 
 ---
 
@@ -408,19 +353,15 @@ Active sprint (this iteration):
 
 Subsequent sprints (ordered):
 
-5. **#13 Wire `add_finalized_chunk` and `add_vote` into production** —
-   makes fork-choice scoring + finalised-anchor handling actually
-   functional in a live network (until then the
-   reorg-materialisation hook only fires on Invalid demotion).
-6. **#8 Validator activation/exit epoch FSM** — depends on #1 +
+5. **#8 Validator activation/exit epoch FSM** — depends on #1 +
    `RegisterValidator` wire format.
-7. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`
+6. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`
    path) — depends on #2 fork choice.
 
 Deferred (per doc 14, no accepted design yet):
 
-8. **#9 Chunk proof aggregation**
-9. **#10 Recursive checkpoint proof + light client**
+7. **#9 Chunk proof aggregation**
+8. **#10 Recursive checkpoint proof + light client**
 
 `DaCommitmentFraud` under #6 is also deferred until DA ingest exists
 (post-v1).

@@ -37,8 +37,9 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use neutrino_consensus_chunk_bft::{BftError, ChunkBft};
+use neutrino_consensus_fork_choice::ChunkVote;
 use neutrino_consensus_types::{Chunk, FinalityVote, FinalityVoteData, FinalityVotePhase};
-use neutrino_primitives::{BitVec, ChainId, ChunkHash, ChunkId};
+use neutrino_primitives::{BitVec, ChainId, ChunkHash, ChunkId, ValidatorIndex};
 use neutrino_storage::Database;
 
 use crate::engine::Engine;
@@ -429,6 +430,10 @@ impl<DB: Database> Engine<DB> {
         emit_aggregator_actions(&mut session, &mut actions);
 
         self.bft_sessions.insert(chunk_id, session);
+        // Pending-fix #13: feed the local prevote (and any
+        // round-0 precommit if recompute_quorum_transitions
+        // already crossed prevote quorum) into fork-choice.
+        self.feed_broadcast_actions_to_fork_choice(&actions);
         Ok(actions)
     }
 
@@ -459,26 +464,116 @@ impl<DB: Database> Engine<DB> {
         }
         let chain_id = self.chain_spec().chain_id;
         let active_validator_set_root = self.previous_validator_set_root()?;
-        let session = self
-            .bft_sessions
-            .get_mut(&chunk_id)
-            .expect("contains_key checked above");
-        let active_set_len = session.bft.active_set_len();
-        match vote.data.phase {
-            FinalityVotePhase::Prevote => session.bft.add_prevote(vote)?,
-            FinalityVotePhase::Precommit => session.bft.add_precommit(vote)?,
-        }
+
+        // Pending-fix #13: snapshot the peer vote's signers before
+        // the phase-routing match consumes `vote`. The snapshot is
+        // fed into fork-choice only after the BFT layer accepts the
+        // vote (`?` propagation below would discard it otherwise).
+        let peer_contributions = self.snapshot_vote_signers_for_fork_choice(&vote);
+        let peer_vote_data = vote.data.clone();
+
         let mut actions = Vec::new();
-        recompute_quorum_transitions(
-            session,
-            self.local_voter.as_ref(),
-            chain_id,
-            active_validator_set_root,
-            active_set_len,
-            &mut actions,
-        )?;
-        emit_aggregator_actions(session, &mut actions);
+        {
+            let session = self
+                .bft_sessions
+                .get_mut(&chunk_id)
+                .expect("contains_key checked above");
+            let active_set_len = session.bft.active_set_len();
+            match vote.data.phase {
+                FinalityVotePhase::Prevote => session.bft.add_prevote(vote)?,
+                FinalityVotePhase::Precommit => session.bft.add_precommit(vote)?,
+            }
+            recompute_quorum_transitions(
+                session,
+                self.local_voter.as_ref(),
+                chain_id,
+                active_validator_set_root,
+                active_set_len,
+                &mut actions,
+            )?;
+            emit_aggregator_actions(session, &mut actions);
+        }
+
+        // Feed the peer vote AND every newly-emitted local
+        // broadcast vote (prevote on session open / round advance,
+        // precommit on prevote-quorum) into fork-choice. The
+        // session borrow is dropped, so `&mut self.fork_choice`
+        // is freely available.
+        self.add_vote_signers_to_fork_choice(&peer_contributions, &peer_vote_data);
+        self.feed_broadcast_actions_to_fork_choice(&actions);
+
         Ok(actions)
+    }
+
+    /// Snapshot `(validator_index, effective_stake)` for every
+    /// signer of `vote` (one per set bit in `aggregation_bits`).
+    /// Mirrors the exclusion rules `ChunkBft::vote_stake` applies:
+    /// slashed validators and zero-stake validators contribute
+    /// nothing — fork-choice scoring stays in lockstep with
+    /// BFT-quorum accounting.
+    fn snapshot_vote_signers_for_fork_choice(
+        &self,
+        vote: &FinalityVote,
+    ) -> Vec<(ValidatorIndex, u64)> {
+        let bit_len = vote.aggregation_bits.bit_len();
+        self.active_validator_set()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, validator)| {
+                let idx_u32 = u32::try_from(index).ok()?;
+                if idx_u32 >= bit_len {
+                    return None;
+                }
+                if !vote.aggregation_bits.get(idx_u32).unwrap_or(false) {
+                    return None;
+                }
+                if validator.slashed || validator.effective_stake == 0 {
+                    return None;
+                }
+                Some((idx_u32, validator.effective_stake))
+            })
+            .collect()
+    }
+
+    /// Feed a pre-snapshotted (signer, weight) pair list plus a
+    /// shared `FinalityVoteData` payload into the fork-choice DAG.
+    /// One `add_vote` call per signer — fork-choice keys votes by
+    /// validator index, so later votes replace prior entries.
+    fn add_vote_signers_to_fork_choice(
+        &mut self,
+        signers: &[(ValidatorIndex, u64)],
+        data: &FinalityVoteData,
+    ) {
+        for (validator_index, weight) in signers {
+            self.fork_choice.add_vote(
+                *validator_index,
+                ChunkVote {
+                    data: data.clone(),
+                    weight: *weight,
+                },
+            );
+        }
+    }
+
+    /// Pending-fix #13: feed every `BroadcastPrevote` /
+    /// `BroadcastPrecommit` action in `actions` into fork-choice.
+    /// Used at the end of every public BFT-loop entry point so
+    /// the local validator's own vote populates fork-choice
+    /// alongside peer votes. The `PublishAggregate*` variants are
+    /// re-published unions of partial votes the local node
+    /// observed; their per-signer contributions are already fed
+    /// via the per-vote ingest paths, so they are skipped here.
+    fn feed_broadcast_actions_to_fork_choice(&mut self, actions: &[BftAction]) {
+        for action in actions {
+            let vote_ref = match action {
+                BftAction::BroadcastPrevote(v) | BftAction::BroadcastPrecommit(v) => v,
+                BftAction::PublishAggregatePrevote { .. }
+                | BftAction::PublishAggregatePrecommit { .. }
+                | BftAction::QuorumReached(_) => continue,
+            };
+            let signers = self.snapshot_vote_signers_for_fork_choice(vote_ref);
+            self.add_vote_signers_to_fork_choice(&signers, &vote_ref.data);
+        }
     }
 
     /// Read the validator-set root committed by the previous
@@ -637,6 +732,11 @@ impl<DB: Database> Engine<DB> {
             emit_aggregator_actions(&mut session, &mut actions);
             self.bft_sessions.insert(kept_chunk_id, session);
         }
+        // Pending-fix #13: feed any new-round local prevotes /
+        // precommits emitted by the timeout pipeline into
+        // fork-choice. Per-validator de-dup means a round-N vote
+        // replaces a round-(N-1) vote from the same validator.
+        self.feed_broadcast_actions_to_fork_choice(&actions);
         Ok(actions)
     }
 }
@@ -973,6 +1073,86 @@ mod tests {
         let actions = engine.observe_finality_vote(orphan_vote).expect("no error");
         assert!(actions.is_empty(), "orphan votes are silently dropped");
         assert!(engine.bft_session(99).is_none());
+    }
+
+    /// Pending-fix #13: every accepted finality vote feeds the
+    /// fork-choice DAG with one `ChunkVote` per signer. Single-
+    /// signer votes contribute exactly one entry; aggregate votes
+    /// contribute one entry per set bit. The recorded weight is
+    /// the validator's `effective_stake` (matching `vote_stake`).
+    #[test]
+    fn observe_finality_vote_feeds_fork_choice() {
+        let spec = chain_spec_with(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let _ = engine
+            .open_bft_session(chunk.clone())
+            .expect("open session");
+        // Opening the session emits v0's prevote internally, which
+        // also flows through `observe_finality_vote` semantics — so
+        // v0's vote should already be in fork-choice.
+        assert_eq!(
+            engine.fork_choice_vote_count(),
+            1,
+            "session open must feed v0's local prevote into fork choice (got {})",
+            engine.fork_choice_vote_count(),
+        );
+
+        // Feed v1's prevote — fork-choice gains a second entry.
+        let v1_prevote = build_local_vote(
+            0,
+            chunk.hash(),
+            0,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        engine
+            .observe_finality_vote(v1_prevote)
+            .expect("ingest v1 prevote");
+        assert_eq!(
+            engine.fork_choice_vote_count(),
+            2,
+            "v1's prevote must record into fork choice (got {})",
+            engine.fork_choice_vote_count(),
+        );
+
+        // v1's subsequent precommit REPLACES the v1 prevote entry
+        // (one slot per validator in fork_choice.votes), not appends.
+        let v1_precommit = build_local_vote(
+            0,
+            chunk.hash(),
+            0,
+            FinalityVotePhase::Precommit,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        engine
+            .observe_finality_vote(v1_precommit)
+            .expect("ingest v1 precommit");
+        assert_eq!(
+            engine.fork_choice_vote_count(),
+            2,
+            "v1's precommit replaces v1's prevote entry; count stays at 2 (got {})",
+            engine.fork_choice_vote_count(),
+        );
+
+        // The stored entry for v1 must reflect the latest phase and
+        // the canonical stake weight.
+        let v1_vote = engine
+            .fork_choice()
+            .vote_for_validator(1)
+            .expect("v1's vote present");
+        assert_eq!(v1_vote.data.chunk_id, 0);
+        assert_eq!(v1_vote.data.phase, FinalityVotePhase::Precommit);
+        assert_eq!(
+            v1_vote.weight, spec.initial_validators[1].effective_stake,
+            "fork-choice weight must equal v1's effective_stake",
+        );
     }
 
     #[test]

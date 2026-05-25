@@ -27,6 +27,7 @@ borsh.workspace                   = true
 neutrino-consensus-engine.workspace = true
 neutrino-consensus-fork-choice.workspace = true
 neutrino-consensus-types.workspace  = true
+neutrino-crypto.workspace           = true
 neutrino-default-runtime-core.workspace = true
 neutrino-mempool.workspace        = true
 neutrino-network.workspace        = true

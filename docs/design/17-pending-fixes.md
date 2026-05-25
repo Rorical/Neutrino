@@ -261,27 +261,6 @@ nodes.
 
 ---
 
-## #8 Validator activation/exit epoch FSM
-
-**Severity:** correctness for staking economics; cosmetic until
-real onboarding lands.
-
-**Symptom.** `Validator { activation_epoch, exit_epoch, last_active_chunk }`
-(`crates/primitives/src/lib.rs:447-452`) — no code consults any of
-these fields. Every fixture sets `activation_epoch: 0, exit_epoch:
-u64::MAX`.
-
-**Approach.** Define `Epoch = ChunkSize * EpochLengthInChunks`.
-Validators added through `Transaction::RegisterValidator` enter the
-queue at epoch E and become active at E + ACTIVATION_DELAY. Exiting
-validators go inactive at E + EXIT_DELAY. The fork-choice + BFT
-quorum weighting both filter by the per-epoch active set.
-
-Depends on: item #1 (cross-layer rotation), and a
-`Transaction::RegisterValidator` wire format.
-
----
-
 ## #9 Chunk proof aggregation
 
 **Severity:** deferred by design (per doc 14). Not required for
@@ -335,7 +314,10 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
 - **#12 Reorg materialisation across the DAG** — closed by `32272bf`
   (`feat(consensus,node): reorg materialisation`).
 - **#13 Wire `add_finalized_chunk` and `add_vote` into production** —
-  closed by this commit.
+  closed by `1cbd667`
+  (`feat(consensus,node): wire fork-choice into production`).
+- **#8 Validator activation/exit epoch FSM** — closed by this
+  commit.
 
 ---
 
@@ -353,15 +335,13 @@ Active sprint (this iteration):
 
 Subsequent sprints (ordered):
 
-5. **#8 Validator activation/exit epoch FSM** — depends on #1 +
-   `RegisterValidator` wire format.
-6. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`
+5. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`
    path) — depends on #2 fork choice.
 
 Deferred (per doc 14, no accepted design yet):
 
-7. **#9 Chunk proof aggregation**
-8. **#10 Recursive checkpoint proof + light client**
+6. **#9 Chunk proof aggregation**
+7. **#10 Recursive checkpoint proof + light client**
 
 `DaCommitmentFraud` under #6 is also deferred until DA ingest exists
 (post-v1).

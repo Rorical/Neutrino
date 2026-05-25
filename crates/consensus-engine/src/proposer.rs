@@ -103,6 +103,21 @@ impl ProposerKey {
         self.secret_key.sign(message)
     }
 
+    /// Produce the BLS proof-of-possession over this key's own
+    /// public key under the `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO
+    /// _POP_` DST. The signed payload is exactly
+    /// `self.public_key_bytes()`, matching what
+    /// [`PublicKey::verify_pop`](neutrino_crypto::bls::PublicKey::verify_pop)
+    /// expects.
+    ///
+    /// Used by validator operators preparing a
+    /// `Transaction::RegisterValidator` to bind their fresh BLS
+    /// identity to the on-chain registration (pending-fix #8).
+    #[must_use]
+    pub fn prove_possession(&self) -> Signature {
+        self.secret_key.prove_possession()
+    }
+
     /// Borrow the underlying BLS secret key. Crate-internal so
     /// modules that need to call into `neutrino-vrf::eval` (which
     /// requires the raw key) can do so without re-deriving it.

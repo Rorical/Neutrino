@@ -45,8 +45,10 @@ use neutrino_consensus_types::{
     Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
     SlashingEvidence,
 };
+use neutrino_crypto::bls::{PublicKey as BlsPublicKey, Signature as BlsSignature};
 use neutrino_default_runtime_core::{
-    LeakTx, QUERY_METHOD_VALIDATOR_SET, SlashTx, Transaction as RuntimeTransaction, ValidatorSet,
+    LeakTx, QUERY_METHOD_VALIDATOR_REGISTRATIONS, QUERY_METHOD_VALIDATOR_SET, SlashTx,
+    Transaction as RuntimeTransaction, ValidatorRegistrations, ValidatorSet,
 };
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
@@ -59,7 +61,7 @@ use neutrino_network::rpc::{
 use neutrino_network::service::NetworkCommand;
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Epoch, Hash, Height, Slot, StateRoot,
     Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
@@ -226,6 +228,283 @@ fn encode_slashing_as_tx(
         }))
         .expect("borsh encode Transaction::Slash never fails"),
     )
+}
+
+/// Query the runtime for its current `ValidatorSet` (stake by
+/// address). Used by the rotation bridge in pending-fix #1.
+fn query_runtime_validator_set(
+    executor: &dyn ErasedBlockExecutor,
+    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Blake3Hasher>,
+) -> Result<ValidatorSet, String> {
+    let request = neutrino_runtime_abi::QueryRequest {
+        method: QUERY_METHOD_VALIDATOR_SET.to_string(),
+        args: Vec::new(),
+    };
+    let response = executor
+        .query(&request, state_snapshot)
+        .map_err(|err| format!("runtime validator_set query failed: {err}"))?;
+    if response.code != neutrino_runtime_abi::QueryStatus::Ok.as_u32() {
+        return Err(format!(
+            "runtime validator_set query returned status {}",
+            response.code
+        ));
+    }
+    borsh::from_slice(&response.payload)
+        .map_err(|err| format!("runtime validator_set borsh decode failed: {err}"))
+}
+
+/// Query the runtime for its current `ValidatorRegistrations` (BLS
+/// pubkey + POP keyed by address). Used by the rotation bridge in
+/// pending-fix #8.
+///
+/// Tolerates `UnknownMethod` by returning an empty registry — runtimes
+/// older than the pending-fix #8 wire bump do not implement this
+/// query, and treating "missing" as "empty" lets the bridge keep
+/// running against legacy runtimes (the activation FSM simply
+/// degenerates to "no new validators").
+fn query_runtime_validator_registrations(
+    executor: &dyn ErasedBlockExecutor,
+    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Blake3Hasher>,
+) -> Result<ValidatorRegistrations, String> {
+    let request = neutrino_runtime_abi::QueryRequest {
+        method: QUERY_METHOD_VALIDATOR_REGISTRATIONS.to_string(),
+        args: Vec::new(),
+    };
+    let response = executor
+        .query(&request, state_snapshot)
+        .map_err(|err| format!("runtime validator_registrations query failed: {err}"))?;
+    if response.code == neutrino_runtime_abi::QueryStatus::UnknownMethod.as_u32() {
+        return Ok(ValidatorRegistrations::default());
+    }
+    if response.code != neutrino_runtime_abi::QueryStatus::Ok.as_u32() {
+        return Err(format!(
+            "runtime validator_registrations query returned status {}",
+            response.code
+        ));
+    }
+    borsh::from_slice(&response.payload)
+        .map_err(|err| format!("runtime validator_registrations borsh decode failed: {err}"))
+}
+
+/// Derive the consensus-side `effective_stake` for a validator
+/// from the activation/exit FSM (pending-fix #8). Slashed and
+/// out-of-window validators report zero so every existing
+/// `effective_stake == 0` filter excludes them naturally.
+///
+/// - `runtime_stake = Some(s)` when the runtime has an entry for
+///   the validator (saturated at `u64::MAX`).
+/// - `runtime_stake = None` when the runtime has no entry; the
+///   validator falls back to `genesis_stake` (only meaningful for
+///   chain-spec validators — runtime-registered validators always
+///   have a runtime entry because `apply_register_validator`
+///   creates one).
+fn computed_effective_stake(
+    slashed: bool,
+    activation_epoch: Epoch,
+    exit_epoch: Epoch,
+    current_epoch: Epoch,
+    runtime_stake: Option<u64>,
+    genesis_stake: u64,
+) -> u64 {
+    if slashed {
+        return 0;
+    }
+    if current_epoch < activation_epoch {
+        return 0;
+    }
+    if current_epoch >= exit_epoch {
+        return 0;
+    }
+    runtime_stake.unwrap_or(genesis_stake)
+}
+
+/// Refresh a pre-existing consensus validator entry against the
+/// runtime's current stake. Used by pass 1 of the rotation bridge.
+///
+/// The exit FSM (pending-fix #8) is engaged only for runtime-
+/// registered validators (identified by `activation_epoch > 0`):
+/// when their runtime stake drops to zero or disappears, the bridge
+/// sets `exit_epoch = current_epoch + exit_delay_epochs` once
+/// (subsequent rotations do not rewrite the field — exit is a
+/// one-shot transition).
+///
+/// Chain-spec validators (`activation_epoch == 0`) are exempt from
+/// the auto-exit FSM and keep their genesis `effective_stake` when
+/// the runtime has no entry for them; they exit only by being
+/// explicitly slashed to zero or by future operator intervention.
+fn refresh_runtime_validator(
+    validator: &Validator,
+    runtime_stake: Option<u64>,
+    current_epoch: Epoch,
+    exit_delay: Epoch,
+    chunk_id: ChunkId,
+) -> Validator {
+    let is_runtime_registered = validator.activation_epoch > 0;
+    let runtime_stake_is_zero = runtime_stake.unwrap_or(0) == 0;
+    let exit_epoch =
+        if is_runtime_registered && validator.exit_epoch == u64::MAX && runtime_stake_is_zero {
+            current_epoch.saturating_add(exit_delay)
+        } else {
+            validator.exit_epoch
+        };
+    // Fallback semantics differ for the two populations:
+    //
+    // - Runtime-registered (`activation_epoch > 0`): runtime is
+    //   authoritative. If the runtime has no entry the validator's
+    //   stake is zero — they exited or were slashed to zero. The
+    //   `exit_epoch` field records the formal exit window but the
+    //   effective stake disappears immediately.
+    // - Chain-spec (`activation_epoch == 0`): the genesis stake is
+    //   the fallback because chain-spec validators are not
+    //   auto-registered in the runtime's `validator_set` — a
+    //   missing runtime entry simply means "they never staked
+    //   through the runtime", not "they exited".
+    let fallback_stake = if is_runtime_registered {
+        0
+    } else {
+        validator.effective_stake
+    };
+    let effective_stake = computed_effective_stake(
+        validator.slashed,
+        validator.activation_epoch,
+        exit_epoch,
+        current_epoch,
+        runtime_stake,
+        fallback_stake,
+    );
+    Validator {
+        pubkey: validator.pubkey,
+        withdrawal_credentials: validator.withdrawal_credentials,
+        effective_stake,
+        slashed: validator.slashed,
+        activation_epoch: validator.activation_epoch,
+        exit_epoch,
+        last_active_chunk: chunk_id.saturating_add(1),
+    }
+}
+
+/// Pass 1 of the rotation bridge: rebuild each existing consensus
+/// validator from the runtime's current stake distribution. Joins
+/// by `withdrawal_credentials == runtime_entry.address` and
+/// engages the exit FSM for runtime-registered validators whose
+/// stake has dropped to zero.
+fn refresh_existing_active_set(
+    existing_active: &[Validator],
+    runtime_set: &ValidatorSet,
+    current_epoch: Epoch,
+    exit_delay: Epoch,
+    chunk_id: ChunkId,
+) -> Vec<Validator> {
+    let mut next = Vec::with_capacity(existing_active.len());
+    for validator in existing_active {
+        let runtime_stake = runtime_set
+            .entries
+            .iter()
+            .find(|entry| entry.address == validator.withdrawal_credentials)
+            .map(|entry| u64::try_from(entry.stake).unwrap_or(u64::MAX));
+        let updated = refresh_runtime_validator(
+            validator,
+            runtime_stake,
+            current_epoch,
+            exit_delay,
+            chunk_id,
+        );
+        next.push(updated);
+    }
+    next
+}
+
+/// Pass 2 of the rotation bridge: mint a fresh consensus validator
+/// entry for every runtime registration that is not yet in
+/// `new_active`. Verifies the BLS proof-of-possession host-side and
+/// silently drops registrations whose POP fails — they consumed
+/// gas at runtime but never enter consensus.
+fn mint_new_runtime_validators(
+    new_active: &mut Vec<Validator>,
+    registrations: &ValidatorRegistrations,
+    runtime_set: &ValidatorSet,
+    current_epoch: Epoch,
+    activation_delay: Epoch,
+    chunk_id: ChunkId,
+) {
+    for registration in &registrations.entries {
+        if new_active
+            .iter()
+            .any(|v| v.withdrawal_credentials == registration.address)
+        {
+            continue;
+        }
+        if !verify_registration_pop(registration) {
+            continue;
+        }
+
+        // Look up the runtime stake (registration always creates a
+        // `Validator` record, so this is normally present, but the
+        // FSM tolerates a 0-stake registration too — the validator
+        // simply enters with `effective_stake = 0` permanently
+        // until they receive a deposit).
+        let runtime_stake = runtime_set
+            .entries
+            .iter()
+            .find(|entry| entry.address == registration.address)
+            .map(|entry| u64::try_from(entry.stake).unwrap_or(u64::MAX));
+
+        let activation_epoch = current_epoch.saturating_add(activation_delay);
+        let minted = Validator {
+            pubkey: registration.bls_pubkey,
+            withdrawal_credentials: registration.address,
+            // Derived: 0 until activation, runtime_stake after.
+            effective_stake: computed_effective_stake(
+                /* slashed       */ false,
+                /* activation    */ activation_epoch,
+                /* exit          */ u64::MAX,
+                /* current_epoch */ current_epoch,
+                /* runtime_stake */ runtime_stake,
+                /* genesis_stake */ 0,
+            ),
+            slashed: false,
+            activation_epoch,
+            exit_epoch: u64::MAX,
+            last_active_chunk: chunk_id.saturating_add(1),
+        };
+        trace!(
+            address = ?registration.address,
+            activation_epoch,
+            current_epoch,
+            "minted runtime-registered consensus validator entry"
+        );
+        new_active.push(minted);
+    }
+}
+
+/// Verify the BLS proof-of-possession stored on `registration`.
+/// Returns `false` on malformed bytes or POP verification failure;
+/// emits a debug log explaining why the registration was filtered.
+fn verify_registration_pop(
+    registration: &neutrino_default_runtime_core::ValidatorRegistration,
+) -> bool {
+    let Ok(pk) = BlsPublicKey::from_bytes(&registration.bls_pubkey) else {
+        debug!(
+            address = ?registration.address,
+            "skipping validator registration with malformed BLS pubkey"
+        );
+        return false;
+    };
+    let Ok(pop) = BlsSignature::from_bytes(&registration.pop_signature) else {
+        debug!(
+            address = ?registration.address,
+            "skipping validator registration with malformed BLS pop signature"
+        );
+        return false;
+    };
+    if pk.verify_pop(&pop).is_err() {
+        debug!(
+            address = ?registration.address,
+            "skipping validator registration with invalid proof-of-possession"
+        );
+        return false;
+    }
+    true
 }
 
 /// Outcome of a single `SlashingPool::insert`. Returned to the
@@ -806,34 +1085,55 @@ where
         }
     }
 
-    /// Pending-fix #1: rebuild the engine's active validator set from
-    /// the runtime's post-chunk stake distribution and persist the
-    /// snapshot effective at `chunk_id + 1`.
+    /// Pending-fix #1 + #8: rebuild the engine's active validator set
+    /// from the runtime's post-chunk stake distribution and persist
+    /// the snapshot effective at `chunk_id + 1`.
     ///
-    /// Joins the runtime's `ValidatorSet` (queried via the installed
-    /// executor's `validator_set` method) into the existing consensus
-    /// active set by matching
-    /// `runtime_entry.address == consensus_validator.withdrawal_credentials`.
-    /// The runtime's `stake` (a `u128`) is copied into
-    /// `Validator.effective_stake` (a `u64`, saturated at `u64::MAX`).
-    /// Validators absent from the runtime's set keep their previous
-    /// `effective_stake` — chain-spec validators that have never been
-    /// staked through the runtime remain at their genesis weight.
+    /// The bridge runs three reconciliation passes against the
+    /// runtime state, executed under a single executor snapshot so
+    /// they all observe the same post-finalize-chunk view:
     ///
-    /// New validators present only in the runtime (no matching
-    /// withdrawal-credential in the consensus set) are silently
-    /// ignored: registering a fresh consensus identity requires a
-    /// `Transaction::RegisterValidator` that carries the BLS pubkey,
-    /// which is pending-fix #8. The chain-spec initial validator
-    /// registry remains authoritative for who can propose / vote.
+    /// 1. **Stake refresh.** Every existing consensus validator's
+    ///    `effective_stake` is recomputed from the runtime's
+    ///    `validator_set` query, joined by
+    ///    `withdrawal_credentials == runtime_entry.address`.
+    /// 2. **Activation FSM (pending-fix #8).** Runtime-side
+    ///    `RegisterValidator` transactions appear in the
+    ///    `validator_registrations` query result with a BLS pubkey +
+    ///    proof-of-possession. For every registration the bridge
+    ///    has not yet seen, the BLS POP is verified host-side; on
+    ///    success a fresh consensus [`Validator`] is minted with
+    ///    `activation_epoch = current_epoch +
+    ///    consensus.activation_delay_epochs` and
+    ///    `effective_stake = 0`. The validator becomes
+    ///    consensus-eligible only after the activation epoch is
+    ///    reached.
+    /// 3. **Exit FSM (pending-fix #8).** Runtime-registered
+    ///    validators (those born with `activation_epoch > 0`) whose
+    ///    runtime stake has dropped to zero have their `exit_epoch`
+    ///    set to `current_epoch + consensus.exit_delay_epochs`
+    ///    (one-shot — the exit_epoch is not rewritten on
+    ///    subsequent rotations). Chain-spec validators
+    ///    (`activation_epoch == 0`) are exempt from the auto-exit
+    ///    FSM and keep their genesis stake when the runtime has no
+    ///    entry for them.
+    ///
+    /// The final `effective_stake` reported to consensus is derived
+    /// per-validator from
+    /// `(runtime_stake, current_epoch, activation_epoch, exit_epoch,
+    /// slashed)` via [`computed_effective_stake`]. Because every
+    /// existing eligibility filter already excludes
+    /// `effective_stake == 0`, the activation/exit FSM needs no
+    /// changes to the VRF, BFT, or aggregator-selection code paths.
     ///
     /// Returns silently when the local node has no executor installed
     /// (test backends that exercise gossip without a runtime).
     ///
     /// # Errors
     ///
-    /// Surfaces store / query failures as descriptive strings so the
-    /// caller can log them without re-deriving the error type.
+    /// Surfaces store / query / POP-verification failures as
+    /// descriptive strings so the caller can log them without
+    /// re-deriving the error type.
     pub fn rotate_active_validator_set_for_chunk(&self, chunk_id: ChunkId) -> Result<(), String> {
         let Some(executor) = self.block_executor_snapshot() else {
             // No runtime attached (e.g. gossip-only test backend).
@@ -841,55 +1141,54 @@ where
             return Ok(());
         };
 
-        // Capture the live trie + existing active set under one
-        // engine-mutex acquisition so the query observes a consistent
-        // post-finalize-chunk snapshot.
-        let (state_snapshot, existing_active) =
-            self.with_engine(|e| (e.state().clone(), e.active_validator_set().to_vec()));
+        // Capture the live trie + existing active set + epoch params
+        // under one engine-mutex acquisition so the queries observe a
+        // consistent post-finalize-chunk snapshot.
+        let (state_snapshot, existing_active, epoch_length_in_chunks, activation_delay, exit_delay) =
+            self.with_engine(|e| {
+                let consensus = &e.chain_spec().consensus;
+                (
+                    e.state().clone(),
+                    e.active_validator_set().to_vec(),
+                    consensus.epoch_length_in_chunks,
+                    consensus.activation_delay_epochs,
+                    consensus.exit_delay_epochs,
+                )
+            });
 
-        let request = neutrino_runtime_abi::QueryRequest {
-            method: QUERY_METHOD_VALIDATOR_SET.to_string(),
-            args: Vec::new(),
-        };
-        let response = executor
-            .query(&request, &state_snapshot)
-            .map_err(|err| format!("runtime validator_set query failed: {err}"))?;
-        if response.code != neutrino_runtime_abi::QueryStatus::Ok.as_u32() {
-            return Err(format!(
-                "runtime validator_set query returned status {}",
-                response.code
-            ));
-        }
-        let runtime_set: ValidatorSet = borsh::from_slice(&response.payload)
-            .map_err(|err| format!("runtime validator_set borsh decode failed: {err}"))?;
+        // The new active set takes effect at the start of chunk
+        // `chunk_id + 1`. Its first block has height
+        // `(chunk_id + 1) * chunk_size`, putting it in epoch
+        // `(chunk_id + 1) / epoch_length_in_chunks`. Activation /
+        // exit deadlines are measured against this anchor.
+        let current_epoch: Epoch = chunk_id
+            .saturating_add(1)
+            .checked_div(epoch_length_in_chunks)
+            .unwrap_or(0);
 
-        // Join runtime stake onto existing consensus entries.
-        // Validators absent from the runtime keep their previous
-        // weight; this avoids accidentally zeroing chain-spec
-        // validators who never interacted with the runtime.
-        let new_active: Vec<Validator> = existing_active
-            .iter()
-            .map(|validator| {
-                let runtime_stake = runtime_set
-                    .entries
-                    .iter()
-                    .find(|entry| entry.address == validator.withdrawal_credentials)
-                    .map(|entry| u64::try_from(entry.stake).unwrap_or(u64::MAX));
-                Validator {
-                    pubkey: validator.pubkey,
-                    withdrawal_credentials: validator.withdrawal_credentials,
-                    effective_stake: runtime_stake.unwrap_or(validator.effective_stake),
-                    slashed: validator.slashed,
-                    activation_epoch: validator.activation_epoch,
-                    exit_epoch: validator.exit_epoch,
-                    last_active_chunk: chunk_id.saturating_add(1),
-                }
-            })
-            .collect();
+        let runtime_set: ValidatorSet = query_runtime_validator_set(&*executor, &state_snapshot)?;
+        let registrations: ValidatorRegistrations =
+            query_runtime_validator_registrations(&*executor, &state_snapshot)?;
+
+        let mut new_active = refresh_existing_active_set(
+            &existing_active,
+            &runtime_set,
+            current_epoch,
+            exit_delay,
+            chunk_id,
+        );
+        mint_new_runtime_validators(
+            &mut new_active,
+            &registrations,
+            &runtime_set,
+            current_epoch,
+            activation_delay,
+            chunk_id,
+        );
 
         // No-op if the new set is byte-identical to the previous one
-        // (steady-state common case: chunk had no runtime stake
-        // mutations). Saves a snapshot write per chunk.
+        // (steady-state common case: chunk had no runtime stake or
+        // registration mutations). Saves a snapshot write per chunk.
         if new_active == existing_active {
             return Ok(());
         }
@@ -899,7 +1198,7 @@ where
             .map_err(|err| format!("set_active_validator_set failed: {err}"))?;
         trace!(
             chunk_id,
-            effective_at, "rotated consensus active validator set"
+            effective_at, current_epoch, "rotated consensus active validator set"
         );
         Ok(())
     }

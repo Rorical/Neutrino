@@ -55,6 +55,15 @@ pub const GAS_DEPOSIT: u64 = 30_000;
 pub const GAS_VOLUNTARY_EXIT: u64 = 40_000;
 /// Fixed per-transaction gas cost for a [`Transaction::Withdraw`].
 pub const GAS_WITHDRAW: u64 = 50_000;
+/// Fixed per-transaction gas cost for a [`Transaction::RegisterValidator`].
+///
+/// A registration creates a brand-new validator entry, stores the
+/// BLS pubkey + POP under a dedicated state key, and folds the
+/// validator into the canonical `ValidatorSet`. Priced above
+/// `Deposit` because the extra state writes (registration record +
+/// validator entry + set membership) have no equivalent for a
+/// transfer into a pre-existing validator.
+pub const GAS_REGISTER_VALIDATOR: u64 = 75_000;
 
 /// Per-kind gas cost lookup. The cost is independent of the
 /// transaction's outcome: only successful executions consume gas, but
@@ -70,6 +79,7 @@ pub const fn tx_gas(tx: &Transaction) -> u64 {
         Transaction::Deposit(_) => GAS_DEPOSIT,
         Transaction::VoluntaryExit(_) => GAS_VOLUNTARY_EXIT,
         Transaction::Withdraw(_) => GAS_WITHDRAW,
+        Transaction::RegisterValidator(_) => GAS_REGISTER_VALIDATOR,
     }
 }
 
@@ -90,6 +100,7 @@ pub const fn tx_kind_code(tx: &Transaction) -> u8 {
         Transaction::Deposit(_) => 5,
         Transaction::VoluntaryExit(_) => 6,
         Transaction::Withdraw(_) => 7,
+        Transaction::RegisterValidator(_) => 8,
     }
 }
 
@@ -110,6 +121,7 @@ pub const fn tx_charges_fee(tx: &Transaction) -> bool {
             | Transaction::Deposit(_)
             | Transaction::VoluntaryExit(_)
             | Transaction::Withdraw(_)
+            | Transaction::RegisterValidator(_)
     )
 }
 
@@ -129,6 +141,8 @@ pub const DOMAIN_DEPOSIT: &[u8; 16] = b"NTRO/deposit\x00\x00\x00\x00";
 pub const DOMAIN_VOLUNTARY_EXIT: &[u8; 16] = b"NTRO/vexit\x00\x00\x00\x00\x00\x00";
 /// Domain tag prepended to every Ed25519 withdraw signature.
 pub const DOMAIN_WITHDRAW: &[u8; 16] = b"NTRO/withdraw\x00\x00\x00";
+/// Domain tag prepended to every Ed25519 register-validator signature.
+pub const DOMAIN_REGISTER_VALIDATOR: &[u8; 16] = b"NTRO/regval\x00\x00\x00\x00\x00";
 /// Domain tag for the canonical [`ValidatorSet`] root commitment.
 pub const DOMAIN_VALIDATOR_SET_ROOT: &[u8; 16] = b"NTRO/valset-rt\x00\x00";
 /// Domain tag for the per-block receipts-root commitment.
@@ -146,6 +160,14 @@ pub const VALIDATOR_KEY_PREFIX: &[u8; 4] = b"val:";
 pub const WITHDRAWAL_KEY_PREFIX: &[u8; 4] = b"wdr:";
 /// Canonical key holding the [`ValidatorSet`] summary.
 pub const VALIDATOR_SET_KEY: &[u8] = b"validator_set";
+/// Canonical key holding the [`ValidatorRegistrations`] summary.
+///
+/// Each row carries a registered validator's BLS pubkey and
+/// proof-of-possession signature. Populated by
+/// [`Transaction::RegisterValidator`]; consumed by the host-side
+/// rotation bridge in `chain_backend.rs` to mint new consensus-side
+/// [`neutrino_primitives::Validator`] entries.
+pub const VALIDATOR_REGISTRATIONS_KEY: &[u8] = b"validator_registrations";
 
 /// Length of the canonical signed payload for a transfer:
 /// `16B domain || 8B chain_id || 32B from || 32B to || 16B amount || 8B nonce`.
@@ -159,6 +181,10 @@ pub const DEPOSIT_SIG_MSG_LEN: usize = 16 + 8 + 32 + 32 + 16 + 8;
 /// Length of the canonical signed payload for a voluntary-exit /
 /// withdraw transaction: `16B domain || 8B chain_id || 32B validator || 8B nonce`.
 pub const VALIDATOR_OP_SIG_MSG_LEN: usize = 16 + 8 + 32 + 8;
+/// Length of the canonical signed payload for a register-validator
+/// transaction: `16B domain || 8B chain_id || 32B depositor ||
+/// 32B validator || 48B bls_pubkey || 16B deposit_amount || 8B nonce`.
+pub const REGISTER_VALIDATOR_SIG_MSG_LEN: usize = 16 + 8 + 32 + 32 + 48 + 16 + 8;
 
 /// Number of blocks an unstaked / exited amount waits in the queue.
 ///
@@ -378,6 +404,19 @@ pub enum Transaction {
     /// the current block height stay queued; the transaction succeeds
     /// (and consumes its gas) even if zero entries are matured.
     Withdraw(WithdrawTx),
+    /// Register a brand-new validator identity. Creates a runtime
+    /// validator entry funded by `deposit_amount` from the depositor,
+    /// records the BLS pubkey + proof-of-possession under
+    /// [`VALIDATOR_REGISTRATIONS_KEY`], and upserts the validator's
+    /// stake into the canonical [`ValidatorSet`].
+    ///
+    /// The runtime does *not* verify the proof-of-possession (it
+    /// has no BLS code path); the host-side rotation bridge
+    /// verifies it before minting the corresponding consensus-side
+    /// [`neutrino_primitives::Validator`]. Registrations with an
+    /// invalid POP burn gas but never enter the consensus active
+    /// set.
+    RegisterValidator(RegisterValidatorTx),
 }
 
 /// Ed25519-signed transfer of `amount` between two accounts.
@@ -498,6 +537,49 @@ pub struct WithdrawTx {
     pub signature: [u8; 64],
 }
 
+/// Ed25519-signed validator-registration transaction.
+///
+/// Creates a brand-new validator identified by `validator`, funded
+/// by `deposit_amount` debited from `depositor`. The 48-byte BLS
+/// pubkey and 96-byte proof-of-possession are recorded under
+/// [`VALIDATOR_REGISTRATIONS_KEY`] so the host-side rotation bridge
+/// can lift them into the consensus active validator set after
+/// verifying the POP. The runtime itself does not link `bls_pubkey`
+/// for verification — it stores it as opaque bytes.
+///
+/// The Ed25519 signature is produced by `depositor`, not by the
+/// validator's BLS identity (the depositor and validator addresses
+/// may be the same). The POP, separately, binds the BLS private key
+/// to its corresponding public key.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct RegisterValidatorTx {
+    /// Account paying the deposit and signing the transaction.
+    pub depositor: Address,
+    /// Address of the validator being registered. Becomes the
+    /// `withdrawal_credentials` of the consensus-side
+    /// [`neutrino_primitives::Validator`] entry the rotation bridge
+    /// will mint after verifying the POP.
+    pub validator: Address,
+    /// BLS12-381 G1 compressed public key (min-pk POP scheme). The
+    /// rotation bridge stores this on the consensus side; chunk
+    /// finality votes are signed with the matching BLS private key.
+    pub bls_pubkey: neutrino_primitives::BlsPublicKey,
+    /// BLS proof-of-possession over `bls_pubkey` under the
+    /// `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` DST. The
+    /// host-side rotation bridge verifies this; the runtime stores
+    /// it as opaque bytes.
+    pub pop_signature: neutrino_primitives::BlsSignature,
+    /// Initial stake credited to the validator from the depositor's
+    /// spendable balance. Zero is permitted but discouraged —
+    /// the validator would join with `stake = 0` and contribute
+    /// nothing to VRF eligibility or BFT quorum weighting.
+    pub deposit_amount: u128,
+    /// Depositor's expected next nonce.
+    pub nonce: u64,
+    /// Ed25519 signature over [`register_validator_sig_message`].
+    pub signature: [u8; 64],
+}
+
 /// Single queued unbonding entry.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Withdrawal {
@@ -536,6 +618,77 @@ impl WithdrawalQueue {
         }
         total
     }
+}
+
+/// One row of [`ValidatorRegistrations`]. Recorded by
+/// [`Transaction::RegisterValidator`] and consumed by the host-side
+/// rotation bridge.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatorRegistration {
+    /// Runtime address of the registered validator. Doubles as the
+    /// `withdrawal_credentials` of the consensus-side
+    /// [`neutrino_primitives::Validator`] entry the bridge mints.
+    pub address: Address,
+    /// BLS12-381 G1 compressed public key (min-pk POP scheme).
+    pub bls_pubkey: neutrino_primitives::BlsPublicKey,
+    /// BLS proof-of-possession over `bls_pubkey`. The runtime stores
+    /// this as opaque bytes; the host-side rotation bridge verifies
+    /// it under the `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
+    /// DST before lifting the registration into the consensus
+    /// active validator set.
+    pub pop_signature: neutrino_primitives::BlsSignature,
+}
+
+/// Canonical store of every runtime-side validator registration
+/// produced by [`Transaction::RegisterValidator`]. Entries are kept
+/// sorted by `address` ascending so the bridge sees a stable order.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct ValidatorRegistrations {
+    /// Registrations sorted by `address` ascending. Append-only —
+    /// once a validator is registered they remain in the set even
+    /// if their stake later drops to zero (exit is handled by the
+    /// host-side activation FSM, not by removing the registration).
+    pub entries: Vec<ValidatorRegistration>,
+}
+
+impl ValidatorRegistrations {
+    /// `true` when `addr` already has a registration row.
+    #[must_use]
+    pub fn contains(&self, addr: &Address) -> bool {
+        self.entries
+            .binary_search_by(|e| e.address.cmp(addr))
+            .is_ok()
+    }
+
+    /// Insert a new row. Returns `false` (and leaves `self`
+    /// unchanged) if `addr` is already registered — the runtime
+    /// uses this as the duplicate-registration gate.
+    pub fn insert(&mut self, registration: ValidatorRegistration) -> bool {
+        match self
+            .entries
+            .binary_search_by(|e| e.address.cmp(&registration.address))
+        {
+            Ok(_) => false,
+            Err(idx) => {
+                self.entries.insert(idx, registration);
+                true
+            }
+        }
+    }
+}
+
+fn load_validator_registrations<B: StateBackend>(state: &mut B) -> ValidatorRegistrations {
+    state
+        .read(VALIDATOR_REGISTRATIONS_KEY)
+        .and_then(|bytes| ValidatorRegistrations::try_from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn store_validator_registrations<B: StateBackend>(state: &mut B, set: &ValidatorRegistrations) {
+    state.write(
+        VALIDATOR_REGISTRATIONS_KEY,
+        borsh::to_vec(set).expect("borsh encode ValidatorRegistrations never fails"),
+    );
 }
 
 /// Per-transaction receipt status code.
@@ -699,6 +852,29 @@ pub fn withdraw_sig_message(chain_id: u64, tx: &WithdrawTx) -> [u8; VALIDATOR_OP
     validator_op_message(DOMAIN_WITHDRAW, chain_id, &tx.validator, tx.nonce)
 }
 
+/// Build the canonical 160-byte payload signed for a register-validator.
+///
+/// Layout: `domain || chain_id || depositor || validator ||
+/// bls_pubkey || deposit_amount_le || nonce_le`. Binding the BLS
+/// pubkey into the Ed25519-signed payload prevents an adversary
+/// from intercepting a `RegisterValidator` in flight and rebinding
+/// it to a different consensus identity before inclusion.
+#[must_use]
+pub fn register_validator_sig_message(
+    chain_id: u64,
+    tx: &RegisterValidatorTx,
+) -> [u8; REGISTER_VALIDATOR_SIG_MSG_LEN] {
+    let mut msg = [0u8; REGISTER_VALIDATOR_SIG_MSG_LEN];
+    msg[0..16].copy_from_slice(DOMAIN_REGISTER_VALIDATOR);
+    msg[16..24].copy_from_slice(&chain_id.to_le_bytes());
+    msg[24..56].copy_from_slice(&tx.depositor);
+    msg[56..88].copy_from_slice(&tx.validator);
+    msg[88..136].copy_from_slice(&tx.bls_pubkey);
+    msg[136..152].copy_from_slice(&tx.deposit_amount.to_le_bytes());
+    msg[152..160].copy_from_slice(&tx.nonce.to_le_bytes());
+    msg
+}
+
 fn validator_op_message(
     domain: &[u8; 16],
     chain_id: u64,
@@ -760,6 +936,15 @@ fn verify_withdraw_signature(tx: &WithdrawTx, chain_id: u64) -> bool {
     };
     let sig = Signature::from_bytes(&tx.signature);
     pk.verify(&withdraw_sig_message(chain_id, tx), &sig).is_ok()
+}
+
+fn verify_register_validator_signature(tx: &RegisterValidatorTx, chain_id: u64) -> bool {
+    let Ok(pk) = VerifyingKey::from_bytes(&tx.depositor) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&tx.signature);
+    pk.verify(&register_validator_sig_message(chain_id, tx), &sig)
+        .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +1103,9 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
             Transaction::Withdraw(withdraw_tx) => {
                 apply_withdraw(state, input.chain_id, input.block_height, fee, withdraw_tx)
             }
+            Transaction::RegisterValidator(register_tx) => {
+                apply_register_validator(state, input.chain_id, fee, register_tx)
+            }
         };
         match result {
             Ok(()) => {
@@ -1047,6 +1235,9 @@ pub fn validate_tx<B: StateBackend>(
             validate_voluntary_exit(state, chain_id, fee, exit_tx)
         }
         Transaction::Withdraw(withdraw_tx) => validate_withdraw(state, chain_id, fee, withdraw_tx),
+        Transaction::RegisterValidator(register_tx) => {
+            validate_register_validator(state, chain_id, fee, register_tx)
+        }
         // Consensus-driven transactions are never user-submittable.
         // The producer injects them directly into `body.transactions`
         // without ever passing them through the mempool.
@@ -1198,6 +1389,41 @@ fn validate_withdraw<B: StateBackend>(
     // their existing balance (we don't know at admission time what
     // the actual matured amount will be when the block executes).
     if signer.balance < fee {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    TxValidity::valid(0)
+}
+
+fn validate_register_validator<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    fee: u128,
+    tx: &RegisterValidatorTx,
+) -> TxValidity {
+    if !verify_register_validator_signature(tx, chain_id) {
+        return TxValidity::invalid(TxValidationCode::BadSignature);
+    }
+    let depositor = load_account(state, &tx.depositor);
+    if depositor.nonce != tx.nonce {
+        return TxValidity::invalid(TxValidationCode::NonceMismatch);
+    }
+    let Some(total_debit) = tx.deposit_amount.checked_add(fee) else {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    };
+    if depositor.balance < total_debit {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    // Duplicate-registration gate: refuse to admit a second
+    // registration for an address that already has either a runtime
+    // `Validator` record or a `ValidatorRegistration` row. The
+    // host-side bridge keys on `withdrawal_credentials` and would
+    // otherwise see two competing BLS pubkeys for the same address.
+    let registrations = load_validator_registrations(state);
+    if registrations.contains(&tx.validator) {
+        return TxValidity::invalid(TxValidationCode::InsufficientBalance);
+    }
+    let validator = load_validator(state, &tx.validator);
+    if validator.stake > 0 || validator.active {
         return TxValidity::invalid(TxValidationCode::InsufficientBalance);
     }
     TxValidity::valid(0)
@@ -1520,6 +1746,72 @@ fn apply_withdraw<B: StateBackend>(
     Ok(())
 }
 
+fn apply_register_validator<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    fee: u128,
+    tx: &RegisterValidatorTx,
+) -> Result<(), ReceiptStatus> {
+    if !verify_register_validator_signature(tx, chain_id) {
+        return Err(ReceiptStatus::BadSignature);
+    }
+    let mut depositor = load_account(state, &tx.depositor);
+    if depositor.nonce != tx.nonce {
+        return Err(ReceiptStatus::NonceMismatch);
+    }
+    let Some(total_debit) = tx.deposit_amount.checked_add(fee) else {
+        return Err(ReceiptStatus::Overflow);
+    };
+    if depositor.balance < total_debit {
+        return Err(ReceiptStatus::InsufficientBalance);
+    }
+
+    // Reject duplicate registration. Equivalent to `validate_register
+    // _validator`'s check but the STF re-runs it because nothing
+    // prevents a block from carrying multiple RegisterValidator txs
+    // for the same address.
+    let mut registrations = load_validator_registrations(state);
+    if registrations.contains(&tx.validator) {
+        return Err(ReceiptStatus::InsufficientBalance);
+    }
+    let existing = load_validator(state, &tx.validator);
+    if existing.stake > 0 || existing.active {
+        return Err(ReceiptStatus::InsufficientBalance);
+    }
+
+    // Mint the validator record. Mirrors `apply_deposit` but the
+    // validator did not exist before this call.
+    let validator = Validator {
+        stake: tx.deposit_amount,
+        active: tx.deposit_amount > 0,
+    };
+    depositor.balance -= total_debit;
+    depositor.nonce = depositor.nonce.saturating_add(1);
+
+    let mut set = load_validator_set(state);
+    if validator.active {
+        set.upsert(tx.validator, validator.stake);
+    }
+
+    // Append to the registrations index. The bridge will verify the
+    // POP before lifting this entry into the consensus active set;
+    // an invalid POP burns gas here but never enters consensus.
+    registrations.insert(ValidatorRegistration {
+        address: tx.validator,
+        bls_pubkey: tx.bls_pubkey,
+        pop_signature: tx.pop_signature,
+    });
+
+    // Self-registration (`depositor == validator`) is allowed; the
+    // depositor's account fields cover the validator's account
+    // fields when they are the same address.
+    store_account(state, &tx.depositor, &depositor);
+    store_validator(state, &tx.validator, &validator);
+    store_validator_set(state, &set);
+    store_validator_registrations(state, &registrations);
+    Ok(())
+}
+
 fn load_withdrawal_queue<B: StateBackend>(state: &mut B, addr: &Address) -> WithdrawalQueue {
     state
         .read(&withdrawal_key(addr))
@@ -1615,6 +1907,18 @@ pub const QUERY_METHOD_RUNTIME_VERSION: &str = "runtime_version";
 /// not as a missing key.
 pub const QUERY_METHOD_PENDING_WITHDRAWALS: &str = "pending_withdrawals";
 
+/// Query method: return the canonical [`ValidatorRegistrations`]
+/// snapshot recorded by [`Transaction::RegisterValidator`].
+///
+/// Args wire format: empty (no payload expected).
+/// Payload wire format: `borsh(ValidatorRegistrations)` — empty
+/// registries are returned as `ValidatorRegistrations::default()`
+/// (empty entries vector). The host-side rotation bridge polls
+/// this method at every chunk close to discover newly-registered
+/// validators whose BLS POP it must verify before lifting them
+/// into the consensus active set.
+pub const QUERY_METHOD_VALIDATOR_REGISTRATIONS: &str = "validator_registrations";
+
 /// Dispatch a [`neutrino_runtime_abi::QueryRequest`] against `state`.
 ///
 /// Returns a [`neutrino_runtime_abi::QueryResponse`] carrying the
@@ -1638,6 +1942,7 @@ pub fn query<B: neutrino_runtime_core::StateBackend>(
         QUERY_METHOD_VALIDATOR_SET => query_validator_set(state),
         QUERY_METHOD_RUNTIME_VERSION => query_runtime_version(),
         QUERY_METHOD_PENDING_WITHDRAWALS => query_pending_withdrawals(&request.args, state),
+        QUERY_METHOD_VALIDATOR_REGISTRATIONS => query_validator_registrations(state),
         unknown => QueryResponse::err(QueryStatus::UnknownMethod, unknown.as_bytes().to_vec()),
     }
 }
@@ -1703,6 +2008,15 @@ fn query_pending_withdrawals<B: neutrino_runtime_core::StateBackend>(
         .unwrap_or_default();
     let payload = borsh::to_vec(&queue).expect("borsh encode WithdrawalQueue never fails");
     QueryResponse::ok(payload)
+}
+
+fn query_validator_registrations<B: neutrino_runtime_core::StateBackend>(
+    state: &mut B,
+) -> neutrino_runtime_abi::QueryResponse {
+    let registrations = load_validator_registrations(state);
+    let payload =
+        borsh::to_vec(&registrations).expect("borsh encode ValidatorRegistrations never fails");
+    neutrino_runtime_abi::QueryResponse::ok(payload)
 }
 
 #[cfg(test)]

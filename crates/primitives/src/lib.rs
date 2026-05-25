@@ -110,6 +110,29 @@ pub const DEFAULT_BFT_ROUND_TIMEOUT_STEP_SECS: u64 = DEFAULT_SLOT_DURATION_SECS;
 /// declaring the chunk stalled. Comfortably above realistic
 /// partition durations.
 pub const DEFAULT_BFT_MAX_ROUND: u32 = 32;
+/// Default epoch length in chunks.
+///
+/// With the default `chunk_size = 128` this yields a
+/// one-chunk-per-epoch cadence (`epoch_length_blocks = 128`).
+/// Single-chunk epochs keep activation / exit latency proportional
+/// to chunk timing rather than introducing a separate time horizon
+/// for staking economics.
+pub const DEFAULT_EPOCH_LENGTH_IN_CHUNKS: u64 = 1;
+/// Default activation delay for runtime-registered validators in epochs.
+///
+/// A new `RegisterValidator` lands in epoch E; the validator becomes
+/// consensus-eligible at epoch `E + DEFAULT_ACTIVATION_DELAY_EPOCHS`.
+/// Two epochs gives every follower at least one full epoch to
+/// observe the registration before it influences vote weights.
+pub const DEFAULT_ACTIVATION_DELAY_EPOCHS: u64 = 2;
+/// Default exit delay for runtime-registered validators in epochs.
+///
+/// When a validator's runtime stake drops to zero in epoch E, their
+/// `exit_epoch` is set to `E + DEFAULT_EXIT_DELAY_EPOCHS`. From that
+/// epoch forward they are filtered out of VRF eligibility and BFT
+/// quorum weighting. The delay leaves room for slashing windows to
+/// close before stake walks free.
+pub const DEFAULT_EXIT_DELAY_EPOCHS: u64 = 2;
 /// Default withdrawal delay and weak-subjectivity period in seconds.
 pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 = 14 * 24 * 60 * 60;
 /// Default number of chunks to retain lock-violation evidence.
@@ -517,6 +540,30 @@ pub struct ConsensusParams {
     /// a separate operator intervention (or a partition heal that
     /// lets earlier rounds reach quorum).
     pub bft_max_round: u32,
+    /// Number of consecutive chunks that make up one epoch. Together
+    /// with `chunk_size` this defines `epoch_length_blocks =
+    /// chunk_size * epoch_length_in_chunks`. Used by the
+    /// validator-set rotation bridge to compute the current epoch
+    /// from the chunk index that just finalised:
+    /// `current_epoch = (chunk_id + 1) / epoch_length_in_chunks`.
+    pub epoch_length_in_chunks: u64,
+    /// Activation delay applied to runtime-registered validators in
+    /// epochs. A `Transaction::RegisterValidator` accepted in
+    /// chunk N causes the bridge to seat the new consensus
+    /// validator with
+    /// `activation_epoch = (N + 1) / epoch_length_in_chunks +
+    /// activation_delay_epochs`. The validator stays at
+    /// `effective_stake = 0` until that epoch, so every existing
+    /// `effective_stake == 0` filter naturally excludes them from
+    /// VRF eligibility and BFT quorum weighting.
+    pub activation_delay_epochs: u64,
+    /// Exit delay applied to runtime-registered validators in
+    /// epochs. When a runtime-registered validator's runtime stake
+    /// drops to zero, the bridge sets `exit_epoch =
+    /// current_epoch + exit_delay_epochs`. After that epoch the
+    /// validator is permanently filtered out of consensus through
+    /// the same `effective_stake == 0` path used for activation.
+    pub exit_delay_epochs: u64,
 }
 
 impl Default for ConsensusParams {
@@ -542,6 +589,9 @@ impl Default for ConsensusParams {
             bft_round_timeout_base_secs: DEFAULT_BFT_ROUND_TIMEOUT_BASE_SECS,
             bft_round_timeout_step_secs: DEFAULT_BFT_ROUND_TIMEOUT_STEP_SECS,
             bft_max_round: DEFAULT_BFT_MAX_ROUND,
+            epoch_length_in_chunks: DEFAULT_EPOCH_LENGTH_IN_CHUNKS,
+            activation_delay_epochs: DEFAULT_ACTIVATION_DELAY_EPOCHS,
+            exit_delay_epochs: DEFAULT_EXIT_DELAY_EPOCHS,
         }
     }
 }
@@ -833,6 +883,14 @@ impl ChainSpec {
             if validator.effective_stake == 0 {
                 return Err(ChainSpecError::ZeroValidatorStake);
             }
+            // The activation/exit FSM (pending-fix #8) uses
+            // `activation_epoch > 0` as the discriminator for
+            // runtime-registered validators. Chain-spec entries must
+            // be born at genesis so the bridge can tell the two
+            // populations apart.
+            if validator.activation_epoch != 0 || validator.exit_epoch != u64::MAX {
+                return Err(ChainSpecError::NonGenesisInitialValidator);
+            }
             total_stake = total_stake
                 .checked_add(validator.effective_stake)
                 .ok_or(ChainSpecError::ValidatorStakeOverflow)?;
@@ -872,6 +930,13 @@ impl ConsensusParams {
             || self.proposer_boost_fraction > FIXED_U128_ONE
         {
             return Err(ChainSpecError::InvalidFixedPointParameter);
+        }
+
+        if self.epoch_length_in_chunks == 0
+            || self.activation_delay_epochs == 0
+            || self.exit_delay_epochs == 0
+        {
+            return Err(ChainSpecError::ZeroConsensusParameter);
         }
 
         Ok(())
@@ -964,6 +1029,13 @@ pub enum ChainSpecError {
     ZeroValidatorStake,
     /// Total validator stake overflowed `u64`.
     ValidatorStakeOverflow,
+    /// An initial validator was declared with a non-genesis
+    /// `activation_epoch` or `exit_epoch`. Genesis validators
+    /// must always be born at epoch 0 with `exit_epoch = u64::MAX`
+    /// so the auto-exit FSM driven by the runtime-side
+    /// `RegisterValidator` flow can use `activation_epoch > 0`
+    /// as the discriminator for runtime-registered validators.
+    NonGenesisInitialValidator,
 }
 
 impl fmt::Display for ChainSpecError {
@@ -992,6 +1064,9 @@ impl fmt::Display for ChainSpecError {
             Self::EmptyValidatorSet => f.write_str("initial validator set must not be empty"),
             Self::ZeroValidatorStake => f.write_str("validator effective stake must be non-zero"),
             Self::ValidatorStakeOverflow => f.write_str("total validator stake overflowed"),
+            Self::NonGenesisInitialValidator => f.write_str(
+                "initial validator must have activation_epoch = 0 and exit_epoch = u64::MAX",
+            ),
         }
     }
 }

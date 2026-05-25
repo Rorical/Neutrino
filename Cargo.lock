@@ -3889,6 +3889,7 @@ dependencies = [
  "neutrino-consensus-engine",
  "neutrino-consensus-fork-choice",
  "neutrino-consensus-types",
+ "neutrino-crypto",
  "neutrino-default-runtime-core",
  "neutrino-mempool",
  "neutrino-network",

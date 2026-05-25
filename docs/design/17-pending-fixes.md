@@ -217,26 +217,15 @@ removes. Bounded by configurable max-entries cap.
 
 ---
 
-## #6 Unsupported slashing variants
+## #6 Unsupported slashing variants — `DaCommitmentFraud` only
 
-**Severity:** consensus completeness; gates true autonomy under
-adversarial conditions.
+**Severity:** consensus completeness, fully landed except for
+`DaCommitmentFraud` which is deferred to post-v1 (DA ingest does
+not exist yet).
 
-**Symptom.** `LongRangeForkParticipation` and `DaCommitmentFraud`
-return `SlashingError::UnsupportedVariant` from
-`Engine::verify_slashing_evidence`
-(`crates/consensus-engine/src/engine.rs:851-855`). `LockViolation`
-verifies foreign evidence but doesn't synthesize new evidence from
-locally-observed precommit pairs.
-
-**Approach.**
-- `LongRangeForkParticipation`: requires fork-choice integration
-  (item #2). After #2, walk the fork-choice DAG to detect votes
-  signed against a chunk that diverges from a finalized chunk.
-- `DaCommitmentFraud`: requires DA ingest. v1 has `da_root` as a
-  placeholder; advanced DA is post-v1.
-- `LockViolation`: synthesize by tracking per-validator prevote
-  quorum locks; emit when a peer precommit conflicts.
+**Status.** `LongRangeForkParticipation` and `LockViolation`
+synthesis closed by this commit (#6); `DaCommitmentFraud` stays
+queued. See "Items closed by recent commits" below.
 
 ---
 
@@ -316,8 +305,12 @@ checkpoint, replacing the recursive-STARK protocol of doc 11.
 - **#13 Wire `add_finalized_chunk` and `add_vote` into production** —
   closed by `1cbd667`
   (`feat(consensus,node): wire fork-choice into production`).
-- **#8 Validator activation/exit epoch FSM** — closed by this
-  commit.
+- **#8 Validator activation/exit epoch FSM** — closed by `9ef5243`
+  (`feat(runtime,consensus,node): validator activation/exit FSM`).
+- **#6 `LongRangeForkParticipation` verification +
+  `LockViolation` synthesis** — closed by this commit.
+  `DaCommitmentFraud` remains deferred until DA ingest lands
+  (post-v1 per doc 14).
 
 ---
 
@@ -333,15 +326,11 @@ Active sprint (this iteration):
    gate for #1 + #2.
 4. **#4 BFT round timeouts** — liveness under transient partitions.
 
-Subsequent sprints (ordered):
-
-5. **#6 Unsupported slashing variants** (`LongRangeForkParticipation`
-   path) — depends on #2 fork choice.
-
 Deferred (per doc 14, no accepted design yet):
 
-6. **#9 Chunk proof aggregation**
-7. **#10 Recursive checkpoint proof + light client**
+5. **#9 Chunk proof aggregation**
+6. **#10 Recursive checkpoint proof + light client**
+7. **#6 `DaCommitmentFraud` variant** — blocked on DA ingest.
 
 `DaCommitmentFraud` under #6 is also deferred until DA ingest exists
 (post-v1).

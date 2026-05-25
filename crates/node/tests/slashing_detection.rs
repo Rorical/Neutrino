@@ -431,6 +431,354 @@ async fn drain_slashing_pool_returns_items_in_fifo_order() {
 }
 
 #[tokio::test]
+async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
+    // Pending-fix #6: end-to-end LockViolation synthesis through
+    // the chain-backend's vote-ingest path.
+    //
+    // 1. Open a BFT session for chunk_id=0 with 3 validators.
+    // 2. Ingest v1's prevote (round 0) — crosses 2/3 stake. The
+    //    BFT loop hook must record the lock prevote quorum into
+    //    the slashing monitor.
+    // 3. Ingest v1's precommit for the same chunk_hash at round 0
+    //    (consistent with the lock — no slashing).
+    // 4. Ingest v1's precommit for a DIFFERENT chunk_hash at round
+    //    1 — the cross-round detector must emit LockViolation
+    //    because the lock quorum is in cache and no unlock quorum
+    //    intervenes. The chain-backend's slashing pool grows by 1.
+    let engine = Engine::genesis(spec(3), MemoryDatabase::new()).expect("genesis");
+    let backend = Arc::new(ChainBackend::new(engine, MockProofSystem::new()));
+    backend.set_local_voter(proposer(0));
+    let chunk = neutrino_consensus_types::Chunk {
+        chunk_id: 0,
+        start_height: 1,
+        end_height: 1,
+        start_state_root: ZERO_HASH,
+        end_state_root: [0x77; 32],
+        start_block_hash: [0xAA; 32],
+        end_block_hash: [0xBB; 32],
+        block_hash_root: [0xCC; 32],
+        block_proof_root: [0xDD; 32],
+        vrf_proof_root: [0xEE; 32],
+        active_validator_set_root: validator_set_root(&validators(3)),
+        next_validator_set_root: validator_set_root(&validators(3)),
+        da_root: [0x33; 32],
+    };
+    let chunk_hash = chunk.hash();
+    backend.with_engine_mut_for_test(|e| {
+        e.open_bft_session(chunk).expect("open_bft_session");
+    });
+
+    // Step 2: v1's prevote crosses 2/3 stake (v0 already prevoted
+    // when the session opened).
+    let v1 = proposer(1);
+    let v1_prevote = partial_vote(0, 0, FinalityVotePhase::Prevote, 0xCC, &v1, 3);
+    // The chunk_hash in the prevote needs to match the actual
+    // chunk's hash — that's what the BFT layer's `add_prevote`
+    // expects. Rebuild with the real chunk_hash.
+    let mut v1_prevote = v1_prevote;
+    v1_prevote.data.chunk_hash = chunk_hash;
+    v1_prevote.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_prevote.data);
+
+    backend.ingest_finality_vote(v1_prevote).await;
+
+    // Step 3: v1's round-0 precommit for chunk_hash (consistent
+    // with the lock). The chain backend's mechanism flows through
+    // `observe_vote_for_slashing` which records the precommit.
+    // No slashing should fire here.
+    let mut v1_precommit_r0 = partial_vote(0, 0, FinalityVotePhase::Precommit, 0xCC, &v1, 3);
+    v1_precommit_r0.data.chunk_hash = chunk_hash;
+    v1_precommit_r0.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r0.data);
+    backend.ingest_finality_vote(v1_precommit_r0).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "first precommit (consistent with lock) must not slash"
+    );
+
+    // Step 4: v1's conflicting round-1 precommit with a different
+    // chunk_hash. The cross-round detector must fire.
+    let mut conflicting_hash = chunk_hash;
+    conflicting_hash[0] ^= 0xFF;
+    let mut v1_precommit_r1 = partial_vote(0, 1, FinalityVotePhase::Precommit, 0xDD, &v1, 3);
+    v1_precommit_r1.data.chunk_hash = conflicting_hash;
+    v1_precommit_r1.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r1.data);
+    backend.ingest_finality_vote(v1_precommit_r1).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        1,
+        "cross-round conflicting precommit must surface LockViolation"
+    );
+
+    let drained = backend.drain_slashing_pool(10);
+    match drained.as_slice() {
+        [
+            SlashingEvidence::LockViolation {
+                validator_index,
+                vote_a,
+                vote_b,
+                lock_evidence,
+            },
+        ] => {
+            assert_eq!(*validator_index, 1);
+            assert_eq!(vote_a.data.chunk_hash, chunk_hash);
+            assert_eq!(vote_b.data.chunk_hash, conflicting_hash);
+            assert_eq!(lock_evidence.locked_prevote_quorum.data.round, 0);
+            assert_eq!(
+                lock_evidence.locked_prevote_quorum.data.chunk_hash,
+                chunk_hash,
+            );
+        }
+        other => panic!("expected single LockViolation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn peer_supplied_long_range_fork_evidence_passes_engine_verifier() {
+    // Pending-fix #6 verification side: peer-supplied
+    // `LongRangeForkParticipation` evidence is verified by the
+    // engine before pooling. This test confirms the verifier
+    // accepts genuine evidence (carried checkpoint matches the
+    // local canonical view, vote signature valid, hash diverges
+    // from canonical chunk).
+    //
+    // The backend's `ingest_slashing_evidence` path will be
+    // exercised once the local node has the chunk finalised; for
+    // the verifier alone, this test sets up a backend whose
+    // checkpoint store has the carried checkpoint persisted.
+    //
+    // Because building an SP1-finalised chunk in an integration
+    // test is non-trivial, this test instead asserts the
+    // negative path: a node WITHOUT the canonical chunk persisted
+    // returns `NotYetFinalizedLocally` and the pool stays empty
+    // (matching the production gossip-drop behaviour).
+    let backend = fresh_backend();
+    let v0 = proposer(0);
+
+    let canonical_chunk = neutrino_consensus_types::Chunk {
+        chunk_id: 5,
+        start_height: 6,
+        end_height: 6,
+        start_state_root: ZERO_HASH,
+        end_state_root: [0x77; 32],
+        start_block_hash: [0xAA; 32],
+        end_block_hash: [0xBB; 32],
+        block_hash_root: [0xCC; 32],
+        block_proof_root: [0xDD; 32],
+        vrf_proof_root: [0xEE; 32],
+        active_validator_set_root: validator_set_root(&validators(2)),
+        next_validator_set_root: validator_set_root(&validators(2)),
+        da_root: [0x33; 32],
+    };
+    let carried_checkpoint = Checkpoint {
+        chain_id: TEST_CHAIN_ID,
+        index: 5,
+        start_height: canonical_chunk.start_height,
+        end_height: canonical_chunk.end_height,
+        start_block_hash: canonical_chunk.start_block_hash,
+        end_block_hash: canonical_chunk.end_block_hash,
+        start_state_root: canonical_chunk.start_state_root,
+        end_state_root: canonical_chunk.end_state_root,
+        end_validator_set_root: canonical_chunk.next_validator_set_root,
+        history_root: ZERO_HASH,
+        proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
+    };
+    let divergent_hash = {
+        let mut h = canonical_chunk.hash();
+        h[0] ^= 0xFF;
+        h
+    };
+    let vote_data = FinalityVoteData {
+        chunk_id: 5,
+        round: 0,
+        chunk_hash: divergent_hash,
+        phase: FinalityVotePhase::Precommit,
+    };
+    let evidence = SlashingEvidence::LongRangeForkParticipation {
+        validator_index: 0,
+        vote: IndexedVote {
+            data: vote_data.clone(),
+            signature: v0.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
+        },
+        canonical_finalized_chunk: carried_checkpoint,
+    };
+
+    // No checkpoint/chunk persisted locally → engine returns
+    // NotYetFinalizedLocally, pool stays empty.
+    backend.ingest_slashing_evidence(evidence).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "evidence referencing a not-yet-finalised chunk must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn long_range_fork_evidence_with_mismatched_checkpoint_is_rejected() {
+    // The carried checkpoint must match the local canonical view
+    // byte-for-byte. If it doesn't, the verifier returns
+    // EvidenceFieldsInconsistent and the pool stays empty.
+    let backend = fresh_backend();
+    let v0 = proposer(0);
+
+    // Persist a canonical chunk + checkpoint at chunk_id = 5.
+    let canonical_chunk = neutrino_consensus_types::Chunk {
+        chunk_id: 5,
+        start_height: 6,
+        end_height: 6,
+        start_state_root: ZERO_HASH,
+        end_state_root: [0x77; 32],
+        start_block_hash: [0xAA; 32],
+        end_block_hash: [0xBB; 32],
+        block_hash_root: [0xCC; 32],
+        block_proof_root: [0xDD; 32],
+        vrf_proof_root: [0xEE; 32],
+        active_validator_set_root: validator_set_root(&validators(2)),
+        next_validator_set_root: validator_set_root(&validators(2)),
+        da_root: [0x33; 32],
+    };
+    let local_checkpoint = Checkpoint {
+        chain_id: TEST_CHAIN_ID,
+        index: 5,
+        start_height: 6,
+        end_height: 6,
+        start_block_hash: [0xAA; 32],
+        end_block_hash: [0xBB; 32],
+        start_state_root: ZERO_HASH,
+        end_state_root: [0x77; 32],
+        end_validator_set_root: canonical_chunk.next_validator_set_root,
+        history_root: ZERO_HASH,
+        proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
+    };
+    backend.with_engine_mut_for_test(|e| {
+        e.store_mut()
+            .put_chunk(&canonical_chunk)
+            .expect("put_chunk");
+        e.store_mut()
+            .put_checkpoint(&local_checkpoint)
+            .expect("put_checkpoint");
+    });
+
+    // Forge a checkpoint that differs in `end_state_root`.
+    let mut carried = local_checkpoint;
+    carried.end_state_root[0] ^= 0xFF;
+    let divergent_hash = {
+        let mut h = canonical_chunk.hash();
+        h[0] ^= 0xFF;
+        h
+    };
+    let vote_data = FinalityVoteData {
+        chunk_id: 5,
+        round: 0,
+        chunk_hash: divergent_hash,
+        phase: FinalityVotePhase::Precommit,
+    };
+    let evidence = SlashingEvidence::LongRangeForkParticipation {
+        validator_index: 0,
+        vote: IndexedVote {
+            data: vote_data.clone(),
+            signature: v0.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
+        },
+        canonical_finalized_chunk: carried,
+    };
+    backend.ingest_slashing_evidence(evidence).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "mismatched-checkpoint evidence must be dropped",
+    );
+}
+
+#[tokio::test]
+async fn long_range_fork_evidence_against_matching_canonical_is_pooled() {
+    // Positive case: peer-supplied evidence whose carried
+    // checkpoint matches the local canonical view, whose vote
+    // signature verifies, and whose chunk_hash diverges from the
+    // canonical chunk hash → engine accepts, pool grows.
+    let backend = fresh_backend();
+    let v0 = proposer(0);
+
+    let canonical_chunk = neutrino_consensus_types::Chunk {
+        chunk_id: 5,
+        start_height: 6,
+        end_height: 6,
+        start_state_root: ZERO_HASH,
+        end_state_root: [0x77; 32],
+        start_block_hash: [0xAA; 32],
+        end_block_hash: [0xBB; 32],
+        block_hash_root: [0xCC; 32],
+        block_proof_root: [0xDD; 32],
+        vrf_proof_root: [0xEE; 32],
+        active_validator_set_root: validator_set_root(&validators(2)),
+        next_validator_set_root: validator_set_root(&validators(2)),
+        da_root: [0x33; 32],
+    };
+    let local_checkpoint = Checkpoint {
+        chain_id: TEST_CHAIN_ID,
+        index: 5,
+        start_height: 6,
+        end_height: 6,
+        start_block_hash: [0xAA; 32],
+        end_block_hash: [0xBB; 32],
+        start_state_root: ZERO_HASH,
+        end_state_root: [0x77; 32],
+        end_validator_set_root: canonical_chunk.next_validator_set_root,
+        history_root: ZERO_HASH,
+        proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
+    };
+    backend.with_engine_mut_for_test(|e| {
+        e.store_mut()
+            .put_chunk(&canonical_chunk)
+            .expect("put_chunk");
+        e.store_mut()
+            .put_checkpoint(&local_checkpoint)
+            .expect("put_checkpoint");
+    });
+
+    let divergent_hash = {
+        let mut h = canonical_chunk.hash();
+        h[0] ^= 0xFF;
+        h
+    };
+    let vote_data = FinalityVoteData {
+        chunk_id: 5,
+        round: 0,
+        chunk_hash: divergent_hash,
+        phase: FinalityVotePhase::Precommit,
+    };
+    let evidence = SlashingEvidence::LongRangeForkParticipation {
+        validator_index: 0,
+        vote: IndexedVote {
+            data: vote_data.clone(),
+            signature: v0.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
+        },
+        canonical_finalized_chunk: local_checkpoint,
+    };
+    backend.ingest_slashing_evidence(evidence).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        1,
+        "genuine LongRangeForkParticipation evidence must be pooled",
+    );
+
+    let drained = backend.drain_slashing_pool(10);
+    match drained.as_slice() {
+        [
+            SlashingEvidence::LongRangeForkParticipation {
+                validator_index,
+                vote,
+                canonical_finalized_chunk,
+            },
+        ] => {
+            assert_eq!(*validator_index, 0);
+            assert_eq!(vote.data.chunk_id, 5);
+            assert_eq!(vote.data.chunk_hash, divergent_hash);
+            assert_eq!(canonical_finalized_chunk.index, 5);
+        }
+        other => panic!("expected single LongRangeForkParticipation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn invalid_vrf_evidence_construction_round_trips() {
     // The InvalidVrfClaim path inside verify_and_import_gossip_block
     // requires (a) a header whose signature verifies but (b) a VRF

@@ -38,7 +38,9 @@ use core::fmt;
 
 use neutrino_consensus_chunk_bft::{BftError, ChunkBft};
 use neutrino_consensus_fork_choice::ChunkVote;
-use neutrino_consensus_types::{Chunk, FinalityVote, FinalityVoteData, FinalityVotePhase};
+use neutrino_consensus_types::{
+    Chunk, FinalityVote, FinalityVoteData, FinalityVotePhase, QuorumCertificate,
+};
 use neutrino_primitives::{BitVec, ChainId, ChunkHash, ChunkId, ValidatorIndex};
 use neutrino_storage::Database;
 
@@ -419,6 +421,10 @@ impl<DB: Database> Engine<DB> {
             actions.push(BftAction::BroadcastPrevote(prevote));
         }
 
+        // Capture peer_quorum BEFORE recompute_quorum_transitions
+        // can transition the session so the lock-quorum snapshot
+        // logic (pending-fix #6) sees the original state.
+        let prior_peer_quorum = session.peer_quorum;
         recompute_quorum_transitions(
             &mut session,
             self.local_voter.as_ref(),
@@ -428,8 +434,16 @@ impl<DB: Database> Engine<DB> {
             &mut actions,
         )?;
         emit_aggregator_actions(&mut session, &mut actions);
+        // Pending-fix #6: feed the lock-prevote quorum, if it just
+        // crossed 2/3 stake, into the slashing monitor so future
+        // cross-round precommit pairs can be attributed to a
+        // verifiable lock.
+        let lock_quorum = capture_just_crossed_lock_quorum(&session, prior_peer_quorum);
 
         self.bft_sessions.insert(chunk_id, session);
+        if let Some(quorum) = lock_quorum {
+            self.slashing_monitor.record_prevote_quorum(quorum);
+        }
         // Pending-fix #13: feed the local prevote (and any
         // round-0 precommit if recompute_quorum_transitions
         // already crossed prevote quorum) into fork-choice.
@@ -473,12 +487,16 @@ impl<DB: Database> Engine<DB> {
         let peer_vote_data = vote.data.clone();
 
         let mut actions = Vec::new();
+        let lock_quorum;
         {
             let session = self
                 .bft_sessions
                 .get_mut(&chunk_id)
                 .expect("contains_key checked above");
             let active_set_len = session.bft.active_set_len();
+            // Pending-fix #6: capture peer_quorum BEFORE
+            // recompute_quorum_transitions transitions the session.
+            let prior_peer_quorum = session.peer_quorum;
             match vote.data.phase {
                 FinalityVotePhase::Prevote => session.bft.add_prevote(vote)?,
                 FinalityVotePhase::Precommit => session.bft.add_precommit(vote)?,
@@ -492,6 +510,17 @@ impl<DB: Database> Engine<DB> {
                 &mut actions,
             )?;
             emit_aggregator_actions(session, &mut actions);
+            lock_quorum = capture_just_crossed_lock_quorum(session, prior_peer_quorum);
+        }
+
+        // Pending-fix #6: feed the just-crossed lock prevote
+        // quorum to the slashing monitor. Done before the
+        // fork-choice feed to keep the ordering deterministic for
+        // tests; both call sites are now safe under separate
+        // mutable borrows because the session borrow above was
+        // dropped at the end of the inner scope.
+        if let Some(quorum) = lock_quorum {
+            self.slashing_monitor.record_prevote_quorum(quorum);
         }
 
         // Feed the peer vote AND every newly-emitted local
@@ -721,6 +750,12 @@ impl<DB: Database> Engine<DB> {
                 session.local = LocalVoteProgress::Prevoted;
                 actions.push(BftAction::BroadcastPrevote(prevote));
             }
+            // Pending-fix #6: capture peer_quorum BEFORE the
+            // transition so we can snapshot the lock prevote
+            // quorum if it crosses 2/3 stake on this round.
+            // Round-advance reset peer_quorum to BelowPrevote
+            // above so this is normally `BelowPrevote`.
+            let prior_peer_quorum = session.peer_quorum;
             recompute_quorum_transitions(
                 &mut session,
                 voter.as_ref(),
@@ -730,7 +765,11 @@ impl<DB: Database> Engine<DB> {
                 &mut actions,
             )?;
             emit_aggregator_actions(&mut session, &mut actions);
+            let lock_quorum = capture_just_crossed_lock_quorum(&session, prior_peer_quorum);
             self.bft_sessions.insert(kept_chunk_id, session);
+            if let Some(quorum) = lock_quorum {
+                self.slashing_monitor.record_prevote_quorum(quorum);
+            }
         }
         // Pending-fix #13: feed any new-round local prevotes /
         // precommits emitted by the timeout pipeline into
@@ -744,6 +783,44 @@ impl<DB: Database> Engine<DB> {
 /// Inspect the session's freshly-updated quorum status and emit the
 /// follow-on actions (precommit broadcast, finalization signal) that
 /// just became newly applicable.
+/// Snapshot the lock-prevote [`QuorumCertificate`] produced when
+/// `session.peer_quorum` just transitioned from
+/// [`PeerQuorumProgress::BelowPrevote`] to anything else.
+///
+/// Used by the slashing-monitor feed for pending-fix #6:
+/// [`SlashingMonitor::record_prevote_quorum`] needs every
+/// `(chunk_id, round, chunk_hash)` that crossed 2/3 prevote stake
+/// so the cross-round `LockViolation` detector can attach lock
+/// evidence to subsequent conflicting precommits.
+///
+/// `prior_peer_quorum` is the value of `session.peer_quorum`
+/// before [`recompute_quorum_transitions`] ran; the helper
+/// compares to detect a fresh transition (so repeated `add_*`
+/// calls after the first quorum crossing don't emit duplicate
+/// snapshots — `SlashingMonitor::record_prevote_quorum` is also
+/// idempotent, but the helper keeps the BFT hot path quiet).
+fn capture_just_crossed_lock_quorum(
+    session: &BftSession,
+    prior_peer_quorum: PeerQuorumProgress,
+) -> Option<QuorumCertificate> {
+    if !matches!(prior_peer_quorum, PeerQuorumProgress::BelowPrevote) {
+        return None;
+    }
+    if matches!(session.peer_quorum, PeerQuorumProgress::BelowPrevote) {
+        return None;
+    }
+    let aggregate = session.bft.current_aggregate(FinalityVotePhase::Prevote)?;
+    Some(QuorumCertificate {
+        data: FinalityVoteData {
+            chunk_id: session.chunk_id,
+            round: session.bft.round(),
+            chunk_hash: session.chunk_hash,
+            phase: FinalityVotePhase::Prevote,
+        },
+        aggregate,
+    })
+}
+
 fn recompute_quorum_transitions<E>(
     session: &mut BftSession,
     local_voter: Option<&ProposerKey>,
@@ -1407,6 +1484,120 @@ mod tests {
     }
 
     /// Confirm the max-round ceiling stops the session advancing
+    /// Pending-fix #6: when the BFT loop observes a peer vote that
+    /// pushes a session past 2/3 prevote stake, the just-crossed
+    /// lock prevote quorum must be fed into the slashing monitor.
+    /// A subsequent cross-round conflicting precommit from the
+    /// same validator then triggers `LockViolation` synthesis.
+    #[test]
+    fn observe_finality_vote_feeds_lock_quorum_into_slashing_monitor() {
+        use neutrino_consensus_types::SlashingEvidence;
+
+        let spec = chain_spec_with(3);
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        engine.set_local_voter(proposer(0));
+
+        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk_hash = chunk.hash();
+        let _ = engine.open_bft_session(chunk).expect("open session");
+        // After open, session has v0's prevote. With 3 validators
+        // and 2/3 quorum, v0 alone is 1/3 → no quorum yet → no
+        // lock evidence in the monitor.
+
+        // Feed v1's prevote — crosses 2/3 prevote stake. The BFT
+        // loop hook should snapshot the just-formed quorum into the
+        // slashing monitor's `observed_prevote_quorums` cache.
+        let v1_prevote = build_local_vote(
+            0,
+            chunk_hash,
+            0,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        engine
+            .observe_finality_vote(v1_prevote)
+            .expect("ingest v1 prevote");
+
+        // The slashing monitor now has a lock quorum for
+        // (chunk_id=0, round=0, chunk_hash). v1 sends a round-0
+        // precommit consistent with the lock, then later a
+        // round-1 precommit for a DIFFERENT hash → must surface
+        // LockViolation.
+        let v1_precommit_r0 = build_local_vote(
+            0,
+            chunk_hash,
+            0,
+            FinalityVotePhase::Precommit,
+            spec.chain_id,
+            &proposer(1),
+            3,
+        );
+        let evidence = engine
+            .observe_vote_for_slashing(&v1_precommit_r0)
+            .expect("v1 precommit r0 recorded");
+        assert!(
+            evidence.is_none(),
+            "first precommit registers without slashing"
+        );
+
+        // Now the conflicting cross-round precommit. Different
+        // chunk_hash but same chunk_id; the lock quorum is in the
+        // cache; no unlock quorum exists at any intervening round.
+        let mut conflicting_chunk_hash = chunk_hash;
+        conflicting_chunk_hash[0] ^= 0xFF;
+        let v1_precommit_r1 = neutrino_consensus_types::FinalityVote {
+            aggregation_bits: {
+                let mut bits = neutrino_primitives::BitVec::default();
+                for index in 0..3 {
+                    bits.push(index == 1);
+                }
+                bits
+            },
+            data: neutrino_consensus_types::FinalityVoteData {
+                chunk_id: 0,
+                round: 1,
+                chunk_hash: conflicting_chunk_hash,
+                phase: FinalityVotePhase::Precommit,
+            },
+            signature: proposer(1).sign_finality_vote(
+                spec.chain_id,
+                &neutrino_consensus_types::FinalityVoteData {
+                    chunk_id: 0,
+                    round: 1,
+                    chunk_hash: conflicting_chunk_hash,
+                    phase: FinalityVotePhase::Precommit,
+                },
+            ),
+        };
+        let evidence = engine
+            .observe_vote_for_slashing(&v1_precommit_r1)
+            .expect("v1 cross-round precommit recorded")
+            .expect("LockViolation must be synthesised");
+        match evidence {
+            SlashingEvidence::LockViolation {
+                validator_index,
+                vote_a,
+                vote_b,
+                lock_evidence,
+            } => {
+                assert_eq!(validator_index, 1);
+                assert_eq!(vote_a.data.round, 0);
+                assert_eq!(vote_a.data.chunk_hash, chunk_hash);
+                assert_eq!(vote_b.data.round, 1);
+                assert_eq!(vote_b.data.chunk_hash, conflicting_chunk_hash);
+                assert_eq!(lock_evidence.locked_prevote_quorum.data.round, 0);
+                assert_eq!(
+                    lock_evidence.locked_prevote_quorum.data.chunk_hash,
+                    chunk_hash,
+                );
+                assert!(lock_evidence.claimed_unlock_quorum.is_none());
+            }
+            other => panic!("expected LockViolation, got {other:?}"),
+        }
+    }
+
     /// once it is reached. Useful so a chronically partitioned
     /// network does not loop forever incrementing rounds.
     #[test]

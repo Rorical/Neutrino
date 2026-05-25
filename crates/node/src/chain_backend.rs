@@ -215,8 +215,12 @@ fn encode_slashing_as_tx(
         }
         | SlashingEvidence::InvalidProofSigning {
             validator_index, ..
+        }
+        | SlashingEvidence::LongRangeForkParticipation {
+            validator_index, ..
         } => *validator_index,
-        _ => return None,
+        // `DaCommitmentFraud` is deferred (post-v1) per doc 14.
+        SlashingEvidence::DaCommitmentFraud { .. } => return None,
     };
     let position = usize::try_from(offender_index).ok()?;
     let validator = active_set.get(position)?;

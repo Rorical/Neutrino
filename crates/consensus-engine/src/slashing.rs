@@ -1,38 +1,52 @@
 //! Detection and verification of objective slashing evidence.
 //!
-//! M7-B implements engine-side detection for four of the eight
-//! conditions enumerated in `docs/design/02-consensus.md §2.7`:
+//! Engine-side detection covers seven of the eight conditions
+//! enumerated in `docs/design/02-consensus.md §2.7`:
 //!
 //! - [`SlashingEvidence::DoubleProposal`]
 //! - [`SlashingEvidence::DoublePrevote`]
 //! - [`SlashingEvidence::DoublePrecommit`]
 //! - [`SlashingEvidence::InvalidVrfClaim`]
+//! - [`SlashingEvidence::InvalidProofSigning`]
+//! - [`SlashingEvidence::LockViolation`] (synthesised from a
+//!   cross-round precommit pair when a locally-observed lock
+//!   prevote quorum exists, pending-fix #6)
+//! - [`SlashingEvidence::LongRangeForkParticipation`] (verified
+//!   against the local canonical chunk / checkpoint, pending-fix
+//!   #6)
 //!
-//! Fully-formed [`SlashingEvidence::LockViolation`] can be verified
-//! when it carries a real lock quorum, but the live detector does not
-//! synthesize lock evidence from precommit pairs alone. The remaining
-//! three, `InvalidProofSigning`, `LongRangeForkParticipation`, and
-//! `DaCommitmentFraud`, depend on state the engine does not yet
-//! maintain: invalid-proof markers, long-range fork-choice
-//! integration, and DA bundle ingest.
+//! The remaining variant, `DaCommitmentFraud`, is deferred until
+//! DA bundle ingest lands (post-v1 per doc 14).
 //!
 //! Detection vs. verification:
 //!
 //! * **Detection** maintains a [`SlashingMonitor`] keyed by
 //!   `(proposer, slot)` for headers and `(validator, chunk, round,
-//!   phase)` for single-signer votes. Each `record_*` call returns
-//!   `Some(SlashingEvidence)` when the same signer has been observed
-//!   committing to a different artifact for the same key.
+//!   phase)` for single-signer votes plus a `(chunk_id, round,
+//!   chunk_hash)`-keyed cache of locally-observed prevote quorums.
+//!   Each `record_*` call returns `Some(SlashingEvidence)` when
+//!   the same signer has been observed committing to a different
+//!   artifact for the same key, OR when a cross-round precommit
+//!   pair collides with a known lock quorum (the new
+//!   `LockViolation` path). The lock-quorum cache feed is driven
+//!   by the BFT loop via [`SlashingMonitor::record_prevote_quorum`].
 //! * **Verification** re-runs the cryptographic checks every
-//!   accepting node must independently apply to gossiped evidence:
-//!   for `DoubleProposal` both header signatures verify under the
-//!   proposer's BLS public key, for `DoublePrevote` and
-//!   `DoublePrecommit` both per-validator BLS signatures verify under
-//!   the validator's BLS public key, for `LockViolation` a real locked
-//!   prevote quorum is verified before the conflicting precommits, and
-//!   for `InvalidVrfClaim` the header proposer signature verifies but
-//!   the VRF claim re-derived from the active validator set + finalized
-//!   seed fails for the carried reason.
+//!   accepting node must independently apply to gossiped evidence.
+//!   `LongRangeForkParticipation` also consults the engine's
+//!   chain store to confirm the carried checkpoint matches the
+//!   local canonical view at the same chunk-id.
+//!
+//! ## Soundness note on LockViolation synthesis
+//!
+//! The cross-round detector triggers only when the lock prevote
+//! quorum has been observed *before or alongside* the conflicting
+//! precommit pair. A lock quorum observed strictly AFTER both
+//! precommits is not retroactively applied — the trade-off
+//! accepts incompleteness (missing late-arriving evidence) in
+//! exchange for soundness (never emitting a slash without a
+//! verified lock-quorum claim). Pair-only detection would slash
+//! honest validators who voted across rounds before a quorum
+//! formed.
 //!
 //! All evidence variants carry full headers / votes so a replaying
 //! node can independently re-verify them without needing the
@@ -49,8 +63,8 @@ use neutrino_consensus_types::{
 use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
 use neutrino_crypto::bls::{PublicKey, Signature};
 use neutrino_primitives::{
-    ChainId, ChunkId, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DomainTag, FixedU128, Seed, Slot,
-    Validator, ValidatorIndex,
+    ChainId, ChunkHash, ChunkId, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DomainTag, FixedU128, Seed,
+    Slot, Validator, ValidatorIndex,
 };
 
 use crate::signature::{SignatureError, verify_header_signature};
@@ -82,6 +96,14 @@ pub struct SlashingMonitor {
     /// `(validator_index, chunk_id, round, phase) → vote` previously
     /// accepted from a single-signer aggregation bit set.
     seen_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedVote>,
+    /// Prevote quorums the local node has observed reach 2/3 stake,
+    /// keyed by `(chunk_id, round, chunk_hash)`. Populated by
+    /// [`Self::record_prevote_quorum`] from the BFT loop whenever
+    /// `recompute_quorum_transitions` first transitions a session
+    /// to `PrevoteQuorumObserved`. Consumed by the cross-round
+    /// `LockViolation` synthesiser in
+    /// [`Self::record_indexed_vote`].
+    observed_prevote_quorums: BTreeMap<(ChunkId, u32, ChunkHash), QuorumCertificate>,
     /// Largest slot value observed by `record_header`. Drives the
     /// header retention sliding window.
     high_water_slot: Slot,
@@ -114,6 +136,7 @@ impl SlashingMonitor {
         Self {
             seen_headers: BTreeMap::new(),
             seen_votes: BTreeMap::new(),
+            observed_prevote_quorums: BTreeMap::new(),
             high_water_slot: 0,
             high_water_chunk: 0,
             retention_window,
@@ -150,7 +173,9 @@ impl SlashingMonitor {
 
     /// Garbage-collect vote entries whose `chunk_id` is older than
     /// `high_water_chunk - retention_window`. Called after every
-    /// successful `record_vote` insertion.
+    /// successful `record_vote` insertion. Also prunes
+    /// `observed_prevote_quorums` under the same cutoff so the
+    /// lock-quorum cache cannot grow unboundedly.
     fn prune_votes(&mut self) {
         if self.retention_window == 0 {
             return;
@@ -160,6 +185,8 @@ impl SlashingMonitor {
         };
         self.seen_votes
             .retain(|(_, chunk_id, _, _), _| *chunk_id >= cutoff);
+        self.observed_prevote_quorums
+            .retain(|(chunk_id, _, _), _| *chunk_id >= cutoff);
     }
 
     /// Record a signed header. If the same proposer has previously
@@ -196,19 +223,36 @@ impl SlashingMonitor {
 
     /// Record a single-signer indexed vote.
     ///
-    /// Returns evidence under two rules, checked in order:
+    /// Returns evidence under three rules, checked in order:
     ///
-    /// 1. **Same-round equivocation** - a validator that has already
+    /// 1. **Same-round equivocation** — a validator that has already
     ///    been observed voting for a *different* `chunk_hash` at the
     ///    exact same `(chunk_id, round, phase)` produces
     ///    [`SlashingEvidence::DoublePrevote`] /
     ///    [`SlashingEvidence::DoublePrecommit`].
-    /// 2. **No equivocation** - exact-duplicate or same-hash votes
+    /// 2. **Cross-round lock violation** (precommits only) — a
+    ///    validator who precommits a new `chunk_hash` at a later
+    ///    round than a prior precommit for the same `chunk_id` is
+    ///    slashable IF (a) the local node observed a 2/3 prevote
+    ///    quorum for the prior precommit's `chunk_hash` at the
+    ///    prior round (the "lock"), AND (b) the local node has
+    ///    NOT observed a 2/3 prevote quorum for the new precommit's
+    ///    `chunk_hash` at any round strictly between the two
+    ///    precommit rounds (an honest "unlock"). Produces
+    ///    [`SlashingEvidence::LockViolation`] with the locked
+    ///    prevote quorum attached as `lock_evidence`. Lock quorums
+    ///    are fed in by the BFT loop via
+    ///    [`Self::record_prevote_quorum`]; the detector is sound
+    ///    but not complete (a lock quorum observed AFTER both
+    ///    precommit precludes synthesis, by design — see the
+    ///    module docstring for the soundness trade-off).
+    /// 3. **No equivocation** — exact-duplicate or same-hash votes
     ///    return `None`. The vote is still recorded for future
     ///    equivocation lookups.
     ///
     /// Aggregated votes carrying more than one signer bit do not
-    /// participate here; that's M7-C territory.
+    /// participate here; the caller extracts the single signer via
+    /// [`extract_single_signer`] first.
     pub fn record_indexed_vote(
         &mut self,
         validator_index: ValidatorIndex,
@@ -223,6 +267,9 @@ impl SlashingMonitor {
         if vote.data.chunk_id > self.high_water_chunk {
             self.high_water_chunk = vote.data.chunk_id;
         }
+        // Rule 1: same-round equivocation. Caught before any insert
+        // / cross-round work because the existing entry at the same
+        // key always takes precedence.
         if let Some(existing) = self.seen_votes.get(&key) {
             if existing.data.chunk_hash != vote.data.chunk_hash {
                 let evidence = match vote.data.phase {
@@ -244,9 +291,130 @@ impl SlashingMonitor {
             return None;
         }
         self.seen_votes.insert(key, vote.clone());
-        self.prune_votes();
 
+        // Rule 2: cross-round LockViolation. Precommits only.
+        if vote.data.phase == FinalityVotePhase::Precommit
+            && let Some(evidence) = self.try_synthesize_lock_violation(validator_index, vote)
+        {
+            self.prune_votes();
+            return Some(evidence);
+        }
+
+        self.prune_votes();
         None
+    }
+
+    /// Record an observed 2/3 prevote quorum so the
+    /// [`Self::record_indexed_vote`] cross-round detector can
+    /// attach lock evidence when it later sees a conflicting
+    /// precommit. Called by the BFT loop once per
+    /// `(chunk_id, round, chunk_hash)` quorum transition.
+    ///
+    /// Subsequent calls for the same key are no-ops — the first
+    /// observation is sufficient lock evidence and replacing the
+    /// stored aggregate with a later (larger) one is unnecessary.
+    pub fn record_prevote_quorum(&mut self, quorum: QuorumCertificate) {
+        if quorum.data.phase != FinalityVotePhase::Prevote {
+            return;
+        }
+        if quorum.data.chunk_id > self.high_water_chunk {
+            self.high_water_chunk = quorum.data.chunk_id;
+        }
+        let key = (
+            quorum.data.chunk_id,
+            quorum.data.round,
+            quorum.data.chunk_hash,
+        );
+        self.observed_prevote_quorums.entry(key).or_insert(quorum);
+        self.prune_votes();
+    }
+
+    /// Look for a prior precommit by `validator_index` for the same
+    /// `chunk_id`, at a strictly earlier `round`, voting for a
+    /// different `chunk_hash`. Returns the prior round + the prior
+    /// vote on the first match (lowest-round) so the carried
+    /// `vote_a` is the earliest conflicting precommit.
+    fn find_prior_conflicting_precommit(
+        &self,
+        validator_index: ValidatorIndex,
+        chunk_id: ChunkId,
+        new_round: u32,
+        new_chunk_hash: ChunkHash,
+    ) -> Option<(u32, IndexedVote)> {
+        self.seen_votes.iter().find_map(|((v, c, r, p), vote)| {
+            if *v == validator_index
+                && *c == chunk_id
+                && *r < new_round
+                && *p == FinalityVotePhase::Precommit
+                && vote.data.chunk_hash != new_chunk_hash
+            {
+                Some((*r, vote.clone()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Returns `true` if an observed prevote quorum for
+    /// `(chunk_id, R, new_chunk_hash)` exists with
+    /// `prior_round < R <= new_round`. Such a quorum permits an
+    /// honest "unlock" — the validator is allowed to switch their
+    /// precommit to `new_chunk_hash` without being slashed.
+    fn has_unlock_quorum(
+        &self,
+        chunk_id: ChunkId,
+        prior_round: u32,
+        new_round: u32,
+        new_chunk_hash: ChunkHash,
+    ) -> bool {
+        for round in prior_round.saturating_add(1)..=new_round {
+            let key = (chunk_id, round, new_chunk_hash);
+            if self.observed_prevote_quorums.contains_key(&key) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Attempt to synthesise [`SlashingEvidence::LockViolation`]
+    /// from the just-recorded precommit. Implements rule 2 of
+    /// [`Self::record_indexed_vote`]: needs both a prior
+    /// conflicting precommit AND a locally-observed lock quorum at
+    /// the prior round, AND no honest-unlock quorum in between.
+    fn try_synthesize_lock_violation(
+        &self,
+        validator_index: ValidatorIndex,
+        new_vote: &IndexedVote,
+    ) -> Option<SlashingEvidence> {
+        let (prior_round, prior_vote) = self.find_prior_conflicting_precommit(
+            validator_index,
+            new_vote.data.chunk_id,
+            new_vote.data.round,
+            new_vote.data.chunk_hash,
+        )?;
+        let lock_key = (
+            new_vote.data.chunk_id,
+            prior_round,
+            prior_vote.data.chunk_hash,
+        );
+        let lock_quorum = self.observed_prevote_quorums.get(&lock_key)?;
+        if self.has_unlock_quorum(
+            new_vote.data.chunk_id,
+            prior_round,
+            new_vote.data.round,
+            new_vote.data.chunk_hash,
+        ) {
+            return None;
+        }
+        Some(SlashingEvidence::LockViolation {
+            validator_index,
+            vote_a: prior_vote,
+            vote_b: new_vote.clone(),
+            lock_evidence: LockEvidence {
+                locked_prevote_quorum: lock_quorum.clone(),
+                claimed_unlock_quorum: None,
+            },
+        })
     }
 
     /// Number of distinct (proposer, slot) headers indexed.
@@ -369,6 +537,13 @@ pub enum SlashingError {
     /// The carried `VrfRejectionReason` does not match what
     /// re-running the verifier locally produces.
     VrfReasonInconsistent,
+    /// The evidence references a checkpoint or chunk the local
+    /// node has not finalized yet, so verification cannot complete.
+    /// The evidence may still be valid; the caller should drop it
+    /// for now and re-ingest once the relevant chunk lands. Used by
+    /// `LongRangeForkParticipation` evidence whose `chunk_id` has
+    /// not been finalised locally.
+    NotYetFinalizedLocally,
     /// Evidence variant is not yet supported by the engine.
     UnsupportedVariant,
 }
@@ -397,6 +572,9 @@ impl fmt::Display for SlashingError {
             }
             Self::VrfReasonInconsistent => f.write_str(
                 "InvalidVrfClaim evidence: carried rejection reason does not match local verification",
+            ),
+            Self::NotYetFinalizedLocally => f.write_str(
+                "slashing evidence references a checkpoint or chunk the local node has not finalized yet",
             ),
             Self::UnsupportedVariant => {
                 f.write_str("slashing evidence variant is not yet supported by the engine")
@@ -576,6 +754,74 @@ fn quorum_reached(stake: u64, total_stake: u64, (numerator, denominator): (u64, 
         && numerator != 0
         && u128::from(stake) * u128::from(denominator)
             >= u128::from(total_stake) * u128::from(numerator)
+}
+
+/// Verify a [`SlashingEvidence::LongRangeForkParticipation`].
+///
+/// The variant catches a validator signing a finality vote on a
+/// chunk whose hash conflicts with the canonically finalised chunk
+/// at the same `chunk_id`. Because the chunk_id is finalised on
+/// the local chain, the validator's vote necessarily references a
+/// divergent branch — the "long-range fork" the doc names.
+///
+/// Verification:
+///
+/// 1. `vote.data.chunk_id == carried_checkpoint.index` — the
+///    carried checkpoint must point at the same chunk-id the
+///    offender's vote covers.
+/// 2. `local_checkpoint.is_some() && local_chunk.is_some()` — the
+///    local chain has finalised the chunk. Without a local
+///    finalised view the verifier cannot confirm divergence and
+///    returns [`SlashingError::NotYetFinalizedLocally`].
+/// 3. `*local_checkpoint == *carried_checkpoint` — the carried
+///    checkpoint matches the local canonical view. A mismatch
+///    means either the offender is on a different fork than this
+///    verifier or the carried evidence is forged; either way the
+///    verifier returns
+///    [`SlashingError::EvidenceFieldsInconsistent`].
+/// 4. `vote.data.chunk_hash != local_chunk.hash()` — the
+///    validator's vote references a different chunk than the
+///    canonical one. If the hashes match the validator voted
+///    correctly and there is nothing to slash; returns
+///    [`SlashingError::NotEquivocating`].
+/// 5. The per-validator BLS signature on the vote verifies
+///    against the offender's public key in the active set.
+///
+/// The local checkpoint + chunk are passed as parameters (rather
+/// than looked up by this function) so the verifier stays
+/// no_std-friendly and unit-testable without an engine. The
+/// engine wrapper in `Engine::verify_slashing_evidence` does the
+/// store lookups and forwards the results.
+///
+/// # Errors
+///
+/// Returns the matching [`SlashingError`] variant on any failed
+/// check.
+pub fn verify_long_range_fork_participation_evidence(
+    validator_index: ValidatorIndex,
+    vote: &IndexedVote,
+    carried_checkpoint: &neutrino_primitives::Checkpoint,
+    local_checkpoint: Option<&neutrino_primitives::Checkpoint>,
+    local_chunk: Option<&neutrino_consensus_types::Chunk>,
+    active_set: &[Validator],
+    chain_id: ChainId,
+) -> Result<(), SlashingError> {
+    if vote.data.chunk_id != carried_checkpoint.index {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    let Some(local_checkpoint) = local_checkpoint else {
+        return Err(SlashingError::NotYetFinalizedLocally);
+    };
+    let Some(local_chunk) = local_chunk else {
+        return Err(SlashingError::NotYetFinalizedLocally);
+    };
+    if local_checkpoint != carried_checkpoint {
+        return Err(SlashingError::EvidenceFieldsInconsistent);
+    }
+    if vote.data.chunk_hash == local_chunk.hash() {
+        return Err(SlashingError::NotEquivocating);
+    }
+    verify_indexed_vote_signature(validator_index, vote, active_set, chain_id)
 }
 
 /// Verify a [`SlashingEvidence::DoublePrevote`] or
@@ -1332,6 +1578,430 @@ mod tests {
                 neutrino_primitives::DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
             ),
             Err(SlashingError::VrfReasonInconsistent)
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Pending-fix #6 — LockViolation synthesis
+    // -----------------------------------------------------------
+
+    fn quorum_for_prevote_data(
+        chunk_id: ChunkId,
+        round: u32,
+        chunk_hash: u8,
+        signers: &[u8],
+    ) -> QuorumCertificate {
+        quorum_certificate_for_data(
+            FinalityVoteData {
+                chunk_id,
+                round,
+                chunk_hash: [chunk_hash; 32],
+                phase: FinalityVotePhase::Prevote,
+            },
+            signers,
+        )
+    }
+
+    #[test]
+    fn record_indexed_vote_synthesises_lock_violation_when_lock_quorum_present() {
+        // Validator 1 precommits chunk_hash 0xAA at round 0 alongside
+        // an observed prevote quorum at the same key (the "lock"),
+        // then precommits chunk_hash 0xBB at round 1 with no
+        // observed unlock quorum.
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+
+        monitor.record_prevote_quorum(quorum_for_prevote_data(7, 0, 0xAA, &[0, 1]));
+        let lock_precommit = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        assert!(monitor.record_indexed_vote(1, &lock_precommit).is_none());
+
+        let conflicting = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        let evidence = monitor
+            .record_indexed_vote(1, &conflicting)
+            .expect("lock violation evidence emitted");
+        match evidence {
+            SlashingEvidence::LockViolation {
+                validator_index,
+                vote_a,
+                vote_b,
+                lock_evidence,
+            } => {
+                assert_eq!(validator_index, 1);
+                assert_eq!(vote_a.data.round, 0);
+                assert_eq!(vote_a.data.chunk_hash, [0xAA; 32]);
+                assert_eq!(vote_b.data.round, 1);
+                assert_eq!(vote_b.data.chunk_hash, [0xBB; 32]);
+                assert_eq!(lock_evidence.locked_prevote_quorum.data.round, 0);
+                assert!(lock_evidence.claimed_unlock_quorum.is_none());
+            }
+            other => panic!("expected LockViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_indexed_vote_synthesises_lock_violation_when_quorum_observed_first() {
+        // Same scenario as above but the lock quorum is observed
+        // BEFORE either precommit — confirms the cache survives
+        // arbitrary observation order.
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+
+        monitor.record_prevote_quorum(quorum_for_prevote_data(7, 0, 0xAA, &[0, 1]));
+        let lock_precommit = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let conflicting = signed_indexed_vote(7, 5, FinalityVotePhase::Precommit, 0xBB, &v1);
+
+        assert!(monitor.record_indexed_vote(1, &lock_precommit).is_none());
+        let evidence = monitor
+            .record_indexed_vote(1, &conflicting)
+            .expect("lock violation evidence emitted");
+        assert!(matches!(evidence, SlashingEvidence::LockViolation { .. }));
+    }
+
+    #[test]
+    fn record_indexed_vote_skips_lock_violation_when_unlock_quorum_intervenes() {
+        // Validator switches their precommit from 0xAA → 0xBB across
+        // rounds 0 → 2 with an HONEST prevote quorum for 0xBB at
+        // round 1 in between. The cross-round detector must NOT
+        // emit a LockViolation because the unlock was legitimate.
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+
+        // Locked prevote quorum at round 0 for 0xAA.
+        monitor.record_prevote_quorum(quorum_for_prevote_data(7, 0, 0xAA, &[0, 1]));
+        // Honest unlock prevote quorum at round 1 for 0xBB.
+        monitor.record_prevote_quorum(quorum_for_prevote_data(7, 1, 0xBB, &[0, 1]));
+
+        let lock_precommit = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let switched = signed_indexed_vote(7, 2, FinalityVotePhase::Precommit, 0xBB, &v1);
+
+        assert!(monitor.record_indexed_vote(1, &lock_precommit).is_none());
+        assert!(
+            monitor.record_indexed_vote(1, &switched).is_none(),
+            "honest unlock must not synthesise LockViolation",
+        );
+    }
+
+    #[test]
+    fn record_indexed_vote_skips_lock_violation_when_lock_quorum_arrives_after_both_precommits() {
+        // Soundness side of the soundness/completeness trade-off:
+        // a lock quorum observed strictly AFTER both precommits
+        // does not retroactively trigger the detector. Documented
+        // behaviour — see the module docstring.
+        let v1 = proposer(1);
+        let mut monitor = SlashingMonitor::new();
+
+        let lock_precommit = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let conflicting = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+
+        assert!(monitor.record_indexed_vote(1, &lock_precommit).is_none());
+        assert!(monitor.record_indexed_vote(1, &conflicting).is_none());
+
+        // Lock quorum observed AFTER the conflicting precommit.
+        monitor.record_prevote_quorum(quorum_for_prevote_data(7, 0, 0xAA, &[0, 1]));
+        // No retroactive emission.
+    }
+
+    #[test]
+    fn synthesised_lock_violation_passes_engine_verifier() {
+        // Round-trip: the cross-round detector emits evidence the
+        // shared verifier accepts. Confirms our synthesised
+        // LockEvidence shape is compatible with
+        // `verify_lock_violation_evidence`.
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let mut monitor = SlashingMonitor::new();
+
+        monitor.record_prevote_quorum(quorum_for_prevote_data(7, 0, 0xAA, &[0, 1]));
+        let lock_precommit = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let conflicting = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+
+        monitor.record_indexed_vote(1, &lock_precommit);
+        let evidence = monitor
+            .record_indexed_vote(1, &conflicting)
+            .expect("evidence emitted");
+        let SlashingEvidence::LockViolation {
+            validator_index,
+            vote_a,
+            vote_b,
+            lock_evidence,
+        } = evidence
+        else {
+            panic!("expected LockViolation");
+        };
+        verify_lock_violation_evidence(
+            validator_index,
+            &vote_a,
+            &vote_b,
+            &lock_evidence,
+            &active_set,
+            CHAIN_ID,
+            (2, 3),
+        )
+        .expect("synthesised LockViolation evidence passes verifier");
+    }
+
+    #[test]
+    fn record_prevote_quorum_ignores_non_prevote_phase() {
+        // The cache only exists to gate LockViolation synthesis;
+        // accepting a precommit-tagged quorum would be a programmer
+        // error and should be silently ignored.
+        let mut monitor = SlashingMonitor::new();
+        let precommit_tagged = quorum_certificate_for_data(
+            FinalityVoteData {
+                chunk_id: 7,
+                round: 0,
+                chunk_hash: [0xAA; 32],
+                phase: FinalityVotePhase::Precommit,
+            },
+            &[0, 1],
+        );
+        monitor.record_prevote_quorum(precommit_tagged);
+
+        let v1 = proposer(1);
+        let lock_precommit = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xAA, &v1);
+        let conflicting = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
+        monitor.record_indexed_vote(1, &lock_precommit);
+        assert!(
+            monitor.record_indexed_vote(1, &conflicting).is_none(),
+            "non-prevote 'quorum' must not enable LockViolation synthesis",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Pending-fix #6 — LongRangeForkParticipation verification
+    // -----------------------------------------------------------
+
+    fn dummy_checkpoint(index: u64, end_block_hash_byte: u8) -> neutrino_primitives::Checkpoint {
+        neutrino_primitives::Checkpoint {
+            chain_id: CHAIN_ID,
+            index,
+            start_height: index.saturating_mul(10),
+            end_height: index.saturating_mul(10).saturating_add(9),
+            start_block_hash: [0; 32],
+            end_block_hash: [end_block_hash_byte; 32],
+            start_state_root: [0; 32],
+            end_state_root: [0; 32],
+            end_validator_set_root: [0; 32],
+            history_root: [0; 32],
+            proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
+        }
+    }
+
+    fn dummy_chunk(chunk_id: u64, end_block_hash_byte: u8) -> neutrino_consensus_types::Chunk {
+        neutrino_consensus_types::Chunk {
+            chunk_id,
+            start_height: chunk_id.saturating_mul(10),
+            end_height: chunk_id.saturating_mul(10).saturating_add(9),
+            start_state_root: [0; 32],
+            end_state_root: [0; 32],
+            start_block_hash: [0; 32],
+            end_block_hash: [end_block_hash_byte; 32],
+            block_hash_root: [0; 32],
+            block_proof_root: [0; 32],
+            vrf_proof_root: [0; 32],
+            active_validator_set_root: [0; 32],
+            next_validator_set_root: [0; 32],
+            da_root: [0; 32],
+        }
+    }
+
+    #[test]
+    fn verify_long_range_fork_accepts_genuine_divergence() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        // Local canonical chunk has hash H; offender voted for H'.
+        let canonical_chunk = dummy_chunk(5, 0xCC);
+        let canonical_hash = canonical_chunk.hash();
+        let checkpoint = dummy_checkpoint(5, 0xCC);
+        // Offender's vote references chunk_hash = byte-tampered.
+        let mut divergent_hash = canonical_hash;
+        divergent_hash[0] ^= 0xFF;
+        let vote = IndexedVote {
+            data: FinalityVoteData {
+                chunk_id: 5,
+                round: 0,
+                chunk_hash: divergent_hash,
+                phase: FinalityVotePhase::Precommit,
+            },
+            signature: v1.sign_finality_vote(
+                CHAIN_ID,
+                &FinalityVoteData {
+                    chunk_id: 5,
+                    round: 0,
+                    chunk_hash: divergent_hash,
+                    phase: FinalityVotePhase::Precommit,
+                },
+            ),
+        };
+        verify_long_range_fork_participation_evidence(
+            1,
+            &vote,
+            &checkpoint,
+            Some(&checkpoint),
+            Some(&canonical_chunk),
+            &active_set,
+            CHAIN_ID,
+        )
+        .expect("divergent vote on a finalised chunk verifies");
+    }
+
+    #[test]
+    fn verify_long_range_fork_rejects_matching_chunk_hash() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let canonical_chunk = dummy_chunk(5, 0xCC);
+        let canonical_hash = canonical_chunk.hash();
+        let checkpoint = dummy_checkpoint(5, 0xCC);
+        // Vote references the SAME chunk_hash as the canonical
+        // chunk — the validator voted correctly; no slashing.
+        let data = FinalityVoteData {
+            chunk_id: 5,
+            round: 0,
+            chunk_hash: canonical_hash,
+            phase: FinalityVotePhase::Precommit,
+        };
+        let vote = IndexedVote {
+            data: data.clone(),
+            signature: v1.sign_finality_vote(CHAIN_ID, &data),
+        };
+        assert_eq!(
+            verify_long_range_fork_participation_evidence(
+                1,
+                &vote,
+                &checkpoint,
+                Some(&checkpoint),
+                Some(&canonical_chunk),
+                &active_set,
+                CHAIN_ID,
+            ),
+            Err(SlashingError::NotEquivocating)
+        );
+    }
+
+    #[test]
+    fn verify_long_range_fork_defers_when_local_checkpoint_missing() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let checkpoint = dummy_checkpoint(5, 0xCC);
+        let data = FinalityVoteData {
+            chunk_id: 5,
+            round: 0,
+            chunk_hash: [0xDD; 32],
+            phase: FinalityVotePhase::Precommit,
+        };
+        let vote = IndexedVote {
+            data: data.clone(),
+            signature: v1.sign_finality_vote(CHAIN_ID, &data),
+        };
+        assert_eq!(
+            verify_long_range_fork_participation_evidence(
+                1,
+                &vote,
+                &checkpoint,
+                None, // local checkpoint missing
+                Some(&dummy_chunk(5, 0xCC)),
+                &active_set,
+                CHAIN_ID,
+            ),
+            Err(SlashingError::NotYetFinalizedLocally)
+        );
+    }
+
+    #[test]
+    fn verify_long_range_fork_rejects_mismatched_checkpoint() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let canonical_chunk = dummy_chunk(5, 0xCC);
+        // Carried checkpoint has different end_block_hash than the
+        // local canonical view.
+        let carried = dummy_checkpoint(5, 0xCC);
+        let local = dummy_checkpoint(5, 0xEE);
+        let data = FinalityVoteData {
+            chunk_id: 5,
+            round: 0,
+            chunk_hash: [0xDD; 32],
+            phase: FinalityVotePhase::Precommit,
+        };
+        let vote = IndexedVote {
+            data: data.clone(),
+            signature: v1.sign_finality_vote(CHAIN_ID, &data),
+        };
+        assert_eq!(
+            verify_long_range_fork_participation_evidence(
+                1,
+                &vote,
+                &carried,
+                Some(&local),
+                Some(&canonical_chunk),
+                &active_set,
+                CHAIN_ID,
+            ),
+            Err(SlashingError::EvidenceFieldsInconsistent)
+        );
+    }
+
+    #[test]
+    fn verify_long_range_fork_rejects_mismatched_chunk_id() {
+        let v1 = proposer(1);
+        let active_set = validators_with_keys(2);
+        let canonical_chunk = dummy_chunk(5, 0xCC);
+        let checkpoint = dummy_checkpoint(5, 0xCC);
+        // Vote claims chunk_id=3 but carried checkpoint is for index=5.
+        let data = FinalityVoteData {
+            chunk_id: 3,
+            round: 0,
+            chunk_hash: [0xDD; 32],
+            phase: FinalityVotePhase::Precommit,
+        };
+        let vote = IndexedVote {
+            data: data.clone(),
+            signature: v1.sign_finality_vote(CHAIN_ID, &data),
+        };
+        assert_eq!(
+            verify_long_range_fork_participation_evidence(
+                1,
+                &vote,
+                &checkpoint,
+                Some(&checkpoint),
+                Some(&canonical_chunk),
+                &active_set,
+                CHAIN_ID,
+            ),
+            Err(SlashingError::EvidenceFieldsInconsistent)
+        );
+    }
+
+    #[test]
+    fn verify_long_range_fork_rejects_bad_signature() {
+        let v1 = proposer(1);
+        let v0 = proposer(0);
+        let active_set = validators_with_keys(2);
+        let canonical_chunk = dummy_chunk(5, 0xCC);
+        let checkpoint = dummy_checkpoint(5, 0xCC);
+        let data = FinalityVoteData {
+            chunk_id: 5,
+            round: 0,
+            chunk_hash: [0xDD; 32],
+            phase: FinalityVotePhase::Precommit,
+        };
+        // Signature claims to be from validator 1 (the verifier's
+        // index argument) but is actually signed by v0.
+        let _ = v1;
+        let vote = IndexedVote {
+            data: data.clone(),
+            signature: v0.sign_finality_vote(CHAIN_ID, &data),
+        };
+        assert_eq!(
+            verify_long_range_fork_participation_evidence(
+                1,
+                &vote,
+                &checkpoint,
+                Some(&checkpoint),
+                Some(&canonical_chunk),
+                &active_set,
+                CHAIN_ID,
+            ),
+            Err(SlashingError::BadSignature)
         );
     }
 }

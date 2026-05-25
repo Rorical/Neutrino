@@ -1118,11 +1118,49 @@ impl<DB: Database> Engine<DB> {
                 }
                 Ok(())
             }
-            // LongRangeForkParticipation / DaCommitmentFraud require
-            // fork-choice and DA-ingest state this engine does not
-            // maintain yet.
-            _ => Err(SlashingError::UnsupportedVariant),
+            SlashingEvidence::LongRangeForkParticipation {
+                validator_index,
+                vote,
+                canonical_finalized_chunk,
+            } => self.verify_long_range_fork_participation(
+                *validator_index,
+                vote,
+                canonical_finalized_chunk,
+            ),
+            // `DaCommitmentFraud` requires DA-ingest state this
+            // engine does not maintain yet (deferred per doc 14 +
+            // doc 17 #6).
+            SlashingEvidence::DaCommitmentFraud { .. } => Err(SlashingError::UnsupportedVariant),
         }
+    }
+
+    /// Engine wrapper around
+    /// [`slashing::verify_long_range_fork_participation_evidence`]
+    /// that looks up the local canonical checkpoint + chunk from
+    /// the chain store and forwards them.
+    fn verify_long_range_fork_participation(
+        &self,
+        validator_index: neutrino_primitives::ValidatorIndex,
+        vote: &neutrino_consensus_types::IndexedVote,
+        canonical_finalized_chunk: &neutrino_primitives::Checkpoint,
+    ) -> Result<(), SlashingError> {
+        let local_checkpoint = self
+            .store()
+            .get_checkpoint(canonical_finalized_chunk.index)
+            .map_err(|_| SlashingError::NotYetFinalizedLocally)?;
+        let local_chunk = self
+            .store()
+            .get_chunk(vote.data.chunk_id)
+            .map_err(|_| SlashingError::NotYetFinalizedLocally)?;
+        slashing::verify_long_range_fork_participation_evidence(
+            validator_index,
+            vote,
+            canonical_finalized_chunk,
+            local_checkpoint.as_ref(),
+            local_chunk.as_ref(),
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+        )
     }
 }
 

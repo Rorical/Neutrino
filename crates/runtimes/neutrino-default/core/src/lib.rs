@@ -996,8 +996,63 @@ pub struct StfInput {
 /// Public output committed by the SP1 Guest. Mirrored by the native
 /// dry-run path so the SP1 verifier can cross-check it against the
 /// consensus engine's `BlockProofPublicInputs`.
+///
+/// # Binding to `BlockProofPublicInputs`
+///
+/// Every field carries a cryptographic commitment that the host-side
+/// verifier (`Sp1ProofSystem::verify_block`) cross-checks against the
+/// matching field in `BlockProofPublicInputs`. The set covers:
+///
+/// 1. The STF *inputs* the guest consumed: `chain_id`, `block_height`,
+///    `block_gas_limit`, `gas_price`, `proposer_address`,
+///    `transactions_root` (re-derived from `input.transactions`).
+///    Without these bindings, a malicious prover can feed the guest
+///    fabricated values (e.g. unlock withdrawals early, redirect fees,
+///    drain accounts via inflated gas_price) and produce a proof that
+///    matches a forged header.
+///
+/// 2. The STF *outputs* the guest produced: `pre_state_root`,
+///    `post_state_root`, `applied`, `failed`, `validator_set_root`,
+///    `gas_used`, `receipts_root`. These were already bound; the
+///    inputs above were not until the Q2 closure.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StfPublicOutput {
+    /// Chain identifier the STF executed under.  The consensus engine
+    /// wires this into `BlockProofPublicInputs.chain_id` so a proof
+    /// from chain A cannot be replayed as a proof on chain B (the
+    /// committed value would not match the verifier's expected
+    /// chain_id).
+    pub chain_id: u64,
+    /// Height of the block being executed.  Bound to
+    /// `BlockProofPublicInputs.height` so a malicious prover cannot
+    /// supply a forged `block_height` to the STF (e.g. to mature
+    /// withdrawals early — the STF uses `block_height` for the
+    /// `UNBONDING_DELAY_BLOCKS` clock).
+    pub block_height: u64,
+    /// Block-level gas ceiling the STF executed under.  Bound to
+    /// `BlockProofPublicInputs.gas_limit` so a malicious prover
+    /// cannot raise the ceiling beyond what the header committed
+    /// to (which would let gas-hogging transactions pass).
+    pub block_gas_limit: u64,
+    /// Per-gas-unit native-token cost the STF applied.  Bound to
+    /// `BlockProofPublicInputs.gas_price` so a malicious prover
+    /// cannot quietly inflate the gas_price (draining arbitrary
+    /// signers' balances) or zero it (skipping the fee market).
+    pub gas_price: u128,
+    /// Runtime account credited with this block's accumulated fees.
+    /// Bound to `BlockProofPublicInputs.proposer_address` so a
+    /// malicious prover cannot redirect fees to a different
+    /// address than the consensus header committed to.
+    pub proposer_address: Address,
+    /// Binary Merkle root over the borsh-encoded forms of
+    /// `input.transactions`, computed under the same convention as
+    /// `neutrino_primitives::merkle_root_of_blobs`.  Bound to
+    /// `BlockProofPublicInputs.transactions_root` (= the body's
+    /// `transactions_root` lane), so a malicious prover cannot feed
+    /// the guest a transaction list that diverges from the one
+    /// gossiped in the body — the highest-severity attack the Q2
+    /// audit identified (forged `post_state_root` via fake mint).
+    pub transactions_root: StateRoot,
     /// State root before this block.
     pub pre_state_root: StateRoot,
     /// State root after this block.
@@ -1063,6 +1118,23 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
     let mut gas_used: u64 = 0;
     let mut proposer_fee: u128 = 0;
     let mut receipts: Vec<Receipt> = Vec::with_capacity(input.transactions.len());
+
+    // Q2 binding: compute `transactions_root` over the borsh-encoded
+    // forms of `input.transactions` up front.  The host plumbs
+    // `body.transactions` (already-borsh-encoded blobs) through to the
+    // STF; re-encoding them here recovers exactly those same bytes
+    // because borsh is canonical for the `Transaction` variants we
+    // accept.  The resulting digest matches `header.transactions_root`
+    // (also a Merkle over `body.transactions`), so the SP1 verifier's
+    // `committed.transactions_root == public_inputs.transactions_root`
+    // cross-check rejects any proof whose `input.transactions`
+    // diverges from the gossiped body.
+    let transaction_blobs: Vec<Vec<u8>> = input
+        .transactions
+        .iter()
+        .map(|tx| borsh::to_vec(tx).expect("Transaction borsh is canonical and infallible"))
+        .collect();
+    let transactions_root = neutrino_primitives::merkle_root_of_blobs(&transaction_blobs);
 
     for tx in &input.transactions {
         let kind = tx_kind_code(tx);
@@ -1150,6 +1222,16 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
     let receipts_root = compute_receipts_root(&receipts);
     let post = state.post_state_root();
     StfPublicOutput {
+        // Q2 input bindings — copied from `StfInput` so the SP1
+        // verifier can cross-check them against
+        // `BlockProofPublicInputs`.
+        chain_id: input.chain_id,
+        block_height: input.block_height,
+        block_gas_limit: input.block_gas_limit,
+        gas_price: input.gas_price,
+        proposer_address: input.proposer_address,
+        transactions_root,
+        // Pre-existing output bindings.
         pre_state_root: pre,
         post_state_root: post,
         applied,

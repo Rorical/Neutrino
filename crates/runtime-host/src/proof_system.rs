@@ -209,8 +209,13 @@ where
         // 5. Cross-check the committed StfPublicOutput against the
         //    consensus public inputs before handing the proof back.
         //    `verify_block` re-checks this too, but doing it here as
-        //    well surfaces a state-root divergence as a proving
-        //    failure rather than a downstream verification failure.
+        //    well surfaces a divergence as a proving failure rather
+        //    than a downstream verification failure. Mirrors the
+        //    full verifier-side cross-check set so an off-tree
+        //    prover that skips the lines above (the
+        //    input-vs-public-inputs ones) still produces a proof
+        //    that the verifier accepts or rejects on consistent
+        //    grounds.
         let committed: StfPublicOutput =
             BorshDeserialize::deserialize_reader(&mut proof.public_values.as_slice())
                 .map_err(|_| ProofError::MalformedProof)?;
@@ -223,6 +228,27 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
         if committed.receipts_root != public_inputs.receipt_root {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.validator_set_root != public_inputs.runtime_extra {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.chain_id != public_inputs.chain_id {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.block_height != public_inputs.height {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.block_gas_limit != public_inputs.gas_limit {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.gas_price != public_inputs.gas_price {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.proposer_address != public_inputs.proposer_address {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if committed.transactions_root != public_inputs.transactions_root {
             return Err(ProofError::PublicInputMismatch);
         }
 
@@ -238,15 +264,45 @@ where
         let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
 
         // 2. Cryptographic verify against the bound verifying key.
+        //    Anchors the proof to the embedded guest ELF; a proof
+        //    generated against a different ELF (different bytecode)
+        //    fails here.
         self.ctx
             .prover
             .verify(&bundle, &self.ctx.vk, None)
             .map_err(|_| ProofError::BackendRejected)?;
 
-        // 3. Cross-check committed StfPublicOutput against the
-        //    consensus-level public inputs. The engine has already
-        //    matched the rest of the envelope (chain_id, block_hash,
-        //    transactions_root, ...) against the canonical header.
+        // 3. Cross-check the committed `StfPublicOutput` against
+        //    every consensus-bound field of `BlockProofPublicInputs`.
+        //
+        //    Output bindings (always cross-checked):
+        //    - `pre_state_root`     ↔ `public_inputs.state_root_before`
+        //    - `post_state_root`    ↔ `public_inputs.state_root_after`
+        //    - `gas_used`           ↔ `public_inputs.gas_used`
+        //    - `receipts_root`      ↔ `public_inputs.receipt_root`
+        //    - `validator_set_root` ↔ `public_inputs.runtime_extra`
+        //      (= `header.runtime_extra`, plumbed through the engine's
+        //      `block_proof_public_inputs`)
+        //
+        //    Input bindings (Q2 closure):
+        //    - `chain_id`           ↔ `public_inputs.chain_id`
+        //    - `block_height`       ↔ `public_inputs.height`
+        //    - `block_gas_limit`    ↔ `public_inputs.gas_limit`
+        //    - `gas_price`          ↔ `public_inputs.gas_price`
+        //    - `proposer_address`   ↔ `public_inputs.proposer_address`
+        //    - `transactions_root`  ↔ `public_inputs.transactions_root`
+        //      (= `header.transactions_root`, the body's Merkle root
+        //      over `body.transactions`)
+        //
+        //    Together these close the cross-chain-replay, fee-redirect,
+        //    forged-gas-price, forged-height, forged-gas-limit,
+        //    forged-state-root-via-fake-transactions, and
+        //    validator-set-divergence attacks the Q2 audit identified.
+        //    The remaining `BlockProofPublicInputs` fields
+        //    (`parent_block_hash`, `block_hash`, `da_root`,
+        //    `vm_code_hash`, `abi_version`) are consensus-bound by
+        //    the engine's header chain and chain-spec hash anchor,
+        //    not the STF; they are not consumed by `apply_block`.
         let stf_output: StfPublicOutput =
             BorshDeserialize::deserialize_reader(&mut bundle.public_values.as_slice())
                 .map_err(|_| ProofError::MalformedProof)?;
@@ -261,6 +317,27 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
         if stf_output.receipts_root != public_inputs.receipt_root {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.validator_set_root != public_inputs.runtime_extra {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.chain_id != public_inputs.chain_id {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.block_height != public_inputs.height {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.block_gas_limit != public_inputs.gas_limit {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.gas_price != public_inputs.gas_price {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.proposer_address != public_inputs.proposer_address {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        if stf_output.transactions_root != public_inputs.transactions_root {
             return Err(ProofError::PublicInputMismatch);
         }
 

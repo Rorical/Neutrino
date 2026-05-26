@@ -813,6 +813,7 @@ mod tests {
                 gas_limit: 1_000_000,
                 gas_price: 0,
                 proposer_address: [0u8; 32],
+                runtime_extra: ZERO_HASH,
             },
             proof_bytes: vec![1, 2, 3, 4],
         };

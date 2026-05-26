@@ -498,6 +498,7 @@ impl<DB: Database> Engine<DB> {
             gas_limit: header.gas_limit,
             gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: self.proposer_runtime_address_for_finalize(header.proposer_index),
+            runtime_extra: header.runtime_extra,
         }
     }
 

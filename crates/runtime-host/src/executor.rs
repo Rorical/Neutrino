@@ -85,16 +85,34 @@ impl BlockExecutor for WasmExecutor {
         state: &mut Trie<Blake3Hasher>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         // Decode body.transactions into typed STF transactions.
-        // Malformed entries are silently dropped here; the STF would
-        // otherwise count them as `failed`, but a borsh-decode
-        // failure means the runtime ABI doesn't even recognise the
-        // byte string as a transaction so we exclude it from
-        // `StfInput.transactions` entirely.
+        //
+        // Q2 binding: the SP1 Guest commits `transactions_root` over
+        // the borsh-encoded forms of `input.transactions`.  This
+        // matches `header.transactions_root` (= Merkle over
+        // `body.transactions` raw blobs) *only* if every blob in the
+        // body decodes successfully AND the decoded `Transaction`
+        // re-encodes to the original bytes.  Borsh is canonical, so
+        // the second clause holds for any well-formed blob.  We
+        // therefore fail-fast on the first clause: a single malformed
+        // entry rejects the whole block, because silently dropping
+        // would let a malicious proposer publish a header with a
+        // `transactions_root` that the SP1 proof cannot reproduce.
+        //
+        // Honest producers always populate `body.transactions` from
+        // a mempool whose admission already ran `validate_tx`, so
+        // every blob is borsh-decodable in practice.  The fail-fast
+        // path only triggers under adversarial conditions where a
+        // peer gossiped a body with crafted garbage.
         let mut txs = Vec::with_capacity(body.transactions.len());
-        for raw in &body.transactions {
-            if let Ok(tx) = <Transaction as BorshDeserialize>::try_from_slice(raw.as_slice()) {
-                txs.push(tx);
-            }
+        for (idx, raw) in body.transactions.iter().enumerate() {
+            let tx = <Transaction as BorshDeserialize>::try_from_slice(raw.as_slice()).map_err(
+                |err| {
+                    ExecutorError::Codec(format!(
+                        "body.transactions[{idx}] failed to decode as Transaction: {err}",
+                    ))
+                },
+            )?;
+            txs.push(tx);
         }
         let input = StfInput {
             chain_id: ctx.chain_id,

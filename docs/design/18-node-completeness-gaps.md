@@ -11,12 +11,117 @@ This document is forward-looking: it describes work that is **not
 yet done**. Items that are already implemented are recorded in
 docs 14, 16, and 17.
 
-## Q1-closure follow-on (this commit)
+## Q2-closure follow-on — SP1 proof binding soundness
+
+A separate Q2 audit identified that only 4 of 15
+`BlockProofPublicInputs` fields were cryptographically bound by
+the SP1 proof; the other 11 were checked only against the wire
+envelope, leaving multiple high-severity attack vectors (forged
+`state_root` via fake transactions, fee redirect, gas-price
+inflation, cross-chain replay, height forgery to mature
+withdrawals early, validator-set divergence).  All of these are
+closed by this commit.
+
+### Bindings added
+
+- **`StfPublicOutput` expanded** with six new fields the guest
+  now commits:
+  - `chain_id`, `block_height`, `block_gas_limit`, `gas_price`,
+    `proposer_address` — the five STF *input* parameters
+    (`crates/runtimes/neutrino-default/core/src/lib.rs`).
+  - `transactions_root` — Merkle root over the borsh-encoded
+    forms of `input.transactions`, computed inside `apply_block`
+    via `neutrino_primitives::merkle_root_of_blobs` so it
+    matches `header.transactions_root` byte-for-byte.
+
+- **`BlockProofPublicInputs` gained `runtime_extra: Hash`**, set
+  from `header.runtime_extra` by the engine's
+  `block_proof_public_inputs` (`crates/consensus-engine/src/import.rs`,
+  `prove.rs`, `finalize.rs`).  The verifier cross-checks
+  `committed.validator_set_root == public_inputs.runtime_extra`,
+  closing the validator-set-divergence attack.
+
+- **`Sp1ProofSystem::verify_block`** cross-checks **all 11**
+  guest-committed fields against `BlockProofPublicInputs`:
+  - Pre-existing 4: `pre/post_state_root`, `gas_used`,
+    `receipts_root` ↔ same.
+  - New 7: `chain_id`, `block_height` ↔ `height`,
+    `block_gas_limit` ↔ `gas_limit`, `gas_price`,
+    `proposer_address`, `transactions_root`,
+    `validator_set_root` ↔ `runtime_extra`.
+  Any one mismatch fails fast with `PublicInputMismatch`.
+
+- **`Sp1ProofSystem::prove_block`** mirrors the same cross-check
+  set as defence-in-depth, so an off-tree prover that skips the
+  input-vs-public-inputs cross-checks produces a proof the
+  verifier rejects on consistent grounds.
+
+- **WasmExecutor fail-fast on malformed blobs.**  The shared
+  `transactions_root` binding only holds if every blob in
+  `body.transactions` decodes successfully (otherwise the host's
+  filter and the guest's input would diverge).  The previous
+  silent-drop loop in `crates/runtime-host/src/executor.rs` is
+  replaced by a strict fail-fast that surfaces
+  `ExecutorError::Codec` on the first bad blob.  Honest
+  producers always emit borsh-decodable blobs (they come from
+  a validated mempool); this regression gate enforces the
+  invariant under adversarial conditions.
+
+### Attacks now mitigated
+
+| Audit attack | Closure mechanism |
+|---|---|
+| A — forged `post_state_root` via fake transactions | `committed.transactions_root` ↔ `header.transactions_root` |
+| B — fee redirect via forged `proposer_address` | `committed.proposer_address` ↔ PI |
+| C — fee drain via forged `gas_price` | `committed.gas_price` ↔ PI |
+| D — gas-ceiling bypass via forged `gas_limit` | `committed.block_gas_limit` ↔ PI |
+| E — early withdrawal via forged `block_height` | `committed.block_height` ↔ PI |
+| F — cross-chain replay via swapped `chain_id` | `committed.chain_id` ↔ PI |
+| G — validator-set divergence via lying about `validator_set_root` | `committed.validator_set_root` ↔ PI.runtime_extra |
+| I — asymmetric prover/verifier checks | `prove_block` now mirrors the full `verify_block` cross-check set |
+
+Attack H (vk cache poisoning) and J (`runtime_code_hash ==
+ZERO_HASH` escape hatch) remain — they are operational /
+deployment-time concerns, not SP1 binding gaps, and stay
+tracked in Tier 1.
+
+### New regression tests
+
+- `crates/runtime-host/tests/sp1_proof_system.rs` — 7 new
+  per-field rejection tests (`sp1_proof_system_rejects_
+  chain_id_mismatch`, `..._height_mismatch`, `..._gas_limit_
+  mismatch`, `..._gas_price_mismatch`, `..._proposer_address_
+  mismatch`, `..._transactions_root_mismatch`, `..._runtime_
+  extra_mismatch`) plus the refactored happy-path test, total
+  14/14 tests passing.
+- `crates/runtime-host/tests/wire_bridge.rs` — renamed
+  `body_transactions_with_unknown_blob_are_silently_dropped`
+  to `..._are_rejected` and inverted the assertion to pin the
+  new fail-fast contract.
+
+### Wire-format impact
+
+- `StfPublicOutput` and `BlockProofPublicInputs` both gained
+  fields.  Both are borsh-serialised, so old proofs cannot be
+  decoded under the new shape and vice versa.  v1 bring-up has
+  no production state to migrate; the chain-spec hash changes
+  because `runtime_code_hash` (= BLAKE3 of the master WASM
+  cdylib) changes whenever runtime-default-core's `apply_block`
+  recompiles.
+- `neutrino_primitives::merkle_root_of_blobs` /
+  `merkle_root_of_hashes` are exposed as the canonical no_std
+  helpers so the guest and the engine compute the same Merkle
+  root for `body.transactions` without depending on
+  `consensus-engine` (which is host-only).
+
+---
+
+## Q1-closure follow-on
 
 A separate Q1 verification audit identified four gaps inside the
 consensus + runtime layers themselves (orthogonal to Tier 1-4
-below). Three are closed by this commit; the fourth is folded
-into Tier 1.
+below). Three are closed by an earlier commit; the fourth is
+folded into Tier 1.
 
 - **Dry-run on DAG siblings.**  Closed.
   `Engine::import_block_with_dry_run` previously skipped the

@@ -66,29 +66,31 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     live
 }
 
-const fn public_inputs(
-    pre: [u8; 32],
-    post: [u8; 32],
-    gas_used: u64,
-    gas_limit: u64,
-    receipt_root: [u8; 32],
+/// Build a `BlockProofPublicInputs` whose Q2-bound fields match the
+/// `StfPublicOutput` the guest just committed.  Tests that intend the
+/// happy path call this; tests that exercise individual cross-check
+/// rejections mutate one field after constructing it.
+const fn matching_public_inputs(
+    input: &StfInput,
+    output: &neutrino_default_runtime_core::StfPublicOutput,
 ) -> BlockProofPublicInputs {
     BlockProofPublicInputs {
-        chain_id: 1,
-        height: 1,
+        chain_id: input.chain_id,
+        height: input.block_height,
         parent_block_hash: ZERO_HASH,
         block_hash: ZERO_HASH,
-        state_root_before: pre,
-        state_root_after: post,
-        transactions_root: ZERO_HASH,
-        receipt_root,
+        state_root_before: output.pre_state_root,
+        state_root_after: output.post_state_root,
+        transactions_root: output.transactions_root,
+        receipt_root: output.receipts_root,
         da_root: ZERO_HASH,
         vm_code_hash: ZERO_HASH,
         abi_version: 1,
-        gas_used,
-        gas_limit,
-        gas_price: 0,
-        proposer_address: ZERO_HASH,
+        gas_used: output.gas_used,
+        gas_limit: input.block_gas_limit,
+        gas_price: input.gas_price,
+        proposer_address: input.proposer_address,
+        runtime_extra: output.validator_set_root,
     }
 }
 
@@ -117,13 +119,8 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
         .expect("mock prove succeeds")
         .proof;
     let sp1_bp = Sp1BlockProof::from_sp1(&bundle).expect("encode");
-    let pi = public_inputs(
-        dry.output.pre_state_root,
-        dry.output.post_state_root,
-        dry.output.gas_used,
-        BLOCK_GAS_LIMIT,
-        dry.output.receipts_root,
-    );
+    let pi = matching_public_inputs(&input, &dry.output);
+    let _ = BLOCK_GAS_LIMIT; // silence unused once constant
     (sp1_bp, pi)
 }
 
@@ -192,6 +189,88 @@ fn sp1_proof_system_rejects_receipt_root_mismatch() {
     assert_eq!(err, ProofError::PublicInputMismatch);
 }
 
+/// Q2 closure: each new input-binding field is independently
+/// cross-checked.  Mutating any one of them on the verifier side
+/// (after the proof is built against the legitimate values) must
+/// fail with `PublicInputMismatch`.
+
+#[test]
+fn sp1_proof_system_rejects_chain_id_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(16);
+    pi.chain_id ^= 0xFFFF_FFFF_FFFF_FFFF;
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered chain_id must reject (cross-chain replay defence)");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+#[test]
+fn sp1_proof_system_rejects_height_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(17);
+    pi.height = pi.height.wrapping_add(1);
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered height must reject (withdrawal-maturity acceleration defence)");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+#[test]
+fn sp1_proof_system_rejects_gas_limit_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(18);
+    pi.gas_limit = pi.gas_limit.wrapping_add(1);
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered gas_limit must reject (block-gas-ceiling defence)");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+#[test]
+fn sp1_proof_system_rejects_gas_price_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(19);
+    pi.gas_price = pi.gas_price.wrapping_add(1);
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered gas_price must reject (fee-drain defence)");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+#[test]
+fn sp1_proof_system_rejects_proposer_address_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(20);
+    pi.proposer_address[0] ^= 0xFF;
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered proposer_address must reject (fee-redirect defence)");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+#[test]
+fn sp1_proof_system_rejects_transactions_root_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(21);
+    pi.transactions_root[0] ^= 0xFF;
+    let err = proof_system.verify_block(&proof, &pi).expect_err(
+        "tampered transactions_root must reject (forged-state-root-via-fake-txns defence)",
+    );
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
+#[test]
+fn sp1_proof_system_rejects_runtime_extra_mismatch() {
+    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
+    let (proof, mut pi) = build_block_proof(22);
+    pi.runtime_extra[0] ^= 0xFF;
+    let err = proof_system
+        .verify_block(&proof, &pi)
+        .expect_err("tampered runtime_extra must reject (validator-set-divergence defence)");
+    assert_eq!(err, ProofError::PublicInputMismatch);
+}
+
 /// M3-new exit criterion 1: corrupted proof bytes are rejected with
 /// `ProofError::MalformedProof` before any cryptographic work.
 #[test]
@@ -200,7 +279,7 @@ fn sp1_proof_system_rejects_malformed_proof_bytes() {
     let bad_proof = Sp1BlockProof {
         bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
     };
-    let pi = public_inputs([0; 32], [1; 32], 0, 1_000_000, ZERO_HASH);
+    let (_, pi) = build_block_proof(23);
     let err = proof_system
         .verify_block(&bad_proof, &pi)
         .expect_err("malformed bytes must reject");

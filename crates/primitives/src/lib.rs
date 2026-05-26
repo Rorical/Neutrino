@@ -189,6 +189,65 @@ pub fn blake3_256(input: &[u8]) -> Hash {
     *blake3::hash(input).as_bytes()
 }
 
+/// Sentinel root committed for an empty Merkle leaf list.  Chosen as
+/// [`ZERO_HASH`] so an empty body lane and a never-populated lane are
+/// indistinguishable by root alone; lane contents differentiate them.
+pub const EMPTY_MERKLE_ROOT: Hash = ZERO_HASH;
+
+/// Binary Merkle root over a slice of pre-borsh-encoded raw byte
+/// blobs (`Vec<Vec<u8>>`).
+///
+/// Each leaf is `BLAKE3(u32_le(len(blob)) || blob)`, matching borsh's
+/// canonical encoding of `Vec<u8>` (so the digest is identical to
+/// `consensus-engine::merkle::merkle_root::<Vec<u8>>(blobs)` and the
+/// SP1 Guest's commitment binds 1:1 to `header.transactions_root`).
+/// Internal nodes are `BLAKE3(left || right)`, with an odd leaf at any
+/// level promoted unchanged to the next level.  Empty inputs map to
+/// [`EMPTY_MERKLE_ROOT`].
+#[must_use]
+pub fn merkle_root_of_blobs(blobs: &[Vec<u8>]) -> Hash {
+    let leaves: Vec<Hash> = blobs
+        .iter()
+        .map(|blob| {
+            // Borsh encodes `Vec<u8>` as `u32_le(len) || bytes`. Match
+            // that here without pulling borsh into the dependency tree
+            // of this leaf — primitives is a foundation crate.
+            let len = u32::try_from(blob.len()).expect("blob length fits u32");
+            let mut buf = Vec::with_capacity(4 + blob.len());
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(blob);
+            blake3_256(&buf)
+        })
+        .collect();
+    merkle_root_of_hashes(&leaves)
+}
+
+/// Binary Merkle root over already-hashed leaves.  Same algorithm as
+/// [`merkle_root_of_blobs`] but caller-supplied hashes — useful when
+/// the caller already holds canonical leaf digests.
+#[must_use]
+pub fn merkle_root_of_hashes(leaves: &[Hash]) -> Hash {
+    if leaves.is_empty() {
+        return EMPTY_MERKLE_ROOT;
+    }
+    let mut current: Vec<Hash> = leaves.to_vec();
+    while current.len() > 1 {
+        let mut next: Vec<Hash> = Vec::with_capacity(current.len().div_ceil(2));
+        let mut chunks = current.chunks_exact(2);
+        for pair in &mut chunks {
+            let mut concat = [0_u8; 64];
+            concat[..32].copy_from_slice(&pair[0]);
+            concat[32..].copy_from_slice(&pair[1]);
+            next.push(blake3_256(&concat));
+        }
+        if let Some(odd) = chunks.remainder().first() {
+            next.push(*odd);
+        }
+        current = next;
+    }
+    current[0]
+}
+
 /// Error returned when bounded bytes exceed their configured maximum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundsError {

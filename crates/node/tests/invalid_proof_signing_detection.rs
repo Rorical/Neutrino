@@ -166,6 +166,7 @@ fn bad_mock_proof(block: &Block) -> BlockProof {
         gas_limit: block.header.gas_limit,
         gas_price: 0,
         proposer_address: [0x44; 32],
+        runtime_extra: block.header.runtime_extra,
     };
     // Commitment doesn't match what MockProofSystem would compute,
     // so verify_block fails with PublicInputMismatch.
@@ -202,6 +203,7 @@ fn good_mock_proof(block: &Block) -> BlockProof {
         gas_limit: block.header.gas_limit,
         gas_price: 0,
         proposer_address: [0x44; 32],
+        runtime_extra: block.header.runtime_extra,
     };
     let mock_proof = MockProofSystem::new()
         .prove_block_for_test(&public_inputs)

@@ -193,20 +193,24 @@ fn body_transactions_with_borsh_inactivity_leak_apply_through_wasm_executor() {
 }
 
 #[test]
-fn body_transactions_with_unknown_blob_are_silently_dropped() {
-    // The executor's borsh-decode loop drops blobs that don't parse
-    // as Transaction. Legacy / unrecognised wire formats are
-    // discarded without affecting state. This pins the contract
-    // surrounding the consensus → runtime bridge: malformed entries
-    // are not consensus failures, they just don't apply.
+fn body_transactions_with_unknown_blob_are_rejected() {
+    // Q2 closure: the executor's borsh-decode loop is now fail-fast
+    // instead of silently dropping. A single malformed blob rejects
+    // the whole block, because silent drop would break the SP1
+    // proof's `transactions_root` binding: the guest commits the
+    // root over `input.transactions` (the filtered, decoded list),
+    // and that must equal `header.transactions_root` (over the raw
+    // body blobs). Honest producers always emit borsh-decodable
+    // blobs (they come from a validated mempool); this regression
+    // gate enforces that peer-supplied bodies follow the same
+    // invariant.
     let addr = validator_address(0xCC);
     let mut state = seeded_live(addr, 80).trie().clone();
-    let pre_stake = fetch_validator(&state, &addr).stake;
 
     // A legacy `0x05 || pubkey[48]` slash blob — the pre-M7-new wire
     // format that no longer decodes as borsh `Transaction`. Mixed
-    // with a real borsh `Transaction::Slash` to demonstrate the real
-    // one still applies while the legacy one is dropped.
+    // with a real borsh `Transaction::Slash` to demonstrate that
+    // even one bad blob aborts execution.
     let mut legacy_slash = vec![0x05u8];
     legacy_slash.extend_from_slice(&[0xFF; 48]);
     let real_slash = borsh::to_vec(&Transaction::Slash(SlashTx {
@@ -221,15 +225,12 @@ fn body_transactions_with_unknown_blob_are_silently_dropped() {
     };
 
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
-    let _ = executor
+    let err = executor
         .execute_block(&ctx(), &body, &mut state)
-        .expect("execute_block succeeds");
-
-    // Only the real Slash applied; legacy entry was dropped.
-    let validator = fetch_validator(&state, &addr);
-    assert_eq!(
-        validator.stake,
-        pre_stake - 30,
-        "only the borsh Slash applied; legacy blob was silently dropped",
+        .expect_err("malformed blob must reject the whole block");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("body.transactions[0]") && msg.contains("failed to decode"),
+        "unexpected error message: {msg}",
     );
 }

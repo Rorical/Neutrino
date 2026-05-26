@@ -1475,6 +1475,7 @@ impl<DB: Database> Engine<DB> {
             gas_limit: header.gas_limit,
             gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: self.proposer_runtime_address_for_import(header.proposer_index),
+            runtime_extra: header.runtime_extra,
         }
     }
 
@@ -1802,6 +1803,7 @@ mod tests {
             gas_limit: 1_000_000,
             gas_price: 0,
             proposer_address: [0u8; 32],
+            runtime_extra: ZERO_HASH,
         };
         let block_proof = proof_system
             .prove_block(&[], &block_inputs)

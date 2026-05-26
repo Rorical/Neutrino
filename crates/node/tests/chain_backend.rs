@@ -155,6 +155,7 @@ fn build_recursive_proof(
         gas_limit: 1_000_000,
         gas_price: 0,
         proposer_address: [0u8; 32],
+        runtime_extra: ZERO_HASH,
     };
     let block_proof = ps.prove_block(&[], &block_inputs).unwrap();
     let chunk_inputs = ChunkProofPublicInputs {

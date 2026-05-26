@@ -461,6 +461,16 @@ pub struct BlockProofPublicInputs {
     /// so a malicious prover cannot redirect fees to a different
     /// address than consensus committed to.
     pub proposer_address: Hash,
+    /// Runtime-emitted commitment carried in `header.runtime_extra`.
+    /// For the default runtime this is the canonical
+    /// `validator_set_root` — the SP1 Guest commits the same value as
+    /// `StfPublicOutput.validator_set_root` and the verifier
+    /// cross-checks the two are equal.  Closes the
+    /// `validator_set_root` divergence attack the Q2 audit
+    /// identified (a malicious prover rewriting the consensus
+    /// active set in the proven state without the runtime catching
+    /// the disagreement).
+    pub runtime_extra: Hash,
 }
 
 /// Public inputs committed by a single chunk proof.
@@ -763,6 +773,7 @@ mod tests {
                         gas_limit: 1_000_000,
                         gas_price: 0,
                         proposer_address: [0u8; 32],
+                        runtime_extra: hash(57),
                     },
                     proof_bytes: vec![0xFF; 8],
                 },
@@ -810,6 +821,7 @@ mod tests {
             gas_limit: 1_000_000,
             gas_price: 0,
             proposer_address: [0u8; 32],
+            runtime_extra: hash(64),
         };
         let block_proof = BlockProof {
             height: block_inputs.height,

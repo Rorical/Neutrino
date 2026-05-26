@@ -1081,6 +1081,100 @@ pub struct StfPublicOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Chunk aggregator wire types
+// ---------------------------------------------------------------------------
+
+/// Per-block metadata the chunk-aggregator guest consumes for
+/// continuity checking and inner-proof verification.
+///
+/// The aggregator's verify-inner-proof loop computes
+/// `pv_digest = SHA-256(borsh(stf_output))` per block and passes it
+/// to `verify_sp1_proof(block_guest_vk_digest, pv_digest)`.  If the
+/// supplied `stf_output` doesn't match the inner proof's actual
+/// committed public values, the SP1 recursion AIR rejects the
+/// proof and the chunk-aggregator's own proof fails to verify —
+/// so a malicious prover that lies about per-block continuity
+/// cannot produce a valid chunk proof.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct ChunkAggregatorBlockMeta {
+    /// Canonical header hash of this block.  Used for the
+    /// `block_hash_root` Merkle commitment and for parent-hash
+    /// chain-linking with the previous block in the chunk.
+    pub block_hash: neutrino_primitives::BlockHash,
+    /// Parent header hash.  Cross-checked against
+    /// `block_metas[i-1].block_hash` so the header chain is
+    /// continuous across the chunk's block range.
+    pub parent_block_hash: neutrino_primitives::BlockHash,
+    /// Public output committed by the inner SP1 block proof.  Used
+    /// for:
+    ///
+    /// - State-root chaining
+    ///   (`prev.post_state_root == curr.pre_state_root`).
+    /// - Height monotonicity
+    ///   (`prev.block_height + 1 == curr.block_height`).
+    /// - Chain-id consistency.
+    /// - Validator-set continuity inside the chunk
+    ///   (Phase 3 will relax this to allow mid-chunk rotation).
+    /// - `pv_digest` computation for `verify_sp1_proof`.
+    pub stf_output: StfPublicOutput,
+}
+
+/// Input to the SP1 chunk-aggregator guest.
+///
+/// The host's `Sp1ProofSystem::prove_chunk_with_extras` borsh-encodes
+/// this struct and writes it to the guest's stdin as a single
+/// `read_vec()` payload.  The host additionally registers `N` inner
+/// SP1 block proofs via `SP1Stdin::write_proof` in canonical block
+/// order; the guest consumes them in the same order via
+/// `verify_sp1_proof` calls.
+///
+/// Output: the guest commits a borsh-encoded
+/// [`neutrino_consensus_types::ChunkProofPublicInputs`] as the
+/// chunk proof's public values.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct ChunkAggregatorInput {
+    /// Chunk identifier the aggregator commits in its public
+    /// output.  Cross-checked against the engine's expected value.
+    pub chunk_id: neutrino_primitives::ChunkId,
+    /// First block height covered by this chunk (inclusive).
+    pub start_height: neutrino_primitives::Height,
+    /// Last block height covered (inclusive).
+    pub end_height: neutrino_primitives::Height,
+    /// State root before the first block in the chunk executes.
+    /// Cross-checked against `block_metas[0].stf_output.pre_state_root`.
+    pub start_state_root: neutrino_primitives::StateRoot,
+    /// State root after the last block in the chunk executes.
+    /// Cross-checked against `block_metas[last].stf_output.post_state_root`.
+    pub end_state_root: neutrino_primitives::StateRoot,
+    /// Header hash at `start_height`.  Cross-checked against
+    /// `block_metas[0].block_hash`.
+    pub start_block_hash: neutrino_primitives::BlockHash,
+    /// Header hash at `end_height`.  Cross-checked against
+    /// `block_metas[last].block_hash`.
+    pub end_block_hash: neutrino_primitives::BlockHash,
+    /// Chain identifier — every block's `stf_output.chain_id`
+    /// must equal this value.
+    pub chain_id: neutrino_primitives::ChainId,
+    /// Per-block metadata in canonical block order.  Length =
+    /// `end_height - start_height + 1`.
+    pub block_metas: Vec<ChunkAggregatorBlockMeta>,
+    /// Hash of the block-guest's verifying key, packed as 8
+    /// little-endian `u32` limbs to match the shape
+    /// `sp1_zkvm::lib::verify::verify_sp1_proof(&[u32; 8], &[u8; 32])`
+    /// expects.  All inner block proofs share the same vk (they came
+    /// from the same block-guest ELF), so this field is constant
+    /// across `block_metas`.
+    pub block_guest_vk_digest: [u32; 8],
+    /// Phase 1 pass-through: aggregated VRF-proof Merkle root.
+    /// Phase 4 will compute this in-circuit per block.
+    pub vrf_proof_root: neutrino_primitives::Hash,
+    /// Phase 1 pass-through: aggregated DA-bundle commitment.
+    /// Phase 6 will derive this from per-block `da_root` values
+    /// when DA ingest lands.
+    pub da_root: neutrino_primitives::Hash,
+}
+
+// ---------------------------------------------------------------------------
 // apply_block
 // ---------------------------------------------------------------------------
 

@@ -1,0 +1,33 @@
+# Standalone crate built by runtime-host/build.rs under the `succinct`
+# toolchain. The empty [workspace] opts it out of the parent workspace
+# (same pattern as the block guest at `../guest/`).
+[workspace]
+
+[package]
+name        = "neutrino-default-chunk-guest"
+version     = "0.1.0"
+edition     = "2024"
+publish     = false
+description = "SP1 chunk-aggregator Guest binary for the Neutrino default runtime."
+
+[[bin]]
+name = "neutrino-default-chunk-guest"
+path = "src/main.rs"
+
+[dependencies]
+# `verify` enables `sp1_zkvm::lib::verify::verify_sp1_proof` (the
+# recursion-syscall wrapper).  Without this feature the guest cannot
+# verify inner SP1 proofs, which is the whole point of the aggregator.
+sp1-zkvm                       = { version = "=6.2.1", features = ["verify"] }
+borsh                          = { version = "1.5", default-features = false, features = ["derive"] }
+neutrino-default-runtime-core  = { path = "../core", default-features = false }
+neutrino-consensus-types       = { path = "../../../consensus-types", default-features = false }
+neutrino-primitives            = { path = "../../../primitives", default-features = false }
+sha2                           = { version = "0.10", default-features = false }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+debug         = false
+panic         = "abort"

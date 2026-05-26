@@ -1,9 +1,11 @@
-//! Builds both:
-//! - the `neutrino-default-runtime-guest` ELF via `sp1-build`, which
-//!   `include_elf!` consumes through `SP1_ELF_<name>`,
+//! Builds three artefacts:
+//! - the `neutrino-default-runtime-guest` ELF (block-prover) via
+//!   `sp1-build`, consumed by `lib.rs` through `include_elf!`,
+//! - the `neutrino-default-chunk-guest` ELF (chunk-aggregator) via
+//!   `sp1-build`, also consumed through `include_elf!`,
 //! - the `neutrino-default-runtime-master` `wasm32-unknown-unknown`
-//!   cdylib via a sub-cargo invocation; the resulting `.wasm` path is
-//!   exposed to `lib.rs` via `NEUTRINO_DEFAULT_MASTER_WASM`.
+//!   cdylib via a sub-cargo invocation; the resulting `.wasm` path
+//!   is exposed to `lib.rs` via `NEUTRINO_DEFAULT_MASTER_WASM`.
 
 use std::env;
 use std::path::PathBuf;
@@ -12,8 +14,9 @@ use std::process::Command;
 fn main() {
     rerun_if_changed_runtime_sources();
 
-    // ----- SP1 Guest ELF -----
+    // ----- SP1 Guest ELFs -----
     sp1_build::build_program("../runtimes/neutrino-default/guest");
+    sp1_build::build_program("../runtimes/neutrino-default/chunk-guest");
 
     // ----- WASM master cdylib -----
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -74,6 +77,8 @@ fn rerun_if_changed_runtime_sources() {
     for path in [
         "../runtimes/neutrino-default/guest/src",
         "../runtimes/neutrino-default/guest/Cargo.toml",
+        "../runtimes/neutrino-default/chunk-guest/src",
+        "../runtimes/neutrino-default/chunk-guest/Cargo.toml",
         "../runtimes/neutrino-default/master/src",
         "../runtimes/neutrino-default/master/Cargo.toml",
         "../runtimes/neutrino-default/core/src",

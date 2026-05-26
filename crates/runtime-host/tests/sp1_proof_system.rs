@@ -286,12 +286,20 @@ fn sp1_proof_system_rejects_malformed_proof_bytes() {
     assert_eq!(err, ProofError::MalformedProof);
 }
 
-/// M3-new exit criterion 3: chunk-proof aggregation is deferred. The
-/// SP1 adapter returns `Unsupported` so engine paths that still call
-/// `prove_chunk` (e.g. legacy mock-based tests) get a clear signal
-/// rather than a silent fallback.
+/// The trait-level [`ProofSystem::prove_chunk`] is intentionally a
+/// stub that always returns [`ProofError::Unsupported`] now that
+/// chunk aggregation is implemented.  Production callers must use
+/// [`Sp1ProofSystem::prove_chunk_with_block_hashes`] (which threads
+/// per-block header hashes through to the aggregator guest —
+/// information the trait signature cannot carry because block
+/// hashes are consensus-bound rather than STF-bound; see Q2's
+/// binding table in doc 18).
+///
+/// This test pins the "plain trait method = stub" contract so
+/// downstream callers cannot accidentally rely on it for real
+/// chunk-proof production.
 #[test]
-fn sp1_proof_system_chunk_methods_return_unsupported() {
+fn sp1_proof_system_plain_prove_chunk_is_a_stub() {
     use neutrino_consensus_types::ChunkProofPublicInputs;
 
     let proof_system = Sp1ProofSystem::mock().expect("mock setup");
@@ -310,8 +318,12 @@ fn sp1_proof_system_chunk_methods_return_unsupported() {
         next_validator_set_root: ZERO_HASH,
         da_root: ZERO_HASH,
     };
+    // Empty block-proof array — the host pre-check rejects with
+    // PublicInputMismatch before reaching the Unsupported sentinel.
+    // Pinning this exact code path so future refactors don't
+    // accidentally make the trait method partially work.
     let err = proof_system
         .prove_chunk(&[], &chunk_pi)
-        .expect_err("chunk aggregation is deferred by the SP1 rewrite");
-    assert_eq!(err, ProofError::Unsupported);
+        .expect_err("plain prove_chunk must always reject");
+    assert_eq!(err, ProofError::PublicInputMismatch);
 }

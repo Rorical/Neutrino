@@ -25,15 +25,20 @@
 use std::sync::Mutex;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_default_runtime_core::StfPublicOutput;
-use neutrino_proof_system::{ProofError, ProofSystem, public_inputs::BlockPublicInputs};
+use neutrino_consensus_types::ChunkProofPublicInputs;
+use neutrino_default_runtime_core::{ChunkAggregatorInput, StfPublicOutput};
+use neutrino_proof_system::{
+    ProofError, ProofSystem,
+    public_inputs::{BlockPublicInputs, ChunkPublicInputs},
+};
 use sp1_sdk::{
-    SP1ProofWithPublicValues, SP1ProvingKey, SP1VerifyingKey,
+    HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin,
+    SP1VerifyingKey,
     blocking::{MockProver, ProveRequest, Prover, ProverClient},
 };
 
 use crate::executor::decode_witness_bundle;
-use crate::{ProverCtx, Sp1HostError};
+use crate::{DEFAULT_CHUNK_GUEST_ELF, ProverCtx, Sp1HostError, sdk_err};
 
 /// Wire form of an SP1 block proof.
 ///
@@ -62,6 +67,33 @@ impl Sp1BlockProof {
     }
 }
 
+/// Wire form of an SP1 chunk-aggregator proof.
+///
+/// Parallel to [`Sp1BlockProof`] but produced by the
+/// [`DEFAULT_CHUNK_GUEST_ELF`] chunk-aggregator guest.  Public values
+/// are a borsh-encoded
+/// [`neutrino_consensus_types::ChunkProofPublicInputs`].
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct Sp1ChunkProof {
+    /// `bincode::serialize(&SP1ProofWithPublicValues)` bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl Sp1ChunkProof {
+    /// Serialize an SP1 chunk-aggregator proof bundle for the wire.
+    pub fn from_sp1(proof: &SP1ProofWithPublicValues) -> Result<Self, Sp1HostError> {
+        let bytes =
+            bincode::serialize(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
+        Ok(Self { bytes })
+    }
+
+    /// Decode the inner SP1 proof bundle.
+    pub fn to_sp1(&self) -> Result<SP1ProofWithPublicValues, Sp1HostError> {
+        bincode::deserialize::<SP1ProofWithPublicValues>(&self.bytes)
+            .map_err(|err| Sp1HostError::Codec(err.to_string()))
+    }
+}
+
 /// Adapter that drives an SP1 prover (mock, cpu, cuda, ...) through the
 /// consensus engine's [`ProofSystem`] trait.
 ///
@@ -70,9 +102,15 @@ impl Sp1BlockProof {
 /// (a non-zero exit code from the guest causes `verify_proof` to
 /// reject the proof).
 pub struct Sp1ProofSystem<P: Prover> {
-    /// Holds the prover handle, proving key, and verifying key for the
-    /// embedded guest ELF.
+    /// Block-prover context: proving + verifying key for the embedded
+    /// block-guest ELF (`DEFAULT_GUEST_ELF`).
     ctx: ProverCtx<P>,
+    /// Chunk-aggregator proving key for the embedded
+    /// [`DEFAULT_CHUNK_GUEST_ELF`].
+    chunk_pk: P::ProvingKey,
+    /// Chunk-aggregator verifying key.  Bound 1:1 to the chunk-guest
+    /// ELF the same way `ctx.vk` is bound to the block-guest ELF.
+    chunk_vk: SP1VerifyingKey,
     /// Verification cannot happen concurrently against the same prover
     /// in wasmtime / SP1 SDK; protect the handle behind a Mutex so the
     /// adapter is `Send + Sync`.
@@ -87,15 +125,26 @@ impl<P> Sp1ProofSystem<P>
 where
     P: Prover<ProvingKey = SP1ProvingKey>,
 {
-    /// Build with an existing prover handle. Disk-caches the verifying
-    /// key keyed on the embedded guest ELF.
+    /// Build with an existing prover handle.  Disk-caches the
+    /// verifying keys for both the block-guest and the
+    /// chunk-aggregator-guest ELFs.
     ///
     /// # Errors
-    /// Returns [`Sp1HostError::Sdk`] if `setup` fails on a cold cache.
+    /// Returns [`Sp1HostError::Sdk`] if `setup` fails for either ELF.
     pub fn new(prover: P) -> Result<Self, Sp1HostError> {
         let ctx = ProverCtx::new_cached(prover)?;
+        // Reuse the same prover handle for the chunk-aggregator
+        // setup.  The pk/vk are deterministic per ELF; the disk
+        // cache lives under the same `NEUTRINO_SP1_CACHE_DIR`.
+        let chunk_proving_key = ctx
+            .prover
+            .setup(DEFAULT_CHUNK_GUEST_ELF.clone())
+            .map_err(sdk_err)?;
+        let chunk_verifying_key = chunk_proving_key.verifying_key().clone();
         Ok(Self {
             ctx,
+            chunk_pk: chunk_proving_key,
+            chunk_vk: chunk_verifying_key,
             _lock: Mutex::new(()),
         })
     }
@@ -104,6 +153,13 @@ where
     #[must_use]
     pub const fn verifying_key(&self) -> &SP1VerifyingKey {
         &self.ctx.vk
+    }
+
+    /// Verifying key bound to the embedded
+    /// [`DEFAULT_CHUNK_GUEST_ELF`].
+    #[must_use]
+    pub const fn chunk_verifying_key(&self) -> &SP1VerifyingKey {
+        &self.chunk_vk
     }
 }
 
@@ -124,14 +180,15 @@ where
     P: Prover<ProvingKey = SP1ProvingKey> + Send + Sync,
 {
     type BlockProof = Sp1BlockProof;
+    type ChunkProof = Sp1ChunkProof;
 
-    // Chunk and recursive proofs are deferred by the SP1 rewrite; the
-    // engine has its own scaffold types (which are still referenced by
-    // legacy import paths under MockProofSystem). We pick the same
-    // borsh-stable units `MockProofSystem` uses so the type system is
-    // happy on both sides; the `prove_*` / `verify_*` methods always
-    // return Unsupported via the trait defaults.
-    type ChunkProof = Sp1BlockProof;
+    // Recursive checkpoint proofs are still deferred by the SP1
+    // rewrite (see doc 14 §"Checkpoint recursion").  The
+    // `RecursiveProof` associated type stays as `Sp1BlockProof` for
+    // wire-format compatibility with the legacy paths that still
+    // mention recursive proofs in their signatures; both
+    // `prove_recursive` and `verify_recursive` keep the trait's
+    // `Err(ProofError::Unsupported)` defaults.
     type RecursiveProof = Sp1BlockProof;
 
     fn prove_block(
@@ -342,5 +399,237 @@ where
         }
 
         Ok(())
+    }
+
+    /// Aggregate `N` per-block SP1 proofs into a single Compressed
+    /// STARK chunk proof.
+    ///
+    /// The chunk-aggregator guest (`DEFAULT_CHUNK_GUEST_ELF`) inside
+    /// the proof verifies every inner block proof via
+    /// `verify_sp1_proof`, asserts cross-block continuity, and
+    /// commits a [`ChunkProofPublicInputs`] derived from the
+    /// per-block `StfPublicOutput` data.
+    ///
+    /// # Errors
+    /// - [`ProofError::PublicInputMismatch`] when the caller's
+    ///   declared `public_inputs` disagree with the values the
+    ///   aggregator guest commits (or when per-block `StfPublicOutput`
+    ///   continuity asserts fail at host pre-check time).
+    /// - [`ProofError::InvalidWitness`] when a block proof bundle is
+    ///   not decodable.
+    /// - [`ProofError::BackendRejected`] when the prover fails to
+    ///   produce the proof.
+    /// - [`ProofError::MalformedProof`] when the committed public
+    ///   values are not borsh-decodable.
+    fn prove_chunk(
+        &self,
+        block_proofs: &[Self::BlockProof],
+        public_inputs: &ChunkPublicInputs,
+    ) -> Result<Self::ChunkProof, ProofError> {
+        if block_proofs.is_empty() {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        let expected_count =
+            usize::try_from(public_inputs.end_height - public_inputs.start_height + 1)
+                .map_err(|_| ProofError::PublicInputMismatch)?;
+        if block_proofs.len() != expected_count {
+            return Err(ProofError::PublicInputMismatch);
+        }
+
+        // Extract per-block StfPublicOutput from each inner proof's
+        // committed public values.  The chunk-aggregator guest will
+        // re-derive `pv_digest = SHA-256(borsh(stf_output))` and pass
+        // it to `verify_sp1_proof`; the SP1 recursion AIR enforces
+        // that the supplied `stf_output` matches the inner proof's
+        // actual committed values.
+        let mut block_metas = Vec::with_capacity(block_proofs.len());
+        for proof in block_proofs {
+            let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
+            let stf_output: StfPublicOutput =
+                BorshDeserialize::deserialize_reader(&mut bundle.public_values.as_slice())
+                    .map_err(|_| ProofError::MalformedProof)?;
+            // Phase 1: block_hash + parent_block_hash are supplied by
+            // the host (caller knows them); they are bound to the
+            // chunk via `block_hash_root` aggregation.  The aggregator
+            // doesn't currently derive them from the inner proof
+            // (block_hash isn't in `StfPublicOutput` — Q2's binding
+            // table notes it as consensus-bound, not STF-bound).
+            //
+            // The host populates them via the engine's canonical
+            // header lookup before calling `prove_chunk`; that's the
+            // `prove_chunk_with_block_hashes` extras path below.
+            block_metas.push((stf_output, [0u8; 32], [0u8; 32]));
+        }
+
+        // The plain `prove_chunk` signature only carries
+        // `ChunkProofPublicInputs`, not per-block hashes; the
+        // production caller threads block hashes through via
+        // `prove_chunk_with_block_hashes` (added below).  Until that
+        // path is wired, the plain entry returns Unsupported so
+        // callers don't get half-baked chunk proofs that fail the
+        // first parent-hash chain-link assertion.
+        let _ = block_metas;
+        let _ = public_inputs;
+        Err(ProofError::Unsupported)
+    }
+
+    /// Verify a chunk-aggregator proof against its declared public
+    /// inputs.
+    ///
+    /// # Errors
+    /// - [`ProofError::MalformedProof`] on bundle decode failure.
+    /// - [`ProofError::BackendRejected`] on cryptographic verifier
+    ///   failure.
+    /// - [`ProofError::PublicInputMismatch`] when the committed
+    ///   public inputs disagree with the caller's declaration.
+    fn verify_chunk(
+        &self,
+        proof: &Self::ChunkProof,
+        public_inputs: &ChunkPublicInputs,
+    ) -> Result<(), ProofError> {
+        let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
+        self.ctx
+            .prover
+            .verify(&bundle, &self.chunk_vk, None)
+            .map_err(|_| ProofError::BackendRejected)?;
+
+        let committed: ChunkProofPublicInputs =
+            BorshDeserialize::deserialize_reader(&mut bundle.public_values.as_slice())
+                .map_err(|_| ProofError::MalformedProof)?;
+        if committed != *public_inputs {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl<P> Sp1ProofSystem<P>
+where
+    P: Prover<ProvingKey = SP1ProvingKey> + Send + Sync,
+{
+    /// Aggregate `N` block proofs into a chunk proof, threading
+    /// per-block header hashes through to the aggregator guest.
+    ///
+    /// `block_hashes[i]` is the canonical hash of block `i` in the
+    /// chunk's height range, and `parent_block_hashes[i]` is its
+    /// `header.parent_hash`.  Both arrays must equal
+    /// `block_proofs.len()` in length and be in canonical block
+    /// order.
+    ///
+    /// This is the path production callers (consensus engine's
+    /// `finalize_chunk`) use; the trait's [`prove_chunk`] method only
+    /// has access to `ChunkProofPublicInputs` and cannot derive these
+    /// hashes from the inner proofs (block hashes are consensus-bound,
+    /// not STF-bound — see Q2's binding table in doc 18).
+    ///
+    /// # Errors
+    /// See [`Self::prove_chunk`].  Additionally returns
+    /// [`ProofError::PublicInputMismatch`] when the supplied
+    /// `block_hashes` / `parent_block_hashes` arrays have the wrong
+    /// length.
+    pub fn prove_chunk_with_block_hashes(
+        &self,
+        block_proofs: &[Sp1BlockProof],
+        block_hashes: &[neutrino_primitives::BlockHash],
+        parent_block_hashes: &[neutrino_primitives::BlockHash],
+        public_inputs: &ChunkPublicInputs,
+    ) -> Result<Sp1ChunkProof, ProofError> {
+        let n = block_proofs.len();
+        if n == 0 || block_hashes.len() != n || parent_block_hashes.len() != n {
+            return Err(ProofError::PublicInputMismatch);
+        }
+        let expected_count =
+            usize::try_from(public_inputs.end_height - public_inputs.start_height + 1)
+                .map_err(|_| ProofError::PublicInputMismatch)?;
+        if n != expected_count {
+            return Err(ProofError::PublicInputMismatch);
+        }
+
+        // 1. Extract per-block StfPublicOutput and build
+        //    `ChunkAggregatorBlockMeta` entries.
+        let mut block_metas = Vec::with_capacity(n);
+        for (i, proof) in block_proofs.iter().enumerate() {
+            let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
+            let stf_output: StfPublicOutput =
+                BorshDeserialize::deserialize_reader(&mut bundle.public_values.as_slice())
+                    .map_err(|_| ProofError::MalformedProof)?;
+            block_metas.push(neutrino_default_runtime_core::ChunkAggregatorBlockMeta {
+                block_hash: block_hashes[i],
+                parent_block_hash: parent_block_hashes[i],
+                stf_output,
+            });
+        }
+
+        // 2. Build the chunk-aggregator's stdin payload.  The
+        //    block-guest's vk hash is the constant the aggregator
+        //    passes to `verify_sp1_proof` for every inner proof —
+        //    `HashableKey::hash_u32()` returns the canonical
+        //    `[u32; 8]` digest of the verifying key the SP1
+        //    recursion AIR expects.
+        let aggregator_input = ChunkAggregatorInput {
+            chunk_id: public_inputs.chunk_id,
+            start_height: public_inputs.start_height,
+            end_height: public_inputs.end_height,
+            start_state_root: public_inputs.start_state_root,
+            end_state_root: public_inputs.end_state_root,
+            start_block_hash: public_inputs.start_block_hash,
+            end_block_hash: public_inputs.end_block_hash,
+            // chain_id isn't in ChunkProofPublicInputs today; carry
+            // it through by reading the first block's
+            // `StfPublicOutput.chain_id` so the aggregator can
+            // assert chain_id constancy across the chunk.
+            chain_id: block_metas[0].stf_output.chain_id,
+            block_metas,
+            block_guest_vk_digest: self.ctx.vk.hash_u32(),
+            vrf_proof_root: public_inputs.vrf_proof_root,
+            da_root: public_inputs.da_root,
+        };
+
+        let mut stdin = SP1Stdin::new();
+        let payload = borsh::to_vec(&aggregator_input)
+            .map_err(|err| Sp1HostError::Codec(err.to_string()))
+            .map_err(|_| ProofError::InvalidWitness)?;
+        stdin.write_vec(payload);
+
+        // 3. Register every inner block proof for the aggregator
+        //    to consume via `verify_sp1_proof` syscalls.  Order
+        //    matches the per-block iteration inside the guest.
+        for proof in block_proofs {
+            let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
+            // Extract the inner Compressed STARK and register it
+            // for recursion.
+            let inner_recursion_proof = match bundle.proof {
+                SP1Proof::Compressed(p) => *p,
+                _ => {
+                    // Only Compressed proofs can be recursively
+                    // verified; Core proofs would need to be
+                    // compressed first.  Our `prove_block` always
+                    // emits Compressed so this branch should be
+                    // unreachable for honest callers.
+                    return Err(ProofError::MalformedProof);
+                }
+            };
+            stdin.write_proof(inner_recursion_proof, self.ctx.vk.vk.clone());
+        }
+
+        // 4. Drive the chunk-aggregator prover.
+        let proof = self
+            .ctx
+            .prover
+            .prove(&self.chunk_pk, stdin)
+            .compressed()
+            .run()
+            .map_err(|_| ProofError::BackendRejected)?;
+
+        // 5. Cross-check the committed ChunkProofPublicInputs
+        //    against the caller's expectation.
+        let committed: ChunkProofPublicInputs =
+            BorshDeserialize::deserialize_reader(&mut proof.public_values.as_slice())
+                .map_err(|_| ProofError::MalformedProof)?;
+        if committed != *public_inputs {
+            return Err(ProofError::PublicInputMismatch);
+        }
+
+        Sp1ChunkProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof)
     }
 }

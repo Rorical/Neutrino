@@ -42,6 +42,10 @@ neutrino-default-runtime-master = { workspace = true }
 ed25519-dalek                   = { workspace = true }
 rand_core                       = { workspace = true }
 rand_chacha                     = { workspace = true }
+# `sha2` mirrors the chunk-aggregator guest's pv_digest hash; tests
+# reproduce it host-side to assert the guest's `block_proof_root`
+# Merkle leaves byte-for-byte.
+sha2                            = { workspace = true }
 
 [lints]
 workspace = true

@@ -116,6 +116,31 @@ use thiserror::Error;
 /// do not get to choose.
 pub const DEFAULT_GUEST_ELF: Elf = include_elf!("neutrino-default-runtime-guest");
 
+/// Default-runtime SP1 chunk-aggregator Guest ELF.  Compiled in by
+/// `build.rs` from `crates/runtimes/neutrino-default/chunk-guest/`.
+///
+/// The chunk aggregator reads `N` per-block
+/// [`neutrino_default_runtime_core::ChunkAggregatorBlockMeta`] entries
+/// plus an SP1 chunk-aggregator input from stdin, then for each block
+/// invokes `verify_sp1_proof` against the block-guest's `vk_digest`
+/// and the SHA-256 of the borsh-encoded `StfPublicOutput`.  The SP1
+/// recursion AIR consumes the host-registered inner block proofs in
+/// order; cross-block continuity, edge bindings, and aggregated
+/// Merkle commitments are checked inside the guest.  Output: a
+/// borsh-encoded [`neutrino_consensus_types::ChunkProofPublicInputs`].
+pub const DEFAULT_CHUNK_GUEST_ELF: Elf = include_elf!("neutrino-default-chunk-guest");
+
+/// BLAKE3 hash of [`DEFAULT_CHUNK_GUEST_ELF`].
+///
+/// Informational only — the precompile-bound vk inside
+/// `Sp1ProofSystem::chunk_verifying_key()` is the actual identity
+/// check.  Useful for log lines and future chain-spec pinning
+/// (#18.3.1 in doc 18).
+#[must_use]
+pub fn default_chunk_guest_elf_hash() -> [u8; 32] {
+    neutrino_primitives::blake3_256(&DEFAULT_CHUNK_GUEST_ELF)
+}
+
 /// Errors produced by the SP1 host.
 #[derive(Debug, Error)]
 pub enum Sp1HostError {
@@ -371,7 +396,7 @@ pub fn default_ctx() -> Result<&'static ProverCtx<sp1_sdk::blocking::EnvProver>,
     Ok(DEFAULT_CTX.get_or_init(|| ctx))
 }
 
-fn sdk_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
+pub(crate) fn sdk_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
     Sp1HostError::Sdk(err.to_string())
 }
 

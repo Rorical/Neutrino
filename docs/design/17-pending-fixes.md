@@ -1,14 +1,22 @@
 # 17 — Pending Fixes for Autonomous Network Operation
 
-Status: living triage list maintained alongside the implementation.
+Status: **closed sprint, historical record.** All items in the
+original triage list have either landed (see "Items closed by
+recent commits" below) or are explicitly deferred per doc 14.
+Forward-looking gap analysis for completing the node as an
+operator-friendly product is now tracked in
+[doc 18 — Node Completeness Gap Analysis](18-node-completeness-gaps.md);
+items deferred here (#9, #10, and `DaCommitmentFraud` under #6)
+are mirrored there as #18.3.5, #18.3.6, and #18.3.7
+respectively.
 
 This document records the gaps between the current code state and "an
 autonomous public testnet of N>1 validators that runs indefinitely
 under normal conditions". Each item has a severity, a measurable
 acceptance test, and an implementation sketch.
 
-The list is ordered by impact-vs-cost; items 1–4 are scheduled for the
-current sprint, items 5–10 are tracked but deferred until the
+The list is ordered by impact-vs-cost; items 1–4 were scheduled for
+the closing sprint, items 5–10 were tracked but deferred until the
 prerequisites land.
 
 When an item lands, move it out of this file (or strike it through

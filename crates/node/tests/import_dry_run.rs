@@ -234,6 +234,110 @@ async fn tampered_state_root_blocks_import() {
     );
 }
 
+/// Q1 follow-on: sibling dry-run.
+///
+/// Two validators v0 and v1 both produce a block at slot 1 (high
+/// `expected_proposers_per_slot` makes both VRF-eligible). On a
+/// target follower, we import v0's block first (head advances to
+/// `block_v0`). v1's block then arrives — its parent is genesis,
+/// which is NOT the follower's materialised head (`block_v0`), so
+/// it is a DAG sibling. Before the Q1 fix, sibling imports
+/// skipped the dry-run hook entirely (the engine could not
+/// reconstruct an arbitrary parent state on demand). The new
+/// `dry_run_block_against_parent` rebuilds the parent's trie
+/// from persisted nodes/values and re-executes the body against
+/// it; we verify it catches a tampered `state_root` on the
+/// sibling.
+#[tokio::test]
+async fn sibling_block_dry_run_rejects_tampered_state_root() {
+    let v0 = proposer(0);
+    let v1 = proposer(1);
+    let backend_v0 = build_backend(v0.clone()).await;
+    let backend_v1 = build_backend(v1.clone()).await;
+    let target = build_backend(v0.clone()).await;
+    let genesis_head = target.local_status().await.head_block_hash;
+
+    let block_a = produce_legitimate_block(Arc::clone(&backend_v0), v0.clone()).await;
+    let block_b = produce_legitimate_block(Arc::clone(&backend_v1), v1.clone()).await;
+    assert_ne!(
+        block_a.hash(),
+        block_b.hash(),
+        "different proposers must produce distinct blocks at the same slot"
+    );
+    assert_eq!(
+        block_a.header.parent_hash, block_b.header.parent_hash,
+        "both sibling blocks must extend the same parent (genesis)"
+    );
+
+    // Import block_a first → target's head = block_a.
+    target
+        .verify_and_import_gossip_block(block_a.clone())
+        .await
+        .expect("block_a imports cleanly as the extending block");
+    let head_after_a = target.local_status().await.head_block_hash;
+    assert_eq!(head_after_a, block_a.hash());
+
+    // block_b arrives → its parent (genesis) ≠ target's head
+    // (block_a). Before the fix this would silently skip the
+    // dry-run; with the fix the executor reconstructs the genesis
+    // state trie and re-runs the body, so a tampered state_root
+    // is now caught.
+    let tampered_b = tamper_state_root(block_b, &v1);
+    let err = target
+        .verify_and_import_gossip_block(tampered_b)
+        .await
+        .expect_err("sibling dry-run must reject the tampered state_root");
+    assert!(
+        matches!(err, SyncBackendError::Rejected(_)),
+        "expected SyncBackendError::Rejected on sibling dry-run mismatch (got {err:?})",
+    );
+
+    // Head must not have moved — block_a is still the materialised
+    // tip; the sibling DAG entry is not added because import
+    // failed before fork-choice registration.
+    let head_after_b = target.local_status().await.head_block_hash;
+    assert_eq!(
+        head_after_b,
+        block_a.hash(),
+        "head must stay on block_a; the tampered sibling must not enter the DAG. \
+         (genesis was {genesis_head:?})",
+    );
+}
+
+/// Sync-mode follower path: a node catching up via
+/// `verify_and_import_headers` (the sync-driver entry point used
+/// for header batches) must also run the dry-run against the
+/// executor when one is installed. Before the Q1 fix this path
+/// called `import_block` directly with no executor, leaving an
+/// unverified-state window during sync.
+#[tokio::test]
+async fn sync_path_runs_dry_run_against_tampered_state_root() {
+    let v0 = proposer(0);
+    let backend_a = build_backend(v0.clone()).await;
+    let backend_b = build_backend(v0.clone()).await;
+    let genesis_head = backend_b.local_status().await.head_block_hash;
+
+    let block = produce_legitimate_block(Arc::clone(&backend_a), v0.clone()).await;
+    let tampered = tamper_state_root(block, &v0);
+
+    // Route via `verify_and_import_headers` — the path the sync
+    // driver uses for header batches.
+    let err = backend_b
+        .verify_and_import_headers(vec![tampered])
+        .await
+        .expect_err("sync-mode header batch must run dry-run and reject tampered state_root");
+    assert!(
+        matches!(err, SyncBackendError::Rejected(_)),
+        "expected SyncBackendError::Rejected on sync dry-run mismatch (got {err:?})",
+    );
+
+    let head_after = backend_b.local_status().await.head_block_hash;
+    assert_eq!(
+        head_after, genesis_head,
+        "head must not advance on a sync-time dry-run rejection",
+    );
+}
+
 /// Companion to `tampered_state_root_blocks_import`: tampering
 /// with `gas_used` is caught by the same dry-run hook.
 #[tokio::test]

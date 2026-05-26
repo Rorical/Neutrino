@@ -1825,11 +1825,63 @@ fn store_withdrawal_queue<B: StateBackend>(state: &mut B, addr: &Address, queue:
 
 fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> Result<(), ReceiptStatus> {
     let mut validator = load_validator(state, &tx.validator);
-    if validator.stake == 0 {
+    let mut queue = load_withdrawal_queue(state, &tx.validator);
+
+    // Total slashable = active stake + queued unbonding.  Queued
+    // entries stay slashable until they mature into the spendable
+    // balance via `apply_withdraw`, which closes the
+    // unstake-then-detect-then-slash front-running gap: a
+    // validator who notices their own misbehaviour cannot
+    // pre-emptively `Unstake` to hide stake from the impending
+    // slash.  The spendable account balance is intentionally
+    // never touched — funds that have already left the staking
+    // lifecycle are out of reach of the slashing penalty.
+    let queued_total = queue.total();
+    let total_slashable = validator.stake.saturating_add(queued_total);
+    if total_slashable == 0 {
+        // Nothing to burn — folds in the previous "no validator"
+        // failure (a never-deposited address has zero stake and
+        // an empty queue) under the same error code.
         return Err(ReceiptStatus::InsufficientBalance);
     }
-    let burn = validator.stake.min(tx.amount);
-    validator.stake -= burn;
+
+    let burn = total_slashable.min(tx.amount);
+
+    // Burn from active stake first.  Stake is the primary
+    // slashable asset; the queue is a secondary source consumed
+    // only when stake is exhausted.
+    let burn_from_stake = validator.stake.min(burn);
+    validator.stake -= burn_from_stake;
+    let mut remaining_burn = burn - burn_from_stake;
+
+    // Then burn FIFO from the unbonding queue.  Oldest entries
+    // burn first: they were unstaked at the earliest opportunity,
+    // so they reflect the validator's earliest known intent to
+    // exit and are the most plausible front-running targets.  A
+    // partially-burned entry preserves its `mature_at_height` so
+    // the residue still observes the unbonding delay.
+    let queue_touched = remaining_burn > 0 && !queue.entries.is_empty();
+    if queue_touched {
+        let mut new_entries: Vec<Withdrawal> = Vec::with_capacity(queue.entries.len());
+        for entry in queue.entries.drain(..) {
+            if remaining_burn == 0 {
+                new_entries.push(entry);
+                continue;
+            }
+            if entry.amount <= remaining_burn {
+                remaining_burn -= entry.amount;
+                // Entry burned in full — drop it.
+            } else {
+                new_entries.push(Withdrawal {
+                    amount: entry.amount - remaining_burn,
+                    mature_at_height: entry.mature_at_height,
+                });
+                remaining_burn = 0;
+            }
+        }
+        queue.entries = new_entries;
+    }
+
     validator.active = validator.stake > 0;
 
     let mut set = load_validator_set(state);
@@ -1841,6 +1893,16 @@ fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> Result<(), Recei
 
     store_validator(state, &tx.validator, &validator);
     store_validator_set(state, &set);
+    // Touch the queue key only when we actually changed it, so the
+    // witness footprint stays minimal for the common
+    // "slash a non-unstaking validator" case.
+    if queue_touched {
+        if queue.entries.is_empty() {
+            state.delete(&withdrawal_key(&tx.validator));
+        } else {
+            store_withdrawal_queue(state, &tx.validator, &queue);
+        }
+    }
     Ok(())
 }
 
@@ -2556,6 +2618,234 @@ mod tests {
         assert_eq!(host_out.applied, 0);
         assert_eq!(host_out.failed, 1);
         assert_eq!(host_out.validator_set_root, ValidatorSet::default().root());
+    }
+
+    #[test]
+    fn slash_does_not_touch_queue_when_stake_covers_burn() {
+        // Validator with 100 active stake + 50 queued; slash 30
+        // should burn 30 from stake (=> 70) and leave the queue
+        // untouched. Regression guard so the queue-touching path
+        // (state.write / state.delete on withdrawal_key) stays
+        // out of the witness for the common slash case.
+        let alice = signing_key(70);
+        let addr = address_of(&alice);
+        let mut live = LiveTrie::default();
+        live.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake: 100,
+                active: true,
+            }),
+        );
+        let mut set = ValidatorSet::default();
+        set.upsert(addr, 100);
+        live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+        let queue = WithdrawalQueue {
+            entries: alloc::vec![
+                Withdrawal {
+                    amount: 30,
+                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                },
+                Withdrawal {
+                    amount: 20,
+                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                },
+            ],
+        };
+        live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
+
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_height: TEST_BLOCK_HEIGHT,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
+            transactions: alloc::vec![Transaction::Slash(SlashTx {
+                validator: addr,
+                amount: 30,
+            })],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+
+        let (_, post) = apply_against(&live, &input);
+        let validator_after = read_validator(&post, &addr);
+        assert_eq!(validator_after.stake, 70);
+        assert!(validator_after.active);
+        let queue_after = read_withdrawal_queue(&post, &addr);
+        assert_eq!(queue_after.entries.len(), 2);
+        assert_eq!(queue_after.total(), 50);
+    }
+
+    #[test]
+    fn slash_drains_queued_unbonding_after_stake_exhausted() {
+        // Validator with 50 active stake + 50 queued (split 30/20);
+        // slash 80 should burn 50 from stake (=> 0), then 30 from
+        // the queue FIFO (drops the first 30-entry entirely),
+        // leaving the queue at [20]. Validator becomes inactive
+        // (stake = 0) and is removed from the set.
+        let alice = signing_key(71);
+        let addr = address_of(&alice);
+        let mut live = LiveTrie::default();
+        live.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake: 50,
+                active: true,
+            }),
+        );
+        let mut set = ValidatorSet::default();
+        set.upsert(addr, 50);
+        live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+        let queue = WithdrawalQueue {
+            entries: alloc::vec![
+                Withdrawal {
+                    amount: 30,
+                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                },
+                Withdrawal {
+                    amount: 20,
+                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS + 1,
+                },
+            ],
+        };
+        live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
+
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_height: TEST_BLOCK_HEIGHT,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
+            transactions: alloc::vec![Transaction::Slash(SlashTx {
+                validator: addr,
+                amount: 80,
+            })],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.validator_set_root, ValidatorSet::default().root());
+
+        let (_, post) = apply_against(&live, &input);
+        let validator_after = read_validator(&post, &addr);
+        assert_eq!(validator_after.stake, 0);
+        assert!(!validator_after.active);
+        let queue_after = read_withdrawal_queue(&post, &addr);
+        assert_eq!(queue_after.entries.len(), 1);
+        assert_eq!(queue_after.entries[0].amount, 20);
+        // Maturity of the surviving entry must equal the *original*
+        // mature_at_height — partial-burn preservation is the
+        // anti-front-running property we care about.
+        assert_eq!(
+            queue_after.entries[0].mature_at_height,
+            TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS + 1,
+        );
+    }
+
+    #[test]
+    fn slash_consumes_partial_entry_and_preserves_residue_maturity() {
+        // Edge case: slash amount lands mid-entry. Validator has
+        // 0 stake + a single 50-entry queue; slash 30 should burn
+        // 30 from the entry, leaving a 20-entry with the same
+        // maturity. The "stake exhausted, slash from queue
+        // mid-entry" path is the most subtle clawback case.
+        let alice = signing_key(72);
+        let addr = address_of(&alice);
+        let mut live = LiveTrie::default();
+        live.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake: 0,
+                active: false,
+            }),
+        );
+        let queue = WithdrawalQueue {
+            entries: alloc::vec![Withdrawal {
+                amount: 50,
+                mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+            }],
+        };
+        live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
+
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_height: TEST_BLOCK_HEIGHT,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
+            transactions: alloc::vec![Transaction::Slash(SlashTx {
+                validator: addr,
+                amount: 30,
+            })],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+
+        let (_, post) = apply_against(&live, &input);
+        let queue_after = read_withdrawal_queue(&post, &addr);
+        assert_eq!(queue_after.entries.len(), 1);
+        assert_eq!(queue_after.entries[0].amount, 20);
+        assert_eq!(
+            queue_after.entries[0].mature_at_height,
+            TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+        );
+    }
+
+    #[test]
+    fn slash_clamps_to_total_slashable_when_amount_exceeds() {
+        // Validator with 10 stake + 5 queued, slash 1_000_000.
+        // Burn is clamped to 15 (total slashable); validator stake
+        // and queue are both zeroed. No underflow, no overflow,
+        // and the queue key is deleted (not left as an empty queue).
+        let alice = signing_key(73);
+        let addr = address_of(&alice);
+        let mut live = LiveTrie::default();
+        live.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake: 10,
+                active: true,
+            }),
+        );
+        let mut set = ValidatorSet::default();
+        set.upsert(addr, 10);
+        live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+        let queue = WithdrawalQueue {
+            entries: alloc::vec![Withdrawal {
+                amount: 5,
+                mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+            }],
+        };
+        live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
+
+        let input = StfInput {
+            chain_id: CHAIN_ID,
+            block_height: TEST_BLOCK_HEIGHT,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
+            transactions: alloc::vec![Transaction::Slash(SlashTx {
+                validator: addr,
+                amount: 1_000_000,
+            })],
+        };
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.validator_set_root, ValidatorSet::default().root());
+
+        let (_, post) = apply_against(&live, &input);
+        let validator_after = read_validator(&post, &addr);
+        assert_eq!(validator_after.stake, 0);
+        assert!(!validator_after.active);
+        let queue_after = read_withdrawal_queue(&post, &addr);
+        assert!(queue_after.entries.is_empty());
+        // Queue key must be deleted (not left as an empty queue)
+        // so the trie footprint stays minimal.
+        assert!(post.get(&withdrawal_key(&addr)).is_none());
     }
 
     // -----------------------------------------------------------------

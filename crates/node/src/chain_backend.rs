@@ -2071,11 +2071,26 @@ where
         &self,
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError> {
+        // Pending-fix #7 follow-on: route sync-driver header batches
+        // through the executor-equipped import path so re-execution
+        // catches forged commitments on sync-replay too. Backends
+        // that intentionally run without an executor (test
+        // harnesses only — production node always installs the
+        // default-runtime WASM executor in `runner.rs`) fall back
+        // to the no-dry-run path.
+        let executor = self.block_executor_snapshot();
         let mut last: Option<HeadersImported> = None;
         for block in blocks {
-            let outcome = self
-                .with_engine_mut(|e| e.import_block(&block))
-                .map_err(Self::map_import_err)?;
+            let block_ref = &block;
+            let import_result = executor.as_ref().map_or_else(
+                || self.with_engine_mut(|e| e.import_block(block_ref)),
+                |executor| {
+                    self.with_engine_mut(|e| {
+                        e.import_block_with_dry_run(block_ref, executor.as_ref())
+                    })
+                },
+            );
+            let outcome = import_result.map_err(Self::map_import_err)?;
             self.forget_mined_transactions(&block.body.transactions);
             last = Some(HeadersImported {
                 new_head_height: outcome.new_head_height,

@@ -465,23 +465,32 @@ impl<DB: Database> Engine<DB> {
     /// state from a block that will be retroactively dropped on
     /// proof-arrival.
     ///
-    /// The dry-run is skipped (silently, with a tracing warn) when:
+    /// Two import shapes call the dry-run:
     ///
-    /// - The block is a DAG sibling (parent != materialised head):
-    ///   the engine does not yet support loading an arbitrary
-    ///   parent state on demand, so re-execution would need a trie
-    ///   reconstruction pass (future work).
-    /// - The local `self.state.root()` does not match
-    ///   `head_state_root`: today, followers do not advance their
-    ///   in-memory trie on `import_block` (only `try_produce_block`
-    ///   calls `replace_state_internal`), so the trie commonly
-    ///   lags the committed scalar. Activating the cross-check in
-    ///   that state would mass-reject every legitimate gossipped
-    ///   block. A future follower-side replay pass will close this
-    ///   gap; until then the guard avoids the regression.
+    /// - **Extending block** (parent == materialised head): runs
+    ///   [`Self::dry_run_block_against_head`], which re-executes
+    ///   the body against the live state trie and returns the
+    ///   post-execution trie. The caller commits it via
+    ///   [`Self::replace_state_internal`] in lockstep with the
+    ///   head pointer update so the invariant
+    ///   `self.state.root() == self.head_state_root()` survives
+    ///   the import.
+    /// - **Sibling block** (parent != materialised head, e.g.
+    ///   multi-winner slot or late arrival on a competing branch):
+    ///   runs [`Self::dry_run_block_against_parent`], which
+    ///   reconstructs the parent's state trie via
+    ///   [`Trie::from_persisted`] and re-executes against that.
+    ///   The post-state is verified against the header but
+    ///   discarded — siblings do not move the materialised head
+    ///   until fork choice flips, at which point
+    ///   [`Self::materialise_to_fork_choice_head`] replays the
+    ///   branch with the same checks.
     ///
-    /// In both skip cases the block still passes through every
-    /// other validation step that [`Self::import_block`] performs.
+    /// The dry-run is only skipped when the caller passes
+    /// `executor = None` (i.e. backends that intentionally don't
+    /// install a dynamic-runtime executor — exotic test harnesses
+    /// only).  In that mode the block still passes every other
+    /// validation step that [`Self::import_block`] performs.
     ///
     /// # Errors
     ///
@@ -655,7 +664,24 @@ impl<DB: Database> Engine<DB> {
                 );
                 Some(self.dry_run_block_against_head(executor, block)?)
             }
-            _ => None,
+            (Some(executor), false) => {
+                // Sibling import. Reconstruct the parent's state
+                // trie from persisted nodes/values and re-execute
+                // against it; this catches a malicious proposer
+                // who publishes a forged commitment for a block
+                // that does not extend our materialised head
+                // (e.g. a multi-winner slot). The post-state is
+                // verified but discarded — the materialised head
+                // stays put until fork choice picks this branch
+                // and `materialise_to_fork_choice_head` replays
+                // forward with the same checks.
+                let parent_state_root = parent_header
+                    .as_ref()
+                    .map_or_else(|| self.chain_spec().genesis_state_root, |h| h.state_root);
+                self.dry_run_block_against_parent(executor, block, parent_state_root)?;
+                None
+            }
+            (None, _) => None,
         };
 
         let hash = block.hash();
@@ -813,6 +839,89 @@ impl<DB: Database> Engine<DB> {
             });
         }
         Ok(scratch)
+    }
+
+    /// Re-execute `block` against a reconstruction of `parent_state_root`
+    /// and cross-check the resulting commitments against the
+    /// header.  Used by [`Self::import_block_inner`] for sibling
+    /// imports — blocks whose parent is not the locally materialised
+    /// head (e.g. multi-winner slots, late-arriving sibling on a
+    /// competing branch).
+    ///
+    /// The reconstructed trie is dropped after the cross-check
+    /// because the engine's materialised state continues to follow
+    /// the linearly-applied chain. If fork choice subsequently
+    /// promotes this branch, [`Self::materialise_to_fork_choice_head`]
+    /// replays the whole new branch through the same executor with
+    /// the same checks.
+    ///
+    /// Same cost shape as `materialise_to_fork_choice_head`: walking
+    /// `iter_trie_nodes` / `iter_state_values` over the whole DB.
+    /// Sibling imports are rare so this is acceptable; future
+    /// optimisation can switch to a per-root index.
+    fn dry_run_block_against_parent(
+        &self,
+        executor: &dyn ErasedBlockExecutor,
+        block: &Block,
+        parent_state_root: StateRoot,
+    ) -> Result<(), ImportError<DB::Error>> {
+        let proposer_position = usize::try_from(block.header.proposer_index)
+            .expect("u32 validator index fits usize on supported targets");
+        let proposer_address = self
+            .active_validator_set()
+            .get(proposer_position)
+            .map(|v| v.withdrawal_credentials)
+            .unwrap_or_default();
+        let ctx = BlockExecutionContext {
+            chain_id: self.chain_spec().chain_id,
+            block_height: block.header.height,
+            gas_limit: block.header.gas_limit,
+            gas_price: self.chain_spec().runtime.gas_price,
+            proposer_address,
+        };
+
+        // Content-addressed storage: loading every persisted node /
+        // value is correct because the trie only navigates entries
+        // reachable from `parent_state_root`.
+        let trie_nodes = self.store().iter_trie_nodes()?;
+        let state_values = self.store().iter_state_values()?;
+        let mut scratch = Trie::from_persisted(parent_state_root, trie_nodes, state_values);
+
+        let ExecutionOutcome {
+            state_root_after,
+            runtime_extra,
+            receipts_root,
+            gas_used,
+            witness_bytes: _,
+        } = executor
+            .execute_block(&ctx, &block.body, &mut scratch)
+            .map_err(ImportError::DryRunFailed)?;
+
+        if state_root_after != block.header.state_root {
+            return Err(ImportError::StateRootMismatch {
+                expected: block.header.state_root,
+                computed: state_root_after,
+            });
+        }
+        if runtime_extra != block.header.runtime_extra {
+            return Err(ImportError::HeaderRuntimeExtraMismatch {
+                expected: block.header.runtime_extra,
+                actual: runtime_extra,
+            });
+        }
+        if receipts_root != block.header.receipts_root {
+            return Err(ImportError::ReceiptsRootMismatch {
+                expected: block.header.receipts_root,
+                computed: receipts_root,
+            });
+        }
+        if gas_used != block.header.gas_used {
+            return Err(ImportError::GasUsedMismatch {
+                expected: block.header.gas_used,
+                computed: gas_used,
+            });
+        }
+        Ok(())
     }
 
     /// Pending-fix #12: if the fork-choice DAG's head has diverged

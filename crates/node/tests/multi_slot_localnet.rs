@@ -14,11 +14,14 @@
 //!
 //! 1. The chain advances: every validator's local head height
 //!    reaches at least `MIN_HEAD_ADVANCE` blocks.
-//! 2. At least one validator finalises a chunk
-//!    (`finalized_checkpoint_index >= 1`). With multi-winner slots,
-//!    different validators may materialise different sibling
-//!    branches, so finalisation can lag on the minority side until
-//!    reorg materialisation (pending-fix #7) closes that gap.
+//! 2. **Every** validator finalises ≥`MIN_FINALIZED_CHUNKS` chunks
+//!    (`finalized_checkpoint_index >= MIN_FINALIZED_CHUNKS`).  This
+//!    was originally "at least one validator finalises ≥1 chunk"
+//!    because minority-branch validators could not reorg.  Reorg
+//!    materialisation (pending-fix #12) and fork-choice production
+//!    wiring (pending-fix #13) close that gap; the Q1 follow-on
+//!    upgrades the assertion to "every validator finalises
+//!    multiple chunks".
 //! 3. All validators converge on the same fork-choice DAG head
 //!    (`fork_choice_head()`). The DAG records every imported block;
 //!    vote-weighted head selection plus deterministic tie-breaks
@@ -65,6 +68,13 @@ const N_SLOTS: u64 = 32;
 /// confirms autonomous advance while tolerating VRF variance and
 /// the occasional multi-winner slot.
 const MIN_HEAD_ADVANCE: u64 = 2;
+/// Every validator must finalise at least this many chunks within
+/// the `N_SLOTS` window. With `chunk_size = 1`, multi-winner slots
+/// rare (~2.5% at `expected_proposers_per_slot = 1/4`), and
+/// `MIN_HEAD_ADVANCE = 2` lower bound on heads, two chunks is a
+/// conservative floor that exercises BFT finality on every node
+/// rather than just one.
+const MIN_FINALIZED_CHUNKS: u64 = 2;
 const VOTE_SUBNETS: u16 = 2;
 const TEST_CHAIN_ID: u64 = 8_181_818;
 const TEST_GENESIS_SEED: [u8; 32] = [0xE5; 32];
@@ -422,7 +432,7 @@ fn spawn_slot_loop(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)] // E2E orchestration test; splitting dilutes assertions.
-async fn n_validators_autonomously_advance_chain_and_finalize_at_least_one_chunk() {
+async fn n_validators_autonomously_advance_chain_and_every_node_finalizes_multiple_chunks() {
     let _ = tracing_subscriber::fmt::try_init();
     let spec = chain_spec(N_VALIDATORS);
 
@@ -548,16 +558,25 @@ async fn n_validators_autonomously_advance_chain_and_finalize_at_least_one_chunk
         );
     }
 
-    // 2. At least one validator finalises a chunk. With
-    //    chunk_size = 4 and a 16-slot window, the majority branch
-    //    that materialises on most nodes accumulates enough
-    //    contiguous Proven blocks for chunk-BFT to fire. Validators
-    //    that landed on a minority branch may have zero finalised
-    //    chunks until reorg materialisation lands (pending-fix #7).
+    // 2. Every validator finalises at least MIN_FINALIZED_CHUNKS
+    //    chunks. With chunk_size = 1, reorg materialisation
+    //    (pending-fix #12) and fork-choice production wiring
+    //    (pending-fix #13) both wired, minority-branch validators
+    //    converge back to the majority via fork-choice replay and
+    //    finalise the same chunks. Before those fixes the
+    //    assertion was the weaker "at least one validator
+    //    finalises a chunk"; the stronger "every validator
+    //    finalises ≥N chunks" is the Q1 follow-on assertion.
     let max_finalised = finalized_indices.iter().copied().max().unwrap_or(0);
+    let min_finalised = finalized_indices.iter().copied().min().unwrap_or(0);
     assert!(
-        max_finalised >= 1,
-        "no validator finalised a chunk in the {N_SLOTS}-slot window \
+        max_finalised >= MIN_FINALIZED_CHUNKS,
+        "no validator finalised ≥{MIN_FINALIZED_CHUNKS} chunks in the {N_SLOTS}-slot window \
+         (heights = {head_heights:?}, finalized = {finalized_indices:?})",
+    );
+    assert!(
+        min_finalised >= MIN_FINALIZED_CHUNKS,
+        "every validator must finalise ≥{MIN_FINALIZED_CHUNKS} chunks after pending-fix #12 \
          (heights = {head_heights:?}, finalized = {finalized_indices:?})",
     );
 

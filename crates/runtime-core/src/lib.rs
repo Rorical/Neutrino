@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 
 use neutrino_primitives::StateRoot;
 use neutrino_runtime_abi::StateWitness;
-use neutrino_trie::{Blake3Hasher, Hasher, Trie};
+use neutrino_trie::{Hasher, Poseidon2Hasher, Trie};
 
 /// State root of an empty trie. Mirrors `neutrino_trie::EMPTY_TRIE_ROOT`
 /// (`[0; 32]`).
@@ -95,7 +95,7 @@ pub struct WitnessState {
     /// Keys explicitly witnessed. Reads outside this set panic.
     witnessed: BTreeSet<Vec<u8>>,
     /// Partial trie carrying every node and value on the touched paths.
-    trie: Trie<Blake3Hasher>,
+    trie: Trie<Poseidon2Hasher>,
     /// Pre-state root claimed by the witness, validated at construction.
     pre_root: StateRoot,
 }
@@ -115,12 +115,12 @@ impl WitnessState {
         //     addressed store assumes this invariant; we re-check it
         //     so an adversarial host can't smuggle in a forged node.
         for node in &witness.nodes {
-            if Blake3Hasher::hash_node(&node.bytes) != node.hash {
+            if Poseidon2Hasher::hash_node(&node.bytes) != node.hash {
                 return Err(WitnessError::NodeHashMismatch { claimed: node.hash });
             }
         }
         for value in &witness.values {
-            if Blake3Hasher::hash_value(&value.bytes) != value.hash {
+            if Poseidon2Hasher::hash_value(&value.bytes) != value.hash {
                 return Err(WitnessError::ValueHashMismatch {
                     claimed: value.hash,
                 });
@@ -144,7 +144,7 @@ impl WitnessState {
         // (3) Build the partial trie. Walks will fetch on-path nodes;
         //     missing nodes panic (the engine treats this as guest
         //     abort and rejects the proof).
-        let trie = Trie::<Blake3Hasher>::from_persisted(
+        let trie = Trie::<Poseidon2Hasher>::from_persisted(
             witness.pre_state_root,
             witness.nodes.iter().map(|n| (n.hash, n.bytes.clone())),
             witness.values.iter().map(|v| (v.hash, v.bytes.clone())),
@@ -201,16 +201,16 @@ pub mod host {
     use super::{BTreeSet, StateBackend, StateRoot, StateWitness, Vec};
     use alloc::collections::BTreeMap;
     use neutrino_runtime_abi::{TrieNodeBytes, TrieValueBytes};
-    use neutrino_trie::{Blake3Hasher, Trie};
+    use neutrino_trie::{Poseidon2Hasher, Trie};
 
     /// In-memory state trie used by tests and by the dry-run path.
     ///
-    /// Wraps a `neutrino_trie::Trie<Blake3Hasher>` so callers get the
+    /// Wraps a `neutrino_trie::Trie<Poseidon2Hasher>` so callers get the
     /// canonical state root for free and the same partial-trie
     /// reconstruction the SP1 Guest performs.
     #[derive(Clone, Debug, Default)]
     pub struct LiveTrie {
-        trie: Trie<Blake3Hasher>,
+        trie: Trie<Poseidon2Hasher>,
     }
 
     impl LiveTrie {
@@ -218,7 +218,7 @@ pub mod host {
         /// block producer to take a [`LiveTrie`] view of the engine's
         /// authoritative state trie before invoking the runtime.
         #[must_use]
-        pub const fn from_trie(trie: Trie<Blake3Hasher>) -> Self {
+        pub const fn from_trie(trie: Trie<Poseidon2Hasher>) -> Self {
             Self { trie }
         }
 
@@ -248,7 +248,7 @@ pub mod host {
 
         /// Borrow the underlying trie (read-only).
         #[must_use]
-        pub const fn trie(&self) -> &Trie<Blake3Hasher> {
+        pub const fn trie(&self) -> &Trie<Poseidon2Hasher> {
             &self.trie
         }
     }
@@ -268,7 +268,7 @@ pub mod host {
         ///
         /// Lazily initialised from `live` on the first write so the
         /// read-only paths stay free.
-        scratch: Option<Trie<Blake3Hasher>>,
+        scratch: Option<Trie<Poseidon2Hasher>>,
     }
 
     impl<'a> TracingState<'a> {
@@ -313,7 +313,7 @@ pub mod host {
         /// clone of the live snapshot; the pending lists are empty
         /// and the root equals `pre_state_root`.
         #[must_use]
-        pub fn into_committed_and_witness(self) -> (Trie<Blake3Hasher>, StateWitness) {
+        pub fn into_committed_and_witness(self) -> (Trie<Poseidon2Hasher>, StateWitness) {
             let mut nodes = BTreeMap::new();
             let mut values = BTreeMap::new();
             for key in &self.accessed {
@@ -349,7 +349,7 @@ pub mod host {
             (post_state, witness)
         }
 
-        fn ensure_scratch(&mut self) -> &mut Trie<Blake3Hasher> {
+        fn ensure_scratch(&mut self) -> &mut Trie<Poseidon2Hasher> {
             if self.scratch.is_none() {
                 // Clone the live trie's content-addressed maps via
                 // collect_path_nodes for every accessed key. We don't
@@ -460,7 +460,7 @@ mod tests {
     fn witness_state_writes_change_post_state_root() {
         // Build a trie with a single key/value via TracingState-style
         // raw construction.
-        let mut trie = Trie::<Blake3Hasher>::new();
+        let mut trie = Trie::<Poseidon2Hasher>::new();
         trie.insert(b"k", b"v".to_vec()).unwrap();
         let pre_root = trie.root();
 

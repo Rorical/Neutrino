@@ -89,7 +89,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block};
 use neutrino_runtime_abi::StateWitness;
 use neutrino_runtime_core::host::{LiveTrie, TracingState};
-use neutrino_trie::{Blake3Hasher, Trie};
+use neutrino_trie::{Poseidon2Hasher, Trie};
 use sp1_sdk::{
     Elf, ExecutionReport, HashableKey, ProvingKey, SP1_CIRCUIT_VERSION, SP1ProofWithPublicValues,
     SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey,
@@ -165,7 +165,7 @@ pub struct DryRun {
     /// in-memory head advances in lock-step with the witnessed
     /// transition. Read-only blocks return a clone of the live
     /// snapshot so the swap is unconditional.
-    pub post_state: Trie<Blake3Hasher>,
+    pub post_state: Trie<Poseidon2Hasher>,
 }
 
 /// Cached prover + proving/verifying keys for a single guest ELF.

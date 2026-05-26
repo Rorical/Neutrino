@@ -158,12 +158,12 @@ fn tampered_witness_value_makes_guest_abort() {
 
     // Claim a non-empty pre_state_root but supply node bytes that
     // hash to a *different* root. The host's verification
-    // (`Blake3Hasher::hash_node(bytes) == hash`) passes for each
+    // (`Poseidon2Hasher::hash_node(bytes) == hash`) passes for each
     // supplied node, but the *root* the witness claims is not among
     // them, so `WitnessState::new` returns `PreRootMissing`.
     let bogus_bytes = b"definitely-not-a-canonical-trie-node".to_vec();
     let bogus_hash =
-        <neutrino_trie::Blake3Hasher as neutrino_trie::Hasher>::hash_node(&bogus_bytes);
+        <neutrino_trie::Poseidon2Hasher as neutrino_trie::Hasher>::hash_node(&bogus_bytes);
     let witness = StateWitness {
         pre_state_root: [0xAA; 32],
         nodes: vec![TrieNodeBytes {

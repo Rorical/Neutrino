@@ -25,12 +25,17 @@ use neutrino_primitives::{Hash, ZERO_HASH};
 
 use crate::bits::BitPath;
 use crate::error::TrieError;
-use crate::hasher::{Blake3Hasher, Hasher};
+use crate::hasher::Hasher;
 use crate::node::Node;
+use crate::poseidon2::Poseidon2Hasher;
 use crate::proof::{Proof, ProofStep, ProofTerminal};
 
-/// Binary sparse Merkle trie parameterised by hash function. Defaults
-/// to [`Blake3Hasher`].
+/// Binary sparse Merkle trie parameterised by hash function.
+///
+/// Defaults to [`Poseidon2Hasher`], the SP1-precompile-aligned hash;
+/// the [`crate::Blake3Hasher`] variant is still available for callers
+/// that need the pre-Poseidon2 trie hash (e.g., historical-state
+/// replay or compatibility-shim tests).
 ///
 /// The trie buffers every newly produced node and value in
 /// `pending_nodes` / `pending_values` so callers wanting persistence
@@ -39,7 +44,7 @@ use crate::proof::{Proof, ProofStep, ProofTerminal};
 /// only describe what is *new since the last drain*, mirroring the
 /// content-addressed RocksDB columns the engine writes them to.
 #[derive(Clone, Debug)]
-pub struct Trie<H: Hasher = Blake3Hasher> {
+pub struct Trie<H: Hasher = Poseidon2Hasher> {
     nodes: BTreeMap<Hash, Vec<u8>>,
     values: BTreeMap<Hash, Vec<u8>>,
     pending_nodes: Vec<(Hash, Vec<u8>)>,
@@ -795,11 +800,20 @@ fn encode_bitpath_from_parts(bit_len: u32, bytes: &[u8]) -> BitPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hasher::Blake3Hasher;
     use crate::proof::{ProofError, ProofOutcome, ProofStep, ProofTerminal};
     use alloc::vec;
     use rand_chacha::ChaCha20Rng;
     use rand_core::{RngCore, SeedableRng};
 
+    // Existing test corpus stays on `Blake3Hasher` so the legacy
+    // hasher keeps the same test coverage it had before the default
+    // switched.  Default `Trie<>` is exercised transitively by
+    // downstream crates (`runtime-core`, `runtime-host`, every node
+    // integration test) which all use the new `Poseidon2Hasher`
+    // default.  Adding a parallel `Poseidon2Hasher` test corpus
+    // here would duplicate everything for no extra signal — the
+    // hash function is plug-in.
     type TestTrie = Trie<Blake3Hasher>;
 
     fn value(byte: u8) -> Vec<u8> {

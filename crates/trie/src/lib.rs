@@ -19,6 +19,7 @@ mod bits;
 mod error;
 mod hasher;
 mod node;
+mod poseidon2;
 mod proof;
 mod trie;
 
@@ -27,6 +28,7 @@ use neutrino_primitives::{StateRoot, ZERO_HASH};
 pub use error::TrieError;
 pub use hasher::{Blake3Hasher, Hasher, TRIE_NODE_DOMAIN};
 pub use node::{NODE_TAG_BRANCH, NODE_TAG_EXTENSION, NODE_TAG_LEAF, Node};
+pub use poseidon2::{Poseidon2Hasher, TRIE_NODE_DOMAIN_POSEIDON2};
 pub use proof::{Proof, ProofError, ProofOutcome, ProofStep, ProofTerminal};
 pub use trie::Trie;
 

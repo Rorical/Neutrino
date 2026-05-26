@@ -19,7 +19,7 @@ use core::fmt;
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{Hash, StateRoot};
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidationCode, TxValidity};
-use neutrino_trie::{Blake3Hasher, Trie};
+use neutrino_trie::{Poseidon2Hasher, Trie};
 
 /// Per-block consensus context passed to [`BlockExecutor::execute_block`].
 ///
@@ -104,7 +104,7 @@ pub trait BlockExecutor {
         &self,
         ctx: &BlockExecutionContext,
         body: &Body,
-        state: &mut Trie<Blake3Hasher>,
+        state: &mut Trie<Poseidon2Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error>;
 
     /// Run a read-only [`QueryRequest`] against `state`.
@@ -126,7 +126,7 @@ pub trait BlockExecutor {
     fn query(
         &self,
         request: &QueryRequest,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, Self::Error>;
 
     /// Mempool / RPC admission check for a single candidate
@@ -161,7 +161,7 @@ pub trait BlockExecutor {
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, Self::Error>;
 }
 
@@ -185,7 +185,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
         &self,
         ctx: &BlockExecutionContext,
         body: &Body,
-        state: &mut Trie<Blake3Hasher>,
+        state: &mut Trie<Poseidon2Hasher>,
     ) -> Result<ExecutionOutcome, String>;
 
     /// Type-erased counterpart to [`BlockExecutor::query`].
@@ -196,7 +196,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
     fn query(
         &self,
         request: &QueryRequest,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, String>;
 
     /// Type-erased counterpart to [`BlockExecutor::validate_tx`].
@@ -210,7 +210,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String>;
 }
 
@@ -222,7 +222,7 @@ where
         &self,
         ctx: &BlockExecutionContext,
         body: &Body,
-        state: &mut Trie<Blake3Hasher>,
+        state: &mut Trie<Poseidon2Hasher>,
     ) -> Result<ExecutionOutcome, String> {
         BlockExecutor::execute_block(self, ctx, body, state).map_err(|err| err.to_string())
     }
@@ -230,7 +230,7 @@ where
     fn query(
         &self,
         request: &QueryRequest,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, String> {
         BlockExecutor::query(self, request, state).map_err(|err| err.to_string())
     }
@@ -241,7 +241,7 @@ where
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String> {
         BlockExecutor::validate_tx(self, tx_bytes, chain_id, block_gas_limit, gas_price, state)
             .map_err(|err| err.to_string())
@@ -263,7 +263,7 @@ impl BlockExecutor for UnsupportedExecutor {
         &self,
         _ctx: &BlockExecutionContext,
         _body: &Body,
-        _state: &mut Trie<Blake3Hasher>,
+        _state: &mut Trie<Poseidon2Hasher>,
     ) -> Result<ExecutionOutcome, Self::Error> {
         Err(String::from("block executor not configured"))
     }
@@ -271,7 +271,7 @@ impl BlockExecutor for UnsupportedExecutor {
     fn query(
         &self,
         _request: &QueryRequest,
-        _state: &Trie<Blake3Hasher>,
+        _state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, Self::Error> {
         Err(String::from("block executor not configured"))
     }
@@ -282,7 +282,7 @@ impl BlockExecutor for UnsupportedExecutor {
         _chain_id: u64,
         _block_gas_limit: u64,
         _gas_price: u128,
-        _state: &Trie<Blake3Hasher>,
+        _state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, Self::Error> {
         // Without an executor the system has no way to interpret the
         // bytes, so report a definitive failure rather than silently

@@ -130,6 +130,29 @@ borsh               = { version = "1.5",  default-features = false, features = [
 # SP1 zkVM — hard environment dependency (see AGENTS.md).
 sp1-sdk             = { version = "=6.2.1", default-features = false, features = ["blocking"] }
 sp1-build           = { version = "=6.2.1" }
+# `sp1-lib` exposes the Poseidon2 syscall wrapper used by the trie
+# crate when compiled into the SP1 Guest. Outside the zkVM the syscall
+# is unreachable, so this dep is target-gated at the consumer crate.
+sp1-lib             = { version = "=6.2.1" }
+
+# Plonky3-derived crates pinned to SP1's fork. The trie crate uses
+# them on the host side to compute Poseidon2 digests that are
+# byte-identical to what `sp1-lib::poseidon2::Poseidon2ByteHash`
+# would produce inside the SP1 Guest. Same Poseidon2 instance the
+# `POSEIDON2` precompile is bound to (KoalaBear width 16, S-box x^3,
+# 8 external + 20 partial rounds).
+p3-field            = { version = "=0.3.3-succinct", default-features = false }
+p3-koala-bear       = { version = "=0.3.3-succinct", default-features = false }
+p3-poseidon2        = { version = "=0.3.3-succinct", default-features = false }
+p3-symmetric        = { version = "=0.3.3-succinct", default-features = false }
+# Source of the SP1-canonical Poseidon2 round constants
+# (`my_kb_16_perm`); transitively pulls slop-poseidon2 + slop-algebra.
+# Pulled in by trie's host-side software permutation.
+slop-koala-bear     = { version = "=6.2.1" }
+
+# no_std + alloc compatible lazy-init for the trie's host-side
+# Poseidon2 permutation singleton.
+once_cell           = { version = "1.20", default-features = false, features = ["alloc", "race"] }
 
 # Binary serde codec. Used for on-disk SP1 verifying-key caches. Pulled
 # in transitively by sp1-sdk regardless.

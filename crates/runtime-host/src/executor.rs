@@ -18,7 +18,7 @@ use neutrino_default_runtime_core::{StfInput, Transaction};
 use neutrino_proof_system::executor::{BlockExecutionContext, BlockExecutor, ExecutionOutcome};
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
 use neutrino_runtime_core::host::LiveTrie;
-use neutrino_trie::{Blake3Hasher, Trie};
+use neutrino_trie::{Poseidon2Hasher, Trie};
 use thiserror::Error;
 
 use crate::DryRun;
@@ -82,7 +82,7 @@ impl BlockExecutor for WasmExecutor {
         &self,
         ctx: &BlockExecutionContext,
         body: &Body,
-        state: &mut Trie<Blake3Hasher>,
+        state: &mut Trie<Poseidon2Hasher>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         // Decode body.transactions into typed STF transactions.
         //
@@ -159,7 +159,7 @@ impl BlockExecutor for WasmExecutor {
     fn query(
         &self,
         request: &QueryRequest,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, ExecutorError> {
         // Snapshot the trie into a read-only LiveTrie view. The
         // WasmRuntime's query path clones the scratch trie internally
@@ -175,7 +175,7 @@ impl BlockExecutor for WasmExecutor {
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
-        state: &Trie<Blake3Hasher>,
+        state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, ExecutorError> {
         let live = LiveTrie::from_trie(state.clone());
         Ok(self

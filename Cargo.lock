@@ -1599,6 +1599,7 @@ dependencies = [
  "ff",
  "generic-array 0.14.9",
  "group",
+ "hkdf",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -4028,8 +4029,14 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "neutrino-primitives",
+ "once_cell",
+ "p3-field",
+ "p3-koala-bear",
+ "p3-poseidon2",
+ "p3-symmetric",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "sp1-lib",
 ]
 
 [[package]]
@@ -6616,6 +6623,18 @@ dependencies = [
  "sp1-primitives",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "sp1-lib"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02cd166e010c80e542585bf74585ea80eff117c361656cae43f2968cf0af12d4"
+dependencies = [
+ "bincode",
+ "elliptic-curve",
+ "serde",
+ "sp1-primitives",
 ]
 
 [[package]]

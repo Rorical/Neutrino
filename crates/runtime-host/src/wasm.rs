@@ -30,7 +30,7 @@ use neutrino_runtime_abi::{
     TrieValueBytes, TxValidity, TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
 };
 use neutrino_runtime_core::host::LiveTrie;
-use neutrino_trie::{Blake3Hasher, Trie};
+use neutrino_trie::{Poseidon2Hasher, Trie};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 use crate::{DryRun, Sp1HostError};
@@ -405,7 +405,7 @@ struct HostState {
     /// report the correct `post_state_root` to the guest without
     /// mutating `live`. Discarded after read-only query calls so no
     /// mutation can leak from the runtime back to `live`.
-    scratch: Trie<Blake3Hasher>,
+    scratch: Trie<Poseidon2Hasher>,
     /// Keys the STF has read or written. Becomes the witness key set
     /// and drives node extraction.
     accessed: BTreeSet<Vec<u8>>,
@@ -450,7 +450,7 @@ impl HostState {
         let _ = self.scratch.remove(key);
     }
 
-    fn into_state_and_witness(self) -> (Trie<Blake3Hasher>, StateWitness) {
+    fn into_state_and_witness(self) -> (Trie<Poseidon2Hasher>, StateWitness) {
         let mut nodes = BTreeMap::new();
         let mut values = BTreeMap::new();
         for key in &self.accessed {

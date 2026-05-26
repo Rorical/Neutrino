@@ -238,7 +238,7 @@ fn encode_slashing_as_tx(
 /// address). Used by the rotation bridge in pending-fix #1.
 fn query_runtime_validator_set(
     executor: &dyn ErasedBlockExecutor,
-    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Blake3Hasher>,
+    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Poseidon2Hasher>,
 ) -> Result<ValidatorSet, String> {
     let request = neutrino_runtime_abi::QueryRequest {
         method: QUERY_METHOD_VALIDATOR_SET.to_string(),
@@ -268,7 +268,7 @@ fn query_runtime_validator_set(
 /// degenerates to "no new validators").
 fn query_runtime_validator_registrations(
     executor: &dyn ErasedBlockExecutor,
-    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Blake3Hasher>,
+    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Poseidon2Hasher>,
 ) -> Result<ValidatorRegistrations, String> {
     let request = neutrino_runtime_abi::QueryRequest {
         method: QUERY_METHOD_VALIDATOR_REGISTRATIONS.to_string(),

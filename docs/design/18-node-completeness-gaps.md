@@ -11,6 +11,80 @@ This document is forward-looking: it describes work that is **not
 yet done**. Items that are already implemented are recorded in
 docs 14, 16, and 17.
 
+## Trie-hash switch — BLAKE3 → Poseidon2
+
+A separate optimisation pass replaces the state trie's BLAKE3
+hasher with an SP1-precompile-aligned Poseidon2 hasher.  In-circuit
+hashing inside the SP1 Guest goes from ~1.5 M cycles per node hash
+(BLAKE3 software-emulated under RISC-V) to ~100 cycles per
+permutation (`POSEIDON2` syscall precompile) — roughly a
+**30–60% reduction in per-block proof cycle count**, dominated by
+the existing per-state-op trie hashing cost.
+
+### What changed
+
+- **`crates/trie/src/poseidon2.rs`** (new, 450 lines) — SP1's
+  canonical KoalaBear Poseidon2 width-16 hasher.  Two
+  implementations behind one `Hasher` impl:
+  - `#[cfg(target_os = "zkvm")]`: dispatches to
+    `sp1-lib::poseidon2::Poseidon2ByteHash::hash`, which the SP1
+    Guest compiler turns into a `POSEIDON2` precompile syscall
+    per absorbed block.
+  - `#[cfg(not(any(target_os = "zkvm", target_arch = "wasm32")))]`:
+    software permutation built on `p3-poseidon2` + `p3-koala-bear`,
+    using the same hardcoded round constants
+    (`RC16_RAW`) as `slop-koala-bear::my_kb_16_perm`.  Lazy-init
+    via `once_cell::race::OnceBox` so the permutation struct is
+    constructed once per process.
+  - `#[cfg(target_arch = "wasm32")]`: panic-stub.  The master
+    cdylib delegates state-root computation to host imports
+    (`pre_state_root` / `post_state_root` WASM imports) and never
+    instantiates the trie's hash function at runtime, so the dead
+    code links cleanly without dragging the `p3-poseidon2` ↔
+    `rand` ↔ `getrandom` chain into the wasm32-unknown-unknown
+    build.
+
+- **`crates/trie/src/lib.rs`** + **`trie.rs`** — `Trie<H>`'s
+  default type parameter switched from `Blake3Hasher` to
+  `Poseidon2Hasher`.  The Blake3Hasher type stays exported so
+  callers that need the legacy hasher (historical-state replay,
+  compatibility-shim tests) can opt in.
+
+- **`crates/primitives/Cargo.toml`** + **workspace** — added
+  workspace deps `p3-field`, `p3-koala-bear`, `p3-poseidon2`,
+  `p3-symmetric`, `once_cell`, plus target-gated `sp1-lib`.
+
+- **Concrete `Trie<Blake3Hasher>` use sites switched**
+  (`runtime-core/src/lib.rs`, `runtime-host/src/{lib,executor,wasm}.rs`,
+  `runtime-host/tests/prove_verify.rs`, `node/src/chain_backend.rs`,
+  `proof-system/src/executor.rs`).
+
+### Cryptographic equivalence
+
+`sp1_proof_system_accepts_consistent_block_proof` is the
+host-vs-guest cross-check: it builds a real SP1 Compressed
+STARK proof, sends it through `Sp1ProofSystem::verify_block`,
+and asserts acceptance.  The proof's `committed.pre_state_root`
+is computed by the SP1 Guest (precompile path), but the verifier
+re-derives the state root from the witness using our host-side
+software Poseidon2.  The proof verifying means the two paths
+produce byte-identical digests — confirming the hardcoded
+`RC16_RAW` table matches the precompile's parameters.
+
+### Why deferred from Path B
+
+The all-Poseidon2 follow-on (block hash, chunk hash, chain-spec
+hash, receipt root, transactions root, validator-set root) is
+deferred to a later sprint.  Trie hashing is the high-volume
+in-circuit surface (every state read/write touches it); the
+other surfaces are computed once per block off-circuit and once
+per block in-circuit, so the cycle saving is comparatively
+small.  Keeping BLAKE3 for the wire-level commitments preserves
+the existing chain-spec hash and gossipsub message-id formats
+unchanged.
+
+---
+
 ## Q2-closure follow-on — SP1 proof binding soundness
 
 A separate Q2 audit identified that only 4 of 15

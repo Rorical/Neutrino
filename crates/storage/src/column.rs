@@ -44,12 +44,14 @@ pub enum Column {
     /// startup so a node that crashes after detecting equivocation
     /// still emits the evidence in its next produced block.
     SlashingPool,
-    /// Node-local metadata such as DB version and chain-spec hash.
+    /// Node-local metadata such as chain-spec hash.
     Meta,
+    /// Reusable objective-evidence receipts keyed by offence ID.
+    EvidenceProofs,
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 19] = [
+pub const ALL_COLUMNS: [Column; 20] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -69,6 +71,7 @@ pub const ALL_COLUMNS: [Column; 19] = [
     Column::Mempool,
     Column::SlashingPool,
     Column::Meta,
+    Column::EvidenceProofs,
 ];
 
 impl Column {
@@ -95,6 +98,7 @@ impl Column {
             Self::Mempool => "mempool",
             Self::SlashingPool => "slashing_pool",
             Self::Meta => "meta",
+            Self::EvidenceProofs => "evidence_proofs",
         }
     }
 }
@@ -105,7 +109,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 19);
+        assert_eq!(ALL_COLUMNS.len(), 20);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -115,7 +119,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 19] = [
+        let names: [&str; 20] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -135,6 +139,7 @@ mod tests {
             "mempool",
             "slashing_pool",
             "meta",
+            "evidence_proofs",
         ];
         for (column, expected) in ALL_COLUMNS.iter().zip(names) {
             assert_eq!(column.name(), expected);

@@ -1,9 +1,7 @@
 //! Per-block proof orchestration: the FSM transitions
 //! `BlockProduced → PendingProof → Proven` for a single produced block.
 //!
-//! The legacy in-tree prover was removed by the SP1/WASM rewrite; the
-//! production backend will be rebuilt as an SP1 Compressed STARK block
-//! proof system.
+//! Production proofs use the SP1 Compressed STARK backend.
 
 use core::fmt;
 
@@ -37,6 +35,8 @@ pub enum ProveError<E> {
         /// Hash of the parent header that could not be loaded.
         parent_hash: BlockHash,
     },
+    /// The execution witness has not been persisted.
+    MissingWitness(BlockHash),
     /// Backend proof generation failed.
     Backend(ProofError),
     /// Borsh-serialising the backend proof bytes for storage failed.
@@ -57,6 +57,7 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ProveError<E> {
             Self::MissingParentHeader { parent_hash } => {
                 write!(f, "parent header {parent_hash:?} is missing")
             }
+            Self::MissingWitness(hash) => write!(f, "block {hash:?} has no execution witness"),
             Self::Backend(err) => write!(f, "proof backend error: {err:?}"),
             Self::Codec(err) => write!(f, "borsh encode of backend proof failed: {err}"),
         }
@@ -118,12 +119,8 @@ impl<DB: Database> Engine<DB> {
     ///
     /// Blocks produced through
     /// [`Engine::try_produce_block`](crate::Engine::try_produce_block)
-    /// have their witness persisted automatically. For blocks that
-    /// reached the store through a different path (e.g. the legacy
-    /// M5 fixtures or sync without witness backfill), the witness is
-    /// absent and the backend is invoked with an empty byte slice. The
-    /// mock backend ignores the witness; real backends (M8-C onward)
-    /// reject empty witnesses with [`ProofError::InvalidWitness`].
+    /// have their witness persisted automatically. Imported blocks require
+    /// witness generation before local proving.
     pub fn prove_block<PS: ProofSystem>(
         &mut self,
         block_hash: &BlockHash,
@@ -154,11 +151,10 @@ impl<DB: Database> Engine<DB> {
         let state_root_before = self.parent_state_root(&header)?;
         let public_inputs = self.public_inputs_for(&header, state_root_before, block_hash);
 
-        // Load the persisted witness, if any. Falling back to empty
-        // bytes preserves the M5 legacy path where blocks were
-        // produced before the witness pipeline existed; the mock
-        // backend tolerates this and real backends will reject it.
-        let witness_bytes = self.store().get_witness(block_hash)?.unwrap_or_default();
+        let witness_bytes = self
+            .store()
+            .get_witness(block_hash)?
+            .ok_or(ProveError::MissingWitness(*block_hash))?;
 
         // Invoke the backend.
         let backend_proof = proof_system.prove_block(&witness_bytes, &public_inputs)?;
@@ -214,7 +210,6 @@ impl<DB: Database> Engine<DB> {
             receipt_root: header.receipts_root,
             da_root: header.da_root,
             vm_code_hash: self.chain_spec().runtime_code_hash,
-            abi_version: self.chain_spec().runtime_version.abi_version,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
             gas_price: self.chain_spec().runtime.gas_price,

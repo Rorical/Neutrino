@@ -2,7 +2,7 @@
 
 //! SP1 prover/verifier and WASM dynamic runtime host for Neutrino.
 //!
-//! Exposes the M2-new orchestration entry points:
+//! Exposes execution and proof orchestration entry points:
 //!
 //! - [`dry_run`] — native dry-run against a [`LiveTrie`] using a
 //!   [`TracingState`]; returns the recorded [`StateWitness`] plus the
@@ -17,6 +17,7 @@
 //!   [`StfPublicOutput`], and check it equals the caller's expected
 //!   output (covers the "tampered `post_state_root`" exit criterion).
 
+pub mod evidence;
 pub mod executor;
 pub mod proof_system;
 pub mod wasm;
@@ -43,7 +44,7 @@ pub fn default_runtime_code_hash() -> [u8; 32] {
 /// BLAKE3 hash of the embedded default-runtime SP1 Guest ELF.
 ///
 /// Exposed alongside [`default_runtime_code_hash`] for observability
-/// (`system_version` RPC, log lines, debugging tooling). The Guest
+/// (runtime identity queries, log lines, debugging tooling). The Guest
 /// ELF's identity is captured separately by the SP1 verifying-key
 /// cache, so this is informational.
 #[must_use]
@@ -51,28 +52,11 @@ pub fn default_guest_elf_hash() -> [u8; 32] {
     neutrino_primitives::blake3_256(&DEFAULT_GUEST_ELF)
 }
 
-/// Validate a chain-spec `runtime_code_hash` against the embedded
-/// master cdylib.
-///
-/// Returns `Ok(())` when:
-/// - `chain_spec_hash == ZERO_HASH` (placeholder, opt-out for tests
-///   and pre-v1 bring-up), or
-/// - `chain_spec_hash == default_runtime_code_hash()`.
-///
-/// Returns `Err((expected, actual))` otherwise, with `expected` the
-/// chain-spec-declared value and `actual` the embedded ELF's hash.
+/// Validate that the chain specification names the embedded WASM runtime.
 ///
 /// # Errors
-///
-/// Returns `Err` when the chain spec advertises a non-zero
-/// `runtime_code_hash` that does not match the embedded master
-/// cdylib. The node binary must refuse to start in that case so a
-/// silent runtime-vs-spec mismatch cannot quietly produce a divergent
-/// chain.
+/// Returns the declared and actual hashes when they differ.
 pub fn expect_runtime_code_hash(chain_spec_hash: [u8; 32]) -> Result<(), ([u8; 32], [u8; 32])> {
-    if chain_spec_hash == neutrino_primitives::ZERO_HASH {
-        return Ok(());
-    }
     let actual = default_runtime_code_hash();
     if chain_spec_hash == actual {
         Ok(())
@@ -98,48 +82,17 @@ use sp1_sdk::{
 };
 use thiserror::Error;
 
-/// Default-runtime SP1 Guest ELF, compiled in by `build.rs`.
-///
-/// This is the runtime this binary ships with. Once on-chain runtime
-/// upgrades are wired through consensus (M3-new and beyond), nodes
-/// will additionally accept ELFs supplied at runtime — for example a
-/// post-upgrade runtime fetched from chain state — and use them
-/// alongside the embedded default. The whole `runtime-host` API is
-/// parametric over the ELF for this reason; [`DEFAULT_GUEST_ELF`] is
-/// the convenience default, not the only acceptable input.
-///
-/// Consensus binds each block proof to the verifying key of the
-/// runtime version active at that block's height. The chain spec
-/// commits to the genesis `vk` and runtime upgrades append new entries
-/// to an on-chain `(activation_height, vk)` registry. Verification
-/// always picks the `vk` matching the block's runtime version; nodes
-/// do not get to choose.
+/// Embedded default-runtime SP1 block Guest compiled by `build.rs`.
+/// The production verifier pins this program's verifying key.
 pub const DEFAULT_GUEST_ELF: Elf = include_elf!("neutrino-default-runtime-guest");
 
-/// Default-runtime SP1 chunk-aggregator Guest ELF.  Compiled in by
-/// `build.rs` from `crates/runtimes/neutrino-default/chunk-guest/`.
-///
-/// The chunk aggregator reads `N` per-block
-/// [`neutrino_default_runtime_core::ChunkAggregatorBlockMeta`] entries
-/// plus an SP1 chunk-aggregator input from stdin, then for each block
-/// invokes `verify_sp1_proof` against the block-guest's `vk_digest`
-/// and the SHA-256 of the borsh-encoded `StfPublicOutput`.  The SP1
-/// recursion AIR consumes the host-registered inner block proofs in
-/// order; cross-block continuity, edge bindings, and aggregated
-/// Merkle commitments are checked inside the guest.  Output: a
-/// borsh-encoded [`neutrino_consensus_types::ChunkProofPublicInputs`].
-pub const DEFAULT_CHUNK_GUEST_ELF: Elf = include_elf!("neutrino-default-chunk-guest");
+/// Guest that verifies execution bindings, BLS finality, VRF and rotation.
+/// Historical consensus evidence is still fail-closed in this guest.
+pub const DEFAULT_CONSENSUS_CHUNK_GUEST_ELF: Elf =
+    include_elf!("neutrino-default-consensus-chunk-guest");
 
-/// BLAKE3 hash of [`DEFAULT_CHUNK_GUEST_ELF`].
-///
-/// Informational only — the precompile-bound vk inside
-/// `Sp1ProofSystem::chunk_verifying_key()` is the actual identity
-/// check.  Useful for log lines and future chain-spec pinning
-/// (#18.3.1 in doc 18).
-#[must_use]
-pub fn default_chunk_guest_elf_hash() -> [u8; 32] {
-    neutrino_primitives::blake3_256(&DEFAULT_CHUNK_GUEST_ELF)
-}
+/// Independent objective-evidence guest, with the same pinned SP1 toolchain.
+pub const DEFAULT_EVIDENCE_GUEST_ELF: Elf = include_elf!("neutrino-default-evidence-guest");
 
 /// Errors produced by the SP1 host.
 #[derive(Debug, Error)]
@@ -157,7 +110,7 @@ pub enum Sp1HostError {
         actual: Box<StfPublicOutput>,
     },
     /// The proof's public-values buffer could not be borsh-decoded
-    /// as an [`StfPublicOutput`]. Indicates a guest/host version skew
+    /// as an [`StfPublicOutput`]. Indicates a guest/host format mismatch
     /// or adversarial proof.
     #[error("failed to decode committed StfPublicOutput: {0}")]
     DecodeOutput(String),
@@ -297,7 +250,7 @@ where
     /// `pk = (vk, elf)`. Caching `vk` on disk lets future invocations
     /// skip the expensive program-ROM preprocessing pass. The cache
     /// file name embeds `BLAKE3(elf_bytes)` and `SP1_CIRCUIT_VERSION`
-    /// so multiple runtime versions and SP1 upgrades coexist on disk
+    /// so keys for different program hashes and SP1 circuits remain isolated
     /// without colliding — this is what makes the path forward-
     /// compatible with on-chain runtime upgrades.
     ///
@@ -409,6 +362,7 @@ fn codec_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
 /// writes are committed to `live`.
 #[must_use]
 pub fn dry_run(input: &StfInput, live: &LiveTrie) -> DryRun {
+    evidence::verify_input_receipts(input).expect("authenticated evidence before native execution");
     let mut tracer = TracingState::new(live);
     let output = apply_block(input, &mut tracer);
     let (post_state, witness) = tracer.into_committed_and_witness();
@@ -481,7 +435,7 @@ where
 
     if &actual != expected {
         return Err(Sp1HostError::PublicOutputMismatch {
-            expected: Box::new(*expected),
+            expected: Box::new(expected.clone()),
             actual: Box::new(actual),
         });
     }
@@ -534,6 +488,7 @@ mod tests {
             post_state,
         } = dry_run(
             &StfInput {
+                evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
                 chain_id: 1,
                 block_height: 1,
                 block_gas_limit: 30_000_000,
@@ -546,10 +501,13 @@ mod tests {
         assert_eq!(output.applied, 0);
         assert_eq!(output.failed, 0);
         assert_eq!(output.pre_state_root, output.post_state_root);
-        // `apply_block` reads the validator-set key for the canonical
-        // `validator_set_root` commitment, so even empty blocks witness
-        // exactly that one key.
-        assert_eq!(witness.witnessed_keys.len(), 1);
+        // Empty blocks must also inspect pending mandatory sanctions.
+        assert_eq!(witness.witnessed_keys.len(), 2);
+        assert!(
+            witness
+                .witnessed_keys
+                .contains(&neutrino_default_runtime_core::accountability::QUEUE_KEY.to_vec())
+        );
         // Read-only blocks fall back to a clone of the live trie so
         // the producer's swap path remains unconditional.
         assert_eq!(post_state.root(), live.state_root());

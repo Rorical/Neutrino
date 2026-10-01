@@ -3,7 +3,7 @@
 //! Stands up two in-process [`NetworkService`] instances over TCP on
 //! `127.0.0.1`, wires each one to its own [`ChainBackend`] (against an
 //! in-memory database), connects them via libp2p, subscribes both to
-//! `/neutrino/blocks/borsh/1`, and asserts that a signed VRF-eligible
+//! `/neutrino/blocks/borsh`, and asserts that a signed VRF-eligible
 //! block published by the producer is received by the follower's
 //! engine and advances the follower's head.
 //!
@@ -26,9 +26,8 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
-    StateParams, Validator, ZERO_HASH,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
 };
 use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
@@ -71,15 +70,13 @@ fn spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"two-node-test".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xCC; 32],
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -99,11 +96,10 @@ fn spec() -> ChainSpec {
 fn signed_block_for_slot(slot: u64, parent: BlockHash, height: Height) -> Block {
     let key = proposer();
     let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
+    let roots = compute_body_roots(&body);
     let vrf_proof = key.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
-        version: HEADER_VERSION,
         height,
         slot,
         parent_hash: parent,
@@ -112,8 +108,6 @@ fn signed_block_for_slot(slot: u64, parent: BlockHash, height: Height) -> Block 
         state_root: [0x11; 32],
         transactions_root: roots.transactions_root,
         votes_root: roots.votes_root,
-        slashings_root: roots.slashings_root,
-        validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,

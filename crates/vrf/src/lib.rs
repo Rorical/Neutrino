@@ -25,6 +25,7 @@
 //! same BLS verifier the recursive checkpoint proof already needs for
 //! finality-vote aggregation.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
 #![allow(clippy::doc_markdown)]
 
@@ -34,6 +35,8 @@ mod eval;
 mod seed;
 mod threshold;
 
-pub use eval::{VrfOutput, VrfProof, eval, verify, vrf_message};
+pub use eval::{VrfOutput, vrf_message};
+#[cfg(feature = "std")]
+pub use eval::{VrfProof, eval, verify};
 pub use seed::fold_seed;
 pub use threshold::is_eligible;

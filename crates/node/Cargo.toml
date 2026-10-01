@@ -33,6 +33,7 @@ neutrino-mempool.workspace        = true
 neutrino-network.workspace        = true
 neutrino-primitives.workspace     = true
 neutrino-proof-system.workspace   = true
+neutrino-prover-chunk.workspace   = true
 neutrino-rpc.workspace            = true
 neutrino-runtime-abi.workspace    = true
 neutrino-runtime-host.workspace   = true
@@ -48,6 +49,7 @@ tracing                           = "0.1.44"
 tracing-subscriber                = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
+neutrino-vrf = { workspace = true }
 tokio                 = { version = "1.52.3", features = ["full", "test-util"] }
 ed25519-dalek         = { workspace = true }
 neutrino-runtime-core = { workspace = true, features = ["host"] }

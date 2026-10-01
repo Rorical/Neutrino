@@ -23,9 +23,8 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_rpc::{BlockId, RpcBackend};
 use neutrino_runtime_core::host::LiveTrie;
@@ -115,15 +114,13 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         end_state_root: state_root,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let spec = ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"fee-market".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: [0xAB; 32],
         genesis_state_root: state_root,

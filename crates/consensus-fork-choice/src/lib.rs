@@ -379,7 +379,6 @@ mod tests {
 
     fn header(parent_hash: BlockHash, height: Height, proposer_index: ValidatorIndex) -> Header {
         Header {
-            version: 1,
             height,
             slot: height,
             parent_hash,
@@ -388,8 +387,6 @@ mod tests {
             state_root: hash(1),
             transactions_root: hash(2),
             votes_root: hash(3),
-            slashings_root: hash(4),
-            validator_ops_root: hash(5),
             da_root: hash(6),
             runtime_extra: hash(7),
             receipts_root: hash(11),
@@ -432,6 +429,7 @@ mod tests {
 
     fn cert(chunk: &Chunk) -> FinalityCert {
         FinalityCert {
+            attestations: Vec::new(),
             chunk_id: chunk.chunk_id,
             round: 0,
             chunk_hash: chunk.hash(),

@@ -5,12 +5,8 @@
 //! block's writes, and emits the borsh-encoded `(StfInput,
 //! StateWitness)` blob the configured proof system later replays.
 //!
-//! The executor is purely the dynamic-execution seam — it knows
-//! nothing about SP1. The witness blob it emits happens to match
-//! the layout the default-runtime guest reads from `SP1Stdin`, but
-//! that's a property of the runtime ABI, not the executor. The
-//! matching [`crate::Sp1ProofSystem::prove_block`] decodes the same
-//! blob on its way into the SP1 prover.
+//! Exact `EvidenceProof` receipts are verified before WASM mutation. The emitted
+//! witness bundle is replayed by the matching SP1 block Guest.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::Body;
@@ -115,6 +111,7 @@ impl BlockExecutor for WasmExecutor {
             txs.push(tx);
         }
         let input = StfInput {
+            evidence_anchor: ctx.evidence_anchor,
             chain_id: ctx.chain_id,
             block_height: ctx.block_height,
             block_gas_limit: ctx.gas_limit,

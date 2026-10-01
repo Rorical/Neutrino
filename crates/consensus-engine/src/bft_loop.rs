@@ -84,6 +84,7 @@ enum PeerQuorumProgress {
 pub struct BftSession {
     chunk_id: ChunkId,
     chunk_hash: ChunkHash,
+    proof_hashes: Vec<neutrino_primitives::Hash>,
     bft: ChunkBft,
     local: LocalVoteProgress,
     peer_quorum: PeerQuorumProgress,
@@ -366,6 +367,20 @@ impl<DB: Database> Engine<DB> {
             return Err(BftLoopError::SessionAlreadyOpen { chunk_id });
         }
         let chunk_hash = chunk.hash();
+        let mut proof_hashes = Vec::new();
+        for height in chunk.start_height..=chunk.end_height {
+            let Some(hash) = self.store().get_block_hash_by_height(height)? else {
+                proof_hashes.clear();
+                break;
+            };
+            let Some(proof) = self.store().get_block_proof(&hash)? else {
+                proof_hashes.clear();
+                break;
+            };
+            proof_hashes.push(neutrino_primitives::blake3_256(
+                &borsh::to_vec(&proof).expect("canonical block proof"),
+            ));
+        }
         let active_validator_set_root = self.previous_validator_set_root()?;
         let active_set = self.active_validator_set().to_vec();
         if active_set.is_empty() {
@@ -392,6 +407,7 @@ impl<DB: Database> Engine<DB> {
         let mut session = BftSession {
             chunk_id,
             chunk_hash,
+            proof_hashes,
             bft,
             local: LocalVoteProgress::Idle,
             peer_quorum: PeerQuorumProgress::BelowPrevote,
@@ -605,13 +621,18 @@ impl<DB: Database> Engine<DB> {
         }
     }
 
-    /// Read the validator-set root committed by the previous
-    /// checkpoint. Every vote in the current BFT session must bind
+    /// Read the validator-set root committed by the previous complete chunk,
+    /// using the genesis checkpoint before any chunk is finalized. Every BFT session binds
     /// this root so equivocations across a validator-set rotation
     /// cannot finalize.
     fn previous_validator_set_root(
         &self,
     ) -> Result<neutrino_primitives::Hash, BftLoopError<DB::Error>> {
+        if let Some(state) = self.store().get_consensus_state()? {
+            return Ok(neutrino_prover_chunk::execution::commitment(
+                &state.statement.next_context.active_validators,
+            ));
+        }
         let previous_index = self.latest_checkpoint_index();
         let previous = self
             .store()
@@ -696,6 +717,7 @@ impl<DB: Database> Engine<DB> {
             let BftSession {
                 chunk_id: kept_chunk_id,
                 chunk_hash,
+                proof_hashes,
                 bft,
                 local: _,
                 peer_quorum: _,
@@ -727,6 +749,7 @@ impl<DB: Database> Engine<DB> {
             let mut session = BftSession {
                 chunk_id: kept_chunk_id,
                 chunk_hash,
+                proof_hashes,
                 bft: advanced_bft,
                 local: LocalVoteProgress::Idle,
                 peer_quorum: PeerQuorumProgress::BelowPrevote,
@@ -836,7 +859,7 @@ fn recompute_quorum_transitions<E>(
         if let Some(voter) = local_voter
             && !session.local_precommitted()
         {
-            let precommit = build_local_vote(
+            let mut precommit = build_local_vote(
                 session.chunk_id,
                 session.chunk_hash,
                 session.bft.round(),
@@ -845,6 +868,22 @@ fn recompute_quorum_transitions<E>(
                 voter,
                 active_set_len,
             );
+            let unlock = QuorumCertificate {
+                data: FinalityVoteData {
+                    phase: FinalityVotePhase::Prevote,
+                    ..precommit.data.clone()
+                },
+                aggregate: session
+                    .bft
+                    .current_aggregate(FinalityVotePhase::Prevote)
+                    .expect("prevote quorum was reached"),
+            };
+            precommit.attestations.push(voter.attest_precommit(
+                chain_id,
+                precommit.data.clone(),
+                session.proof_hashes.clone(),
+                Some(unlock),
+            ));
             session.bft.add_precommit(precommit.clone())?;
             session.local = LocalVoteProgress::Precommitted;
             actions.push(BftAction::BroadcastPrecommit(precommit));
@@ -882,6 +921,7 @@ fn emit_aggregator_actions(session: &mut BftSession, actions: &mut Vec<BftAction
         && let Some(aggregate) = session.bft.current_aggregate(FinalityVotePhase::Prevote)
     {
         let vote = FinalityVote {
+            attestations: session.bft.current_attestations(FinalityVotePhase::Prevote),
             aggregation_bits: aggregate.aggregation_bits,
             data: FinalityVoteData {
                 chunk_id: session.chunk_id,
@@ -902,6 +942,9 @@ fn emit_aggregator_actions(session: &mut BftSession, actions: &mut Vec<BftAction
         && let Some(aggregate) = session.bft.current_aggregate(FinalityVotePhase::Precommit)
     {
         let vote = FinalityVote {
+            attestations: session
+                .bft
+                .current_attestations(FinalityVotePhase::Precommit),
             aggregation_bits: aggregate.aggregation_bits,
             data: FinalityVoteData {
                 chunk_id: session.chunk_id,
@@ -944,6 +987,7 @@ fn build_local_vote(
         bits.push(position == voter_position);
     }
     FinalityVote {
+        attestations: Vec::new(),
         aggregation_bits: bits,
         data,
         signature,
@@ -957,11 +1001,94 @@ mod tests {
     use crate::validator_set::validator_set_root;
     use neutrino_consensus_types::Chunk;
     use neutrino_primitives::{
-        BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-        LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
-        ZERO_HASH,
+        BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
+        ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
     };
     use neutrino_storage::MemoryDatabase;
+
+    fn test_engine(spec: ChainSpec) -> Engine<MemoryDatabase> {
+        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).unwrap();
+        // Session tests exercise BFT separately from block execution.
+        for height in 1..=12 {
+            let header = neutrino_consensus_types::Header {
+                height,
+                slot: height,
+                parent_hash: [0; 32],
+                proposer_index: 0,
+                vrf_proof: [0; 96],
+                state_root: [0; 32],
+                transactions_root: [0; 32],
+                votes_root: [0; 32],
+                da_root: [0; 32],
+                runtime_extra: [0; 32],
+                receipts_root: [0; 32],
+                gas_used: 0,
+                gas_limit: 0,
+                timestamp: 0,
+                signature: [0; 96],
+            };
+            let hash = engine.store_mut().put_header(&header).unwrap();
+            let public_inputs = neutrino_consensus_types::BlockProofPublicInputs {
+                chain_id: 7,
+                height,
+                parent_block_hash: [0; 32],
+                block_hash: hash,
+                state_root_before: [0; 32],
+                state_root_after: [0; 32],
+                transactions_root: [0; 32],
+                receipt_root: [0; 32],
+                da_root: [0; 32],
+                vm_code_hash: [0; 32],
+                gas_used: 0,
+                gas_limit: 0,
+                gas_price: 0,
+                proposer_address: [0; 32],
+                runtime_extra: [0; 32],
+            };
+            engine
+                .store_mut()
+                .put_block_proof(
+                    &hash,
+                    &neutrino_consensus_types::BlockProof {
+                        height,
+                        block_hash: hash,
+                        public_inputs,
+                        proof_bytes: vec![1],
+                    },
+                )
+                .unwrap();
+        }
+        engine
+    }
+
+    fn test_vote(
+        chunk_id: ChunkId,
+        chunk_hash: ChunkHash,
+        round: u32,
+        phase: FinalityVotePhase,
+        chain_id: ChainId,
+        voter: &ProposerKey,
+        active_set_len: usize,
+    ) -> FinalityVote {
+        let mut vote = super::build_local_vote(
+            chunk_id,
+            chunk_hash,
+            round,
+            phase,
+            chain_id,
+            voter,
+            active_set_len,
+        );
+        if phase == FinalityVotePhase::Precommit {
+            vote.attestations.push(voter.attest_precommit(
+                chain_id,
+                vote.data.clone(),
+                vec![[1; 32]],
+                None,
+            ));
+        }
+        vote
+    }
 
     fn proposer(seed: u8) -> ProposerKey {
         ProposerKey::from_ikm(&[seed; 32], u32::from(seed)).expect("derive proposer")
@@ -997,7 +1124,6 @@ mod tests {
             end_state_root: ZERO_HASH,
             end_validator_set_root: vs_root,
             history_root: ZERO_HASH,
-            proof_system_version: proof.proof_system_version,
         };
         // M7-C: keep the foundational session tests deterministic by
         // pinning `expected_aggregators_per_round` to a value so
@@ -1009,12 +1135,11 @@ mod tests {
             ..ConsensusParams::default()
         };
         ChainSpec {
-            spec_version: CHAIN_SPEC_VERSION,
             name: BoundedBytes::new(b"bft-loop-test".to_vec()).expect("name fits"),
             chain_id: 7,
             genesis_time: 1_700_000_000,
             genesis_gas_limit: 30_000_000,
-            runtime_version: RuntimeVersion::default(),
+            runtime_info: RuntimeInfo::default(),
             runtime_code_hash: [0xCC; 32],
             genesis_seed: [0xCC; 32],
             genesis_state_root: ZERO_HASH,
@@ -1064,7 +1189,7 @@ mod tests {
     #[test]
     fn single_validator_session_self_finalises_via_synthesized_quorum() {
         let spec = chain_spec_with(1);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
         let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
         let actions = engine.open_bft_session(chunk).expect("open session");
@@ -1082,7 +1207,7 @@ mod tests {
     #[test]
     fn three_validator_session_advances_on_peer_quorum() {
         let spec = chain_spec_with(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
         let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
         let actions = engine
@@ -1095,7 +1220,7 @@ mod tests {
         assert!(!session.prevote_quorum_observed());
 
         // Feed v1's prevote — now we have 2/3 stake → emit precommit.
-        let v1_prevote = build_local_vote(
+        let v1_prevote = test_vote(
             0,
             chunk.hash(),
             0,
@@ -1115,7 +1240,7 @@ mod tests {
         assert!(!session.precommit_quorum_observed());
 
         // Feed v1's precommit — now 2/3 precommit stake → quorum reached.
-        let v1_precommit = build_local_vote(
+        let v1_precommit = test_vote(
             0,
             chunk.hash(),
             0,
@@ -1136,9 +1261,9 @@ mod tests {
     #[test]
     fn observe_drops_votes_for_unknown_chunks() {
         let spec = chain_spec_with(2);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
-        let orphan_vote = build_local_vote(
+        let orphan_vote = test_vote(
             99,
             [0xAB; 32],
             0,
@@ -1160,7 +1285,7 @@ mod tests {
     #[test]
     fn observe_finality_vote_feeds_fork_choice() {
         let spec = chain_spec_with(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
 
         let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
@@ -1178,7 +1303,7 @@ mod tests {
         );
 
         // Feed v1's prevote — fork-choice gains a second entry.
-        let v1_prevote = build_local_vote(
+        let v1_prevote = test_vote(
             0,
             chunk.hash(),
             0,
@@ -1199,7 +1324,7 @@ mod tests {
 
         // v1's subsequent precommit REPLACES the v1 prevote entry
         // (one slot per validator in fork_choice.votes), not appends.
-        let v1_precommit = build_local_vote(
+        let v1_precommit = test_vote(
             0,
             chunk.hash(),
             0,
@@ -1235,7 +1360,7 @@ mod tests {
     #[test]
     fn opening_the_same_chunk_twice_errors() {
         let spec = chain_spec_with(2);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
         engine.open_bft_session(chunk.clone()).expect("first open");
         let err = engine
@@ -1250,7 +1375,7 @@ mod tests {
     #[test]
     fn aggregator_emits_publish_actions_when_local_aggregate_grows() {
         let spec = chain_spec_with_aggregators(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
         assert!(
             engine.local_is_aggregator_for(0, 0),
@@ -1272,7 +1397,7 @@ mod tests {
 
         // Feed v1's prevote — aggregate stake grows from 1 to 2, so
         // another aggregate publish should fire.
-        let v1_prevote = build_local_vote(
+        let v1_prevote = test_vote(
             0,
             chunk.hash(),
             0,
@@ -1292,7 +1417,7 @@ mod tests {
         );
         // The same prevote re-ingested produces no new publish
         // (aggregate stake did not change).
-        let v1_prevote_dupe = build_local_vote(
+        let v1_prevote_dupe = test_vote(
             0,
             chunk.hash(),
             0,
@@ -1315,7 +1440,7 @@ mod tests {
     #[test]
     fn aggregator_publish_subnet_matches_engine_helper() {
         let spec = chain_spec_with_aggregators(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
         let chunk_id: ChunkId = 11;
         let chunk = {
@@ -1341,7 +1466,7 @@ mod tests {
         // chain_spec_with pins expected_aggregators_per_round to a
         // value so small that no validator clears the threshold.
         let spec = chain_spec_with(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
         assert!(
             !engine.local_is_aggregator_for(0, 0),
@@ -1358,7 +1483,7 @@ mod tests {
     #[test]
     fn non_voter_session_only_accumulates_peer_votes() {
         let spec = chain_spec_with(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         // No local_voter configured: this is a follower-only node.
         let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
         let actions = engine
@@ -1374,7 +1499,7 @@ mod tests {
         // surface a QuorumReached action so the follower can persist
         // the cert.
         for index in 0_u8..2 {
-            let vote = build_local_vote(
+            let vote = test_vote(
                 0,
                 chunk.hash(),
                 0,
@@ -1387,7 +1512,7 @@ mod tests {
         }
         let mut quorum_seen = false;
         for index in 0_u8..2 {
-            let vote = build_local_vote(
+            let vote = test_vote(
                 0,
                 chunk.hash(),
                 0,
@@ -1422,7 +1547,7 @@ mod tests {
         // 2 validators so a single prevote cannot reach the 2/3
         // quorum and the round actually has to time out.
         let spec = chain_spec_with(2);
-        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec);
         engine.set_local_voter(proposer(0));
 
         let chunk = dummy_chunk(0, engine.chain_spec().genesis_validator_set_root);
@@ -1494,7 +1619,7 @@ mod tests {
         use neutrino_consensus_types::SlashingEvidence;
 
         let spec = chain_spec_with(3);
-        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
 
         let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
@@ -1507,7 +1632,7 @@ mod tests {
         // Feed v1's prevote — crosses 2/3 prevote stake. The BFT
         // loop hook should snapshot the just-formed quorum into the
         // slashing monitor's `observed_prevote_quorums` cache.
-        let v1_prevote = build_local_vote(
+        let v1_prevote = test_vote(
             0,
             chunk_hash,
             0,
@@ -1525,7 +1650,7 @@ mod tests {
         // precommit consistent with the lock, then later a
         // round-1 precommit for a DIFFERENT hash → must surface
         // LockViolation.
-        let v1_precommit_r0 = build_local_vote(
+        let v1_precommit_r0 = test_vote(
             0,
             chunk_hash,
             0,
@@ -1547,7 +1672,8 @@ mod tests {
         // cache; no unlock quorum exists at any intervening round.
         let mut conflicting_chunk_hash = chunk_hash;
         conflicting_chunk_hash[0] ^= 0xFF;
-        let v1_precommit_r1 = neutrino_consensus_types::FinalityVote {
+        let mut v1_precommit_r1 = neutrino_consensus_types::FinalityVote {
+            attestations: Vec::new(),
             aggregation_bits: {
                 let mut bits = neutrino_primitives::BitVec::default();
                 for index in 0..3 {
@@ -1571,6 +1697,14 @@ mod tests {
                 },
             ),
         };
+        v1_precommit_r1
+            .attestations
+            .push(proposer(1).attest_precommit(
+                spec.chain_id,
+                v1_precommit_r1.data.clone(),
+                Vec::new(),
+                None,
+            ));
         let evidence = engine
             .observe_vote_for_slashing(&v1_precommit_r1)
             .expect("v1 cross-round precommit recorded")
@@ -1592,7 +1726,7 @@ mod tests {
                     lock_evidence.locked_prevote_quorum.data.chunk_hash,
                     chunk_hash,
                 );
-                assert!(lock_evidence.claimed_unlock_quorum.is_none());
+                assert!(lock_evidence.attestation.unlock_quorum.is_none());
             }
             other => panic!("expected LockViolation, got {other:?}"),
         }
@@ -1603,7 +1737,7 @@ mod tests {
     #[test]
     fn round_timeout_stops_advancing_past_max_round() {
         let spec = chain_spec_with(2);
-        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
+        let mut engine = test_engine(spec);
         engine.set_local_voter(proposer(0));
         let chunk = dummy_chunk(0, engine.chain_spec().genesis_validator_set_root);
         engine.open_bft_session_at(chunk, 0).expect("open");
@@ -1628,5 +1762,156 @@ mod tests {
             actual_round <= max_round,
             "session must not advance past max_round = {max_round}; got {actual_round}",
         );
+    }
+    fn aggregate_attested(chunk: &Chunk, phase: FinalityVotePhase, round: u32) -> FinalityVote {
+        let data = FinalityVoteData {
+            chunk_id: chunk.chunk_id,
+            chunk_hash: chunk.hash(),
+            phase,
+            round,
+        };
+        let mut attestations = Vec::new();
+        let signatures: Vec<_> = (0..2)
+            .map(|index| {
+                let voter = proposer(index);
+                if phase == FinalityVotePhase::Precommit {
+                    attestations.push(voter.attest_precommit(7, data.clone(), vec![[1; 32]], None));
+                }
+                neutrino_crypto::bls::Signature::from_bytes(&voter.sign_finality_vote(7, &data))
+                    .unwrap()
+            })
+            .collect();
+        FinalityVote {
+            data,
+            attestations,
+            aggregation_bits: BitVec::from_bytes(2, vec![3]).unwrap(),
+            signature: neutrino_crypto::bls::aggregate_signatures(
+                &signatures.iter().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .to_bytes(),
+        }
+    }
+
+    fn accountable_certificate(
+        chunk: &Chunk,
+        round: u32,
+    ) -> neutrino_consensus_types::FinalityCert {
+        let prevote = aggregate_attested(chunk, FinalityVotePhase::Prevote, round);
+        let precommit = aggregate_attested(chunk, FinalityVotePhase::Precommit, round);
+        neutrino_consensus_types::FinalityCert {
+            chunk_id: chunk.chunk_id,
+            round,
+            chunk_hash: chunk.hash(),
+            active_validator_set_root: chunk.active_validator_set_root,
+            prevote: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: prevote.aggregation_bits,
+                signature: prevote.signature,
+            },
+            precommit: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: precommit.aggregation_bits,
+                signature: precommit.signature,
+            },
+            attestations: precommit.attestations,
+        }
+    }
+
+    #[test]
+    fn certificates_alone_attribute_every_lock_violator() {
+        let mut spec = chain_spec_with(2);
+        spec.consensus.chunk_size = 1;
+        spec.proof.slot_budget_per_chunk = 1;
+        let mut engine = test_engine(spec.clone());
+        let first = dummy_chunk(0, spec.genesis_validator_set_root);
+        let prior = accountable_certificate(&first, 0);
+        assert!(
+            engine
+                .observe_certificate_for_slashing(&first, &prior)
+                .unwrap()
+                .is_empty()
+        );
+        let mut later = first;
+        later.end_state_root[0] ^= 1;
+        let certificate = accountable_certificate(&later, 2);
+        let evidence = engine
+            .observe_certificate_for_slashing(&later, &certificate)
+            .unwrap();
+        assert_eq!(evidence.len(), 2, "no individual vote gossip was received");
+        for item in &evidence {
+            assert!(matches!(
+                item,
+                neutrino_consensus_types::SlashingEvidence::LockViolation { .. }
+            ));
+            engine.verify_slashing_evidence(item).unwrap();
+        }
+        // A valid signed unlock excuses both signers even though None did not.
+        let quorum = neutrino_consensus_types::QuorumCertificate {
+            data: FinalityVoteData {
+                phase: FinalityVotePhase::Prevote,
+                ..certificate.precommit_vote().data
+            },
+            aggregate: certificate.prevote.clone(),
+        };
+        let mut honest = certificate;
+        for claim in &mut honest.attestations {
+            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_precommit(
+                7,
+                claim.vote.clone(),
+                claim.proof_hashes.clone(),
+                Some(quorum.clone()),
+            );
+        }
+        assert!(
+            engine
+                .observe_certificate_for_slashing(&later, &honest)
+                .unwrap()
+                .is_empty()
+        );
+        let mut stripped = honest;
+        stripped.attestations[0].unlock_quorum = None;
+        assert!(
+            engine
+                .observe_certificate_for_slashing(&later, &stripped)
+                .is_err()
+        );
+    }
+    #[test]
+    fn aggregate_votes_alone_preserve_lock_evidence() {
+        let mut spec = chain_spec_with(2);
+        spec.consensus.chunk_size = 1;
+        spec.proof.slot_budget_per_chunk = 1;
+        let mut engine = test_engine(spec.clone());
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
+        let prevote = aggregate_attested(&chunk, FinalityVotePhase::Prevote, 0);
+        let quorum = neutrino_consensus_types::QuorumCertificate {
+            data: prevote.data,
+            aggregate: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: prevote.aggregation_bits,
+                signature: prevote.signature,
+            },
+        };
+        let mut first = aggregate_attested(&chunk, FinalityVotePhase::Precommit, 0);
+        for claim in &mut first.attestations {
+            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_precommit(
+                7,
+                claim.vote.clone(),
+                claim.proof_hashes.clone(),
+                Some(quorum.clone()),
+            );
+        }
+        assert!(
+            engine
+                .observe_votes_for_slashing(&first)
+                .unwrap()
+                .is_empty()
+        );
+        let mut later = chunk;
+        later.end_state_root[0] ^= 1;
+        let vote = aggregate_attested(&later, FinalityVotePhase::Precommit, 1);
+        let evidence = engine.observe_votes_for_slashing(&vote).unwrap();
+        assert_eq!(evidence.len(), 2);
+        for item in evidence {
+            engine.verify_slashing_evidence(&item).unwrap();
+        }
     }
 }

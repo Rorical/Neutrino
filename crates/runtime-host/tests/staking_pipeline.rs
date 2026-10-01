@@ -7,9 +7,8 @@ use std::sync::OnceLock;
 
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_default_runtime_core::{
-    Account, Address, LeakTx, SlashTx, StakeTx, StfInput, Transaction, UnstakeTx,
-    VALIDATOR_SET_KEY, Validator, ValidatorSet, account_key, encode_account, encode_validator,
-    stake_sig_message, unstake_sig_message, validator_key,
+    Account, Address, StakeTx, StfInput, Transaction, UnstakeTx, ValidatorSet, account_key,
+    encode_account, stake_sig_message, unstake_sig_message,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{ProverCtx, dry_run};
@@ -65,23 +64,6 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     live
 }
 
-fn live_with_validator(addr: Address, account: Account, stake: u128) -> LiveTrie {
-    let mut live = live_with_account(addr, account);
-    live.insert(
-        &validator_key(&addr),
-        encode_validator(&Validator {
-            stake,
-            active: stake > 0,
-        }),
-    );
-    let mut set = ValidatorSet::default();
-    if stake > 0 {
-        set.upsert(addr, stake);
-    }
-    live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
-    live
-}
-
 #[test]
 fn stake_pipeline_prove_verify_mock() {
     let ctx = mock_ctx();
@@ -96,6 +78,7 @@ fn stake_pipeline_prove_verify_mock() {
     );
 
     let input = StfInput {
+        evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
@@ -107,78 +90,6 @@ fn stake_pipeline_prove_verify_mock() {
     assert_eq!(dry.output.applied, 1);
     let mut expected_set = ValidatorSet::default();
     expected_set.upsert(addr, 60);
-    assert_eq!(dry.output.validator_set_root, expected_set.root());
-
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
-    ctx.verify(&proof.proof, &dry.output)
-        .expect("verify accepts proof");
-}
-
-#[test]
-fn slash_pipeline_prove_verify_mock() {
-    let ctx = mock_ctx();
-    let alice = signing_key(102);
-    let addr = address_of(&alice);
-    let live = live_with_validator(
-        addr,
-        Account {
-            nonce: 0,
-            balance: 0,
-        },
-        100,
-    );
-
-    let input = StfInput {
-        chain_id: CHAIN_ID,
-        block_height: 1,
-        block_gas_limit: 30_000_000,
-        gas_price: 0,
-        proposer_address: [0u8; 32],
-        transactions: vec![Transaction::Slash(SlashTx {
-            validator: addr,
-            amount: 25,
-        })],
-    };
-    let dry = dry_run(&input, &live);
-    assert_eq!(dry.output.applied, 1);
-    let mut expected_set = ValidatorSet::default();
-    expected_set.upsert(addr, 75);
-    assert_eq!(dry.output.validator_set_root, expected_set.root());
-
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
-    ctx.verify(&proof.proof, &dry.output)
-        .expect("verify accepts proof");
-}
-
-#[test]
-fn inactivity_leak_pipeline_prove_verify_mock() {
-    let ctx = mock_ctx();
-    let alice = signing_key(103);
-    let addr = address_of(&alice);
-    let live = live_with_validator(
-        addr,
-        Account {
-            nonce: 0,
-            balance: 0,
-        },
-        80,
-    );
-
-    let input = StfInput {
-        chain_id: CHAIN_ID,
-        block_height: 1,
-        block_gas_limit: 30_000_000,
-        gas_price: 0,
-        proposer_address: [0u8; 32],
-        transactions: vec![Transaction::InactivityLeak(LeakTx {
-            validator: addr,
-            amount: 15,
-        })],
-    };
-    let dry = dry_run(&input, &live);
-    assert_eq!(dry.output.applied, 1);
-    let mut expected_set = ValidatorSet::default();
-    expected_set.upsert(addr, 65);
     assert_eq!(dry.output.validator_set_root, expected_set.root());
 
     let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
@@ -200,6 +111,7 @@ fn stake_then_unstake_round_trip() {
     );
 
     let input = StfInput {
+        evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,

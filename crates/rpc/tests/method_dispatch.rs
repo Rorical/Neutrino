@@ -66,9 +66,9 @@ impl RpcBackend for MockBackend {
     fn chain_id(&self) -> ChainId {
         self.chain_id
     }
-    fn runtime_abi_version(&self) -> Option<u32> {
+    fn runtime_code_hash(&self) -> Option<neutrino_primitives::Hash> {
         if self.runtime_attached {
-            Some(neutrino_runtime_abi::VERSION)
+            Some([7; 32])
         } else {
             None
         }
@@ -175,7 +175,6 @@ impl RpcBackend for MockBackend {
 
 const fn sample_header(height: Height, hash_seed: BlockHash) -> Header {
     Header {
-        version: 1,
         height,
         slot: height as Slot,
         parent_hash: [0; 32],
@@ -184,8 +183,6 @@ const fn sample_header(height: Height, hash_seed: BlockHash) -> Header {
         state_root: hash_seed,
         transactions_root: [0; 32],
         votes_root: [0; 32],
-        slashings_root: [0; 32],
-        validator_ops_root: [0; 32],
         da_root: [0; 32],
         runtime_extra: [0; 32],
         receipts_root: [0; 32],
@@ -215,12 +212,14 @@ async fn system_health_reports_runtime_and_mempool() {
 }
 
 #[tokio::test]
-async fn system_version_includes_runtime_abi_when_attached() {
+async fn system_info_includes_runtime_hash_when_attached() {
     let backend = Arc::new(MockBackend::default());
     let module = build_module(backend).unwrap();
-    let result: Value = module.call("system_version", [(); 0]).await.unwrap();
-    assert_eq!(result["abi_version"], neutrino_runtime_abi::VERSION);
-    assert_eq!(result["runtime_abi_version"], neutrino_runtime_abi::VERSION);
+    let result: Value = module.call("system_info", [(); 0]).await.unwrap();
+    assert_eq!(
+        result["runtime_code_hash"],
+        format!("0x{}", "07".repeat(32))
+    );
 }
 
 #[tokio::test]

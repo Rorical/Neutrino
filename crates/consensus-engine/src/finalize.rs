@@ -1,25 +1,4 @@
-//! Chunk-level finalization: roll proven blocks up into a chunk,
-//! aggregate their proofs, run the BFT vote, and walk every covered
-//! block through `Proven → ChunkProven → Finalized`.
-//!
-//! Phase F covers chunk-aggregated proofs and chunk-level BFT
-//! finality. Phase G stacks the recursive checkpoint on top so blocks
-//! can finally reach [`BlockState::Checkpointed`].
-
-use alloc::vec::Vec;
-use core::fmt;
-
-use neutrino_consensus_chunk_bft::{BftError, ChunkBft, FinalizationStatus};
-use neutrino_consensus_types::{
-    BlockProof as WireBlockProof, BlockProofPublicInputs, Chunk, ChunkProof as WireChunkProof,
-    ChunkProofPublicInputs, FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase,
-    Header,
-};
-use neutrino_primitives::{
-    BitVec, BlockHash, ChunkHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH,
-};
-use neutrino_proof_system::{ProofError, ProofSystem};
-use neutrino_storage::Database;
+//! Complete chunk proof and BFT finalization of proven blocks.
 
 use crate::block_state::BlockState;
 use crate::engine::Engine;
@@ -27,6 +6,18 @@ use crate::error::EngineError;
 use crate::merkle::{hash_leaf, merkle_root_of_hashes};
 use crate::proposer::ProposerKey;
 use crate::store::StoreError;
+use alloc::vec::Vec;
+use core::fmt;
+use neutrino_consensus_chunk_bft::{BftError, ChunkBft, FinalizationStatus};
+use neutrino_consensus_types::{
+    BlockProof as WireBlockProof, Chunk, ChunkProof as WireChunkProof, ChunkProofPublicInputs,
+    FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase, Header,
+};
+use neutrino_primitives::{
+    BitVec, BlockHash, ChunkHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH,
+};
+use neutrino_proof_system::{ProofError, ProofSystem};
+use neutrino_storage::Database;
 
 extern crate alloc;
 
@@ -90,9 +81,7 @@ pub enum FinalizeError<E> {
     /// Chunk-BFT bookkeeping rejected the synthesized vote.
     Bft(BftError),
     /// The BFT layer accepted votes but still reports `Pending`. Only
-    /// possible when something else went wrong (chunk proof rejected,
-    /// validator-set root drift, etc.) — never on the M5 single-node
-    /// happy path.
+    /// possible when the available valid votes do not form a quorum.
     FinalizationStalled,
     /// Borsh-serialising the backend chunk proof for storage failed.
     Codec(borsh::io::Error),
@@ -196,90 +185,20 @@ pub struct FinalizeOutcome {
 }
 
 impl<DB: Database> Engine<DB> {
-    /// Finalize the chunk identified by `chunk_id`.
-    ///
-    /// Walks the FSM `Proven → ChunkProven → Finalized` for every
-    /// block in the chunk's height range, building the chunk proof
-    /// and finality certificate along the way.
+    /// Prove and finalize complete execution and consensus for a chunk.
     pub fn finalize_chunk<PS: ProofSystem>(
         &mut self,
         chunk_id: ChunkId,
-        chunk_witness: &[u8],
         proof_system: &PS,
         voter: &ProposerKey,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        self.validate_chunk_id_sequence(chunk_id)?;
-        let chunk_size = self.chain_spec().consensus.chunk_size;
-        let (start_height, end_height) = chunk_range(chunk_id, chunk_size)?;
-
-        let inputs = self.collect_chunk_inputs::<PS>(start_height, end_height, proof_system)?;
-        let (chunk, wire_chunk_proof, public_inputs) = self.assemble_chunk_and_proof::<PS>(
-            chunk_id,
-            start_height,
-            end_height,
-            &inputs,
-            proof_system,
-        )?;
-        let chunk_hash = chunk.hash();
-
-        // Advance Proven → ChunkProven before the BFT vote so a
-        // crash here leaves the FSM in a consistent intermediate
-        // state.
-        for hash in &inputs.block_hashes {
-            self.store_mut()
-                .put_block_state(hash, BlockState::ChunkProven)?;
-        }
-        self.store_mut().put_chunk(&chunk)?;
-        self.store_mut()
-            .put_chunk_proof(chunk_id, &wire_chunk_proof)?;
-
-        let _ = chunk_witness; // M5 mock backend ignores witnesses.
-
-        let active_validator_set_root = chunk.active_validator_set_root;
-        let finality_cert =
-            self.run_chunk_bft(&chunk, chunk_hash, voter, active_validator_set_root)?;
-        self.store_mut()
-            .put_finality_cert(chunk_id, &finality_cert)?;
-
-        let end_block_hash = chunk.end_block_hash;
-        for hash in &inputs.block_hashes {
-            self.store_mut()
-                .put_block_state(hash, BlockState::Finalized)?;
-        }
-        self.store_mut().put_latest_finalized_chunk_id(chunk_id)?;
-        self.store_mut().put_finalized_head(end_block_hash)?;
-        self.update_finalization_pointers(chunk_id, end_block_hash);
-
-        // Pending-fix #13: advance the fork-choice DAG's finalised
-        // anchor in lockstep with the engine's. After this call,
-        // `fork_choice.head()` candidates that do not descend from
-        // `end_block_hash` are filtered out, and any DAG sibling
-        // below the new anchor cannot win head selection.
-        //
-        // Errors are intentionally swallowed: by construction
-        // `chunk_hash` was just derived from `chunk.hash()` and
-        // bound into the same certificate (impossible to disagree),
-        // and `chunk.end_block_hash` was registered into the DAG
-        // by either the producer (`produce.rs:fork_choice.add_block`)
-        // or the importer (`import.rs:fork_choice.add_block`) before
-        // this chunk could reach `Finalized`. The persisted store
-        // pointers above have already committed — surfacing a
-        // post-persistence error here would leave on-disk state
-        // inconsistent with the in-memory DAG. Matches the
-        // existing pattern at `import.rs:870` for
-        // `fork_choice.on_block_proof`.
-        let _ = self.fork_choice.add_finalized_chunk(&chunk, &finality_cert);
-
-        Ok(FinalizeOutcome {
-            chunk,
-            chunk_hash,
-            chunk_proof: wire_chunk_proof,
-            public_inputs,
-            finality_cert,
-        })
+        let mut prepared = self.prepare_consensus_chunk(chunk_id, proof_system)?;
+        self.certify_consensus_chunk(&mut prepared, voter)?;
+        let proof = proof_system.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
+        self.commit_consensus_chunk(&prepared.witness, &proof, proof_system)
     }
 
-    fn validate_chunk_id_sequence(
+    pub(crate) fn validate_chunk_id_sequence(
         &self,
         chunk_id: ChunkId,
     ) -> Result<(), FinalizeError<DB::Error>> {
@@ -299,167 +218,6 @@ impl<DB: Database> Engine<DB> {
         Ok(())
     }
 
-    fn collect_chunk_inputs<PS: ProofSystem>(
-        &self,
-        start_height: Height,
-        end_height: Height,
-        proof_system: &PS,
-    ) -> Result<ChunkInputs<PS>, FinalizeError<DB::Error>> {
-        let capacity = usize::try_from(end_height - start_height + 1)
-            .map_err(|_| FinalizeError::HeightRangeOverflow)?;
-        let mut inputs = ChunkInputs::<PS> {
-            headers: Vec::with_capacity(capacity),
-            block_hashes: Vec::with_capacity(capacity),
-            block_proofs: Vec::with_capacity(capacity),
-            block_proof_leaves: Vec::with_capacity(capacity),
-            vrf_leaves: Vec::with_capacity(capacity),
-            da_leaves: Vec::with_capacity(capacity),
-        };
-        let mut expected_parent = None;
-
-        for height in start_height..=end_height {
-            let header = self
-                .store()
-                .get_header_by_height(height)?
-                .ok_or(FinalizeError::MissingBlock { height })?;
-            let hash = header.hash();
-            if let Some(expected) = expected_parent {
-                if header.parent_hash != expected {
-                    return Err(FinalizeError::ParentHashMismatch {
-                        height,
-                        expected,
-                        actual: header.parent_hash,
-                    });
-                }
-            }
-            let state =
-                self.store()
-                    .get_block_state(&hash)?
-                    .ok_or(FinalizeError::BlockNotProven {
-                        hash,
-                        state: BlockState::BlockProduced,
-                    })?;
-            if state != BlockState::Proven {
-                return Err(FinalizeError::BlockNotProven { hash, state });
-            }
-
-            let wire_proof = self
-                .store()
-                .get_block_proof(&hash)?
-                .ok_or(FinalizeError::MissingBlockProof { hash })?;
-            let backend_proof: PS::BlockProof =
-                borsh::from_slice(&wire_proof.proof_bytes).map_err(FinalizeError::Codec)?;
-            let state_root_before = self.chunk_parent_state_root(&header)?;
-            let expected_public_inputs =
-                self.block_public_inputs_for_chunk(&header, state_root_before, &hash);
-            if wire_proof.height != header.height
-                || wire_proof.block_hash != hash
-                || wire_proof.public_inputs != expected_public_inputs
-            {
-                return Err(FinalizeError::BlockProofPublicInputsMismatch { hash });
-            }
-            proof_system.verify_block(&backend_proof, &wire_proof.public_inputs)?;
-
-            inputs
-                .block_proof_leaves
-                .push(hash_leaf(&wire_proof_leaf_bytes(&wire_proof)));
-            inputs.vrf_leaves.push(hash_leaf(&header.vrf_proof));
-            inputs.da_leaves.push(hash_leaf(&header.da_root));
-            inputs.block_hashes.push(hash);
-            inputs.headers.push(header);
-            inputs.block_proofs.push(backend_proof);
-            expected_parent = Some(hash);
-        }
-
-        Ok(inputs)
-    }
-
-    fn assemble_chunk_and_proof<PS: ProofSystem>(
-        &self,
-        chunk_id: ChunkId,
-        start_height: Height,
-        end_height: Height,
-        inputs: &ChunkInputs<PS>,
-        proof_system: &PS,
-    ) -> Result<(Chunk, WireChunkProof, ChunkProofPublicInputs), FinalizeError<DB::Error>> {
-        let first_header = inputs
-            .headers
-            .first()
-            .expect("non-empty height range guarantees at least one header");
-        let last_header = inputs.headers.last().expect("non-empty headers vec");
-        let start_state_root = self.chunk_parent_state_root(first_header)?;
-        let start_block_hash = *inputs.block_hashes.first().expect("non-empty hashes");
-        let end_block_hash = *inputs.block_hashes.last().expect("non-empty hashes");
-
-        let previous_checkpoint_index = self.latest_checkpoint_index();
-        let previous = self
-            .store()
-            .get_checkpoint(previous_checkpoint_index)?
-            .ok_or_else(|| FinalizeError::Engine(EngineError::NotInitialised))?;
-        let active_validator_set_root = previous.end_validator_set_root;
-        let next_validator_set_root = if last_header.runtime_extra == ZERO_HASH {
-            active_validator_set_root
-        } else {
-            last_header.runtime_extra
-        };
-
-        let public_inputs = ChunkProofPublicInputs {
-            chunk_id,
-            start_height,
-            end_height,
-            start_state_root,
-            end_state_root: last_header.state_root,
-            start_block_hash,
-            end_block_hash,
-            block_hash_root: merkle_root_of_hashes(&inputs.block_hashes),
-            block_proof_root: merkle_root_of_hashes(&inputs.block_proof_leaves),
-            vrf_proof_root: merkle_root_of_hashes(&inputs.vrf_leaves),
-            active_validator_set_root,
-            next_validator_set_root,
-            da_root: merkle_root_of_hashes(&inputs.da_leaves),
-        };
-
-        // The SP1 rewrite explicitly defers chunk-proof aggregation
-        // (see docs/design/13-sp1-runtime-proof-rewrite.md). Backends
-        // that have not implemented `prove_chunk` return
-        // `ProofError::Unsupported`; we tolerate that and persist an
-        // empty `proof_bytes` so the rest of the finalization flow
-        // (Finalized FSM transition, FinalityCert) still works.
-        let chunk_proof_bytes = match proof_system.prove_chunk(&inputs.block_proofs, &public_inputs)
-        {
-            Ok(backend_chunk_proof) => {
-                proof_system.verify_chunk(&backend_chunk_proof, &public_inputs)?;
-                borsh::to_vec(&backend_chunk_proof)?
-            }
-            Err(ProofError::Unsupported) => Vec::new(),
-            Err(other) => return Err(other.into()),
-        };
-
-        let chunk = Chunk {
-            chunk_id,
-            start_height,
-            end_height,
-            start_state_root,
-            end_state_root: last_header.state_root,
-            start_block_hash,
-            end_block_hash,
-            block_hash_root: public_inputs.block_hash_root,
-            block_proof_root: public_inputs.block_proof_root,
-            vrf_proof_root: public_inputs.vrf_proof_root,
-            active_validator_set_root,
-            next_validator_set_root,
-            da_root: public_inputs.da_root,
-        };
-        let chunk_hash = chunk.hash();
-        let wire_chunk_proof = WireChunkProof {
-            chunk_id,
-            chunk_hash,
-            public_inputs: public_inputs.clone(),
-            proof_bytes: chunk_proof_bytes,
-        };
-        Ok((chunk, wire_chunk_proof, public_inputs))
-    }
-
     /// Returns the state root that preceded `header.state_root`.
     fn chunk_parent_state_root(
         &self,
@@ -476,59 +234,18 @@ impl<DB: Database> Engine<DB> {
         Ok(parent.state_root)
     }
 
-    fn block_public_inputs_for_chunk(
-        &self,
-        header: &Header,
-        state_root_before: StateRoot,
-        block_hash: &BlockHash,
-    ) -> BlockProofPublicInputs {
-        BlockProofPublicInputs {
-            chain_id: self.chain_spec().chain_id,
-            height: header.height,
-            parent_block_hash: header.parent_hash,
-            block_hash: *block_hash,
-            state_root_before,
-            state_root_after: header.state_root,
-            transactions_root: header.transactions_root,
-            receipt_root: header.receipts_root,
-            da_root: header.da_root,
-            vm_code_hash: self.chain_spec().runtime_code_hash,
-            abi_version: self.chain_spec().runtime_version.abi_version,
-            gas_used: header.gas_used,
-            gas_limit: header.gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
-            proposer_address: self.proposer_runtime_address_for_finalize(header.proposer_index),
-            runtime_extra: header.runtime_extra,
-        }
-    }
-
-    /// Resolve the runtime account address for the proposer at
-    /// `proposer_index` in the current active validator set. Used
-    /// by the finalize path when re-deriving block-proof public
-    /// inputs for each block in the chunk.
-    fn proposer_runtime_address_for_finalize(
-        &self,
-        proposer_index: neutrino_primitives::ValidatorIndex,
-    ) -> neutrino_primitives::Hash {
-        usize::try_from(proposer_index)
-            .ok()
-            .and_then(|i| self.active_validator_set().get(i))
-            .map_or(neutrino_primitives::ZERO_HASH, |v| v.withdrawal_credentials)
-    }
-
     /// Drive the chunk-BFT module through one round, either by
-    /// consuming a live multi-validator session opened by the M7 BFT
-    /// loop, or by synthesizing a single-validator vote when no
-    /// session exists (M5 single-node path).
-    fn run_chunk_bft(
-        &mut self,
+    /// consuming a live BFT session or obtaining a local certificate when
+    /// the local signer alone meets the configured quorum.
+    pub(crate) fn run_chunk_bft(
+        &self,
         chunk: &Chunk,
         chunk_hash: ChunkHash,
         voter: &ProposerKey,
         active_validator_set_root: Hash,
     ) -> Result<FinalityCert, FinalizeError<DB::Error>> {
-        if let Some(session) = self.bft_sessions.remove(&chunk.chunk_id) {
-            return finalize_from_session(&session, chunk_hash, active_validator_set_root);
+        if let Some(session) = self.bft_sessions.get(&chunk.chunk_id) {
+            return finalize_from_session(session, chunk_hash, active_validator_set_root);
         }
 
         let active_set = self.active_validator_set().to_vec();
@@ -561,7 +278,7 @@ impl<DB: Database> Engine<DB> {
             voter,
             active_set.len(),
         );
-        let precommit = build_single_validator_vote(
+        let mut precommit = build_single_validator_vote(
             chunk.chunk_id,
             chunk_hash,
             0,
@@ -571,6 +288,24 @@ impl<DB: Database> Engine<DB> {
             active_set.len(),
         );
 
+        let mut proof_hashes = Vec::new();
+        for height in chunk.start_height..=chunk.end_height {
+            let hash = self
+                .store()
+                .get_block_hash_by_height(height)?
+                .ok_or(FinalizeError::FinalizationStalled)?;
+            let proof = self
+                .store()
+                .get_block_proof(&hash)?
+                .ok_or(FinalizeError::FinalizationStalled)?;
+            proof_hashes.push(neutrino_prover_chunk::execution::commitment(&proof));
+        }
+        precommit.attestations.push(voter.attest_precommit(
+            self.chain_spec().chain_id,
+            precommit.data.clone(),
+            proof_hashes,
+            None,
+        ));
         bft.add_prevote(prevote)?;
         bft.add_precommit(precommit)?;
 
@@ -632,13 +367,7 @@ impl<DB: Database> Engine<DB> {
             let Some(state) = self.store().get_block_state(&hash)? else {
                 return Ok(None);
             };
-            if !matches!(
-                state,
-                BlockState::Proven
-                    | BlockState::ChunkProven
-                    | BlockState::Finalized
-                    | BlockState::Checkpointed
-            ) {
+            if !matches!(state, BlockState::Proven | BlockState::Finalized) {
                 return Ok(None);
             }
             let Some(wire_proof) = self.store().get_block_proof(&hash)? else {
@@ -708,18 +437,6 @@ fn finalize_from_session<E>(
     Ok(cert)
 }
 
-/// Intermediate data collected while finalizing a chunk, ferried
-/// between [`Engine::collect_chunk_inputs`] and
-/// [`Engine::assemble_chunk_and_proof`].
-struct ChunkInputs<PS: ProofSystem> {
-    headers: Vec<Header>,
-    block_hashes: Vec<BlockHash>,
-    block_proofs: Vec<PS::BlockProof>,
-    block_proof_leaves: Vec<Hash>,
-    vrf_leaves: Vec<Hash>,
-    da_leaves: Vec<Hash>,
-}
-
 /// Compute `(start_height, end_height)` covered by `chunk_id`. Height
 /// numbering starts at 1 (height 0 is genesis), so chunk 0 covers
 /// heights `[1, chunk_size]`.
@@ -771,6 +488,7 @@ fn build_single_validator_vote(
     }
 
     FinalityVote {
+        attestations: Vec::new(),
         aggregation_bits: bits,
         data,
         signature,

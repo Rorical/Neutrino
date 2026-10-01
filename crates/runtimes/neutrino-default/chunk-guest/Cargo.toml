@@ -8,11 +8,16 @@ name        = "neutrino-default-chunk-guest"
 version     = "0.1.0"
 edition     = "2024"
 publish     = false
-description = "SP1 chunk-aggregator Guest binary for the Neutrino default runtime."
+autobins    = false
+description = "SP1 consensus chunk and evidence Guest programs."
 
 [[bin]]
-name = "neutrino-default-chunk-guest"
-path = "src/main.rs"
+name = "neutrino-default-consensus-chunk-guest"
+path = "src/consensus.rs"
+
+[[bin]]
+name = "neutrino-default-evidence-guest"
+path = "src/evidence.rs"
 
 [dependencies]
 # `verify` enables `sp1_zkvm::lib::verify::verify_sp1_proof` (the
@@ -20,14 +25,19 @@ path = "src/main.rs"
 # verify inner SP1 proofs, which is the whole point of the aggregator.
 sp1-zkvm                       = { version = "=6.2.1", features = ["verify"] }
 borsh                          = { version = "1.5", default-features = false, features = ["derive"] }
-neutrino-default-runtime-core  = { path = "../core", default-features = false }
-neutrino-consensus-types       = { path = "../../../consensus-types", default-features = false }
-neutrino-primitives            = { path = "../../../primitives", default-features = false }
 sha2                           = { version = "0.10", default-features = false }
+neutrino-prover-chunk           = { path = "../../../prover-chunk", default-features = false, features = ["sp1-verification"] }
 
 [profile.release]
 opt-level     = 3
-lto           = true
+# SP1 6.2.1's LLVM emits duplicate jump-table labels with fat LTO when
+# linking the portable pairing verifier. Thin LTO keeps modules separate.
+lto           = "thin"
 codegen-units = 1
 debug         = false
 panic         = "abort"
+
+# SP1 6.2 BLS field/pairing acceleration. Keep the native verifier on the
+# crates.io implementation as an independent parity reference.
+[patch.crates-io]
+bls12_381 = { git = "https://github.com/sp1-patches/bls12_381", rev = "9e4e2ae4780d3d69cecbec000f5e814df2392468" }

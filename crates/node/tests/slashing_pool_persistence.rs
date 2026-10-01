@@ -1,4 +1,4 @@
-//! Pending-fix #5 (doc 17) acceptance test: locally-detected
+//! locally-detected
 //! slashing evidence survives a node restart.
 //!
 //! Before this fix the slashing pool lived purely in
@@ -28,9 +28,9 @@ use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_consensus_types::{Block, Body, Header, SlashingEvidence};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
-    StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
@@ -76,7 +76,6 @@ fn spec(count: u8) -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -86,12 +85,11 @@ fn spec(count: u8) -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"slashing-pool-persistence".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: ZERO_HASH,
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -116,11 +114,10 @@ fn signed_block(
     signer: &ProposerKey,
 ) -> Block {
     let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
+    let roots = compute_body_roots(&body);
     let vrf_proof = signer.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
-        version: HEADER_VERSION,
         height,
         slot,
         parent_hash: parent,
@@ -129,8 +126,6 @@ fn signed_block(
         state_root: [state_root_byte; 32],
         transactions_root: roots.transactions_root,
         votes_root: roots.votes_root,
-        slashings_root: roots.slashings_root,
-        validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,

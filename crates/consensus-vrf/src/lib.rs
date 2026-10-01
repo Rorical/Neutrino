@@ -390,7 +390,6 @@ mod tests {
 
     fn header(proposer_index: ValidatorIndex, proof: BlsSignature) -> Header {
         Header {
-            version: 1,
             height: 1,
             slot: SLOT,
             parent_hash: [0x01; 32],
@@ -399,8 +398,6 @@ mod tests {
             state_root: [0x02; 32],
             transactions_root: [0x03; 32],
             votes_root: [0x04; 32],
-            slashings_root: [0x05; 32],
-            validator_ops_root: [0x06; 32],
             da_root: [0x07; 32],
             runtime_extra: [0x08; 32],
             receipts_root: [0x0A; 32],

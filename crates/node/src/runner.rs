@@ -178,9 +178,6 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     // post-state-roots against a different runtime than the network
     // agreed on, producing a divergent chain at proof time.
     //
-    // The all-zero placeholder is allowed so existing test fixtures
-    // (and pre-v1 bring-up deployments) keep working until they pin
-    // a real value.
     if let Err((spec, actual)) = expect_runtime_code_hash(chain_spec.runtime_code_hash) {
         return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
             "chain spec runtime_code_hash {} does not match embedded runtime {}; \
@@ -189,26 +186,17 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
             hex_short(&actual),
         ))));
     }
-    // Same idea for the runtime's unbonding delay: the runtime
-    // hard-codes `UNBONDING_DELAY_BLOCKS = 32` because plumbing it
-    // through `StfInput` is a larger surface change. The chain spec
-    // is allowed to *declare* a different value, but bumping it
-    // requires a matching runtime release; we refuse to start when
-    // the two disagree so the runtime cannot silently apply a
-    // different delay than the chain spec promised users.
-    if chain_spec.runtime.unbonding_delay_blocks
-        != neutrino_default_runtime_core::UNBONDING_DELAY_BLOCKS
+    if chain_spec
+        .runtime
+        .evidence_max_age_blocks
+        .checked_add(chain_spec.consensus.chunk_size)
+        .is_none_or(|window| window >= chain_spec.runtime.unbonding_delay_blocks)
     {
-        return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
-            "chain spec runtime.unbonding_delay_blocks = {spec} disagrees with the \
-             embedded runtime's UNBONDING_DELAY_BLOCKS = {runtime}; rebuild the \
-             runtime to match before bumping the chain spec",
-            spec = chain_spec.runtime.unbonding_delay_blocks,
-            runtime = neutrino_default_runtime_core::UNBONDING_DELAY_BLOCKS,
-        ))));
+        return Err(NodeError::ChainSpec(ChainSpecError::Validation(
+            "unbonding delay must exceed evidence window plus one chunk".into(),
+        )));
     }
     let production_config = build_block_producer_config(&config, &chain_spec)?;
-    let chain_spec_slot_duration = chain_spec.consensus.slot_duration_secs;
     let db = open_node_db(&config)?;
     let engine = open_or_initialise_engine(db, chain_spec)?;
     // SP1 CPU prover for production. Setup is paid once (then cached
@@ -268,18 +256,6 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
             production_config,
         ))
     });
-    let injector_handle = config.inject_test_transactions_per_slot.and_then(|count| {
-        if count == 0 {
-            return None;
-        }
-        let slot_duration = chain_spec_slot_duration;
-        Some(tokio::spawn(crate::tx_injector::run_tx_injector(
-            cmd_tx.clone(),
-            slot_duration,
-            count,
-        )))
-    });
-
     // Optional JSON-RPC server. Started after the engine is open so
     // the very first request observes a consistent head.
     let rpc_handle = if let Some(rpc_cfg) = config.rpc.as_ref() {
@@ -309,9 +285,6 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(handle) = producer_handle.as_ref() {
         handle.abort();
     }
-    if let Some(handle) = injector_handle.as_ref() {
-        handle.abort();
-    }
     if let Some(handle) = rpc_handle.as_ref() {
         let _ = handle.stop();
     }
@@ -322,9 +295,6 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         let _ = network_handle.await;
         let _ = driver_handle.await;
         if let Some(handle) = producer_handle {
-            let _ = handle.await;
-        }
-        if let Some(handle) = injector_handle {
             let _ = handle.await;
         }
         if let Some(handle) = rpc_handle {

@@ -23,14 +23,6 @@ pub enum EngineError<E> {
     /// The database is missing the genesis metadata that
     /// [`Engine::genesis`](crate::Engine::genesis) writes on bootstrap.
     NotInitialised,
-    /// The on-disk database schema version is not supported by this
-    /// build.
-    UnsupportedSchemaVersion {
-        /// Version currently stored in the database.
-        stored: u32,
-        /// Version expected by this binary.
-        expected: u32,
-    },
     /// The database has already been initialised with a genesis. Drop
     /// the database or call
     /// [`Engine::open`](crate::Engine::open) instead.
@@ -48,10 +40,6 @@ impl<E: fmt::Display> fmt::Display for EngineError<E> {
                 "chain spec hash mismatch: stored {stored:?}, provided {provided:?}",
             ),
             Self::NotInitialised => f.write_str("database has no genesis metadata"),
-            Self::UnsupportedSchemaVersion { stored, expected } => write!(
-                f,
-                "unsupported database schema version: stored {stored}, expected {expected}",
-            ),
             Self::AlreadyInitialised => f.write_str("database is already initialised"),
             Self::Store(err) => write!(f, "store error: {err}"),
         }

@@ -10,15 +10,16 @@ homepage      = { workspace = true }
 documentation = { workspace = true }
 publish       = { workspace = true }
 
-# VRF depends on `neutrino-crypto` for BLS sign/verify, which is std-only
-# for now. The crate therefore inherits std-only status. When crypto is
-# split into `crypto-core` + `crypto-full` for the M13 light-client work,
-# the pure-arithmetic surface of this crate (`vrf_message`, `is_eligible`,
-# `fold_seed`) will move behind a no_std `core` feature.
+# Portable message, eligibility and seed logic is available without std.
+# Native BLS signing/verification is provided by the std feature.
+
+[features]
+default = ["std"]
+std = ["dep:neutrino-crypto"]
 
 [dependencies]
 neutrino-primitives = { workspace = true }
-neutrino-crypto     = { workspace = true }
+neutrino-crypto     = { workspace = true, optional = true }
 sha2                = { workspace = true }
 
 [dev-dependencies]

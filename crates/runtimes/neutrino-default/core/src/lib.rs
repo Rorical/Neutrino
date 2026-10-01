@@ -4,14 +4,8 @@
 
 //! Default-runtime STF logic.
 //!
-//! M4-A introduced the account model: every Ed25519 public key is an
-//! address, every address owns an `Account { nonce, balance }`. M4-C
-//! adds validators (`Validator { stake, active }` keyed by address,
-//! plus a canonical `ValidatorSet` record) and the
-//! `Stake` / `Unstake` lifecycle. M4-D adds consensus-driven
-//! `Slash` / `InactivityLeak` transactions that deduct stake without
-//! a signature. Deposits, voluntary exits, and unbonding delays are
-//! still pending.
+//! Ed25519 accounts, transfer/staking/validator lifecycle, gas and receipts,
+//! plus proof-authorized evidence admission and mandatory sanctions.
 //!
 //! The same `apply_block` runs in three places:
 //!
@@ -21,6 +15,11 @@
 //! - natively (against `host::TracingState`) during dry-run.
 
 extern crate alloc;
+
+pub mod accountability;
+pub mod commitments;
+
+pub use neutrino_consensus_types::evidence::EvidenceAnchor;
 
 use alloc::vec::Vec;
 
@@ -38,17 +37,14 @@ use neutrino_runtime_core::StateBackend;
 ///
 /// The values in this module are placeholder constants tuned to feel
 /// like EVM-style "one transfer ~ 21k gas". A real chain would surface
-/// them through the chain spec; doing so is a non-consensus refactor
-/// because the cost is deterministic per kind regardless of source.
+/// them through the chain spec with a corresponding protocol revision.
 pub const GAS_TRANSFER: u64 = 21_000;
 /// Fixed per-transaction gas cost for a [`Transaction::Stake`].
 pub const GAS_STAKE: u64 = 50_000;
 /// Fixed per-transaction gas cost for a [`Transaction::Unstake`].
 pub const GAS_UNSTAKE: u64 = 50_000;
-/// Fixed per-transaction gas cost for a [`Transaction::Slash`].
-pub const GAS_SLASH: u64 = 5_000;
-/// Fixed per-transaction gas cost for a [`Transaction::InactivityLeak`].
-pub const GAS_INACTIVITY_LEAK: u64 = 5_000;
+/// Fixed gas cost for an autonomous proven-sanction execution.
+pub const GAS_SANCTION: u64 = 5_000;
 /// Fixed per-transaction gas cost for a [`Transaction::Deposit`].
 pub const GAS_DEPOSIT: u64 = 30_000;
 /// Fixed per-transaction gas cost for a [`Transaction::VoluntaryExit`].
@@ -74,12 +70,11 @@ pub const fn tx_gas(tx: &Transaction) -> u64 {
         Transaction::Transfer(_) => GAS_TRANSFER,
         Transaction::Stake(_) => GAS_STAKE,
         Transaction::Unstake(_) => GAS_UNSTAKE,
-        Transaction::Slash(_) => GAS_SLASH,
-        Transaction::InactivityLeak(_) => GAS_INACTIVITY_LEAK,
         Transaction::Deposit(_) => GAS_DEPOSIT,
         Transaction::VoluntaryExit(_) => GAS_VOLUNTARY_EXIT,
         Transaction::Withdraw(_) => GAS_WITHDRAW,
         Transaction::RegisterValidator(_) => GAS_REGISTER_VALIDATOR,
+        Transaction::SubmitEvidence(_) => accountability::GAS_EVIDENCE_ADMISSION,
     }
 }
 
@@ -95,12 +90,11 @@ pub const fn tx_kind_code(tx: &Transaction) -> u8 {
         Transaction::Transfer(_) => 0,
         Transaction::Stake(_) => 1,
         Transaction::Unstake(_) => 2,
-        Transaction::Slash(_) => 3,
-        Transaction::InactivityLeak(_) => 4,
-        Transaction::Deposit(_) => 5,
-        Transaction::VoluntaryExit(_) => 6,
-        Transaction::Withdraw(_) => 7,
-        Transaction::RegisterValidator(_) => 8,
+        Transaction::Deposit(_) => 3,
+        Transaction::VoluntaryExit(_) => 4,
+        Transaction::Withdraw(_) => 5,
+        Transaction::RegisterValidator(_) => 6,
+        Transaction::SubmitEvidence(_) => 7,
     }
 }
 
@@ -164,8 +158,8 @@ pub const VALIDATOR_SET_KEY: &[u8] = b"validator_set";
 ///
 /// Each row carries a registered validator's BLS pubkey and
 /// proof-of-possession signature. Populated by
-/// [`Transaction::RegisterValidator`]; consumed by the host-side
-/// rotation bridge in `chain_backend.rs` to mint new consensus-side
+/// [`Transaction::RegisterValidator`]; authenticated by the complete chunk
+/// validator transition to derive consensus-side
 /// [`neutrino_primitives::Validator`] entries.
 pub const VALIDATOR_REGISTRATIONS_KEY: &[u8] = b"validator_registrations";
 
@@ -185,13 +179,6 @@ pub const VALIDATOR_OP_SIG_MSG_LEN: usize = 16 + 8 + 32 + 8;
 /// transaction: `16B domain || 8B chain_id || 32B depositor ||
 /// 32B validator || 48B bls_pubkey || 16B deposit_amount || 8B nonce`.
 pub const REGISTER_VALIDATOR_SIG_MSG_LEN: usize = 16 + 8 + 32 + 32 + 48 + 16 + 8;
-
-/// Number of blocks an unstaked / exited amount waits in the queue.
-///
-/// Placeholder value; production chains pick a much longer delay
-/// (Ethereum's exit queue is roughly a day). Surface this through
-/// the chain spec once a real fee market and reward schedule land.
-pub const UNBONDING_DELAY_BLOCKS: u64 = 32;
 
 /// Ed25519 public-key bytes also used as the account address.
 pub type Address = [u8; 32];
@@ -374,18 +361,9 @@ pub enum Transaction {
     /// Schedule `amount` of the signer's stake for withdrawal. The
     /// matching funds move out of the validator's slashable stake
     /// immediately, into the per-validator [`WithdrawalQueue`] with
-    /// `mature_at_height = current_height + UNBONDING_DELAY_BLOCKS`.
+    /// `mature_at_height = current_height + input.unbonding_delay_blocks`.
     /// Spendable balance is credited later by a [`WithdrawTx`].
     Unstake(UnstakeTx),
-    /// Consensus-driven: deduct `amount` from `validator`'s stake to
-    /// punish provable misbehaviour. The block proposer is responsible
-    /// for ensuring the evidence is valid; the STF trusts the
-    /// inclusion gate.
-    Slash(SlashTx),
-    /// Consensus-driven: deduct `amount` from `validator`'s stake as
-    /// the inactivity-leak penalty for missing a precommit quorum.
-    /// Same trust model as [`SlashTx`].
-    InactivityLeak(LeakTx),
     /// Credit `amount` from the depositor's spendable balance into
     /// `validator`'s stake. The depositor signs; the validator does
     /// not need to be the depositor (third-party-funded validators).
@@ -410,13 +388,14 @@ pub enum Transaction {
     /// [`VALIDATOR_REGISTRATIONS_KEY`], and upserts the validator's
     /// stake into the canonical [`ValidatorSet`].
     ///
-    /// The runtime does *not* verify the proof-of-possession (it
-    /// has no BLS code path); the host-side rotation bridge
-    /// verifies it before minting the corresponding consensus-side
+    /// The STF stores the proof-of-possession; complete chunk validation
+    /// verifies it before admitting the corresponding consensus-side
     /// [`neutrino_primitives::Validator`]. Registrations with an
     /// invalid POP burn gas but never enter the consensus active
     /// set.
     RegisterValidator(RegisterValidatorTx),
+    /// Proof-authenticated evidence admission; processed before user transactions.
+    SubmitEvidence(neutrino_consensus_types::evidence::EvidenceSubmission),
 }
 
 /// Ed25519-signed transfer of `amount` between two accounts.
@@ -463,25 +442,6 @@ pub struct UnstakeTx {
     pub nonce: u64,
     /// Ed25519 signature over `unstake_sig_message`.
     pub signature: [u8; 64],
-}
-
-/// Consensus-driven slash. Carries no signature; the STF assumes the
-/// inclusion gate has validated the underlying evidence.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
-pub struct SlashTx {
-    /// Validator being slashed.
-    pub validator: Address,
-    /// Amount of stake to burn.
-    pub amount: u128,
-}
-
-/// Consensus-driven inactivity leak.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
-pub struct LeakTx {
-    /// Validator being penalised.
-    pub validator: Address,
-    /// Amount of stake to deduct.
-    pub amount: u128,
 }
 
 /// Ed25519-signed deposit.
@@ -542,7 +502,7 @@ pub struct WithdrawTx {
 /// Creates a brand-new validator identified by `validator`, funded
 /// by `deposit_amount` debited from `depositor`. The 48-byte BLS
 /// pubkey and 96-byte proof-of-possession are recorded under
-/// [`VALIDATOR_REGISTRATIONS_KEY`] so the host-side rotation bridge
+/// [`VALIDATOR_REGISTRATIONS_KEY`] so the complete chunk validator transition
 /// can lift them into the consensus active validator set after
 /// verifying the POP. The runtime itself does not link `bls_pubkey`
 /// for verification — it stores it as opaque bytes.
@@ -557,16 +517,16 @@ pub struct RegisterValidatorTx {
     pub depositor: Address,
     /// Address of the validator being registered. Becomes the
     /// `withdrawal_credentials` of the consensus-side
-    /// [`neutrino_primitives::Validator`] entry the rotation bridge
+    /// [`neutrino_primitives::Validator`] entry the chunk validator transition
     /// will mint after verifying the POP.
     pub validator: Address,
     /// BLS12-381 G1 compressed public key (min-pk POP scheme). The
-    /// rotation bridge stores this on the consensus side; chunk
+    /// chunk validator transition stores this on the consensus side; chunk
     /// finality votes are signed with the matching BLS private key.
     pub bls_pubkey: neutrino_primitives::BlsPublicKey,
     /// BLS proof-of-possession over `bls_pubkey` under the
     /// `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` DST. The
-    /// host-side rotation bridge verifies this; the runtime stores
+    /// complete chunk validator transition verifies this; the runtime stores
     /// it as opaque bytes.
     pub pop_signature: neutrino_primitives::BlsSignature,
     /// Initial stake credited to the validator from the depositor's
@@ -602,7 +562,7 @@ pub struct Withdrawal {
 pub struct WithdrawalQueue {
     /// Pending entries in FIFO insertion order. Maturity is monotonic
     /// because every entry created in block `H` matures at
-    /// `H + UNBONDING_DELAY_BLOCKS`, which is strictly greater than
+    /// `H + input.unbonding_delay_blocks`, which is strictly greater than
     /// any earlier entry's maturity.
     pub entries: Vec<Withdrawal>,
 }
@@ -622,17 +582,17 @@ impl WithdrawalQueue {
 
 /// One row of [`ValidatorRegistrations`]. Recorded by
 /// [`Transaction::RegisterValidator`] and consumed by the host-side
-/// rotation bridge.
+/// chunk validator transition.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatorRegistration {
     /// Runtime address of the registered validator. Doubles as the
     /// `withdrawal_credentials` of the consensus-side
-    /// [`neutrino_primitives::Validator`] entry the bridge mints.
+    /// [`neutrino_primitives::Validator`] entry derived by the chunk.
     pub address: Address,
     /// BLS12-381 G1 compressed public key (min-pk POP scheme).
     pub bls_pubkey: neutrino_primitives::BlsPublicKey,
     /// BLS proof-of-possession over `bls_pubkey`. The runtime stores
-    /// this as opaque bytes; the host-side rotation bridge verifies
+    /// this as opaque bytes; the complete chunk validator transition verifies
     /// it under the `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
     /// DST before lifting the registration into the consensus
     /// active validator set.
@@ -954,12 +914,14 @@ fn verify_register_validator_signature(tx: &RegisterValidatorTx, chain_id: u64) 
 /// Input handed to `apply_block` by the host (dry-run) or the SP1 Guest.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct StfInput {
+    /// Incoming historical and program context authenticated by the chunk.
+    pub evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor,
     /// Chain identifier the transactions are bound to. Required for
     /// cross-chain replay protection of the Ed25519 signature.
     pub chain_id: u64,
     /// Height of the block being executed. The STF consults this when
     /// scheduling withdrawal maturity
-    /// (`mature_at_height = block_height + UNBONDING_DELAY_BLOCKS`)
+    /// (`mature_at_height = block_height + unbonding_delay_blocks`)
     /// and when claiming matured entries from the withdrawal queue
     /// (`block_height >= entry.mature_at_height`). The host plumbs
     /// this from `header.height`.
@@ -1015,8 +977,10 @@ pub struct StfInput {
 ///    `post_state_root`, `applied`, `failed`, `validator_set_root`,
 ///    `gas_used`, `receipts_root`. These were already bound; the
 ///    inputs above were not until the Q2 closure.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct StfPublicOutput {
+    /// Block-proven evidence authorization, admissions and mandatory deductions.
+    pub accountability: accountability::AccountabilityOutput,
     /// Chain identifier the STF executed under.  The consensus engine
     /// wires this into `BlockProofPublicInputs.chain_id` so a proof
     /// from chain A cannot be replayed as a proof on chain B (the
@@ -1027,7 +991,7 @@ pub struct StfPublicOutput {
     /// `BlockProofPublicInputs.height` so a malicious prover cannot
     /// supply a forged `block_height` to the STF (e.g. to mature
     /// withdrawals early — the STF uses `block_height` for the
-    /// `UNBONDING_DELAY_BLOCKS` clock).
+    /// `DEFAULT_UNBONDING_DELAY_BLOCKS` clock).
     pub block_height: u64,
     /// Block-level gas ceiling the STF executed under.  Bound to
     /// `BlockProofPublicInputs.gas_limit` so a malicious prover
@@ -1053,6 +1017,8 @@ pub struct StfPublicOutput {
     /// gossiped in the body — the highest-severity attack the Q2
     /// audit identified (forged `post_state_root` via fake mint).
     pub transactions_root: StateRoot,
+    /// Block-proven transaction count authenticating the omitted DA lane.
+    pub transaction_summary: commitments::TransactionSummary,
     /// State root before this block.
     pub pre_state_root: StateRoot,
     /// State root after this block.
@@ -1081,98 +1047,8 @@ pub struct StfPublicOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Chunk aggregator wire types
+// Block execution
 // ---------------------------------------------------------------------------
-
-/// Per-block metadata the chunk-aggregator guest consumes for
-/// continuity checking and inner-proof verification.
-///
-/// The aggregator's verify-inner-proof loop computes
-/// `pv_digest = SHA-256(borsh(stf_output))` per block and passes it
-/// to `verify_sp1_proof(block_guest_vk_digest, pv_digest)`.  If the
-/// supplied `stf_output` doesn't match the inner proof's actual
-/// committed public values, the SP1 recursion AIR rejects the
-/// proof and the chunk-aggregator's own proof fails to verify —
-/// so a malicious prover that lies about per-block continuity
-/// cannot produce a valid chunk proof.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
-pub struct ChunkAggregatorBlockMeta {
-    /// Canonical header hash of this block.  Used for the
-    /// `block_hash_root` Merkle commitment and for parent-hash
-    /// chain-linking with the previous block in the chunk.
-    pub block_hash: neutrino_primitives::BlockHash,
-    /// Parent header hash.  Cross-checked against
-    /// `block_metas[i-1].block_hash` so the header chain is
-    /// continuous across the chunk's block range.
-    pub parent_block_hash: neutrino_primitives::BlockHash,
-    /// Public output committed by the inner SP1 block proof.  Used
-    /// for:
-    ///
-    /// - State-root chaining
-    ///   (`prev.post_state_root == curr.pre_state_root`).
-    /// - Height monotonicity
-    ///   (`prev.block_height + 1 == curr.block_height`).
-    /// - Chain-id consistency.
-    /// - Validator-set continuity inside the chunk
-    ///   (Phase 3 will relax this to allow mid-chunk rotation).
-    /// - `pv_digest` computation for `verify_sp1_proof`.
-    pub stf_output: StfPublicOutput,
-}
-
-/// Input to the SP1 chunk-aggregator guest.
-///
-/// The host's `Sp1ProofSystem::prove_chunk_with_extras` borsh-encodes
-/// this struct and writes it to the guest's stdin as a single
-/// `read_vec()` payload.  The host additionally registers `N` inner
-/// SP1 block proofs via `SP1Stdin::write_proof` in canonical block
-/// order; the guest consumes them in the same order via
-/// `verify_sp1_proof` calls.
-///
-/// Output: the guest commits a borsh-encoded
-/// [`neutrino_consensus_types::ChunkProofPublicInputs`] as the
-/// chunk proof's public values.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
-pub struct ChunkAggregatorInput {
-    /// Chunk identifier the aggregator commits in its public
-    /// output.  Cross-checked against the engine's expected value.
-    pub chunk_id: neutrino_primitives::ChunkId,
-    /// First block height covered by this chunk (inclusive).
-    pub start_height: neutrino_primitives::Height,
-    /// Last block height covered (inclusive).
-    pub end_height: neutrino_primitives::Height,
-    /// State root before the first block in the chunk executes.
-    /// Cross-checked against `block_metas[0].stf_output.pre_state_root`.
-    pub start_state_root: neutrino_primitives::StateRoot,
-    /// State root after the last block in the chunk executes.
-    /// Cross-checked against `block_metas[last].stf_output.post_state_root`.
-    pub end_state_root: neutrino_primitives::StateRoot,
-    /// Header hash at `start_height`.  Cross-checked against
-    /// `block_metas[0].block_hash`.
-    pub start_block_hash: neutrino_primitives::BlockHash,
-    /// Header hash at `end_height`.  Cross-checked against
-    /// `block_metas[last].block_hash`.
-    pub end_block_hash: neutrino_primitives::BlockHash,
-    /// Chain identifier — every block's `stf_output.chain_id`
-    /// must equal this value.
-    pub chain_id: neutrino_primitives::ChainId,
-    /// Per-block metadata in canonical block order.  Length =
-    /// `end_height - start_height + 1`.
-    pub block_metas: Vec<ChunkAggregatorBlockMeta>,
-    /// Hash of the block-guest's verifying key, packed as 8
-    /// little-endian `u32` limbs to match the shape
-    /// `sp1_zkvm::lib::verify::verify_sp1_proof(&[u32; 8], &[u8; 32])`
-    /// expects.  All inner block proofs share the same vk (they came
-    /// from the same block-guest ELF), so this field is constant
-    /// across `block_metas`.
-    pub block_guest_vk_digest: [u32; 8],
-    /// Phase 1 pass-through: aggregated VRF-proof Merkle root.
-    /// Phase 4 will compute this in-circuit per block.
-    pub vrf_proof_root: neutrino_primitives::Hash,
-    /// Phase 1 pass-through: aggregated DA-bundle commitment.
-    /// Phase 6 will derive this from per-block `da_root` values
-    /// when DA ingest lands.
-    pub da_root: neutrino_primitives::Hash,
-}
 
 // ---------------------------------------------------------------------------
 // apply_block
@@ -1198,37 +1074,28 @@ pub struct ChunkAggregatorInput {
 ///
 /// Receipts:
 ///
-/// - The STF emits one [`Receipt`] per transaction (in canonical
+/// - Mandatory queue executions emit kind-10 receipts first. The STF then
+///   emits one [`Receipt`] per transaction (in canonical
 ///   order), with `status_code = 0` on success, `1` on either soft
 ///   rejection or gas-overflow drop. `gas_used` reflects the gas
 ///   actually charged (the kind's cost on success, `0` on failure).
 /// - [`StfPublicOutput::receipts_root`] is the canonical commitment
 ///   over the receipt vector; the consensus engine wires it into
 ///   `header.receipts_root` and `BlockProofPublicInputs.receipt_root`.
+#[allow(clippy::too_many_lines)] // Keep transaction dispatch and receipt accounting together.
 pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPublicOutput {
     let pre = state.pre_state_root();
     let mut applied: u32 = 0;
     let mut failed: u32 = 0;
-    let mut gas_used: u64 = 0;
+    let (accountability, mut gas_used, mut receipts) = accountability::apply(input, state);
     let mut proposer_fee: u128 = 0;
-    let mut receipts: Vec<Receipt> = Vec::with_capacity(input.transactions.len());
+    receipts.reserve(input.transactions.len());
 
-    // Q2 binding: compute `transactions_root` over the borsh-encoded
-    // forms of `input.transactions` up front.  The host plumbs
-    // `body.transactions` (already-borsh-encoded blobs) through to the
-    // STF; re-encoding them here recovers exactly those same bytes
-    // because borsh is canonical for the `Transaction` variants we
-    // accept.  The resulting digest matches `header.transactions_root`
-    // (also a Merkle over `body.transactions`), so the SP1 verifier's
-    // `committed.transactions_root == public_inputs.transactions_root`
-    // cross-check rejects any proof whose `input.transactions`
-    // diverges from the gossiped body.
-    let transaction_blobs: Vec<Vec<u8>> = input
-        .transactions
-        .iter()
-        .map(|tx| borsh::to_vec(tx).expect("Transaction borsh is canonical and infallible"))
-        .collect();
-    let transactions_root = neutrino_primitives::merkle_root_of_blobs(&transaction_blobs);
+    // Bind every input, including transactions dropped by gas or execution.
+    // A single serialization feeds the transaction Merkle root; the count
+    // authenticates its omitted DA lane in the compact chunk witness.
+    let (transactions_root, transaction_summary) =
+        commitments::transaction_commitments(&input.transactions);
 
     for tx in &input.transactions {
         let kind = tx_kind_code(tx);
@@ -1254,18 +1121,26 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
         let result = match tx {
             Transaction::Transfer(transfer) => apply_transfer(state, input.chain_id, fee, transfer),
             Transaction::Stake(stake_tx) => apply_stake(state, input.chain_id, fee, stake_tx),
-            Transaction::Unstake(unstake_tx) => {
-                apply_unstake(state, input.chain_id, input.block_height, fee, unstake_tx)
-            }
-            // Consensus-driven transactions are free.
-            Transaction::Slash(slash_tx) => apply_slash(state, slash_tx),
-            Transaction::InactivityLeak(leak_tx) => apply_leak(state, leak_tx),
+            Transaction::Unstake(unstake_tx) => apply_unstake(
+                state,
+                input.chain_id,
+                input.block_height,
+                input.evidence_anchor.policy.unbonding_delay_blocks,
+                fee,
+                unstake_tx,
+            ),
+            Transaction::SubmitEvidence(_) => Ok(()),
             Transaction::Deposit(deposit_tx) => {
                 apply_deposit(state, input.chain_id, fee, deposit_tx)
             }
-            Transaction::VoluntaryExit(exit_tx) => {
-                apply_voluntary_exit(state, input.chain_id, input.block_height, fee, exit_tx)
-            }
+            Transaction::VoluntaryExit(exit_tx) => apply_voluntary_exit(
+                state,
+                input.chain_id,
+                input.block_height,
+                input.evidence_anchor.policy.unbonding_delay_blocks,
+                fee,
+                exit_tx,
+            ),
             Transaction::Withdraw(withdraw_tx) => {
                 apply_withdraw(state, input.chain_id, input.block_height, fee, withdraw_tx)
             }
@@ -1316,6 +1191,7 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
     let receipts_root = compute_receipts_root(&receipts);
     let post = state.post_state_root();
     StfPublicOutput {
+        accountability,
         // Q2 input bindings — copied from `StfInput` so the SP1
         // verifier can cross-check them against
         // `BlockProofPublicInputs`.
@@ -1325,6 +1201,7 @@ pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPubli
         gas_price: input.gas_price,
         proposer_address: input.proposer_address,
         transactions_root,
+        transaction_summary,
         // Pre-existing output bindings.
         pre_state_root: pre,
         post_state_root: post,
@@ -1368,8 +1245,8 @@ pub fn compute_receipts_root(receipts: &[Receipt]) -> StateRoot {
 /// [`TxValidationCode::Valid`] (and a mempool priority) or the
 /// matching rejection code.
 ///
-/// Slash and inactivity-leak transactions are consensus-driven and
-/// therefore rejected here with [`TxValidationCode::Unauthorized`];
+/// Evidence submissions require proof admission and are therefore
+/// rejected here with [`TxValidationCode::Unauthorized`];
 /// they cannot enter the mempool through user RPC submission.
 ///
 /// The check is intentionally a strict subset of `apply_*` so a
@@ -1417,9 +1294,7 @@ pub fn validate_tx<B: StateBackend>(
         // Consensus-driven transactions are never user-submittable.
         // The producer injects them directly into `body.transactions`
         // without ever passing them through the mempool.
-        Transaction::Slash(_) | Transaction::InactivityLeak(_) => {
-            TxValidity::invalid(TxValidationCode::Unauthorized)
-        }
+        Transaction::SubmitEvidence(_) => TxValidity::invalid(TxValidationCode::Unauthorized),
     }
 }
 
@@ -1710,6 +1585,7 @@ fn apply_unstake<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     block_height: u64,
+    unbonding_delay: u64,
     fee: u128,
     tx: &UnstakeTx,
 ) -> Result<(), ReceiptStatus> {
@@ -1734,7 +1610,7 @@ fn apply_unstake<B: StateBackend>(
     // out of slashable stake (so a slash after this block cannot reach
     // it) and into the per-validator withdrawal queue. Subsequent
     // `WithdrawTx` claims drain matured entries back into balance.
-    let Some(mature_at_height) = block_height.checked_add(UNBONDING_DELAY_BLOCKS) else {
+    let Some(mature_at_height) = block_height.checked_add(unbonding_delay) else {
         return Err(ReceiptStatus::Overflow);
     };
     let mut queue = load_withdrawal_queue(state, &tx.validator);
@@ -1812,6 +1688,7 @@ fn apply_voluntary_exit<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     block_height: u64,
+    unbonding_delay: u64,
     fee: u128,
     tx: &VoluntaryExitTx,
 ) -> Result<(), ReceiptStatus> {
@@ -1836,7 +1713,7 @@ fn apply_voluntary_exit<B: StateBackend>(
     // already verified above (under the voluntary-exit domain tag),
     // so we bypass the inner signature check by directly applying
     // the bookkeeping the unstake path would otherwise perform.
-    let Some(mature_at_height) = block_height.checked_add(UNBONDING_DELAY_BLOCKS) else {
+    let Some(mature_at_height) = block_height.checked_add(unbonding_delay) else {
         return Err(ReceiptStatus::Overflow);
     };
     let mut queue = load_withdrawal_queue(state, &tx.validator);
@@ -1868,6 +1745,9 @@ fn apply_withdraw<B: StateBackend>(
     fee: u128,
     tx: &WithdrawTx,
 ) -> Result<(), ReceiptStatus> {
+    if accountability::withdrawal_held(state, &tx.validator) {
+        return Err(ReceiptStatus::InsufficientBalance);
+    }
     if !verify_withdraw_signature(tx, chain_id) {
         return Err(ReceiptStatus::BadSignature);
     }
@@ -1879,9 +1759,9 @@ fn apply_withdraw<B: StateBackend>(
 
     // Partition into matured / pending. Maturity is monotonic in
     // insertion order (every entry created at block H matures at
-    // H + UNBONDING_DELAY_BLOCKS), so a single split point exists,
+    // H + DEFAULT_UNBONDING_DELAY_BLOCKS), so a single split point exists,
     // but we scan defensively because the queue could in principle
-    // contain entries from a future where UNBONDING_DELAY_BLOCKS
+    // contain entries from a future where DEFAULT_UNBONDING_DELAY_BLOCKS
     // changes.
     let mut matured: u128 = 0;
     let mut remaining: Vec<Withdrawal> = Vec::new();
@@ -1999,9 +1879,13 @@ fn store_withdrawal_queue<B: StateBackend>(state: &mut B, addr: &Address, queue:
     state.write(&withdrawal_key(addr), encode_withdrawal_queue(queue));
 }
 
-fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> Result<(), ReceiptStatus> {
-    let mut validator = load_validator(state, &tx.validator);
-    let mut queue = load_withdrawal_queue(state, &tx.validator);
+fn apply_deduction<B: StateBackend>(
+    state: &mut B,
+    address: &Address,
+    amount: u128,
+) -> Result<(), ReceiptStatus> {
+    let mut validator = load_validator(state, address);
+    let mut queue = load_withdrawal_queue(state, address);
 
     // Total slashable = active stake + queued unbonding.  Queued
     // entries stay slashable until they mature into the spendable
@@ -2021,7 +1905,7 @@ fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> Result<(), Recei
         return Err(ReceiptStatus::InsufficientBalance);
     }
 
-    let burn = total_slashable.min(tx.amount);
+    let burn = total_slashable.min(amount);
 
     // Burn from active stake first.  Stake is the primary
     // slashable asset; the queue is a secondary source consumed
@@ -2062,39 +1946,24 @@ fn apply_slash<B: StateBackend>(state: &mut B, tx: &SlashTx) -> Result<(), Recei
 
     let mut set = load_validator_set(state);
     if validator.active {
-        set.upsert(tx.validator, validator.stake);
+        set.upsert(*address, validator.stake);
     } else {
-        set.remove(&tx.validator);
+        set.remove(address);
     }
 
-    store_validator(state, &tx.validator, &validator);
+    store_validator(state, address, &validator);
     store_validator_set(state, &set);
     // Touch the queue key only when we actually changed it, so the
     // witness footprint stays minimal for the common
     // "slash a non-unstaking validator" case.
     if queue_touched {
         if queue.entries.is_empty() {
-            state.delete(&withdrawal_key(&tx.validator));
+            state.delete(&withdrawal_key(address));
         } else {
-            store_withdrawal_queue(state, &tx.validator, &queue);
+            store_withdrawal_queue(state, address, &queue);
         }
     }
     Ok(())
-}
-
-fn apply_leak<B: StateBackend>(state: &mut B, tx: &LeakTx) -> Result<(), ReceiptStatus> {
-    // Inactivity leak shares the deduction semantics of `Slash`; the
-    // distinction is purely in how the consensus engine selects which
-    // validator to penalise. Real production may treat slashed funds
-    // differently (e.g. send to a reward pool), but in M4-D both
-    // simply burn.
-    apply_slash(
-        state,
-        &SlashTx {
-            validator: tx.validator,
-            amount: tx.amount,
-        },
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2129,13 +1998,13 @@ pub const QUERY_METHOD_VALIDATOR_GET: &str = "validator_get";
 /// Payload wire format: `borsh(ValidatorSet)`.
 pub const QUERY_METHOD_VALIDATOR_SET: &str = "validator_set";
 
-/// Query method: return the runtime version advertised by this
-/// runtime ELF.
+/// Query method: return the runtime metadata advertised by this
+/// runtime.
 ///
 /// Args wire format: empty.
 /// Payload wire format:
-/// `borsh(neutrino_primitives::RuntimeVersion)`.
-pub const QUERY_METHOD_RUNTIME_VERSION: &str = "runtime_version";
+/// `borsh(neutrino_primitives::RuntimeInfo)`.
+pub const QUERY_METHOD_RUNTIME_INFO: &str = "runtime_info";
 
 /// Query method: return the validator's [`WithdrawalQueue`].
 ///
@@ -2151,10 +2020,8 @@ pub const QUERY_METHOD_PENDING_WITHDRAWALS: &str = "pending_withdrawals";
 /// Args wire format: empty (no payload expected).
 /// Payload wire format: `borsh(ValidatorRegistrations)` — empty
 /// registries are returned as `ValidatorRegistrations::default()`
-/// (empty entries vector). The host-side rotation bridge polls
-/// this method at every chunk close to discover newly-registered
-/// validators whose BLS POP it must verify before lifting them
-/// into the consensus active set.
+/// (empty entries vector). Complete chunk validation authenticates
+/// the registry directly against the block-proven state root.
 pub const QUERY_METHOD_VALIDATOR_REGISTRATIONS: &str = "validator_registrations";
 
 /// Dispatch a [`neutrino_runtime_abi::QueryRequest`] against `state`.
@@ -2178,7 +2045,7 @@ pub fn query<B: neutrino_runtime_core::StateBackend>(
         QUERY_METHOD_ACCOUNT_GET => query_account_get(&request.args, state),
         QUERY_METHOD_VALIDATOR_GET => query_validator_get(&request.args, state),
         QUERY_METHOD_VALIDATOR_SET => query_validator_set(state),
-        QUERY_METHOD_RUNTIME_VERSION => query_runtime_version(),
+        QUERY_METHOD_RUNTIME_INFO => query_runtime_info(),
         QUERY_METHOD_PENDING_WITHDRAWALS => query_pending_withdrawals(&request.args, state),
         QUERY_METHOD_VALIDATOR_REGISTRATIONS => query_validator_registrations(state),
         unknown => QueryResponse::err(QueryStatus::UnknownMethod, unknown.as_bytes().to_vec()),
@@ -2225,9 +2092,9 @@ fn query_validator_set<B: neutrino_runtime_core::StateBackend>(
     neutrino_runtime_abi::QueryResponse::ok(payload)
 }
 
-fn query_runtime_version() -> neutrino_runtime_abi::QueryResponse {
-    let version = neutrino_primitives::RuntimeVersion::default();
-    let payload = borsh::to_vec(&version).expect("borsh encode RuntimeVersion never fails");
+fn query_runtime_info() -> neutrino_runtime_abi::QueryResponse {
+    let info = neutrino_primitives::RuntimeInfo::default();
+    let payload = borsh::to_vec(&info).expect("borsh encode RuntimeInfo never fails");
     neutrino_runtime_abi::QueryResponse::ok(payload)
 }
 
@@ -2261,6 +2128,7 @@ fn query_validator_registrations<B: neutrino_runtime_core::StateBackend>(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use neutrino_primitives::DEFAULT_UNBONDING_DELAY_BLOCKS;
     use neutrino_runtime_core::{
         WitnessState,
         host::{LiveTrie, TracingState},
@@ -2275,7 +2143,7 @@ mod tests {
     /// when exercising the limit's enforcement.
     const TEST_BLOCK_GAS_LIMIT: u64 = 30_000_000;
     /// Default block height for STF unit tests. Sized comfortably
-    /// above `UNBONDING_DELAY_BLOCKS` so withdrawal-maturity arithmetic
+    /// above `DEFAULT_UNBONDING_DELAY_BLOCKS` so withdrawal-maturity arithmetic
     /// doesn't underflow on the happy path; tests exercising the
     /// queue override per-call.
     const TEST_BLOCK_HEIGHT: u64 = 100;
@@ -2333,6 +2201,7 @@ mod tests {
     fn empty_block_is_a_noop() {
         let live = LiveTrie::default();
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2362,6 +2231,7 @@ mod tests {
 
         let tx = signed_transfer(&alice, bob_addr, 30, 0, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2390,6 +2260,7 @@ mod tests {
 
         let tx = signed_transfer(&alice, [0xAB; 32], 10, 3, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2419,6 +2290,7 @@ mod tests {
 
         let tx = signed_transfer(&alice, [0xAB; 32], 50, 0, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2447,6 +2319,7 @@ mod tests {
         let mut tx = signed_transfer(&alice, [0xAB; 32], 10, 0, CHAIN_ID);
         tx.signature[0] ^= 0xFF;
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2473,6 +2346,7 @@ mod tests {
 
         let tx = signed_transfer(&alice, [0xAB; 32], 10, 0, CHAIN_ID + 1);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2499,6 +2373,7 @@ mod tests {
 
         let tx = signed_transfer(&alice, alice_addr, 30, 0, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2551,6 +2426,7 @@ mod tests {
 
         let pre_root = ValidatorSet::default().root();
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2590,6 +2466,7 @@ mod tests {
         let stake = signed_stake(&alice, 40, 0, CHAIN_ID);
         let unstake = signed_unstake(&alice, 40, 1, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2619,6 +2496,7 @@ mod tests {
 
         let stake = signed_stake(&alice, 1_000, 0, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2648,6 +2526,7 @@ mod tests {
         let mut tx = signed_stake(&alice, 10, 0, CHAIN_ID);
         tx.signature[0] ^= 0xFF;
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -2658,6 +2537,22 @@ mod tests {
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.failed, 1);
+    }
+
+    // Pure STF tests exercise deductions with a bound, already-authenticated
+    // statement. Actual proof bytes are verified separately by host/Guest tests.
+    fn proven_sanction_input(
+        mut input: StfInput,
+        address: Address,
+        amount: u128,
+        kind: neutrino_consensus_types::evidence::SanctionKind,
+    ) -> StfInput {
+        input.evidence_anchor.policy.slash_amount = amount;
+        input.evidence_anchor.policy.inactivity_leak_amount = amount;
+        input.transactions = alloc::vec![accountability::tests::admission(
+            &mut input, 1, address, kind
+        )];
+        input
     }
 
     #[test]
@@ -2686,16 +2581,20 @@ mod tests {
         live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
 
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 30,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            30,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -2723,16 +2622,20 @@ mod tests {
 
         // Burn more than the stake — clamped to the current stake.
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 999,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            999,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -2756,16 +2659,20 @@ mod tests {
         live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
 
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::InactivityLeak(LeakTx {
-                validator: addr,
-                amount: 20,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            20,
+            neutrino_consensus_types::evidence::SanctionKind::Inactivity,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -2779,20 +2686,25 @@ mod tests {
     fn slashing_an_unknown_validator_is_a_no_op() {
         let live = LiveTrie::default();
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: [0xFF; 32],
-                amount: 10,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            [0xFF; 32],
+            10,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
-        assert_eq!(host_out.applied, 0);
-        assert_eq!(host_out.failed, 1);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.failed, 0);
+        assert_eq!(host_out.accountability.executed.len(), 1);
         assert_eq!(host_out.validator_set_root, ValidatorSet::default().root());
     }
 
@@ -2820,27 +2732,31 @@ mod tests {
             entries: alloc::vec![
                 Withdrawal {
                     amount: 30,
-                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                    mature_at_height: TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS,
                 },
                 Withdrawal {
                     amount: 20,
-                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                    mature_at_height: TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS,
                 },
             ],
         };
         live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
 
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 30,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            30,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -2878,27 +2794,31 @@ mod tests {
             entries: alloc::vec![
                 Withdrawal {
                     amount: 30,
-                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                    mature_at_height: TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS,
                 },
                 Withdrawal {
                     amount: 20,
-                    mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS + 1,
+                    mature_at_height: TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS + 1,
                 },
             ],
         };
         live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
 
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 80,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            80,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -2916,7 +2836,7 @@ mod tests {
         // anti-front-running property we care about.
         assert_eq!(
             queue_after.entries[0].mature_at_height,
-            TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS + 1,
+            TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS + 1,
         );
     }
 
@@ -2940,22 +2860,26 @@ mod tests {
         let queue = WithdrawalQueue {
             entries: alloc::vec![Withdrawal {
                 amount: 50,
-                mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                mature_at_height: TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS,
             }],
         };
         live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
 
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 30,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            30,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -2966,7 +2890,7 @@ mod tests {
         assert_eq!(queue_after.entries[0].amount, 20);
         assert_eq!(
             queue_after.entries[0].mature_at_height,
-            TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+            TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS,
         );
     }
 
@@ -2992,22 +2916,26 @@ mod tests {
         let queue = WithdrawalQueue {
             entries: alloc::vec![Withdrawal {
                 amount: 5,
-                mature_at_height: TEST_BLOCK_HEIGHT + UNBONDING_DELAY_BLOCKS,
+                mature_at_height: TEST_BLOCK_HEIGHT + DEFAULT_UNBONDING_DELAY_BLOCKS,
             }],
         };
         live.insert(&withdrawal_key(&addr), borsh::to_vec(&queue).unwrap());
 
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
             gas_price: 0,
             proposer_address: [0u8; 32],
-            transactions: alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 1_000_000,
-            })],
+            transactions: alloc::vec![],
         };
+        let input = proven_sanction_input(
+            input,
+            addr,
+            1_000_000,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
+        );
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!(host_out.applied, 1);
@@ -3039,6 +2967,7 @@ mod tests {
             },
         );
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3065,6 +2994,7 @@ mod tests {
             },
         );
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3097,6 +3027,7 @@ mod tests {
         let tx0 = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
         let tx1 = Transaction::Transfer(signed_transfer(&alice, [0xCD; 32], 20, 1, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             // Room for exactly one transfer; the second would push
@@ -3124,6 +3055,7 @@ mod tests {
             },
         );
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: 0,
@@ -3165,7 +3097,7 @@ mod tests {
         let bytes = borsh::to_vec(tx).expect("encode tx");
         let mut tracer = TracingState::new(live);
         // Pre-fee-market default: gas_price = 0 disables fees, so the
-        // admission balance check matches the legacy "amount only"
+        // admission balance check matches zero-price execution
         // behaviour every existing test was written against.
         validate_tx(&bytes, &mut tracer, CHAIN_ID, TEST_BLOCK_GAS_LIMIT, 0)
     }
@@ -3244,27 +3176,6 @@ mod tests {
             0,
         );
         assert_eq!(validity.code, TxValidationCode::Malformed);
-    }
-
-    #[test]
-    fn validate_tx_rejects_consensus_driven_transactions() {
-        let live = LiveTrie::default();
-        let slash = Transaction::Slash(SlashTx {
-            validator: [0xFF; 32],
-            amount: 10,
-        });
-        let leak = Transaction::InactivityLeak(LeakTx {
-            validator: [0xFF; 32],
-            amount: 10,
-        });
-        assert_eq!(
-            validate_against(&live, &slash).code,
-            TxValidationCode::Unauthorized,
-        );
-        assert_eq!(
-            validate_against(&live, &leak).code,
-            TxValidationCode::Unauthorized,
-        );
     }
 
     #[test]
@@ -3404,6 +3315,7 @@ mod tests {
 
         let tx = Transaction::Deposit(signed_deposit(&alice, bob_addr, 60, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3440,6 +3352,7 @@ mod tests {
         );
         let tx = Transaction::Deposit(signed_deposit(&alice, bob_addr, 100, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3479,6 +3392,7 @@ mod tests {
 
         let tx = Transaction::Unstake(signed_unstake(&alice, 30, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 100,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3498,13 +3412,13 @@ mod tests {
         // Stake reduced.
         let val = read_validator(&post, &addr);
         assert_eq!(val.stake, 20);
-        // Queue entry with mature_at_height = 100 + UNBONDING_DELAY_BLOCKS.
+        // Queue entry with mature_at_height = 100 + DEFAULT_UNBONDING_DELAY_BLOCKS.
         let queue = read_withdrawal_queue(&post, &addr);
         assert_eq!(queue.entries.len(), 1);
         assert_eq!(queue.entries[0].amount, 30);
         assert_eq!(
             queue.entries[0].mature_at_height,
-            100 + UNBONDING_DELAY_BLOCKS,
+            100 + DEFAULT_UNBONDING_DELAY_BLOCKS,
         );
     }
 
@@ -3533,6 +3447,7 @@ mod tests {
 
         let tx = Transaction::VoluntaryExit(signed_voluntary_exit(&alice, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 50,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3568,6 +3483,7 @@ mod tests {
         );
         let tx = Transaction::VoluntaryExit(signed_voluntary_exit(&alice, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3610,6 +3526,7 @@ mod tests {
 
         let tx = Transaction::Withdraw(signed_withdraw(&alice, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 100,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3653,6 +3570,7 @@ mod tests {
 
         let tx = Transaction::Withdraw(signed_withdraw(&alice, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 100,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3697,6 +3615,7 @@ mod tests {
 
         let tx = Transaction::Withdraw(signed_withdraw(&alice, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 100,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3713,7 +3632,7 @@ mod tests {
     fn full_unstake_withdraw_lifecycle_round_trips() {
         // Block 1: stake 40 from balance.
         // Block 2: unstake 40 (queued, balance unchanged).
-        // Block at H = 2 + UNBONDING_DELAY_BLOCKS: withdraw drains it.
+        // Block at H = 2 + DEFAULT_UNBONDING_DELAY_BLOCKS: withdraw drains it.
         let alice = signing_key(49);
         let addr = address_of(&alice);
         let live = live_with_account(
@@ -3726,6 +3645,7 @@ mod tests {
 
         // Block 1.
         let input1 = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 1,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3737,6 +3657,7 @@ mod tests {
 
         // Block 2: unstake.
         let input2 = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 2,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3754,6 +3675,7 @@ mod tests {
 
         // A withdraw at block 5 (still pending) credits zero.
         let early = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: 5,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3766,8 +3688,9 @@ mod tests {
         assert_eq!(read_withdrawal_queue(&live3, &addr).total(), 40);
 
         // A withdraw at the maturity height claims the 40 back.
-        let claim_h = 2 + UNBONDING_DELAY_BLOCKS;
+        let claim_h = 2 + DEFAULT_UNBONDING_DELAY_BLOCKS;
         let mature = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: claim_h,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3788,6 +3711,7 @@ mod tests {
     fn empty_block_emits_canonical_receipts_root() {
         let live = LiveTrie::default();
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3850,6 +3774,7 @@ mod tests {
         //     bumped alice's nonce.
         let insufficient = signed_transfer(&alice, [0xFE; 32], 1_000, 1, CHAIN_ID);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3911,6 +3836,7 @@ mod tests {
         let tx1 = Transaction::Transfer(signed_transfer(&alice, [0xCD; 32], 20, 1, CHAIN_ID));
         let kind_transfer = tx_kind_code(&tx0);
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: GAS_TRANSFER,
@@ -3957,6 +3883,7 @@ mod tests {
         );
         let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 1, 0, CHAIN_ID));
         let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -3982,6 +3909,7 @@ mod tests {
     /// readable.
     fn fee_input(txs: Vec<Transaction>, gas_price: u128, proposer_address: Address) -> StfInput {
         StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
             chain_id: CHAIN_ID,
             block_height: TEST_BLOCK_HEIGHT,
             block_gas_limit: TEST_BLOCK_GAS_LIMIT,
@@ -4108,12 +4036,15 @@ mod tests {
         live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
 
         let input = fee_input(
-            alloc::vec![Transaction::Slash(SlashTx {
-                validator: addr,
-                amount: 25,
-            })],
+            alloc::vec![],
             10, // gas_price
             proposer_addr,
+        );
+        let input = proven_sanction_input(
+            input,
+            addr,
+            25,
+            neutrino_consensus_types::evidence::SanctionKind::Slash,
         );
         let (_, post) = apply_against(&live, &input);
         // Validator stake reduced, but proposer received nothing.

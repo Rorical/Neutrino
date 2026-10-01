@@ -61,6 +61,7 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
 
 fn input_with_transfers(txs: Vec<TransferTx>) -> StfInput {
     StfInput {
+        evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
@@ -109,7 +110,7 @@ fn tampered_post_state_root_is_rejected() {
     let dry = dry_run(&input, &live);
     let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
 
-    let mut tampered = dry.output;
+    let mut tampered = dry.output.clone();
     tampered.post_state_root[0] ^= 0xFF;
 
     let err = ctx

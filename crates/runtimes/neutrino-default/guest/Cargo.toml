@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 sp1-zkvm                       = "=6.2.1"
+neutrino-prover-chunk           = { path = "../../../prover-chunk", default-features = false, features = ["sp1-verification"] }
 borsh                          = { version = "1.5", default-features = false, features = ["derive"] }
 neutrino-default-runtime-core  = { path = "../core", default-features = false }
 neutrino-runtime-core          = { path = "../../../runtime-core", default-features = false }
@@ -22,7 +23,10 @@ neutrino-runtime-abi           = { path = "../../../runtime-abi", default-featur
 
 [profile.release]
 opt-level     = 3
-lto           = true
+lto           = "thin"
 codegen-units = 1
 debug         = false
 panic         = "abort"
+
+[patch.crates-io]
+bls12_381 = { git = "https://github.com/sp1-patches/bls12_381", rev = "9e4e2ae4780d3d69cecbec000f5e814df2392468" }

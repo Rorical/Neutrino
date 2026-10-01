@@ -18,7 +18,7 @@ std = ["neutrino-primitives/std", "neutrino-consensus-types/std"]
 neutrino-consensus-types = { workspace = true }
 neutrino-crypto          = { workspace = true }
 neutrino-primitives      = { workspace = true }
-neutrino-vrf             = { workspace = true }
+neutrino-vrf             = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 # Tests use rand_chacha (rand_core 0.6 compatible) so they can feed

@@ -85,7 +85,6 @@ const fn matching_public_inputs(
         receipt_root: output.receipts_root,
         da_root: ZERO_HASH,
         vm_code_hash: ZERO_HASH,
-        abi_version: 1,
         gas_used: output.gas_used,
         gas_limit: input.block_gas_limit,
         gas_price: input.gas_price,
@@ -107,6 +106,7 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
     );
     let tx = signed_transfer(&alice, [0xCC; 32], 25, 0, CHAIN_ID);
     let input = StfInput {
+        evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: BLOCK_GAS_LIMIT,
@@ -286,44 +286,13 @@ fn sp1_proof_system_rejects_malformed_proof_bytes() {
     assert_eq!(err, ProofError::MalformedProof);
 }
 
-/// The trait-level [`ProofSystem::prove_chunk`] is intentionally a
-/// stub that always returns [`ProofError::Unsupported`] now that
-/// chunk aggregation is implemented.  Production callers must use
-/// [`Sp1ProofSystem::prove_chunk_with_block_hashes`] (which threads
-/// per-block header hashes through to the aggregator guest —
-/// information the trait signature cannot carry because block
-/// hashes are consensus-bound rather than STF-bound; see Q2's
-/// binding table in doc 18).
-///
-/// This test pins the "plain trait method = stub" contract so
-/// downstream callers cannot accidentally rely on it for real
-/// chunk-proof production.
 #[test]
-fn sp1_proof_system_plain_prove_chunk_is_a_stub() {
-    use neutrino_consensus_types::ChunkProofPublicInputs;
-
-    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
-    let chunk_pi = ChunkProofPublicInputs {
-        chunk_id: 0,
-        start_height: 1,
-        end_height: 1,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: ZERO_HASH,
-        block_hash_root: ZERO_HASH,
-        block_proof_root: ZERO_HASH,
-        vrf_proof_root: ZERO_HASH,
-        active_validator_set_root: ZERO_HASH,
-        next_validator_set_root: ZERO_HASH,
-        da_root: ZERO_HASH,
-    };
-    // Empty block-proof array — the host pre-check rejects with
-    // PublicInputMismatch before reaching the Unsupported sentinel.
-    // Pinning this exact code path so future refactors don't
-    // accidentally make the trait method partially work.
-    let err = proof_system
-        .prove_chunk(&[], &chunk_pi)
-        .expect_err("plain prove_chunk must always reject");
-    assert_eq!(err, ProofError::PublicInputMismatch);
+fn startup_requires_the_exact_embedded_runtime_hash() {
+    use neutrino_runtime_host::{default_runtime_code_hash, expect_runtime_code_hash};
+    let hash = default_runtime_code_hash();
+    assert_eq!(expect_runtime_code_hash(hash), Ok(()));
+    assert!(expect_runtime_code_hash(ZERO_HASH).is_err());
+    let mut other = hash;
+    other[0] ^= 1;
+    assert!(expect_runtime_code_hash(other).is_err());
 }

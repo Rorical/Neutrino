@@ -1478,7 +1478,7 @@ fn build_behaviour(
     );
 
     let identify = identify::Behaviour::new(identify::Config::new(
-        "/neutrino/identify/1.0.0".to_owned(),
+        "/neutrino/identify".to_owned(),
         local_key.public(),
     ));
 
@@ -1653,7 +1653,7 @@ const fn build_topic_score_params() -> gossipsub::TopicScoreParams {
 /// Build the Kademlia behaviour with the Neutrino DHT protocol name.
 fn build_kademlia(local_peer_id: PeerId) -> kad::Behaviour<MemoryStore> {
     let store = MemoryStore::new(local_peer_id);
-    let config = kad::Config::new(StreamProtocol::new("/neutrino/kad/1.0.0"));
+    let config = kad::Config::new(StreamProtocol::new("/neutrino/kad"));
     let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, config);
     kademlia.set_mode(Some(kad::Mode::Server));
     kademlia
@@ -1805,7 +1805,7 @@ fn parse_topic(s: &str) -> Option<Topic> {
     }
     // Subnet-indexed aggregate vote topics: parse the trailing index.
     let prefix = "/neutrino/aggregate_finality_votes_";
-    let suffix = "/borsh/1";
+    let suffix = "/borsh";
     if let Some(rest) = s.strip_prefix(prefix) {
         if let Some(idx_str) = rest.strip_suffix(suffix) {
             if let Ok(idx) = idx_str.parse::<u8>()
@@ -1845,7 +1845,11 @@ mod tests {
             parse_topic(&Topic::AggregateFinalityVotes(16).protocol_string()),
             None
         );
-        assert_eq!(parse_topic("/neutrino/garbage/borsh/1"), None);
+        assert_eq!(parse_topic("/neutrino/garbage/borsh"), None);
+        assert_eq!(
+            parse_topic("/neutrino/aggregate_finality_votes_0/borsh/extra"),
+            None
+        );
     }
 
     #[tokio::test]

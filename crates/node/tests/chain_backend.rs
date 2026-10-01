@@ -5,22 +5,19 @@
 //! read/write paths the sync driver uses:
 //! - status / progress queries return engine-consistent values,
 //! - gossipped blocks extend the local head exactly once,
-//! - recursive checkpoint proofs imported via the sync FSM advance the
-//!   `latest_checkpoint_index`, and
 //! - the corresponding RPC read methods see what we just imported.
 
 use neutrino_consensus_engine::Engine;
 use neutrino_consensus_engine::ProposerKey;
 use neutrino_consensus_engine::body::compute_body_roots;
 use neutrino_consensus_engine::validator_set::validator_set_root;
-use neutrino_consensus_types::{Block, Body, Header, RecursiveCheckpointProof};
+use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
-    StateParams, Validator, ZERO_HASH, blake3_256,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
 };
-use neutrino_proof_system::{MockProofSystem, ProofSystem};
+use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
 use neutrino_sync::SyncBackend;
 
@@ -58,15 +55,13 @@ fn spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"chain-backend-test".to_vec()).unwrap(),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xCC; 32],
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -90,11 +85,10 @@ fn spec() -> ChainSpec {
 fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> Block {
     let p = proposer();
     let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
+    let roots = compute_body_roots(&body);
     let vrf_proof = p.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
-        version: HEADER_VERSION,
         height,
         slot,
         parent_hash: parent,
@@ -103,8 +97,6 @@ fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> 
         state_root,
         transactions_root: roots.transactions_root,
         votes_root: roots.votes_root,
-        slashings_root: roots.slashings_root,
-        validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,
@@ -116,75 +108,6 @@ fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> 
     let header_hash = header.hash();
     header.signature = p.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
     Block { header, body }
-}
-
-fn build_recursive_proof(
-    chain_spec: &ChainSpec,
-    end_height: Height,
-    end_block_hash: BlockHash,
-    end_state_root: [u8; 32],
-) -> RecursiveCheckpointProof {
-    use neutrino_consensus_types::{BlockProofPublicInputs, ChunkProofPublicInputs};
-    let ps = MockProofSystem::new();
-    let public_inputs = Checkpoint {
-        chain_id: chain_spec.chain_id,
-        index: 1,
-        start_height: 0,
-        end_height,
-        start_block_hash: ZERO_HASH,
-        end_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root,
-        end_validator_set_root: validator_set_root(&validators()),
-        history_root: ZERO_HASH,
-        proof_system_version: chain_spec.proof.proof_system_version,
-    };
-    let block_inputs = BlockProofPublicInputs {
-        chain_id: chain_spec.chain_id,
-        height: end_height,
-        parent_block_hash: ZERO_HASH,
-        block_hash: end_block_hash,
-        state_root_before: ZERO_HASH,
-        state_root_after: end_state_root,
-        transactions_root: ZERO_HASH,
-        receipt_root: ZERO_HASH,
-        da_root: ZERO_HASH,
-        vm_code_hash: ZERO_HASH,
-        abi_version: 1,
-        gas_used: 0,
-        gas_limit: 1_000_000,
-        gas_price: 0,
-        proposer_address: [0u8; 32],
-        runtime_extra: ZERO_HASH,
-    };
-    let block_proof = ps.prove_block(&[], &block_inputs).unwrap();
-    let chunk_inputs = ChunkProofPublicInputs {
-        chunk_id: 0,
-        start_height: 0,
-        end_height,
-        start_state_root: ZERO_HASH,
-        end_state_root,
-        start_block_hash: ZERO_HASH,
-        end_block_hash,
-        block_hash_root: ZERO_HASH,
-        block_proof_root: ZERO_HASH,
-        vrf_proof_root: ZERO_HASH,
-        active_validator_set_root: validator_set_root(&validators()),
-        next_validator_set_root: validator_set_root(&validators()),
-        da_root: ZERO_HASH,
-    };
-    let chunk_proof = ps.prove_chunk(&[block_proof], &chunk_inputs).unwrap();
-    let recursive = ps
-        .prove_recursive(None, &chunk_proof, &public_inputs)
-        .unwrap();
-    let proof_bytes = borsh::to_vec(&recursive).unwrap();
-    let _ = blake3_256(b"witness placeholder");
-    RecursiveCheckpointProof {
-        checkpoint_index: 1,
-        checkpoint_hash: public_inputs.hash(),
-        public_inputs,
-        proof_bytes,
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -225,6 +148,12 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
     let by_root = backend.blocks_by_root(&[b1.hash()]).await;
     assert_eq!(by_root.blocks.len(), 1);
 
+    backend.with_engine_mut_for_test(|engine| {
+        engine
+            .store_mut()
+            .put_witness(&b1.hash(), b"block-only mock fixture")
+            .unwrap();
+    });
     let proof = backend
         .prove_block(&b1.hash())
         .expect("prove imported block")
@@ -237,7 +166,7 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn duplicate_gossip_block_is_rejected_as_chain_extension_mismatch() {
+async fn duplicate_gossip_block_is_idempotent_and_preserves_proof_state() {
     let engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
 
@@ -247,45 +176,29 @@ async fn duplicate_gossip_block_is_rejected_as_chain_extension_mismatch() {
         .verify_and_import_gossip_block(b1.clone())
         .await
         .expect("first import");
-    let err = backend
-        .verify_and_import_gossip_block(b1)
+    backend.with_engine_mut_for_test(|engine| {
+        engine
+            .store_mut()
+            .put_witness(&b1.hash(), b"block-only mock fixture")
+            .unwrap();
+    });
+    let proof = backend
+        .prove_block(&b1.hash())
+        .expect("prove first import")
+        .block_proof;
+    let before = backend.local_progress().await;
+    let outcome = backend
+        .verify_and_import_gossip_block(b1.clone())
         .await
-        .expect_err("second import must fail");
-    // The first import advanced head to 1, so the duplicate now looks
-    // like a non-extending block (height = 1, but expected is 2).
-    // `HeightMismatch` and `ParentMismatch` now surface as
-    // `ChainBehind` so the driver can trigger a HeaderBackfill resync.
-    assert!(matches!(
-        err,
-        neutrino_sync::SyncBackendError::ChainBehind(_)
-    ));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn recursive_proof_import_advances_latest_checkpoint() {
-    let chain_spec = spec();
-    let engine = Engine::genesis(chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    let backend = ChainBackend::new(engine, MockProofSystem::new());
-
-    let proof = build_recursive_proof(&chain_spec, 128, [0x77; 32], [0x88; 32]);
-    let imported = backend
-        .verify_and_import_checkpoints(vec![(proof.public_inputs.clone(), proof.clone())])
-        .await
-        .expect("import valid recursive proof");
-    assert_eq!(imported.new_finalized_index, 1);
-    assert_eq!(imported.new_finalized_height, 128);
-    assert_eq!(imported.new_finalized_block_hash, [0x77; 32]);
-
-    // The latest recursive proof read endpoint should now return what we
-    // just imported.
-    let latest = backend
-        .latest_recursive_proof()
-        .await
-        .expect("latest proof present");
-    assert_eq!(latest.checkpoint.index, 1);
-    assert_eq!(latest.recursive_proof, proof);
-
-    let by_index = backend.recursive_proofs_by_index(1, 4).await;
-    assert_eq!(by_index.items.len(), 1);
-    assert_eq!(by_index.items[0].0.index, 1);
+        .expect("identical gossip is idempotent");
+    assert_eq!(outcome.new_head_height, 1);
+    assert_eq!(outcome.new_head_hash, b1.hash());
+    assert_eq!(
+        backend.local_progress().await.proven_height,
+        before.proven_height
+    );
+    assert_eq!(
+        backend.block_proofs_by_height(1, 1).await.proofs,
+        vec![proof]
+    );
 }

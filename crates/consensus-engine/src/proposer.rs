@@ -53,6 +53,28 @@ impl fmt::Display for ProposerKeyError {
 impl std::error::Error for ProposerKeyError {}
 
 impl ProposerKey {
+    /// Sign explicit proof acceptance and the exact unlock claim for a precommit.
+    #[must_use]
+    pub fn attest_precommit(
+        &self,
+        chain_id: ChainId,
+        vote: FinalityVoteData,
+        proof_hashes: Vec<Hash>,
+        unlock_quorum: Option<neutrino_consensus_types::QuorumCertificate>,
+    ) -> neutrino_consensus_types::PrecommitAttestation {
+        let mut attestation = neutrino_consensus_types::PrecommitAttestation {
+            validator_index: self.validator_index,
+            vote_signature: self.sign_finality_vote(chain_id, &vote),
+            vote,
+            proof_hashes,
+            unlock_quorum,
+            signature: [0; 96],
+        };
+        attestation.signature = self
+            .sign_raw(&attestation.signing_message(chain_id))
+            .to_bytes();
+        attestation
+    }
     /// Build a proposer from an existing BLS secret key.
     #[must_use]
     pub fn new(secret_key: SecretKey, validator_index: ValidatorIndex) -> Self {

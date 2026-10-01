@@ -18,37 +18,24 @@
 //! [`neutrino_consensus_engine::bft_loop`]: opens a BFT session for
 //! every newly proof-ready chunk, broadcasts the local validator's
 //! signed votes, ingests peer votes, and triggers chunk finalization
-//! once the 2/3 precommit quorum is reached. Recursive checkpoint
-//! recursion is explicitly deferred under the SP1 rewrite (see
-//! doc 14).
-//!
-//! What is **not** validated yet on import:
-//!
-//! - Local re-execution of the block's `state_root`. Followers trust
-//!   the proposer's header `state_root` until the matching SP1 proof
-//!   arrives on `Topic::BlockProofs`. Pre-proof defenses include
-//!   header signature + VRF verification, timestamp drift bounds,
-//!   body-roots match, and the empty-body `runtime_extra` cross-check
-//!   in [`Engine::import_block`]. The SP1 proof verifies the rest
-//!   end-to-end before chunk BFT can finalize.
+//! after the configured precommit quorum and complete proof verification.
+//! Followers execute imported blocks through the installed executor, verify
+//! block proofs, and authenticate the full consensus boundary before proceeding.
+//! Checkpoint recursion remains unsupported.
+
+mod evidence;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use neutrino_consensus_engine::{
-    BftAction, CheckpointError, CheckpointOutcome, Engine, FinalizeError, FinalizeOutcome,
-    ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError,
-    ProveOutcome, vrf_rejection_reason,
+    BftAction, Engine, FinalizeError, FinalizeOutcome, ImportError, ProductionConfig,
+    ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
+    vrf_rejection_reason,
 };
 use neutrino_consensus_types::{
-    Block, BlockProof, Body, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof,
-    SlashingEvidence,
-};
-use neutrino_crypto::bls::{PublicKey as BlsPublicKey, Signature as BlsSignature};
-use neutrino_default_runtime_core::{
-    LeakTx, QUERY_METHOD_VALIDATOR_REGISTRATIONS, QUERY_METHOD_VALIDATOR_SET, SlashTx,
-    Transaction as RuntimeTransaction, ValidatorRegistrations, ValidatorSet,
+    Block, BlockProof, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof, SlashingEvidence,
 };
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
@@ -61,7 +48,7 @@ use neutrino_network::rpc::{
 use neutrino_network::service::NetworkCommand;
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Epoch, Hash, Height, Slot, StateRoot,
+    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
     Validator, ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
@@ -78,50 +65,20 @@ use neutrino_sync::{
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-/// Default mempool byte budget. Sized generously so the M6 default
-/// runtime's 4096-byte body buffer easily fits a handful of validated
-/// deposits per slot without rebuilding capacity tracking each tick.
+/// Maximum bytes of ordinary transactions retained in the mempool.
 const DEFAULT_MEMPOOL_CAPACITY_BYTES: usize = 256 * 1024;
 
-/// Default per-block body budget the producer drains from the mempool.
-///
-/// The runtime ELF reads up to 4096 bytes from `host_input`; the
-/// producer leaves a small slack for the `tx_count` prefix and per-tx
-/// length headers so a borderline-full mempool never bumps a single
-/// drain past the runtime's buffer.
-const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 3_500;
-
-/// Default cap on the number of slashing-evidence items pulled from
-/// the slashing pool into a single block body. Sized to leave room
-/// for transactions and validator-set operations inside the
-/// runtime's 4 KiB input buffer even when every slot drains the
-/// pool to the limit.
-const DEFAULT_BODY_SLASHING_BUDGET: usize = 32;
+/// Per-block budget for ordinary mempool transactions. Evidence receipts
+/// have a separate bounded selection path.
+const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 256 * 1024;
 
 /// Maximum number of slashing-evidence items the pool retains at any
 /// time. Once exceeded, the oldest entry (FIFO) is evicted both
 /// in-memory and from `Column::SlashingPool`. Sized to comfortably
 /// cover even an adversarial network where every validator
 /// equivocates every chunk: 1024 entries at ~16 KiB worst-case
-/// gossip size caps RAM/disk pressure at ~16 MiB. Pending-fix #5
-/// (doc 17) calls for a "configurable max-entries cap"; today this
-/// is a node-local const matching `DEFAULT_BODY_SLASHING_BUDGET`'s
-/// style. Promote to `ConsensusParams` when there is a concrete
-/// reason to vary it per chain.
+/// gossip size caps retention. Verified receipts have a separate byte-bounded cache.
 const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
-
-/// Default cap on the number of inactivity-leak transactions pulled
-/// into a single block body. Each entry is a borsh-encoded
-/// `Transaction::InactivityLeak` per non-participating validator;
-/// 128 leaves comfortable headroom for the largest realistic
-/// inactivity report from a chunk's worth of missed precommits.
-const DEFAULT_BODY_INACTIVITY_BATCH_BUDGET: usize = 128;
-
-// Per-occurrence stake-deduction amounts now live on
-// `ChainSpec.runtime.{slash_amount, inactivity_leak_amount}`
-// (`neutrino_primitives::RuntimeParams`). Defaults match the legacy
-// hard-coded values: `slash_amount = u128::MAX` (burn whatever
-// remains) and `inactivity_leak_amount = 1` (per missed precommit).
 
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
@@ -134,8 +91,11 @@ const DEFAULT_BODY_INACTIVITY_BATCH_BUDGET: usize = 128;
 /// Concurrent reads block on each other today; if that becomes a hot
 /// path the mutex can be swapped for an `RwLock`.
 pub struct ChainBackend<DB: Database, P: ProofSystem> {
-    engine: Mutex<Engine<DB>>,
-    proof_system: P,
+    engine: Arc<Mutex<Engine<DB>>>,
+    evidence_job_running: Arc<std::sync::atomic::AtomicBool>,
+    evidence_job_cursor: std::sync::atomic::AtomicUsize,
+    proof_system: Arc<P>,
+    consensus_proof_task: Mutex<Option<ConsensusProofTask<P>>>,
     mempool: Mutex<Mempool>,
     /// Channel used to publish gossip messages produced by the BFT
     /// loop (prevotes, precommits, chunk proofs, recursive proofs).
@@ -146,18 +106,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// `voter` argument to [`Engine::finalize_chunk`]. Wrapped in an
     /// [`Arc`] so async tasks can hold a snapshot without re-locking.
     local_voter: Mutex<Option<Arc<ProposerKey>>>,
-    /// In-memory pool of slashing evidence detected locally or
-    /// ingested from peers. Drained by the producer when assembling
-    /// a block body's `slashings` field. M7-D will switch this to a
-    /// persistent column once the runtime starts applying penalties.
+    /// Persistent raw reports awaiting independent EvidenceProof generation.
     slashing_pool: Mutex<SlashingPool>,
-    /// FIFO pool of encoded [`TX_INACTIVITY_LEAK_BATCH`] runtime
-    /// transactions produced after every chunk finalization.
-    /// Drained by the producer alongside the mempool into
-    /// `body.transactions`; idempotency against multi-producer
-    /// double-application is enforced by the runtime's
-    /// `leak:through` pointer.
-    inactivity_pool: Mutex<Vec<Vec<u8>>>,
     /// Dynamic-runtime executor used by [`Self::try_produce_block`].
     /// `None` leaves the producer disabled (any production attempt
     /// surfaces [`ProductionError::Executor`]); the node binary
@@ -167,349 +117,18 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     block_executor: Mutex<Option<Arc<dyn ErasedBlockExecutor>>>,
 }
 
-/// Encode a single inactivity-leak transaction for a validator
-/// identified by their 32-byte runtime address (the
-/// `withdrawal_credentials` field on the consensus-side `Validator`).
-///
-/// `amount` is the chain-spec's
-/// `runtime.inactivity_leak_amount`; the runtime clamps it to the
-/// validator's current stake. The wire layout is
-/// `borsh(Transaction::InactivityLeak(LeakTx { validator, amount }))`
-/// — exactly what [`WasmExecutor::execute_block`] decodes from each
-/// `body.transactions[i]` entry.
-fn encode_inactivity_leak_tx(validator_address: [u8; 32], amount: u128) -> Vec<u8> {
-    borsh::to_vec(&RuntimeTransaction::InactivityLeak(LeakTx {
-        validator: validator_address,
-        amount,
-    }))
-    .expect("borsh encode Transaction::InactivityLeak never fails")
-}
-
-/// Encode a single slash transaction for the validator at the
-/// supplied index in the active set. Returns `None` for evidence
-/// variants the consensus engine does not currently surface to the
-/// runtime (e.g. `LongRangeForkParticipation`, `DaCommitmentFraud`),
-/// or when the offender index is outside the active set.
-///
-/// The wire layout is `borsh(Transaction::Slash(SlashTx { validator,
-/// amount }))`, where `validator` is the offender's
-/// `withdrawal_credentials` — the 32-byte runtime address mapped to
-/// their consensus BLS pubkey through the chain spec's validator
-/// declaration.
-fn encode_slashing_as_tx(
-    evidence: &SlashingEvidence,
-    active_set: &[Validator],
-    amount: u128,
-) -> Option<Vec<u8>> {
-    let offender_index = match evidence {
-        SlashingEvidence::DoubleProposal { proposer_index, .. }
-        | SlashingEvidence::InvalidVrfClaim { proposer_index, .. } => *proposer_index,
-        SlashingEvidence::DoublePrevote {
-            validator_index, ..
-        }
-        | SlashingEvidence::DoublePrecommit {
-            validator_index, ..
-        }
-        | SlashingEvidence::LockViolation {
-            validator_index, ..
-        }
-        | SlashingEvidence::InvalidProofSigning {
-            validator_index, ..
-        }
-        | SlashingEvidence::LongRangeForkParticipation {
-            validator_index, ..
-        } => *validator_index,
-        // `DaCommitmentFraud` is deferred (post-v1) per doc 14.
-        SlashingEvidence::DaCommitmentFraud { .. } => return None,
-    };
-    let position = usize::try_from(offender_index).ok()?;
-    let validator = active_set.get(position)?;
-    let address = validator.withdrawal_credentials;
-    Some(
-        borsh::to_vec(&RuntimeTransaction::Slash(SlashTx {
-            validator: address,
-            amount,
-        }))
-        .expect("borsh encode Transaction::Slash never fails"),
-    )
-}
-
-/// Query the runtime for its current `ValidatorSet` (stake by
-/// address). Used by the rotation bridge in pending-fix #1.
-fn query_runtime_validator_set(
-    executor: &dyn ErasedBlockExecutor,
-    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Poseidon2Hasher>,
-) -> Result<ValidatorSet, String> {
-    let request = neutrino_runtime_abi::QueryRequest {
-        method: QUERY_METHOD_VALIDATOR_SET.to_string(),
-        args: Vec::new(),
-    };
-    let response = executor
-        .query(&request, state_snapshot)
-        .map_err(|err| format!("runtime validator_set query failed: {err}"))?;
-    if response.code != neutrino_runtime_abi::QueryStatus::Ok.as_u32() {
-        return Err(format!(
-            "runtime validator_set query returned status {}",
-            response.code
-        ));
-    }
-    borsh::from_slice(&response.payload)
-        .map_err(|err| format!("runtime validator_set borsh decode failed: {err}"))
-}
-
-/// Query the runtime for its current `ValidatorRegistrations` (BLS
-/// pubkey + POP keyed by address). Used by the rotation bridge in
-/// pending-fix #8.
-///
-/// Tolerates `UnknownMethod` by returning an empty registry — runtimes
-/// older than the pending-fix #8 wire bump do not implement this
-/// query, and treating "missing" as "empty" lets the bridge keep
-/// running against legacy runtimes (the activation FSM simply
-/// degenerates to "no new validators").
-fn query_runtime_validator_registrations(
-    executor: &dyn ErasedBlockExecutor,
-    state_snapshot: &neutrino_trie::Trie<neutrino_trie::Poseidon2Hasher>,
-) -> Result<ValidatorRegistrations, String> {
-    let request = neutrino_runtime_abi::QueryRequest {
-        method: QUERY_METHOD_VALIDATOR_REGISTRATIONS.to_string(),
-        args: Vec::new(),
-    };
-    let response = executor
-        .query(&request, state_snapshot)
-        .map_err(|err| format!("runtime validator_registrations query failed: {err}"))?;
-    if response.code == neutrino_runtime_abi::QueryStatus::UnknownMethod.as_u32() {
-        return Ok(ValidatorRegistrations::default());
-    }
-    if response.code != neutrino_runtime_abi::QueryStatus::Ok.as_u32() {
-        return Err(format!(
-            "runtime validator_registrations query returned status {}",
-            response.code
-        ));
-    }
-    borsh::from_slice(&response.payload)
-        .map_err(|err| format!("runtime validator_registrations borsh decode failed: {err}"))
-}
-
-/// Derive the consensus-side `effective_stake` for a validator
-/// from the activation/exit FSM (pending-fix #8). Slashed and
-/// out-of-window validators report zero so every existing
-/// `effective_stake == 0` filter excludes them naturally.
-///
-/// - `runtime_stake = Some(s)` when the runtime has an entry for
-///   the validator (saturated at `u64::MAX`).
-/// - `runtime_stake = None` when the runtime has no entry; the
-///   validator falls back to `genesis_stake` (only meaningful for
-///   chain-spec validators — runtime-registered validators always
-///   have a runtime entry because `apply_register_validator`
-///   creates one).
-fn computed_effective_stake(
-    slashed: bool,
-    activation_epoch: Epoch,
-    exit_epoch: Epoch,
-    current_epoch: Epoch,
-    runtime_stake: Option<u64>,
-    genesis_stake: u64,
-) -> u64 {
-    if slashed {
-        return 0;
-    }
-    if current_epoch < activation_epoch {
-        return 0;
-    }
-    if current_epoch >= exit_epoch {
-        return 0;
-    }
-    runtime_stake.unwrap_or(genesis_stake)
-}
-
-/// Refresh a pre-existing consensus validator entry against the
-/// runtime's current stake. Used by pass 1 of the rotation bridge.
-///
-/// The exit FSM (pending-fix #8) is engaged only for runtime-
-/// registered validators (identified by `activation_epoch > 0`):
-/// when their runtime stake drops to zero or disappears, the bridge
-/// sets `exit_epoch = current_epoch + exit_delay_epochs` once
-/// (subsequent rotations do not rewrite the field — exit is a
-/// one-shot transition).
-///
-/// Chain-spec validators (`activation_epoch == 0`) are exempt from
-/// the auto-exit FSM and keep their genesis `effective_stake` when
-/// the runtime has no entry for them; they exit only by being
-/// explicitly slashed to zero or by future operator intervention.
-fn refresh_runtime_validator(
-    validator: &Validator,
-    runtime_stake: Option<u64>,
-    current_epoch: Epoch,
-    exit_delay: Epoch,
-    chunk_id: ChunkId,
-) -> Validator {
-    let is_runtime_registered = validator.activation_epoch > 0;
-    let runtime_stake_is_zero = runtime_stake.unwrap_or(0) == 0;
-    let exit_epoch =
-        if is_runtime_registered && validator.exit_epoch == u64::MAX && runtime_stake_is_zero {
-            current_epoch.saturating_add(exit_delay)
-        } else {
-            validator.exit_epoch
-        };
-    // Fallback semantics differ for the two populations:
-    //
-    // - Runtime-registered (`activation_epoch > 0`): runtime is
-    //   authoritative. If the runtime has no entry the validator's
-    //   stake is zero — they exited or were slashed to zero. The
-    //   `exit_epoch` field records the formal exit window but the
-    //   effective stake disappears immediately.
-    // - Chain-spec (`activation_epoch == 0`): the genesis stake is
-    //   the fallback because chain-spec validators are not
-    //   auto-registered in the runtime's `validator_set` — a
-    //   missing runtime entry simply means "they never staked
-    //   through the runtime", not "they exited".
-    let fallback_stake = if is_runtime_registered {
-        0
-    } else {
-        validator.effective_stake
-    };
-    let effective_stake = computed_effective_stake(
-        validator.slashed,
-        validator.activation_epoch,
-        exit_epoch,
-        current_epoch,
-        runtime_stake,
-        fallback_stake,
-    );
-    Validator {
-        pubkey: validator.pubkey,
-        withdrawal_credentials: validator.withdrawal_credentials,
-        effective_stake,
-        slashed: validator.slashed,
-        activation_epoch: validator.activation_epoch,
-        exit_epoch,
-        last_active_chunk: chunk_id.saturating_add(1),
-    }
-}
-
-/// Pass 1 of the rotation bridge: rebuild each existing consensus
-/// validator from the runtime's current stake distribution. Joins
-/// by `withdrawal_credentials == runtime_entry.address` and
-/// engages the exit FSM for runtime-registered validators whose
-/// stake has dropped to zero.
-fn refresh_existing_active_set(
-    existing_active: &[Validator],
-    runtime_set: &ValidatorSet,
-    current_epoch: Epoch,
-    exit_delay: Epoch,
-    chunk_id: ChunkId,
-) -> Vec<Validator> {
-    let mut next = Vec::with_capacity(existing_active.len());
-    for validator in existing_active {
-        let runtime_stake = runtime_set
-            .entries
-            .iter()
-            .find(|entry| entry.address == validator.withdrawal_credentials)
-            .map(|entry| u64::try_from(entry.stake).unwrap_or(u64::MAX));
-        let updated = refresh_runtime_validator(
-            validator,
-            runtime_stake,
-            current_epoch,
-            exit_delay,
-            chunk_id,
-        );
-        next.push(updated);
-    }
-    next
-}
-
-/// Pass 2 of the rotation bridge: mint a fresh consensus validator
-/// entry for every runtime registration that is not yet in
-/// `new_active`. Verifies the BLS proof-of-possession host-side and
-/// silently drops registrations whose POP fails — they consumed
-/// gas at runtime but never enter consensus.
-fn mint_new_runtime_validators(
-    new_active: &mut Vec<Validator>,
-    registrations: &ValidatorRegistrations,
-    runtime_set: &ValidatorSet,
-    current_epoch: Epoch,
-    activation_delay: Epoch,
-    chunk_id: ChunkId,
-) {
-    for registration in &registrations.entries {
-        if new_active
-            .iter()
-            .any(|v| v.withdrawal_credentials == registration.address)
-        {
-            continue;
-        }
-        if !verify_registration_pop(registration) {
-            continue;
-        }
-
-        // Look up the runtime stake (registration always creates a
-        // `Validator` record, so this is normally present, but the
-        // FSM tolerates a 0-stake registration too — the validator
-        // simply enters with `effective_stake = 0` permanently
-        // until they receive a deposit).
-        let runtime_stake = runtime_set
-            .entries
-            .iter()
-            .find(|entry| entry.address == registration.address)
-            .map(|entry| u64::try_from(entry.stake).unwrap_or(u64::MAX));
-
-        let activation_epoch = current_epoch.saturating_add(activation_delay);
-        let minted = Validator {
-            pubkey: registration.bls_pubkey,
-            withdrawal_credentials: registration.address,
-            // Derived: 0 until activation, runtime_stake after.
-            effective_stake: computed_effective_stake(
-                /* slashed       */ false,
-                /* activation    */ activation_epoch,
-                /* exit          */ u64::MAX,
-                /* current_epoch */ current_epoch,
-                /* runtime_stake */ runtime_stake,
-                /* genesis_stake */ 0,
+type ConsensusProofTask<P> = (
+    ChunkId,
+    tokio::task::JoinHandle<
+        Result<
+            (
+                neutrino_prover_chunk::consensus::ConsensusWitness,
+                <P as ProofSystem>::ChunkProof,
             ),
-            slashed: false,
-            activation_epoch,
-            exit_epoch: u64::MAX,
-            last_active_chunk: chunk_id.saturating_add(1),
-        };
-        trace!(
-            address = ?registration.address,
-            activation_epoch,
-            current_epoch,
-            "minted runtime-registered consensus validator entry"
-        );
-        new_active.push(minted);
-    }
-}
-
-/// Verify the BLS proof-of-possession stored on `registration`.
-/// Returns `false` on malformed bytes or POP verification failure;
-/// emits a debug log explaining why the registration was filtered.
-fn verify_registration_pop(
-    registration: &neutrino_default_runtime_core::ValidatorRegistration,
-) -> bool {
-    let Ok(pk) = BlsPublicKey::from_bytes(&registration.bls_pubkey) else {
-        debug!(
-            address = ?registration.address,
-            "skipping validator registration with malformed BLS pubkey"
-        );
-        return false;
-    };
-    let Ok(pop) = BlsSignature::from_bytes(&registration.pop_signature) else {
-        debug!(
-            address = ?registration.address,
-            "skipping validator registration with malformed BLS pop signature"
-        );
-        return false;
-    };
-    if pk.verify_pop(&pop).is_err() {
-        debug!(
-            address = ?registration.address,
-            "skipping validator registration with invalid proof-of-possession"
-        );
-        return false;
-    }
-    true
-}
+            neutrino_proof_system::ProofError,
+        >,
+    >,
+);
 
 /// Outcome of a single `SlashingPool::insert`. Returned to the
 /// caller (a `ChainBackend` helper) so the on-disk
@@ -627,7 +246,13 @@ where
     /// original FIFO order is not preserved across restart, which
     /// is semantically fine because slashing outcomes do not depend
     /// on the order evidence is observed.
-    pub fn new(engine: Engine<DB>, proof_system: P) -> Self {
+    pub fn new(mut engine: Engine<DB>, proof_system: P) -> Self {
+        if let (Some(block), Some(evidence)) = (
+            proof_system.consensus_block_key(),
+            proof_system.evidence_key(),
+        ) {
+            engine.set_evidence_programs(block, evidence);
+        }
         let mut slashing_pool = SlashingPool::default();
         let persisted = engine
             .store()
@@ -641,13 +266,15 @@ where
             });
         slashing_pool.load_from_disk(persisted);
         Self {
-            engine: Mutex::new(engine),
-            proof_system,
+            engine: Arc::new(Mutex::new(engine)),
+            evidence_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            evidence_job_cursor: std::sync::atomic::AtomicUsize::new(0),
+            proof_system: Arc::new(proof_system),
+            consensus_proof_task: Mutex::new(None),
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(slashing_pool),
-            inactivity_pool: Mutex::new(Vec::new()),
             block_executor: Mutex::new(None),
         }
     }
@@ -717,16 +344,13 @@ where
     /// proof passes verification.
     ///
     /// Used by [`Self::ingest_slashing_evidence`] to drop dishonest
-    /// `InvalidProofSigning` claims: if the carried proof actually
-    /// verifies, the evidence's claim that it was rejected is
-    /// false.
-    fn block_proof_verifies(&self, proof: &BlockProof) -> bool {
-        let Ok(backend_proof) = borsh::from_slice::<P::BlockProof>(&proof.proof_bytes) else {
-            return false;
-        };
-        self.proof_system
-            .verify_block(&backend_proof, &proof.public_inputs)
-            .is_ok()
+    /// `InvalidProofSigning` claims. A backend error or lack of support
+    /// cannot establish an objective rejection.
+    fn block_proof_objectively_rejected(&self, proof: &BlockProof) -> bool {
+        matches!(
+            self.proof_system.classify_block_rejection(proof),
+            Ok(Some(_))
+        )
     }
 
     fn block_executor_snapshot(&self) -> Option<Arc<dyn ErasedBlockExecutor>> {
@@ -742,12 +366,13 @@ where
     ///
     /// Without a publisher the engine still ingests peer votes into
     /// [`Engine::observe_finality_vote`] but emits no broadcast
-    /// traffic. M5 single-node tests deliberately leave this unset.
+    /// traffic. Isolated tests can leave this unset.
     pub fn set_network_publisher(&self, publisher: mpsc::Sender<NetworkCommand>) {
         *self
             .network_publisher
             .lock()
             .expect("ChainBackend network_publisher poisoned") = Some(publisher);
+        self.start_evidence_jobs();
     }
 
     /// Install the local validator's BLS key used by the BFT loop to
@@ -755,10 +380,8 @@ where
     /// `voter` argument to [`Engine::finalize_chunk`] when the loop
     /// finalises a chunk on a `QuorumReached` action.
     ///
-    /// Calling this method enables the multi-validator BFT-driven
-    /// finalize path; leaving it unset keeps the M5 single-node
-    /// fallback (the producer calls [`Self::finalize_chunk`] manually
-    /// and the engine synthesises a single-validator vote).
+    /// Without a local key this backend follows the chain without signing
+    /// or initiating BFT finalization.
     pub fn set_local_voter(&self, voter: ProposerKey) {
         self.with_engine_mut(|engine| engine.set_local_voter(voter.clone()));
         *self
@@ -818,7 +441,7 @@ where
     /// and swallowed — the in-memory drain has already happened, so
     /// the producer either commits the drained items in the next
     /// block (the disk row will be overwritten / deleted on the
-    /// next drain), or `restore_to_slashing_pool` re-persists them.
+    /// next drain), and removes them from persistent storage.
     pub fn drain_slashing_pool(&self, max: usize) -> Vec<SlashingEvidence> {
         let drained = self
             .slashing_pool
@@ -886,9 +509,15 @@ where
     /// it once. Persists the new entry to [`Column::SlashingPool`]
     /// so it survives a node restart (pending-fix #5).
     async fn pool_and_gossip_slashing(&self, evidence: SlashingEvidence) {
+        if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence
+            && !self.block_proof_objectively_rejected(rejected_proof)
+        {
+            return;
+        }
         if !self.insert_persistent(&evidence) {
             return;
         }
+        self.start_evidence_jobs();
         let Some(publisher) = self.publisher_snapshot() else {
             return;
         };
@@ -941,36 +570,21 @@ where
         slot: Slot,
         proposer: &ProposerKey,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
-        // Body transaction order: slash transactions (from drained
-        // slashing evidence) first, then inactivity-leak transactions,
-        // then mempool transactions. Consensus-driven entries are
-        // prepended so a saturated mempool cannot starve them out.
-        // Each entry is a borsh-encoded `Transaction` envelope the
-        // WASM executor decodes one-by-one; `body.slashings` is also
-        // kept on the wire for header-root commitment and peer
-        // verification.
-        let drained_inactivity = self.drain_inactivity_pool(DEFAULT_BODY_INACTIVITY_BATCH_BUDGET);
+        self.start_evidence_jobs();
+        if self.proof_system.consensus_block_key().is_some()
+            && !self.with_engine(|e| {
+                let next_chunk = e
+                    .latest_finalized_chunk_id()
+                    .map_or(Some(0), |id| id.checked_add(1));
+                e.head_height()
+                    .checked_div(e.chain_spec().consensus.chunk_size)
+                    == next_chunk
+            })
+        {
+            return Ok(None);
+        }
         let drained_mempool = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
-        let drained_hashes: Vec<Hash> = drained_mempool.iter().map(|tx| blake3_256(tx)).collect();
-        let drained_slashings = self.drain_slashing_pool(DEFAULT_BODY_SLASHING_BUDGET);
-        let (active_set, slash_amount) = self.with_engine(|e| {
-            (
-                e.active_validator_set().to_vec(),
-                e.chain_spec().runtime.slash_amount,
-            )
-        });
-        let slash_txs: Vec<Vec<u8>> = drained_slashings
-            .iter()
-            .filter_map(|evidence| encode_slashing_as_tx(evidence, &active_set, slash_amount))
-            .collect();
-        let mut all_txs = slash_txs;
-        all_txs.extend(drained_inactivity.iter().cloned());
-        all_txs.extend(drained_mempool.iter().cloned());
-        let body = Body {
-            transactions: all_txs,
-            slashings: drained_slashings.clone(),
-            ..Body::default()
-        };
+        let (body, included_mempool) = self.select_evidence_body(&drained_mempool);
         // The executor lives behind an `Arc<dyn ErasedBlockExecutor>`
         // so we can hold a snapshot across the engine mutex without
         // poisoning. Production fails fast if no executor has been
@@ -983,228 +597,61 @@ where
             },
             |executor| {
                 self.with_engine_mut(|e| {
+                    if let Some(key) = self.proof_system.consensus_block_key() {
+                        let height = e.head_height().checked_add(1).ok_or_else(|| {
+                            ProductionError::Executor("height overflow".to_owned())
+                        })?;
+                        e.authorize_consensus_body(
+                            height,
+                            e.head_hash(),
+                            &body,
+                            e.chain_spec().genesis_gas_limit,
+                            &key,
+                        )
+                        .map_err(|err| ProductionError::Executor(err.to_string()))?;
+                    }
                     let gas_limit = e.chain_spec().genesis_gas_limit;
                     let cfg = ProductionConfig { proposer };
                     e.try_produce_block(slot, cfg, body, gas_limit, executor.as_ref())
                 })
             },
         );
-        // On Ok(Some) the engine consumed the body — the drained
-        // transactions, slashings, and inactivity leaks are now
-        // committed. On Ok(None) (not eligible) the engine did not
-        // touch the body; on Err the engine rejected. Restore every
-        // drained pool in either non-success case so the next slot
-        // can retry them.
-        if !matches!(&result, Ok(Some(_))) {
+        if matches!(&result, Ok(Some(_))) {
+            self.restore_to_mempool(drained_mempool.into_iter().skip(included_mempool).collect());
+        } else {
             self.restore_to_mempool(drained_mempool);
-            self.restore_to_slashing_pool(&drained_slashings);
-            self.restore_to_inactivity_pool(drained_inactivity);
         }
-        let _ = drained_hashes; // hashes are only useful for log filtering today
         result
     }
 
-    /// Re-pool evidence that was drained for production but the
-    /// engine refused to commit. Re-persists each item to
-    /// [`Column::SlashingPool`] so a crash between drain and
-    /// production still preserves the evidence on disk.
-    fn restore_to_slashing_pool(&self, evidence: &[SlashingEvidence]) {
-        for item in evidence {
-            // `insert_persistent` already handles in-memory dedup,
-            // FIFO cap eviction, and on-disk sync — the same path
-            // every other pool-write site uses.
-            let _ = self.insert_persistent(item);
-        }
-    }
-
-    fn restore_to_inactivity_pool(&self, batches: Vec<Vec<u8>>) {
-        let mut pool = self
-            .inactivity_pool
-            .lock()
-            .expect("ChainBackend inactivity_pool poisoned");
-        // Restore at the head to preserve the original FIFO order.
-        let mut combined = batches;
-        combined.append(&mut pool);
-        *pool = combined;
-    }
-
-    /// Number of inactivity-leak batches currently pooled.
-    #[must_use]
-    pub fn inactivity_pool_len(&self) -> usize {
-        self.inactivity_pool
-            .lock()
-            .expect("ChainBackend inactivity_pool poisoned")
-            .len()
-    }
-
-    /// Drain up to `max` inactivity-leak batches in FIFO order.
-    /// Used by the producer when assembling a block body's
-    /// transaction list.
-    pub fn drain_inactivity_pool(&self, max: usize) -> Vec<Vec<u8>> {
-        let mut pool = self
-            .inactivity_pool
-            .lock()
-            .expect("ChainBackend inactivity_pool poisoned");
-        let take = max.min(pool.len());
-        pool.drain(..take).collect()
-    }
-
-    /// Compute and pool the inactivity-leak transactions for `chunk_id`.
-    ///
-    /// One borsh-encoded `Transaction::InactivityLeak(LeakTx)` is
-    /// produced per non-participating validator, keyed by that
-    /// validator's `withdrawal_credentials` (the 32-byte runtime
-    /// address mapped to their consensus BLS pubkey through the
-    /// chain spec). Each transaction lands in the next produced
-    /// block's `body.transactions` lane where the WASM executor
-    /// decodes and applies it through `apply_leak`.
-    fn pool_inactivity_leak_for(&self, chunk_id: ChunkId) {
-        let report = self.with_engine(|e| e.compute_inactivity_report(chunk_id));
-        let Ok(report) = report else {
-            return;
-        };
-        if report.is_empty() {
-            return;
-        }
-        let (addresses, leak_amount) = self.with_engine(|e| {
-            let active = e.active_validator_set();
-            let addrs = report
-                .iter()
-                .filter_map(|idx| {
-                    let pos = usize::try_from(*idx).ok()?;
-                    active.get(pos).map(|v| v.withdrawal_credentials)
-                })
-                .collect::<Vec<_>>();
-            (addrs, e.chain_spec().runtime.inactivity_leak_amount)
-        });
-        if addresses.is_empty() {
-            return;
-        }
-        let mut pool = self
-            .inactivity_pool
-            .lock()
-            .expect("ChainBackend inactivity_pool poisoned");
-        for address in addresses {
-            pool.push(encode_inactivity_leak_tx(address, leak_amount));
-        }
-    }
-
-    /// Pending-fix #1 + #8: rebuild the engine's active validator set
-    /// from the runtime's post-chunk stake distribution and persist
-    /// the snapshot effective at `chunk_id + 1`.
-    ///
-    /// The bridge runs three reconciliation passes against the
-    /// runtime state, executed under a single executor snapshot so
-    /// they all observe the same post-finalize-chunk view:
-    ///
-    /// 1. **Stake refresh.** Every existing consensus validator's
-    ///    `effective_stake` is recomputed from the runtime's
-    ///    `validator_set` query, joined by
-    ///    `withdrawal_credentials == runtime_entry.address`.
-    /// 2. **Activation FSM (pending-fix #8).** Runtime-side
-    ///    `RegisterValidator` transactions appear in the
-    ///    `validator_registrations` query result with a BLS pubkey +
-    ///    proof-of-possession. For every registration the bridge
-    ///    has not yet seen, the BLS POP is verified host-side; on
-    ///    success a fresh consensus [`Validator`] is minted with
-    ///    `activation_epoch = current_epoch +
-    ///    consensus.activation_delay_epochs` and
-    ///    `effective_stake = 0`. The validator becomes
-    ///    consensus-eligible only after the activation epoch is
-    ///    reached.
-    /// 3. **Exit FSM (pending-fix #8).** Runtime-registered
-    ///    validators (those born with `activation_epoch > 0`) whose
-    ///    runtime stake has dropped to zero have their `exit_epoch`
-    ///    set to `current_epoch + consensus.exit_delay_epochs`
-    ///    (one-shot — the exit_epoch is not rewritten on
-    ///    subsequent rotations). Chain-spec validators
-    ///    (`activation_epoch == 0`) are exempt from the auto-exit
-    ///    FSM and keep their genesis stake when the runtime has no
-    ///    entry for them.
-    ///
-    /// The final `effective_stake` reported to consensus is derived
-    /// per-validator from
-    /// `(runtime_stake, current_epoch, activation_epoch, exit_epoch,
-    /// slashed)` via [`computed_effective_stake`]. Because every
-    /// existing eligibility filter already excludes
-    /// `effective_stake == 0`, the activation/exit FSM needs no
-    /// changes to the VRF, BFT, or aggregator-selection code paths.
-    ///
-    /// Returns silently when the local node has no executor installed
-    /// (test backends that exercise gossip without a runtime).
-    ///
-    /// # Errors
-    ///
-    /// Surfaces store / query / POP-verification failures as
-    /// descriptive strings so the caller can log them without
-    /// re-deriving the error type.
-    pub fn rotate_active_validator_set_for_chunk(&self, chunk_id: ChunkId) -> Result<(), String> {
-        let Some(executor) = self.block_executor_snapshot() else {
-            // No runtime attached (e.g. gossip-only test backend).
-            // The active set stays at its previous value.
+    fn authorize_incoming_consensus_body(&self, block: &Block) -> Result<(), SyncBackendError> {
+        let Some(key) = self.proof_system.consensus_block_key() else {
             return Ok(());
         };
-
-        // Capture the live trie + existing active set + epoch params
-        // under one engine-mutex acquisition so the queries observe a
-        // consistent post-finalize-chunk snapshot.
-        let (state_snapshot, existing_active, epoch_length_in_chunks, activation_delay, exit_delay) =
-            self.with_engine(|e| {
-                let consensus = &e.chain_spec().consensus;
-                (
-                    e.state().clone(),
-                    e.active_validator_set().to_vec(),
-                    consensus.epoch_length_in_chunks,
-                    consensus.activation_delay_epochs,
-                    consensus.exit_delay_epochs,
+        self.with_engine(|engine| {
+            let next = engine
+                .latest_finalized_chunk_id()
+                .map_or(Some(0), |id| id.checked_add(1));
+            let chunk = block
+                .header
+                .height
+                .checked_sub(1)
+                .and_then(|h| h.checked_div(engine.chain_spec().consensus.chunk_size));
+            if chunk != next {
+                return Err(SyncBackendError::ChainBehind(
+                    "waiting for the previous complete chunk proof".to_owned(),
+                ));
+            }
+            engine
+                .authorize_consensus_body(
+                    block.header.height,
+                    block.header.parent_hash,
+                    &block.body,
+                    block.header.gas_limit,
+                    &key,
                 )
-            });
-
-        // The new active set takes effect at the start of chunk
-        // `chunk_id + 1`. Its first block has height
-        // `(chunk_id + 1) * chunk_size`, putting it in epoch
-        // `(chunk_id + 1) / epoch_length_in_chunks`. Activation /
-        // exit deadlines are measured against this anchor.
-        let current_epoch: Epoch = chunk_id
-            .saturating_add(1)
-            .checked_div(epoch_length_in_chunks)
-            .unwrap_or(0);
-
-        let runtime_set: ValidatorSet = query_runtime_validator_set(&*executor, &state_snapshot)?;
-        let registrations: ValidatorRegistrations =
-            query_runtime_validator_registrations(&*executor, &state_snapshot)?;
-
-        let mut new_active = refresh_existing_active_set(
-            &existing_active,
-            &runtime_set,
-            current_epoch,
-            exit_delay,
-            chunk_id,
-        );
-        mint_new_runtime_validators(
-            &mut new_active,
-            &registrations,
-            &runtime_set,
-            current_epoch,
-            activation_delay,
-            chunk_id,
-        );
-
-        // No-op if the new set is byte-identical to the previous one
-        // (steady-state common case: chunk had no runtime stake or
-        // registration mutations). Saves a snapshot write per chunk.
-        if new_active == existing_active {
-            return Ok(());
-        }
-
-        let effective_at = chunk_id.saturating_add(1);
-        self.with_engine_mut(|e| e.set_active_validator_set(effective_at, new_active))
-            .map_err(|err| format!("set_active_validator_set failed: {err}"))?;
-        trace!(
-            chunk_id,
-            effective_at, current_epoch, "rotated consensus active validator set"
-        );
-        Ok(())
+                .map_err(|err| SyncBackendError::Rejected(err.to_string()))
+        })
     }
 
     /// Submit a peer-supplied transaction into the local mempool.
@@ -1316,7 +763,7 @@ where
         &self,
         block_hash: &BlockHash,
     ) -> Result<ProveOutcome, ProveError<DB::Error>> {
-        self.with_engine_mut(|e| e.prove_block(block_hash, &self.proof_system))
+        self.with_engine_mut(|e| e.prove_block(block_hash, self.proof_system.as_ref()))
     }
 
     /// Finalize chunk `chunk_id` against the local engine state.
@@ -1334,23 +781,7 @@ where
         chunk_id: u64,
         voter: &ProposerKey,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        self.with_engine_mut(|e| e.finalize_chunk(chunk_id, &[], &self.proof_system, voter))
-    }
-
-    /// Fold chunk `chunk_id` into a recursive checkpoint.
-    ///
-    /// Called immediately after [`Self::finalize_chunk`] so the
-    /// producer can publish both artifacts in lock-step.
-    ///
-    /// # Errors
-    ///
-    /// Surfaces any [`CheckpointError`] variant raised by
-    /// [`Engine::checkpoint_chunk`].
-    pub fn checkpoint_chunk(
-        &self,
-        chunk_id: u64,
-    ) -> Result<CheckpointOutcome, CheckpointError<DB::Error>> {
-        self.with_engine_mut(|e| e.checkpoint_chunk(chunk_id, &[], &self.proof_system))
+        self.with_engine_mut(|e| e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter))
     }
 
     /// Current head height, snapshotted under the engine mutex.
@@ -1582,7 +1013,24 @@ where
         if self.with_engine(|e| e.bft_session(chunk_id).is_some()) {
             return;
         }
-        let chunk = match self.with_engine(|e| e.assemble_chunk(chunk_id)) {
+        let assembled = if self.proof_system.consensus_block_key().is_some() {
+            self.with_engine(|e| {
+                let prepared = e.prepare_consensus_chunk(chunk_id, self.proof_system.as_ref())?;
+                let candidate =
+                    neutrino_prover_chunk::consensus::validate_candidate(&prepared.witness)
+                        .map_err(|_| {
+                            neutrino_consensus_engine::FinalizeError::Backend(
+                                neutrino_proof_system::ProofError::InvalidWitness,
+                            )
+                        })?;
+                Ok(Some(neutrino_prover_chunk::consensus::as_chunk(
+                    &candidate.execution,
+                )))
+            })
+        } else {
+            self.with_engine(|e| e.assemble_chunk(chunk_id))
+        };
+        let chunk = match assembled {
             Ok(Some(chunk)) => chunk,
             Ok(None) => return,
             Err(err) => {
@@ -1590,7 +1038,10 @@ where
                 return;
             }
         };
-        let actions = match self.with_engine_mut(|e| e.open_bft_session(chunk)) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let actions = match self.with_engine_mut(|e| e.open_bft_session_at(chunk, now_secs)) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(chunk_id, ?err, "open_bft_session failed");
@@ -1660,6 +1111,21 @@ where
     /// timeout window. Tests pass a deterministic `now_secs` to
     /// drive scenarios.
     pub async fn tick_bft_round_timeouts(&self, now_secs: u64) {
+        self.poll_consensus_proof().await;
+        if self.proof_system.consensus_block_key().is_some() {
+            let ready = self.with_engine(|engine| {
+                let next = engine
+                    .latest_finalized_chunk_id()
+                    .map_or(0, |id| id.saturating_add(1));
+                engine
+                    .bft_session(next)
+                    .filter(|session| session.precommit_quorum_observed())
+                    .map(|_| next)
+            });
+            if let Some(chunk_id) = ready {
+                self.handle_quorum_reached(chunk_id).await;
+            }
+        }
         let actions = match self.with_engine_mut(|e| e.tick_bft_round_timeouts(now_secs)) {
             Ok(actions) => actions,
             Err(err) => {
@@ -1672,43 +1138,99 @@ where
         }
     }
 
-    /// Drive the engine through chunk finalization once the BFT loop
-    /// reports a 2/3 precommit quorum. The chunk proof aggregation and
-    /// recursive checkpoint paths are explicitly deferred by the SP1
-    /// rewrite (see `docs/design/13-sp1-runtime-proof-rewrite.md`), so
-    /// this handler no longer produces or gossips those artifacts; it
-    /// transitions the chunk's blocks to `BlockState::Finalized`,
-    /// pools any inactivity-leak transactions, and (per pending-fix
-    /// #1) rotates the consensus active validator set against the
-    /// runtime's post-chunk stake distribution.
-    #[allow(clippy::unused_async)] // Trait contract preserves async signature for future host I/O.
+    /// Start complete proving after BFT without blocking the network task.
+    #[allow(clippy::unused_async)]
     async fn handle_quorum_reached(&self, chunk_id: ChunkId) {
         let Some(voter) = self.local_voter() else {
-            debug!(chunk_id, "QuorumReached but no local voter configured");
             return;
         };
-        if let Err(err) =
-            self.with_engine_mut(|e| e.finalize_chunk(chunk_id, &[], &self.proof_system, &voter))
-        {
-            warn!(chunk_id, error = %err, "chunk finalisation failed");
+        self.start_consensus_proof(chunk_id, &voter);
+    }
+
+    /// Proving runs on a blocking worker with no engine mutex held. Rechecking
+    /// the incoming anchor during commit rejects a stale or competing result.
+    fn start_consensus_proof(&self, chunk_id: ChunkId, voter: &ProposerKey) {
+        let mut running = self
+            .consensus_proof_task
+            .lock()
+            .expect("proof task mutex poisoned");
+        if running.is_some() {
             return;
         }
+        let prepared = self.with_engine_mut(|engine| {
+            let mut prepared =
+                engine.prepare_consensus_chunk(chunk_id, self.proof_system.as_ref())?;
+            engine.certify_consensus_chunk(&mut prepared, voter)?;
+            Ok::<_, neutrino_consensus_engine::FinalizeError<DB::Error>>(prepared)
+        });
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(chunk_id, %error, "complete chunk preparation failed");
+                return;
+            }
+        };
+        let prover = Arc::clone(&self.proof_system);
+        let task = tokio::task::spawn_blocking(move || {
+            let proof = prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
+            Ok::<_, neutrino_proof_system::ProofError>((prepared.witness, proof))
+        });
+        *running = Some((chunk_id, task));
+    }
 
-        // M7-D.3: derive the inactivity report from the freshly-
-        // persisted finality cert and pool a leak batch so the next
-        // block the local node produces applies the penalty
-        // on-chain. The runtime's `leak:through` pointer guards
-        // against multi-producer double-application across the
-        // network.
-        self.pool_inactivity_leak_for(chunk_id);
-
-        // Pending-fix #1: cross-layer validator-set rotation. After
-        // chunk K finalises, the runtime's stake mutations through
-        // the chunk's transactions are committed; query the runtime
-        // for the post-chunk validator set and update the consensus
-        // active set effective at chunk K+1.
-        if let Err(err) = self.rotate_active_validator_set_for_chunk(chunk_id) {
-            warn!(chunk_id, error = %err, "active-set rotation failed");
+    /// Collect only finished work; proof failures leave the BFT session for retry.
+    async fn poll_consensus_proof(&self) {
+        let completed = {
+            let mut running = self
+                .consensus_proof_task
+                .lock()
+                .expect("proof task mutex poisoned");
+            if running.as_ref().is_some_and(|(_, task)| task.is_finished()) {
+                running.take()
+            } else {
+                None
+            }
+        };
+        let Some((chunk_id, task)) = completed else {
+            return;
+        };
+        let (witness, proof) = match task.await {
+            Ok(Ok(result)) => result,
+            other => {
+                warn!(
+                    chunk_id,
+                    ?other,
+                    "complete chunk proving failed; finality not persisted"
+                );
+                return;
+            }
+        };
+        let outcome = self.with_engine_mut(|engine| {
+            engine.commit_consensus_chunk(&witness, &proof, self.proof_system.as_ref())
+        });
+        match outcome {
+            Ok(outcome) => {
+                self.start_evidence_jobs();
+                let publisher = self
+                    .network_publisher
+                    .lock()
+                    .expect("publisher mutex poisoned")
+                    .clone();
+                if let Some(publisher) = publisher {
+                    match borsh::to_vec(&outcome.chunk_proof) {
+                        Ok(data) => {
+                            let _ = publisher
+                                .send(NetworkCommand::Publish {
+                                    topic: Topic::ChunkProofs,
+                                    data,
+                                })
+                                .await;
+                        }
+                        Err(error) => warn!(chunk_id, %error, "chunk proof encoding failed"),
+                    }
+                }
+            }
+            Err(error) => warn!(chunk_id, %error, "complete chunk commit rejected"),
         }
     }
 
@@ -1755,6 +1277,53 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
     P: ProofSystem + Send + Sync + 'static,
 {
+    async fn consensus_sync_target(
+        &self,
+    ) -> Result<Option<neutrino_sync::backend::ConsensusSyncTarget>, SyncBackendError> {
+        self.poll_consensus_proof().await;
+        if self.proof_system.consensus_block_key().is_none() {
+            return Ok(None);
+        }
+        self.with_engine(|engine| {
+            let chunk_id = engine
+                .latest_finalized_chunk_id()
+                .map_or(Some(0), |id| id.checked_add(1))
+                .ok_or_else(|| SyncBackendError::Rejected("chunk overflow".to_owned()))?;
+            let size = engine.chain_spec().consensus.chunk_size;
+            let end_height = chunk_id
+                .checked_add(1)
+                .and_then(|id| id.checked_mul(size))
+                .ok_or_else(|| SyncBackendError::Rejected("height overflow".to_owned()))?;
+            let start = end_height - size + 1;
+            let mut next_proof = start;
+            for height in start..=end_height {
+                let Some(header) = engine
+                    .store()
+                    .get_header_by_height(height)
+                    .map_err(Self::map_store_err)?
+                else {
+                    break;
+                };
+                if engine
+                    .store()
+                    .get_block_proof(&header.hash())
+                    .map_err(Self::map_store_err)?
+                    .is_none()
+                {
+                    break;
+                }
+                next_proof = height
+                    .checked_add(1)
+                    .ok_or_else(|| SyncBackendError::Rejected("height overflow".to_owned()))?;
+            }
+            Ok(Some(neutrino_sync::backend::ConsensusSyncTarget {
+                chunk_id,
+                end_height,
+                next_header: engine.head_height().saturating_add(1),
+                next_proof,
+            }))
+        })
+    }
     async fn local_status(&self) -> Status {
         self.with_engine(|e| {
             let head_slot = e
@@ -1769,7 +1338,7 @@ where
             // 0..N have been BFT-finalized) by adding 1 to the latest
             // finalized chunk id when present. Recursive checkpoint
             // proofs are deferred (see
-            // docs/design/13-sp1-runtime-proof-rewrite.md).
+            // docs/design/10-proof-system.md).
             let (finalized_index, finalized_chunk) =
                 e.latest_finalized_chunk_id().map_or((0, None), |chunk_id| {
                     (
@@ -1936,11 +1505,8 @@ where
     }
 
     async fn state_nodes(&self, root: StateRoot, _paths: &[Vec<u8>]) -> StateByRootResponse {
-        // M6 nodes serve a full dump of the persisted trie when the
-        // requested root matches the local head's state root. Real
-        // path-walking + per-path streaming arrives with M12 snap
-        // sync; for the M6 default runtime (a counter at a fixed
-        // key) the entire state easily fits in one RPC.
+        // Serve a bounded full-trie dump at the current head root. Sparse
+        // path streaming is not implemented by this endpoint.
         self.with_engine(|e| {
             if e.head_state_root() != root {
                 debug!(
@@ -2054,7 +1620,7 @@ where
         let mut last: Option<CheckpointsImported> = None;
         for (_cp, proof) in items {
             let outcome = self
-                .with_engine_mut(|e| e.import_recursive_proof(&proof, &self.proof_system))
+                .with_engine_mut(|e| e.import_recursive_proof(&proof, self.proof_system.as_ref()))
                 .map_err(Self::map_import_err)?;
             last = Some(CheckpointsImported {
                 new_finalized_index: outcome.checkpoint_index,
@@ -2081,6 +1647,7 @@ where
         let executor = self.block_executor_snapshot();
         let mut last: Option<HeadersImported> = None;
         for block in blocks {
+            self.authorize_incoming_consensus_body(&block)?;
             let block_ref = &block;
             let import_result = executor.as_ref().map_or_else(
                 || self.with_engine_mut(|e| e.import_block(block_ref)),
@@ -2145,12 +1712,16 @@ where
             // backends keep the prior behaviour.
             let proof_ref = &proof;
             let import_result = self.block_executor_snapshot().map_or_else(
-                || self.with_engine_mut(|e| e.import_block_proof(proof_ref, &self.proof_system)),
+                || {
+                    self.with_engine_mut(|e| {
+                        e.import_block_proof(proof_ref, self.proof_system.as_ref())
+                    })
+                },
                 |executor| {
                     self.with_engine_mut(|e| {
                         e.import_block_proof_with_dry_run(
                             proof_ref,
-                            &self.proof_system,
+                            self.proof_system.as_ref(),
                             executor.as_ref(),
                         )
                     })
@@ -2178,6 +1749,7 @@ where
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
+        self.authorize_incoming_consensus_body(&block)?;
         // Slashing detection runs first: a peer that gossips a
         // validly-signed but non-extending header (e.g. an
         // equivocating block we already reorg'd past) must still be
@@ -2241,10 +1813,54 @@ where
         &self,
         proof: ChunkProof,
     ) -> Result<ChunkProofImported, SyncBackendError> {
+        {
+            let certificate = &proof.finality_cert;
+            let chunk = neutrino_prover_chunk::consensus::as_chunk(
+                &neutrino_prover_chunk::execution::ExecutionStatement {
+                    chunk: proof.public_inputs.clone(),
+                    context_hash: [0; 32],
+                    block_guest_vk_digest: [0; 8],
+                },
+            );
+            let evidence = self
+                .with_engine_mut(|engine| {
+                    engine.observe_certificate_for_slashing(&chunk, certificate)
+                })
+                .unwrap_or_default();
+            for item in evidence {
+                self.pool_and_gossip_slashing(item).await;
+            }
+        }
+        if self.proof_system.consensus_block_key().is_some() {
+            self.with_engine(|engine| {
+                if engine
+                    .latest_finalized_chunk_id()
+                    .is_some_and(|id| id >= proof.chunk_id)
+                {
+                    return Err(SyncBackendError::NotAvailable(
+                        "chunk already finalized".to_owned(),
+                    ));
+                }
+                let next = engine
+                    .latest_finalized_chunk_id()
+                    .map_or(Some(0), |id| id.checked_add(1));
+                if next != Some(proof.chunk_id)
+                    || engine.head_height() < proof.public_inputs.end_height
+                {
+                    return Err(SyncBackendError::ChainBehind(
+                        "chunk dependencies are not available yet".to_owned(),
+                    ));
+                }
+                Ok(())
+            })?;
+        }
         let chunk_id = proof.chunk_id;
         let outcome = self
-            .with_engine_mut(|e| e.import_chunk_proof(&proof, &self.proof_system))
+            .with_engine_mut(|e| e.import_chunk_proof(&proof, self.proof_system.as_ref()))
             .map_err(Self::map_import_err)?;
+        if self.proof_system.consensus_block_key().is_some() {
+            self.start_evidence_jobs();
+        }
         debug!(
             chunk_id,
             end_height = outcome.end_height,
@@ -2263,15 +1879,15 @@ where
             ?vote.data.phase,
             "received finality vote"
         );
-        // Slashing detection observes single-signer votes; aggregated
-        // votes silently return Ok(None) and are routed through
-        // observe_finality_vote only.
-        if let Ok(Some(evidence)) = self.with_engine_mut(|e| e.observe_vote_for_slashing(&vote)) {
-            self.pool_and_gossip_slashing(evidence).await;
+        // Signed attestations preserve individual attribution through aggregation.
+        if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
+            for item in evidence {
+                self.pool_and_gossip_slashing(item).await;
+            }
         }
         // M7-new InvalidProofSigning detector: a peer precommit
-        // that names a chunk covering a locally-rejected proof is
-        // slashable. Each detected entry carries the rejected
+        // with a signed attestation accepting the exact locally-rejected
+        // proof envelope is slashable. A plain precommit is insufficient. Each detected entry carries the rejected
         // `BlockProof` so any replayer can independently re-run
         // `proof_system.verify_block` and confirm the rejection.
         let invalid_proof_evidence = self
@@ -2302,8 +1918,10 @@ where
             ?vote.data.phase,
             "received aggregate finality vote"
         );
-        if let Ok(Some(evidence)) = self.with_engine_mut(|e| e.observe_vote_for_slashing(&vote)) {
-            self.pool_and_gossip_slashing(evidence).await;
+        if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
+            for item in evidence {
+                self.pool_and_gossip_slashing(item).await;
+            }
         }
         let invalid_proof_evidence = self
             .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
@@ -2321,6 +1939,13 @@ where
         self.handle_bft_actions(actions).await;
     }
 
+    async fn ingest_evidence_proof(
+        &self,
+        artifact: neutrino_consensus_types::evidence::EvidenceArtifact,
+    ) -> neutrino_sync::EvidenceProofAcceptance {
+        self.accept_evidence_artifact(artifact).await
+    }
+
     async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {
         // Verify the peer-supplied evidence cryptographically before
         // pooling it: a forged claim must not poison the pool that
@@ -2329,7 +1954,14 @@ where
         // mesh-wide propagation and the M7-B detector already
         // gossipped locally-detected items via
         // `pool_and_gossip_slashing`.
-        if let Err(err) = self.with_engine(|e| e.verify_slashing_evidence(&evidence)) {
+        let historical = self.proof_system.consensus_block_key().is_some_and(|key| {
+            self.with_engine(|e| {
+                e.verify_historical_slashing_evidence(&evidence, &key)
+                    .is_ok()
+            })
+        });
+        if !historical && let Err(err) = self.with_engine(|e| e.verify_slashing_evidence(&evidence))
+        {
             debug!(?err, "rejected peer-supplied slashing evidence");
             return;
         }
@@ -2340,15 +1972,16 @@ where
         // `verify_block`. If it succeeds, the emitter was wrong
         // (or malicious) about the rejection — drop the evidence.
         if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence {
-            if self.block_proof_verifies(rejected_proof) {
+            if !self.block_proof_objectively_rejected(rejected_proof) {
                 debug!(
                     block_hash = ?rejected_proof.block_hash,
-                    "rejected peer-supplied InvalidProofSigning evidence: carried proof verifies",
+                    "rejected InvalidProofSigning evidence: objective rejection not established",
                 );
                 return;
             }
         }
         if self.insert_persistent(&evidence) {
+            self.start_evidence_jobs();
             trace!("pooled peer-supplied slashing evidence");
         }
     }
@@ -2365,13 +1998,10 @@ where
         Self::chain_id(self)
     }
 
-    fn runtime_abi_version(&self) -> Option<u32> {
-        // Mirror what the runtime advertises in its
-        // `_neutrino_query` `runtime_version` response: a node with
-        // an installed executor speaks the same ABI version this
-        // build of the host links against.
+    fn runtime_code_hash(&self) -> Option<neutrino_primitives::Hash> {
+        // Startup pins the installed runtime to this chain-spec content hash.
         if self.block_executor_snapshot().is_some() {
-            Some(neutrino_runtime_abi::VERSION)
+            Some(self.with_engine(|engine| engine.chain_spec().runtime_code_hash))
         } else {
             None
         }
@@ -2483,9 +2113,8 @@ where
     }
 
     async fn storage_at(&self, key: &[u8], at: &BlockId) -> Option<Vec<u8>> {
-        // v1 supports only the live head trie. Resolving the trie for
-        // historical checkpoints requires reconstructing it from
-        // persisted nodes, which is M12 territory.
+        // Queries use the live head trie. Historical state queries
+        // require reconstruction from persisted nodes.
         match at {
             BlockId::Latest => self.with_engine(|engine| engine.state().get(key)),
             BlockId::Finalized => {
@@ -2519,9 +2148,9 @@ where
         args: Vec<u8>,
         at: &BlockId,
     ) -> Result<RuntimeCallResponse, RuntimeCallError> {
-        // v1 supports only the live head trie. Historical state
-        // would need reconstruction from persisted nodes (M12
-        // territory); see `storage_at` for the matching limitation.
+        // Queries use the live head trie. Historical state queries
+        // require reconstruction from persisted nodes; see `storage_at`
+        // for the matching limitation.
         // `Finalized` falls through to `Latest` because the engine
         // commits state inline today — the same fallback used by
         // `storage_at`.
@@ -2558,199 +2187,5 @@ where
             payload: response.payload,
             gas_used: 0,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use neutrino_consensus_types::{Header, IndexedVote, VrfRejectionReason};
-    use neutrino_primitives::HEADER_VERSION;
-
-    fn make_validator(address: [u8; 32]) -> Validator {
-        Validator {
-            pubkey: [0xAB; 48],
-            withdrawal_credentials: address,
-            effective_stake: 32_000_000_000,
-            slashed: false,
-            activation_epoch: 0,
-            exit_epoch: u64::MAX,
-            last_active_chunk: 0,
-        }
-    }
-
-    fn sample_header(proposer_index: u32) -> Header {
-        Header {
-            version: HEADER_VERSION,
-            height: 1,
-            slot: 1,
-            parent_hash: [0; 32],
-            proposer_index,
-            vrf_proof: [0; 96],
-            state_root: [0; 32],
-            transactions_root: [0; 32],
-            votes_root: [0; 32],
-            slashings_root: [0; 32],
-            validator_ops_root: [0; 32],
-            da_root: [0; 32],
-            runtime_extra: [0; 32],
-            receipts_root: [0; 32],
-            gas_used: 0,
-            gas_limit: 0,
-            timestamp: 0,
-            signature: [0; 96],
-        }
-    }
-
-    fn sample_indexed_vote() -> IndexedVote {
-        IndexedVote {
-            data: neutrino_consensus_types::FinalityVoteData {
-                chunk_id: 0,
-                round: 0,
-                chunk_hash: [0; 32],
-                phase: neutrino_consensus_types::FinalityVotePhase::Prevote,
-            },
-            signature: [0; 96],
-        }
-    }
-
-    fn decode_transaction(bytes: &[u8]) -> RuntimeTransaction {
-        borsh::from_slice(bytes).expect("borsh decodes as Transaction")
-    }
-
-    #[test]
-    fn encode_slashing_as_tx_emits_borsh_slash_for_double_proposal() {
-        let address = [0x11; 32];
-        let active_set = vec![make_validator(address)];
-        let evidence = SlashingEvidence::DoubleProposal {
-            proposer_index: 0,
-            header_a: sample_header(0),
-            header_b: sample_header(0),
-        };
-        let blob = encode_slashing_as_tx(&evidence, &active_set, u128::MAX).expect("encoded");
-        match decode_transaction(&blob) {
-            RuntimeTransaction::Slash(SlashTx { validator, amount }) => {
-                assert_eq!(
-                    validator, address,
-                    "offender's runtime address from withdrawal_credentials"
-                );
-                assert_eq!(amount, u128::MAX);
-            }
-            other => panic!("expected Transaction::Slash, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn encode_slashing_as_tx_handles_all_supported_variants() {
-        let address = [0x22; 32];
-        let active_set = vec![make_validator(address)];
-
-        // Every variant the consensus engine actively pools should
-        // map to a borsh-encoded Transaction::Slash.
-        let evidences = vec![
-            SlashingEvidence::DoubleProposal {
-                proposer_index: 0,
-                header_a: sample_header(0),
-                header_b: sample_header(0),
-            },
-            SlashingEvidence::DoublePrevote {
-                validator_index: 0,
-                vote_a: sample_indexed_vote(),
-                vote_b: sample_indexed_vote(),
-            },
-            SlashingEvidence::DoublePrecommit {
-                validator_index: 0,
-                vote_a: sample_indexed_vote(),
-                vote_b: sample_indexed_vote(),
-            },
-            SlashingEvidence::InvalidVrfClaim {
-                proposer_index: 0,
-                header: sample_header(0),
-                reason: VrfRejectionReason::ThresholdNotMet,
-            },
-        ];
-
-        for evidence in evidences {
-            let blob = encode_slashing_as_tx(&evidence, &active_set, u128::MAX).expect("encoded");
-            match decode_transaction(&blob) {
-                RuntimeTransaction::Slash(SlashTx { validator, amount }) => {
-                    assert_eq!(validator, address);
-                    assert_eq!(amount, u128::MAX);
-                }
-                other => panic!("expected Slash, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn encode_slashing_as_tx_honours_chain_spec_amount() {
-        // Chain spec configures a graduated 2000-unit penalty; we
-        // expect that exact amount to surface in the encoded blob,
-        // not the legacy `u128::MAX` constant.
-        let address = [0x77; 32];
-        let active_set = vec![make_validator(address)];
-        let evidence = SlashingEvidence::DoublePrevote {
-            validator_index: 0,
-            vote_a: sample_indexed_vote(),
-            vote_b: sample_indexed_vote(),
-        };
-        let blob = encode_slashing_as_tx(&evidence, &active_set, 2_000).expect("encoded");
-        match decode_transaction(&blob) {
-            RuntimeTransaction::Slash(SlashTx { amount, .. }) => assert_eq!(amount, 2_000),
-            other => panic!("expected Slash, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn encode_slashing_as_tx_skips_unsupported_variants() {
-        let active_set = vec![make_validator([0x33; 32])];
-        let evidence = SlashingEvidence::DaCommitmentFraud {
-            proposer_index: 0,
-            header: sample_header(0),
-            fraud_proof: neutrino_consensus_types::DaFraudProof {
-                expected_da_root: [0; 32],
-                computed_da_root: [0; 32],
-                bundle_hash: [0; 32],
-                offending_bundle: vec![],
-            },
-        };
-        assert!(encode_slashing_as_tx(&evidence, &active_set, u128::MAX).is_none());
-    }
-
-    #[test]
-    fn encode_slashing_as_tx_skips_out_of_range_offender_index() {
-        // Offender index points at validator 5; active set only has 1.
-        let active_set = vec![make_validator([0x44; 32])];
-        let evidence = SlashingEvidence::DoubleProposal {
-            proposer_index: 5,
-            header_a: sample_header(5),
-            header_b: sample_header(5),
-        };
-        assert!(encode_slashing_as_tx(&evidence, &active_set, u128::MAX).is_none());
-    }
-
-    #[test]
-    fn encode_inactivity_leak_tx_emits_borsh_inactivity_leak() {
-        let address = [0x55; 32];
-        let blob = encode_inactivity_leak_tx(address, 1);
-        match decode_transaction(&blob) {
-            RuntimeTransaction::InactivityLeak(LeakTx { validator, amount }) => {
-                assert_eq!(validator, address);
-                assert_eq!(amount, 1);
-            }
-            other => panic!("expected InactivityLeak, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn encode_inactivity_leak_tx_uses_chain_spec_amount() {
-        let address = [0x66; 32];
-        let blob = encode_inactivity_leak_tx(address, 1_234);
-        match decode_transaction(&blob) {
-            RuntimeTransaction::InactivityLeak(LeakTx { amount, .. }) => {
-                assert_eq!(amount, 1_234);
-            }
-            other => panic!("expected InactivityLeak, got {other:?}"),
-        }
     }
 }

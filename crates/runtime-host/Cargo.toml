@@ -33,11 +33,14 @@ neutrino-primitives           = { workspace = true }
 neutrino-proof-system         = { workspace = true }
 neutrino-consensus-types      = { workspace = true }
 neutrino-trie                 = { workspace = true }
+neutrino-prover-chunk         = { workspace = true, features = ["sp1-verification"] }
 
 [build-dependencies]
 sp1-build = { workspace = true }
 
 [dev-dependencies]
+neutrino-crypto                 = { workspace = true }
+neutrino-vrf                    = { workspace = true }
 neutrino-default-runtime-master = { workspace = true }
 ed25519-dalek                   = { workspace = true }
 rand_core                       = { workspace = true }

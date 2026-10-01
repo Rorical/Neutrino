@@ -117,6 +117,7 @@ impl WasmRuntime {
     /// recovery fails. Codec errors during input/output encoding are
     /// surfaced the same way.
     pub fn dry_run(&self, input: &StfInput, live: &LiveTrie) -> Result<DryRun, WasmError> {
+        crate::evidence::verify_input_receipts(input).map_err(codec_err)?;
         // Cloning the trie is a BTreeMap clone — fine for tests; M5-new
         // can switch this to a reference-counted snapshot when blocks
         // grow large.

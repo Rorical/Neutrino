@@ -31,7 +31,7 @@
 pub enum RpcNamespace {
     /// `chain_*` — block + checkpoint queries.
     Chain,
-    /// `system_*` — chain id, health, version.
+    /// `system_*` — chain id, health, runtime identity.
     System,
     /// `state_*` — raw trie reads.
     State,
@@ -52,5 +52,5 @@ pub use backend::{
 pub use server::{RpcConfig, RpcContext, RpcStartError, build_module, serve};
 pub use types::{
     BlockIdJson, BlockJson, BodyJson, BytesHex, FinalizedInfoJson, HashHex, HeadInfoJson,
-    HeaderJson, HealthJson, RuntimeCallResultJson, SubmitResultJson, ValidatorJson, VersionJson,
+    HeaderJson, HealthJson, RuntimeCallResultJson, SubmitResultJson, SystemInfoJson, ValidatorJson,
 };

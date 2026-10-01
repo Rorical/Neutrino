@@ -32,9 +32,9 @@ use neutrino_consensus_types::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BitVec, BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
-    StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BitVec, BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height,
+    LightClientParams, ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
@@ -80,7 +80,6 @@ fn spec(count: u8) -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -92,12 +91,11 @@ fn spec(count: u8) -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m7-slashing-test".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xCC; 32],
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -125,11 +123,10 @@ fn signed_block(
     signer: &ProposerKey,
 ) -> Block {
     let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
+    let roots = compute_body_roots(&body);
     let vrf_proof = signer.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
-        version: HEADER_VERSION,
         height,
         slot,
         parent_hash: parent,
@@ -138,8 +135,6 @@ fn signed_block(
         state_root: [state_root_byte; 32],
         transactions_root: roots.transactions_root,
         votes_root: roots.votes_root,
-        slashings_root: roots.slashings_root,
-        validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,
@@ -176,6 +171,7 @@ fn partial_vote(
         bits.push(position == voter_position);
     }
     FinalityVote {
+        attestations: Vec::new(),
         aggregation_bits: bits,
         data,
         signature,
@@ -327,6 +323,7 @@ async fn aggregated_votes_do_not_trigger_double_vote_detection() {
     bits.push(true);
     bits.push(true);
     let aggregated = FinalityVote {
+        attestations: Vec::new(),
         aggregation_bits: bits,
         data: FinalityVoteData {
             chunk_id: 0,
@@ -436,7 +433,7 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     // the chain-backend's vote-ingest path.
     //
     // 1. Open a BFT session for chunk_id=0 with 3 validators.
-    // 2. Ingest v1's prevote (round 0) — crosses 2/3 stake. The
+    // 2. Ingest v0 and v1's prevotes (round 0) — crosses 2/3 stake. The
     //    BFT loop hook must record the lock prevote quorum into
     //    the slashing monitor.
     // 3. Ingest v1's precommit for the same chunk_hash at round 0
@@ -447,7 +444,6 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     //    intervenes. The chain-backend's slashing pool grows by 1.
     let engine = Engine::genesis(spec(3), MemoryDatabase::new()).expect("genesis");
     let backend = Arc::new(ChainBackend::new(engine, MockProofSystem::new()));
-    backend.set_local_voter(proposer(0));
     let chunk = neutrino_consensus_types::Chunk {
         chunk_id: 0,
         start_height: 1,
@@ -468,8 +464,15 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
         e.open_bft_session(chunk).expect("open_bft_session");
     });
 
-    // Step 2: v1's prevote crosses 2/3 stake (v0 already prevoted
-    // when the session opened).
+    // This observer has no local voter: a synthetic chunk has no stored
+    // block proofs to attest. Both prevotes arrive through peer intake.
+    let v0 = proposer(0);
+    let mut v0_prevote = partial_vote(0, 0, FinalityVotePhase::Prevote, 0xCC, &v0, 3);
+    v0_prevote.data.chunk_hash = chunk_hash;
+    v0_prevote.signature = v0.sign_finality_vote(TEST_CHAIN_ID, &v0_prevote.data);
+    backend.ingest_finality_vote(v0_prevote).await;
+
+    // Step 2: v1's prevote crosses 2/3 stake.
     let v1 = proposer(1);
     let v1_prevote = partial_vote(0, 0, FinalityVotePhase::Prevote, 0xCC, &v1, 3);
     // The chunk_hash in the prevote needs to match the actual
@@ -488,6 +491,12 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let mut v1_precommit_r0 = partial_vote(0, 0, FinalityVotePhase::Precommit, 0xCC, &v1, 3);
     v1_precommit_r0.data.chunk_hash = chunk_hash;
     v1_precommit_r0.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r0.data);
+    v1_precommit_r0.attestations = vec![v1.attest_precommit(
+        TEST_CHAIN_ID,
+        v1_precommit_r0.data.clone(),
+        vec![[0x44; 32]],
+        None,
+    )];
     backend.ingest_finality_vote(v1_precommit_r0).await;
     assert_eq!(
         backend.slashing_pool_len(),
@@ -502,6 +511,12 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let mut v1_precommit_r1 = partial_vote(0, 1, FinalityVotePhase::Precommit, 0xDD, &v1, 3);
     v1_precommit_r1.data.chunk_hash = conflicting_hash;
     v1_precommit_r1.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r1.data);
+    v1_precommit_r1.attestations = vec![v1.attest_precommit(
+        TEST_CHAIN_ID,
+        v1_precommit_r1.data.clone(),
+        vec![[0x55; 32]],
+        None,
+    )];
     backend.ingest_finality_vote(v1_precommit_r1).await;
     assert_eq!(
         backend.slashing_pool_len(),
@@ -580,7 +595,6 @@ async fn peer_supplied_long_range_fork_evidence_passes_engine_verifier() {
         end_state_root: canonical_chunk.end_state_root,
         end_validator_set_root: canonical_chunk.next_validator_set_root,
         history_root: ZERO_HASH,
-        proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
     };
     let divergent_hash = {
         let mut h = canonical_chunk.hash();
@@ -598,6 +612,16 @@ async fn peer_supplied_long_range_fork_evidence_passes_engine_verifier() {
         vote: IndexedVote {
             data: vote_data.clone(),
             signature: v0.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
+        },
+        canonical_vote: {
+            let data = FinalityVoteData {
+                chunk_hash: canonical_chunk.hash(),
+                ..vote_data.clone()
+            };
+            IndexedVote {
+                signature: v0.sign_finality_vote(TEST_CHAIN_ID, &data),
+                data,
+            }
         },
         canonical_finalized_chunk: carried_checkpoint,
     };
@@ -647,7 +671,6 @@ async fn long_range_fork_evidence_with_mismatched_checkpoint_is_rejected() {
         end_state_root: [0x77; 32],
         end_validator_set_root: canonical_chunk.next_validator_set_root,
         history_root: ZERO_HASH,
-        proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
     };
     backend.with_engine_mut_for_test(|e| {
         e.store_mut()
@@ -677,6 +700,16 @@ async fn long_range_fork_evidence_with_mismatched_checkpoint_is_rejected() {
         vote: IndexedVote {
             data: vote_data.clone(),
             signature: v0.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
+        },
+        canonical_vote: {
+            let data = FinalityVoteData {
+                chunk_hash: canonical_chunk.hash(),
+                ..vote_data.clone()
+            };
+            IndexedVote {
+                signature: v0.sign_finality_vote(TEST_CHAIN_ID, &data),
+                data,
+            }
         },
         canonical_finalized_chunk: carried,
     };
@@ -723,7 +756,6 @@ async fn long_range_fork_evidence_against_matching_canonical_is_pooled() {
         end_state_root: [0x77; 32],
         end_validator_set_root: canonical_chunk.next_validator_set_root,
         history_root: ZERO_HASH,
-        proof_system_version: neutrino_primitives::PROOF_SYSTEM_VERSION,
     };
     backend.with_engine_mut_for_test(|e| {
         e.store_mut()
@@ -751,6 +783,16 @@ async fn long_range_fork_evidence_against_matching_canonical_is_pooled() {
             data: vote_data.clone(),
             signature: v0.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
         },
+        canonical_vote: {
+            let data = FinalityVoteData {
+                chunk_hash: canonical_chunk.hash(),
+                ..vote_data.clone()
+            };
+            IndexedVote {
+                signature: v0.sign_finality_vote(TEST_CHAIN_ID, &data),
+                data,
+            }
+        },
         canonical_finalized_chunk: local_checkpoint,
     };
     backend.ingest_slashing_evidence(evidence).await;
@@ -767,6 +809,7 @@ async fn long_range_fork_evidence_against_matching_canonical_is_pooled() {
                 validator_index,
                 vote,
                 canonical_finalized_chunk,
+                ..
             },
         ] => {
             assert_eq!(*validator_index, 0);

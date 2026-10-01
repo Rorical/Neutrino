@@ -11,15 +11,14 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, GAS_TRANSFER, SlashTx, Transaction, TransferTx, account_key, encode_account,
+    Account, Address, GAS_TRANSFER, Transaction, TransferTx, account_key, encode_account,
     transfer_sig_message,
 };
 use neutrino_mempool::InsertError;
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
@@ -112,15 +111,13 @@ fn seeded_chain_spec_and_trie(alice_addr: Address, balance: u128) -> (ChainSpec,
         end_state_root: state_root,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let spec = ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"mempool-admission".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: [0xAB; 32],
         genesis_state_root: state_root,
@@ -166,20 +163,41 @@ fn submit_transaction_rejects_malformed_payload() {
 }
 
 #[test]
-fn submit_transaction_rejects_consensus_driven_slash() {
+fn submit_transaction_rejects_proof_admission() {
     let alice = signing_key(2);
     let backend = seeded_backend(address_of(&alice), 100);
-    // Slash transactions are consensus-driven; admission must refuse
+    // Evidence submissions require the verified admission path; ordinary admission refuses
     // them with the Unauthorized rejection code so a malicious peer
     // cannot inject one through gossip or RPC.
-    let slash = Transaction::Slash(SlashTx {
-        validator: [0xFF; 32],
-        amount: 10,
-    });
-    let bytes = borsh::to_vec(&slash).expect("encode tx");
+    let submission =
+        Transaction::SubmitEvidence(neutrino_consensus_types::evidence::EvidenceSubmission {
+            statement: neutrino_consensus_types::evidence::EvidenceStatement {
+                chain_id: 7,
+                chain_spec_hash: [0; 32],
+                block_guest_vk_digest: [0; 8],
+                context: neutrino_consensus_types::evidence::EvidenceContext {
+                    chunk_id: 0,
+                    chunk_hash: [0; 32],
+                    end_height: 1,
+                    validators_root: [0; 32],
+                    seed: [0; 32],
+                },
+                offender: validators()[0].clone(),
+                kind: neutrino_consensus_types::evidence::SanctionKind::Slash,
+                offence_id: [0; 32],
+                facts_commitment: [0; 32],
+            },
+            history: neutrino_consensus_types::evidence::HistoryOpening {
+                index: 0,
+                count: 1,
+                siblings: vec![],
+            },
+            proof_bytes: vec![1],
+        });
+    let bytes = borsh::to_vec(&submission).expect("encode tx");
     let err = backend
         .submit_transaction(bytes)
-        .expect_err("Slash must be rejected by admission");
+        .expect_err("Evidence submission requires proof admission");
     assert_eq!(err, InsertError::RejectedByValidator);
     assert_eq!(backend.mempool_len(), 0);
 }

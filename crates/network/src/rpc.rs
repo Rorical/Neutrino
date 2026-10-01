@@ -5,17 +5,17 @@
 //!
 //! | Protocol id                                | Request → Response                                       |
 //! |--------------------------------------------|----------------------------------------------------------|
-//! | `/neutrino/req/status/1`                   | [`Status`] → [`Status`]                                  |
-//! | `/neutrino/req/metadata/1`                 | [`MetadataRequest`] → [`Metadata`]                       |
-//! | `/neutrino/req/ping/1`                     | [`PingPayload`] → [`PingPayload`]                        |
-//! | `/neutrino/req/blocks_by_range/1`          | [`BlocksByRangeRequest`] → [`BlocksByRangeResponse`]     |
-//! | `/neutrino/req/blocks_by_root/1`           | [`BlocksByRootRequest`]  → [`BlocksByRootResponse`]      |
-//! | `/neutrino/req/state_by_root/1`            | [`StateByRootRequest`]   → [`StateByRootResponse`]       |
-//! | `/neutrino/req/block_proof_by_hash/1`      | [`BlockProofByHashRequest`] → [`BlockProofByHashResponse`] |
-//! | `/neutrino/req/block_proof_by_height/1`    | [`BlockProofByHeightRequest`] → [`BlockProofByHeightResponse`] |
-//! | `/neutrino/req/chunk_proof_by_id/1`        | [`ChunkProofByIdRequest`] → [`ChunkProofByIdResponse`]   |
-//! | `/neutrino/req/recursive_proof_latest/1`   | [`RecursiveProofLatestRequest`] → [`RecursiveProofLatestResponse`]   |
-//! | `/neutrino/req/recursive_proof_by_index/1` | [`RecursiveProofByIndexRequest`] → [`RecursiveProofByIndexResponse`] |
+//! | `/neutrino/req/status`                   | [`Status`] → [`Status`]                                  |
+//! | `/neutrino/req/metadata`                 | [`MetadataRequest`] → [`Metadata`]                       |
+//! | `/neutrino/req/ping`                     | [`PingPayload`] → [`PingPayload`]                        |
+//! | `/neutrino/req/blocks_by_range`          | [`BlocksByRangeRequest`] → [`BlocksByRangeResponse`]     |
+//! | `/neutrino/req/blocks_by_root`           | [`BlocksByRootRequest`]  → [`BlocksByRootResponse`]      |
+//! | `/neutrino/req/state_by_root`            | [`StateByRootRequest`]   → [`StateByRootResponse`]       |
+//! | `/neutrino/req/block_proof_by_hash`      | [`BlockProofByHashRequest`] → [`BlockProofByHashResponse`] |
+//! | `/neutrino/req/block_proof_by_height`    | [`BlockProofByHeightRequest`] → [`BlockProofByHeightResponse`] |
+//! | `/neutrino/req/chunk_proof_by_id`        | [`ChunkProofByIdRequest`] → [`ChunkProofByIdResponse`]   |
+//! | `/neutrino/req/recursive_proof_latest`   | [`RecursiveProofLatestRequest`] → [`RecursiveProofLatestResponse`]   |
+//! | `/neutrino/req/recursive_proof_by_index` | [`RecursiveProofByIndexRequest`] → [`RecursiveProofByIndexResponse`] |
 //!
 //! Every request and response is canonically encoded with `borsh`, matching
 //! the wire format used by gossip and on-disk consensus types.
@@ -40,31 +40,31 @@ use std::io;
 use thiserror::Error;
 
 /// Status RPC protocol id.
-pub const PROTOCOL_STATUS: &str = "/neutrino/req/status/1";
+pub const PROTOCOL_STATUS: &str = "/neutrino/req/status";
 /// Metadata RPC protocol id.
-pub const PROTOCOL_METADATA: &str = "/neutrino/req/metadata/1";
+pub const PROTOCOL_METADATA: &str = "/neutrino/req/metadata";
 /// Ping RPC protocol id.
-pub const PROTOCOL_PING: &str = "/neutrino/req/ping/1";
+pub const PROTOCOL_PING: &str = "/neutrino/req/ping";
 /// `BlocksByRange` RPC protocol id.
-pub const PROTOCOL_BLOCKS_BY_RANGE: &str = "/neutrino/req/blocks_by_range/1";
+pub const PROTOCOL_BLOCKS_BY_RANGE: &str = "/neutrino/req/blocks_by_range";
 /// `BlocksByRoot` RPC protocol id.
-pub const PROTOCOL_BLOCKS_BY_ROOT: &str = "/neutrino/req/blocks_by_root/1";
+pub const PROTOCOL_BLOCKS_BY_ROOT: &str = "/neutrino/req/blocks_by_root";
 /// `StateByRoot` RPC protocol id.
-pub const PROTOCOL_STATE_BY_ROOT: &str = "/neutrino/req/state_by_root/1";
+pub const PROTOCOL_STATE_BY_ROOT: &str = "/neutrino/req/state_by_root";
 /// `BlockProofByHash` RPC protocol id.
-pub const PROTOCOL_BLOCK_PROOF_BY_HASH: &str = "/neutrino/req/block_proof_by_hash/1";
+pub const PROTOCOL_BLOCK_PROOF_BY_HASH: &str = "/neutrino/req/block_proof_by_hash";
 /// `BlockProofByHeight` RPC protocol id.
-pub const PROTOCOL_BLOCK_PROOF_BY_HEIGHT: &str = "/neutrino/req/block_proof_by_height/1";
+pub const PROTOCOL_BLOCK_PROOF_BY_HEIGHT: &str = "/neutrino/req/block_proof_by_height";
 /// `ChunkProofById` RPC protocol id.
-pub const PROTOCOL_CHUNK_PROOF_BY_ID: &str = "/neutrino/req/chunk_proof_by_id/1";
+pub const PROTOCOL_CHUNK_PROOF_BY_ID: &str = "/neutrino/req/chunk_proof_by_id";
 /// `RecursiveProofLatest` RPC protocol id.
-pub const PROTOCOL_RECURSIVE_PROOF_LATEST: &str = "/neutrino/req/recursive_proof_latest/1";
+pub const PROTOCOL_RECURSIVE_PROOF_LATEST: &str = "/neutrino/req/recursive_proof_latest";
 /// `RecursiveProofByIndex` RPC protocol id.
-pub const PROTOCOL_RECURSIVE_PROOF_BY_INDEX: &str = "/neutrino/req/recursive_proof_by_index/1";
+pub const PROTOCOL_RECURSIVE_PROOF_BY_INDEX: &str = "/neutrino/req/recursive_proof_by_index";
 /// `FinalityCertByChunk` RPC protocol id.
-pub const PROTOCOL_FINALITY_CERT_BY_CHUNK: &str = "/neutrino/req/finality_cert_by_chunk/1";
+pub const PROTOCOL_FINALITY_CERT_BY_CHUNK: &str = "/neutrino/req/finality_cert_by_chunk";
 /// `WitnessByBlock` RPC protocol id.
-pub const PROTOCOL_WITNESS_BY_BLOCK: &str = "/neutrino/req/witness_by_block/1";
+pub const PROTOCOL_WITNESS_BY_BLOCK: &str = "/neutrino/req/witness_by_block";
 
 /// Default maximum request payload size in bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
@@ -102,31 +102,31 @@ pub const MAX_WITNESSES_PER_RESPONSE: u64 = 4;
 /// [`request_response::Behaviour`] instances.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RpcProtocol {
-    /// Doc 06 `/neutrino/req/status/1`.
+    /// Doc 06 `/neutrino/req/status`.
     Status,
-    /// Doc 06 `/neutrino/req/metadata/1`.
+    /// Doc 06 `/neutrino/req/metadata`.
     Metadata,
-    /// Doc 06 `/neutrino/req/ping/1`.
+    /// Doc 06 `/neutrino/req/ping`.
     Ping,
-    /// Doc 06 `/neutrino/req/blocks_by_range/1`.
+    /// Doc 06 `/neutrino/req/blocks_by_range`.
     BlocksByRange,
-    /// Doc 06 `/neutrino/req/blocks_by_root/1`.
+    /// Doc 06 `/neutrino/req/blocks_by_root`.
     BlocksByRoot,
-    /// Doc 06 `/neutrino/req/state_by_root/1`.
+    /// Doc 06 `/neutrino/req/state_by_root`.
     StateByRoot,
-    /// Doc 06 `/neutrino/req/block_proof_by_hash/1`.
+    /// Doc 06 `/neutrino/req/block_proof_by_hash`.
     BlockProofByHash,
-    /// Doc 06 `/neutrino/req/block_proof_by_height/1`.
+    /// Doc 06 `/neutrino/req/block_proof_by_height`.
     BlockProofByHeight,
-    /// Doc 06 `/neutrino/req/chunk_proof_by_id/1`.
+    /// Doc 06 `/neutrino/req/chunk_proof_by_id`.
     ChunkProofById,
-    /// Doc 06 `/neutrino/req/recursive_proof_latest/1`.
+    /// Doc 06 `/neutrino/req/recursive_proof_latest`.
     RecursiveProofLatest,
-    /// Doc 06 `/neutrino/req/recursive_proof_by_index/1`.
+    /// Doc 06 `/neutrino/req/recursive_proof_by_index`.
     RecursiveProofByIndex,
-    /// Doc 06 `/neutrino/req/finality_cert_by_chunk/1`.
+    /// Doc 06 `/neutrino/req/finality_cert_by_chunk`.
     FinalityCertByChunk,
-    /// Doc 06 `/neutrino/req/witness_by_block/1`.
+    /// Doc 06 `/neutrino/req/witness_by_block`.
     WitnessByBlock,
 }
 
@@ -734,11 +734,9 @@ mod tests {
     use futures_ringbuf::Endpoint;
     use libp2p::request_response::Codec;
     use neutrino_consensus_types::{Body, Header};
-    use neutrino_primitives::HEADER_VERSION;
 
     fn sample_header() -> Header {
         Header {
-            version: HEADER_VERSION,
             height: 7,
             slot: 9,
             parent_hash: [1; 32],
@@ -747,8 +745,6 @@ mod tests {
             state_root: [4; 32],
             transactions_root: [5; 32],
             votes_root: [6; 32],
-            slashings_root: [7; 32],
-            validator_ops_root: [8; 32],
             da_root: [9; 32],
             runtime_extra: [10; 32],
             receipts_root: [12; 32],
@@ -768,43 +764,43 @@ mod tests {
 
     #[test]
     fn protocol_ids_match_doc_06() {
-        assert_eq!(RpcProtocol::Status.protocol_id(), "/neutrino/req/status/1");
+        assert_eq!(RpcProtocol::Status.protocol_id(), "/neutrino/req/status");
         assert_eq!(
             RpcProtocol::Metadata.protocol_id(),
-            "/neutrino/req/metadata/1"
+            "/neutrino/req/metadata"
         );
-        assert_eq!(RpcProtocol::Ping.protocol_id(), "/neutrino/req/ping/1");
+        assert_eq!(RpcProtocol::Ping.protocol_id(), "/neutrino/req/ping");
         assert_eq!(
             RpcProtocol::BlocksByRange.protocol_id(),
-            "/neutrino/req/blocks_by_range/1"
+            "/neutrino/req/blocks_by_range"
         );
         assert_eq!(
             RpcProtocol::BlocksByRoot.protocol_id(),
-            "/neutrino/req/blocks_by_root/1"
+            "/neutrino/req/blocks_by_root"
         );
         assert_eq!(
             RpcProtocol::StateByRoot.protocol_id(),
-            "/neutrino/req/state_by_root/1"
+            "/neutrino/req/state_by_root"
         );
         assert_eq!(
             RpcProtocol::BlockProofByHash.protocol_id(),
-            "/neutrino/req/block_proof_by_hash/1"
+            "/neutrino/req/block_proof_by_hash"
         );
         assert_eq!(
             RpcProtocol::BlockProofByHeight.protocol_id(),
-            "/neutrino/req/block_proof_by_height/1"
+            "/neutrino/req/block_proof_by_height"
         );
         assert_eq!(
             RpcProtocol::ChunkProofById.protocol_id(),
-            "/neutrino/req/chunk_proof_by_id/1"
+            "/neutrino/req/chunk_proof_by_id"
         );
         assert_eq!(
             RpcProtocol::RecursiveProofLatest.protocol_id(),
-            "/neutrino/req/recursive_proof_latest/1"
+            "/neutrino/req/recursive_proof_latest"
         );
         assert_eq!(
             RpcProtocol::RecursiveProofByIndex.protocol_id(),
-            "/neutrino/req/recursive_proof_by_index/1"
+            "/neutrino/req/recursive_proof_by_index"
         );
     }
 
@@ -892,7 +888,6 @@ mod tests {
             end_state_root: [2; 32],
             end_validator_set_root: [3; 32],
             history_root: [4; 32],
-            proof_system_version: 1,
         };
         let proof = RecursiveCheckpointProof {
             checkpoint_index: checkpoint.index,

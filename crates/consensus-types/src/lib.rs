@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+pub mod evidence;
+
 use alloc::vec::Vec;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -18,8 +20,6 @@ use neutrino_primitives::{
 /// Engine-canonical block header.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct Header {
-    /// Protocol version.
-    pub version: u32,
     /// Monotonic block height.
     pub height: Height,
     /// Slot at which the block was produced.
@@ -36,10 +36,6 @@ pub struct Header {
     pub transactions_root: [u8; 32],
     /// Finality votes root.
     pub votes_root: [u8; 32],
-    /// Slashing evidence root.
-    pub slashings_root: [u8; 32],
-    /// Validator operations root.
-    pub validator_ops_root: [u8; 32],
     /// Data-availability commitment root.
     pub da_root: [u8; 32],
     /// Runtime-defined commitment.
@@ -75,7 +71,6 @@ impl Header {
 
 #[derive(BorshSerialize)]
 struct HeaderHashPayload {
-    version: u32,
     height: Height,
     slot: Slot,
     parent_hash: BlockHash,
@@ -84,8 +79,6 @@ struct HeaderHashPayload {
     state_root: StateRoot,
     transactions_root: Hash,
     votes_root: Hash,
-    slashings_root: Hash,
-    validator_ops_root: Hash,
     da_root: Hash,
     runtime_extra: Hash,
     receipts_root: Hash,
@@ -97,7 +90,6 @@ struct HeaderHashPayload {
 impl From<&Header> for HeaderHashPayload {
     fn from(header: &Header) -> Self {
         Self {
-            version: header.version,
             height: header.height,
             slot: header.slot,
             parent_hash: header.parent_hash,
@@ -106,8 +98,6 @@ impl From<&Header> for HeaderHashPayload {
             state_root: header.state_root,
             transactions_root: header.transactions_root,
             votes_root: header.votes_root,
-            slashings_root: header.slashings_root,
-            validator_ops_root: header.validator_ops_root,
             da_root: header.da_root,
             runtime_extra: header.runtime_extra,
             receipts_root: header.receipts_root,
@@ -173,31 +163,124 @@ pub struct FinalityVote {
     pub data: FinalityVoteData,
     /// Aggregate BLS signature.
     pub signature: BlsSignature,
+    /// Mandatory per-signer proof/unlock commitments for precommits; empty for
+    /// prevotes. An aggregate alone cannot attribute proof-byte acceptance.
+    pub attestations: Vec<PrecommitAttestation>,
 }
 
-/// Engine-canonical block body.
+/// Explicit, independently signed statement accompanying a precommit.
 ///
-/// v1 carries three live lanes (`transactions`, `finality_votes`,
-/// `slashings`) plus the matching header roots. Deposits and voluntary
-/// exits travel as in-band `Transaction::Deposit` / `Transaction::VoluntaryExit`
-/// payloads inside `transactions`; the BLS PoP body lanes documented in
-/// doc 07 §7.6 are reserved for a future revision. `header.validator_ops_root`
-/// is therefore always [`neutrino_primitives::ZERO_HASH`] in v1.
+/// The signature covers the vote and its individual signature, ordered hashes of `BlockProof`
+/// envelopes, and the exact optional unlock certificate. Removing a certificate
+/// or substituting proof bytes therefore invalidates the signature.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PrecommitAttestation {
+    /// Individual precommit signature, retained for evidence after aggregation.
+    pub vote_signature: BlsSignature,
+    /// Index in the authenticated validator set for this chunk.
+    pub validator_index: ValidatorIndex,
+    /// Exact precommit covered by this attestation.
+    pub vote: FinalityVoteData,
+    /// BLAKE3(borsh(BlockProof)), ordered by block height within the chunk.
+    pub proof_hashes: Vec<Hash>,
+    /// The signer's claimed unlock justification, including an explicit `None`.
+    pub unlock_quorum: Option<QuorumCertificate>,
+    /// Signature under `DOMAIN_VOTE_ATTESTATION` and the chain ID.
+    pub signature: BlsSignature,
+}
+
+impl PrecommitAttestation {
+    /// Canonical bytes signed by the validator (excluding the signature itself).
+    #[must_use]
+    pub fn signing_message(&self, chain_id: u64) -> Vec<u8> {
+        let mut bytes = Vec::from(neutrino_primitives::DOMAIN_VOTE_ATTESTATION);
+        bytes.extend_from_slice(&chain_id.to_le_bytes());
+        bytes.extend_from_slice(
+            &borsh::to_vec(&(
+                self.validator_index,
+                &self.vote,
+                &self.vote_signature,
+                &self.proof_hashes,
+                &self.unlock_quorum,
+            ))
+            .expect("canonical precommit attestation"),
+        );
+        bytes
+    }
+}
+
+/// Check exact precommit signer coverage and complete proof-list lengths.
+/// Cryptographic verification and expected validator bitmap length are caller duties.
+#[must_use]
+pub fn attestation_coverage_valid(
+    vote: &FinalityVoteData,
+    bits: &BitVec,
+    claims: &[PrecommitAttestation],
+    block_count: u64,
+) -> bool {
+    if vote.phase == FinalityVotePhase::Prevote {
+        return claims.is_empty();
+    }
+    if block_count == 0 || claims.is_empty() {
+        return false;
+    }
+    let mut seen = alloc::collections::BTreeSet::new();
+    for claim in claims {
+        if claim.vote != *vote
+            || bits.get(claim.validator_index) != Some(true)
+            || !seen.insert(claim.validator_index)
+            || u64::try_from(claim.proof_hashes.len()).ok() != Some(block_count)
+        {
+            return false;
+        }
+    }
+    (0..bits.bit_len())
+        .filter(|index| bits.get(*index) == Some(true))
+        .count()
+        == seen.len()
+}
+
+impl PrecommitAttestation {
+    /// Recover the independently signed vote for objective evidence.
+    #[must_use]
+    pub fn indexed_vote(&self) -> IndexedVote {
+        IndexedVote {
+            data: self.vote.clone(),
+            signature: self.vote_signature,
+        }
+    }
+}
+
+impl FinalityCert {
+    /// Recover the accountable precommit envelope without losing individual signatures.
+    #[must_use]
+    pub fn precommit_vote(&self) -> FinalityVote {
+        FinalityVote {
+            data: FinalityVoteData {
+                chunk_id: self.chunk_id,
+                round: self.round,
+                chunk_hash: self.chunk_hash,
+                phase: FinalityVotePhase::Precommit,
+            },
+            aggregation_bits: self.precommit.aggregation_bits.clone(),
+            signature: self.precommit.signature,
+            attestations: self.attestations.clone(),
+        }
+    }
+}
+
+/// Canonical transaction and embedded finality-vote body.
+/// Validator operations and proven evidence admissions are runtime transactions.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Body {
     /// Runtime-defined transaction blobs.
     pub transactions: Vec<Vec<u8>>,
     /// Aggregated finality votes.
     pub finality_votes: Vec<FinalityVote>,
-    /// Objective slashing evidence included by the proposer. The
-    /// chain backend re-encodes each accepted variant as a
-    /// `Transaction::Slash` and prepends those blobs to
-    /// `transactions` before the runtime executes the block.
-    pub slashings: Vec<SlashingEvidence>,
 }
 
 /// Aggregated vote signature and signer bitmap.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct AggregatedVote {
     /// Validators whose signatures are included.
     pub aggregation_bits: BitVec,
@@ -206,7 +289,7 @@ pub struct AggregatedVote {
 }
 
 /// Quorum certificate for one finality vote payload.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct QuorumCertificate {
     /// Signed vote payload.
     pub data: FinalityVoteData,
@@ -215,8 +298,10 @@ pub struct QuorumCertificate {
 }
 
 /// Finality certificate proving prevote and precommit quorum for one chunk.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FinalityCert {
+    /// Complete per-signer precommit accountability statements.
+    pub attestations: Vec<PrecommitAttestation>,
     /// Finalized chunk identifier.
     pub chunk_id: ChunkId,
     /// BFT round that finalized the chunk.
@@ -271,13 +356,17 @@ pub enum ProofRejectionReason {
 pub struct LockEvidence {
     /// Earlier prevote quorum that locked the validator.
     pub locked_prevote_quorum: QuorumCertificate,
-    /// Claimed higher-round unlock quorum, if any.
-    pub claimed_unlock_quorum: Option<QuorumCertificate>,
+    /// The later signer's authenticated unlock claim. Absence of a locally
+    /// observed certificate is never evidence of absence.
+    pub attestation: PrecommitAttestation,
 }
 
 /// Evidence that a published DA bundle does not match its committed root.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DaFraudProof {
+    /// Proposer signature authenticating publication of these exact bytes.
+    /// Header commitment alone cannot attribute an arbitrary bad peer bundle.
+    pub publication_signature: BlsSignature,
     /// DA root committed by the signed header.
     pub expected_da_root: Hash,
     /// DA root recomputed from the offending bundle.
@@ -339,20 +428,19 @@ pub enum SlashingEvidence {
         /// Lock and unlock evidence.
         lock_evidence: LockEvidence,
     },
-    /// A validator signed a chunk-precommit containing a block whose
-    /// SP1 proof the local engine independently rejected.
-    ///
-    /// The evidence is self-contained: any verifier can re-run
-    /// `proof_system.verify_block` against [`Self::InvalidProofSigning::rejected_proof`]
-    /// and confirm the rejection without needing the proof to be
-    /// stored locally.
+    /// A validator explicitly accepted a specific proof envelope that fails
+    /// the protocol verifier. A precommit alone is insufficient: the evidence
+    /// must carry the offender's domain-separated attestation of the complete
+    /// proof bytes and metadata. Verifiers independently establish rejection.
     InvalidProofSigning {
         /// Offending validator index.
         validator_index: ValidatorIndex,
         /// Per-validator precommit the offender signed. The vote's
         /// chunk_id must cover the height of `rejected_proof`.
         vote: IndexedVote,
-        /// Block proof the offender allegedly signed off on. Any
+        /// Explicit acceptance of this exact proof envelope by the offender.
+        attestation: PrecommitAttestation,
+        /// Exact block proof envelope bound by the attestation. Any
         /// verifier re-runs `proof_system.verify_block` on this and
         /// expects rejection.
         rejected_proof: BlockProof,
@@ -369,6 +457,9 @@ pub enum SlashingEvidence {
         vote: IndexedVote,
         /// Canonical finalized checkpoint that the vote conflicts with.
         canonical_finalized_chunk: Checkpoint,
+        /// Same validator's conflicting vote for the canonical chunk in the
+        /// same phase and round. Mere fork divergence cannot prove misconduct.
+        canonical_vote: IndexedVote,
     },
     /// A proposer committed to DA bytes that do not match the signed root.
     DaCommitmentFraud {
@@ -440,10 +531,8 @@ pub struct BlockProofPublicInputs {
     pub receipt_root: Hash,
     /// Data-availability commitment for this block.
     pub da_root: Hash,
-    /// BLAKE3 of the canonical runtime ELF bytes.
+    /// BLAKE3 of the WASM runtime artifact bytes.
     pub vm_code_hash: Hash,
-    /// ABI version expected by the runtime.
-    pub abi_version: u32,
     /// Sum of per-transaction gas the runtime charged inside the block.
     /// Cross-checked against `header.gas_used` so a malicious prover
     /// cannot understate the block's gas consumption.
@@ -523,6 +612,8 @@ pub struct BlockProof {
 /// Opaque chunk proof artifact gossiped once a chunk is proven.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChunkProof {
+    /// Certificate proven by complete consensus aggregation.
+    pub finality_cert: FinalityCert,
     /// Chunk identifier proven by this artifact.
     pub chunk_id: ChunkId,
     /// Chunk hash proven by this artifact.
@@ -550,7 +641,7 @@ pub struct RecursiveCheckpointProof {
 mod tests {
     use super::*;
     use borsh::{from_slice, to_vec};
-    use neutrino_primitives::{PROOF_SYSTEM_VERSION, ZERO_HASH};
+    use neutrino_primitives::ZERO_HASH;
 
     fn hash(byte: u8) -> Hash {
         [byte; 32]
@@ -570,7 +661,6 @@ mod tests {
 
     fn header() -> Header {
         Header {
-            version: 1,
             height: 7,
             slot: 9,
             parent_hash: hash(1),
@@ -579,8 +669,6 @@ mod tests {
             state_root: hash(4),
             transactions_root: hash(5),
             votes_root: hash(6),
-            slashings_root: hash(7),
-            validator_ops_root: hash(8),
             da_root: hash(9),
             runtime_extra: hash(10),
             receipts_root: hash(15),
@@ -609,6 +697,7 @@ mod tests {
 
     fn finality_vote() -> FinalityVote {
         FinalityVote {
+            attestations: Vec::new(),
             aggregation_bits: bit_vec(),
             data: vote_data(FinalityVotePhase::Prevote),
             signature: sig(16),
@@ -634,7 +723,6 @@ mod tests {
             end_state_root: hash(21),
             end_validator_set_root: hash(22),
             history_root: hash(23),
-            proof_system_version: PROOF_SYSTEM_VERSION,
         }
     }
 
@@ -670,17 +758,11 @@ mod tests {
 
     #[test]
     fn block_round_trip_preserves_all_body_lanes() {
-        let evidence = SlashingEvidence::DoublePrevote {
-            validator_index: 1,
-            vote_a: indexed_vote(FinalityVotePhase::Prevote),
-            vote_b: indexed_vote(FinalityVotePhase::Prevote),
-        };
         let block = Block {
             header: header(),
             body: Body {
                 transactions: vec![vec![1, 2, 3]],
                 finality_votes: vec![finality_vote()],
-                slashings: vec![evidence],
             },
         };
 
@@ -694,6 +776,7 @@ mod tests {
     #[test]
     fn finality_cert_round_trips() {
         let cert = FinalityCert {
+            attestations: Vec::new(),
             chunk_id: 41,
             round: 42,
             chunk_hash: hash(43),
@@ -718,6 +801,17 @@ mod tests {
         let original = base.hash();
         base.end_height += 1;
         assert_ne!(base.hash(), original);
+    }
+
+    fn test_attestation(unlock_quorum: Option<QuorumCertificate>) -> PrecommitAttestation {
+        PrecommitAttestation {
+            vote_signature: [0; 96],
+            validator_index: 5,
+            vote: vote_data(FinalityVotePhase::Precommit),
+            proof_hashes: vec![[1; 32]],
+            unlock_quorum,
+            signature: [2; 96],
+        }
     }
 
     #[test]
@@ -748,11 +842,12 @@ mod tests {
                 vote_b: indexed_vote(FinalityVotePhase::Precommit),
                 lock_evidence: LockEvidence {
                     locked_prevote_quorum: quorum.clone(),
-                    claimed_unlock_quorum: Some(quorum),
+                    attestation: test_attestation(Some(quorum)),
                 },
             },
             SlashingEvidence::InvalidProofSigning {
                 validator_index: 5,
+                attestation: test_attestation(None),
                 vote: indexed_vote(FinalityVotePhase::Precommit),
                 rejected_proof: BlockProof {
                     height: 9,
@@ -768,7 +863,6 @@ mod tests {
                         receipt_root: hash(54),
                         da_root: hash(55),
                         vm_code_hash: hash(56),
-                        abi_version: 1,
                         gas_used: 0,
                         gas_limit: 1_000_000,
                         gas_price: 0,
@@ -783,11 +877,13 @@ mod tests {
                 validator_index: 6,
                 vote: indexed_vote(FinalityVotePhase::Prevote),
                 canonical_finalized_chunk: checkpoint(),
+                canonical_vote: indexed_vote(FinalityVotePhase::Prevote),
             },
             SlashingEvidence::DaCommitmentFraud {
                 proposer_index: 7,
                 header: header(),
                 fraud_proof: DaFraudProof {
+                    publication_signature: [0; 96],
                     expected_da_root: hash(51),
                     computed_da_root: hash(52),
                     bundle_hash: hash(53),
@@ -816,7 +912,6 @@ mod tests {
             receipt_root: hash(61),
             da_root: hash(62),
             vm_code_hash: hash(63),
-            abi_version: 1,
             gas_used: 0,
             gas_limit: 1_000_000,
             gas_price: 0,
@@ -845,6 +940,15 @@ mod tests {
             da_root: hash(75),
         };
         let chunk_proof = ChunkProof {
+            finality_cert: FinalityCert {
+                attestations: Vec::new(),
+                chunk_id: 3,
+                round: 0,
+                chunk_hash: chunk().hash(),
+                prevote: aggregated_vote(44),
+                precommit: aggregated_vote(45),
+                active_validator_set_root: hash(73),
+            },
             chunk_id: chunk_inputs.chunk_id,
             chunk_hash: chunk().hash(),
             public_inputs: chunk_inputs,

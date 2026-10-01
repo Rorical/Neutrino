@@ -38,6 +38,8 @@ use tokio::time::timeout;
 
 #[derive(Default)]
 struct MockState {
+    full_chunk_size: Option<u64>,
+    proven_height: u64,
     status: Status,
     rpc_calls: Vec<String>,
     advance_to_index: CheckpointIndex,
@@ -111,6 +113,20 @@ impl MockBackend {
 
 #[async_trait]
 impl SyncBackend for MockBackend {
+    async fn consensus_sync_target(
+        &self,
+    ) -> Result<Option<neutrino_sync::backend::ConsensusSyncTarget>, SyncBackendError> {
+        let state = self.inner.lock().unwrap();
+        Ok(state.full_chunk_size.map(|size| {
+            let chunk_id = u64::try_from(state.chunk_proof_imports.len()).unwrap();
+            neutrino_sync::backend::ConsensusSyncTarget {
+                chunk_id,
+                end_height: (chunk_id + 1) * size,
+                next_header: state.status.head_height + 1,
+                next_proof: state.proven_height + 1,
+            }
+        }))
+    }
     async fn local_status(&self) -> Status {
         self.inner.lock().unwrap().status
     }
@@ -225,6 +241,9 @@ impl SyncBackend for MockBackend {
         let last = blocks
             .last()
             .ok_or_else(|| SyncBackendError::Rejected("empty block batch in mock".to_owned()))?;
+        if self.inner.lock().unwrap().full_chunk_size.is_some() {
+            self.inner.lock().unwrap().status.head_height = last.header.height;
+        }
         Ok(HeadersImported {
             new_head_height: target,
             new_head_hash: last.hash(),
@@ -276,6 +295,7 @@ impl SyncBackend for MockBackend {
             }
         }
         self.inner.lock().unwrap().proofs_imported_count += 1;
+        self.inner.lock().unwrap().proven_height = last.height;
         Ok(ProofsImported {
             new_proven_height: last.height,
         })
@@ -683,9 +703,8 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
 
 fn sample_block(height: Height, slot: u64, _seed: u8) -> Block {
     use neutrino_consensus_types::{Body, Header};
-    use neutrino_primitives::HEADER_VERSION;
+
     let header = Header {
-        version: HEADER_VERSION,
         height,
         slot,
         parent_hash: [0; 32],
@@ -694,8 +713,6 @@ fn sample_block(height: Height, slot: u64, _seed: u8) -> Block {
         state_root: [1; 32],
         transactions_root: [0; 32],
         votes_root: [0; 32],
-        slashings_root: [0; 32],
-        validator_ops_root: [0; 32],
         da_root: [0; 32],
         runtime_extra: [0; 32],
         receipts_root: [0; 32],
@@ -729,7 +746,6 @@ fn sample_block_proof(height: Height) -> BlockProof {
             receipt_root: ZERO_HASH,
             da_root: ZERO_HASH,
             vm_code_hash: ZERO_HASH,
-            abi_version: 1,
             gas_used: 0,
             gas_limit: 1_000_000,
             gas_price: 0,
@@ -744,6 +760,21 @@ fn sample_chunk_proof(chunk_id: ChunkId, end_height: Height) -> ChunkProof {
     use neutrino_consensus_types::ChunkProofPublicInputs;
     use neutrino_primitives::ZERO_HASH;
     ChunkProof {
+        finality_cert: neutrino_consensus_types::FinalityCert {
+            attestations: Vec::new(),
+            chunk_id,
+            round: 0,
+            chunk_hash: [0xCC; 32],
+            prevote: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: neutrino_primitives::BitVec::default(),
+                signature: [0; 96],
+            },
+            precommit: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: neutrino_primitives::BitVec::default(),
+                signature: [0; 96],
+            },
+            active_validator_set_root: ZERO_HASH,
+        },
         chunk_id,
         chunk_hash: [0xCC; 32],
         public_inputs: ChunkProofPublicInputs {
@@ -765,10 +796,105 @@ fn sample_chunk_proof(chunk_id: ChunkId, end_height: Height) -> ChunkProof {
     }
 }
 
+#[tokio::test]
+async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
+    let backend = MockBackend::default();
+    backend.inner.lock().unwrap().full_chunk_size = Some(2);
+    let observer = backend.clone();
+    let (commands, mut received) = mpsc::channel(64);
+    let (events, event_rx) = mpsc::channel(16);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        commands,
+        event_rx,
+    );
+    let run = tokio::spawn(driver.run());
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let mut order = Vec::new();
+    while observer.chunk_proof_imports().len() < 2 {
+        let command = timeout(Duration::from_secs(3), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let NetworkCommand::SendRpcRequest {
+            request,
+            response_tx,
+            ..
+        } = command
+        else {
+            continue;
+        };
+        let response = match request {
+            RpcRequest::Status(_) => RpcResponse::Status(Status {
+                head_height: 4,
+                finalized_checkpoint_index: 2,
+                ..Status::default()
+            }),
+            RpcRequest::BlocksByRange(request) => {
+                order.push(format!("blocks {}", request.start_height));
+                assert_eq!(request.count, 2);
+                if request.start_height == 3 {
+                    assert_eq!(observer.chunk_proof_imports(), vec![0]);
+                }
+                RpcResponse::BlocksByRange(BlocksByRangeResponse {
+                    blocks: (request.start_height..request.start_height + request.count)
+                        .map(|height| sample_block(height, height, 0))
+                        .collect(),
+                })
+            }
+            RpcRequest::BlockProofByHeight(request) => {
+                order.push(format!("proofs {}", request.start_height));
+                RpcResponse::BlockProofByHeight(BlockProofByHeightResponse {
+                    proofs: (request.start_height..request.start_height + request.count)
+                        .map(sample_block_proof)
+                        .collect(),
+                })
+            }
+            RpcRequest::ChunkProofById(request) => {
+                let id = request.chunk_ids[0];
+                order.push(format!("finality {id}"));
+                RpcResponse::ChunkProofById(ChunkProofByIdResponse {
+                    proofs: vec![sample_chunk_proof(id, (id + 1) * 2)],
+                })
+            }
+            other => panic!("unexpected request {other:?}"),
+        };
+        response_tx.send(Ok(response)).unwrap();
+        if order.len() == 6 {
+            timeout(Duration::from_secs(3), async {
+                while observer.chunk_proof_imports().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+    assert_eq!(
+        order,
+        [
+            "blocks 1",
+            "proofs 1",
+            "finality 0",
+            "blocks 3",
+            "proofs 3",
+            "finality 1"
+        ]
+    );
+    drop(events);
+    run.await.unwrap().unwrap();
+}
+
 fn sample_finality_vote(chunk_id: ChunkId) -> FinalityVote {
     use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
     use neutrino_primitives::BitVec;
     FinalityVote {
+        attestations: Vec::new(),
         aggregation_bits: BitVec::default(),
         data: FinalityVoteData {
             chunk_id,
@@ -798,12 +924,9 @@ fn sample_slashing_evidence() -> SlashingEvidence {
     }
 }
 
-/// Chunk-proof aggregation is explicitly deferred by the SP1 rewrite
-/// (see `docs/design/13-sp1-runtime-proof-rewrite.md`), so the sync
-/// driver now ignores `Topic::ChunkProofs` gossip without dispatching
-/// it to the backend. The test pins that contract.
+/// Complete chunk gossip must reach the backend verification path.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn gossipped_chunk_proof_is_ignored_by_sync_driver() {
+async fn gossipped_chunk_proof_is_dispatched_to_verifying_backend() {
     let backend = MockBackend::default();
     backend.set_status(Status::default());
     let backend_handle = backend.clone();
@@ -830,10 +953,7 @@ async fn gossipped_chunk_proof_is_ignored_by_sync_driver() {
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(
-        backend_handle.chunk_proof_imports().is_empty(),
-        "chunk-proof gossip must not reach the backend in M3-new"
-    );
+    assert_eq!(backend_handle.chunk_proof_imports(), vec![42]);
 
     drop(event_tx);
     handle.await.unwrap().unwrap();

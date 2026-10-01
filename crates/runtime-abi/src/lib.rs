@@ -2,7 +2,7 @@
 #![deny(unsafe_code)]
 #![allow(clippy::doc_markdown)]
 
-//! Stable wire definitions for the Neutrino runtime ABI v1.
+//! Stable wire definitions for the Neutrino runtime ABI.
 //!
 //! This crate is the single source of truth for the contract between the
 //! consensus node and any runtime (WASM dynamic runtime or SP1 guest). It
@@ -18,8 +18,7 @@
 //! - The witness envelope handed to the SP1 Guest
 //!   ([`StateWitness`], [`WitnessEntry`]).
 //!
-//! Numbers and field layouts here are consensus-critical and must not be
-//! changed without bumping [`ABI_VERSION`].
+//! Field layouts are consensus-critical; the chain pins the runtime artifact hash.
 
 extern crate alloc;
 
@@ -27,18 +26,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
-    ABI_VERSION, BlockHash, BlsSignature, Hash, Height, Seed, Slot, StateRoot, ValidatorIndex,
+    BlockHash, BlsSignature, Hash, Height, Seed, Slot, StateRoot, ValidatorIndex,
 };
 
 pub mod status;
 
-pub use neutrino_primitives::RuntimeVersion;
+pub use neutrino_primitives::RuntimeInfo;
 pub use status::{Status, UnknownStatus};
-
-/// Runtime ABI version implemented by this crate. Bumping this value is
-/// a consensus-breaking change: the host refuses to load any runtime
-/// whose [`RuntimeVersion::abi_version`] does not match.
-pub const VERSION: u32 = ABI_VERSION;
 
 /// Runtime function name used by the host to run a single transaction
 /// admission check against the WASM dynamic runtime.
@@ -385,12 +379,11 @@ pub struct StateWitness {
     pub witnessed_keys: Vec<Vec<u8>>,
 }
 
-/// Returns the [`RuntimeVersion`] this crate advertises by default. It
-/// reuses the canonical version constants from [`neutrino_primitives`]
-/// so the chain spec, the runtime ABI, and the SDK never drift.
+/// Returns the [`RuntimeInfo`] this crate advertises by default.
+/// shares the canonical runtime metadata with the chain specification.
 #[must_use]
-pub fn default_runtime_version() -> RuntimeVersion {
-    RuntimeVersion::default()
+pub fn default_runtime_info() -> RuntimeInfo {
+    RuntimeInfo::default()
 }
 
 #[cfg(test)]
@@ -417,13 +410,6 @@ mod tests {
         let decoded: BlockContext =
             borsh::from_slice(&encoded).expect("borsh deserialization succeeds");
         assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn default_runtime_version_matches_abi_version() {
-        let version = default_runtime_version();
-        assert_eq!(version.abi_version, VERSION);
-        assert_eq!(version.abi_version, ABI_VERSION);
     }
 
     #[test]

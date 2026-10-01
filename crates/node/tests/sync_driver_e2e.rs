@@ -1,25 +1,11 @@
 //! End-to-end `SyncDriver` test against a real `ChainBackend` over
 //! libp2p.
 //!
-//! Closes the explicit gap called out in `snap_sync_via_rpc.rs:21-25`:
-//! the data plane was already proven (`snap_sync_via_rpc`), and the
-//! FSM was already proven against a synthetic backend
-//! (`crates/sync/tests/driver_loop.rs`), but no test exercised the
-//! real FSM transitions over libp2p against a real `ChainBackend`.
-//!
-//! Topology: two nodes on `127.0.0.1` loopback.
-//!
-//! 1. Node A: build `ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>`
-//!    with `WasmExecutor`. Produce + prove 3 blocks locally (so A's
-//!    head is at height 3 with full proof coverage).
-//! 2. Node B: build the same kind of backend but leave it empty.
-//! 3. Spawn `SyncDriver` for both. Connect A and B via libp2p.
-//! 4. B's FSM walks `Init → HeaderBackfill → StateFetch
-//!    (short-circuits on ZERO_HASH root) → ProofBackfill → Following`.
-//!    A's driver serves the RPCs.
-//! 5. Assert: B converges to `head_height = 3, proven_height = 3,
-//!    head_block_hash == A's head_block_hash` within the test
-//!    budget.
+//! Node A produces and finalizes three single-block chunks before peering.
+//! Node B starts from genesis and must fetch each block, block proof and complete
+//! chunk proof before crossing the next validator/seed boundary. This uses mock
+//! SP1 block execution and the explicitly native test consensus adapter; the real
+//! recursive-cryptography gate lives in runtime-host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,14 +17,17 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH, fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+use neutrino_rpc::RpcBackend;
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
+use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
 use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
-use sp1_sdk::blocking::MockProver;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -81,7 +70,6 @@ fn chain_spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -89,12 +77,11 @@ fn chain_spec() -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m6-sync-driver-e2e".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -111,7 +98,7 @@ fn chain_spec() -> ChainSpec {
     }
 }
 
-type NodeBackend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
+type NodeBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 struct NodeHandle {
     peer_id: PeerId,
@@ -127,7 +114,7 @@ fn build_node() -> (NodeHandle, NetworkService) {
     let (event_tx, event_rx) = mpsc::channel(1024);
     let svc = NetworkService::new(key, cmd_rx, event_tx).expect("network service");
     let engine = Engine::genesis(chain_spec(), MemoryDatabase::new()).expect("genesis");
-    let proof_system = Sp1ProofSystem::mock().expect("mock SP1 adapter");
+    let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 adapter");
     let backend = Arc::new(ChainBackend::new(engine, proof_system));
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     backend.set_block_executor(executor);
@@ -189,7 +176,10 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
         let backend = Arc::clone(&producer_handle.backend);
         let block_hash = outcome.block_hash;
         let _ = tokio::task::spawn_blocking(move || {
-            backend.prove_block(&block_hash).expect("prove_block")
+            backend.prove_block(&block_hash).expect("prove_block");
+            backend
+                .finalize_chunk(slot - 1, &proposer())
+                .expect("complete chunk proof and finality")
         })
         .await
         .expect("spawn_blocking prove_block");
@@ -255,14 +245,21 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
     //
     // Poll the follower's local_progress until it matches the
     // producer's, with a generous timeout that absorbs libp2p
-    // mesh formation + status handshake + 2 RPC round-trips
-    // (BlocksByRange + BlockProofByHeight).
+    // mesh formation plus sequential blocks/proofs/finality RPCs for each chunk.
     let target_head = producer_handle.backend.head_height();
     let target_hash = producer_handle.backend.local_status().await.head_block_hash;
     let converged = timeout(Duration::from_secs(30), async {
         loop {
             let progress = follower_handle.backend.local_progress().await;
-            if progress.head_height == target_head && progress.proven_height == target_head {
+            if progress.head_height == target_head
+                && progress.proven_height == target_head
+                && follower_handle
+                    .backend
+                    .local_status()
+                    .await
+                    .finalized_checkpoint_index
+                    == N_BLOCKS
+            {
                 return progress;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -275,6 +272,12 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
     }
 
     let follower_status = follower_handle.backend.local_status().await;
+    assert_eq!(follower_status.finalized_checkpoint_index, N_BLOCKS);
+    assert_eq!(
+        follower_handle.backend.active_validator_set().await,
+        producer_handle.backend.active_validator_set().await,
+        "the final proven validator boundary is identical",
+    );
     assert_eq!(
         follower_status.head_height, target_head,
         "follower head height"

@@ -23,7 +23,7 @@ use crate::slashing::{
     self, SlashingError, SlashingMonitor, verify_double_proposal_evidence,
     verify_double_vote_evidence, verify_invalid_vrf_claim_evidence, verify_lock_violation_evidence,
 };
-use crate::store::{ChainStore, StoreError, pointers};
+use crate::store::{ChainStore, StoreError};
 use neutrino_consensus_fork_choice::ForkChoice;
 
 extern crate alloc;
@@ -38,6 +38,7 @@ extern crate alloc;
 #[derive(Debug)]
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
+    pub(crate) evidence_programs: Option<([u32; 8], [u32; 8])>,
     store: ChainStore<DB>,
     clock: SlotClock,
     state: Trie,
@@ -112,7 +113,7 @@ impl<DB: Database> Engine<DB> {
     /// Initialise a brand new engine on an empty `db`.
     ///
     /// Validates `chain_spec`, writes metadata
-    /// (`chain_spec_hash`, `db_schema_version`), the genesis
+    /// (`chain_spec_hash`), the genesis
     /// checkpoint, the initial validator-set snapshot, and the genesis
     /// pointers (`tip`, `finalized_head`, `latest_checkpoint_index`).
     /// Returns an [`EngineError`] if the spec is invalid or the
@@ -127,7 +128,6 @@ impl<DB: Database> Engine<DB> {
 
         let spec_hash = chain_spec.hash();
         store.put_chain_spec_hash(spec_hash)?;
-        store.put_db_schema_version(pointers::CURRENT_DB_SCHEMA_VERSION)?;
         store.put_checkpoint(&chain_spec.genesis_checkpoint)?;
         store.put_validator_set_snapshot(0, &chain_spec.initial_validators)?;
         store.put_tip(chain_spec.genesis_block_hash)?;
@@ -158,6 +158,7 @@ impl<DB: Database> Engine<DB> {
             active_validator_set,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
+            evidence_programs: None,
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
@@ -168,7 +169,7 @@ impl<DB: Database> Engine<DB> {
     /// Re-open an already-initialised database.
     ///
     /// Verifies that the stored chain-spec hash matches `chain_spec`
-    /// and that the on-disk schema version is supported. Rehydrates
+    /// and decodes the current stored format. Rehydrates
     /// the in-memory head and finalization pointers from the store.
     pub fn open(chain_spec: ChainSpec, db: DB) -> Result<Self, EngineError<DB::Error>> {
         chain_spec.validate()?;
@@ -181,15 +182,6 @@ impl<DB: Database> Engine<DB> {
             return Err(EngineError::ChainSpecMismatch {
                 stored: stored_spec_hash,
                 provided,
-            });
-        }
-        let stored_schema = store
-            .get_db_schema_version()?
-            .ok_or(EngineError::NotInitialised)?;
-        if stored_schema != pointers::CURRENT_DB_SCHEMA_VERSION {
-            return Err(EngineError::UnsupportedSchemaVersion {
-                stored: stored_schema,
-                expected: pointers::CURRENT_DB_SCHEMA_VERSION,
             });
         }
 
@@ -260,6 +252,7 @@ impl<DB: Database> Engine<DB> {
             active_validator_set,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
+            evidence_programs: None,
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
@@ -357,13 +350,6 @@ impl<DB: Database> Engine<DB> {
         Ok(())
     }
 
-    /// Persist the active VRF seed. Called after each chunk-close
-    /// advance so [`Engine::open`] resumes against the same VRF
-    /// eligibility surface the live node was producing under.
-    pub fn persist_finalized_seed(&mut self) -> Result<(), StoreError<DB::Error>> {
-        self.store.put_finalized_seed(self.finalized_seed)
-    }
-
     /// Borrow the active chain spec.
     #[must_use]
     pub const fn chain_spec(&self) -> &ChainSpec {
@@ -433,8 +419,8 @@ impl<DB: Database> Engine<DB> {
     /// Vote-weighted heaviest-proven-chain head per the fork-choice
     /// DAG. May differ from [`Self::head_hash`] when a competing
     /// branch has accumulated more vote weight than the locally
-    /// materialized chain; full reorg materialisation is pending-fix
-    /// #7 in `docs/design/17-pending-fixes.md`.
+    /// materialized chain. Reorg materialisation replays the selected branch
+    /// through the configured executor.
     #[must_use]
     pub fn fork_choice_head(&self) -> BlockHash {
         self.fork_choice.head()
@@ -599,93 +585,17 @@ impl<DB: Database> Engine<DB> {
         self.state = next;
     }
 
-    /// Advance the in-memory finalization pointers after chunk
-    /// finalization has persisted everything. Crate-internal — the
-    /// finalize module is the only legitimate caller.
-    pub(crate) const fn update_finalization_pointers(
-        &mut self,
-        chunk_id: ChunkId,
-        finalized_head: BlockHash,
-    ) {
-        self.latest_finalized_chunk_id = Some(chunk_id);
-        // Keep the head hash unchanged here: M5 single-node finalizes
-        // chunks ending at heights below the current production head,
-        // so head_hash is the most recently produced block, not the
-        // finalized end. Callers reading the finalized_head must do
-        // so through the chain store pointer.
-        let _ = finalized_head;
+    /// Install only after the complete finalization batch has committed.
+    pub(crate) fn install_consensus_state(&mut self, state: &crate::full_chunk::ConsensusState) {
+        self.latest_finalized_chunk_id = Some(state.statement.execution.chunk.chunk_id);
+        self.finalized_seed = state.statement.next_seed;
+        self.active_validator_set
+            .clone_from(&state.statement.next_context.active_validators);
     }
 
-    /// Advance the in-memory checkpoint pointers after recursive
-    /// checkpoint persistence. Crate-internal — the checkpoint
-    /// module is the only legitimate caller.
-    pub(crate) const fn update_checkpoint_pointers(
-        &mut self,
-        checkpoint_index: CheckpointIndex,
-        next_finalized_seed: Seed,
-    ) {
-        self.latest_checkpoint_index = checkpoint_index;
-        self.finalized_seed = next_finalized_seed;
-    }
-
-    /// Fold every newly-eligible chunk's VRF proofs into the local
-    /// `finalized_seed`. Walks the persisted checkpoints in order
-    /// starting from
-    /// [`pointers::SEED_ADVANCED_THROUGH_CHECKPOINT`](crate::store::pointers::SEED_ADVANCED_THROUGH_CHECKPOINT)
-    /// and stops at the first checkpoint whose covering headers are
-    /// not yet present (followers receive checkpoints before
-    /// headers, so partial advance is normal).
-    ///
-    /// On every successful checkpoint advance the seed is folded
-    /// incrementally; the persisted seed and pointer are written
-    /// exactly once at the end of the walk to avoid disk write
-    /// amplification.
-    ///
-    /// Idempotent: a no-op when no new headers or checkpoints have
-    /// arrived since the last call. Safe to invoke after every
-    /// [`Engine::import_block`] and [`Engine::import_recursive_proof`].
-    pub(crate) fn try_advance_finalized_seed(&mut self) -> Result<(), StoreError<DB::Error>> {
-        let starting_pointer = self
-            .store
-            .get_seed_advanced_through_checkpoint()?
-            .unwrap_or(0);
-        let mut seed = self.finalized_seed;
-        let mut advanced_through = starting_pointer;
-        let mut next = advanced_through.saturating_add(1);
-        let latest = self.latest_checkpoint_index;
-
-        while next <= latest {
-            let Some(checkpoint) = self.store.get_checkpoint(next)? else {
-                break;
-            };
-            // Genesis (index 0) covers no blocks; non-genesis
-            // checkpoints record `start_height = previous.end_height`
-            // so the covered range is `[start+1, end]`.
-            let mut proofs: Vec<neutrino_primitives::BlsSignature> = Vec::new();
-            let mut complete = true;
-            let lower = checkpoint.start_height.saturating_add(1);
-            for height in lower..=checkpoint.end_height {
-                let Some(header) = self.store.get_header_by_height(height)? else {
-                    complete = false;
-                    break;
-                };
-                proofs.push(header.vrf_proof);
-            }
-            if !complete {
-                break;
-            }
-            seed = neutrino_vrf::fold_seed(&seed, &proofs);
-            advanced_through = next;
-            next = next.saturating_add(1);
-        }
-
-        if advanced_through != starting_pointer {
-            self.finalized_seed = seed;
-            self.store.put_finalized_seed(seed)?;
-            self.store
-                .put_seed_advanced_through_checkpoint(advanced_through)?;
-        }
-        Ok(())
+    /// Update the index after verification and persistence of a checkpoint.
+    pub(crate) const fn install_checkpoint_index(&mut self, index: CheckpointIndex) {
+        self.latest_checkpoint_index = index;
     }
 
     /// Observe a signed header for slashing detection.
@@ -718,44 +628,6 @@ impl<DB: Database> Engine<DB> {
         )
         .map_err(slashing_signature_to_slashing_err)?;
         Ok(self.slashing_monitor.record_header(header))
-    }
-
-    /// Compute the set of validator indices that did not sign the
-    /// finalized precommit quorum for `chunk_id`.
-    ///
-    /// Used by the M7-D.3 inactivity-leak emission path: the chain
-    /// backend turns the returned set into a single
-    /// `TX_INACTIVITY_LEAK_BATCH` runtime transaction that deducts
-    /// a small percentage from each non-participating validator's
-    /// staked balance.
-    ///
-    /// Returns an empty vector when the chunk's finality cert is
-    /// missing or every active validator participated.
-    ///
-    /// # Errors
-    ///
-    /// Surfaces store errors.
-    pub fn compute_inactivity_report(
-        &self,
-        chunk_id: ChunkId,
-    ) -> Result<Vec<neutrino_primitives::ValidatorIndex>, StoreError<DB::Error>> {
-        let Some(cert) = self.store().get_finality_cert(chunk_id)? else {
-            return Ok(Vec::new());
-        };
-        let active_set = self.active_validator_set();
-        let mut missing = Vec::new();
-        for (idx, _) in active_set.iter().enumerate() {
-            let idx_u32 = u32::try_from(idx).expect("u32 fits usize on supported targets");
-            if !cert
-                .precommit
-                .aggregation_bits
-                .get(idx_u32)
-                .unwrap_or(false)
-            {
-                missing.push(idx_u32);
-            }
-        }
-        Ok(missing)
     }
 
     /// Subnet index used by the M7-C aggregator role to route the
@@ -866,12 +738,135 @@ impl<DB: Database> Engine<DB> {
             .any(|selection| selection.validator_index == local_idx)
     }
 
+    fn accountability_validators(
+        &self,
+        chunk_id: u64,
+    ) -> Result<alloc::vec::Vec<Validator>, SlashingError> {
+        if let Some(state) = self
+            .store()
+            .get_consensus_state()
+            .map_err(|_| SlashingError::BadSignature)?
+            && let Some(record) = state
+                .history
+                .chunks
+                .iter()
+                .find(|record| record.chunk.chunk_id == chunk_id)
+        {
+            return Ok(record.validators.clone());
+        }
+        Ok(self.active_validator_set().to_vec())
+    }
+
+    /// Attribute every signer of an aggregate, retaining all independently valid evidence.
+    pub fn observe_votes_for_slashing(
+        &mut self,
+        vote: &FinalityVote,
+    ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
+        let votes = self.attributable_votes(vote)?;
+        let mut evidence = alloc::vec::Vec::new();
+        for individual in votes {
+            if let Some(item) = self.observe_vote_for_slashing(&individual)? {
+                evidence.push(item);
+            }
+        }
+        Ok(evidence)
+    }
+
+    fn attributable_votes(
+        &self,
+        vote: &FinalityVote,
+    ) -> Result<alloc::vec::Vec<FinalityVote>, SlashingError> {
+        let validators = self.accountability_validators(vote.data.chunk_id)?;
+        if slashing::extract_single_signer(vote, validators.len()).is_some() {
+            return Ok(alloc::vec![vote.clone()]);
+        }
+        if vote.data.phase != neutrino_consensus_types::FinalityVotePhase::Precommit {
+            return Ok(alloc::vec::Vec::new());
+        }
+        neutrino_prover_chunk::finality::verify_vote(
+            self.chain_spec().chain_id,
+            &validators,
+            vote,
+            self.chain_spec().consensus.bft_max_round,
+            self.chain_spec().consensus.chunk_size,
+        )
+        .map_err(|_| SlashingError::BadSignature)?;
+        Ok(vote
+            .attestations
+            .iter()
+            .map(|claim| {
+                let mut bits = neutrino_primitives::BitVec::default();
+                for index in 0..vote.aggregation_bits.bit_len() {
+                    bits.push(index == claim.validator_index);
+                }
+                FinalityVote {
+                    data: claim.vote.clone(),
+                    aggregation_bits: bits,
+                    signature: claim.vote_signature,
+                    attestations: alloc::vec![claim.clone()],
+                }
+            })
+            .collect())
+    }
+
+    /// Observe an authenticated finality certificate, including its locking quorum.
+    pub fn observe_certificate_for_slashing(
+        &mut self,
+        chunk: &neutrino_consensus_types::Chunk,
+        certificate: &neutrino_consensus_types::FinalityCert,
+    ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
+        let validators = self.accountability_validators(chunk.chunk_id)?;
+        neutrino_prover_chunk::finality::verify_finality(
+            self.chain_spec().chain_id,
+            &self.chain_spec().consensus,
+            &validators,
+            chunk,
+            certificate,
+        )
+        .map_err(|_| SlashingError::BadSignature)?;
+        // Rehydrate the persisted canonical certificate so restart/rotation does
+        // not discard attribution for a conflicting finality certificate.
+        if let Some(state) = self
+            .store()
+            .get_consensus_state()
+            .map_err(|_| SlashingError::BadSignature)?
+            && let Some(record) = state
+                .history
+                .chunks
+                .iter()
+                .find(|record| record.chunk.chunk_id == chunk.chunk_id)
+        {
+            let prior = record.finality.precommit_vote();
+            self.slashing_monitor.record_prevote_quorum(
+                neutrino_consensus_types::QuorumCertificate {
+                    data: neutrino_consensus_types::FinalityVoteData {
+                        phase: FinalityVotePhase::Prevote,
+                        ..prior.data.clone()
+                    },
+                    aggregate: record.finality.prevote.clone(),
+                },
+            );
+            self.observe_votes_for_slashing(&prior)?;
+        }
+        let vote = certificate.precommit_vote();
+        self.slashing_monitor
+            .record_prevote_quorum(neutrino_consensus_types::QuorumCertificate {
+                data: neutrino_consensus_types::FinalityVoteData {
+                    phase: neutrino_consensus_types::FinalityVotePhase::Prevote,
+                    ..vote.data.clone()
+                },
+                aggregate: certificate.prevote.clone(),
+            });
+        let mut evidence = self.observe_votes_for_slashing(&vote)?;
+        evidence.extend(self.observe_vote_for_invalid_proof_signing(&vote)?);
+        Ok(evidence)
+    }
+
     /// Observe a finality vote for slashing detection.
     ///
     /// Only single-signer (partial) votes participate in detection.
-    /// Aggregated votes with more than one bit set short-circuit to
-    /// `Ok(None)` since the equivocator cannot be attributed from
-    /// the aggregate alone — M7-C will add subnet-aware detection.
+    /// Use [`Self::observe_votes_for_slashing`] for aggregate envelopes; it
+    /// recovers individually signed votes from their mandatory attestations.
     ///
     /// The vote's BLS signature is re-verified before recording so a
     /// malicious peer cannot pollute the monitor with forged
@@ -887,7 +882,8 @@ impl<DB: Database> Engine<DB> {
         &mut self,
         vote: &FinalityVote,
     ) -> Result<Option<SlashingEvidence>, SlashingError> {
-        let active_set_len = self.active_validator_set().len();
+        let validators = self.accountability_validators(vote.data.chunk_id)?;
+        let active_set_len = validators.len();
         let Some((signer, indexed)) = slashing::extract_single_signer(vote, active_set_len) else {
             return Ok(None);
         };
@@ -897,17 +893,61 @@ impl<DB: Database> Engine<DB> {
         slashing::verify_indexed_vote_signature(
             signer,
             &indexed,
-            self.active_validator_set(),
+            &validators,
             self.chain_spec().chain_id,
         )?;
-        Ok(self.slashing_monitor.record_indexed_vote(signer, &indexed))
+        for attestation in &vote.attestations {
+            if slashing::verify_precommit_attestation(
+                attestation,
+                signer,
+                &indexed.data,
+                &validators,
+                self.chain_spec().chain_id,
+            )
+            .is_ok()
+            {
+                if let Some(quorum) = &attestation.unlock_quorum
+                    && quorum.data.chunk_id == indexed.data.chunk_id
+                    && quorum.data.round <= indexed.data.round
+                    && neutrino_prover_chunk::slashing::verify_quorum(
+                        self.chain_spec().chain_id,
+                        &validators,
+                        quorum,
+                        (
+                            self.chain_spec().consensus.bft_prevote_quorum_numerator,
+                            self.chain_spec().consensus.bft_prevote_quorum_denominator,
+                        ),
+                    )
+                    .is_ok()
+                {
+                    self.slashing_monitor.record_prevote_quorum(quorum.clone());
+                }
+                self.slashing_monitor
+                    .record_attestation(attestation.clone());
+            }
+        }
+        let evidence = self.slashing_monitor.record_indexed_vote(signer, &indexed);
+        Ok(evidence.filter(|evidence| self.verify_slashing_evidence(evidence).is_ok()))
+    }
+
+    /// Detect proof acceptance violations for every individually attested aggregate signer.
+    pub fn observe_vote_for_invalid_proof_signing(
+        &self,
+        vote: &FinalityVote,
+    ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
+        let mut evidence = alloc::vec::Vec::new();
+        for individual in self.attributable_votes(vote)? {
+            evidence.extend(self.observe_individual_for_invalid_proof_signing(&individual)?);
+        }
+        Ok(evidence)
     }
 
     /// Detect [`SlashingEvidence::InvalidProofSigning`] from an
     /// inbound finality vote.
     ///
     /// Returns evidence for every covered block in the vote's chunk
-    /// whose SP1 proof the local engine rejected at gossip-import
+    /// whose exact proof envelope the signer explicitly attested to and
+    /// the local engine rejected at gossip-import
     /// time (see [`crate::Engine::import_block_proof`]'s rejected-
     /// proof cache). The signer's per-validator signature is
     /// re-verified before evidence is emitted so a malicious peer
@@ -924,22 +964,23 @@ impl<DB: Database> Engine<DB> {
     /// Returns the matching [`SlashingError`] variant when the
     /// signature on the underlying vote fails to verify against
     /// the active set.
-    pub fn observe_vote_for_invalid_proof_signing(
+    fn observe_individual_for_invalid_proof_signing(
         &self,
         vote: &FinalityVote,
     ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
-        let active_set_len = self.active_validator_set().len();
+        let validators = self.accountability_validators(vote.data.chunk_id)?;
+        let active_set_len = validators.len();
         let Some((signer, indexed)) = slashing::extract_single_signer(vote, active_set_len) else {
             return Ok(alloc::vec::Vec::new());
         };
         slashing::verify_indexed_vote_signature(
             signer,
             &indexed,
-            self.active_validator_set(),
+            &validators,
             self.chain_spec().chain_id,
         )?;
 
-        // Inactivity-leak detection only applies to precommit phase
+        // Explicit proof-acceptance detection only applies to precommit phase
         // (signing off on a chunk's finalisability). Prevotes are
         // expressions of "ready to lock in", not declarations of
         // proof acceptance, so they are not slashable through this
@@ -973,9 +1014,28 @@ impl<DB: Database> Engine<DB> {
                 continue;
             };
             if let Some((rejected_proof, reason)) = self.rejected_proofs.get(&block_hash) {
+                let Some(attestation) = vote.attestations.iter().find(|attestation| {
+                    slashing::verify_precommit_attestation(
+                        attestation,
+                        signer,
+                        &indexed.data,
+                        &validators,
+                        self.chain_spec().chain_id,
+                    )
+                    .is_ok()
+                        && slashing::verify_proof_acceptance(
+                            attestation,
+                            rejected_proof,
+                            chunk_size,
+                        )
+                        .is_ok()
+                }) else {
+                    continue;
+                };
                 evidence.push(SlashingEvidence::InvalidProofSigning {
                     validator_index: signer,
                     vote: indexed.clone(),
+                    attestation: attestation.clone(),
                     rejected_proof: rejected_proof.clone(),
                     reason: *reason,
                 });
@@ -1036,26 +1096,26 @@ impl<DB: Database> Engine<DB> {
                 validator_index,
                 vote_a,
                 vote_b,
-            } => verify_double_vote_evidence(
-                *validator_index,
-                FinalityVotePhase::Prevote,
-                vote_a,
-                vote_b,
-                self.active_validator_set(),
-                self.chain_spec().chain_id,
-            ),
-            SlashingEvidence::DoublePrecommit {
+            }
+            | SlashingEvidence::DoublePrecommit {
                 validator_index,
                 vote_a,
                 vote_b,
-            } => verify_double_vote_evidence(
-                *validator_index,
-                FinalityVotePhase::Precommit,
-                vote_a,
-                vote_b,
-                self.active_validator_set(),
-                self.chain_spec().chain_id,
-            ),
+            } => {
+                let phase = if matches!(evidence, SlashingEvidence::DoublePrevote { .. }) {
+                    FinalityVotePhase::Prevote
+                } else {
+                    FinalityVotePhase::Precommit
+                };
+                verify_double_vote_evidence(
+                    *validator_index,
+                    phase,
+                    vote_a,
+                    vote_b,
+                    &self.accountability_validators(vote_a.data.chunk_id)?,
+                    self.chain_spec().chain_id,
+                )
+            }
             SlashingEvidence::InvalidVrfClaim {
                 proposer_index,
                 header,
@@ -1079,7 +1139,7 @@ impl<DB: Database> Engine<DB> {
                 vote_a,
                 vote_b,
                 lock_evidence,
-                self.active_validator_set(),
+                &self.accountability_validators(vote_a.data.chunk_id)?,
                 self.chain_spec().chain_id,
                 (
                     self.chain_spec().consensus.bft_prevote_quorum_numerator,
@@ -1089,49 +1149,53 @@ impl<DB: Database> Engine<DB> {
             SlashingEvidence::InvalidProofSigning {
                 validator_index,
                 vote,
-                rejected_proof: _,
+                attestation,
+                rejected_proof,
                 reason: _,
-            } => {
-                // Signature-side check only; the proof-rejection
-                // check requires a `ProofSystem` reference that the
-                // engine does not own. The chain backend re-runs
-                // `verify_block` on the carried proof before pooling
-                // the evidence (see
-                // `ChainBackend::verify_invalid_proof_signing_evidence`).
-                //
-                // Validating the signer's per-validator BLS signature
-                // here prevents a peer from pooling forged evidence
-                // even if they manage to construct a plausible
-                // `BlockProof` envelope.
-                slashing::verify_indexed_vote_signature(
-                    *validator_index,
-                    vote,
-                    self.active_validator_set(),
-                    self.chain_spec().chain_id,
-                )?;
-                // The chunk-id on the precommit must cover a height
-                // the local node knows about; otherwise the evidence
-                // points at a chunk the local chain hasn't seen and
-                // we cannot reason about it.
-                if !matches!(vote.data.phase, FinalityVotePhase::Precommit,) {
-                    return Err(SlashingError::UnsupportedVariant);
-                }
-                Ok(())
-            }
+            } => slashing::verify_proof_signing_attribution(
+                *validator_index,
+                vote,
+                attestation,
+                rejected_proof,
+                &self.accountability_validators(vote.data.chunk_id)?,
+                self.chain_spec().chain_id,
+                self.chain_spec().consensus.chunk_size,
+            ),
             SlashingEvidence::LongRangeForkParticipation {
                 validator_index,
                 vote,
                 canonical_finalized_chunk,
+                canonical_vote,
             } => self.verify_long_range_fork_participation(
                 *validator_index,
                 vote,
                 canonical_finalized_chunk,
+                canonical_vote,
             ),
-            // `DaCommitmentFraud` requires DA-ingest state this
-            // engine does not maintain yet (deferred per doc 14 +
-            // doc 17 #6).
-            SlashingEvidence::DaCommitmentFraud { .. } => Err(SlashingError::UnsupportedVariant),
+            SlashingEvidence::DaCommitmentFraud {
+                proposer_index,
+                header,
+                fraud_proof,
+            } => self.verify_da_commitment_fraud(*proposer_index, header, fraud_proof),
         }
+    }
+
+    fn verify_da_commitment_fraud(
+        &self,
+        index: u32,
+        header: &Header,
+        fraud: &neutrino_consensus_types::DaFraudProof,
+    ) -> Result<(), SlashingError> {
+        if header.proposer_index != index {
+            return Err(SlashingError::EvidenceFieldsInconsistent);
+        }
+        neutrino_prover_chunk::slashing::verify_da_fraud(
+            self.chain_spec().chain_id,
+            self.active_validator_set(),
+            header,
+            fraud,
+        )
+        .map_err(|_| SlashingError::EvidenceFieldsInconsistent)
     }
 
     /// Engine wrapper around
@@ -1143,7 +1207,24 @@ impl<DB: Database> Engine<DB> {
         validator_index: neutrino_primitives::ValidatorIndex,
         vote: &neutrino_consensus_types::IndexedVote,
         canonical_finalized_chunk: &neutrino_primitives::Checkpoint,
+        canonical_vote: &neutrino_consensus_types::IndexedVote,
     ) -> Result<(), SlashingError> {
+        verify_double_vote_evidence(
+            validator_index,
+            vote.data.phase,
+            vote,
+            canonical_vote,
+            self.active_validator_set(),
+            self.chain_spec().chain_id,
+        )?;
+        let chunk = self
+            .store()
+            .get_chunk(vote.data.chunk_id)
+            .map_err(|_| SlashingError::NotYetFinalizedLocally)?
+            .ok_or(SlashingError::NotYetFinalizedLocally)?;
+        if canonical_vote.data.chunk_hash != chunk.hash() {
+            return Err(SlashingError::EvidenceFieldsInconsistent);
+        }
         let local_checkpoint = self
             .store()
             .get_checkpoint(canonical_finalized_chunk.index)
@@ -1185,8 +1266,8 @@ mod tests {
     use super::*;
     use crate::validator_set::validator_set_root;
     use neutrino_primitives::{
-        BoundedBytes, CHAIN_SPEC_VERSION, Checkpoint, ConsensusParams, LightClientParams,
-        ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+        BoundedBytes, Checkpoint, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
+        RuntimeParams, StateParams, Validator, ZERO_HASH,
     };
     use neutrino_storage::MemoryDatabase;
 
@@ -1218,15 +1299,13 @@ mod tests {
             end_state_root: genesis_state_root,
             end_validator_set_root: vs_root,
             history_root: ZERO_HASH,
-            proof_system_version: proof.proof_system_version,
         };
         ChainSpec {
-            spec_version: CHAIN_SPEC_VERSION,
             name: BoundedBytes::new(b"m5-local".to_vec()).expect("name fits"),
             chain_id: 1,
             genesis_time: 1_700_000_000,
             genesis_gas_limit: 30_000_000,
-            runtime_version: RuntimeVersion::default(),
+            runtime_info: RuntimeInfo::default(),
             runtime_code_hash: [0xBB; 32],
             genesis_seed: [0xCC; 32],
             genesis_state_root,
@@ -1263,10 +1342,6 @@ mod tests {
 
         let store = engine.store();
         assert_eq!(store.get_chain_spec_hash().unwrap(), Some(spec.hash()));
-        assert_eq!(
-            store.get_db_schema_version().unwrap(),
-            Some(pointers::CURRENT_DB_SCHEMA_VERSION),
-        );
         assert_eq!(
             store.get_checkpoint(0).unwrap(),
             Some(spec.genesis_checkpoint.clone())
@@ -1315,33 +1390,6 @@ mod tests {
         assert_eq!(reopened.finalized_seed(), engine.finalized_seed());
         assert_eq!(reopened.latest_checkpoint_index(), 0);
         assert_eq!(reopened.latest_finalized_chunk_id(), None);
-    }
-
-    #[test]
-    fn open_rehydrates_finalized_seed_advanced_by_a_chunk_close() {
-        // Restart-resume must observe the same VRF seed the live node
-        // was producing under: returning to the genesis seed would
-        // silently fork the chain after the first chunk-close.
-        let spec = chain_spec();
-        let db = MemoryDatabase::new();
-        let mut engine = Engine::genesis(spec, db).expect("genesis");
-
-        let new_seed: Seed = [0x99; 32];
-        engine.update_checkpoint_pointers(1, new_seed);
-        // Mirror what `checkpoint_chunk` does at the storage layer so
-        // `Engine::open` can rehydrate the same pointers we set.
-        engine
-            .store_mut()
-            .put_latest_checkpoint_index(1)
-            .expect("persist checkpoint index");
-        engine.persist_finalized_seed().expect("persist seed");
-
-        let saved_db = engine.store().db().clone();
-        let spec = chain_spec();
-        drop(engine);
-        let reopened = Engine::open(spec, saved_db).expect("reopen");
-        assert_eq!(reopened.finalized_seed(), new_seed);
-        assert_eq!(reopened.latest_checkpoint_index(), 1);
     }
 
     #[test]

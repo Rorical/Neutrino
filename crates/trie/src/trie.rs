@@ -33,9 +33,8 @@ use crate::proof::{Proof, ProofStep, ProofTerminal};
 /// Binary sparse Merkle trie parameterised by hash function.
 ///
 /// Defaults to [`Poseidon2Hasher`], the SP1-precompile-aligned hash;
-/// the [`crate::Blake3Hasher`] variant is still available for callers
-/// that need the pre-Poseidon2 trie hash (e.g., historical-state
-/// replay or compatibility-shim tests).
+/// [`crate::Blake3Hasher`] is an alternative for generic trie consumers
+/// and reference hash tests. The runtime always selects Poseidon2.
 ///
 /// The trie buffers every newly produced node and value in
 /// `pending_nodes` / `pending_values` so callers wanting persistence
@@ -806,7 +805,7 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
     use rand_core::{RngCore, SeedableRng};
 
-    // Existing test corpus stays on `Blake3Hasher` so the legacy
+    // The generic trie corpus uses `Blake3Hasher` so the reference
     // hasher keeps the same test coverage it had before the default
     // switched.  Default `Trie<>` is exercised transitively by
     // downstream crates (`runtime-core`, `runtime-host`, every node
@@ -862,10 +861,10 @@ mod tests {
     fn overwrite_changes_value_and_root() {
         let mut trie = TestTrie::new();
         trie.insert(b"k", b"v1".to_vec()).expect("insert");
-        let root_v1 = trie.root();
+        let first_root = trie.root();
         trie.insert(b"k", b"v2".to_vec()).expect("overwrite");
         assert_eq!(trie.get(b"k"), Some(b"v2".to_vec()));
-        assert_ne!(trie.root(), root_v1);
+        assert_ne!(trie.root(), first_root);
     }
 
     #[test]

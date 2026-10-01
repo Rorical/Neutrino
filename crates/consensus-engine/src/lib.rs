@@ -3,21 +3,17 @@
 
 //! Consensus engine: slot-driven block production, proof FSM, and persistence.
 //!
-//! M5 builds out the single-node engine that takes runtime ELF + chain spec,
-//! produces blocks on every eligible slot, walks the block FSM through
-//! `BlockProduced \u2192 PendingProof \u2192 Proven \u2192 ChunkProven \u2192 Finalized \u2192
-//! Checkpointed`, and persists every artifact (header, body, proof, chunk,
-//! finality cert, checkpoint, recursive proof, validator-set snapshot) to a
-//! column-family [`Database`](neutrino_storage::Database).
+//! The engine executes and proves blocks, collects chunk BFT certificates,
+//! and atomically installs complete consensus proof transitions.
 
 pub mod bft_loop;
 pub mod block_state;
 pub mod body;
-pub mod checkpoint;
 pub mod clock;
 pub mod engine;
 pub mod error;
 pub mod finalize;
+pub mod full_chunk;
 pub mod import;
 pub mod merkle;
 pub mod produce;
@@ -31,7 +27,6 @@ pub mod validator_set;
 pub use bft_loop::{BftAction, BftLoopError, BftSession};
 pub use block_state::{BlockState, InvalidTransition};
 pub use body::{BodyRoots, apply_body_roots, compute_body_roots};
-pub use checkpoint::{CheckpointError, CheckpointOutcome};
 pub use clock::SlotClock;
 pub use engine::Engine;
 pub use error::EngineError;

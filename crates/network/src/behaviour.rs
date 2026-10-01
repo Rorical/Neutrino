@@ -37,30 +37,30 @@ pub struct NeutrinoBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     /// Kademlia DHT for peer discovery.
     pub kademlia: kad::Behaviour<MemoryStore>,
-    /// `/neutrino/req/status/1` request/response.
+    /// `/neutrino/req/status` request/response.
     pub rpc_status: StatusBehaviour,
-    /// `/neutrino/req/metadata/1` request/response.
+    /// `/neutrino/req/metadata` request/response.
     pub rpc_metadata: MetadataBehaviour,
-    /// `/neutrino/req/ping/1` request/response.
+    /// `/neutrino/req/ping` request/response.
     pub rpc_ping: PingBehaviour,
-    /// `/neutrino/req/blocks_by_range/1` request/response.
+    /// `/neutrino/req/blocks_by_range` request/response.
     pub rpc_blocks_by_range: BlocksByRangeBehaviour,
-    /// `/neutrino/req/blocks_by_root/1` request/response.
+    /// `/neutrino/req/blocks_by_root` request/response.
     pub rpc_blocks_by_root: BlocksByRootBehaviour,
-    /// `/neutrino/req/state_by_root/1` request/response.
+    /// `/neutrino/req/state_by_root` request/response.
     pub rpc_state_by_root: StateByRootBehaviour,
-    /// `/neutrino/req/block_proof_by_hash/1` request/response.
+    /// `/neutrino/req/block_proof_by_hash` request/response.
     pub rpc_block_proof_by_hash: BlockProofByHashBehaviour,
-    /// `/neutrino/req/block_proof_by_height/1` request/response.
+    /// `/neutrino/req/block_proof_by_height` request/response.
     pub rpc_block_proof_by_height: BlockProofByHeightBehaviour,
-    /// `/neutrino/req/chunk_proof_by_id/1` request/response.
+    /// `/neutrino/req/chunk_proof_by_id` request/response.
     pub rpc_chunk_proof_by_id: ChunkProofByIdBehaviour,
-    /// `/neutrino/req/recursive_proof_latest/1` request/response.
+    /// `/neutrino/req/recursive_proof_latest` request/response.
     pub rpc_recursive_proof_latest: RecursiveProofLatestBehaviour,
-    /// `/neutrino/req/recursive_proof_by_index/1` request/response.
+    /// `/neutrino/req/recursive_proof_by_index` request/response.
     pub rpc_recursive_proof_by_index: RecursiveProofByIndexBehaviour,
-    /// `/neutrino/req/finality_cert_by_chunk/1` request/response.
+    /// `/neutrino/req/finality_cert_by_chunk` request/response.
     pub rpc_finality_cert_by_chunk: FinalityCertByChunkBehaviour,
-    /// `/neutrino/req/witness_by_block/1` request/response.
+    /// `/neutrino/req/witness_by_block` request/response.
     pub rpc_witness_by_block: WitnessByBlockBehaviour,
 }

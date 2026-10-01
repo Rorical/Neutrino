@@ -71,6 +71,154 @@ impl<DB> ChainStore<DB> {
 }
 
 impl<DB: Database> ChainStore<DB> {
+    /// Persist a reusable evidence receipt after native verification.
+    pub fn put_evidence_artifact(
+        &mut self,
+        artifact: &neutrino_consensus_types::evidence::EvidenceArtifact,
+    ) -> Result<(), StoreError<DB::Error>> {
+        use neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES;
+        let invalid = |message| {
+            StoreError::Codec(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                message,
+            ))
+        };
+        if artifact.proof_bytes.is_empty() || artifact.proof_bytes.len() > MAX_EVIDENCE_PROOF_BYTES
+        {
+            return Err(invalid("evidence receipt size"));
+        }
+        let entries = self
+            .db
+            .iter_column(Column::EvidenceProofs)
+            .map_err(StoreError::Database)?;
+        // Do not overwrite an already verified receipt with alternate encoding.
+        if entries
+            .iter()
+            .any(|(key, _)| key.as_slice() == artifact.statement.offence_id)
+        {
+            return Ok(());
+        }
+        let bytes = borsh::to_vec(artifact)?;
+        if entries.len() >= 256
+            || entries.iter().map(|(_, value)| value.len()).sum::<usize>() + bytes.len()
+                > 32 * 1024 * 1024
+        {
+            return Err(invalid("evidence pool capacity"));
+        }
+        self.put_raw(
+            Column::EvidenceProofs,
+            &artifact.statement.offence_id,
+            &bytes,
+        )
+    }
+
+    /// Drop expired receipts or offences in the authenticated, sorted finalized
+    /// ledger. Unfinalized execution is retained for re-admission after reorg.
+    pub fn prune_evidence_artifacts(
+        &mut self,
+        finalized_height: u64,
+        max_age: u64,
+        finalized_penalties: &[Hash],
+    ) -> Result<(), StoreError<DB::Error>> {
+        let mut batch = neutrino_storage::Batch::new();
+        for artifact in self.evidence_artifacts()? {
+            if finalized_height.saturating_sub(artifact.statement.context.end_height) >= max_age
+                || finalized_penalties
+                    .binary_search(&artifact.statement.offence_id)
+                    .is_ok()
+            {
+                batch.delete(Column::EvidenceProofs, artifact.statement.offence_id);
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.db.write_batch(batch).map_err(StoreError::Database)
+    }
+
+    /// Load evidence receipts for restart recovery and re-admission after reorg.
+    pub fn evidence_artifacts(
+        &self,
+    ) -> Result<Vec<neutrino_consensus_types::evidence::EvidenceArtifact>, StoreError<DB::Error>>
+    {
+        self.db
+            .iter_column(Column::EvidenceProofs)
+            .map_err(StoreError::Database)?
+            .into_iter()
+            .map(|(key, bytes)| {
+                let artifact: neutrino_consensus_types::evidence::EvidenceArtifact =
+                    borsh::from_slice(&bytes)?;
+                if key.as_slice() != artifact.statement.offence_id {
+                    return Err(StoreError::Codec(borsh::io::Error::new(
+                        borsh::io::ErrorKind::InvalidData,
+                        "evidence key mismatch",
+                    )));
+                }
+                Ok(artifact)
+            })
+            .collect()
+    }
+    /// Load the last proof-gated consensus boundary and replay ledger.
+    pub fn get_consensus_state(
+        &self,
+    ) -> Result<Option<crate::full_chunk::ConsensusState>, StoreError<DB::Error>> {
+        self.get_decoded(Column::Finalized, pointers::CONSENSUS_STATE)
+    }
+
+    /// Atomically persist complete finality and its outgoing trust boundary.
+    pub(crate) fn put_consensus_finalization(
+        &mut self,
+        witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
+        proof: &ChunkProof,
+        state: &crate::full_chunk::ConsensusState,
+    ) -> Result<(), StoreError<DB::Error>> {
+        let mut batch = neutrino_storage::Batch::new();
+        let chunk = neutrino_prover_chunk::consensus::as_chunk(&state.statement.execution);
+        let key = keys::chunk_id_key(chunk.chunk_id);
+        batch.put(Column::Chunks, key, borsh::to_vec(&chunk)?);
+        batch.put(Column::ChunkProofs, key, borsh::to_vec(proof)?);
+        batch.put(
+            Column::FinalityCerts,
+            key,
+            borsh::to_vec(&witness.finality_cert)?,
+        );
+        batch.put(
+            Column::Finalized,
+            pointers::CONSENSUS_STATE,
+            borsh::to_vec(state)?,
+        );
+        batch.put(Column::Finalized, pointers::LATEST_FINALIZED_CHUNK_ID, key);
+        batch.put(
+            Column::Finalized,
+            pointers::FINALIZED_HEAD,
+            chunk.end_block_hash,
+        );
+        batch.put(
+            Column::Finalized,
+            pointers::FINALIZED_SEED,
+            state.statement.next_seed,
+        );
+        let next = &state.statement.next_context;
+        batch.put(
+            Column::ValidatorSetSnapshots,
+            keys::checkpoint_index_key(next.chunk_id),
+            borsh::to_vec(&next.active_validators)?,
+        );
+        batch.put(
+            Column::Finalized,
+            pointers::LATEST_VALIDATOR_SET_INDEX,
+            keys::checkpoint_index_key(next.chunk_id),
+        );
+        for block in &witness.blocks {
+            batch.put(
+                Column::BlockStates,
+                block.header.hash(),
+                borsh::to_vec(&BlockState::Finalized)?,
+            );
+        }
+        self.db.write_batch(batch).map_err(StoreError::Database)
+    }
+
     // ---------- Generic helpers ----------
 
     fn put_encoded<T: BorshSerialize>(
@@ -206,12 +354,11 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Block FSM state ----------
 
-    /// Persist the mock-proof FSM state for `hash`.
+    /// Persist the block FSM state for `hash`.
     ///
     /// Per-block state is tracked in [`Column::BlockStates`] so the
-    /// 1000-slot M5 replay test can assert every block walks
-    /// `BlockProduced → PendingProof → Proven → ChunkProven →
-    /// Finalized → Checkpointed`.
+    /// engine can enforce each block's progression:
+    /// `BlockProduced → PendingProof → Proven → Finalized`.
     pub fn put_block_state(
         &mut self,
         hash: &BlockHash,
@@ -220,7 +367,7 @@ impl<DB: Database> ChainStore<DB> {
         self.put_encoded(Column::BlockStates, &keys::hash_key(hash), &state)
     }
 
-    /// Read the mock-proof FSM state for `hash`.
+    /// Read the block FSM state for `hash`.
     pub fn get_block_state(
         &self,
         hash: &BlockHash,
@@ -467,36 +614,6 @@ impl<DB: Database> ChainStore<DB> {
         Ok(raw.and_then(|bytes| Seed::try_from(bytes.as_slice()).ok()))
     }
 
-    /// Write the highest checkpoint index whose covering headers have
-    /// already been folded into [`pointers::FINALIZED_SEED`].
-    pub fn put_seed_advanced_through_checkpoint(
-        &mut self,
-        index: CheckpointIndex,
-    ) -> Result<(), StoreError<DB::Error>> {
-        self.put_raw(
-            Column::Finalized,
-            pointers::SEED_ADVANCED_THROUGH_CHECKPOINT,
-            &keys::checkpoint_index_key(index),
-        )
-    }
-
-    /// Read the highest checkpoint index whose covering headers have
-    /// already been folded into the persisted seed. Returns `None`
-    /// when the engine has never advanced the seed (treat as `0`).
-    pub fn get_seed_advanced_through_checkpoint(
-        &self,
-    ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
-        let raw = self.get_raw(
-            Column::Finalized,
-            pointers::SEED_ADVANCED_THROUGH_CHECKPOINT,
-        )?;
-        Ok(raw.and_then(|b| {
-            <[u8; 8]>::try_from(b.as_slice())
-                .ok()
-                .map(u64::from_be_bytes)
-        }))
-    }
-
     /// Iterate every persisted `(hash, bytes)` pair in
     /// [`Column::TrieNodes`]. Used by `Engine::open` to rehydrate the
     /// runtime state trie after restart.
@@ -551,7 +668,7 @@ impl<DB: Database> ChainStore<DB> {
     /// evidence so two detectors that observe the same equivocation
     /// produce the same key (de-dup is free).
     ///
-    /// Pending-fix #5 (doc 17): a node that detects equivocation
+    /// a node that detects equivocation
     /// and crashes before its next produced block must not lose the
     /// evidence. Every `pool_and_gossip_slashing` / restore site in
     /// `ChainBackend` mirrors its in-memory write here so a fresh
@@ -623,25 +740,6 @@ impl<DB: Database> ChainStore<DB> {
         let raw = self.get_raw(Column::Meta, pointers::CHAIN_SPEC_HASH)?;
         Ok(raw.and_then(|bytes| Hash::try_from(bytes.as_slice()).ok()))
     }
-
-    /// Write the database schema version.
-    pub fn put_db_schema_version(&mut self, version: u32) -> Result<(), StoreError<DB::Error>> {
-        self.put_raw(
-            Column::Meta,
-            pointers::DB_SCHEMA_VERSION,
-            &version.to_be_bytes(),
-        )
-    }
-
-    /// Read the database schema version.
-    pub fn get_db_schema_version(&self) -> Result<Option<u32>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Meta, pointers::DB_SCHEMA_VERSION)?;
-        Ok(raw.and_then(|b| {
-            <[u8; 4]>::try_from(b.as_slice())
-                .ok()
-                .map(u32::from_be_bytes)
-        }))
-    }
 }
 
 #[cfg(test)]
@@ -651,7 +749,7 @@ mod tests {
         AggregatedVote, Body, FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase,
         Header,
     };
-    use neutrino_primitives::{BitVec, BlsSignature, Hash, PROOF_SYSTEM_VERSION, ZERO_HASH};
+    use neutrino_primitives::{BitVec, BlsSignature, Hash, ZERO_HASH};
     use neutrino_storage::MemoryDatabase;
 
     fn h(b: u8) -> Hash {
@@ -664,7 +762,6 @@ mod tests {
 
     fn header(height: u64, slot: u64, parent: Hash) -> Header {
         Header {
-            version: 1,
             height,
             slot,
             parent_hash: parent,
@@ -673,8 +770,6 @@ mod tests {
             state_root: h(2),
             transactions_root: ZERO_HASH,
             votes_root: ZERO_HASH,
-            slashings_root: ZERO_HASH,
-            validator_ops_root: ZERO_HASH,
             da_root: ZERO_HASH,
             runtime_extra: ZERO_HASH,
             receipts_root: ZERO_HASH,
@@ -724,7 +819,6 @@ mod tests {
             end_state_root: h(22),
             end_validator_set_root: h(17),
             history_root: h(23),
-            proof_system_version: PROOF_SYSTEM_VERSION,
         }
     }
 
@@ -761,7 +855,6 @@ mod tests {
         assert_eq!(store.get_latest_finalized_chunk_id().expect("get"), None);
         assert_eq!(store.get_latest_checkpoint_index().expect("get"), None);
         assert_eq!(store.get_chain_spec_hash().expect("get"), None);
-        assert_eq!(store.get_db_schema_version().expect("get"), None);
     }
 
     #[test]
@@ -770,6 +863,7 @@ mod tests {
         let body = Body {
             transactions: vec![vec![1, 2, 3]],
             finality_votes: vec![FinalityVote {
+                attestations: Vec::new(),
                 aggregation_bits: {
                     let mut b = BitVec::default();
                     b.push(true);
@@ -783,7 +877,6 @@ mod tests {
                 },
                 signature: sig(7),
             }],
-            slashings: Vec::new(),
         };
         let hash = h(123);
         store.put_body(&hash, &body).expect("put");
@@ -808,7 +901,6 @@ mod tests {
                 receipt_root: ZERO_HASH,
                 da_root: ZERO_HASH,
                 vm_code_hash: h(50),
-                abi_version: 1,
                 gas_used: 0,
                 gas_limit: 1_000_000,
                 gas_price: 0,
@@ -878,6 +970,15 @@ mod tests {
         assert_eq!(store.get_chunk(2).expect("get chunk"), Some(c.clone()));
 
         let cp = neutrino_consensus_types::ChunkProof {
+            finality_cert: FinalityCert {
+                attestations: Vec::new(),
+                chunk_id: 2,
+                round: 0,
+                chunk_hash: c.hash(),
+                prevote: aggregated(1),
+                precommit: aggregated(2),
+                active_validator_set_root: c.active_validator_set_root,
+            },
             chunk_id: 2,
             chunk_hash: c.hash(),
             public_inputs: neutrino_consensus_types::ChunkProofPublicInputs {
@@ -901,6 +1002,7 @@ mod tests {
         assert_eq!(store.get_chunk_proof(2).expect("get"), Some(cp));
 
         let cert = FinalityCert {
+            attestations: Vec::new(),
             chunk_id: 2,
             round: 0,
             chunk_hash: c.hash(),
@@ -957,9 +1059,6 @@ mod tests {
         store.put_latest_finalized_chunk_id(42).expect("put");
         store.put_latest_checkpoint_index(7).expect("put");
         store.put_chain_spec_hash(h(99)).expect("put");
-        store
-            .put_db_schema_version(pointers::CURRENT_DB_SCHEMA_VERSION)
-            .expect("put");
         assert_eq!(store.get_tip().expect("get"), Some(h(1)));
         assert_eq!(store.get_finalized_head().expect("get"), Some(h(2)));
         assert_eq!(
@@ -968,10 +1067,6 @@ mod tests {
         );
         assert_eq!(store.get_latest_checkpoint_index().expect("get"), Some(7));
         assert_eq!(store.get_chain_spec_hash().expect("get"), Some(h(99)));
-        assert_eq!(
-            store.get_db_schema_version().expect("get"),
-            Some(pointers::CURRENT_DB_SCHEMA_VERSION),
-        );
     }
 
     #[test]

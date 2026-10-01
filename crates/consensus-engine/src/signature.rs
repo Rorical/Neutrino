@@ -132,7 +132,6 @@ mod tests {
 
     fn sample_header(proposer_index: u32, signature: [u8; 96]) -> Header {
         Header {
-            version: 1,
             height: 1,
             slot: 1,
             parent_hash: [0; 32],
@@ -141,8 +140,6 @@ mod tests {
             state_root: [0; 32],
             transactions_root: [0; 32],
             votes_root: [0; 32],
-            slashings_root: [0; 32],
-            validator_ops_root: [0; 32],
             da_root: [0; 32],
             runtime_extra: [0; 32],
             receipts_root: [0; 32],

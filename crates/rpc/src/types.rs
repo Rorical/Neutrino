@@ -95,8 +95,6 @@ impl From<BytesHex> for Vec<u8> {
 /// JSON representation of a block header.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeaderJson {
-    /// Protocol version.
-    pub version: u32,
     /// Block height.
     pub height: u64,
     /// Slot at which the block was produced.
@@ -113,10 +111,6 @@ pub struct HeaderJson {
     pub transactions_root: HashHex,
     /// Finality votes root.
     pub votes_root: HashHex,
-    /// Slashings root.
-    pub slashings_root: HashHex,
-    /// Validator-operations root.
-    pub validator_ops_root: HashHex,
     /// Data-availability root.
     pub da_root: HashHex,
     /// Runtime-defined commitment (typically the validator-set root).
@@ -134,7 +128,6 @@ pub struct HeaderJson {
 impl From<&Header> for HeaderJson {
     fn from(h: &Header) -> Self {
         Self {
-            version: h.version,
             height: h.height,
             slot: h.slot,
             parent_hash: HashHex(h.parent_hash),
@@ -143,8 +136,6 @@ impl From<&Header> for HeaderJson {
             state_root: HashHex(h.state_root),
             transactions_root: HashHex(h.transactions_root),
             votes_root: HashHex(h.votes_root),
-            slashings_root: HashHex(h.slashings_root),
-            validator_ops_root: HashHex(h.validator_ops_root),
             da_root: HashHex(h.da_root),
             runtime_extra: HashHex(h.runtime_extra),
             receipts_root: HashHex(h.receipts_root),
@@ -162,11 +153,9 @@ pub struct BodyJson {
     /// Runtime-defined transaction blobs.
     pub transactions: Vec<BytesHex>,
     /// Number of aggregated finality votes (full vote contents are
-    /// not exposed in v1; finality is reported through
+    /// not exposed; finality is reported through
     /// `chain_finalized`).
     pub finality_votes: u32,
-    /// Number of slashing-evidence entries.
-    pub slashings: u32,
 }
 
 impl From<&Body> for BodyJson {
@@ -174,7 +163,6 @@ impl From<&Body> for BodyJson {
         Self {
             transactions: b.transactions.iter().cloned().map(BytesHex).collect(),
             finality_votes: u32::try_from(b.finality_votes.len()).unwrap_or(u32::MAX),
-            slashings: u32::try_from(b.slashings.len()).unwrap_or(u32::MAX),
         }
     }
 }
@@ -252,7 +240,7 @@ pub struct HealthJson {
     pub peers: u64,
     /// `true` if sync FSM is still trailing the network.
     pub is_syncing: bool,
-    /// `true` if a runtime ELF is attached and queries are usable.
+    /// `true` if a WASM runtime is attached and queries are usable.
     pub runtime_available: bool,
     /// Local mempool transaction count.
     pub mempool: u64,
@@ -260,13 +248,11 @@ pub struct HealthJson {
     pub head_height: u64,
 }
 
-/// JSON shape returned by `system_version`.
+/// JSON shape returned by `system_info`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VersionJson {
-    /// Runtime ABI version this node speaks.
-    pub abi_version: u32,
-    /// Runtime ABI version reported by the attached runtime ELF, if any.
-    pub runtime_abi_version: Option<u32>,
+pub struct SystemInfoJson {
+    /// Content hash of the attached WASM runtime, if any.
+    pub runtime_code_hash: Option<HashHex>,
 }
 
 /// JSON shape returned by `validator_set_active`. Validators are

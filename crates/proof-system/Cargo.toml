@@ -25,6 +25,8 @@ neutrino-consensus-types = { workspace = true }
 neutrino-primitives      = { workspace = true }
 neutrino-runtime-abi     = { workspace = true }
 neutrino-trie            = { workspace = true }
+neutrino-prover-chunk    = { workspace = true }
+neutrino-default-runtime-core = { workspace = true }
 borsh                    = { workspace = true }
 
 [lints]

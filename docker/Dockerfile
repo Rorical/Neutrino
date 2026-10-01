@@ -20,13 +20,20 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        ca-certificates \
         clang \
         cmake \
+        curl \
         git \
         libclang-dev \
         libssl-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.sp1/bin:${PATH}"
+RUN curl -fsSL https://sp1up.succinct.xyz | bash \
+    && /root/.sp1/bin/sp1up --version 6.2.1 \
+    && rustup target add wasm32-unknown-unknown
 
 WORKDIR /src
 # Copy the entire workspace; cargo will figure out the dependency graph.
@@ -51,15 +58,14 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/neutrino-node /usr/local/bin/neutrino-node
 
 # Persistent state directory. `data_dir` in the node config points
-# here, and docker-compose mounts a named volume on top so restarts
-# resume from disk instead of replaying genesis.
+# here; mount a persistent volume so restarts resume from disk.
 RUN mkdir -p /var/lib/neutrino \
     && chown neutrino:neutrino /var/lib/neutrino
 
 USER neutrino
 WORKDIR /home/neutrino
 
-# Default port mapping aligned with docker-compose.yml.
+# Default node network ports.
 EXPOSE 30303/tcp 30303/udp
 
 ENV RUST_LOG="info,libp2p=warn,libp2p_swarm=info"

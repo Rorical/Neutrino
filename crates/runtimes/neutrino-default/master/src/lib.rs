@@ -284,6 +284,7 @@ mod tests {
     #[test]
     fn apply_block_with_witness_runs_an_empty_block() {
         let input = StfInput {
+            evidence_anchor: neutrino_default_runtime_core::EvidenceAnchor::default(),
             chain_id: 1,
             block_height: 1,
             block_gas_limit: 30_000_000,
@@ -299,7 +300,10 @@ mod tests {
             pre_state_root: empty_state_root(),
             nodes: alloc::vec![],
             values: alloc::vec![],
-            witnessed_keys: alloc::vec![VALIDATOR_SET_KEY.to_vec()],
+            witnessed_keys: alloc::vec![
+                VALIDATOR_SET_KEY.to_vec(),
+                neutrino_default_runtime_core::accountability::QUEUE_KEY.to_vec()
+            ],
         };
         let bytes = borsh::to_vec(&(input, witness)).unwrap();
         let out_bytes = apply_block_with_witness(&bytes);

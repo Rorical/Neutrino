@@ -60,14 +60,6 @@ pub type DomainTag = [u8; 16];
 
 /// Zero hash used for empty roots and genesis placeholders.
 pub const ZERO_HASH: Hash = [0; 32];
-/// Current engine/header version.
-pub const HEADER_VERSION: u32 = 1;
-/// Current chain-spec schema version.
-pub const CHAIN_SPEC_VERSION: u32 = 1;
-/// Current proof-system public-input version.
-pub const PROOF_SYSTEM_VERSION: u32 = 1;
-/// Runtime ABI version targeted by M0.
-pub const ABI_VERSION: u32 = 1;
 /// Fractional bits in `FixedU128`.
 pub const FIXED_U128_FRAC_BITS: u32 = 64;
 /// `1.0` as `Q64.64`.
@@ -156,19 +148,23 @@ pub const MAX_CHAIN_NAME_BYTES: usize = 64;
 pub const MAX_METADATA_BYTES: usize = 256;
 
 /// BLS-VRF eval/verify domain.
-pub const DOMAIN_VRF: DomainTag = *b"NEUTRINO_VRF_V1\0";
+pub const DOMAIN_VRF: DomainTag = *b"NEUTRINO_VRF____";
 /// Block header proposer-signature domain.
 pub const DOMAIN_PROPOSER_SIG: DomainTag = *b"NEUTRINO_PROPOSE";
 /// Finality prevote domain.
 pub const DOMAIN_PREVOTE: DomainTag = *b"NEUTRINO_PREVOTE";
 /// Finality precommit domain.
 pub const DOMAIN_PRECOMMIT: DomainTag = *b"NEUTRINO_PRECOMM";
+/// Explicit precommit proof-artifact and unlock commitments (wire revision 2).
+pub const DOMAIN_VOTE_ATTESTATION: DomainTag = *b"NEUTRINO_VOTE___";
+/// Domain for a proposer's signed publication of exact DA bundle bytes.
+pub const DOMAIN_DA_PUBLICATION: DomainTag = *b"NEUTRINO_DA_PUB_";
 /// Validator deposit proof-of-possession domain.
 pub const DOMAIN_DEPOSIT_POP: DomainTag = *b"NEUTRINO_DEP_POP";
 /// Voluntary-exit signature domain.
-pub const DOMAIN_VOLUNTARY_EXIT: DomainTag = *b"NEUTRINO_VEXIT00";
+pub const DOMAIN_VOLUNTARY_EXIT: DomainTag = *b"NEUTRINO_VEXIT__";
 /// Future chunk-aggregator proof domain.
-pub const DOMAIN_AGG_PROOF: DomainTag = *b"NEUTRINO_AGGPRF0";
+pub const DOMAIN_AGG_PROOF: DomainTag = *b"NEUTRINO_AGGPRF_";
 
 /// Converts an integer into `Q64.64`.
 pub const fn fixed_u128_from_integer(value: u64) -> FixedU128 {
@@ -227,25 +223,53 @@ pub fn merkle_root_of_blobs(blobs: &[Vec<u8>]) -> Hash {
 /// the caller already holds canonical leaf digests.
 #[must_use]
 pub fn merkle_root_of_hashes(leaves: &[Hash]) -> Hash {
+    merkle_root_from_hashes(leaves.to_vec())
+}
+
+/// Reduce owned Merkle leaves in place, without allocating at each tree level.
+/// Uses exactly the same odd-leaf promotion and empty root as
+/// [`merkle_root_of_hashes`].
+#[must_use]
+pub fn merkle_root_from_hashes(mut leaves: Vec<Hash>) -> Hash {
     if leaves.is_empty() {
         return EMPTY_MERKLE_ROOT;
     }
-    let mut current: Vec<Hash> = leaves.to_vec();
-    while current.len() > 1 {
-        let mut next: Vec<Hash> = Vec::with_capacity(current.len().div_ceil(2));
-        let mut chunks = current.chunks_exact(2);
-        for pair in &mut chunks {
+    while leaves.len() > 1 {
+        let length = leaves.len();
+        for index in 0..length / 2 {
             let mut concat = [0_u8; 64];
-            concat[..32].copy_from_slice(&pair[0]);
-            concat[32..].copy_from_slice(&pair[1]);
-            next.push(blake3_256(&concat));
+            concat[..32].copy_from_slice(&leaves[index * 2]);
+            concat[32..].copy_from_slice(&leaves[index * 2 + 1]);
+            leaves[index] = blake3_256(&concat);
         }
-        if let Some(odd) = chunks.remainder().first() {
-            next.push(*odd);
+        if length % 2 != 0 {
+            leaves[length / 2] = leaves[length - 1];
         }
-        current = next;
+        leaves.truncate(length.div_ceil(2));
     }
-    current[0]
+    leaves[0]
+}
+
+/// Domain for counted transaction and vote DA commitments to counted body-lane Merkle roots.
+pub const DOMAIN_DA_LANE: DomainTag = *b"NEUTRINO_DA_____";
+
+/// Commit the transaction and vote lanes without hashing their bytes
+/// again.
+///
+/// Each leaf binds its domain, lane index, exact count and Merkle root.
+/// Counts are essential: Merkle roots alone do not encode a tree's shape.
+#[must_use]
+pub fn da_root_from_lane_roots(lanes: [(u32, Hash); 2]) -> Hash {
+    let mut leaves = [[0; 32]; 2];
+    for (tag, (count, root)) in (0_u8..2).zip(lanes) {
+        let mut bytes = [0; 53];
+        bytes[..16].copy_from_slice(&DOMAIN_DA_LANE);
+        bytes[16] = tag;
+        bytes[17..21].copy_from_slice(&count.to_le_bytes());
+        bytes[21..].copy_from_slice(&root);
+        leaves[usize::from(tag)] = blake3_256(&bytes);
+    }
+    merkle_root_of_hashes(&leaves)
 }
 
 /// Error returned when bounded bytes exceed their configured maximum.
@@ -493,33 +517,24 @@ pub enum HashAlgorithm {
     #[default]
     Blake3,
     /// SHA-256, useful for backends that prefer SHA-friendly trie
-    /// commitments (e.g. an alternative `proof_system_version` swap).
+    /// commitments (e.g. an alternative proof-parameter configuration).
     Sha256,
     /// Poseidon-style arithmetic hash, useful for in-circuit Merkle and
     /// Fiat-Shamir economics in future proof backends.
     Poseidon,
 }
 
-/// Runtime version exposed by the runtime ABI and ELF metadata.
+/// Runtime metadata exposed by the runtime query API.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct RuntimeVersion {
+pub struct RuntimeInfo {
     /// Fixed-width runtime name.
     pub spec_name: [u8; 16],
-    /// Consensus-breaking runtime version.
-    pub spec_version: u32,
-    /// Implementation-only runtime version.
-    pub impl_version: u32,
-    /// Host ABI version expected by the runtime.
-    pub abi_version: u32,
 }
 
-impl Default for RuntimeVersion {
+impl Default for RuntimeInfo {
     fn default() -> Self {
         Self {
             spec_name: *b"NEUTRINO_DEFAULT",
-            spec_version: 1,
-            impl_version: 1,
-            abi_version: ABI_VERSION,
         }
     }
 }
@@ -602,13 +617,13 @@ pub struct ConsensusParams {
     /// Number of consecutive chunks that make up one epoch. Together
     /// with `chunk_size` this defines `epoch_length_blocks =
     /// chunk_size * epoch_length_in_chunks`. Used by the
-    /// validator-set rotation bridge to compute the current epoch
+    /// complete chunk validator transition to compute the current epoch
     /// from the chunk index that just finalised:
     /// `current_epoch = (chunk_id + 1) / epoch_length_in_chunks`.
     pub epoch_length_in_chunks: u64,
     /// Activation delay applied to runtime-registered validators in
     /// epochs. A `Transaction::RegisterValidator` accepted in
-    /// chunk N causes the bridge to seat the new consensus
+    /// chunk N causes the chunk transition to seat the new consensus
     /// validator with
     /// `activation_epoch = (N + 1) / epoch_length_in_chunks +
     /// activation_delay_epochs`. The validator stays at
@@ -618,7 +633,7 @@ pub struct ConsensusParams {
     pub activation_delay_epochs: u64,
     /// Exit delay applied to runtime-registered validators in
     /// epochs. When a runtime-registered validator's runtime stake
-    /// drops to zero, the bridge sets `exit_epoch =
+    /// drops to zero, the chunk transition sets `exit_epoch =
     /// current_epoch + exit_delay_epochs`. After that epoch the
     /// validator is permanently filtered out of consensus through
     /// the same `effective_stake == 0` path used for activation.
@@ -655,11 +670,9 @@ impl Default for ConsensusParams {
     }
 }
 
-/// Proof-market and proof-version constants covered by the chain-spec hash.
+/// Proof-market constants covered by the chain-spec hash.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProofParams {
-    /// Public-input proof-system version.
-    pub proof_system_version: u32,
     /// Ideal no-empty-slot chunk length in slots.
     pub slot_budget_per_chunk: u64,
     /// Fallback prover bounty premium as `Q64.64`.
@@ -669,7 +682,6 @@ pub struct ProofParams {
 impl Default for ProofParams {
     fn default() -> Self {
         Self {
-            proof_system_version: PROOF_SYSTEM_VERSION,
             slot_budget_per_chunk: DEFAULT_CHUNK_SIZE,
             fallback_premium: DEFAULT_FALLBACK_PREMIUM,
         }
@@ -712,8 +724,6 @@ pub struct LightClientParams {
     pub anchor_interval_checkpoints: u64,
     /// User-facing stale-checkpoint threshold in seconds.
     pub stale_threshold_secs: u64,
-    /// Expected recursive proof version.
-    pub expected_proof_version: u32,
 }
 
 impl Default for LightClientParams {
@@ -722,15 +732,14 @@ impl Default for LightClientParams {
             weak_subjectivity_period_secs: DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS,
             anchor_interval_checkpoints: DEFAULT_ANCHOR_INTERVAL_CHECKPOINTS,
             stale_threshold_secs: DEFAULT_LIGHT_CLIENT_STALE_THRESHOLD_SECS,
-            expected_proof_version: PROOF_SYSTEM_VERSION,
         }
     }
 }
 
 /// Default unbonding delay used when a chain spec does not override
-/// `runtime.unbonding_delay_blocks`. Matches the default-runtime's
-/// historical `UNBONDING_DELAY_BLOCKS` constant of 32.
-pub const DEFAULT_UNBONDING_DELAY_BLOCKS: u64 = 32;
+/// `runtime.unbonding_delay_blocks`. Leaves a full evidence window plus
+/// a chunk before funds can become withdrawable.
+pub const DEFAULT_UNBONDING_DELAY_BLOCKS: u64 = 2048;
 
 /// Default per-occurrence consensus-slash amount.
 ///
@@ -754,7 +763,7 @@ pub const DEFAULT_INACTIVITY_LEAK_AMOUNT: u128 = 1;
 /// Adding new fields is non-breaking on the wire format because
 /// borsh deserialization is positional and new entries must append.
 /// `Default` returns the canonical no-fee, full-stake-slash, 32-block
-/// unbonding configuration that preserves legacy behavior. Real
+/// unbonding configuration. Real
 /// chains override individual fields through `chain-spec.toml`:
 ///
 /// ```toml
@@ -765,8 +774,16 @@ pub const DEFAULT_INACTIVITY_LEAK_AMOUNT: u128 = 1;
 /// ```
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RuntimeParams {
+    /// Evidence admission window after its authenticated source chunk ends.
+    pub evidence_max_age_blocks: u64,
+    /// Maximum number of verified sanctions retained in the mandatory FIFO.
+    pub evidence_max_pending: u32,
+    /// Maximum proof-carrying evidence admissions per block.
+    pub evidence_admissions_per_block: u32,
+    /// Mandatory FIFO executions reserved at the start of each block.
+    pub evidence_executions_per_block: u32,
     /// Native-token cost per gas unit. `0` disables fees entirely
-    /// (the canonical pre-fee-market configuration). The runtime
+    /// The runtime
     /// debits `tx_gas(tx) * gas_price` from each successful signed
     /// transaction's sender and credits the accumulated sum to the
     /// block proposer's runtime account.
@@ -777,23 +794,26 @@ pub struct RuntimeParams {
     /// `StfInput.block_height` and the queue's `mature_at_height`
     /// arithmetic.
     pub unbonding_delay_blocks: u64,
-    /// Per-occurrence stake deduction applied by a consensus-driven
-    /// `Transaction::Slash`. Clamped by the runtime to the offender's
+    /// Per-offence stake deduction applied by the mandatory sanction queue.
+    /// Clamped by the runtime to the offender's
     /// current stake. `u128::MAX` means "burn whatever remains".
     pub slash_amount: u128,
-    /// Per-missed-precommit stake deduction applied by a consensus-
-    /// driven `Transaction::InactivityLeak`. Also clamped to current
-    /// stake.
+    /// Stake deduction for proven precommit certificate non-inclusion.
+    /// Clamped to current stake.
     pub inactivity_leak_amount: u128,
 }
 
 impl Default for RuntimeParams {
     fn default() -> Self {
-        // Mirrors the legacy hard-coded constants in
+        // Defaults for the execution parameters in
         // `crates/node/src/chain_backend.rs` so chains that omit a
         // `runtime` block from their chain-spec keep the pre-existing
         // behavior.
         Self {
+            evidence_max_age_blocks: 1024,
+            evidence_max_pending: 1024,
+            evidence_admissions_per_block: 16,
+            evidence_executions_per_block: 16,
             gas_price: 0,
             unbonding_delay_blocks: DEFAULT_UNBONDING_DELAY_BLOCKS,
             slash_amount: DEFAULT_SLASH_AMOUNT,
@@ -826,8 +846,6 @@ pub struct Checkpoint {
     pub end_validator_set_root: Hash,
     /// Authenticated history accumulator root.
     pub history_root: Hash,
-    /// Proof-system version that produced this checkpoint.
-    pub proof_system_version: u32,
 }
 
 impl Checkpoint {
@@ -840,8 +858,6 @@ impl Checkpoint {
 /// Canonical chain specification used for DB metadata and peer compatibility.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChainSpec {
-    /// Chain-spec schema version.
-    pub spec_version: u32,
     /// Human-readable chain name.
     pub name: BoundedBytes<MAX_CHAIN_NAME_BYTES>,
     /// Chain identifier.
@@ -850,9 +866,9 @@ pub struct ChainSpec {
     pub genesis_time: u64,
     /// Genesis block gas limit.
     pub genesis_gas_limit: u64,
-    /// Runtime version expected at genesis.
-    pub runtime_version: RuntimeVersion,
-    /// BLAKE3 hash of the canonical runtime ELF bytes stored on-chain.
+    /// Runtime metadata expected at genesis.
+    pub runtime_info: RuntimeInfo,
+    /// BLAKE3 hash of the WASM runtime artifact bytes.
     pub runtime_code_hash: Hash,
     /// Public randomness seed for the first post-genesis chunk.
     pub genesis_seed: Seed,
@@ -899,7 +915,6 @@ impl ChainSpec {
             end_state_root: self.genesis_state_root,
             end_validator_set_root: self.genesis_validator_set_root,
             history_root: ZERO_HASH,
-            proof_system_version: self.proof.proof_system_version,
         }
     }
 
@@ -910,18 +925,8 @@ impl ChainSpec {
 
     /// Validates consistency of consensus-critical chain-spec fields.
     pub fn validate(&self) -> Result<(), ChainSpecError> {
-        if self.spec_version != CHAIN_SPEC_VERSION {
-            return Err(ChainSpecError::UnsupportedSpecVersion(self.spec_version));
-        }
-
         if self.chain_id == 0 {
             return Err(ChainSpecError::ZeroChainId);
-        }
-
-        if self.runtime_version.abi_version != ABI_VERSION {
-            return Err(ChainSpecError::UnsupportedAbiVersion(
-                self.runtime_version.abi_version,
-            ));
         }
 
         if self.genesis_checkpoint != self.canonical_genesis_checkpoint() {
@@ -931,7 +936,22 @@ impl ChainSpec {
         self.consensus.validate()?;
         self.proof.validate(&self.consensus)?;
         self.state.validate()?;
-        self.light_client.validate(&self.proof)?;
+        self.light_client.validate()?;
+        if self.runtime.evidence_max_age_blocks == 0
+            || self
+                .runtime
+                .evidence_max_age_blocks
+                .checked_add(self.consensus.chunk_size)
+                .is_none_or(|window| window >= self.runtime.unbonding_delay_blocks)
+            || self.runtime.evidence_max_pending == 0
+            || self.runtime.evidence_max_pending > 4096
+            || self.runtime.evidence_executions_per_block == 0
+            || self.runtime.evidence_executions_per_block > self.runtime.evidence_max_pending
+            || self.runtime.evidence_admissions_per_block == 0
+            || self.runtime.evidence_admissions_per_block > self.runtime.evidence_max_pending
+        {
+            return Err(ChainSpecError::InvalidEvidencePolicy);
+        }
 
         if self.initial_validators.is_empty() {
             return Err(ChainSpecError::EmptyValidatorSet);
@@ -1004,7 +1024,7 @@ impl ConsensusParams {
 
 impl ProofParams {
     fn validate(&self, consensus: &ConsensusParams) -> Result<(), ChainSpecError> {
-        if self.proof_system_version == 0 || self.slot_budget_per_chunk == 0 {
+        if self.slot_budget_per_chunk == 0 {
             return Err(ChainSpecError::ZeroProofParameter);
         }
 
@@ -1031,16 +1051,12 @@ impl StateParams {
 }
 
 impl LightClientParams {
-    fn validate(&self, proof: &ProofParams) -> Result<(), ChainSpecError> {
+    fn validate(&self) -> Result<(), ChainSpecError> {
         if self.weak_subjectivity_period_secs == 0
             || self.anchor_interval_checkpoints == 0
             || self.stale_threshold_secs == 0
         {
             return Err(ChainSpecError::ZeroLightClientParameter);
-        }
-
-        if self.expected_proof_version != proof.proof_system_version {
-            return Err(ChainSpecError::LightClientProofVersionMismatch);
         }
 
         Ok(())
@@ -1058,12 +1074,10 @@ fn validate_quorum(numerator: u64, denominator: u64) -> Result<(), ChainSpecErro
 /// Chain-spec validation error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainSpecError {
-    /// The schema version is not supported by this binary.
-    UnsupportedSpecVersion(u32),
+    /// Evidence limits or the relationship to the withdrawal delay are invalid.
+    InvalidEvidencePolicy,
     /// Chain ID zero is reserved as invalid.
     ZeroChainId,
-    /// The runtime ABI version does not match the host.
-    UnsupportedAbiVersion(u32),
     /// The embedded genesis checkpoint is not canonical for the spec fields.
     InvalidGenesisCheckpoint,
     /// At least one consensus parameter was zero.
@@ -1080,8 +1094,6 @@ pub enum ChainSpecError {
     ZeroStateParameter,
     /// At least one light-client parameter was zero.
     ZeroLightClientParameter,
-    /// Light-client expected proof version does not match proof params.
-    LightClientProofVersionMismatch,
     /// The initial validator set must not be empty.
     EmptyValidatorSet,
     /// Validators must start with non-zero effective stake.
@@ -1100,11 +1112,8 @@ pub enum ChainSpecError {
 impl fmt::Display for ChainSpecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedSpecVersion(version) => {
-                write!(f, "unsupported chain-spec version {version}")
-            }
+            Self::InvalidEvidencePolicy => f.write_str("invalid evidence queue/window policy"),
             Self::ZeroChainId => f.write_str("chain ID must be non-zero"),
-            Self::UnsupportedAbiVersion(version) => write!(f, "unsupported ABI version {version}"),
             Self::InvalidGenesisCheckpoint => f.write_str("genesis checkpoint is not canonical"),
             Self::ZeroConsensusParameter => f.write_str("consensus parameters must be non-zero"),
             Self::InvalidQuorum => f.write_str("BFT quorum fraction is invalid"),
@@ -1116,9 +1125,6 @@ impl fmt::Display for ChainSpecError {
             Self::ZeroStateParameter => f.write_str("state parameters must be non-zero"),
             Self::ZeroLightClientParameter => {
                 f.write_str("light-client parameters must be non-zero")
-            }
-            Self::LightClientProofVersionMismatch => {
-                f.write_str("light-client proof version must match proof params")
             }
             Self::EmptyValidatorSet => f.write_str("initial validator set must not be empty"),
             Self::ZeroValidatorStake => f.write_str("validator effective stake must be non-zero"),
@@ -1138,12 +1144,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn in_place_merkle_matches_reference_for_every_tree_shape() {
+        // Independent level-allocating reference, including all odd promotions.
+        for count in 0..130 {
+            let mut reference: Vec<Hash> = (0_u32..count)
+                .map(|i| blake3_256(&i.to_le_bytes()))
+                .collect();
+            let actual = merkle_root_from_hashes(reference.clone());
+            while reference.len() > 1 {
+                reference = reference
+                    .chunks(2)
+                    .map(|pair| {
+                        if pair.len() == 1 {
+                            return pair[0];
+                        }
+                        let mut bytes = [0; 64];
+                        bytes[..32].copy_from_slice(&pair[0]);
+                        bytes[32..].copy_from_slice(&pair[1]);
+                        blake3_256(&bytes)
+                    })
+                    .collect();
+            }
+            assert_eq!(
+                actual,
+                reference.first().copied().unwrap_or(EMPTY_MERKLE_ROOT)
+            );
+        }
+    }
+
+    #[test]
     fn domain_tags_are_exactly_sixteen_bytes() {
         let tags = [
             DOMAIN_VRF,
             DOMAIN_PROPOSER_SIG,
             DOMAIN_PREVOTE,
             DOMAIN_PRECOMMIT,
+            DOMAIN_VOTE_ATTESTATION,
+            DOMAIN_DA_PUBLICATION,
             DOMAIN_DEPOSIT_POP,
             DOMAIN_VOLUNTARY_EXIT,
             DOMAIN_AGG_PROOF,
@@ -1192,6 +1229,33 @@ mod tests {
     }
 
     #[test]
+    fn evidence_policy_requires_a_usable_window_bounded_queue_and_throughput() {
+        type Mutation = fn(&mut RuntimeParams);
+        for mutate in [
+            |p: &mut RuntimeParams| p.evidence_max_age_blocks = 0,
+            |p: &mut RuntimeParams| p.evidence_max_pending = 0,
+            |p: &mut RuntimeParams| p.evidence_max_pending = 4097,
+            |p: &mut RuntimeParams| p.evidence_admissions_per_block = 0,
+            |p: &mut RuntimeParams| p.evidence_executions_per_block = 0,
+            |p: &mut RuntimeParams| p.evidence_executions_per_block = p.evidence_max_pending + 1,
+            |p: &mut RuntimeParams| p.evidence_max_age_blocks = p.unbonding_delay_blocks,
+        ] as [Mutation; 7]
+        {
+            let mut spec = test_chain_spec();
+            spec.genesis_checkpoint = spec.canonical_genesis_checkpoint();
+            mutate(&mut spec.runtime);
+            assert_eq!(spec.validate(), Err(ChainSpecError::InvalidEvidencePolicy));
+        }
+        let mut spec = test_chain_spec();
+        spec.genesis_checkpoint = spec.canonical_genesis_checkpoint();
+        spec.runtime.evidence_max_age_blocks = 1;
+        spec.runtime.unbonding_delay_blocks = spec.consensus.chunk_size + 1;
+        assert_eq!(spec.validate(), Err(ChainSpecError::InvalidEvidencePolicy));
+        spec.runtime.unbonding_delay_blocks += 1;
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
     fn chain_spec_rejects_noncanonical_genesis_checkpoint() {
         let mut spec = test_chain_spec();
         spec.genesis_checkpoint.end_height = 1;
@@ -1216,16 +1280,14 @@ mod tests {
             end_state_root: [2; 32],
             end_validator_set_root: [3; 32],
             history_root: ZERO_HASH,
-            proof_system_version: proof.proof_system_version,
         };
 
         ChainSpec {
-            spec_version: CHAIN_SPEC_VERSION,
             name: BoundedBytes::new(b"local-testnet".to_vec()).expect("name fits"),
             chain_id: 7,
             genesis_time: 1_800_000_000,
             genesis_gas_limit: 30_000_000,
-            runtime_version: RuntimeVersion::default(),
+            runtime_info: RuntimeInfo::default(),
             runtime_code_hash: [4; 32],
             genesis_seed: [5; 32],
             genesis_state_root: [2; 32],

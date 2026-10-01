@@ -1,4 +1,4 @@
-//! Pending-fix #13 (doc 17) acceptance test: the production
+//! the production
 //! `ChainBackend` paths feed fork-choice the two pieces of state
 //! that previously stayed test-only.
 //!
@@ -15,7 +15,7 @@
 //!    vote-weighted head selection only ever fired in unit tests
 //!    that poked the DAG via `fork_choice_mut_for_test()`.
 //!
-//! The test exercises the single-validator-fallback finalisation
+//! The test exercises the single-validator complete proof finalisation
 //! path (which uses a synthesised certificate rather than peer
 //! votes) for assertion #1; assertion #2 is covered by the
 //! engine-side unit test in `bft_loop.rs::observe_finality_vote_feeds_fork_choice`,
@@ -30,13 +30,14 @@ use std::sync::Arc;
 use neutrino_consensus_engine::{BlockState, Engine, ProposerKey, validator_set_root};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
+use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
-use sp1_sdk::blocking::MockProver;
 
 const CHAIN_ID: u64 = 66666;
 const GENESIS_SEED: [u8; 32] = [0xF1; 32];
@@ -76,7 +77,6 @@ fn chain_spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -84,12 +84,11 @@ fn chain_spec() -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"fork-choice-prod-wire".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: ZERO_HASH,
         genesis_seed: GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -106,11 +105,11 @@ fn chain_spec() -> ChainSpec {
     }
 }
 
-type Backend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
+type Backend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 fn fresh_backend() -> Arc<Backend> {
     let engine = Engine::genesis(chain_spec(), MemoryDatabase::new()).expect("genesis");
-    let proof_system = Sp1ProofSystem::mock().expect("mock SP1 setup");
+    let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 setup");
     let backend = Arc::new(ChainBackend::new(engine, proof_system));
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     backend.set_block_executor(executor);
@@ -151,7 +150,7 @@ fn chunk_finalisation_advances_fork_choice_finalized_anchor() {
         .expect("prove_block");
     assert_eq!(proven.state, BlockState::Proven);
 
-    // Finalize chunk 0 via the single-validator-fallback path
+    // Finalize chunk 0 via the single-validator complete proof path
     // (no BFT session open → synthesised certificate).
     let finalize_outcome = backend
         .finalize_chunk(0, &proposer)
@@ -223,7 +222,7 @@ fn single_validator_finalisation_does_not_populate_fork_choice_votes() {
     assert_eq!(
         backend.fork_choice_vote_count(),
         0,
-        "single-validator-fallback finalisation must not populate fork-choice's vote map \
+        "single-validator complete proof finalisation must not populate fork-choice's vote map \
          (the synthesised cert bypasses observe_finality_vote)",
     );
 }

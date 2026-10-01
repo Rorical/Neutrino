@@ -25,13 +25,11 @@ fn run() -> Result<(), String> {
     if args.next().is_some() {
         return Err("too many arguments".to_string());
     }
-    Err(format!(
-        "command `{command}` awaits the WASM/SP1 runtime rewrite"
-    ))
+    Err(format!("command `{command}` is not implemented"))
 }
 
 fn print_usage() {
     eprintln!("usage: neutrino-cli <command>");
     eprintln!();
-    eprintln!("Commands will be reintroduced on top of the WASM/SP1 runtime architecture.");
+    eprintln!("Run a node with the neutrino-node binary.");
 }

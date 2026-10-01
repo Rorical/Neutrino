@@ -23,9 +23,9 @@ use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProductionConfig, ProposerKey};
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH, fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -73,7 +73,6 @@ fn chain_spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 4,
@@ -81,12 +80,11 @@ fn chain_spec() -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m5-replay".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: GENESIS_SEED,
         genesis_state_root: ZERO_HASH,

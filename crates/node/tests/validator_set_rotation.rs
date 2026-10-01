@@ -1,33 +1,6 @@
-//! Pending-fix #1: cross-layer validator-set rotation.
-//!
-//! The default runtime tracks its own `ValidatorSet` keyed by 32-byte
-//! addresses; the consensus layer tracks a `Vec<Validator>` keyed by
-//! BLS pubkeys. Without an active bridge, runtime stake mutations
-//! (deposits, slashes, inactivity leaks) never affect consensus
-//! proposer eligibility or BFT quorum weighting.
-//!
-//! This test stands up a single-validator backend whose consensus
-//! validator's `withdrawal_credentials` equals an Ed25519 signing
-//! key's pubkey. It then drives:
-//!
-//! 1. Genesis: the consensus active set has the validator at the
-//!    chain-spec's `effective_stake = 1_000_000_000`. The runtime's
-//!    own validator set is empty (chain-spec validators are not
-//!    auto-registered through the runtime).
-//! 2. Block 1: a `Transaction::Stake(validator, 250_000)` signed by
-//!    the validator's key registers the validator in the runtime's
-//!    set with `stake = 250_000`.
-//! 3. Chunk 0 finalises. `ChainBackend::handle_quorum_reached`
-//!    invokes the rotation bridge, which queries the runtime's
-//!    `validator_set`, joins onto the existing consensus active set,
-//!    and writes the new snapshot.
-//! 4. After rotation, `Engine::active_validator_set()[0].effective_stake
-//!    == 250_000` — the runtime-side stake overrides the genesis
-//!    chain-spec value, exactly as it would after a real validator
-//!    onboarding or slash event.
-//!
-//! Acceptance: the BFT-quorum + VRF-eligibility calculations now
-//! observe the runtime's stake distribution.
+//! Complete chunk proofs derive the next consensus stake from authenticated
+//! runtime accounts. WASM execution and SP1 block bindings feed native consensus
+//! validation; finalization installs the verified rotation atomically.
 
 use std::sync::Arc;
 
@@ -38,24 +11,25 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_rpc::RpcBackend;
 use neutrino_runtime_core::host::LiveTrie;
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
+use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use sp1_sdk::blocking::MockProver;
 
 const CHAIN_ID: u64 = 9_191_919;
 const GENESIS_STAKE: u64 = 1_000_000_000;
 const RUNTIME_STAKE: u128 = 250_000;
 const FUNDING: u128 = 10_000_000;
 
-type RotationBackend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
+type RotationBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 fn validator_signing_key() -> SigningKey {
     let mut rng = ChaCha20Rng::seed_from_u64(0xC0_FFEE);
@@ -86,7 +60,7 @@ fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> Chai
     let validators = chain_spec_validators(runtime_addr);
     let proof = ProofParams {
         // `chunk_size = 1` lets a single produced block close chunk 0
-        // immediately so the rotation bridge runs without driving
+        // immediately so the complete chunk validator transition runs without driving
         // multiple slots.
         slot_budget_per_chunk: 1,
         ..ProofParams::default()
@@ -111,15 +85,13 @@ fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> Chai
         end_state_root: genesis_state_root,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"rotation-test".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: ZERO_HASH,
         genesis_seed: [0xAB; 32],
         genesis_state_root,
@@ -149,7 +121,7 @@ fn build_backend(runtime_addr: Address) -> Arc<RotationBackend> {
     let spec = build_chain_spec(runtime_addr, state_root);
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     engine.replace_state_with_reconstructed(live.trie().clone());
-    let proof_system = Sp1ProofSystem::mock().expect("mock SP1 setup");
+    let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 setup");
     let backend = Arc::new(ChainBackend::new(engine, proof_system));
     backend.set_block_executor(WasmExecutor::default_runtime().expect("wasm runtime"));
     backend.set_local_voter(proposer_key());
@@ -225,15 +197,12 @@ fn finalize_chunk_rotates_consensus_active_set_to_runtime_stake() {
         "stake tx mutates the runtime validator_set root",
     );
 
-    // -- 3. Close chunk 0 and run the rotation bridge. This mirrors
+    // -- 3. Close chunk 0 and run the complete chunk validator transition. This mirrors
     //       what `producer::close_due_chunks` does in the live node
     //       binary after every chunk-finalize success.
     let _finalize = backend
         .finalize_chunk(0, &proposer)
         .expect("finalize chunk 0");
-    backend
-        .rotate_active_validator_set_for_chunk(0)
-        .expect("rotation succeeds");
 
     // -- 4. Acceptance: the consensus active set now reflects the
     //       runtime's stake. A node querying VRF eligibility or the
@@ -283,9 +252,6 @@ fn rotation_is_a_noop_when_runtime_set_is_empty() {
     let _finalize = backend
         .finalize_chunk(0, &proposer)
         .expect("finalize chunk 0");
-    backend
-        .rotate_active_validator_set_for_chunk(0)
-        .expect("rotation succeeds");
 
     let set = active_set(&backend);
     assert_eq!(

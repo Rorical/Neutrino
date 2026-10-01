@@ -13,6 +13,30 @@ publish       = { workspace = true }
 [features]
 default = ["std"]
 std = []
+sp1-verification = ["dep:sp1-verifier", "dep:sp1-primitives", "dep:sp1-hypercube", "dep:sp1-recursion-executor", "dep:serde", "dep:bincode"]
+
+[dependencies]
+borsh = { workspace = true }
+neutrino-consensus-types = { workspace = true }
+neutrino-default-runtime-core = { workspace = true }
+neutrino-primitives = { workspace = true }
+neutrino-runtime-core = { workspace = true }
+neutrino-runtime-abi = { workspace = true }
+neutrino-vrf = { path = "../vrf", version = "0.1.0", default-features = false }
+sha2 = { workspace = true }
+bls12_381 = { version = "=0.8.0", default-features = false, features = ["alloc", "pairings", "experimental"] }
+# bls12_381 0.8's hash-to-curve API uses digest 0.9.
+sha2_09 = { package = "sha2", version = "=0.9.9", default-features = false }
+sp1-verifier = { version = "=6.2.1", default-features = false, optional = true }
+sp1-primitives = { version = "=6.2.1", optional = true }
+sp1-hypercube = { version = "=6.2.1", optional = true }
+sp1-recursion-executor = { version = "=6.2.1", default-features = false, optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+bincode = { version = "1.3", optional = true }
+
+[dev-dependencies]
+neutrino-runtime-core = { workspace = true, features = ["host"] }
+neutrino-crypto = { workspace = true }
 
 [lints]
 workspace = true

@@ -23,27 +23,29 @@ use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
     Account, Address, DepositTx, GAS_DEPOSIT, GAS_UNSTAKE, GAS_WITHDRAW, Receipt, Transaction,
-    UNBONDING_DELAY_BLOCKS, UnstakeTx, ValidatorSet, WithdrawTx, account_key,
-    compute_receipts_root, deposit_sig_message, encode_account, tx_kind_code, unstake_sig_message,
-    withdraw_sig_message,
+    UnstakeTx, ValidatorSet, WithdrawTx, account_key, compute_receipts_root, deposit_sig_message,
+    encode_account, tx_kind_code, unstake_sig_message, withdraw_sig_message,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_rpc::{BlockId, RpcBackend};
 use neutrino_runtime_core::host::LiveTrie;
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+use neutrino_runtime_host::WasmExecutor;
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
 use neutrino_storage::MemoryDatabase;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use sp1_sdk::blocking::MockProver;
 
 const CHAIN_ID: u64 = 9001;
+const UNBONDING_DELAY_BLOCKS: u64 = 8;
+const CHUNK_SIZE: u64 = 4;
 
-type LifecycleBackend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
+type LifecycleBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 fn signing_key(seed: u64) -> SigningKey {
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -113,11 +115,11 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
     let vs_root = neutrino_consensus_engine::validator_set_root(&validators());
     let genesis_block_hash = [0xCC; 32];
     let proof = ProofParams {
-        slot_budget_per_chunk: 1,
+        slot_budget_per_chunk: CHUNK_SIZE,
         ..ProofParams::default()
     };
     let consensus = ConsensusParams {
-        chunk_size: 1,
+        chunk_size: CHUNK_SIZE,
         expected_proposers_per_slot: fixed_u128_from_integer(8),
         ..ConsensusParams::default()
     };
@@ -132,15 +134,13 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         end_state_root: state_root,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let spec = ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"full-lifecycle".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: [0xAB; 32],
         genesis_state_root: state_root,
@@ -151,7 +151,11 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
-        runtime: RuntimeParams::default(),
+        runtime: RuntimeParams {
+            unbonding_delay_blocks: UNBONDING_DELAY_BLOCKS,
+            evidence_max_age_blocks: 2,
+            ..RuntimeParams::default()
+        },
         initial_validators: validators(),
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     };
@@ -162,7 +166,7 @@ fn seeded_backend(seeds: &[(Address, Account)]) -> Arc<LifecycleBackend> {
     let (spec, live) = seeded_chain_spec_and_trie(seeds);
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     engine.replace_state_with_reconstructed(live.trie().clone());
-    let proof_system = Sp1ProofSystem::mock().expect("mock SP1 setup");
+    let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 setup");
     let backend = Arc::new(ChainBackend::new(engine, proof_system));
     backend.set_block_executor(WasmExecutor::default_runtime().expect("wasm runtime"));
     backend
@@ -314,24 +318,21 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
         "early withdraw did not drain the queue",
     );
 
-    // Fast-forward by producing empty blocks until the head's height
-    // reaches the entry's maturity. Block heights are monotonic with
-    // slots through `try_produce_block`'s `head_height + 1` rule, so
-    // producing N consecutive blocks at sequential slots advances
-    // head_height by N. The unstake at block-height 2 scheduled the
-    // withdrawal at `mature_at_height = 2 + UNBONDING_DELAY_BLOCKS`.
-    //
-    // We do not prove every empty block: chunks finalize on proof,
-    // but the test only needs head_height to advance. Proving every
-    // empty block multiplies the test cost without exercising new
-    // runtime behavior.
+    // Advance through proof-gated chunk boundaries using a short, internally
+    // consistent test policy (evidence age + chunk size < unbonding delay).
     let mature_height = 2 + UNBONDING_DELAY_BLOCKS;
     let mut next_slot = 4u64; // slot 3 was the early withdraw
     while backend.head_height() < mature_height {
-        backend
+        let block = backend
             .try_produce_block(next_slot, &proposer)
-            .expect("try_produce_block")
-            .expect("validator eligible");
+            .unwrap()
+            .unwrap();
+        backend.prove_block(&block.block_hash).unwrap();
+        if block.block.header.height % CHUNK_SIZE == 0 {
+            backend
+                .finalize_chunk(block.block.header.height / CHUNK_SIZE - 1, &proposer)
+                .unwrap();
+        }
         next_slot += 1;
     }
     assert_eq!(backend.head_height(), mature_height);

@@ -7,7 +7,7 @@ use core::fmt;
 /// `Database(E)` propagates the backend error verbatim. `Codec(io)`
 /// wraps the [`borsh`](borsh) encode/decode error type; for any
 /// supported backend a `Codec` error indicates on-disk corruption or a
-/// version mismatch (every type stored by the engine has a stable
+/// format mismatch (every type stored by the engine has a stable
 /// borsh schema that round-trips by construction).
 #[derive(Debug)]
 pub enum StoreError<E> {

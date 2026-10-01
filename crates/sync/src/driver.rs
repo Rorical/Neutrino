@@ -34,6 +34,8 @@ use tracing::{debug, info, warn};
 use crate::backend::{HeadersImported, SyncBackend, SyncBackendError};
 use crate::error::SyncDriverError;
 
+mod full_chunk;
+
 /// Construction-time options for [`SyncDriver`].
 #[derive(Clone, Copy, Debug)]
 pub struct SyncDriverConfig {
@@ -62,6 +64,7 @@ const PENDING_PROOF_BUFFER_LIMIT: usize = 256;
 /// Stage 5 sync driver — the engine-side bridge between the libp2p
 /// network service and the sync state machine.
 pub struct SyncDriver {
+    full_chunks: full_chunk::FullChunkSync,
     fsm: SyncMachine,
     backend: Arc<dyn SyncBackend>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -96,6 +99,7 @@ impl SyncDriver {
         let (outbound_tx, outbound_rx) = mpsc::channel(config.outbound_buffer);
         let fsm = SyncMachine::new(config.mode, local_progress);
         Self {
+            full_chunks: full_chunk::FullChunkSync::default(),
             fsm,
             backend,
             cmd_tx,
@@ -116,8 +120,18 @@ impl SyncDriver {
 
     /// Drive the loop until the network event channel closes.
     pub async fn run(mut self) -> Result<(), SyncDriverError> {
+        let mut retry = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
+                _ = retry.tick(), if self.full_chunks.enabled && !self.full_chunks.in_flight => {
+                    let count = self.connected_peers.len();
+                    let index = self.full_chunks.retry_cursor.checked_rem(count).unwrap_or(0);
+                    self.full_chunks.retry_cursor = self.full_chunks.retry_cursor.wrapping_add(1);
+                    if let Some(peer) = self.connected_peers.iter().nth(index).copied() {
+                        self.send_rpc(peer, RpcRequest::Status(self.backend.local_status().await),
+                            |peer, response| OutboundOutcome::StatusResponse { peer, response }).await;
+                    }
+                }
                 event = self.event_rx.recv() => {
                     let Some(event) = event else {
                         info!("network event channel closed, sync driver stopping");
@@ -214,12 +228,18 @@ impl SyncDriver {
         if topic == Topic::BlockProofs {
             return self.handle_block_proof_gossip(data).await;
         }
-        if topic == Topic::ChunkProofs || topic == Topic::Checkpoints {
-            // The SP1 rewrite defers chunk-proof aggregation and
-            // checkpoint recursion; the node never produces these
-            // gossip messages anymore. Any inbound message on these
-            // topics is ignored (accepted to keep peer scoring
-            // neutral but not imported).
+        if topic == Topic::ChunkProofs {
+            let Ok(proof) = borsh::from_slice::<neutrino_consensus_types::ChunkProof>(&data) else {
+                return MessageAcceptance::Reject;
+            };
+            return match self.backend.verify_and_import_chunk_proof(proof).await {
+                Ok(_) => MessageAcceptance::Accept,
+                Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
+                Err(_) => MessageAcceptance::Ignore,
+            };
+        }
+        if topic == Topic::Checkpoints {
+            // Checkpoint recursion has no implemented production verifier.
             return neutrino_network::libp2p::gossipsub::MessageAcceptance::Ignore;
         }
         if topic == Topic::Transactions {
@@ -233,6 +253,18 @@ impl SyncDriver {
             return self
                 .handle_aggregate_finality_vote_gossip(subnet, data)
                 .await;
+        }
+        if topic == Topic::EvidenceProofs {
+            let Ok(artifact) =
+                borsh::from_slice::<neutrino_consensus_types::evidence::EvidenceArtifact>(&data)
+            else {
+                return MessageAcceptance::Reject;
+            };
+            return match self.backend.ingest_evidence_proof(artifact).await {
+                crate::EvidenceProofAcceptance::Accepted => MessageAcceptance::Accept,
+                crate::EvidenceProofAcceptance::Deferred => MessageAcceptance::Ignore,
+                crate::EvidenceProofAcceptance::Rejected => MessageAcceptance::Reject,
+            };
         }
         if topic == Topic::SlashingEvidence {
             return self.handle_slashing_evidence_gossip(data).await;
@@ -664,21 +696,41 @@ impl SyncDriver {
         });
     }
 
+    async fn handle_rpc_failure(
+        &mut self,
+        protocol: RpcProtocol,
+        peer: neutrino_network::PeerId,
+        error: neutrino_network::rpc::RpcError,
+    ) {
+        let commands = self.fsm.on_event(SyncEvent::RpcFailed {
+            protocol,
+            peer,
+            error: error.to_string(),
+        });
+        self.dispatch_sync_commands(commands).await;
+    }
+
     async fn handle_outbound_outcome(&mut self, outcome: OutboundOutcome) {
         match outcome {
+            OutboundOutcome::Consensus {
+                peer,
+                step,
+                response,
+            } => {
+                full_chunk::on_response(self, peer, step, response).await;
+            }
             OutboundOutcome::StatusResponse { peer, response } => match response {
                 Ok(RpcResponse::Status(status)) => {
+                    if full_chunk::on_status(self, peer, status).await {
+                        return;
+                    }
                     let cmds = self.fsm.on_event(SyncEvent::PeerStatus { peer, status });
                     self.dispatch_sync_commands(cmds).await;
                 }
                 Ok(other) => warn!(?other, "unexpected response type for Status RPC"),
                 Err(err) => {
-                    let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                        protocol: RpcProtocol::Status,
-                        peer,
-                        error: err.to_string(),
-                    });
-                    self.dispatch_sync_commands(cmds).await;
+                    self.handle_rpc_failure(RpcProtocol::Status, peer, err)
+                        .await;
                 }
             },
             OutboundOutcome::RecursiveProofs { peer, response } => match response {
@@ -691,12 +743,8 @@ impl SyncDriver {
                     "unexpected response type for RecursiveProofByIndex RPC"
                 ),
                 Err(err) => {
-                    let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                        protocol: RpcProtocol::RecursiveProofByIndex,
-                        peer,
-                        error: err.to_string(),
-                    });
-                    self.dispatch_sync_commands(cmds).await;
+                    self.handle_rpc_failure(RpcProtocol::RecursiveProofByIndex, peer, err)
+                        .await;
                 }
             },
             OutboundOutcome::Blocks { peer, response } => match response {
@@ -705,12 +753,8 @@ impl SyncDriver {
                 }
                 Ok(other) => warn!(?other, "unexpected response type for BlocksByRange RPC"),
                 Err(err) => {
-                    let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                        protocol: RpcProtocol::BlocksByRange,
-                        peer,
-                        error: err.to_string(),
-                    });
-                    self.dispatch_sync_commands(cmds).await;
+                    self.handle_rpc_failure(RpcProtocol::BlocksByRange, peer, err)
+                        .await;
                 }
             },
             OutboundOutcome::StateNodes {
@@ -731,12 +775,8 @@ impl SyncDriver {
                 }
                 Ok(other) => warn!(?other, "unexpected response type for StateByRoot RPC"),
                 Err(err) => {
-                    let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                        protocol: RpcProtocol::StateByRoot,
-                        peer,
-                        error: err.to_string(),
-                    });
-                    self.dispatch_sync_commands(cmds).await;
+                    self.handle_rpc_failure(RpcProtocol::StateByRoot, peer, err)
+                        .await;
                 }
             },
             OutboundOutcome::BlockProofs {
@@ -753,12 +793,8 @@ impl SyncDriver {
                     "unexpected response type for BlockProofByHeight RPC"
                 ),
                 Err(err) => {
-                    let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                        protocol: RpcProtocol::BlockProofByHeight,
-                        peer,
-                        error: err.to_string(),
-                    });
-                    self.dispatch_sync_commands(cmds).await;
+                    self.handle_rpc_failure(RpcProtocol::BlockProofByHeight, peer, err)
+                        .await;
                 }
             },
         }
@@ -973,6 +1009,11 @@ impl SyncDriver {
 /// into the main driver loop.
 #[derive(Debug)]
 enum OutboundOutcome {
+    Consensus {
+        peer: neutrino_network::PeerId,
+        step: full_chunk::Step,
+        response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
+    },
     StatusResponse {
         peer: neutrino_network::PeerId,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,

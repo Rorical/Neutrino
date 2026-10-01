@@ -1,4 +1,4 @@
-//! Pending-fix #12 (doc 17) acceptance test: when the fork-choice
+//! when the fork-choice
 //! DAG selects a head different from the linearly-materialised
 //! head, the engine walks back to the lowest common ancestor,
 //! replays the new branch through the executor, and commits the
@@ -29,7 +29,7 @@
 //!   because the empty body is a state fixed point.
 //!
 //! The follower under test (`F`) is built once, imports A1 first
-//! (so its materialised head is A1), imports B1 second (DAG
+//! (so its materialised head is A1), gives A1 explicit support, then imports B1 (DAG
 //! sibling, no head movement), then is forced to reorg via
 //! `fork_choice_mut_for_test().add_vote()` weighting B1 above A1.
 //! After the explicit
@@ -38,7 +38,7 @@
 //! (since B1 has an empty body).
 //!
 //! Without `add_vote` wired through production (a separate gap
-//! tracked in the doc 17 audit observations 1+2), the production
+//! tracked in the branch replay invariants), the production
 //! trigger for materialisation today is purely
 //! proof-status-driven — i.e. an `Invalid`-marked branch in
 //! `import_block_proof`. This test exercises the materialise
@@ -58,9 +58,9 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH, fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
@@ -146,7 +146,6 @@ fn chain_spec_and_trie(count: u8) -> (ChainSpec, LiveTrie) {
         end_state_root: genesis_state_root,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -156,12 +155,11 @@ fn chain_spec_and_trie(count: u8) -> (ChainSpec, LiveTrie) {
         ..ConsensusParams::default()
     };
     let spec = ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"reorg-materialisation".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: ZERO_HASH,
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root,
@@ -243,8 +241,14 @@ async fn submit_transfer(backend: Arc<Backend>, amount: u128, nonce: u64) {
 /// follower's fork-choice DAG. Used to force the fork-choice head
 /// off the linearly-materialised head without going through
 /// production vote ingestion (which is not yet wired into the
-/// DAG, see doc 17 audit observation 2).
-async fn inject_vote_for(backend: Arc<Backend>, block_hash: BlockHash, chunk_id: u64) {
+/// DAG, see branch replay invariant).
+async fn inject_vote_for(
+    backend: Arc<Backend>,
+    block_hash: BlockHash,
+    chunk_id: u64,
+    validator_index: u32,
+    weight: u64,
+) {
     tokio::task::spawn_blocking(move || {
         backend.with_engine_mut_for_test(|engine| {
             let dummy_chunk = Chunk {
@@ -264,7 +268,7 @@ async fn inject_vote_for(backend: Arc<Backend>, block_hash: BlockHash, chunk_id:
             };
             let chunk_hash = engine.fork_choice_mut_for_test().add_chunk(&dummy_chunk);
             engine.fork_choice_mut_for_test().add_vote(
-                0,
+                validator_index,
                 ChunkVote {
                     data: FinalityVoteData {
                         chunk_id,
@@ -272,7 +276,7 @@ async fn inject_vote_for(backend: Arc<Backend>, block_hash: BlockHash, chunk_id:
                         chunk_hash,
                         phase: FinalityVotePhase::Precommit,
                     },
-                    weight: 1_000_000_000_000,
+                    weight,
                 },
             );
         });
@@ -289,6 +293,7 @@ async fn inject_vote_for(backend: Arc<Backend>, block_hash: BlockHash, chunk_id:
 /// materialise trigger, the follower's head + state trie are at
 /// B1, NOT A1.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the complete fork switch and state replay in one scenario.
 async fn reorg_materialises_to_new_fork_choice_head() {
     let v0 = proposer(0);
     let v1 = proposer(1);
@@ -354,6 +359,17 @@ async fn reorg_materialises_to_new_fork_choice_head() {
         "follower invariant must hold after A1 import",
     );
 
+    // Anchor A1 with explicit support instead of depending on the VRF/hash
+    // tie-breaker order of these particular fixture headers.
+    inject_vote_for(
+        Arc::clone(&follower),
+        block_a1.hash(),
+        1,
+        0,
+        100_000_000_000,
+    )
+    .await;
+
     // Follower imports B1 → DAG sibling, no head movement.
     follower
         .verify_and_import_gossip_block(sibling_b1.clone())
@@ -362,11 +378,18 @@ async fn reorg_materialises_to_new_fork_choice_head() {
     assert_eq!(
         follower.local_status().await.head_block_hash,
         block_a1.hash(),
-        "B1 must not displace A1 as the materialised head (no votes yet)",
+        "B1 must not displace A1 while A1 has the supporting vote",
     );
 
     // Inject a heavy vote for B1 → fork-choice picks B1.
-    inject_vote_for(Arc::clone(&follower), sibling_b1.hash(), 1).await;
+    inject_vote_for(
+        Arc::clone(&follower),
+        sibling_b1.hash(),
+        1,
+        1,
+        1_000_000_000_000,
+    )
+    .await;
     assert_eq!(
         follower.fork_choice_head(),
         sibling_b1.hash(),

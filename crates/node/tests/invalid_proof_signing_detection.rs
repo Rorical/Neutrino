@@ -14,8 +14,6 @@
 //! 4. The evidence lands in the slashing pool.
 //! 5. Peer-supplied evidence with a proof that *actually* verifies
 //!    is rejected at `ingest_slashing_evidence` time.
-//! 6. The body encoder turns the variant into a borsh-encoded
-//!    `Transaction::Slash` keyed by the offender's runtime address.
 
 use std::sync::Arc;
 
@@ -28,9 +26,9 @@ use neutrino_consensus_types::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BitVec, BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
-    StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BitVec, BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height,
+    LightClientParams, ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_proof_system::{MockBlockProof, MockProofSystem};
 use neutrino_storage::MemoryDatabase;
@@ -76,7 +74,6 @@ fn spec(count: u8) -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -84,12 +81,11 @@ fn spec(count: u8) -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m7-invalid-proof-signing".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xCC; 32],
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -113,10 +109,9 @@ fn fresh_backend() -> Arc<ChainBackend<MemoryDatabase, MockProofSystem>> {
 
 fn signed_block(slot: u64, parent: BlockHash, height: Height, signer: &ProposerKey) -> Block {
     let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
+    let roots = compute_body_roots(&body);
     let vrf_proof = signer.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
     let mut header = Header {
-        version: HEADER_VERSION,
         height,
         slot,
         parent_hash: parent,
@@ -125,8 +120,6 @@ fn signed_block(slot: u64, parent: BlockHash, height: Height, signer: &ProposerK
         state_root: [0x11; 32],
         transactions_root: roots.transactions_root,
         votes_root: roots.votes_root,
-        slashings_root: roots.slashings_root,
-        validator_ops_root: roots.validator_ops_root,
         da_root: roots.da_root,
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,
@@ -161,7 +154,6 @@ fn bad_mock_proof(block: &Block) -> BlockProof {
         receipt_root: ZERO_HASH,
         da_root: block.header.da_root,
         vm_code_hash: [0xCC; 32],
-        abi_version: 1,
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
         gas_price: 0,
@@ -198,7 +190,6 @@ fn good_mock_proof(block: &Block) -> BlockProof {
         receipt_root: ZERO_HASH,
         da_root: block.header.da_root,
         vm_code_hash: [0xCC; 32],
-        abi_version: 1,
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
         gas_price: 0,
@@ -256,6 +247,7 @@ fn partial_vote(
         bits.push(position == voter_position);
     }
     FinalityVote {
+        attestations: Vec::new(),
         aggregation_bits: bits,
         data,
         signature,
@@ -294,7 +286,15 @@ async fn invalid_proof_signing_detector_emits_evidence_on_precommit() {
     // publishes a precommit for chunk 0 covering the bad block.
     // The detector fires and pools an InvalidProofSigning entry.
     let active_set_len = 2;
-    let bad_vote = partial_vote(0, FinalityVotePhase::Precommit, &v1, active_set_len);
+    let mut bad_vote = partial_vote(0, FinalityVotePhase::Precommit, &v1, active_set_len);
+    let mut hashes = vec![[0; 32]; usize::try_from(spec(2).consensus.chunk_size).unwrap()];
+    hashes[0] = neutrino_primitives::blake3_256(&borsh::to_vec(&bad_proof).unwrap());
+    bad_vote.attestations.push(v1.attest_precommit(
+        TEST_CHAIN_ID,
+        bad_vote.data.clone(),
+        hashes,
+        None,
+    ));
     backend.ingest_finality_vote(bad_vote.clone()).await;
 
     assert_eq!(
@@ -312,6 +312,7 @@ async fn invalid_proof_signing_detector_emits_evidence_on_precommit() {
             vote,
             rejected_proof,
             reason,
+            ..
         } => {
             assert_eq!(
                 *validator_index,
@@ -391,6 +392,15 @@ async fn ingest_rejects_invalid_proof_signing_evidence_whose_proof_verifies() {
     };
     let dishonest_evidence = SlashingEvidence::InvalidProofSigning {
         validator_index: v1.validator_index(),
+        attestation: v1.attest_precommit(
+            TEST_CHAIN_ID,
+            indexed.data.clone(),
+            vec![
+                neutrino_primitives::blake3_256(&borsh::to_vec(&valid_proof).unwrap());
+                usize::try_from(spec(2).consensus.chunk_size).unwrap()
+            ],
+            None,
+        ),
         vote: indexed,
         rejected_proof: valid_proof,
         reason: ProofRejectionReason::VerifierRejected,
@@ -402,4 +412,87 @@ async fn ingest_rejects_invalid_proof_signing_evidence_whose_proof_verifies() {
         0,
         "evidence carrying a proof that verifies must be dropped",
     );
+}
+
+#[tokio::test]
+async fn ordinary_precommit_does_not_accept_a_peers_substituted_proof() {
+    let backend = fresh_backend();
+    let genesis_hash = backend.local_status().await.head_block_hash;
+    let block = signed_block(1, genesis_hash, 1, &proposer(0));
+    backend
+        .verify_and_import_gossip_block(block.clone())
+        .await
+        .unwrap();
+    let proof = bad_mock_proof(&block);
+    assert!(
+        backend
+            .verify_and_import_block_proofs(1, vec![proof])
+            .await
+            .is_err()
+    );
+    let vote = partial_vote(0, FinalityVotePhase::Precommit, &proposer(1), 2);
+    backend.ingest_finality_vote(vote).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "a peer cannot frame an ordinary precommit signer by injecting a rejected proof"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_only_proof_acceptance_attributes_every_signer() {
+    let backend = fresh_backend();
+    let genesis = backend.local_status().await.head_block_hash;
+    let block = signed_block(1, genesis, 1, &proposer(0));
+    backend
+        .verify_and_import_gossip_block(block.clone())
+        .await
+        .unwrap();
+    let rejected = bad_mock_proof(&block);
+    assert!(
+        backend
+            .verify_and_import_block_proofs(1, vec![rejected.clone()])
+            .await
+            .is_err()
+    );
+    let mut aggregate = partial_vote(0, FinalityVotePhase::Precommit, &proposer(0), 2);
+    aggregate.aggregation_bits = BitVec::from_bytes(2, vec![3]).unwrap();
+    let signatures: Vec<_> = (0..2)
+        .map(|index| {
+            let voter = proposer(index);
+            aggregate.attestations.push(voter.attest_precommit(
+                TEST_CHAIN_ID,
+                aggregate.data.clone(),
+                vec![neutrino_primitives::blake3_256(
+                    &borsh::to_vec(&rejected).unwrap(),
+                )],
+                None,
+            ));
+            neutrino_crypto::bls::Signature::from_bytes(
+                &voter.sign_finality_vote(TEST_CHAIN_ID, &aggregate.data),
+            )
+            .unwrap()
+        })
+        .collect();
+    aggregate.signature =
+        neutrino_crypto::bls::aggregate_signatures(&signatures.iter().collect::<Vec<_>>())
+            .unwrap()
+            .to_bytes();
+    backend.ingest_aggregate_finality_vote(0, aggregate).await;
+    let evidence = backend.drain_slashing_pool(8);
+    assert_eq!(evidence.len(), 2);
+    let mut signers: Vec<_> = evidence
+        .iter()
+        .map(|evidence| {
+            let SlashingEvidence::InvalidProofSigning {
+                validator_index, ..
+            } = evidence
+            else {
+                panic!("wrong sanction")
+            };
+            *validator_index
+        })
+        .collect();
+    signers.sort_unstable();
+    assert_eq!(signers, vec![0, 1]);
 }

@@ -77,8 +77,8 @@ pub struct RuntimeCallResponse {
 /// Failure modes for [`RpcBackend::runtime_call`].
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RuntimeCallError {
-    /// The backend has no runtime ELF attached; queries are unavailable.
-    #[error("runtime ELF is not configured on this node")]
+    /// The backend has no WASM runtime attached; queries are unavailable.
+    #[error("WASM runtime is not configured on this node")]
     RuntimeNotConfigured,
     /// The caller requested a historical state root, but the backend
     /// does not yet support reconstructing it.
@@ -120,12 +120,10 @@ pub trait RpcBackend: Send + Sync + 'static {
     /// Chain id this node participates in.
     fn chain_id(&self) -> ChainId;
 
-    /// Runtime ABI version reported in `system_version`. Returns
-    /// `None` if the backend has no runtime attached (the RPC layer
-    /// falls back to the engine's ABI in that case).
-    fn runtime_abi_version(&self) -> Option<u32>;
+    /// Content hash of the attached runtime, or `None` when no runtime is installed.
+    fn runtime_code_hash(&self) -> Option<neutrino_primitives::Hash>;
 
-    /// Whether a runtime ELF is attached and `runtime_call` is
+    /// Whether a WASM runtime is attached and `runtime_call` is
     /// callable. Returned in `system_health` so clients can detect
     /// query-disabled nodes up front.
     fn runtime_available(&self) -> bool;
@@ -173,7 +171,7 @@ pub trait RpcBackend: Send + Sync + 'static {
     async fn block_by_height(&self, height: Height) -> Option<Block>;
 
     /// Read a raw storage value at `key`. Only `BlockId::Latest` and
-    /// `BlockId::Finalized` are supported in v1; historical lookups
+    /// `BlockId::Finalized` are supported; historical lookups
     /// return `None`.
     async fn storage_at(&self, key: &[u8], at: &BlockId) -> Option<Vec<u8>>;
 
@@ -181,8 +179,8 @@ pub trait RpcBackend: Send + Sync + 'static {
     async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, SubmitError>;
 
     /// Invoke the runtime's read-only query entrypoint. `at` selects
-    /// the state root the query observes; v1 only supports the
-    /// `Latest` and `Finalized` block ids.
+    /// the state root the query observes; only the
+    /// `Latest` and `Finalized` block ids are supported.
     async fn runtime_call(
         &self,
         method: String,

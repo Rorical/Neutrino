@@ -1,9 +1,6 @@
 //! Per-slot block production.
 //!
-//! The accepted SP1 rewrite (see
-//! `docs/design/13-sp1-runtime-proof-rewrite.md` and
-//! `docs/design/14-sp1-rewrite-roadmap.md`) splits block production
-//! into three concerns:
+//! Block production has three concerns:
 //!
 //! 1. **VRF eligibility.** Owned by this module; consults the active
 //!    validator set, finalized seed, and chain spec.
@@ -30,9 +27,7 @@ use core::fmt;
 
 use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_consensus_vrf::{VrfError, total_active_stake};
-use neutrino_primitives::{
-    BlockHash, BlsSignature, HEADER_VERSION, Slot, StateRoot, Validator, ZERO_HASH,
-};
+use neutrino_primitives::{BlockHash, BlsSignature, Slot, StateRoot, Validator, ZERO_HASH};
 use neutrino_proof_system::{BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome};
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
@@ -244,6 +239,9 @@ impl<DB: Database> Engine<DB> {
             .map(|v| v.withdrawal_credentials)
             .unwrap_or_default();
         let ctx = BlockExecutionContext {
+            evidence_anchor: self
+                .evidence_anchor(height)
+                .map_err(ProductionError::Executor)?,
             chain_id,
             block_height: height,
             gas_limit,
@@ -265,7 +263,7 @@ impl<DB: Database> Engine<DB> {
         // body Merkle roots are still derived host-side because the
         // header lanes are consensus-level commitments, not runtime
         // ones.
-        let body_roots = compute_body_roots(&body, &[]);
+        let body_roots = compute_body_roots(&body);
 
         // Assemble the unsigned header. Slot timing follows the
         // chain spec's `genesis_time + slot * slot_duration_secs`
@@ -276,7 +274,6 @@ impl<DB: Database> Engine<DB> {
             .genesis_time
             .saturating_add(slot.saturating_mul(chain_spec.consensus.slot_duration_secs));
         let mut header = Header {
-            version: HEADER_VERSION,
             height,
             slot,
             parent_hash,
@@ -285,8 +282,6 @@ impl<DB: Database> Engine<DB> {
             state_root: state_root_after,
             transactions_root: ZERO_HASH,
             votes_root: ZERO_HASH,
-            slashings_root: ZERO_HASH,
-            validator_ops_root: ZERO_HASH,
             da_root: ZERO_HASH,
             // Wire the validator-set commitment the runtime emitted
             // into `runtime_extra` so the chunk BFT and consensus

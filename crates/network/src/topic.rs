@@ -1,8 +1,8 @@
 //! Canonical gossip topic registry.
 //!
-//! All topics follow the structure `/neutrino/<topic>/<format>/<version>` as
+//! All topics follow the structure `/neutrino/<topic>/<format>` as
 //! defined in `docs/design/06-networking.md`. The wire format is always
-//! `borsh` and the version is `1`.
+//! `borsh`. Each topic has one current payload format.
 //!
 //! Per-topic transmission byte caps, also defined in doc 06, are enforced on
 //! the gossipsub `Config` at service construction.
@@ -14,40 +14,41 @@ pub const VOTE_SUBNETS: u8 = 16;
 
 /// The set of canonical Neutrino gossip topics.
 ///
-/// Every variant maps to a stable, versioned protocol string. The mapping is
-/// consensus-relevant: changing it without bumping the version constitutes a
-/// hard fork at the networking layer.
+/// Every variant maps to one canonical protocol string.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Topic {
-    /// `/neutrino/blocks/borsh/1`: full block (header + body) gossip.
+    /// `/neutrino/blocks/borsh`: full block (header + body) gossip.
     Blocks,
-    /// `/neutrino/txs/borsh/1`: mempool transaction gossip.
+    /// `/neutrino/txs/borsh`: mempool transaction gossip.
     Transactions,
-    /// `/neutrino/slashing_evidence/borsh/1`: objective slashing reports.
+    /// `/neutrino/slashing_evidence/borsh`: objective slashing reports.
     SlashingEvidence,
-    /// `/neutrino/block_proofs/borsh/1`: per-block validity proofs.
+    /// Independently proven objective offences.
+    EvidenceProofs,
+    /// `/neutrino/block_proofs/borsh`: per-block validity proofs.
     BlockProofs,
-    /// `/neutrino/chunk_proofs/borsh/1`: aggregated chunk proofs.
+    /// `/neutrino/chunk_proofs/borsh`: aggregated chunk proofs.
     ChunkProofs,
-    /// `/neutrino/checkpoints/borsh/1`: recursive checkpoint proofs.
+    /// `/neutrino/checkpoints/borsh`: recursive checkpoint proofs.
     Checkpoints,
-    /// `/neutrino/prover_bounty/borsh/1`: missed-deadline bounty announcements.
+    /// `/neutrino/prover_bounty/borsh`: missed-deadline bounty announcements.
     ProverBounty,
-    /// `/neutrino/finality_votes_prevote/borsh/1`: BFT prevote votes.
+    /// `/neutrino/finality_votes_prevote/borsh`: BFT prevote votes.
     FinalityVotesPrevote,
-    /// `/neutrino/finality_votes_precommit/borsh/1`: BFT precommit votes.
+    /// `/neutrino/finality_votes_precommit/borsh`: BFT precommit votes.
     FinalityVotesPrecommit,
-    /// `/neutrino/aggregate_finality_votes_<subnet>/borsh/1` for `subnet` in
+    /// `/neutrino/aggregate_finality_votes_<subnet>/borsh` for `subnet` in
     /// `0..VOTE_SUBNETS`.
     AggregateFinalityVotes(u8),
 }
 
 impl Topic {
     /// All non-subnet topics, in canonical order.
-    pub const STATIC: [Self; 9] = [
+    pub const STATIC: [Self; 10] = [
         Self::Blocks,
         Self::Transactions,
         Self::SlashingEvidence,
+        Self::EvidenceProofs,
         Self::BlockProofs,
         Self::ChunkProofs,
         Self::Checkpoints,
@@ -77,32 +78,35 @@ impl Topic {
     pub const fn max_transmit_size(self) -> usize {
         match self {
             Self::BlockProofs => 2 * 1024 * 1024,
-            Self::Blocks | Self::ChunkProofs => 8 * 1024 * 1024,
-            Self::Checkpoints => 64 * 1024,
-            Self::FinalityVotesPrevote
+            Self::Blocks
+            | Self::ChunkProofs
+            | Self::EvidenceProofs
+            | Self::SlashingEvidence
+            | Self::FinalityVotesPrevote
             | Self::FinalityVotesPrecommit
-            | Self::AggregateFinalityVotes(_)
-            | Self::ProverBounty => 4 * 1024,
+            | Self::AggregateFinalityVotes(_) => 8 * 1024 * 1024,
+            Self::Checkpoints => 64 * 1024,
+            Self::ProverBounty => 4 * 1024,
             Self::Transactions => 128 * 1024,
-            Self::SlashingEvidence => 16 * 1024,
         }
     }
 
-    /// Canonical protocol string, e.g. `/neutrino/blocks/borsh/1`.
+    /// Canonical protocol string, e.g. `/neutrino/blocks/borsh`.
     #[must_use]
     pub fn protocol_string(self) -> String {
         match self {
-            Self::Blocks => "/neutrino/blocks/borsh/1".to_owned(),
-            Self::Transactions => "/neutrino/txs/borsh/1".to_owned(),
-            Self::SlashingEvidence => "/neutrino/slashing_evidence/borsh/1".to_owned(),
-            Self::BlockProofs => "/neutrino/block_proofs/borsh/1".to_owned(),
-            Self::ChunkProofs => "/neutrino/chunk_proofs/borsh/1".to_owned(),
-            Self::Checkpoints => "/neutrino/checkpoints/borsh/1".to_owned(),
-            Self::ProverBounty => "/neutrino/prover_bounty/borsh/1".to_owned(),
-            Self::FinalityVotesPrevote => "/neutrino/finality_votes_prevote/borsh/1".to_owned(),
-            Self::FinalityVotesPrecommit => "/neutrino/finality_votes_precommit/borsh/1".to_owned(),
+            Self::Blocks => "/neutrino/blocks/borsh".to_owned(),
+            Self::Transactions => "/neutrino/txs/borsh".to_owned(),
+            Self::EvidenceProofs => "/neutrino/evidence_proofs/borsh".to_owned(),
+            Self::SlashingEvidence => "/neutrino/slashing_evidence/borsh".to_owned(),
+            Self::BlockProofs => "/neutrino/block_proofs/borsh".to_owned(),
+            Self::ChunkProofs => "/neutrino/chunk_proofs/borsh".to_owned(),
+            Self::Checkpoints => "/neutrino/checkpoints/borsh".to_owned(),
+            Self::ProverBounty => "/neutrino/prover_bounty/borsh".to_owned(),
+            Self::FinalityVotesPrevote => "/neutrino/finality_votes_prevote/borsh".to_owned(),
+            Self::FinalityVotesPrecommit => "/neutrino/finality_votes_precommit/borsh".to_owned(),
             Self::AggregateFinalityVotes(subnet) => {
-                format!("/neutrino/aggregate_finality_votes_{subnet}/borsh/1")
+                format!("/neutrino/aggregate_finality_votes_{subnet}/borsh")
             }
         }
     }
@@ -126,46 +130,43 @@ mod tests {
 
     #[test]
     fn protocol_strings_match_doc_06() {
-        assert_eq!(Topic::Blocks.protocol_string(), "/neutrino/blocks/borsh/1");
-        assert_eq!(
-            Topic::Transactions.protocol_string(),
-            "/neutrino/txs/borsh/1"
-        );
+        assert_eq!(Topic::Blocks.protocol_string(), "/neutrino/blocks/borsh");
+        assert_eq!(Topic::Transactions.protocol_string(), "/neutrino/txs/borsh");
         assert_eq!(
             Topic::SlashingEvidence.protocol_string(),
-            "/neutrino/slashing_evidence/borsh/1"
+            "/neutrino/slashing_evidence/borsh"
         );
         assert_eq!(
             Topic::BlockProofs.protocol_string(),
-            "/neutrino/block_proofs/borsh/1"
+            "/neutrino/block_proofs/borsh"
         );
         assert_eq!(
             Topic::ChunkProofs.protocol_string(),
-            "/neutrino/chunk_proofs/borsh/1"
+            "/neutrino/chunk_proofs/borsh"
         );
         assert_eq!(
             Topic::Checkpoints.protocol_string(),
-            "/neutrino/checkpoints/borsh/1"
+            "/neutrino/checkpoints/borsh"
         );
         assert_eq!(
             Topic::ProverBounty.protocol_string(),
-            "/neutrino/prover_bounty/borsh/1"
+            "/neutrino/prover_bounty/borsh"
         );
         assert_eq!(
             Topic::FinalityVotesPrevote.protocol_string(),
-            "/neutrino/finality_votes_prevote/borsh/1"
+            "/neutrino/finality_votes_prevote/borsh"
         );
         assert_eq!(
             Topic::FinalityVotesPrecommit.protocol_string(),
-            "/neutrino/finality_votes_precommit/borsh/1"
+            "/neutrino/finality_votes_precommit/borsh"
         );
         assert_eq!(
             Topic::AggregateFinalityVotes(0).protocol_string(),
-            "/neutrino/aggregate_finality_votes_0/borsh/1"
+            "/neutrino/aggregate_finality_votes_0/borsh"
         );
         assert_eq!(
             Topic::AggregateFinalityVotes(15).protocol_string(),
-            "/neutrino/aggregate_finality_votes_15/borsh/1"
+            "/neutrino/aggregate_finality_votes_15/borsh"
         );
     }
 
@@ -184,14 +185,20 @@ mod tests {
         assert_eq!(Topic::BlockProofs.max_transmit_size(), 2 * 1024 * 1024);
         assert_eq!(Topic::ChunkProofs.max_transmit_size(), 8 * 1024 * 1024);
         assert_eq!(Topic::Checkpoints.max_transmit_size(), 64 * 1024);
-        assert_eq!(Topic::FinalityVotesPrevote.max_transmit_size(), 4 * 1024);
-        assert_eq!(Topic::FinalityVotesPrecommit.max_transmit_size(), 4 * 1024);
+        assert_eq!(
+            Topic::FinalityVotesPrevote.max_transmit_size(),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            Topic::FinalityVotesPrecommit.max_transmit_size(),
+            8 * 1024 * 1024
+        );
         assert_eq!(
             Topic::AggregateFinalityVotes(0).max_transmit_size(),
-            4 * 1024
+            8 * 1024 * 1024
         );
         assert_eq!(Topic::Transactions.max_transmit_size(), 128 * 1024);
-        assert_eq!(Topic::SlashingEvidence.max_transmit_size(), 16 * 1024);
+        assert_eq!(Topic::SlashingEvidence.max_transmit_size(), 8 * 1024 * 1024);
     }
 
     #[test]

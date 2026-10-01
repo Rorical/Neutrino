@@ -1,8 +1,8 @@
-//! Builds three artefacts:
+//! Builds four artefacts:
 //! - the `neutrino-default-runtime-guest` ELF (block-prover) via
 //!   `sp1-build`, consumed by `lib.rs` through `include_elf!`,
-//! - the `neutrino-default-chunk-guest` ELF (chunk-aggregator) via
-//!   `sp1-build`, also consumed through `include_elf!`,
+//! - the `neutrino-default-consensus-chunk-guest` ELF (full consensus),
+//! - the `neutrino-default-evidence-guest` ELF (objective offences),
 //! - the `neutrino-default-runtime-master` `wasm32-unknown-unknown`
 //!   cdylib via a sub-cargo invocation; the resulting `.wasm` path
 //!   is exposed to `lib.rs` via `NEUTRINO_DEFAULT_MASTER_WASM`.
@@ -15,8 +15,12 @@ fn main() {
     rerun_if_changed_runtime_sources();
 
     // ----- SP1 Guest ELFs -----
-    sp1_build::build_program("../runtimes/neutrino-default/guest");
-    sp1_build::build_program("../runtimes/neutrino-default/chunk-guest");
+    let guest_args = sp1_build::BuildArgs {
+        locked: true,
+        ..Default::default()
+    };
+    sp1_build::build_program_with_args("../runtimes/neutrino-default/guest", guest_args.clone());
+    sp1_build::build_program_with_args("../runtimes/neutrino-default/chunk-guest", guest_args);
 
     // ----- WASM master cdylib -----
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -77,8 +81,10 @@ fn rerun_if_changed_runtime_sources() {
     for path in [
         "../runtimes/neutrino-default/guest/src",
         "../runtimes/neutrino-default/guest/Cargo.toml",
+        "../runtimes/neutrino-default/guest/Cargo.lock",
         "../runtimes/neutrino-default/chunk-guest/src",
         "../runtimes/neutrino-default/chunk-guest/Cargo.toml",
+        "../runtimes/neutrino-default/chunk-guest/Cargo.lock",
         "../runtimes/neutrino-default/master/src",
         "../runtimes/neutrino-default/master/Cargo.toml",
         "../runtimes/neutrino-default/core/src",
@@ -87,6 +93,11 @@ fn rerun_if_changed_runtime_sources() {
         "../runtime-core/Cargo.toml",
         "../runtime-abi/src",
         "../runtime-abi/Cargo.toml",
+        "../prover-chunk/src",
+        "../prover-chunk/Cargo.toml",
+        "../consensus-types/src",
+        "../primitives/src",
+        "../vrf/src",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }

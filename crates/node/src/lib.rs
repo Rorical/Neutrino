@@ -10,16 +10,8 @@
 //! lifetime managed by [`run`]. The binary entry-point in `main.rs` is a
 //! thin TOML-driven wrapper around this library.
 //!
-//! What this slice provides:
-//! - TOML configuration loading ([`NodeConfig`]).
-//! - Network bring-up: keypair, listeners, bootnode dial-out,
-//!   topic subscriptions.
-//! - A real [`ChainBackend`] path selected by `chain_spec_path`.
-//! - Optional validator block production when runtime ELF and proposer
-//!   key material are configured.
-//!
-//! What this slice does **not** yet provide:
-//! - JSON-RPC / metrics endpoints.
+//! Provides TOML configuration, networking, full synchronization, WASM execution,
+//! SP1 proof jobs, chunk BFT, validator production and optional JSON-RPC.
 
 pub mod chain_backend;
 pub mod chain_spec;
@@ -27,7 +19,6 @@ pub mod config;
 pub mod db;
 pub(crate) mod producer;
 pub mod runner;
-pub(crate) mod tx_injector;
 
 pub use chain_backend::ChainBackend;
 pub use chain_spec::{ChainSpecError, ChainSpecFile, ValidatorEntry};

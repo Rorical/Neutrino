@@ -1,7 +1,7 @@
 //! Stable ABI status codes for the runtime host contract.
 //!
 //! Status codes are part of the guest/host wire contract: they never
-//! change semantics across ABI minor versions. A successful operation
+//! change semantics within the current ABI. A successful operation
 //! returns [`Status::Ok`]; any other variant indicates the host refused
 //! the call and the runtime should treat the operation as having no
 //! effect.

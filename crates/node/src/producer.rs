@@ -181,72 +181,16 @@ async fn attempt_slot(
                 "produced and published block"
             );
 
-            // Close every chunk whose final height the new head has
-            // just reached. With the BFT loop enabled, the BFT path
-            // typically finalises first and this becomes a no-op
-            // (`next_chunk_to_close` returns a chunk whose end height
-            // is still ahead). The fallback is retained for single-
-            // validator runs where no peer prevote/precommit ever
-            // arrives, and for chunk boundaries the BFT loop hasn't
-            // yet observed.
-            close_due_chunks(backend.as_ref(), cmd_tx, &config.proposer, slot).await;
+            // The BFT path starts background consensus proving, including the
+            // single-validator quorum. Poll completion without generating a
+            // second proof while holding the engine mutex.
+            backend.tick_bft_round_timeouts(unix_now_secs()).await;
         }
         Ok(None) => debug!(slot, "validator not eligible for slot"),
         Err(ProductionError::NonMonotonicSlot { parent_slot, .. }) => {
             debug!(slot, parent_slot, "slot already covered by local head");
         }
         Err(err) => warn!(slot, error = %err, "block production failed"),
-    }
-}
-
-/// Close every chunk whose end-height the local head has reached but
-/// has not yet been finalized. Chunk proof aggregation and recursive
-/// checkpoint proving are explicitly deferred by the SP1 rewrite, so
-/// this loop only drives the local BFT vote + `Finalized` transition;
-/// no chunk-proof or recursive-checkpoint gossip is produced.
-#[allow(clippy::unused_async)] // `.await`'d by the producer slot loop; signature preserved.
-async fn close_due_chunks(
-    backend: &ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>,
-    cmd_tx: &mpsc::Sender<NetworkCommand>,
-    proposer: &ProposerKey,
-    slot: u64,
-) {
-    let _ = cmd_tx; // Reserved for future M3-new gossip needs.
-    let chunk_size = backend.chunk_size().max(1);
-    loop {
-        let head_height = backend.head_height();
-        let Some(next_chunk_id) = backend.next_chunk_to_close() else {
-            return;
-        };
-        let chunk_end_height = next_chunk_id.saturating_add(1).saturating_mul(chunk_size);
-        if head_height < chunk_end_height {
-            return;
-        }
-        let finalize_outcome = match backend.finalize_chunk(next_chunk_id, proposer) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                warn!(slot, chunk_id = next_chunk_id, error = %err, "chunk finalization failed");
-                return;
-            }
-        };
-        info!(
-            slot,
-            chunk_id = next_chunk_id,
-            end_height = finalize_outcome.chunk.end_height,
-            "closed chunk"
-        );
-        // Pending-fix #1: bridge runtime stake mutations into the
-        // consensus active validator set so the next chunk's
-        // VRF eligibility + BFT quorum weighting observe the
-        // post-chunk distribution.
-        if let Err(err) = backend.rotate_active_validator_set_for_chunk(next_chunk_id) {
-            warn!(
-                slot,
-                chunk_id = next_chunk_id,
-                error = %err,
-                "active-set rotation failed",
-            );
-        }
     }
 }
 

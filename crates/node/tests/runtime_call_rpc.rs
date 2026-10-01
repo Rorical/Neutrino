@@ -6,26 +6,25 @@
 //! Exercises:
 //!
 //! - the four canonical methods (`account_get`, `validator_get`,
-//!   `validator_set`, `runtime_version`),
+//!   `validator_set`, `runtime_info`),
 //! - the `RuntimeNotConfigured` error when no executor is installed,
 //! - `HistoricalStateNotSupported` for explicit `Hash`/`Height` block ids,
-//! - `runtime_available()` / `runtime_abi_version()` flipping on/off
+//! - `runtime_available()` / `runtime_code_hash()` flipping on/off
 //!   alongside `set_block_executor`,
 //! - that block production does not disturb the read-only query path
-//!   (`runtime_version` still resolves after a block is sealed and proven).
+//!   (`runtime_info` still resolves after a block is sealed and proven).
 
 use std::sync::Arc;
 
 use neutrino_consensus_engine::{Engine, ProposerKey, validator_set_root};
 use neutrino_default_runtime_core::{
-    QUERY_METHOD_ACCOUNT_GET, QUERY_METHOD_RUNTIME_VERSION, QUERY_METHOD_VALIDATOR_GET,
+    QUERY_METHOD_ACCOUNT_GET, QUERY_METHOD_RUNTIME_INFO, QUERY_METHOD_VALIDATOR_GET,
     QUERY_METHOD_VALIDATOR_SET, ValidatorSet,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_rpc::{BlockId, RpcBackend, RuntimeCallError};
 use neutrino_runtime_abi::QueryStatus;
@@ -70,7 +69,6 @@ fn chain_spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -78,13 +76,12 @@ fn chain_spec() -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"runtime-call-rpc".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xDD; 32],
+        runtime_info: RuntimeInfo::default(),
+        runtime_code_hash: neutrino_runtime_host::default_runtime_code_hash(),
         genesis_seed: GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
@@ -134,27 +131,27 @@ async fn fresh_backend_without_executor() -> Arc<Backend> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn runtime_version_round_trips_through_rpc_layer() {
+async fn runtime_info_round_trips_through_rpc_layer() {
     let backend = fresh_backend_with_executor().await;
 
     assert!(backend.runtime_available());
     assert_eq!(
-        backend.runtime_abi_version(),
-        Some(neutrino_runtime_abi::VERSION),
+        backend.runtime_code_hash(),
+        Some(neutrino_runtime_host::default_runtime_code_hash()),
     );
 
     let response = backend
         .runtime_call(
-            QUERY_METHOD_RUNTIME_VERSION.to_owned(),
+            QUERY_METHOD_RUNTIME_INFO.to_owned(),
             Vec::new(),
             &BlockId::Latest,
         )
         .await
-        .expect("runtime_version should succeed");
+        .expect("runtime_info should succeed");
 
     assert_eq!(response.code, QueryStatus::Ok.as_u32());
-    let decoded: RuntimeVersion = borsh::from_slice(&response.payload).expect("decode");
-    assert_eq!(decoded, RuntimeVersion::default());
+    let decoded: RuntimeInfo = borsh::from_slice(&response.payload).expect("decode");
+    assert_eq!(decoded, RuntimeInfo::default());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -255,11 +252,11 @@ async fn no_executor_returns_runtime_not_configured() {
     let backend = fresh_backend_without_executor().await;
 
     assert!(!backend.runtime_available());
-    assert_eq!(backend.runtime_abi_version(), None);
+    assert_eq!(backend.runtime_code_hash(), None);
 
     let err = backend
         .runtime_call(
-            QUERY_METHOD_RUNTIME_VERSION.to_owned(),
+            QUERY_METHOD_RUNTIME_INFO.to_owned(),
             Vec::new(),
             &BlockId::Latest,
         )
@@ -275,12 +272,12 @@ async fn historical_hash_block_id_is_rejected() {
 
     let err = backend
         .runtime_call(
-            QUERY_METHOD_RUNTIME_VERSION.to_owned(),
+            QUERY_METHOD_RUNTIME_INFO.to_owned(),
             Vec::new(),
             &BlockId::Hash([0xFF; 32]),
         )
         .await
-        .expect_err("hash-id queries are not supported in v1");
+        .expect_err("hash-id queries are not supported");
 
     assert!(matches!(err, RuntimeCallError::HistoricalStateNotSupported));
 }
@@ -291,12 +288,12 @@ async fn historical_height_block_id_is_rejected() {
 
     let err = backend
         .runtime_call(
-            QUERY_METHOD_RUNTIME_VERSION.to_owned(),
+            QUERY_METHOD_RUNTIME_INFO.to_owned(),
             Vec::new(),
             &BlockId::Height(42),
         )
         .await
-        .expect_err("height-id queries are not supported in v1");
+        .expect_err("height-id queries are not supported");
 
     assert!(matches!(err, RuntimeCallError::HistoricalStateNotSupported));
 }
@@ -307,7 +304,7 @@ async fn finalized_block_id_falls_through_to_latest() {
 
     let response = backend
         .runtime_call(
-            QUERY_METHOD_RUNTIME_VERSION.to_owned(),
+            QUERY_METHOD_RUNTIME_INFO.to_owned(),
             Vec::new(),
             &BlockId::Finalized,
         )
@@ -321,7 +318,7 @@ async fn finalized_block_id_falls_through_to_latest() {
 async fn query_path_survives_block_production() {
     // Produce + prove one block to confirm the executor is not
     // consumed or invalidated by the block-production path. Then
-    // re-issue `runtime_version` against the new head and assert
+    // re-issue `runtime_info` against the new head and assert
     // the same metadata still resolves.
     let backend = fresh_backend_with_executor().await;
     let proposer = proposer();
@@ -355,14 +352,14 @@ async fn query_path_survives_block_production() {
 
     let response = backend
         .runtime_call(
-            QUERY_METHOD_RUNTIME_VERSION.to_owned(),
+            QUERY_METHOD_RUNTIME_INFO.to_owned(),
             Vec::new(),
             &BlockId::Latest,
         )
         .await
-        .expect("runtime_version still works after production");
+        .expect("runtime_info still works after production");
 
     assert_eq!(response.code, QueryStatus::Ok.as_u32());
-    let decoded: RuntimeVersion = borsh::from_slice(&response.payload).expect("decode");
-    assert_eq!(decoded, RuntimeVersion::default());
+    let decoded: RuntimeInfo = borsh::from_slice(&response.payload).expect("decode");
+    assert_eq!(decoded, RuntimeInfo::default());
 }

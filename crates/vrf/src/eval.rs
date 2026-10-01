@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "std")]
 use neutrino_crypto::{
     CryptoError,
     bls::{PublicKey, SecretKey, Signature},
@@ -13,6 +14,7 @@ use neutrino_primitives::{ChainId, DOMAIN_VRF, Seed, Slot};
 pub type VrfOutput = [u8; 32];
 
 /// VRF proof: a deterministic BLS12-381 signature over [`vrf_message`].
+#[cfg(feature = "std")]
 pub type VrfProof = Signature;
 
 /// Build the canonical BLS-VRF input bytes for a given `(chain, seed, slot)`.
@@ -41,6 +43,7 @@ pub fn vrf_message(chain_id: ChainId, finalized_seed: &Seed, slot: Slot) -> Vec<
 /// Returns the proof (a deterministic 96-byte BLS signature) and the
 /// 32-byte VRF output. The output is the value that
 /// [`crate::is_eligible`] checks against the stake-weighted threshold.
+#[cfg(feature = "std")]
 pub fn eval(
     secret_key: &SecretKey,
     chain_id: ChainId,
@@ -59,6 +62,7 @@ pub fn eval(
 /// produced, so the verifier can feed it directly into
 /// [`crate::is_eligible`] without trusting any value the prover sent over
 /// the wire.
+#[cfg(feature = "std")]
 pub fn verify(
     public_key: &PublicKey,
     chain_id: ChainId,

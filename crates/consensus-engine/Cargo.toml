@@ -27,14 +27,17 @@ neutrino-consensus-vrf    = { workspace = true }
 neutrino-crypto           = { workspace = true }
 neutrino-mempool          = { workspace = true }
 neutrino-proof-system     = { workspace = true }
+neutrino-prover-chunk     = { workspace = true }
 neutrino-runtime-abi      = { workspace = true }
+neutrino-default-runtime-core = { workspace = true }
 neutrino-storage          = { workspace = true }
 neutrino-trie             = { workspace = true }
-neutrino-vrf              = { workspace = true }
+neutrino-vrf              = { workspace = true, features = ["std"] }
 borsh                     = { workspace = true }
 thiserror                 = { workspace = true }
 
 [dev-dependencies]
+neutrino-runtime-core = { workspace = true }
 rand                      = { workspace = true }
 
 [lints]

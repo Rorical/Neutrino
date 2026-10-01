@@ -21,21 +21,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use neutrino_consensus_engine::body::compute_body_roots;
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProposerKey};
-use neutrino_consensus_types::{Block, Body, Header};
+use neutrino_consensus_types::{Block, BlockProof};
 use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    HEADER_VERSION, Height, LightClientParams, ProofParams, RuntimeParams, RuntimeVersion,
-    StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
-use neutrino_proof_system::MockProofSystem;
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
+use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
 use neutrino_sync::SyncBackend;
 use tokio::sync::mpsc;
@@ -81,7 +83,6 @@ fn spec(count: u8) -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -95,13 +96,12 @@ fn spec(count: u8) -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m7-aggregator-test".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
-        runtime_code_hash: [0xCC; 32],
+        runtime_info: RuntimeInfo::default(),
+        runtime_code_hash: neutrino_runtime_host::default_runtime_code_hash(),
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
@@ -117,55 +117,31 @@ fn spec(count: u8) -> ChainSpec {
     }
 }
 
-fn signed_block_for_slot(
-    slot: u64,
-    parent: BlockHash,
-    height: Height,
-    producer_key: &ProposerKey,
-) -> Block {
-    let body = Body::default();
-    let roots = compute_body_roots(&body, &[]);
-    let vrf_proof = producer_key.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
-    let mut header = Header {
-        version: HEADER_VERSION,
-        height,
-        slot,
-        parent_hash: parent,
-        proposer_index: producer_key.validator_index(),
-        vrf_proof,
-        state_root: [0x11; 32],
-        transactions_root: roots.transactions_root,
-        votes_root: roots.votes_root,
-        slashings_root: roots.slashings_root,
-        validator_ops_root: roots.validator_ops_root,
-        da_root: roots.da_root,
-        runtime_extra: ZERO_HASH,
-        receipts_root: ZERO_HASH,
-        gas_used: 0,
-        gas_limit: 1_000_000,
-        timestamp: 1_700_000_000 + slot * 4,
-        signature: [0; 96],
-    };
-    let header_hash = header.hash();
-    header.signature = producer_key.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
-    Block { header, body }
-}
-
 struct NodeHandle {
     peer_id: PeerId,
     cmd_tx: mpsc::Sender<NetworkCommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
-    backend: Arc<ChainBackend<MemoryDatabase, MockProofSystem>>,
+    backend: Arc<ChainBackend<MemoryDatabase, NativeChunkTestSystem>>,
+    pending_proofs: Vec<BlockProof>,
 }
 
-fn build_node(validator_index: u8) -> (NodeHandle, NetworkService) {
+async fn build_node(validator_index: u8) -> (NodeHandle, NetworkService) {
     let key = Keypair::generate_ed25519();
     let peer_id = PeerId::from(key.public());
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(256);
     let svc = NetworkService::new(key, cmd_rx, event_tx).expect("network service");
-    let engine = Engine::genesis(spec(2), MemoryDatabase::new()).expect("genesis");
-    let backend = Arc::new(ChainBackend::new(engine, MockProofSystem::new()));
+    let backend = tokio::task::spawn_blocking(|| {
+        let engine = Engine::genesis(spec(2), MemoryDatabase::new()).expect("genesis");
+        let backend = Arc::new(ChainBackend::new(
+            engine,
+            NativeChunkTestSystem::mock().expect("SP1 setup"),
+        ));
+        backend.set_block_executor(WasmExecutor::default_runtime().expect("WASM executor"));
+        backend
+    })
+    .await
+    .expect("runtime setup job");
     backend.set_local_voter(proposer(validator_index));
     backend.set_network_publisher(cmd_tx.clone());
     (
@@ -174,6 +150,7 @@ fn build_node(validator_index: u8) -> (NodeHandle, NetworkService) {
             cmd_tx,
             event_rx,
             backend,
+            pending_proofs: Vec::new(),
         },
         svc,
     )
@@ -217,26 +194,33 @@ async fn subscribe_all(handle: &NodeHandle, topics: &[Topic]) {
     }
 }
 
-async fn dispatch_one_gossip(handle: &mut NodeHandle, timeout_secs: u64) -> Option<Topic> {
-    let event = timeout(Duration::from_secs(timeout_secs), handle.event_rx.recv())
-        .await
-        .ok()??;
+async fn dispatch_gossip(handle: &mut NodeHandle, event: NetworkEvent) {
     let NetworkEvent::GossipMessage { topic, data, .. } = event else {
-        return None;
+        return;
     };
     match topic {
         Topic::Blocks => {
             let block: Block = borsh::from_slice(&data).expect("decode block");
-            let _ = handle.backend.verify_and_import_gossip_block(block).await;
+            handle
+                .backend
+                .verify_and_import_gossip_block(block)
+                .await
+                .expect("import block");
+            for proof in std::mem::take(&mut handle.pending_proofs) {
+                import_proof_blocking(&handle.backend, proof)
+                    .await
+                    .expect("import buffered proof");
+            }
         }
         Topic::BlockProofs => {
-            let proof: neutrino_consensus_types::BlockProof =
-                borsh::from_slice(&data).expect("decode block proof");
-            let height = proof.height;
-            let _ = handle
-                .backend
-                .verify_and_import_block_proofs(height, vec![proof])
-                .await;
+            let proof: BlockProof = borsh::from_slice(&data).expect("decode block proof");
+            match import_proof_blocking(&handle.backend, proof.clone()).await {
+                Ok(()) => {}
+                Err(neutrino_sync::SyncBackendError::ChainBehind(_)) => {
+                    handle.pending_proofs.push(proof);
+                }
+                Err(error) => panic!("block proof import: {error}"),
+            }
         }
         Topic::FinalityVotesPrevote | Topic::FinalityVotesPrecommit => {
             let vote: neutrino_consensus_types::FinalityVote =
@@ -254,20 +238,32 @@ async fn dispatch_one_gossip(handle: &mut NodeHandle, timeout_secs: u64) -> Opti
         Topic::ChunkProofs => {
             let proof: neutrino_consensus_types::ChunkProof =
                 borsh::from_slice(&data).expect("decode chunk proof");
-            let _ = handle.backend.verify_and_import_chunk_proof(proof).await;
-        }
-        Topic::Checkpoints => {
-            let proof: neutrino_consensus_types::RecursiveCheckpointProof =
-                borsh::from_slice(&data).expect("decode recursive proof");
-            let checkpoint = proof.public_inputs.clone();
-            let _ = handle
+            handle
                 .backend
-                .verify_and_import_checkpoints(vec![(checkpoint, proof)])
-                .await;
+                .verify_and_import_chunk_proof(proof)
+                .await
+                .expect("import chunk proof");
         }
         _ => {}
     }
-    Some(topic)
+}
+
+async fn import_proof_blocking(
+    backend: &Arc<ChainBackend<MemoryDatabase, NativeChunkTestSystem>>,
+    proof: BlockProof,
+) -> Result<(), neutrino_sync::SyncBackendError> {
+    let backend = Arc::clone(backend);
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("proof import runtime");
+        runtime
+            .block_on(backend.verify_and_import_block_proofs(proof.height, vec![proof]))
+            .map(|_| ())
+    })
+    .await
+    .expect("proof import job")
 }
 
 async fn finalized_index(handle: &NodeHandle) -> neutrino_primitives::CheckpointIndex {
@@ -279,14 +275,18 @@ async fn finalized_index(handle: &NodeHandle) -> neutrino_primitives::Checkpoint
 }
 
 async fn produce_and_publish_first_block(handle: &NodeHandle, producer_key: &ProposerKey) {
-    let genesis_hash = handle.backend.local_status().await.head_block_hash;
-    let block = signed_block_for_slot(1, genesis_hash, 1, producer_key);
-    let block_hash = block.hash();
-    handle
-        .backend
-        .verify_and_import_gossip_block(block.clone())
-        .await
-        .expect("A imports own block");
+    let backend = Arc::clone(&handle.backend);
+    let key = producer_key.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        backend
+            .try_produce_block(1, &key)
+            .expect("produce")
+            .expect("eligible")
+    })
+    .await
+    .expect("production job");
+    let block = outcome.block;
+    let block_hash = outcome.block_hash;
     let encoded = borsh::to_vec(&block).expect("encode block");
     handle
         .cmd_tx
@@ -296,10 +296,11 @@ async fn produce_and_publish_first_block(handle: &NodeHandle, producer_key: &Pro
         })
         .await
         .expect("publish block");
-    let prove = handle
-        .backend
-        .prove_block(&block_hash)
-        .expect("A proves block");
+    let backend = Arc::clone(&handle.backend);
+    let prove =
+        tokio::task::spawn_blocking(move || backend.prove_block(&block_hash).expect("prove"))
+            .await
+            .expect("proof job");
     let proof_bytes = borsh::to_vec(&prove.block_proof).expect("encode block proof");
     handle
         .cmd_tx
@@ -318,19 +319,31 @@ async fn drive_until_both_finalised(
     deadline: tokio::time::Instant,
 ) {
     loop {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        handle_a.backend.tick_bft_round_timeouts(now_secs).await;
+        handle_b.backend.tick_bft_round_timeouts(now_secs).await;
         if finalized_index(handle_a).await >= 1 && finalized_index(handle_b).await >= 1 {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "aggregator-subnet BFT loop did not finalise chunk 0 within timeout. \
-             A.finalized_index={}, B.finalized_index={}",
-            finalized_index(handle_a).await,
-            finalized_index(handle_b).await,
+             A.progress={:?}, B.progress={:?}, A.pending={}, B.pending={}",
+            handle_a.backend.local_progress().await,
+            handle_b.backend.local_progress().await,
+            handle_a.pending_proofs.len(),
+            handle_b.pending_proofs.len(),
         );
         tokio::select! {
-            _ = dispatch_one_gossip(handle_a, 1) => {}
-            _ = dispatch_one_gossip(handle_b, 1) => {}
+            event = handle_a.event_rx.recv() => {
+                if let Some(event) = event { dispatch_gossip(handle_a, event).await; }
+            }
+            event = handle_b.event_rx.recv() => {
+                if let Some(event) = event { dispatch_gossip(handle_b, event).await; }
+            }
             () = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
@@ -340,8 +353,8 @@ async fn drive_until_both_finalised(
 async fn passive_follower_finalises_via_aggregate_subnet_topic() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (mut handle_a, mut svc_a) = build_node(0);
-    let (mut handle_b, svc_b) = build_node(1);
+    let (mut handle_a, mut svc_a) = build_node(0).await;
+    let (mut handle_b, svc_b) = build_node(1).await;
 
     svc_a
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
@@ -368,7 +381,6 @@ async fn passive_follower_finalises_via_aggregate_subnet_topic() {
         Topic::Blocks,
         Topic::BlockProofs,
         Topic::ChunkProofs,
-        Topic::Checkpoints,
         Topic::FinalityVotesPrevote,
         Topic::FinalityVotesPrecommit,
         Topic::AggregateFinalityVotes(chunk0_subnet),
@@ -379,7 +391,6 @@ async fn passive_follower_finalises_via_aggregate_subnet_topic() {
         Topic::Blocks,
         Topic::BlockProofs,
         Topic::ChunkProofs,
-        Topic::Checkpoints,
         Topic::AggregateFinalityVotes(chunk0_subnet),
     ];
     subscribe_all(&handle_a, &a_topics).await;

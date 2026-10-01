@@ -30,6 +30,8 @@ use neutrino_trie::{Poseidon2Hasher, Trie};
 /// stable as more consensus context is added later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockExecutionContext {
+    /// Trusted prior consensus context and accepted evidence/block programs.
+    pub evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor,
     /// Chain identifier the transactions are bound to.
     pub chain_id: u64,
     /// Height of the block being executed (`header.height`).
@@ -142,7 +144,7 @@ pub trait BlockExecutor {
     /// surfaced through `ChainSpec`); the runtime uses it to extend
     /// the balance check to `sender.balance >= tx.amount + tx_gas *
     /// gas_price`. `gas_price = 0` disables fee admission and
-    /// preserves the legacy "amount only" behaviour.
+    /// allows zero-price execution.
     ///
     /// Implementations MUST NOT mutate `state` and MUST NOT depend on
     /// non-deterministic inputs: the same `(tx, state, chain_id,

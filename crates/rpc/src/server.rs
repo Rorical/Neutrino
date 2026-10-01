@@ -24,8 +24,8 @@ use jsonrpsee::types::ErrorObjectOwned;
 
 use crate::backend::{BlockId, RpcBackend, RuntimeCallError, SubmitError};
 use crate::types::{
-    BlockIdJson, BlockJson, BytesHex, FinalizedInfoJson, HeadInfoJson, HeaderJson, HealthJson,
-    RuntimeCallResultJson, SubmitResultJson, ValidatorJson, VersionJson,
+    BlockIdJson, BlockJson, BytesHex, FinalizedInfoJson, HashHex, HeadInfoJson, HeaderJson,
+    HealthJson, RuntimeCallResultJson, SubmitResultJson, SystemInfoJson, ValidatorJson,
 };
 
 /// Bind address + tuning knobs for the JSON-RPC server.
@@ -134,10 +134,9 @@ fn register_system_methods(module: &mut RpcModule<RpcContext>) -> Result<(), Rpc
         .map_err(reg_err)?;
 
     module
-        .register_async_method("system_version", |_, ctx, _| async move {
-            Ok::<_, ErrorObjectOwned>(VersionJson {
-                abi_version: neutrino_runtime_abi::VERSION,
-                runtime_abi_version: ctx.backend().runtime_abi_version(),
+        .register_async_method("system_info", |_, ctx, _| async move {
+            Ok::<_, ErrorObjectOwned>(SystemInfoJson {
+                runtime_code_hash: ctx.backend().runtime_code_hash().map(HashHex::from),
             })
         })
         .map_err(reg_err)?;

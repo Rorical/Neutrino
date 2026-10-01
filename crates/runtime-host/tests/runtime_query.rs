@@ -5,17 +5,17 @@
 //! The four canonical methods exercised here are also the ones
 //! `neutrino-default-runtime-core::query` knows how to dispatch:
 //! `account_get`, `validator_get`, `validator_set`, and
-//! `runtime_version`. Unknown methods surface as
+//! `runtime_info`. Unknown methods surface as
 //! [`QueryStatus::UnknownMethod`], malformed args as
 //! [`QueryStatus::InvalidArguments`].
 
 use borsh::BorshSerialize;
 use neutrino_default_runtime_core::{
-    Account, Address, QUERY_METHOD_ACCOUNT_GET, QUERY_METHOD_RUNTIME_VERSION,
+    Account, Address, QUERY_METHOD_ACCOUNT_GET, QUERY_METHOD_RUNTIME_INFO,
     QUERY_METHOD_VALIDATOR_GET, QUERY_METHOD_VALIDATOR_SET, VALIDATOR_SET_KEY, Validator,
     ValidatorSet, account_key, encode_account, encode_validator, validator_key,
 };
-use neutrino_primitives::RuntimeVersion;
+use neutrino_primitives::RuntimeInfo;
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, QueryStatus};
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::wasm::WasmRuntime;
@@ -159,19 +159,18 @@ fn validator_set_returns_empty_set_when_state_is_unpopulated() {
 }
 
 #[test]
-fn runtime_version_advertises_default_metadata() {
+fn runtime_info_advertises_default_metadata() {
     let (runtime, live) = empty_runtime_and_trie();
 
-    let req = request(QUERY_METHOD_RUNTIME_VERSION, Vec::new());
+    let req = request(QUERY_METHOD_RUNTIME_INFO, Vec::new());
     let response = run(&runtime, &live, &req);
 
     assert_ok(&response);
-    let decoded: RuntimeVersion = borsh::from_slice(&response.payload).expect("decode payload");
-    assert_eq!(decoded, RuntimeVersion::default());
+    let decoded: RuntimeInfo = borsh::from_slice(&response.payload).expect("decode payload");
+    assert_eq!(decoded, RuntimeInfo::default());
     // Spot-check a couple of fields so a future change to the
     // default metadata surfaces here.
     assert_eq!(decoded.spec_name, *b"NEUTRINO_DEFAULT");
-    assert_eq!(decoded.abi_version, neutrino_primitives::ABI_VERSION);
 }
 
 #[test]

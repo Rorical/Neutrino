@@ -21,6 +21,30 @@ use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
 use thiserror::Error;
 
+/// Evidence-gossip verdict separates invalid receipts from local sync/cache limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceProofAcceptance {
+    /// Authenticated and persisted for admission.
+    Accepted,
+    /// Local history is unavailable, evidence is stale, or the cache is full.
+    Deferred,
+    /// The submitted receipt or statement is invalid.
+    Rejected,
+}
+
+/// Sequential sync range bounded by the previous complete consensus proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsensusSyncTarget {
+    /// Chunk awaiting proof-gated finalization.
+    pub chunk_id: ChunkId,
+    /// Last height of this chunk.
+    pub end_height: Height,
+    /// First missing canonical header.
+    pub next_header: Height,
+    /// First missing block proof, or end + 1 if complete.
+    pub next_proof: Height,
+}
+
 /// Errors a backend can surface to the driver.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SyncBackendError {
@@ -103,6 +127,10 @@ pub struct ChunkProofImported {
 /// [`tokio::task::spawn_blocking`] for sync storage backends like RocksDB.
 #[async_trait]
 pub trait SyncBackend: Send + Sync + 'static {
+    /// Complete-proof backends sync each chunk before crossing its boundary.
+    async fn consensus_sync_target(&self) -> Result<Option<ConsensusSyncTarget>, SyncBackendError> {
+        Ok(None)
+    }
     /// Build a [`Status`] payload reflecting the local chain head.
     async fn local_status(&self) -> Status;
 
@@ -118,7 +146,7 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Build a [`LocalProgress`] snapshot for the sync FSM.
     async fn local_progress(&self) -> LocalProgress;
 
-    /// Build a response to `/neutrino/req/recursive_proof_latest/1`.
+    /// Build a response to `/neutrino/req/recursive_proof_latest`.
     ///
     /// Returns [`SyncBackendError::NotAvailable`] when the node is still at
     /// genesis (no recursive proof produced yet).
@@ -126,33 +154,33 @@ pub trait SyncBackend: Send + Sync + 'static {
         &self,
     ) -> Result<RecursiveProofLatestResponse, SyncBackendError>;
 
-    /// Build a response to `/neutrino/req/recursive_proof_by_index/1`.
+    /// Build a response to `/neutrino/req/recursive_proof_by_index`.
     async fn recursive_proofs_by_index(
         &self,
         start: CheckpointIndex,
         count: u64,
     ) -> RecursiveProofByIndexResponse;
 
-    /// Build a response to `/neutrino/req/blocks_by_range/1`.
+    /// Build a response to `/neutrino/req/blocks_by_range`.
     async fn blocks_by_range(&self, start: Height, count: u64, step: u64) -> BlocksByRangeResponse;
 
-    /// Build a response to `/neutrino/req/blocks_by_root/1`.
+    /// Build a response to `/neutrino/req/blocks_by_root`.
     async fn blocks_by_root(&self, roots: &[BlockHash]) -> BlocksByRootResponse;
 
-    /// Build a response to `/neutrino/req/state_by_root/1`.
+    /// Build a response to `/neutrino/req/state_by_root`.
     async fn state_nodes(&self, root: StateRoot, paths: &[Vec<u8>]) -> StateByRootResponse;
 
-    /// Build a response to `/neutrino/req/block_proof_by_hash/1`.
+    /// Build a response to `/neutrino/req/block_proof_by_hash`.
     async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse;
 
-    /// Build a response to `/neutrino/req/block_proof_by_height/1`.
+    /// Build a response to `/neutrino/req/block_proof_by_height`.
     async fn block_proofs_by_height(&self, start: Height, count: u64)
     -> BlockProofByHeightResponse;
 
-    /// Build a response to `/neutrino/req/chunk_proof_by_id/1`.
+    /// Build a response to `/neutrino/req/chunk_proof_by_id`.
     async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse;
 
-    /// Build a response to `/neutrino/req/finality_cert_by_chunk/1`.
+    /// Build a response to `/neutrino/req/finality_cert_by_chunk`.
     ///
     /// Default impl returns an empty response; backends override
     /// it to look up the persisted finality certificate per chunk
@@ -161,7 +189,7 @@ pub trait SyncBackend: Send + Sync + 'static {
         FinalityCertByChunkResponse::default()
     }
 
-    /// Build a response to `/neutrino/req/witness_by_block/1`.
+    /// Build a response to `/neutrino/req/witness_by_block`.
     ///
     /// Default impl returns an empty response; archive nodes
     /// override it once block witnesses are persisted (M8+).
@@ -212,14 +240,14 @@ pub trait SyncBackend: Send + Sync + 'static {
     ) -> Result<ProofsImported, SyncBackendError>;
 
     /// Verify + import a block received via gossip on
-    /// `/neutrino/blocks/borsh/1`.
+    /// `/neutrino/blocks/borsh`.
     async fn verify_and_import_gossip_block(
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError>;
 
     /// Admit a peer-supplied transaction (received via
-    /// `/neutrino/txs/borsh/1`) into the local mempool.
+    /// `/neutrino/txs/borsh`) into the local mempool.
     ///
     /// Default impl drops the transaction; backends that maintain a
     /// mempool override it to feed into validation + insertion.
@@ -228,7 +256,7 @@ pub trait SyncBackend: Send + Sync + 'static {
     async fn submit_transaction(&self, _bytes: Vec<u8>) {}
 
     /// Verify + persist a chunk proof received via
-    /// `/neutrino/chunk_proofs/borsh/1`.
+    /// `/neutrino/chunk_proofs/borsh`.
     ///
     /// The default implementation rejects every chunk proof so test
     /// backends that have no proof system stay safe. The production
@@ -244,15 +272,15 @@ pub trait SyncBackend: Send + Sync + 'static {
     }
 
     /// Ingest a finality vote received via
-    /// `/neutrino/finality_votes_prevote/borsh/1` or
-    /// `/neutrino/finality_votes_precommit/borsh/1`.
+    /// `/neutrino/finality_votes_prevote/borsh` or
+    /// `/neutrino/finality_votes_precommit/borsh`.
     ///
     /// Default impl drops the vote. M7 BFT backends override this
     /// to route the vote into the chunk-BFT state machine.
     async fn ingest_finality_vote(&self, _vote: FinalityVote) {}
 
     /// Ingest an aggregate finality vote received via
-    /// `/neutrino/aggregate_finality_votes_<subnet>/borsh/1`.
+    /// `/neutrino/aggregate_finality_votes_<subnet>/borsh`.
     ///
     /// Default impl drops the aggregate. M7 BFT backends override
     /// this to merge the aggregate into the per-chunk vote
@@ -260,9 +288,17 @@ pub trait SyncBackend: Send + Sync + 'static {
     async fn ingest_aggregate_finality_vote(&self, _subnet: u8, _vote: FinalityVote) {}
 
     /// Ingest a slashing evidence record received via
-    /// `/neutrino/slashing_evidence/borsh/1`.
+    /// `/neutrino/slashing_evidence/borsh`.
     ///
     /// Default impl drops the evidence. M7 slashing backends
     /// override this to buffer evidence for runtime application.
     async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {}
+
+    /// Ingest an independently proven offence, available for later block admission.
+    async fn ingest_evidence_proof(
+        &self,
+        _proof: neutrino_consensus_types::evidence::EvidenceArtifact,
+    ) -> EvidenceProofAcceptance {
+        EvidenceProofAcceptance::Deferred
+    }
 }

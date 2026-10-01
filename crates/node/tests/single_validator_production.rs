@@ -28,9 +28,8 @@ use neutrino_consensus_engine::{BlockState, Engine, ProposerKey, validator_set_r
 use neutrino_default_runtime_core::ValidatorSet;
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -57,10 +56,9 @@ fn single_validator_set() -> Vec<Validator> {
 fn chain_spec() -> ChainSpec {
     let validators = single_validator_set();
     let proof = ProofParams {
-        // M5-new test uses `chunk_size = 1` so each block ends its own
-        // chunk; the chain-spec validator requires
-        // `slot_budget_per_chunk = chunk_size`.
-        slot_budget_per_chunk: 1,
+        // Both block-execution steps stay within one chunk; crossing a
+        // chunk boundary now requires a complete consensus proof.
+        slot_budget_per_chunk: 2,
         ..ProofParams::default()
     };
     let vs_root = validator_set_root(&validators);
@@ -76,22 +74,20 @@ fn chain_spec() -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
-        chunk_size: 1,
+        chunk_size: 2,
         // Single validator must clear the eligibility threshold for
         // every slot the test targets.
         expected_proposers_per_slot: fixed_u128_from_integer(8),
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m5-new-single".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: GENESIS_SEED,
         genesis_state_root: ZERO_HASH,

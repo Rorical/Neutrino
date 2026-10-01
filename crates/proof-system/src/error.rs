@@ -4,10 +4,7 @@ use core::fmt;
 
 /// Verification or proving failure surfaced to engine and tooling.
 ///
-/// The variants are stable and shared by every backend. Adding a new
-/// variant is a breaking ABI change at the crate boundary; bumping
-/// `proof_system_version` is the protocol-level lever for the same
-/// change.
+/// The variants are shared by every backend.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProofError {
     /// Proof bytes failed structural decoding or sanity checks.

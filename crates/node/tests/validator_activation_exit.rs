@@ -1,7 +1,7 @@
 //! Pending-fix #8: validator activation / exit epoch FSM.
 //!
 //! Drives the full lifecycle of a runtime-registered validator
-//! through the rotation bridge:
+//! through the chunk validator transition:
 //!
 //! 1. **Registration.** A funded depositor submits a
 //!    `Transaction::RegisterValidator` carrying the new validator's
@@ -37,17 +37,18 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_rpc::{BlockId, RpcBackend};
 use neutrino_runtime_core::host::LiveTrie;
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
+use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use sp1_sdk::blocking::MockProver;
 
 const CHAIN_ID: u64 = 0xACE_BEEF;
 const GENESIS_STAKE: u64 = 1_000_000_000;
@@ -57,7 +58,7 @@ const ACTIVATION_DELAY_EPOCHS: u64 = 2;
 const EXIT_DELAY_EPOCHS: u64 = 2;
 const EPOCH_LENGTH_IN_CHUNKS: u64 = 1;
 
-type ActivationBackend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
+type ActivationBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 fn ed25519_key(seed: u64) -> SigningKey {
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -124,15 +125,13 @@ fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> Chai
         end_state_root: genesis_state_root,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"act-exit".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: ZERO_HASH,
         genesis_seed: [0x4E; 32],
         genesis_state_root,
@@ -170,7 +169,7 @@ fn build_backend(accounts: &[(Address, u128)], proposer_addr: Address) -> Arc<Ac
     let spec = build_chain_spec(proposer_addr, state_root);
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     engine.replace_state_with_reconstructed(live.trie().clone());
-    let proof_system = Sp1ProofSystem::mock().expect("mock SP1 setup");
+    let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 setup");
     let backend = Arc::new(ChainBackend::new(engine, proof_system));
     backend.set_block_executor(WasmExecutor::default_runtime().expect("wasm runtime"));
     backend.set_local_voter(proposer_key());
@@ -248,7 +247,7 @@ fn signed_unstake(sk: &SigningKey, amount: u128, nonce: u64) -> UnstakeTx {
 }
 
 /// Produce one block at `slot`, prove it, finalise its single-block
-/// chunk (`chunk_size = 1`) and run the rotation bridge.
+/// chunk (`chunk_size = 1`) and run the chunk validator transition.
 fn produce_prove_finalize_rotate(
     backend: &ActivationBackend,
     proposer: &ProposerKey,
@@ -265,9 +264,6 @@ fn produce_prove_finalize_rotate(
     backend
         .finalize_chunk(chunk_id, proposer)
         .expect("finalize_chunk");
-    backend
-        .rotate_active_validator_set_for_chunk(chunk_id)
-        .expect("rotation succeeds");
 }
 
 /// Find the entry in `active_set` whose `withdrawal_credentials`

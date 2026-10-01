@@ -1,13 +1,10 @@
 //! M7-new exit criterion 1: 16 validators finalize a chunk whose
-//! blocks all have **real SP1 block proofs**.
+//! blocks execute through mock SP1 and whose outer consensus is checked natively.
 //!
-//! Sister to `multi_validator_localnet.rs`, which exercises the same
-//! BFT-driven 16-node finality path but against `MockProofSystem` +
-//! a hand-rolled block. This test swaps in:
+//! The test uses:
 //!
-//! - `Sp1ProofSystem<MockProver>` on every node — the production SP1
-//!   adapter; only the cryptographic STARK check is mocked, the
-//!   witness decode and `StfPublicOutput` cross-check both run.
+//! - `NativeChunkTestSystem` on every node: mock SP1 block execution plus
+//!   native full-consensus validation. This is not a real recursion test.
 //! - `WasmExecutor::default_runtime()` on every node — the embedded
 //!   default-runtime master cdylib in wasmtime.
 //! - `try_produce_block` + `prove_block` on the producer — the real
@@ -33,14 +30,16 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, Checkpoint, ConsensusParams,
-    LightClientParams, ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator,
-    ZERO_HASH, fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
+#[path = "support/native_chunk.rs"]
+pub mod native_chunk;
+use native_chunk::NativeChunkTestSystem;
+use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
 use neutrino_sync::SyncBackend;
-use sp1_sdk::blocking::MockProver;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -89,7 +88,6 @@ fn chain_spec(count: u8) -> ChainSpec {
         end_state_root: ZERO_HASH,
         end_validator_set_root: vs_root,
         history_root: ZERO_HASH,
-        proof_system_version: proof.proof_system_version,
     };
     let consensus = ConsensusParams {
         chunk_size: 1,
@@ -102,12 +100,11 @@ fn chain_spec(count: u8) -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        spec_version: CHAIN_SPEC_VERSION,
         name: BoundedBytes::new(b"m7-new-sixteen-validators".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
-        runtime_version: RuntimeVersion::default(),
+        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xCC; 32],
         genesis_seed: TEST_GENESIS_SEED,
         genesis_state_root: ZERO_HASH,
@@ -124,7 +121,7 @@ fn chain_spec(count: u8) -> ChainSpec {
     }
 }
 
-type NodeBackend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
+type NodeBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 struct NodeHandle {
     cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -135,13 +132,13 @@ struct NodeHandle {
 
 fn build_node(validator_index: u8) -> (NodeHandle, NetworkService) {
     let key = Keypair::generate_ed25519();
-    // 1024 / 4096 channel sizes match the M7-D.4 localnet so the
+    // Bounded event queues keep the 16-validator burst within capacity; the
     // mesh isn't backpressure-bottlenecked.
     let (cmd_tx, cmd_rx) = mpsc::channel(1024);
     let (event_tx, event_rx) = mpsc::channel(4096);
     let svc = NetworkService::new(key, cmd_rx, event_tx).expect("network service");
     let engine = Engine::genesis(chain_spec(N_VALIDATORS), MemoryDatabase::new()).expect("genesis");
-    let proof_system = Sp1ProofSystem::mock().expect("mock SP1 adapter");
+    let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 adapter");
     let backend = Arc::new(ChainBackend::new(engine, proof_system));
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     backend.set_block_executor(executor);
@@ -195,14 +192,14 @@ fn all_bft_topics() -> Vec<Topic> {
     let mut topics = vec![
         Topic::Blocks,
         Topic::BlockProofs,
+        Topic::ChunkProofs,
         Topic::FinalityVotesPrevote,
         Topic::FinalityVotesPrecommit,
     ];
     for subnet in 0..u8::try_from(VOTE_SUBNETS).expect("subnet fits u8") {
         topics.push(Topic::AggregateFinalityVotes(subnet));
     }
-    // Chunk-proof and checkpoint topics are deferred by M3-new; we
-    // intentionally do not subscribe to them.
+    // Recursive checkpoint proofs remain deferred.
     topics
 }
 
@@ -291,10 +288,12 @@ fn spawn_handle_driver(
                     }
                 }
                 Topic::ChunkProofs => {
-                    // Chunk proofs are deferred by M3-new; accept-and-drop
-                    // so peers that still gossip them don't get scored down.
-                    let _ = borsh::from_slice::<ChunkProof>(&data);
-                    MessageAcceptance::Ignore
+                    if let Ok(proof) = borsh::from_slice::<ChunkProof>(&data) {
+                        let _ = backend.verify_and_import_chunk_proof(proof).await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
+                    }
                 }
                 _ => MessageAcceptance::Ignore,
             };
@@ -399,6 +398,7 @@ async fn wait_for_all_finalised(
     loop {
         let mut indices = Vec::with_capacity(handles.len());
         for h in handles {
+            h.backend.tick_bft_round_timeouts(0).await;
             indices.push(finalized_index(h).await);
         }
         if indices.iter().all(|i| *i >= 1) {

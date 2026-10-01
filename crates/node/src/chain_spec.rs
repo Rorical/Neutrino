@@ -13,8 +13,8 @@ use std::fs;
 use std::path::Path;
 
 use neutrino_primitives::{
-    BoundedBytes, CHAIN_SPEC_VERSION, ChainSpec, ConsensusParams, Hash, LightClientParams,
-    ProofParams, RuntimeParams, RuntimeVersion, StateParams, Validator, ZERO_HASH,
+    BoundedBytes, ChainSpec, ConsensusParams, Hash, LightClientParams, ProofParams, RuntimeInfo,
+    RuntimeParams, StateParams, Validator, ZERO_HASH,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -102,8 +102,7 @@ pub struct ChainSpecFile {
     #[serde(default)]
     pub genesis_block_hash_hex: Option<String>,
     /// Optional hex-encoded runtime code hash (32 bytes). Defaults to
-    /// all-zero — sufficient for M6 stage where the mock proof system is
-    /// in use.
+    /// the hash of the embedded WASM runtime.
     #[serde(default)]
     pub runtime_code_hash_hex: Option<String>,
     /// Optional override for [`ConsensusParams::slot_duration_secs`].
@@ -125,11 +124,21 @@ pub struct ChainSpecFile {
     #[serde(default)]
     pub gas_price: Option<u128>,
     /// Optional override for [`RuntimeParams::unbonding_delay_blocks`].
-    /// Defaults to `32` (the runtime's `UNBONDING_DELAY_BLOCKS`
-    /// placeholder); production chains typically configure much
-    /// longer delays.
+    /// Defaults to the canonical evidence-safe delay in `RuntimeParams`.
     #[serde(default)]
     pub unbonding_delay_blocks: Option<u64>,
+    /// Evidence admission window after the source chunk ends.
+    #[serde(default)]
+    pub evidence_max_age_blocks: Option<u64>,
+    /// Maximum pending mandatory sanctions.
+    #[serde(default)]
+    pub evidence_max_pending: Option<u32>,
+    /// Maximum evidence admissions per block.
+    #[serde(default)]
+    pub evidence_admissions_per_block: Option<u32>,
+    /// Mandatory FIFO execution cap per block.
+    #[serde(default)]
+    pub evidence_executions_per_block: Option<u32>,
     /// Optional override for [`RuntimeParams::slash_amount`]. Defaults
     /// to `u128::MAX` (burn whatever stake remains on equivocation).
     #[serde(default)]
@@ -200,10 +209,12 @@ impl ChainSpecFile {
             self.genesis_block_hash_hex.as_deref(),
             "genesis_block_hash_hex",
         )?;
-        let runtime_code_hash: Hash = decode_hash_or_zero(
-            self.runtime_code_hash_hex.as_deref(),
-            "runtime_code_hash_hex",
-        )?;
+        let runtime_code_hash = self
+            .runtime_code_hash_hex
+            .as_deref()
+            .map(|value| decode_hash_or_zero(Some(value), "runtime_code_hash_hex"))
+            .transpose()?
+            .unwrap_or_else(neutrino_runtime_host::default_runtime_code_hash);
 
         let mut validators: Vec<Validator> = Vec::with_capacity(self.validators.len());
         for (idx, entry) in self.validators.iter().enumerate() {
@@ -228,7 +239,7 @@ impl ChainSpecFile {
         let state = StateParams::default();
         let light_client = LightClientParams::default();
         let mut runtime = RuntimeParams::default();
-        let runtime_version = RuntimeVersion::default();
+        let runtime_info = RuntimeInfo::default();
 
         if let Some(slot_duration_secs) = self.slot_duration_secs {
             consensus.slot_duration_secs = slot_duration_secs;
@@ -242,6 +253,18 @@ impl ChainSpecFile {
         }
         if let Some(unbonding) = self.unbonding_delay_blocks {
             runtime.unbonding_delay_blocks = unbonding;
+        }
+        if let Some(value) = self.evidence_max_age_blocks {
+            runtime.evidence_max_age_blocks = value;
+        }
+        if let Some(value) = self.evidence_max_pending {
+            runtime.evidence_max_pending = value;
+        }
+        if let Some(value) = self.evidence_admissions_per_block {
+            runtime.evidence_admissions_per_block = value;
+        }
+        if let Some(value) = self.evidence_executions_per_block {
+            runtime.evidence_executions_per_block = value;
         }
         if let Some(slash) = self.slash_amount {
             runtime.slash_amount = slash;
@@ -264,16 +287,14 @@ impl ChainSpecFile {
             end_state_root: genesis_state_root,
             end_validator_set_root: genesis_validator_set_root,
             history_root: ZERO_HASH,
-            proof_system_version: proof_params.proof_system_version,
         };
 
         let spec = ChainSpec {
-            spec_version: CHAIN_SPEC_VERSION,
             name,
             chain_id: self.chain_id,
             genesis_time: self.genesis_time,
             genesis_gas_limit: self.genesis_gas_limit,
-            runtime_version,
+            runtime_info,
             runtime_code_hash,
             genesis_seed,
             genesis_state_root,

@@ -1,10 +1,9 @@
 # AGENTS.md
 
-Compact notes for AI coding agents working in this repo. Read `README.md`,
-`docs/design/00-overview.md`, `docs/design/13-sp1-runtime-proof-rewrite.md`,
-`docs/design/14-sp1-rewrite-roadmap.md`, and
-`docs/design/15-legacy-runtime-functionality.md` before changing runtime or
-proof code.
+Compact notes for coding agents. Before runtime/proof edits read `README.md`,
+`docs/design/00-overview.md`, `docs/design/03-execution-runtime.md`,
+`docs/design/10-proof-system.md`, `docs/design/19-complete-chunk-proofs.md` and
+`docs/design/20-evidence-proofs.md`.
 
 ## Environment
 
@@ -35,21 +34,22 @@ cargo fmt    --all -- --check
 Do not claim the workspace is green unless the relevant CI-equivalent commands
 have passed.
 
-## Runtime/proof rewrite status
+## Runtime and proof architecture
 
-- The old in-tree RV32IM VM, runtime host, runtime SDK, default rv32im runtime,
-  and custom Plonky3 block prover were deleted.
-- Do not reintroduce old ELF execution, syscall ABI, `NEUTRINO_DEFAULT_RUNTIME_ELF`,
-  nested `target-rv32` builds, or custom Plonky3 AIR code.
-- Runtime logic must be rebuilt as a shared STF core compiled into both:
-  - a WASM/wasmtime dynamic runtime for ordinary execution, dry-run, witness
-    generation, tx precheck, and RPC/query behavior
-  - an SP1 Guest ELF for proven consensus-critical state transition execution
-- The accepted proof type for the rewrite is SP1 Compressed STARK per block.
-- Chunk proof aggregation and checkpoint recursion are TODO/deferred. The
-  `prover-chunk` and `prover-checkpoint` crates are scaffold markers only.
-- `docs/design/15-legacy-runtime-functionality.md` records what the deleted
-  runtime stack used to do so it can be rebuilt on the new architecture.
+- One shared STF core compiles into WASM/wasmtime ordinary execution and an SP1
+  block Guest. Block proving uses SP1 Compressed STARK.
+- Evidence Guest proves objective offences. Blocks verify exact evidence receipts,
+  admit sanctions and execute the mandatory FIFO. Chunks consume proven effects
+  and verify complete consensus without repeating STF/evidence work.
+- Complete chunk proofs are the only finalization path. Certificates and mandatory
+  precommit attestations are required. Checkpoint recursion remains deferred;
+  `prover-checkpoint` is a scaffold and production recursion returns `Unsupported`.
+- There is one current protocol format with unversioned types, fields and paths.
+  Incompatible development upgrades replace formats directly. Do not introduce
+  deprecated variants, compatibility shims, fake recursive proofs or empty-proof
+  finalization paths.
+- Workspace checks and real compressed EvidenceProof → block → chunk composition
+  are separate acceptance gates. Do not carry results over between changed ELFs.
 
 ## Runtime crate layout
 
@@ -72,7 +72,7 @@ have passed.
   both hard environment dependencies (sp1up + wasm32 rustup target).
 - `crates/runtimes/neutrino-default/core/` — this runtime's STF.
   `no_std + alloc`. Defines `apply_block<B: StateBackend>`, `StfInput`,
-  `StfPublicOutput`, counter semantics. Compiles into native, wasm32,
+  `StfPublicOutput`, staking and accountability semantics. Compiles into native, wasm32,
   and the SP1 Guest target.
 - `crates/runtimes/neutrino-default/master/` — `cdylib + rlib` target.
   `rlib` path (`apply_block_with_witness`) is used for native parity

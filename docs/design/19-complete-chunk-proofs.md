@@ -29,7 +29,7 @@ and commits the next validator set, seed, history and penalty ledger.
 
 Historical commitments exclude certificate signer subsets; alternative valid quorum
 certificates cannot produce different history roots. Evidence validity is proved by
-the independent Guest and exact receipts are checked at block level. The chunk never
+the independent Guest and its statements are authenticated through block recursion. The chunk never
 reverifies an evidence receipt or the underlying offence.
 
 The node validates the candidate before BFT, obtains the certificate, proves outside

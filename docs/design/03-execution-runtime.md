@@ -21,12 +21,15 @@ Deductions are internal operations, not unsigned user transaction variants.
 `StfInput` binds execution context, transactions and incoming evidence anchor.
 `StfPublicOutput` commits state roots, transaction/receipt commitments, gas,
 validator runtime state, transaction count and accountability effects. The block
-Guest also authenticates the header projection used by chunk aggregation.
+Guest authenticates these execution values; the chunk Guest binds them to the
+canonical header and verifies the header hash and continuity.
 
 `runtime-host::WasmRuntime` provides dry-run, validation and query behavior;
 `WasmExecutor` captures the witness and applies writes to the live trie. Block
-proving requires a persisted witness. Exact evidence receipts are verified before
-host execution and again by the block Guest using the same pinned verifier.
+proving requires a persisted witness containing state openings and ordered evidence
+proof attachments. The ordinary host verifies each attachment before execution.
+The block Guest authenticates each statement through SP1 native recursion; proof
+bytes are absent from the STF input and transaction commitments.
 
 RPC `runtime_call` resolves `latest`, `finalized`, a hash or a height to a
 specific block and reads its committed state root. `finalized` means the latest

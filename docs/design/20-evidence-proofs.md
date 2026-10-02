@@ -62,8 +62,8 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
 - [x] Chunk consumes proven sanctions without evidence verification.
 - [x] Node generation, persistent pool, gossip, import and restart paths.
 - [x] Adversarial, lifecycle, queue and native/WASM/Guest parity tests.
-- [x] Locked build, complete workspace test coverage with repaired targets rerun,
-  strict Clippy, and workspace/Guest format checks.
+- [ ] Current-program locked build, complete workspace tests, strict Clippy and
+  workspace/Guest format checks.
 - [ ] Real SP1 EvidenceProof → block → chunk composition gate: queued for the
   current programs, with process-exit subscription and a local completion notification.
 
@@ -71,27 +71,44 @@ Optional early fact compression and batch aggregation are follow-on
 optimizations; individual BFT votes never wait for an SP1 fact proof. The initial
 evidence guest directly compresses self-contained signed evidence.
 
-## Exact receipt binding
+## Statement identity and recursive witnesses
 
-The block Guest uses in-guest deterministic compressed-proof verification for
-evidence receipts. The optimized deferred-proof syscall authenticates only
-program identity and public values; it cannot certify that the receipt bytes
-committed in a transaction are the same receipt. Using it alone would let a
-malicious prover hide a valid alternate receipt behind an invalid transaction
-attachment, which ordinary execution would reject. Native and Guest therefore
-verify the exact transaction-carried receipt with the same pinned verifier.
-Block-to-chunk recursion still uses the optimized syscall. Evidence facts are
-never re-executed by the block, and evidence receipts are never rechecked by the
-chunk. Performance of this exact-byte recursive verification needs measurement.
+`EvidenceSubmission` commits only the exact public statement and its historical
+opening. `Body.evidence_proofs` transports and archives one ordered attachment
+per submission, outside the transaction, vote and DA commitments. Missing,
+extra, reordered, malformed or mismatched attachments are rejected at execution
+and admission boundaries. An attachment carries the evidence program identity;
+its cache key is BLAKE3 of the domain-separated program and canonical statement.
+Alternative valid proofs for that statement have the same transaction identity.
 
-The exact-receipt verifier decodes the bounded envelope once and passes its
-compressed proof directly to the SDK's typed verifier. Circuit, successful exit,
-program identity, exact public values and trailing-byte rejection remain mandatory.
-The block shell retains an immutable validated-input token while verifying receipts,
-then executes that same input without repeating its historical binding checks.
-The token cannot be decoded from witness bytes and does not authorize a receipt.
-Chunk proving and verification share a lazy in-process key; all programs use the
-disk key cache addressed by circuit version and ELF hash.
+The ordinary host verifies each actual attachment before WASM execution. The
+proving host decodes and verifies it once, then supplies the compressed proof and
+pinned verification key through SP1's separate proof stream. The block Guest
+checks policy, historical bindings and exact statement public values, invokes
+native SP1 recursive verification and only then executes the STF. No proof bytes
+enter the STF input, and no full compressed-proof verifier runs in the block Guest.
+Production recursion cannot disable deferred verification.
+
+SP1 execution records recursive claims but does not establish that its proof
+stream matches them. The compressed circuit binds the accumulated claim digest
+to the verified subproofs, including each program and public-values digest.
+Host rejection tests cover the attachment boundaries; only real compressed
+composition establishes recursive acceptance. SP1's execution report does not
+count the recursive assertion syscall, so its counts cannot establish this gate.
+
+`InvalidProofSigning` still binds the exact block proof envelope signed by every
+precommit participant. Evidence Guest retains its deterministic exact-byte
+rejection verifier for that offence, and `facts_commitment` still commits the
+original signed misconduct evidence. Separating the resulting EvidenceProof
+witness changes neither guilt nor the mandatory sanctions and withdrawal holds.
+The chunk consumes block-proven effects without verifying evidence again.
+
+The host's exact-receipt verifier decodes bounded envelopes once and passes the
+proof directly to the SDK's typed verifier. Circuit, successful exit, program
+identity, exact public values and trailing-byte rejection remain mandatory.
+The block shell retains an immutable validated-input token and executes that
+same input without repeating historical binding checks. Chunk proving and
+verification share a lazy in-process key; program keys use the circuit/ELF cache.
 
 ## Protocol parameters and retention
 
@@ -114,10 +131,10 @@ and committed by the claim; its resulting transaction is ordered by consensus.
 Every claim binds the complete chain-spec hash and block program identity.
 
 Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 receipts
-and 32 MiB, never overwrites an existing verified offence, and prunes when its
+and 32 MiB, never overwrites an existing verified statement, and prunes when its
 admission is finalized or its admission window is behind finalized history.
 Receipts executed on an unfinalized branch remain available across reorgs. The block builder reserves
-mandatory execution gas and bounds receipt plus ordinary transaction bytes.
+mandatory execution gas and bounds attachment plus ordinary transaction bytes.
 Background jobs run outside the engine lock; startup/network initialization,
 evidence arrival, finalization and production trigger work. Failed raw reports
 rotate through bounded batches, preserving capacity for inactivity proofs.
@@ -132,7 +149,7 @@ outcomes are explicit, while the cryptographic identity sanction still applies.
 `runtime-host/tests/evidence_pipeline.rs` includes native/WASM/Guest rejection,
 evidence Guest/native parity, and the ignored real CPU gate
 `evidence_block_chunk_real_compressed_recursion`. The real gate starts at an
-explicit trusted finalized history fixture, proves the signed offence, proves
+explicit trusted finalized history fixture, proves the signed offence, recursively verifies that statement and proves
 its actual deduction from 100 stake, then proves and verifies the containing
 consensus chunk and validator sanction. It must run with real compressed proofs;
 mock SP1 receipts are never accepted by the production evidence verifier.
@@ -145,8 +162,8 @@ cannot be carried over to changed programs.
 The gate atomically saves each verified evidence, block and chunk proof under
 `target/proof-acceptance/evidence-pipeline`, configurable with
 `NEUTRINO_EVIDENCE_GATE_DIR`. Checkpoint identities bind the circuit version,
-stage ELF, exact inputs and expected statement. Block inputs include the exact
-evidence receipt; chunk inputs include the exact block proof and attestations.
+stage ELF, exact inputs and expected statement. Block witness inputs include the exact
+evidence attachment; chunk inputs include the exact block proof and attestations.
 Restart reuses a matching stage only after cryptographic verification against its
 current expected statement. Invalid or corrupt checkpoints fail the gate;
 unfinished writes cannot publish a successful stage. Changed programs or inputs
@@ -156,13 +173,3 @@ Long CPU gates can run from frozen test executables and subscribe to the precedi
 process's exit with kqueue. A local macOS notification reports completion; this
 mechanism does not send an automatic chat message or poll the prover. Keep the
 executable hash and final verdict with that run's artifacts.
-
-The 2026-10-01 workspace attempt had three failing node fixtures. Each complete
-affected test target passed after repair; all other targets had passed with the
-same functional sources. Subsequent changes only corrected documentation and
-equivalent fixture spelling/lint annotations. Combined coverage is 682 passing
-tests and five ignored gates, not a claim that the initial command passed.
-Build, strict Clippy and all format checks passed. The current real-gate executable
-was rebuilt and frozen after those changes; its queued receipt and source identities
-are recorded under `target/cleanup-acceptance/20261001T223040Z`. Real compressed
-composition is still pending and is not inferred from this workspace coverage.

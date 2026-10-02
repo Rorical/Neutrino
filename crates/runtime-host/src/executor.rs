@@ -2,8 +2,7 @@
 //!
 //! Drives the embedded default-runtime master cdylib through
 //! wasmtime, mutates the engine's state trie in place with the
-//! block's writes, and emits the borsh-encoded `(StfInput,
-//! StateWitness)` blob the configured proof system later replays.
+//! block's writes, and emits a persisted [`BlockWitness`] for proving.
 //!
 //! Exact `EvidenceProof` receipts are verified before WASM mutation. The emitted
 //! witness bundle is replayed by the matching SP1 block Guest.
@@ -130,19 +129,16 @@ impl BlockExecutor for WasmExecutor {
             output,
             witness,
             post_state,
-        } = self.wasm.dry_run(&input, &live)?;
+        } = self.wasm.dry_run(&input, &live, &body.evidence_proofs)?;
 
         // Commit the dry-run's post-state into the engine's trie.
         // Read-only blocks fall back to a clone of `live`, so the
         // swap is unconditional and idempotent.
-        *state = post_state;
-
-        // Encode the SP1 stdin payload exactly the way
-        // `ProverCtx::prove` does: `borsh(input) || borsh(witness)`.
-        // The wire format is owned by this executor; the matching
-        // `Sp1ProofSystem::prove_block` decodes it.
-        let witness_bytes = encode_witness_bundle(&input, &witness)
+        // Persist attachments beside the semantic input and state witness.
+        // The prover sends them through SP1's separate recursive proof stream.
+        let witness_bytes = encode_witness_bundle(&input, &witness, &body.evidence_proofs)
             .map_err(|err| ExecutorError::Codec(err.to_string()))?;
+        *state = post_state;
 
         Ok(ExecutionOutcome {
             state_root_after: output.post_state_root,
@@ -181,22 +177,25 @@ impl BlockExecutor for WasmExecutor {
     }
 }
 
-/// Wire format the SP1 Guest reads from `SP1Stdin`:
-/// `borsh(StfInput) || borsh(StateWitness)`.
+/// Encode the persisted [`BlockWitness`], including ordered proof attachments.
 ///
-/// Kept symmetric to `runtime_host::encode_stdin` so the prover and
-/// the executor agree on the exact byte layout the guest expects.
-fn encode_witness_bundle(
+/// The Guest receives only the input and state fields as normal stdin.
+///
+/// # Errors
+/// Returns a codec error when the input, witness or attachments cannot be encoded.
+pub fn encode_witness_bundle(
     input: &StfInput,
     witness: &neutrino_runtime_abi::StateWitness,
+    evidence_proofs: &[neutrino_consensus_types::evidence::EvidenceArtifact],
 ) -> Result<Vec<u8>, borsh::io::Error> {
     let mut bytes = Vec::new();
     BorshSerialize::serialize(input, &mut bytes)?;
     BorshSerialize::serialize(witness, &mut bytes)?;
+    BorshSerialize::serialize(evidence_proofs, &mut bytes)?;
     Ok(bytes)
 }
 
-/// Decode a witness blob into its constituent `(StfInput, StateWitness)`.
+/// Decode the complete persisted [`BlockWitness`] without trailing bytes.
 ///
 /// Inverse of [`encode_witness_bundle`]; called by
 /// [`crate::Sp1ProofSystem::prove_block`] before forwarding to the
@@ -204,13 +203,18 @@ fn encode_witness_bundle(
 ///
 /// # Errors
 /// Returns [`borsh::io::Error`] if the blob is not a valid encoding
-/// of the pair.
-pub fn decode_witness_bundle(
-    bytes: &[u8],
-) -> Result<(StfInput, neutrino_runtime_abi::StateWitness), borsh::io::Error> {
-    let mut cursor = bytes;
-    let input = <StfInput as BorshDeserialize>::deserialize_reader(&mut cursor)?;
-    let witness =
-        <neutrino_runtime_abi::StateWitness as BorshDeserialize>::deserialize_reader(&mut cursor)?;
-    Ok((input, witness))
+/// of the complete witness bundle.
+pub fn decode_witness_bundle(bytes: &[u8]) -> Result<BlockWitness, borsh::io::Error> {
+    borsh::from_slice(bytes)
+}
+
+/// Persisted proving input, including proof attachments outside STF semantics.
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct BlockWitness {
+    /// Consensus transaction and execution context.
+    pub input: StfInput,
+    /// Authenticated state openings.
+    pub state: neutrino_runtime_abi::StateWitness,
+    /// Ordered proof witnesses for the evidence statements.
+    pub evidence_proofs: Vec<neutrino_consensus_types::evidence::EvidenceArtifact>,
 }

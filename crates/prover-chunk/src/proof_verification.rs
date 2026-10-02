@@ -27,6 +27,16 @@ pub fn verify_evidence_receipt(
     statement: &neutrino_consensus_types::evidence::EvidenceStatement,
     key: &[u32; 8],
 ) -> Result<(), ProofRejectionReason> {
+    decode_verified_evidence_receipt(bytes, statement, key).map(|_| ())
+}
+
+/// Decode and verify an evidence receipt once, retaining its authenticated proof
+/// for the host's recursive proof stream.
+pub fn decode_verified_evidence_receipt(
+    bytes: &[u8],
+    statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+    key: &[u32; 8],
+) -> Result<SP1Proof, ProofRejectionReason> {
     use neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES;
     if bytes.len() > MAX_EVIDENCE_PROOF_BYTES {
         return Err(ProofRejectionReason::MalformedProof);
@@ -52,7 +62,8 @@ pub fn verify_evidence_receipt(
     if values.exit_code != sp1_primitives::SP1Field::default() {
         return Err(ProofRejectionReason::VerifierRejected);
     }
-    verify_decoded_receipt(&bundle, key)
+    verify_decoded_receipt(&bundle, key)?;
+    Ok(bundle.proof)
 }
 
 // Exact SDK 6.2.1 wire fields. Keeping the SDK host/prover itself out of the

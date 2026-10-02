@@ -123,10 +123,13 @@ fn pipeline<P: Prover<ProvingKey = SP1ProvingKey>>(prover: P, real: bool) {
     let blocks: Vec<_> = inputs
         .into_iter()
         .zip(&witness.blocks)
-        .map(|(input, block)| {
+        .map(|((input, state), block)| {
             eprintln!("consensus gate: prove block {}", block.header.height);
             system
-                .prove_block(&borsh::to_vec(&input).unwrap(), &block.public_inputs)
+                .prove_block(
+                    &neutrino_runtime_host::encode_witness_bundle(&input, &state, &[]).unwrap(),
+                    &block.public_inputs,
+                )
                 .unwrap()
         })
         .collect();

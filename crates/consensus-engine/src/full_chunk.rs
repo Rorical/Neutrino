@@ -115,7 +115,6 @@ impl<DB: Database> Engine<DB> {
     pub fn evidence_submission(
         &self,
         statement: neutrino_consensus_types::evidence::EvidenceStatement,
-        proof_bytes: Vec<u8>,
     ) -> Result<neutrino_consensus_types::evidence::EvidenceSubmission, FinalizeError<DB::Error>>
     {
         let state = self
@@ -135,11 +134,7 @@ impl<DB: Database> Engine<DB> {
         }
         let history = neutrino_consensus_types::evidence::HistoryOpening::build(&leaves, index)
             .ok_or(ProofError::InvalidWitness)?;
-        Ok(neutrino_consensus_types::evidence::EvidenceSubmission {
-            statement,
-            history,
-            proof_bytes,
-        })
+        Ok(neutrino_consensus_types::evidence::EvidenceSubmission { statement, history })
     }
 
     /// Bind a candidate to its finalized boundary and complete parent ancestry.
@@ -201,6 +196,20 @@ impl<DB: Database> Engine<DB> {
             let _checked = neutrino_default_runtime_core::accountability::validate_input(&input);
         })
         .map_err(|_| ProofError::InvalidWitness)?;
+        let mut attachments = body.evidence_proofs.iter();
+        for transaction in &input.transactions {
+            if let neutrino_default_runtime_core::Transaction::SubmitEvidence(submission) =
+                transaction
+            {
+                let attachment = attachments.next().ok_or(ProofError::InvalidWitness)?;
+                if !attachment.binds(&submission.statement, &anchor.evidence_guest_vk_digest) {
+                    return Err(ProofError::InvalidWitness.into());
+                }
+            }
+        }
+        if attachments.next().is_some() {
+            return Err(ProofError::InvalidWitness.into());
+        }
         Ok(())
     }
 

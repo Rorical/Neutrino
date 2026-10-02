@@ -70,8 +70,8 @@ pub struct ExecutionOutcome {
     pub gas_used: u64,
     /// Opaque blob suitable for the matching
     /// `ProofSystem::prove_block`. For the SP1 + default-runtime
-    /// pairing this is the borsh-encoded `(StfInput, StateWitness)`
-    /// the guest replays.
+    /// pairing this is the borsh-encoded runtime input, state witness and
+    /// evidence attachments. The prover supplies attachments separately to recursion.
     pub witness_bytes: Vec<u8>,
 }
 

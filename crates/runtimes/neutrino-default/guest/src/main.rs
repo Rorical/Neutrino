@@ -15,6 +15,7 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_runtime_abi::StateWitness;
 use neutrino_runtime_core::WitnessState;
+use sha2::{Digest, Sha256};
 
 sp1_zkvm::entrypoint!(main);
 
@@ -28,17 +29,17 @@ fn main() {
     let checked = neutrino_default_runtime_core::accountability::validate_input(&input);
     for tx in &input.transactions {
         if let Transaction::SubmitEvidence(submission) = tx {
-            neutrino_prover_chunk::proof_verification::verify_evidence_receipt(
-                &submission.proof_bytes,
-                &submission.statement,
+            let public_values =
+                borsh::to_vec(&submission.statement).expect("canonical evidence statement");
+            let digest: [u8; 32] = Sha256::digest(&public_values).into();
+            sp1_zkvm::lib::verify::verify_sp1_proof(
                 &input.evidence_anchor.evidence_guest_vk_digest,
-            )
-            .expect("exact evidence receipt must verify");
+                &digest,
+            );
         }
     }
 
-    // Verifying the witness against the claimed pre_state_root is the
-    // checked before state execution. Any tamper aborts here.
+    // Authenticate the claimed pre-state root before state execution.
     let mut state = WitnessState::new(&witness).expect("witness must match claimed pre_state_root");
 
     let output: StfPublicOutput = apply_block_validated(&checked, &mut state);

@@ -1,4 +1,4 @@
-//! Exact-receipt evidence → block → chunk composition and fail-closed execution.
+//! Statement-bound evidence → block → chunk composition and fail-closed execution.
 #[path = "support/acceptance.rs"]
 pub mod acceptance;
 #[path = "../../prover-chunk/tests/support/mod.rs"]
@@ -8,7 +8,7 @@ use acceptance::{AcceptanceCache, StageIdentity};
 
 use neutrino_consensus_types::{
     Body, FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
-    evidence::{EvidenceSubmission, HistoryOpening},
+    evidence::{EvidenceArtifact, EvidenceSubmission, HistoryOpening},
 };
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::{StfInput, Transaction};
@@ -73,11 +73,7 @@ fn evidence(witness: &ConsensusWitness) -> EvidenceWitness {
     }
 }
 
-fn submission_input(
-    first: &ConsensusWitness,
-    mut input: StfInput,
-    proof_bytes: Vec<u8>,
-) -> StfInput {
+fn submission_input(first: &ConsensusWitness, mut input: StfInput) -> StfInput {
     let evidence = evidence(first);
     let statement = validate_evidence(&evidence).unwrap();
     let leaves = [commitment(&statement.context)];
@@ -87,26 +83,30 @@ fn submission_input(
     input.transactions = vec![Transaction::SubmitEvidence(EvidenceSubmission {
         statement,
         history: HistoryOpening::build(&leaves, 0).unwrap(),
-        proof_bytes,
     })];
     input
 }
 
 #[test]
-fn invalid_receipt_is_rejected_by_native_wasm_and_block_guest() {
+fn invalid_and_missing_attachments_are_rejected_before_guest_execution() {
     let mock = ProverClient::builder().mock().build();
     let (first, input, _) =
         support::fixture([1; 8], neutrino_runtime_host::default_runtime_code_hash());
-    let input = submission_input(&first, input, vec![1, 2, 3]);
-    assert!(neutrino_runtime_host::evidence::verify_input_receipts(&input).is_err());
+    let input = submission_input(&first, input);
+    let attachments = vec![EvidenceArtifact {
+        evidence_guest_vk_digest: input.evidence_anchor.evidence_guest_vk_digest,
+        statement: validate_evidence(&evidence(&first)).unwrap(),
+        proof_bytes: vec![1, 2, 3],
+    }];
+    assert!(neutrino_runtime_host::evidence::verify_input_receipts(&input, &attachments).is_err());
     assert!(
         WasmRuntime::default_runtime()
             .unwrap()
-            .dry_run(&input, &LiveTrie::default())
+            .dry_run(&input, &LiveTrie::default(), &attachments)
             .is_err()
     );
     // Supply every state key the STF needs. Otherwise a missing-key panic
-    // could hide a missing receipt-verification check in the block Guest.
+    // could hide a missing recursive-verification check in the block Guest.
     let live = LiveTrie::default();
     let mut trace = TracingState::new(&live);
     let expected = neutrino_default_runtime_core::apply_block(&input, &mut trace);
@@ -116,12 +116,70 @@ fn invalid_receipt_is_rejected_by_native_wasm_and_block_guest() {
         neutrino_default_runtime_core::apply_block(&input, &mut replay),
         expected
     );
-    let mut stdin = SP1Stdin::new();
-    stdin.write_vec(borsh::to_vec(&(input, state)).unwrap());
-    let result = mock
-        .execute(neutrino_runtime_host::DEFAULT_GUEST_ELF.clone(), stdin)
-        .run();
-    assert!(!result.is_ok_and(|(_, report)| report.exit_code == 0));
+    let execution = neutrino_runtime_host::ProverCtx::new_cached(mock).unwrap();
+    assert!(execution.execute(&input, &state, &[]).is_err());
+    assert!(execution.execute(&input, &state, &attachments).is_err());
+    assert!(execution.prove(&input, state, &[]).is_err());
+}
+
+#[test]
+fn attachment_count_order_program_and_statement_are_checked_before_proof_decode() {
+    let (first, input, _) =
+        support::fixture([1; 8], neutrino_runtime_host::default_runtime_code_hash());
+    let mut input = submission_input(&first, input);
+    let artifact = EvidenceArtifact {
+        evidence_guest_vk_digest: input.evidence_anchor.evidence_guest_vk_digest,
+        statement: validate_evidence(&evidence(&first)).unwrap(),
+        proof_bytes: vec![1],
+    };
+    let rejected_before_decode = |input: &StfInput, attachments: &[EvidenceArtifact]| {
+        assert!(matches!(
+            neutrino_runtime_host::evidence::verify_input_receipts(input, attachments),
+            Err(neutrino_runtime_host::Sp1HostError::Codec(_))
+        ));
+    };
+    rejected_before_decode(&input, &[]);
+    rejected_before_decode(&input, &[artifact.clone(), artifact.clone()]);
+    let mut wrong = artifact.clone();
+    wrong.evidence_guest_vk_digest[0] ^= 1;
+    rejected_before_decode(&input, &[wrong]);
+    let mut wrong = artifact.clone();
+    wrong.statement.facts_commitment[0] ^= 1;
+    rejected_before_decode(&input, &[wrong]);
+    let mut second = input.transactions[0].clone();
+    let Transaction::SubmitEvidence(submission) = &mut second else {
+        unreachable!()
+    };
+    submission.statement.offence_id[0] ^= 1;
+    let other = EvidenceArtifact {
+        statement: submission.statement.clone(),
+        ..artifact.clone()
+    };
+    input.transactions.push(second);
+    rejected_before_decode(&input, &[other, artifact]);
+}
+
+#[test]
+fn persisted_witness_roundtrips_attachments_and_rejects_trailing_bytes() {
+    let (first, input, state) =
+        support::fixture([1; 8], neutrino_runtime_host::default_runtime_code_hash());
+    let attachment = EvidenceArtifact {
+        evidence_guest_vk_digest: input.evidence_anchor.evidence_guest_vk_digest,
+        statement: validate_evidence(&evidence(&first)).unwrap(),
+        proof_bytes: vec![1],
+    };
+    let mut bytes = neutrino_runtime_host::encode_witness_bundle(
+        &input,
+        &state,
+        std::slice::from_ref(&attachment),
+    )
+    .unwrap();
+    let decoded = neutrino_runtime_host::decode_witness_bundle(&bytes).unwrap();
+    assert_eq!(decoded.input, input);
+    assert_eq!(decoded.state, state);
+    assert_eq!(decoded.evidence_proofs, vec![attachment]);
+    bytes.push(0);
+    assert!(neutrino_runtime_host::decode_witness_bundle(&bytes).is_err());
 }
 
 #[test]
@@ -219,13 +277,26 @@ fn evidence_block_chunk_real_compressed_recursion() {
     let mut corrupt = bytes.clone();
     corrupt.push(0);
     assert!(system.verify_evidence(&corrupt, &statement).is_err());
-    let input = submission_input(&first, input, bytes);
+    let input = submission_input(&first, input);
+    let attachments = vec![EvidenceArtifact {
+        evidence_guest_vk_digest: first.evidence_guest_vk_digest,
+        statement,
+        proof_bytes: bytes,
+    }];
+    let mut alternate = attachments[0].clone();
+    let mut bundle: sp1_sdk::SP1ProofWithPublicValues =
+        bincode::deserialize(&alternate.proof_bytes).unwrap();
+    bundle.tee_proof = Some(vec![1]);
+    alternate.proof_bytes = bincode::serialize(&bundle).unwrap();
+    assert_eq!(alternate.statement_id(), attachments[0].statement_id());
+    assert_ne!(alternate.proof_bytes, attachments[0].proof_bytes);
+    neutrino_runtime_host::evidence::verify_input_receipts(&input, &[alternate]).unwrap();
     let dry = WasmRuntime::default_runtime()
         .unwrap()
-        .dry_run(&input, &live)
+        .dry_run(&input, &live, &attachments)
         .unwrap();
     assert_eq!(
-        neutrino_runtime_host::dry_run(&input, &live).output,
+        neutrino_runtime_host::dry_run(&input, &live, &attachments).output,
         dry.output
     );
     assert_eq!(dry.output.accountability.executed.len(), 1);
@@ -234,8 +305,47 @@ fn evidence_block_chunk_real_compressed_recursion() {
         neutrino_default_runtime_core::ValidatorSet::default().root()
     );
     let mut next = successor_fixture(&first, &input, &dry.output, &live);
-    eprintln!("evidence gate: prove block with exact receipt verification");
-    let block_input = borsh::to_vec(&(input, dry.witness)).unwrap();
+    let execution =
+        neutrino_runtime_host::ProverCtx::new_cached(ProverClient::builder().mock().build())
+            .unwrap();
+    let (values, report) = execution
+        .execute(&input, &dry.witness, &attachments)
+        .unwrap();
+    assert_eq!(report.exit_code, 0);
+    assert_eq!(values.as_slice(), borsh::to_vec(&dry.output).unwrap());
+    eprintln!(
+        "evidence gate: block guest instructions={}, syscalls={:?}",
+        report.total_instruction_count(),
+        report.syscall_counts
+    );
+    eprintln!("evidence gate: prove block with native statement recursion");
+    let executor = neutrino_runtime_host::WasmExecutor::default_runtime().unwrap();
+    let body = Body {
+        transactions: input
+            .transactions
+            .iter()
+            .map(|tx| borsh::to_vec(tx).unwrap())
+            .collect(),
+        evidence_proofs: attachments,
+        ..Body::default()
+    };
+    let context = neutrino_proof_system::BlockExecutionContext {
+        evidence_anchor: input.evidence_anchor,
+        chain_id: input.chain_id,
+        block_height: input.block_height,
+        gas_limit: input.block_gas_limit,
+        gas_price: input.gas_price,
+        proposer_address: input.proposer_address,
+    };
+    let mut state = live.trie().clone();
+    let produced =
+        neutrino_proof_system::BlockExecutor::execute_block(&executor, &context, &body, &mut state)
+            .unwrap();
+    assert_eq!(produced.state_root_after, dry.output.post_state_root);
+    assert_eq!(produced.receipts_root, dry.output.receipts_root);
+    assert_eq!(produced.gas_used, dry.output.gas_used);
+    assert_eq!(produced.runtime_extra, dry.output.validator_set_root);
+    let block_input = produced.witness_bytes;
     let block_identity = StageIdentity::new(
         "block",
         &neutrino_runtime_host::DEFAULT_GUEST_ELF,
@@ -392,8 +502,8 @@ fn successor_fixture(
 
 #[test]
 fn block_proven_sanction_changes_consensus_without_rechecking_raw_evidence() {
-    // Pure composition fixture: marker receipt bytes are not passed through a
-    // host or Guest verifier. The real gate above authenticates the same flow.
+    // Pure STF composition fixture. The real gate above authenticates the
+    // attachment and the same effects through block and chunk proofs.
     let mut live = LiveTrie::default();
     live.insert(
         &neutrino_default_runtime_core::validator_key(&[8; 32]),
@@ -411,7 +521,7 @@ fn block_proven_sanction_changes_consensus_without_rechecking_raw_evidence() {
         borsh::to_vec(&set).unwrap(),
     );
     let (first, input, _) = support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, &live);
-    let input = submission_input(&first, input, vec![1]);
+    let input = submission_input(&first, input);
     let mut trace = TracingState::new(&live);
     let output = neutrino_default_runtime_core::apply_block(&input, &mut trace);
     assert_eq!(output.accountability.executed.len(), 1);

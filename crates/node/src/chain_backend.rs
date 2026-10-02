@@ -626,7 +626,7 @@ where
         let Some(key) = self.proof_system.consensus_block_key() else {
             return Ok(());
         };
-        self.with_engine(|engine| {
+        let replaces_attachments = self.with_engine(|engine| {
             let next = engine
                 .latest_finalized_chunk_id()
                 .map_or(Some(0), |id| id.checked_add(1));
@@ -648,8 +648,30 @@ where
                     block.header.gas_limit,
                     &key,
                 )
-                .map_err(|err| SyncBackendError::Rejected(err.to_string()))
-        })
+                .map_err(|err| SyncBackendError::Rejected(err.to_string()))?;
+            let archived = engine
+                .store()
+                .get_body(&block.hash())
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+            Ok(archived.as_ref().is_some_and(|body| {
+                body.same_consensus_content(&block.body) && body != &block.body
+            }))
+        })?;
+        // Initial execution authenticates attachments in its WASM shell. A
+        // replay may reuse archived execution; verify replacement witnesses here.
+        if self.block_executor_snapshot().is_none() || replaces_attachments {
+            for attachment in &block.body.evidence_proofs {
+                if Some(attachment.evidence_guest_vk_digest) != self.proof_system.evidence_key() {
+                    return Err(SyncBackendError::Rejected(
+                        "evidence program identity mismatch".to_owned(),
+                    ));
+                }
+                self.proof_system
+                    .verify_evidence(&attachment.proof_bytes, &attachment.statement)
+                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Submit a peer-supplied transaction into the local mempool.

@@ -17,8 +17,8 @@ changed Guest binaries. See [evidence proofs](20-evidence-proofs.md).
 
 Outstanding work:
 
-- Measure and bound real proving cost, especially exact evidence receipt verification,
-  larger validator sets, historical witnesses and sustained multi-chunk operation.
+- Measure and bound real proving cost, including statement recursion, objective
+  block-proof rejection, larger validator sets and sustained multi-chunk operation.
 - Design and implement checkpoint recursion and a proof-only light client.
 - Strengthen signed-artifact publication/retrieval, archival and late-arrival detection.
 - Define erasure-coded DA and sampling if availability guarantees are required.

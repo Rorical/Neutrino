@@ -277,6 +277,18 @@ pub struct Body {
     pub transactions: Vec<Vec<u8>>,
     /// Aggregated finality votes.
     pub finality_votes: Vec<FinalityVote>,
+    /// Ordered EvidenceProof attachments, one per evidence admission. These
+    /// witnesses are transported and archived with the body, outside header
+    /// transaction/vote/DA commitments; alternate valid proofs are interchangeable.
+    pub evidence_proofs: Vec<evidence::EvidenceArtifact>,
+}
+
+impl Body {
+    /// Compare the header-committed lanes independently of proof attachments.
+    #[must_use]
+    pub fn same_consensus_content(&self, other: &Self) -> bool {
+        self.transactions == other.transactions && self.finality_votes == other.finality_votes
+    }
 }
 
 /// Aggregated vote signature and signer bitmap.
@@ -763,6 +775,7 @@ mod tests {
             body: Body {
                 transactions: vec![vec![1, 2, 3]],
                 finality_votes: vec![finality_vote()],
+                ..Body::default()
             },
         };
 

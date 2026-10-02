@@ -25,7 +25,7 @@ where
     /// Triggered by evidence arrival, finalization and block-production events.
     /// Proving never holds the engine lock or blocks the BFT message task.
     pub(super) fn start_evidence_jobs(&self) {
-        let (Some(block_key), Some(_)) = (
+        let (Some(block_key), Some(evidence_key)) = (
             self.proof_system.consensus_block_key(),
             self.proof_system.evidence_key(),
         ) else {
@@ -71,6 +71,7 @@ where
                         continue;
                     };
                     let artifact = EvidenceArtifact {
+                        evidence_guest_vk_digest: evidence_key,
                         statement,
                         proof_bytes,
                     };
@@ -220,6 +221,7 @@ where
     ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
         if artifact.proof_bytes.is_empty()
+            || Some(artifact.evidence_guest_vk_digest) != self.proof_system.evidence_key()
             || artifact.proof_bytes.len()
                 > neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES
         {
@@ -243,9 +245,7 @@ where
             {
                 return Deferred;
             }
-            match engine
-                .evidence_submission(artifact.statement.clone(), artifact.proof_bytes.clone())
-            {
+            match engine.evidence_submission(artifact.statement.clone()) {
                 Ok(submission)
                     if submission.binds(engine.chain_spec().chain_id, height, &anchor) =>
                 {
@@ -308,12 +308,13 @@ where
                 {
                     continue;
                 }
-                let Ok(submission) =
-                    engine.evidence_submission(artifact.statement, artifact.proof_bytes)
-                else {
+                let Ok(submission) = engine.evidence_submission(artifact.statement.clone()) else {
                     continue;
                 };
                 if !submission.binds(engine.chain_spec().chain_id, height, &anchor) {
+                    continue;
+                }
+                if !artifact.binds(&submission.statement, &anchor.evidence_guest_vk_digest) {
                     continue;
                 }
                 let executions = (queued.len() + selected + 1)
@@ -330,11 +331,15 @@ where
                 let Ok(tx) = borsh::to_vec(&Transaction::SubmitEvidence(submission)) else {
                     continue;
                 };
-                if bytes + tx.len() + 4 > 7 * 1024 * 1024 {
+                let Ok(attachment_bytes) = borsh::object_length(&artifact) else {
+                    continue;
+                };
+                if bytes + tx.len() + attachment_bytes + 4 > 7 * 1024 * 1024 {
                     continue;
                 }
-                bytes += tx.len() + 4;
+                bytes += tx.len() + attachment_bytes + 4;
                 body.transactions.push(tx);
+                body.evidence_proofs.push(artifact);
                 selected += 1;
             }
             let mut ordinary_count = 0;

@@ -94,7 +94,7 @@ impl<DB: Database> ChainStore<DB> {
         // Do not overwrite an already verified receipt with alternate encoding.
         if entries
             .iter()
-            .any(|(key, _)| key.as_slice() == artifact.statement.offence_id)
+            .any(|(key, _)| key.as_slice() == artifact.statement_id())
         {
             return Ok(());
         }
@@ -105,11 +105,7 @@ impl<DB: Database> ChainStore<DB> {
         {
             return Err(invalid("evidence pool capacity"));
         }
-        self.put_raw(
-            Column::EvidenceProofs,
-            &artifact.statement.offence_id,
-            &bytes,
-        )
+        self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)
     }
 
     /// Drop expired receipts or offences in the authenticated, sorted finalized
@@ -127,7 +123,7 @@ impl<DB: Database> ChainStore<DB> {
                     .binary_search(&artifact.statement.offence_id)
                     .is_ok()
             {
-                batch.delete(Column::EvidenceProofs, artifact.statement.offence_id);
+                batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
         }
         if batch.is_empty() {
@@ -148,7 +144,7 @@ impl<DB: Database> ChainStore<DB> {
             .map(|(key, bytes)| {
                 let artifact: neutrino_consensus_types::evidence::EvidenceArtifact =
                     borsh::from_slice(&bytes)?;
-                if key.as_slice() != artifact.statement.offence_id {
+                if key.as_slice() != artifact.statement_id() {
                     return Err(StoreError::Codec(borsh::io::Error::new(
                         borsh::io::ErrorKind::InvalidData,
                         "evidence key mismatch",
@@ -903,6 +899,7 @@ mod tests {
         let mut store = ChainStore::new(MemoryDatabase::new());
         let body = Body {
             transactions: vec![vec![1, 2, 3]],
+            evidence_proofs: Vec::new(),
             finality_votes: vec![FinalityVote {
                 attestations: Vec::new(),
                 aggregation_bits: {

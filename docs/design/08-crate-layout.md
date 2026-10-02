@@ -12,7 +12,7 @@
 | `runtimes/neutrino-default/chunk-guest` | SP1 consensus chunk and evidence binaries |
 | `runtime-host` | Embedded artifacts, wasmtime execution and SP1 proving/verification |
 | `proof-system` | Backend/executor traits and block-only test mock |
-| `prover-chunk` | Shared deterministic consensus, evidence and exact receipt validation |
+| `prover-chunk` | Shared consensus, evidence statements and exact signed-proof rejection |
 | `prover-checkpoint` | Deferred scaffold |
 | `network`, `sync`, `mempool`, `rpc`, `node`, `cli` | Transport, full sync, admission, query and node/operator interfaces |
 

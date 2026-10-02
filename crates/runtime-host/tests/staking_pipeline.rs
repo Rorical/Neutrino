@@ -86,13 +86,13 @@ fn stake_pipeline_prove_verify_mock() {
         proposer_address: [0u8; 32],
         transactions: vec![Transaction::Stake(signed_stake(&alice, 60, 0))],
     };
-    let dry = dry_run(&input, &live);
+    let dry = dry_run(&input, &live, &[]);
     assert_eq!(dry.output.applied, 1);
     let mut expected_set = ValidatorSet::default();
     expected_set.upsert(addr, 60);
     assert_eq!(dry.output.validator_set_root, expected_set.root());
 
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
+    let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     ctx.verify(&proof.proof, &dry.output)
         .expect("verify accepts proof");
 }
@@ -122,7 +122,7 @@ fn stake_then_unstake_round_trip() {
             Transaction::Unstake(signed_unstake(&alice, 40, 1)),
         ],
     };
-    let dry = dry_run(&input, &live);
+    let dry = dry_run(&input, &live, &[]);
     assert_eq!(dry.output.applied, 2);
     // Net effect: validator set is empty again.
     assert_eq!(
@@ -130,7 +130,7 @@ fn stake_then_unstake_round_trip() {
         ValidatorSet::default().root()
     );
 
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
+    let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     ctx.verify(&proof.proof, &dry.output)
         .expect("verify accepts proof");
 }

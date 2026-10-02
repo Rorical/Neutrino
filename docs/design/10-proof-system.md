@@ -5,8 +5,8 @@ compose the current proof path:
 
 | Proof | Establishes | Consumed by |
 | --- | --- | --- |
-| EvidenceProof | Objective offence, signed artifacts and historical membership | Block exact receipt verifier |
-| Block proof | STF, authenticated state, header/execution commitments and sanctions | Chunk optimized SP1 recursion |
+| EvidenceProof | Objective offence, signed artifacts and historical membership | Block native SP1 recursion |
+| Block proof | STF, authenticated state, execution commitments and sanctions | Chunk optimized SP1 recursion |
 | Chunk proof | Block composition, continuity, BFT, VRF, validator rotation and next context | Node finalization/import |
 
 Transactions are checked inside the block STF; there is no separate transaction
@@ -19,12 +19,14 @@ pins the program identity, chain specification and incoming context. SP1 verifie
 the compressed receipt and callers compare committed public values to the expected
 statement. Nonzero Guest exit, malformed proof or a mismatched statement is rejected.
 
-Block-to-chunk composition uses SP1's optimized recursive syscall. Evidence receipts
-use the deterministic compressed-proof verifier on the exact transaction-carried
-bytes: deferred verification alone binds program/public values but not that receipt
-attachment. See [accountability](20-evidence-proofs.md).
+Evidence-to-block and block-to-chunk composition use SP1's optimized recursive
+syscall. Evidence transactions commit statements and historical openings; proofs
+are interchangeable witnesses outside transaction and DA commitments. Ordinary
+execution verifies actual attachments under the pinned evidence program. The
+deterministic exact-byte verifier remains in Evidence Guest for signed invalid
+block-proof offences. See [accountability](20-evidence-proofs.md).
 
-The host caches block verifying keys by SP1 circuit version and ELF hash. Guest
+The host caches program verifying keys by SP1 circuit version and ELF hash. Guest
 changes alter program identity; incompatible artifacts are never accepted through
 an alternate aggregation API. Real CPU composition gates in `runtime-host/tests`
 are separate from native/Guest execution tests and mock recursion tests.

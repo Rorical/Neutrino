@@ -63,25 +63,46 @@ pub struct HistoryOpening {
     pub siblings: Vec<Hash>,
 }
 
-/// Proof-carrying evidence transaction, including its current history opening.
+/// Consensus evidence claim, including its current history opening.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct EvidenceSubmission {
     /// Public statement authenticated by the receipt.
     pub statement: EvidenceStatement,
     /// Inclusion in the block's incoming trusted historical root.
     pub history: HistoryOpening,
-    /// Canonical host SP1 receipt encoding. The block guest verifies these exact
-    /// bytes and their public values under the pinned evidence program key.
-    pub proof_bytes: Vec<u8>,
 }
 
 /// Reusable network/storage receipt, independent of today's Merkle opening.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct EvidenceArtifact {
+    /// Evidence program identity, checked against the trusted execution anchor.
+    pub evidence_guest_vk_digest: [u32; 8],
     /// Public values proved by the independent guest.
     pub statement: EvidenceStatement,
     /// Canonical compressed SP1 receipt bytes.
     pub proof_bytes: Vec<u8>,
+}
+
+impl EvidenceArtifact {
+    /// Stable statement identity independent of the proof's encoding or nonce.
+    #[must_use]
+    pub fn statement_id(&self) -> Hash {
+        commitment(&(
+            b"neutrino-evidence-statement",
+            self.evidence_guest_vk_digest,
+            &self.statement,
+        ))
+    }
+
+    /// Match an attachment to the exact claim and trusted evidence program.
+    /// Cryptographic verification remains the execution shell's obligation.
+    #[must_use]
+    pub fn binds(&self, statement: &EvidenceStatement, key: &[u32; 8]) -> bool {
+        self.evidence_guest_vk_digest == *key
+            && self.statement == *statement
+            && !self.proof_bytes.is_empty()
+            && self.proof_bytes.len() <= MAX_EVIDENCE_PROOF_BYTES
+    }
 }
 
 /// Incoming block authorization context. The chunk authenticates every field.
@@ -197,14 +218,81 @@ impl EvidenceSubmission {
                 .verify(commitment(&statement.context), anchor.history_root)
             && statement.context.end_height < height
             && height - statement.context.end_height <= anchor.policy.evidence_max_age_blocks
-            && !self.proof_bytes.is_empty()
-            && self.proof_bytes.len() <= MAX_EVIDENCE_PROOF_BYTES
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn artifact() -> EvidenceArtifact {
+        EvidenceArtifact {
+            evidence_guest_vk_digest: [2; 8],
+            statement: EvidenceStatement {
+                chain_id: 7,
+                chain_spec_hash: [3; 32],
+                block_guest_vk_digest: [1; 8],
+                context: EvidenceContext {
+                    chunk_id: 0,
+                    chunk_hash: [4; 32],
+                    end_height: 1,
+                    validators_root: [5; 32],
+                    seed: [6; 32],
+                },
+                offender: Validator {
+                    pubkey: [7; 48],
+                    withdrawal_credentials: [8; 32],
+                    effective_stake: 100,
+                    slashed: false,
+                    activation_epoch: 0,
+                    exit_epoch: u64::MAX,
+                    last_active_chunk: 0,
+                },
+                kind: SanctionKind::Slash,
+                offence_id: [9; 32],
+                facts_commitment: [10; 32],
+            },
+            proof_bytes: alloc::vec![1],
+        }
+    }
+
+    #[test]
+    fn statement_identity_binds_program_and_facts_but_not_proof_encoding() {
+        let original = artifact();
+        let mut alternate = original.clone();
+        alternate.proof_bytes.push(2);
+        assert_eq!(original.statement_id(), alternate.statement_id());
+        alternate.evidence_guest_vk_digest[0] ^= 1;
+        assert_ne!(original.statement_id(), alternate.statement_id());
+        assert!(!alternate.binds(&original.statement, &original.evidence_guest_vk_digest));
+        alternate = original.clone();
+        alternate.statement.facts_commitment[0] ^= 1;
+        assert_ne!(original.statement_id(), alternate.statement_id());
+        assert!(!alternate.binds(&original.statement, &original.evidence_guest_vk_digest));
+    }
+
+    #[test]
+    fn consensus_body_commitments_and_transactions_do_not_contain_proof_bytes() {
+        let original = artifact();
+        let submission = EvidenceSubmission {
+            statement: original.statement.clone(),
+            history: HistoryOpening::default(),
+        };
+        let mut body = crate::Body {
+            transactions: alloc::vec![borsh::to_vec(&submission).unwrap()],
+            evidence_proofs: alloc::vec![original],
+            ..crate::Body::default()
+        };
+        let original_body = body.clone();
+        body.evidence_proofs[0].proof_bytes.push(2);
+        assert!(body.same_consensus_content(&original_body));
+        assert_ne!(
+            borsh::to_vec(&body).unwrap(),
+            borsh::to_vec(&original_body).unwrap()
+        );
+        body.transactions[0].push(0);
+        assert!(!body.same_consensus_content(&original_body));
+    }
 
     #[test]
     fn historical_openings_bind_every_shape_count_and_position() {

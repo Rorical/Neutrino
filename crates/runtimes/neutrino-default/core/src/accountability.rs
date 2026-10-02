@@ -259,9 +259,8 @@ pub(crate) mod tests {
         host::{LiveTrie, TracingState},
     };
 
-    /// Pure-STF fixture: receipt authenticity belongs to the execution shell.
-    /// These marker bytes are deliberately not a valid SP1 proof. Host/Guest
-    /// integration tests must reject them and cannot use this helper.
+    /// Pure-STF fixture: proof authenticity belongs to the execution shell.
+    /// Integration tests must supply independently verified proof attachments.
     #[allow(clippy::redundant_pub_crate)] // Shared with sibling STF tests, never a public production API.
     pub(crate) fn admission(
         input: &mut StfInput,
@@ -300,7 +299,6 @@ pub(crate) mod tests {
                 facts_commitment: [id; 32],
             },
             history: HistoryOpening::build(&leaves, 0).unwrap(),
-            proof_bytes: vec![1],
         })
     }
 
@@ -437,14 +435,14 @@ pub(crate) mod tests {
 
     #[test]
     #[should_panic(expected = "offence replay")]
-    fn replay_is_rejected_after_execution_even_with_new_proof_bytes() {
+    fn replay_is_rejected_after_execution_even_with_different_statement_encoding() {
         let mut input = input();
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let live = LiveTrie::default();
         let mut state = TracingState::new(&live);
         crate::apply_block(&input, &mut state);
         if let Transaction::SubmitEvidence(receipt) = &mut input.transactions[0] {
-            receipt.proof_bytes.push(2);
+            receipt.statement.facts_commitment[0] ^= 1;
         }
         crate::apply_block(&input, &mut state);
     }

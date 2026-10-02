@@ -22,7 +22,9 @@ pub mod executor;
 pub mod proof_system;
 pub mod wasm;
 
-pub use executor::{ExecutorError, WasmExecutor, decode_witness_bundle};
+pub use executor::{
+    BlockWitness, ExecutorError, WasmExecutor, decode_witness_bundle, encode_witness_bundle,
+};
 pub use proof_system::{Sp1BlockProof, Sp1ProofSystem};
 
 /// BLAKE3 hash of the embedded default-runtime master WASM cdylib.
@@ -70,6 +72,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use neutrino_consensus_types::evidence::EvidenceArtifact;
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block};
 use neutrino_runtime_abi::StateWitness;
 use neutrino_runtime_core::host::{LiveTrie, TracingState};
@@ -180,14 +183,14 @@ impl<P: Prover> ProverCtx<P> {
         &self,
         input: &StfInput,
         witness: StateWitness,
+        evidence_proofs: &[EvidenceArtifact],
     ) -> Result<BlockProof, Sp1HostError> {
-        let mut stdin = SP1Stdin::new();
-        let payload = encode_stdin(input, &witness)?;
-        stdin.write_vec(payload);
+        let stdin = block_stdin(&self.prover, input, &witness, evidence_proofs, None)?;
 
         let proof = self
             .prover
             .prove(&self.pk, stdin)
+            .deferred_proof_verification(true)
             .compressed()
             .run()
             .map_err(sdk_err)?;
@@ -229,12 +232,12 @@ impl<P: Prover> ProverCtx<P> {
         &self,
         input: &StfInput,
         witness: &StateWitness,
+        evidence_proofs: &[EvidenceArtifact],
     ) -> Result<(SP1PublicValues, ExecutionReport), Sp1HostError> {
-        let mut stdin = SP1Stdin::new();
-        let payload = encode_stdin(input, witness)?;
-        stdin.write_vec(payload);
+        let stdin = block_stdin(&self.prover, input, witness, evidence_proofs, None)?;
         self.prover
             .execute(self.pk.elf().clone(), stdin)
+            .deferred_proof_verification(true)
             .run()
             .map_err(sdk_err)
     }
@@ -370,8 +373,9 @@ fn codec_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
 /// SP1 Guest needs to replay the same transition. Pure dry-run — no
 /// writes are committed to `live`.
 #[must_use]
-pub fn dry_run(input: &StfInput, live: &LiveTrie) -> DryRun {
-    evidence::verify_input_receipts(input).expect("authenticated evidence before native execution");
+pub fn dry_run(input: &StfInput, live: &LiveTrie, evidence_proofs: &[EvidenceArtifact]) -> DryRun {
+    evidence::verify_input_receipts(input, evidence_proofs)
+        .expect("authenticated evidence before native execution");
     let mut tracer = TracingState::new(live);
     let output = apply_block(input, &mut tracer);
     let (post_state, witness) = tracer.into_committed_and_witness();
@@ -389,6 +393,44 @@ fn encode_stdin(input: &StfInput, witness: &StateWitness) -> Result<Vec<u8>, Sp1
     Ok(bytes)
 }
 
+// The block's normal stdin contains only STF input and state openings. Verified
+// evidence attachments enter SP1's separate recursive proof stream, never the STF.
+pub(crate) fn block_stdin<P: Prover>(
+    prover: &P,
+    input: &StfInput,
+    witness: &StateWitness,
+    evidence_proofs: &[EvidenceArtifact],
+    evidence_vk: Option<&SP1VerifyingKey>,
+) -> Result<SP1Stdin, Sp1HostError> {
+    let proofs = evidence::verify_input_receipts(input, evidence_proofs)?;
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(encode_stdin(input, witness)?);
+    if !proofs.is_empty() {
+        let key = match evidence_vk {
+            Some(key) => key.clone(),
+            None => prover
+                .setup(DEFAULT_EVIDENCE_GUEST_ELF.clone())
+                .map_err(sdk_err)?
+                .verifying_key()
+                .clone(),
+        };
+        if key.hash_u32() != input.evidence_anchor.evidence_guest_vk_digest {
+            return Err(Sp1HostError::Sdk(
+                "evidence program identity mismatch".into(),
+            ));
+        }
+        for proof in proofs {
+            let sp1_sdk::SP1Proof::Compressed(inner) = proof else {
+                return Err(Sp1HostError::Sdk(
+                    "evidence proof must be compressed".into(),
+                ));
+            };
+            stdin.write_proof(*inner, key.vk.clone());
+        }
+    }
+    Ok(stdin)
+}
+
 /// Prove a state transition using the supplied prover. Use [`prove`]
 /// for the env-driven default.
 ///
@@ -399,6 +441,7 @@ pub fn prove_with<P>(
     prover: &P,
     input: &StfInput,
     witness: StateWitness,
+    evidence_proofs: &[EvidenceArtifact],
 ) -> Result<BlockProof, Sp1HostError>
 where
     P: Prover,
@@ -406,12 +449,11 @@ where
     let pk = prover.setup(DEFAULT_GUEST_ELF.clone()).map_err(sdk_err)?;
     let vk = pk.verifying_key().clone();
 
-    let mut stdin = SP1Stdin::new();
-    let payload = encode_stdin(input, &witness)?;
-    stdin.write_vec(payload);
+    let stdin = block_stdin(prover, input, &witness, evidence_proofs, None)?;
 
     let proof = prover
         .prove(&pk, stdin)
+        .deferred_proof_verification(true)
         .compressed()
         .run()
         .map_err(sdk_err)?;
@@ -456,8 +498,12 @@ where
 ///
 /// # Errors
 /// See [`prove_with`].
-pub fn prove(input: &StfInput, witness: StateWitness) -> Result<BlockProof, Sp1HostError> {
-    prove_with(&ProverClient::from_env(), input, witness)
+pub fn prove(
+    input: &StfInput,
+    witness: StateWitness,
+    evidence_proofs: &[EvidenceArtifact],
+) -> Result<BlockProof, Sp1HostError> {
+    prove_with(&ProverClient::from_env(), input, witness, evidence_proofs)
 }
 
 /// Verify a proof using the env-driven prover.
@@ -506,6 +552,7 @@ mod tests {
                 transactions: Vec::new(),
             },
             &live,
+            &[],
         );
         assert_eq!(output.applied, 0);
         assert_eq!(output.failed, 0);

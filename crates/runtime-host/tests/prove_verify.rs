@@ -91,11 +91,11 @@ fn full_pipeline_signed_transfer_mock() {
     let tx = signed_transfer(&alice, bob_addr, 30, 0, CHAIN_ID);
     let input = input_with_transfers(vec![tx]);
 
-    let dry = dry_run(&input, &live);
+    let dry = dry_run(&input, &live, &[]);
     assert_eq!(dry.output.applied, 1);
     assert_eq!(dry.output.failed, 0);
 
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
+    let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     ctx.verify(&proof.proof, &dry.output)
         .expect("verify accepts proof");
 }
@@ -107,8 +107,8 @@ fn tampered_post_state_root_is_rejected() {
     let ctx = mock_ctx();
     let live = LiveTrie::default();
     let input = input_with_transfers(vec![]);
-    let dry = dry_run(&input, &live);
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
+    let dry = dry_run(&input, &live, &[]);
+    let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
 
     let mut tampered = dry.output.clone();
     tampered.post_state_root[0] ^= 0xFF;
@@ -143,7 +143,7 @@ fn missing_witness_entry_makes_guest_abort() {
     };
     let tx = signed_transfer(&alice, [0xCC; 32], 1, 0, CHAIN_ID);
     let input = input_with_transfers(vec![tx]);
-    let (_pv, report) = ctx.execute(&input, &witness).expect("executor runs");
+    let (_pv, report) = ctx.execute(&input, &witness, &[]).expect("executor runs");
     assert_ne!(
         report.exit_code, 0,
         "guest must abort with non-zero exit when an unwitnessed account is read"
@@ -175,7 +175,7 @@ fn tampered_witness_value_makes_guest_abort() {
         witnessed_keys: vec![],
     };
     let input = input_with_transfers(vec![]);
-    let (_pv, report) = ctx.execute(&input, &witness).expect("executor runs");
+    let (_pv, report) = ctx.execute(&input, &witness, &[]).expect("executor runs");
     assert_ne!(
         report.exit_code, 0,
         "guest must abort when the witness contradicts pre_state_root"
@@ -198,7 +198,7 @@ fn master_apply_block_with_witness_matches_dry_run() {
 
     let tx = signed_transfer(&alice, [0xDD; 32], 7, 0, CHAIN_ID);
     let input = input_with_transfers(vec![tx]);
-    let dry = dry_run(&input, &live);
+    let dry = dry_run(&input, &live, &[]);
     let bytes = borsh::to_vec(&(input, dry.witness.clone())).unwrap();
     let out_bytes = neutrino_default_runtime_master::apply_block_with_witness(&bytes);
     let out: StfPublicOutput = borsh::from_slice(&out_bytes).unwrap();
@@ -230,8 +230,8 @@ fn real_prover_full_pipeline() {
 
     let tx = signed_transfer(&alice, [0xEE; 32], 25, 0, CHAIN_ID);
     let input = input_with_transfers(vec![tx]);
-    let dry = dry_run(&input, &live);
-    let proof = ctx.prove(&input, dry.witness.clone()).unwrap();
+    let dry = dry_run(&input, &live, &[]);
+    let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     ctx.verify(&proof.proof, &dry.output).unwrap();
 }
 
@@ -317,7 +317,7 @@ fn real_prover_demonstration() {
     // -------------------------------------------------------------
     println!("[3] Host dry-run (TracingState, no SP1)");
     let started = Instant::now();
-    let dry = dry_run(&input, &live);
+    let dry = dry_run(&input, &live, &[]);
     let elapsed = started.elapsed();
     println!("    elapsed                 {elapsed:.2?}");
     println!("    applied                 {}", dry.output.applied);
@@ -375,7 +375,7 @@ fn real_prover_demonstration() {
     // -------------------------------------------------------------
     println!("[5] SP1 Compressed STARK proof generation (env-selected backend)");
     let started = Instant::now();
-    let proof_bundle = ctx.prove(&input, dry.witness.clone()).unwrap();
+    let proof_bundle = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     let elapsed = started.elapsed();
     println!("    elapsed                 {elapsed:.2?}");
 

@@ -13,6 +13,7 @@ fn artifact(id: u64) -> EvidenceArtifact {
     let mut offence_id = [0; 32];
     offence_id[..8].copy_from_slice(&id.to_le_bytes());
     EvidenceArtifact {
+        evidence_guest_vk_digest: [2; 8],
         statement: EvidenceStatement {
             chain_id: 7,
             chain_spec_hash: witness.chain_spec.hash(),
@@ -84,4 +85,50 @@ fn finalization_releases_cache_capacity_without_discarding_reorg_candidates() {
         .prune_evidence_artifacts(1, 1024, &[original.statement.offence_id])
         .unwrap();
     assert_eq!(store.evidence_artifacts().unwrap(), vec![pending]);
+}
+
+#[test]
+fn pool_identity_is_scoped_to_program_and_exact_statement() {
+    let mut store = ChainStore::new(MemoryDatabase::new());
+    let original = artifact(1);
+    let mut other_program = original.clone();
+    other_program.evidence_guest_vk_digest[0] ^= 1;
+    let mut other_statement = original.clone();
+    other_statement.statement.facts_commitment[0] ^= 1;
+    for item in [&original, &other_program, &other_statement] {
+        store.put_evidence_artifact(item).unwrap();
+    }
+    assert_eq!(store.evidence_artifacts().unwrap().len(), 3);
+    store
+        .prune_evidence_artifacts(1, 1024, &[original.statement.offence_id])
+        .unwrap();
+    assert!(store.evidence_artifacts().unwrap().is_empty());
+}
+
+#[test]
+fn attachment_bytes_do_not_change_roots_and_survive_body_archive() {
+    let mut store = ChainStore::new(MemoryDatabase::new());
+    let original = artifact(1);
+    let mut body = neutrino_consensus_types::Body {
+        transactions: vec![
+            borsh::to_vec(&neutrino_default_runtime_core::Transaction::SubmitEvidence(
+                neutrino_consensus_types::evidence::EvidenceSubmission {
+                    statement: original.statement.clone(),
+                    history: neutrino_consensus_types::evidence::HistoryOpening::default(),
+                },
+            ))
+            .unwrap(),
+        ],
+        evidence_proofs: vec![original],
+        ..neutrino_consensus_types::Body::default()
+    };
+    let roots = neutrino_consensus_engine::body::compute_body_roots(&body);
+    body.evidence_proofs[0].proof_bytes.push(2);
+    assert_eq!(
+        neutrino_consensus_engine::body::compute_body_roots(&body),
+        roots
+    );
+    store.put_body(&[7; 32], &body).unwrap();
+    let reopened = ChainStore::new(store.into_db());
+    assert_eq!(reopened.get_body(&[7; 32]).unwrap(), Some(body));
 }

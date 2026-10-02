@@ -38,7 +38,7 @@ have passed.
 
 - One shared STF core compiles into WASM/wasmtime ordinary execution and an SP1
   block Guest. Block proving uses SP1 Compressed STARK.
-- Evidence Guest proves objective offences. Blocks verify exact evidence receipts,
+- Evidence Guest proves objective offences. Blocks recursively verify evidence statements using separate proof attachments,
   admit sanctions and execute the mandatory FIFO. Chunks consume proven effects
   and verify complete consensus without repeating STF/evidence work.
 - Complete chunk proofs are the only finalization path. Certificates and mandatory

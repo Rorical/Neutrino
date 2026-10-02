@@ -294,6 +294,12 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
         restarted.ingest_evidence_proof(corrupt).await,
         neutrino_sync::EvidenceProofAcceptance::Rejected
     );
+    let mut wrong_program = artifact.clone();
+    wrong_program.evidence_guest_vk_digest[0] ^= 1;
+    assert_eq!(
+        restarted.ingest_evidence_proof(wrong_program).await,
+        neutrino_sync::EvidenceProofAcceptance::Rejected
+    );
     restarted.with_engine_mut_for_test(|engine| {
         assert_eq!(engine.store().evidence_artifacts().unwrap(), vec![artifact]);
     });

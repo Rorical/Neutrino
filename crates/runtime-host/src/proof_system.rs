@@ -2,7 +2,7 @@
 //! consensus engine.
 //!
 //! [`Sp1ProofSystem::prove_block`] decodes the borsh-encoded
-//! `(StfInput, StateWitness)` blob the producer hands off,
+//! persisted input, state witness and evidence attachments the producer hands off,
 //! pre-validates every cross-checked field of
 //! [`BlockProofPublicInputs`] (`chain_id`, `height`, `block_gas_limit`,
 //! `gas_price`, `proposer_address`, `pre_state_root`) against the SP1
@@ -281,10 +281,13 @@ where
         //    block production. The wire format is owned by
         //    `runtime_host::executor`; any decode failure means the
         //    stored bytes are not the canonical
-        //    `borsh(StfInput) || borsh(StateWitness)` shape and the
+        //    complete `BlockWitness` shape and the
         //    proof system cannot proceed.
-        let (input, witness) =
-            decode_witness_bundle(witness).map_err(|_| ProofError::InvalidWitness)?;
+        let crate::BlockWitness {
+            input,
+            state: witness,
+            evidence_proofs,
+        } = decode_witness_bundle(witness).map_err(|_| ProofError::InvalidWitness)?;
 
         // 2. Bind the witness's pre-state-root to the consensus
         //    engine's `state_root_before`. The cryptographic check
@@ -323,15 +326,16 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
 
-        // 3. Serialize for SP1's stdin. The witness bundle is already
-        //    in the layout the guest reads (input || witness); we
-        //    only need to wrap it in an `SP1Stdin`.
-        let mut stdin = sp1_sdk::SP1Stdin::new();
-        let mut payload = Vec::new();
-        BorshSerialize::serialize(&input, &mut payload).map_err(|_| ProofError::InvalidWitness)?;
-        BorshSerialize::serialize(&witness, &mut payload)
-            .map_err(|_| ProofError::InvalidWitness)?;
-        stdin.write_vec(payload);
+        // 3. Keep proof witnesses out of normal stdin and supply verified
+        //    attachments through the native recursive proof stream.
+        let stdin = crate::block_stdin(
+            &self.ctx.prover,
+            &input,
+            &witness,
+            &evidence_proofs,
+            Some(&self.evidence_vk),
+        )
+        .map_err(|_| ProofError::InvalidWitness)?;
 
         // 4. Drive the configured prover (mock / cpu / cuda / network)
         //    to produce a Compressed STARK bound to the embedded
@@ -340,6 +344,7 @@ where
             .ctx
             .prover
             .prove(&self.ctx.pk, stdin)
+            .deferred_proof_verification(true)
             .compressed()
             .run()
             .map_err(|_| ProofError::BackendRejected)?;
@@ -530,6 +535,7 @@ where
             .ctx
             .prover
             .prove(&pk, stdin)
+            .deferred_proof_verification(true)
             .compressed()
             .run()
             .map_err(|_| ProofError::BackendRejected)?;

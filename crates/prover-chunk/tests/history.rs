@@ -421,7 +421,6 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
     let submission = EvidenceSubmission {
         statement: claim,
         history: HistoryOpening::build(&leaves, 0).unwrap(),
-        proof_bytes: vec![1],
     };
     assert!(submission.binds(7, 2, &anchor));
     assert!(!submission.binds(8, 2, &anchor));

@@ -16,7 +16,7 @@ flowchart LR
     F --> W
 ```
 
-EvidenceProof establishes an offence. Block execution verifies the exact receipt,
+EvidenceProof establishes an offence. Block execution recursively verifies the evidence statement,
 authenticates its historical opening, admits the sanction and executes the
 mandatory queue. Chunk aggregation consumes block-proven effects and verifies
 consensus; it does not re-execute transactions or evidence facts.

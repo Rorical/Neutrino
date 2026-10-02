@@ -114,8 +114,8 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
         proposer_address: [0u8; 32],
         transactions: vec![Transaction::Transfer(tx)],
     };
-    let dry = dry_run(&input, &live);
-    let bundle = prove_with(&mock_ctx().prover, &input, dry.witness)
+    let dry = dry_run(&input, &live, &[]);
+    let bundle = prove_with(&mock_ctx().prover, &input, dry.witness, &[])
         .expect("mock prove succeeds")
         .proof;
     let sp1_bp = Sp1BlockProof::from_sp1(&bundle).expect("encode");

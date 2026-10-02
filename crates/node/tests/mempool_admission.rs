@@ -192,7 +192,6 @@ fn submit_transaction_rejects_proof_admission() {
                 count: 1,
                 siblings: vec![],
             },
-            proof_bytes: vec![1],
         });
     let bytes = borsh::to_vec(&submission).expect("encode tx");
     let err = backend

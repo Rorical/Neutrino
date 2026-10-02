@@ -512,7 +512,11 @@ impl<DB: Database> Engine<DB> {
         // and body, before returning the current materialized head unchanged.
         let hash = block.hash();
         if self.store().get_header(&hash)?.as_ref() == Some(&block.header)
-            && self.store().get_body(&hash)?.as_ref() == Some(&block.body)
+            && self
+                .store()
+                .get_body(&hash)?
+                .as_ref()
+                .is_some_and(|body| body.same_consensus_content(&block.body))
         {
             let head_slot = self
                 .store()

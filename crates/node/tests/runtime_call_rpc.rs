@@ -8,7 +8,7 @@
 //! - the four canonical methods (`account_get`, `validator_get`,
 //!   `validator_set`, `runtime_info`),
 //! - the `RuntimeNotConfigured` error when no executor is installed,
-//! - `HistoricalStateNotSupported` for explicit `Hash`/`Height` block ids,
+//! - explicit errors for unknown blocks and reads from retained historical roots,
 //! - `runtime_available()` / `runtime_code_hash()` flipping on/off
 //!   alongside `set_block_executor`,
 //! - that block production does not disturb the read-only query path
@@ -26,7 +26,7 @@ use neutrino_primitives::{
     BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
     RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
-use neutrino_rpc::{BlockId, RpcBackend, RuntimeCallError};
+use neutrino_rpc::{BlockId, QueryError, RpcBackend, RuntimeCallError};
 use neutrino_runtime_abi::QueryStatus;
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -267,7 +267,7 @@ async fn no_executor_returns_runtime_not_configured() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn historical_hash_block_id_is_rejected() {
+async fn unknown_hash_block_id_is_rejected() {
     let backend = fresh_backend_with_executor().await;
 
     let err = backend
@@ -277,13 +277,13 @@ async fn historical_hash_block_id_is_rejected() {
             &BlockId::Hash([0xFF; 32]),
         )
         .await
-        .expect_err("hash-id queries are not supported");
+        .expect_err("unknown block hash");
 
-    assert!(matches!(err, RuntimeCallError::HistoricalStateNotSupported));
+    assert_eq!(err, RuntimeCallError::Query(QueryError::BlockNotFound));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn historical_height_block_id_is_rejected() {
+async fn unknown_height_block_id_is_rejected() {
     let backend = fresh_backend_with_executor().await;
 
     let err = backend
@@ -293,14 +293,25 @@ async fn historical_height_block_id_is_rejected() {
             &BlockId::Height(42),
         )
         .await
-        .expect_err("height-id queries are not supported");
+        .expect_err("unknown block height");
 
-    assert!(matches!(err, RuntimeCallError::HistoricalStateNotSupported));
+    assert_eq!(err, RuntimeCallError::Query(QueryError::BlockNotFound));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn finalized_block_id_falls_through_to_latest() {
+async fn finalized_block_id_selects_trusted_genesis() {
     let backend = fresh_backend_with_executor().await;
+
+    let spec = chain_spec();
+    let finalized = backend.finalized().await.unwrap();
+    assert_eq!(finalized.chunk_id, None);
+    assert_eq!(finalized.block_hash, spec.genesis_block_hash);
+    assert_eq!(finalized.height, 0);
+    assert_eq!(finalized.state_root, spec.genesis_state_root);
+    assert_eq!(
+        backend.resolve_block_id(&BlockId::Height(0)).await.unwrap(),
+        Some(spec.genesis_block_hash)
+    );
 
     let response = backend
         .runtime_call(

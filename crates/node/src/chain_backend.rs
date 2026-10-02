@@ -24,6 +24,7 @@
 //! Checkpoint recursion remains unsupported.
 
 mod evidence;
+mod rpc_queries;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,7 @@ use neutrino_consensus_engine::{
     vrf_rejection_reason,
 };
 use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityVote, Header, RecursiveCheckpointProof, SlashingEvidence,
+    Block, BlockProof, ChunkProof, FinalityVote, RecursiveCheckpointProof, SlashingEvidence,
 };
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
@@ -49,13 +50,9 @@ use neutrino_network::service::NetworkCommand;
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
     BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
-    Validator, ZERO_HASH, blake3_256,
+    ZERO_HASH, blake3_256,
 };
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
-use neutrino_rpc::{
-    BlockId, FinalizedInfo, HeadInfo, RpcBackend, RuntimeCallError, RuntimeCallResponse,
-    SubmitError as RpcSubmitError,
-};
 use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 use neutrino_storage::Database;
 use neutrino_sync::{
@@ -1984,208 +1981,5 @@ where
             self.start_evidence_jobs();
             trace!("pooled peer-supplied slashing evidence");
         }
-    }
-}
-
-#[async_trait]
-impl<DB, P> RpcBackend for ChainBackend<DB, P>
-where
-    DB: Database + Send + 'static,
-    DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
-    P: ProofSystem + Send + Sync + 'static,
-{
-    fn chain_id(&self) -> ChainId {
-        Self::chain_id(self)
-    }
-
-    fn runtime_code_hash(&self) -> Option<neutrino_primitives::Hash> {
-        // Startup pins the installed runtime to this chain-spec content hash.
-        if self.block_executor_snapshot().is_some() {
-            Some(self.with_engine(|engine| engine.chain_spec().runtime_code_hash))
-        } else {
-            None
-        }
-    }
-
-    fn runtime_available(&self) -> bool {
-        self.block_executor_snapshot().is_some()
-    }
-
-    fn mempool_len(&self) -> usize {
-        Self::mempool_len(self)
-    }
-
-    async fn head(&self) -> HeadInfo {
-        self.with_engine(|engine| {
-            let hash = engine.head_hash();
-            let slot = engine
-                .store()
-                .get_header(&hash)
-                .ok()
-                .flatten()
-                .map_or(0, |h| h.slot);
-            HeadInfo {
-                height: engine.head_height(),
-                hash,
-                slot,
-                state_root: engine.head_state_root(),
-            }
-        })
-    }
-
-    async fn finalized(&self) -> FinalizedInfo {
-        self.with_engine(|engine| {
-            let index = engine.latest_checkpoint_index();
-            engine.store().get_checkpoint(index).ok().flatten().map_or(
-                FinalizedInfo {
-                    index: 0,
-                    block_hash: ZERO_HASH,
-                    height: 0,
-                    state_root: ZERO_HASH,
-                },
-                |cp| FinalizedInfo {
-                    index,
-                    block_hash: cp.end_block_hash,
-                    height: cp.end_height,
-                    state_root: cp.end_state_root,
-                },
-            )
-        })
-    }
-
-    async fn active_validator_set(&self) -> Vec<Validator> {
-        self.with_engine(|engine| engine.active_validator_set().to_vec())
-    }
-
-    async fn resolve_block_id(&self, id: &BlockId) -> Option<BlockHash> {
-        match id {
-            BlockId::Latest => Some(self.with_engine(neutrino_consensus_engine::Engine::head_hash)),
-            BlockId::Finalized => self.with_engine(|engine| {
-                let index = engine.latest_checkpoint_index();
-                engine
-                    .store()
-                    .get_checkpoint(index)
-                    .ok()
-                    .flatten()
-                    .map(|cp| cp.end_block_hash)
-            }),
-            BlockId::Hash(h) => {
-                self.with_engine(|engine| engine.store().get_header(h).ok().flatten().map(|_| *h))
-            }
-            BlockId::Height(h) => self
-                .with_engine(|engine| engine.store().get_block_hash_by_height(*h).ok().flatten()),
-        }
-    }
-
-    async fn header_by_hash(&self, hash: BlockHash) -> Option<Header> {
-        self.with_engine(|engine| engine.store().get_header(&hash).ok().flatten())
-    }
-
-    async fn header_by_height(&self, height: Height) -> Option<Header> {
-        self.with_engine(|engine| engine.store().get_header_by_height(height).ok().flatten())
-    }
-
-    async fn block_by_hash(&self, hash: BlockHash) -> Option<Block> {
-        self.with_engine(|engine| {
-            let header = engine.store().get_header(&hash).ok().flatten()?;
-            let body = engine
-                .store()
-                .get_body(&hash)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            Some(Block { header, body })
-        })
-    }
-
-    async fn block_by_height(&self, height: Height) -> Option<Block> {
-        self.with_engine(|engine| {
-            let header = engine.store().get_header_by_height(height).ok().flatten()?;
-            let hash = header.hash();
-            let body = engine
-                .store()
-                .get_body(&hash)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            Some(Block { header, body })
-        })
-    }
-
-    async fn storage_at(&self, key: &[u8], at: &BlockId) -> Option<Vec<u8>> {
-        // Queries use the live head trie. Historical state queries
-        // require reconstruction from persisted nodes.
-        match at {
-            BlockId::Latest => self.with_engine(|engine| engine.state().get(key)),
-            BlockId::Finalized => {
-                // The local engine commits state inline, so the
-                // finalized state matches the head state for now.
-                // Once chunk-bounded execution lands this will need
-                // its own reconstructed trie.
-                self.with_engine(|engine| engine.state().get(key))
-            }
-            BlockId::Hash(_) | BlockId::Height(_) => None,
-        }
-    }
-
-    async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, RpcSubmitError> {
-        match Self::submit_transaction(self, bytes) {
-            Ok(hash) => Ok(hash),
-            Err(InsertError::Duplicate) => Err(RpcSubmitError::Duplicate),
-            Err(InsertError::CapacityExceeded) => Err(RpcSubmitError::Full),
-            Err(InsertError::TooLarge) => Err(RpcSubmitError::Rejected {
-                reason: "transaction exceeds mempool entry size limit".to_owned(),
-            }),
-            Err(InsertError::RejectedByValidator) => Err(RpcSubmitError::Rejected {
-                reason: "runtime admission check rejected transaction".to_owned(),
-            }),
-        }
-    }
-
-    async fn runtime_call(
-        &self,
-        method: String,
-        args: Vec<u8>,
-        at: &BlockId,
-    ) -> Result<RuntimeCallResponse, RuntimeCallError> {
-        // Queries use the live head trie. Historical state queries
-        // require reconstruction from persisted nodes; see `storage_at`
-        // for the matching limitation.
-        // `Finalized` falls through to `Latest` because the engine
-        // commits state inline today — the same fallback used by
-        // `storage_at`.
-        match at {
-            BlockId::Latest | BlockId::Finalized => {}
-            BlockId::Hash(_) | BlockId::Height(_) => {
-                return Err(RuntimeCallError::HistoricalStateNotSupported);
-            }
-        }
-
-        let Some(executor) = self.block_executor_snapshot() else {
-            return Err(RuntimeCallError::RuntimeNotConfigured);
-        };
-
-        // Clone the trie inside the engine lock so the runtime call
-        // observes a consistent snapshot of state. The clone itself
-        // is a BTreeMap copy — heavier than `storage_at` but on the
-        // same order of magnitude as a single block dry-run.
-        let state_snapshot = self.with_engine(|engine| engine.state().clone());
-
-        // Wasmtime's `query` path is sync; run it off the async
-        // executor so the RPC reactor thread is not blocked while
-        // the runtime evaluates. This mirrors how `producer.rs`
-        // wraps `prove_block` calls.
-        let request = neutrino_runtime_abi::QueryRequest { method, args };
-        let response =
-            tokio::task::spawn_blocking(move || executor.query(&request, &state_snapshot))
-                .await
-                .map_err(|err| RuntimeCallError::Runtime(format!("query join error: {err}")))?
-                .map_err(RuntimeCallError::Runtime)?;
-
-        Ok(RuntimeCallResponse {
-            code: response.code,
-            payload: response.payload,
-            gas_used: 0,
-        })
     }
 }

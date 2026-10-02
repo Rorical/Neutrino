@@ -29,7 +29,7 @@
 /// methods directly without consulting this enum.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RpcNamespace {
-    /// `chain_*` — block + checkpoint queries.
+    /// `chain_*` — blocks and proof-finalized chunk boundaries.
     Chain,
     /// `system_*` — chain id, health, runtime identity.
     System,
@@ -46,8 +46,8 @@ pub mod server;
 pub mod types;
 
 pub use backend::{
-    BlockId, FinalizedInfo, HeadInfo, RpcBackend, RuntimeCallError, RuntimeCallResponse,
-    SubmitError,
+    BlockId, FinalizedInfo, HeadInfo, QueryError, RpcBackend, RuntimeCallError,
+    RuntimeCallResponse, SubmitError,
 };
 pub use server::{RpcConfig, RpcContext, RpcStartError, build_module, serve};
 pub use types::{

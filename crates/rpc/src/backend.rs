@@ -10,9 +10,7 @@
 
 use async_trait::async_trait;
 use neutrino_consensus_types::{Block, Header};
-use neutrino_primitives::{
-    BlockHash, ChainId, CheckpointIndex, Hash, Height, Slot, StateRoot, Validator,
-};
+use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot, Validator};
 
 /// Identifier referencing a block: the latest, the latest finalized,
 /// an explicit hash, or an explicit height.
@@ -20,7 +18,7 @@ use neutrino_primitives::{
 /// The JSON deserialiser accepts:
 ///
 /// - `"latest"` / omitted — the unfinalised head
-/// - `"finalized"` — the latest checkpointed block
+/// - `"finalized"` — the latest proof-finalized chunk boundary, or genesis
 /// - `"0x..."` hex string — block hash
 /// - decimal-or-`"0x..."` integer — block height
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -49,16 +47,16 @@ pub struct HeadInfo {
     pub state_root: StateRoot,
 }
 
-/// Summary of the latest finalised checkpoint.
+/// Summary of the latest proof-finalized chunk boundary, or trusted genesis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FinalizedInfo {
-    /// Monotone checkpoint index assigned by the engine.
-    pub index: CheckpointIndex,
-    /// Hash of the checkpoint block.
+    /// Latest finalized chunk ID; `None` before the first chunk finalizes.
+    pub chunk_id: Option<ChunkId>,
+    /// Hash of the finalized block.
     pub block_hash: BlockHash,
-    /// Height of the checkpoint block.
+    /// Height of the finalized block.
     pub height: Height,
-    /// Post-execution state root committed at the checkpoint.
+    /// Post-execution state root committed at the finalized boundary.
     pub state_root: StateRoot,
 }
 
@@ -74,16 +72,32 @@ pub struct RuntimeCallResponse {
     pub gas_used: u64,
 }
 
+/// Failure to resolve or read an authenticated RPC view.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum QueryError {
+    /// The requested hash or height is not known locally.
+    #[error("requested block is not known locally")]
+    BlockNotFound,
+    /// The selected block is known but its state data is not retained locally.
+    #[error("state data for the requested block is not available locally")]
+    StateUnavailable,
+    /// The header is retained but the corresponding block body is unavailable.
+    #[error("body for the requested block is not available locally")]
+    BodyUnavailable,
+    /// Local storage failed or contained inconsistent content-addressed data.
+    #[error("RPC storage read failed: {0}")]
+    Storage(String),
+}
+
 /// Failure modes for [`RpcBackend::runtime_call`].
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RuntimeCallError {
     /// The backend has no WASM runtime attached; queries are unavailable.
     #[error("WASM runtime is not configured on this node")]
     RuntimeNotConfigured,
-    /// The caller requested a historical state root, but the backend
-    /// does not yet support reconstructing it.
-    #[error("historical state queries are not yet supported (only latest/finalized)")]
-    HistoricalStateNotSupported,
+    /// The selected block or its authenticated state could not be loaded.
+    #[error(transparent)]
+    Query(#[from] QueryError),
     /// The runtime crashed or trapped during the call.
     #[error("runtime invocation failed: {0}")]
     Runtime(String),
@@ -144,10 +158,10 @@ pub trait RpcBackend: Send + Sync + 'static {
     }
 
     /// Current unfinalised head summary.
-    async fn head(&self) -> HeadInfo;
+    async fn head(&self) -> Result<HeadInfo, QueryError>;
 
-    /// Latest finalized checkpoint summary.
-    async fn finalized(&self) -> FinalizedInfo;
+    /// Latest proof-finalized chunk boundary, or trusted genesis.
+    async fn finalized(&self) -> Result<FinalizedInfo, QueryError>;
 
     /// Active validator set (the one the engine uses for proposer
     /// eligibility and BFT quorum weighting).
@@ -155,32 +169,30 @@ pub trait RpcBackend: Send + Sync + 'static {
 
     /// Resolve a [`BlockId`] to a block hash, or `None` if the
     /// requested block is not known.
-    async fn resolve_block_id(&self, id: &BlockId) -> Option<BlockHash>;
+    async fn resolve_block_id(&self, id: &BlockId) -> Result<Option<BlockHash>, QueryError>;
 
     /// Fetch a header by block hash. `None` if the hash is unknown.
-    async fn header_by_hash(&self, hash: BlockHash) -> Option<Header>;
+    async fn header_by_hash(&self, hash: BlockHash) -> Result<Option<Header>, QueryError>;
 
-    /// Fetch a header by height. `None` if the height is above the
-    /// local head or not yet imported.
-    async fn header_by_height(&self, height: Height) -> Option<Header>;
+    /// Fetch a header from the selected head's ancestry by height.
+    /// `None` if above the local head or no header is stored (trusted genesis).
+    async fn header_by_height(&self, height: Height) -> Result<Option<Header>, QueryError>;
 
     /// Fetch a full block (header + body) by hash.
-    async fn block_by_hash(&self, hash: BlockHash) -> Option<Block>;
+    async fn block_by_hash(&self, hash: BlockHash) -> Result<Option<Block>, QueryError>;
 
-    /// Fetch a full block (header + body) by height.
-    async fn block_by_height(&self, height: Height) -> Option<Block>;
+    /// Fetch a full block from the selected head's ancestry by height.
+    async fn block_by_height(&self, height: Height) -> Result<Option<Block>, QueryError>;
 
-    /// Read a raw storage value at `key`. Only `BlockId::Latest` and
-    /// `BlockId::Finalized` are supported; historical lookups
-    /// return `None`.
-    async fn storage_at(&self, key: &[u8], at: &BlockId) -> Option<Vec<u8>>;
+    /// Read a raw value from the selected block's state. `None` means
+    /// authenticated key absence; unavailable blocks/state return an error.
+    async fn storage_at(&self, key: &[u8], at: &BlockId) -> Result<Option<Vec<u8>>, QueryError>;
 
     /// Submit a raw transaction to the local mempool.
     async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, SubmitError>;
 
     /// Invoke the runtime's read-only query entrypoint. `at` selects
-    /// the state root the query observes; only the
-    /// `Latest` and `Finalized` block ids are supported.
+    /// the immutable state root the query observes, including retained history.
     async fn runtime_call(
         &self,
         method: String,

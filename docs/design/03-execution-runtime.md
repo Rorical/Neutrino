@@ -27,3 +27,11 @@ Guest also authenticates the header projection used by chunk aggregation.
 `WasmExecutor` captures the witness and applies writes to the live trie. Block
 proving requires a persisted witness. Exact evidence receipts are verified before
 host execution and again by the block Guest using the same pinned verifier.
+
+RPC `runtime_call` resolves `latest`, `finalized`, a hash or a height to a
+specific block and reads its committed state root. `finalized` means the latest
+verified chunk boundary, or trusted genesis before any chunk finalizes. Retained
+historical state is reconstructed and authenticated before invoking the installed
+WASM runtime. Missing blocks or state return explicit errors; queries never fall
+back to the live head. Runtime upgrades and historical runtime-code selection
+remain outside the current pinned-runtime protocol.

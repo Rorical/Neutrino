@@ -283,3 +283,317 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
         assert_eq!(engine.store().evidence_artifacts().unwrap(), vec![artifact]);
     });
 }
+
+fn ready_prover() -> NativeConsensusBackend {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(true).unwrap();
+    NativeConsensusBackend {
+        decisions: Mutex::new(receiver),
+        attempts: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+async fn assert_account_view(
+    backend: &ChainBackend<MemoryDatabase, NativeConsensusBackend>,
+    at: &neutrino_rpc::BlockId,
+    address: [u8; 32],
+    expected: Option<neutrino_default_runtime_core::Account>,
+) {
+    use neutrino_rpc::RpcBackend;
+    let raw = backend
+        .storage_at(&neutrino_default_runtime_core::account_key(&address), at)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw,
+        expected
+            .as_ref()
+            .map(neutrino_default_runtime_core::encode_account)
+    );
+    let response = backend
+        .runtime_call(
+            neutrino_default_runtime_core::QUERY_METHOD_ACCOUNT_GET.to_owned(),
+            address.to_vec(),
+            at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.code,
+        neutrino_runtime_abi::QueryStatus::Ok.as_u32()
+    );
+    let actual: Option<neutrino_default_runtime_core::Account> =
+        borsh::from_slice(&response.payload).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One finality boundary, subsequent execution, forks and restart.
+async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use neutrino_consensus_types::{Block, Body};
+    use neutrino_default_runtime_core::{
+        Account, Transaction, TransferTx, account_key, encode_account, transfer_sig_message,
+    };
+    use neutrino_primitives::{DOMAIN_PROPOSER_SIG, ZERO_HASH};
+    use neutrino_rpc::{BlockId, QueryError, RpcBackend, RuntimeCallError};
+    use neutrino_runtime_core::host::LiveTrie;
+    use neutrino_runtime_host::WasmExecutor;
+    use neutrino_storage::{Column, Database};
+    use neutrino_trie::{Hasher, Poseidon2Hasher};
+
+    let sender_key = SigningKey::from_bytes(&[19; 32]);
+    let sender = sender_key.verifying_key().to_bytes();
+    let recipient = [20; 32];
+    let initial = Account {
+        nonce: 0,
+        balance: 1_000_000,
+    };
+    let mut live = LiveTrie::default();
+    live.insert(&account_key(&sender), encode_account(&initial));
+    let (witness, _, _) = support::fixture_with_live(
+        [1; 8],
+        neutrino_runtime_host::default_runtime_code_hash(),
+        vec![],
+        30_000_000,
+        &live,
+    );
+    let spec = witness.chain_spec.clone();
+    let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
+    engine.replace_state_with_reconstructed(live.trie().clone());
+    engine.flush_trie_to_store().unwrap();
+    let prover = ready_prover();
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let first = &witness.blocks[0];
+    let boundary = first.header.hash();
+    engine
+        .import_block(&Block {
+            header: first.header.clone(),
+            body: Body::default(),
+        })
+        .unwrap();
+    engine
+        .store_mut()
+        .put_block_state(&boundary, BlockState::Proven)
+        .unwrap();
+    engine
+        .store_mut()
+        .put_block_proof(
+            &boundary,
+            &BlockProof {
+                height: 1,
+                block_hash: boundary,
+                public_inputs: first.public_inputs.clone(),
+                proof_bytes: borsh::to_vec(&first.output).unwrap(),
+            },
+        )
+        .unwrap();
+    engine.finalize_chunk(0, &prover, &voter).unwrap();
+    assert_eq!(
+        engine.latest_checkpoint_index(),
+        0,
+        "checkpoint index is independent of chunk finality"
+    );
+    let backend = Arc::new(ChainBackend::new(engine, prover));
+    let executor = tokio::task::spawn_blocking(WasmExecutor::default_runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    backend.set_block_executor(executor);
+    let finalized = backend.finalized().await.unwrap();
+    assert_eq!(finalized.chunk_id, Some(0));
+    assert_eq!(finalized.block_hash, boundary);
+    assert_eq!(finalized.height, 1);
+    assert_eq!(finalized.state_root, spec.genesis_state_root);
+
+    let mut transfer = TransferTx {
+        from: sender,
+        to: recipient,
+        amount: 100,
+        nonce: 0,
+        signature: [0; 64],
+    };
+    transfer.signature = sender_key
+        .sign(&transfer_sig_message(spec.chain_id, &transfer))
+        .to_bytes();
+    let tx = borsh::to_vec(&Transaction::Transfer(transfer)).unwrap();
+    backend.submit_transaction(tx).unwrap();
+    let producer = Arc::clone(&backend);
+    let second = tokio::task::spawn_blocking(move || {
+        producer
+            .try_produce_block(2, &voter)
+            .unwrap()
+            .unwrap()
+            .block
+    })
+    .await
+    .unwrap();
+    assert_ne!(second.header.state_root, finalized.state_root);
+    assert_eq!(backend.finalized().await.unwrap(), finalized);
+    assert_eq!(backend.head().await.unwrap().hash, second.hash());
+    let paid = Account {
+        nonce: 0,
+        balance: 100,
+    };
+    for at in [
+        BlockId::Latest,
+        BlockId::Hash(second.hash()),
+        BlockId::Height(2),
+    ] {
+        assert_account_view(&backend, &at, recipient, Some(paid)).await;
+    }
+    for at in [
+        BlockId::Finalized,
+        BlockId::Hash(boundary),
+        BlockId::Height(1),
+        BlockId::Height(0),
+        BlockId::Hash(spec.genesis_block_hash),
+    ] {
+        assert_account_view(&backend, &at, recipient, None).await;
+        assert_account_view(&backend, &at, sender, Some(initial)).await;
+    }
+    assert_eq!(
+        backend.resolve_block_id(&BlockId::Finalized).await.unwrap(),
+        Some(boundary)
+    );
+
+    // A later imported sibling overwrites the store's height index. RPC height
+    // selection must still follow the materialized chain; its hash remains queryable.
+    let mut sibling = Block {
+        header: second.header.clone(),
+        body: Body::default(),
+    };
+    neutrino_consensus_engine::apply_body_roots(
+        &mut sibling.header,
+        &neutrino_consensus_engine::compute_body_roots(&sibling.body),
+    );
+    sibling.header.state_root = finalized.state_root;
+    sibling.header.gas_used = 0;
+    sibling.header.receipts_root = first.header.receipts_root;
+    sibling.header.runtime_extra = first.header.runtime_extra;
+    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
+    message.extend_from_slice(&spec.chain_id.to_le_bytes());
+    message.extend_from_slice(&sibling.hash());
+    sibling.header.signature = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[])
+        .unwrap()
+        .sign(&message)
+        .to_bytes();
+    backend.with_engine_mut_for_test(|engine| {
+        engine.import_block(&sibling).unwrap();
+        assert_eq!(
+            engine.store().get_block_hash_by_height(2).unwrap(),
+            Some(sibling.hash())
+        );
+        assert_eq!(engine.head_hash(), second.hash());
+    });
+    assert_eq!(
+        backend.header_by_height(2).await.unwrap(),
+        Some(second.header.clone())
+    );
+    assert_eq!(
+        backend.block_by_height(2).await.unwrap(),
+        Some(second.clone())
+    );
+    assert_account_view(&backend, &BlockId::Height(2), recipient, Some(paid)).await;
+    assert_account_view(&backend, &BlockId::Hash(sibling.hash()), recipient, None).await;
+
+    let database = backend.with_engine_mut_for_test(|engine| engine.store().db().clone());
+    let reopened = ChainBackend::new(Engine::open(spec, database).unwrap(), ready_prover());
+    let executor = tokio::task::spawn_blocking(WasmExecutor::default_runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    reopened.set_block_executor(executor);
+    assert_eq!(reopened.finalized().await.unwrap(), finalized);
+    assert_account_view(&reopened, &BlockId::Finalized, recipient, None).await;
+    assert_account_view(&reopened, &BlockId::Height(2), recipient, Some(paid)).await;
+    assert_eq!(
+        reopened
+            .storage_at(b"missing", &BlockId::Hash(ZERO_HASH))
+            .await,
+        Err(QueryError::BlockNotFound)
+    );
+
+    reopened.with_engine_mut_for_test(|engine| {
+        engine
+            .store_mut()
+            .put_body(&second.hash(), &Body::default())
+            .unwrap();
+    });
+    assert!(matches!(
+        reopened.block_by_hash(second.hash()).await,
+        Err(QueryError::Storage(_))
+    ));
+
+    reopened.with_engine_mut_for_test(|engine| {
+        engine
+            .store_mut()
+            .db_mut()
+            .delete(Column::Blocks, &second.hash())
+            .unwrap();
+        engine
+            .store_mut()
+            .db_mut()
+            .delete(Column::TrieNodes, &second.header.state_root)
+            .unwrap();
+    });
+    assert_eq!(
+        reopened.block_by_hash(second.hash()).await,
+        Err(QueryError::BodyUnavailable)
+    );
+    assert_eq!(
+        reopened
+            .storage_at(&account_key(&recipient), &BlockId::Latest)
+            .await,
+        Err(QueryError::StateUnavailable)
+    );
+    assert_eq!(
+        reopened
+            .runtime_call(
+                "account_get".to_owned(),
+                recipient.to_vec(),
+                &BlockId::Latest
+            )
+            .await,
+        Err(RuntimeCallError::Query(QueryError::StateUnavailable))
+    );
+    // Corruption and missing leaf values also fail explicitly, with old roots
+    // still readable rather than falling through to a different state.
+    let value_hash = Poseidon2Hasher::hash_value(&encode_account(&initial));
+    reopened.with_engine_mut_for_test(|engine| {
+        engine
+            .store_mut()
+            .db_mut()
+            .put(Column::StateValues, &value_hash, b"corrupt")
+            .unwrap();
+    });
+    assert!(matches!(
+        reopened.storage_at(b"missing", &BlockId::Finalized).await,
+        Err(QueryError::Storage(_))
+    ));
+    reopened.with_engine_mut_for_test(|engine| {
+        engine
+            .store_mut()
+            .db_mut()
+            .delete(Column::StateValues, &value_hash)
+            .unwrap();
+    });
+    assert_eq!(
+        reopened.storage_at(b"missing", &BlockId::Finalized).await,
+        Err(QueryError::StateUnavailable)
+    );
+    reopened.with_engine_mut_for_test(|engine| {
+        for hash in [second.hash(), boundary] {
+            engine
+                .store_mut()
+                .db_mut()
+                .delete(Column::Headers, &hash)
+                .unwrap();
+        }
+    });
+    assert!(matches!(reopened.head().await, Err(QueryError::Storage(_))));
+    assert!(matches!(
+        reopened.finalized().await,
+        Err(QueryError::Storage(_))
+    ));
+}

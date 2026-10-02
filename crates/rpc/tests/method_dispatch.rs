@@ -12,7 +12,7 @@ use jsonrpsee::server::RpcModule;
 use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_primitives::{BlockHash, ChainId, Hash, Height, Slot, Validator};
 use neutrino_rpc::{
-    BlockId, FinalizedInfo, HeadInfo, RpcBackend, RpcContext, RuntimeCallError,
+    BlockId, FinalizedInfo, HeadInfo, QueryError, RpcBackend, RpcContext, RuntimeCallError,
     RuntimeCallResponse, SubmitError, build_module,
 };
 use serde_json::{Value, json};
@@ -44,6 +44,7 @@ struct MockBackend {
     head_hash: BlockHash,
     runtime_attached: bool,
     runtime_call_response: RuntimeCallResponse,
+    query_error: Option<QueryError>,
 }
 
 impl Default for MockBackend {
@@ -52,6 +53,7 @@ impl Default for MockBackend {
             chain_id: 7,
             head_hash: [0xAA; 32],
             runtime_attached: true,
+            query_error: None,
             runtime_call_response: RuntimeCallResponse {
                 code: 0,
                 payload: vec![1, 2, 3, 4],
@@ -79,21 +81,27 @@ impl RpcBackend for MockBackend {
     fn mempool_len(&self) -> usize {
         3
     }
-    async fn head(&self) -> HeadInfo {
-        HeadInfo {
+    async fn head(&self) -> Result<HeadInfo, QueryError> {
+        if let Some(error) = &self.query_error {
+            return Err(error.clone());
+        }
+        Ok(HeadInfo {
             height: 42,
             hash: self.head_hash,
             slot: 42,
             state_root: [0xBB; 32],
-        }
+        })
     }
-    async fn finalized(&self) -> FinalizedInfo {
-        FinalizedInfo {
-            index: 1,
+    async fn finalized(&self) -> Result<FinalizedInfo, QueryError> {
+        if let Some(error) = &self.query_error {
+            return Err(error.clone());
+        }
+        Ok(FinalizedInfo {
+            chunk_id: Some(0),
             block_hash: [0xCC; 32],
             height: 8,
             state_root: [0xDD; 32],
-        }
+        })
     }
     async fn active_validator_set(&self) -> Vec<Validator> {
         vec![Validator {
@@ -106,55 +114,61 @@ impl RpcBackend for MockBackend {
             last_active_chunk: 0,
         }]
     }
-    async fn resolve_block_id(&self, id: &BlockId) -> Option<BlockHash> {
-        match id {
+    async fn resolve_block_id(&self, id: &BlockId) -> Result<Option<BlockHash>, QueryError> {
+        if let Some(error) = &self.query_error {
+            return Err(error.clone());
+        }
+        Ok(match id {
             BlockId::Latest => Some(self.head_hash),
             BlockId::Finalized => Some([0xCC; 32]),
             BlockId::Hash(h) => Some(*h),
             BlockId::Height(h) if *h == 42 => Some(self.head_hash),
             BlockId::Height(_) => None,
-        }
+        })
     }
-    async fn header_by_hash(&self, hash: BlockHash) -> Option<Header> {
-        if hash == self.head_hash {
+    async fn header_by_hash(&self, hash: BlockHash) -> Result<Option<Header>, QueryError> {
+        Ok(if hash == self.head_hash {
             Some(sample_header(42, hash))
         } else {
             None
-        }
+        })
     }
-    async fn header_by_height(&self, height: Height) -> Option<Header> {
-        if height == 42 {
+    async fn header_by_height(&self, height: Height) -> Result<Option<Header>, QueryError> {
+        Ok(if height == 42 {
             Some(sample_header(42, self.head_hash))
         } else {
             None
-        }
+        })
     }
-    async fn block_by_hash(&self, hash: BlockHash) -> Option<Block> {
-        if hash == self.head_hash {
+    async fn block_by_hash(&self, hash: BlockHash) -> Result<Option<Block>, QueryError> {
+        Ok(if hash == self.head_hash {
             Some(Block {
                 header: sample_header(42, hash),
                 body: Body::default(),
             })
         } else {
             None
-        }
+        })
     }
-    async fn block_by_height(&self, height: Height) -> Option<Block> {
-        if height == 42 {
+    async fn block_by_height(&self, height: Height) -> Result<Option<Block>, QueryError> {
+        Ok(if height == 42 {
             Some(Block {
                 header: sample_header(42, self.head_hash),
                 body: Body::default(),
             })
         } else {
             None
-        }
+        })
     }
-    async fn storage_at(&self, key: &[u8], _at: &BlockId) -> Option<Vec<u8>> {
-        if key == b"present" {
+    async fn storage_at(&self, key: &[u8], _at: &BlockId) -> Result<Option<Vec<u8>>, QueryError> {
+        if let Some(error) = &self.query_error {
+            return Err(error.clone());
+        }
+        Ok(if key == b"present" {
             Some(b"hello".to_vec())
         } else {
             None
-        }
+        })
     }
     async fn submit_transaction(&self, _bytes: Vec<u8>) -> Result<Hash, SubmitError> {
         Ok([0x42; 32])
@@ -165,6 +179,9 @@ impl RpcBackend for MockBackend {
         _args: Vec<u8>,
         _at: &BlockId,
     ) -> Result<RuntimeCallResponse, RuntimeCallError> {
+        if let Some(error) = &self.query_error {
+            return Err(error.clone().into());
+        }
         if self.runtime_attached {
             Ok(self.runtime_call_response.clone())
         } else {
@@ -362,4 +379,47 @@ async fn runtime_call_errors_when_runtime_not_configured() {
     .expect_err("expected error");
     let msg = err["message"].as_str().unwrap_or("");
     assert!(msg.contains("runtime"), "unexpected error payload: {msg}");
+}
+
+#[tokio::test]
+async fn finalized_summary_identifies_the_chunk_boundary() {
+    let module = build_module(Arc::new(MockBackend::default())).unwrap();
+    let result: Value = module.call("chain_finalized", [(); 0]).await.unwrap();
+    assert_eq!(result["chunk_id"], 0);
+    assert_eq!(result["height"], 8);
+    assert!(result.get("index").is_none());
+}
+
+#[tokio::test]
+async fn unavailable_data_is_an_error_instead_of_a_null_result() {
+    for (error, code) in [
+        (QueryError::BlockNotFound, -32020),
+        (QueryError::StateUnavailable, -32021),
+        (QueryError::Storage("disk read failed".to_owned()), -32022),
+        (QueryError::BodyUnavailable, -32023),
+    ] {
+        let module = build_module(Arc::new(MockBackend {
+            query_error: Some(error),
+            ..MockBackend::default()
+        }))
+        .unwrap();
+        for (method, params) in [
+            (
+                "state_getStorage",
+                json!({"key": "0x00", "at": "finalized"}),
+            ),
+            (
+                "runtime_call",
+                json!({"method": "account_get", "at": "finalized"}),
+            ),
+            ("chain_getHeader", json!(["latest"])),
+            ("chain_getBlock", json!(["latest"])),
+            ("chain_head", json!([])),
+            ("chain_finalized", json!([])),
+            ("system_health", json!([])),
+        ] {
+            let error = call_named(&module, method, params).await.expect_err(method);
+            assert_eq!(error["code"], code);
+        }
+    }
 }

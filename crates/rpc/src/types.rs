@@ -212,8 +212,8 @@ impl From<HeadInfo> for HeadInfoJson {
 /// JSON shape returned by `chain_finalized`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FinalizedInfoJson {
-    /// Checkpoint index.
-    pub index: u64,
+    /// Finalized chunk ID, or `None` at genesis.
+    pub chunk_id: Option<u64>,
     /// Finalized block hash.
     pub block_hash: HashHex,
     /// Finalized block height.
@@ -225,7 +225,7 @@ pub struct FinalizedInfoJson {
 impl From<FinalizedInfo> for FinalizedInfoJson {
     fn from(f: FinalizedInfo) -> Self {
         Self {
-            index: f.index,
+            chunk_id: f.chunk_id,
             block_hash: HashHex(f.block_hash),
             height: f.height,
             state_root: HashHex(f.state_root),

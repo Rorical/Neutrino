@@ -10,9 +10,8 @@
 //!
 //! - Inputs are validated up front; invalid params return JSON-RPC
 //!   error code `-32602`.
-//! - Backend errors are surfaced as `-32000` (server error) with a
-//!   human-readable message; details are also tagged on the
-//!   `data` field for clients that want to discriminate.
+//! - Backend errors use distinct server error codes for block lookup,
+//!   unavailable data, storage, runtime invocation, and transaction admission.
 //! - The methods listed in `docs/design/08-crate-layout.md` for the
 //!   `rpc` crate are all implemented.
 
@@ -22,7 +21,7 @@ use std::sync::Arc;
 use jsonrpsee::server::{RpcModule, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 
-use crate::backend::{BlockId, RpcBackend, RuntimeCallError, SubmitError};
+use crate::backend::{BlockId, QueryError, RpcBackend, RuntimeCallError, SubmitError};
 use crate::types::{
     BlockIdJson, BlockJson, BytesHex, FinalizedInfoJson, HashHex, HeadInfoJson, HeaderJson,
     HealthJson, RuntimeCallResultJson, SubmitResultJson, SystemInfoJson, ValidatorJson,
@@ -122,7 +121,11 @@ fn register_system_methods(module: &mut RpcModule<RpcContext>) -> Result<(), Rpc
 
     module
         .register_async_method("system_health", |_, ctx, _| async move {
-            let head = ctx.backend().head().await;
+            let head = ctx
+                .backend()
+                .head()
+                .await
+                .map_err(|error| query_err(&error))?;
             Ok::<_, ErrorObjectOwned>(HealthJson {
                 peers: ctx.backend().peer_count(),
                 is_syncing: ctx.backend().is_syncing(),
@@ -147,14 +150,22 @@ fn register_system_methods(module: &mut RpcModule<RpcContext>) -> Result<(), Rpc
 fn register_chain_methods(module: &mut RpcModule<RpcContext>) -> Result<(), RpcStartError> {
     module
         .register_async_method("chain_head", |_, ctx, _| async move {
-            let head = ctx.backend().head().await;
+            let head = ctx
+                .backend()
+                .head()
+                .await
+                .map_err(|error| query_err(&error))?;
             Ok::<_, ErrorObjectOwned>(HeadInfoJson::from(head))
         })
         .map_err(reg_err)?;
 
     module
         .register_async_method("chain_finalized", |_, ctx, _| async move {
-            let fin = ctx.backend().finalized().await;
+            let fin = ctx
+                .backend()
+                .finalized()
+                .await
+                .map_err(|error| query_err(&error))?;
             Ok::<_, ErrorObjectOwned>(FinalizedInfoJson::from(fin))
         })
         .map_err(reg_err)?;
@@ -169,6 +180,7 @@ fn register_chain_methods(module: &mut RpcModule<RpcContext>) -> Result<(), RpcS
                 ctx.backend()
                     .header_by_hash(hash)
                     .await
+                    .map_err(|error| query_err(&error))?
                     .map(|h| HeaderJson::from(&h)),
             )
         })
@@ -184,6 +196,7 @@ fn register_chain_methods(module: &mut RpcModule<RpcContext>) -> Result<(), RpcS
                 ctx.backend()
                     .block_by_hash(hash)
                     .await
+                    .map_err(|error| query_err(&error))?
                     .map(|b| BlockJson::from(&b)),
             )
         })
@@ -214,7 +227,11 @@ fn register_state_methods(module: &mut RpcModule<RpcContext>) -> Result<(), RpcS
                 at: BlockIdJson,
             }
             let p: StorageParams = params.parse().map_err(invalid_params)?;
-            let value = ctx.backend().storage_at(&p.key.0, &p.at.0).await;
+            let value = ctx
+                .backend()
+                .storage_at(&p.key.0, &p.at.0)
+                .await
+                .map_err(|error| query_err(&error))?;
             Ok::<_, ErrorObjectOwned>(value.map(BytesHex::from))
         })
         .map_err(reg_err)?;
@@ -284,7 +301,10 @@ fn register_runtime_methods(module: &mut RpcModule<RpcContext>) -> Result<(), Rp
 
 /// Resolve a [`BlockId`] to a block hash by asking the backend.
 async fn resolve(ctx: &RpcContext, at: &BlockId) -> Result<Option<[u8; 32]>, ErrorObjectOwned> {
-    Ok(ctx.backend().resolve_block_id(at).await)
+    ctx.backend()
+        .resolve_block_id(at)
+        .await
+        .map_err(|error| query_err(&error))
 }
 
 /// Parse the optional `BlockIdJson` parameter; default to `Latest`.
@@ -330,9 +350,19 @@ fn submit_err(err: &SubmitError) -> ErrorObjectOwned {
 fn runtime_err(err: &RuntimeCallError) -> ErrorObjectOwned {
     let code = match err {
         RuntimeCallError::RuntimeNotConfigured => -32010,
-        RuntimeCallError::HistoricalStateNotSupported => -32011,
+        RuntimeCallError::Query(error) => return query_err(error),
         RuntimeCallError::Runtime(_) => -32012,
         RuntimeCallError::Decode(_) => -32013,
+    };
+    ErrorObjectOwned::owned(code, err.to_string(), None::<()>)
+}
+
+fn query_err(err: &QueryError) -> ErrorObjectOwned {
+    let code = match err {
+        QueryError::BlockNotFound => -32020,
+        QueryError::StateUnavailable => -32021,
+        QueryError::Storage(_) => -32022,
+        QueryError::BodyUnavailable => -32023,
     };
     ErrorObjectOwned::owned(code, err.to_string(), None::<()>)
 }

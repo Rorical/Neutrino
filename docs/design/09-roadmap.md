@@ -4,6 +4,8 @@ Implemented: shared WASM/SP1 execution, authenticated witnesses, block Compresse
 STARK proofs, complete chunk consensus Guest, mandatory BFT attestations,
 EvidenceProof admission and deterministic sanction execution, proof-gated validator
 rotation, follower replay, gossip/RPC backfill and restart state restoration.
+RPC finality follows verified chunks, and state/runtime queries authenticate the
+selected block's retained state, including history and side branches by hash.
 
 Acceptance remains distinct from implementation. Workspace build/tests/Clippy/fmt
 must pass after any protocol change. Real EvidenceProof → block → chunk compressed

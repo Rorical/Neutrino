@@ -331,7 +331,7 @@ async fn follower_can_produce_after_importing_state_mutating_block() {
 
     // v0 produces slot 1 (state advances on v0).
     let block_s1 = produce_block(Arc::clone(&backend_v0), v0.clone(), 1).await;
-    assert!(!block_s1.body.transactions.is_empty());
+    assert_ne!(block_s1.body.transactions, [] as [std::vec::Vec<u8>; 0]);
 
     // v1 imports. Without #11, v1's trie stays at genesis here.
     backend_v1

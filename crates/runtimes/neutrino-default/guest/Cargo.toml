@@ -6,6 +6,7 @@
 name        = "neutrino-default-runtime-guest"
 version     = "0.1.0"
 edition     = "2024"
+rust-version = "1.96"
 publish     = false
 description = "SP1 Guest binary for the Neutrino default runtime."
 
@@ -14,16 +15,17 @@ name = "neutrino-default-runtime-guest"
 path = "src/main.rs"
 
 [dependencies]
-sp1-zkvm                       = { version = "=6.2.1", features = ["verify"] }
-sha2                           = { version = "0.10", default-features = false }
-borsh                          = { version = "1.5", default-features = false, features = ["derive"] }
+sp1-zkvm                       = { version = "=6.8.1", features = ["verify"] }
+sha2                           = { version = "0.11.0", default-features = false }
+borsh                          = { version = "1.8.1", default-features = false, features = ["derive"] }
 neutrino-default-runtime-core  = { path = "../core", default-features = false }
 neutrino-runtime-core          = { path = "../../../runtime-core", default-features = false }
 neutrino-runtime-abi           = { path = "../../../runtime-abi", default-features = false }
 
 [profile.release]
 opt-level     = 3
-lto           = "thin"
+# SP1's bundled standard library requires its default non-LTO link mode.
+lto           = false
 codegen-units = 1
 debug         = false
 panic         = "abort"

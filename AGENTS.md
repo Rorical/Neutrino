@@ -7,7 +7,7 @@ Compact notes for coding agents. Before runtime/proof edits read `README.md`,
 
 ## Environment
 
-- Rust toolchain is pinned by `rust-toolchain.toml` to **1.95.0**. Do not
+- Rust toolchain is pinned by `rust-toolchain.toml` to **1.99.0**. Do not
   `rustup default` anything else.
 - Workspace uses `edition = "2024"` and `resolver = "3"`. Edition 2024
   reserves `gen` as a keyword, so use names such as `gen_sk()` in tests.
@@ -17,8 +17,8 @@ Compact notes for coding agents. Before runtime/proof edits read `README.md`,
   toolchain and `cargo-prove` must be installed via `sp1up` before any
   `cargo build --locked`. `runtime-host`'s build script unconditionally
   compiles the default-runtime guest ELF and embeds it; there is no
-  feature flag to disable this. Pinned SP1 version: **6.2.1**.
-  Install with: `curl -fsSL https://sp1up.succinct.xyz | bash && sp1up`.
+  feature flag to disable this. Pinned SP1 version: **6.8.1**.
+  Install with: `curl -fsSL https://sp1up.succinct.xyz | bash && "$HOME/.sp1/bin/sp1up" --version 6.8.1`.
 
 ## Build, test, lint
 

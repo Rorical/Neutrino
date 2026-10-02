@@ -2961,7 +2961,7 @@ mod tests {
         assert_eq!(validator_after.stake, 0);
         assert!(!validator_after.active);
         let queue_after = read_withdrawal_queue(&post, &addr);
-        assert!(queue_after.entries.is_empty());
+        assert_eq!(queue_after.entries, [] as [Withdrawal; 0]);
         // Queue key must be deleted (not left as an empty queue)
         // so the trie footprint stays minimal.
         assert!(post.get(&withdrawal_key(&addr)).is_none());

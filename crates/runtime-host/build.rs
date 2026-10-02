@@ -52,6 +52,11 @@ fn main() {
         // confuse the wasm build.
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
+        // Clippy's workspace wrapper changes Cargo's crate metadata and
+        // therefore the embedded runtime's code hash. Build the same master
+        // artifact during ordinary builds and host lint checks.
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CLIPPY_ARGS")
         .status()
         .expect("spawn cargo for wasm32 build");
 

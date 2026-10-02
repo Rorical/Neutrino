@@ -26,7 +26,6 @@
 //! umbrella [`RpcRequest`] and [`RpcResponse`] enums exist only at the
 //! crate-internal command/event boundary; they are never serialized to the wire.
 
-use async_trait::async_trait;
 use borsh::{BorshDeserialize, BorshSerialize};
 use core::marker::PhantomData;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -644,7 +643,6 @@ impl<Req, Resp> BorshCodec<Req, Resp> {
     }
 }
 
-#[async_trait]
 impl<Req, Resp> request_response::Codec for BorshCodec<Req, Resp>
 where
     Req: BorshSerialize + BorshDeserialize + Send + 'static,

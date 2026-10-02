@@ -3,7 +3,7 @@
 # Multi-stage Dockerfile for the `neutrino-node` binary.
 #
 # Stage 1: builder pinned to the same toolchain CI uses
-# (rust-toolchain.toml -> 1.95.0). We compile `neutrino-node` with
+# (rust-toolchain.toml -> 1.99.0). We compile `neutrino-node` with
 # `--locked --release`, then copy the binary into a slim runtime stage.
 #
 # Stage 2: minimal Debian-slim runtime — libp2p QUIC + RocksDB need
@@ -11,7 +11,7 @@
 # static. We expose a single 30303/tcp port by convention; tests can
 # remap as needed.
 
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.99.0
 
 # --- builder ------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
@@ -28,11 +28,12 @@ RUN apt-get update \
         libclang-dev \
         libssl-dev \
         pkg-config \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.sp1/bin:${PATH}"
 RUN curl -fsSL https://sp1up.succinct.xyz | bash \
-    && /root/.sp1/bin/sp1up --version 6.2.1 \
+    && /root/.sp1/bin/sp1up --version 6.8.1 \
     && rustup target add wasm32-unknown-unknown
 
 WORKDIR /src

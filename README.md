@@ -60,6 +60,10 @@ maintained. Checkpoint recursion remains unimplemented.
 
 ## Prerequisites
 
+The host toolchain is Rust `1.99.0`, pinned in `rust-toolchain.toml`.
+Linux builds also require `protobuf-compiler` and `libclang-dev` for the
+networking and RocksDB dependencies.
+
 Neutrino has a **hard dependency on the SP1 zkVM toolchain**. Before any
 `cargo build --locked` you must install `sp1up`, which provisions the
 `succinct` rustup toolchain and the `cargo-prove` CLI used to compile the
@@ -67,10 +71,11 @@ runtime guest ELF.
 
 ```text
 curl -fsSL https://sp1up.succinct.xyz | bash
-sp1up
+export PATH="$HOME/.sp1/bin:$PATH"
+sp1up --version 6.8.1
 ```
 
-Pinned SP1 version: `6.2.1`.
+Pinned SP1 version: `6.8.1`.
 
 ## Building
 

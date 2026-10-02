@@ -185,7 +185,7 @@ impl SlashingPool {
         SlashingInsert::Inserted { key, evicted_key }
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.evidence.len()
     }
 
@@ -1047,7 +1047,7 @@ where
     /// modular check against the chain spec's `chunk_size`.
     pub async fn maybe_open_bft_session_for_height(&self, height: Height) {
         let chunk_size = self.chunk_size().max(1);
-        if height == 0 || height % chunk_size != 0 {
+        if height == 0 || !height.is_multiple_of(chunk_size) {
             return;
         }
         let chunk_id = (height - 1) / chunk_size;
@@ -1824,14 +1824,14 @@ where
         // confirm the carried proof actually fails our backend's
         // `verify_block`. If it succeeds, the emitter was wrong
         // (or malicious) about the rejection — drop the evidence.
-        if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence {
-            if !self.block_proof_objectively_rejected(rejected_proof) {
-                debug!(
-                    block_hash = ?rejected_proof.block_hash,
-                    "rejected InvalidProofSigning evidence: objective rejection not established",
-                );
-                return;
-            }
+        if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence
+            && !self.block_proof_objectively_rejected(rejected_proof)
+        {
+            debug!(
+                block_hash = ?rejected_proof.block_hash,
+                "rejected InvalidProofSigning evidence: objective rejection not established",
+            );
+            return;
         }
         if self.insert_persistent(&evidence) {
             self.start_evidence_jobs();

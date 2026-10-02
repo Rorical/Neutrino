@@ -1,6 +1,6 @@
 [package]
 name          = "neutrino-default-runtime-core"
-description   = "Default-runtime STF logic. Compiles to native, wasm32-unknown-unknown, and riscv32im-succinct-zkvm-elf."
+description   = "Default-runtime STF logic. Compiles to native, wasm32-unknown-unknown, and riscv64im-succinct-zkvm-elf."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }

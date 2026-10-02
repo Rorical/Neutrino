@@ -9,7 +9,7 @@
 #
 # Scope: `[target.x86_64-unknown-linux-gnu]` applies ONLY when that
 # triple is the compilation target. The SP1 Guest
-# (`riscv32im-succinct-zkvm-elf`, built by `crates/runtime-host/build.rs`
+# (`riscv64im-succinct-zkvm-elf`, built by `crates/runtime-host/build.rs`
 # via `sp1-build`) and the WASM master cdylib (`wasm32-unknown-unknown`)
 # are unaffected — a host-CPU baseline is meaningless for those.
 #

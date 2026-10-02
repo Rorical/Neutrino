@@ -328,7 +328,7 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
             .unwrap()
             .unwrap();
         backend.prove_block(&block.block_hash).unwrap();
-        if block.block.header.height % CHUNK_SIZE == 0 {
+        if block.block.header.height.is_multiple_of(CHUNK_SIZE) {
             backend
                 .finalize_chunk(block.block.header.height / CHUNK_SIZE - 1, &proposer)
                 .unwrap();

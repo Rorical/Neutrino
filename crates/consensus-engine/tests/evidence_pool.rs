@@ -50,7 +50,10 @@ fn verified_pool_survives_restart_preserves_first_receipt_and_expires_at_finalit
     restarted.prune_evidence_artifacts(10, 10, &[]).unwrap();
     assert_eq!(restarted.evidence_artifacts().unwrap(), vec![original]);
     restarted.prune_evidence_artifacts(11, 10, &[]).unwrap();
-    assert!(restarted.evidence_artifacts().unwrap().is_empty());
+    assert_eq!(
+        restarted.evidence_artifacts().unwrap(),
+        [] as [EvidenceArtifact; 0]
+    );
 }
 
 #[test]
@@ -102,7 +105,10 @@ fn pool_identity_is_scoped_to_program_and_exact_statement() {
     store
         .prune_evidence_artifacts(1, 1024, &[original.statement.offence_id])
         .unwrap();
-    assert!(store.evidence_artifacts().unwrap().is_empty());
+    assert_eq!(
+        store.evidence_artifacts().unwrap(),
+        [] as [EvidenceArtifact; 0]
+    );
 }
 
 #[test]

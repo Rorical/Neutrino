@@ -238,7 +238,7 @@ impl ChunkBft {
 
     /// Number of validators in the active set.
     #[must_use]
-    pub fn active_set_len(&self) -> usize {
+    pub const fn active_set_len(&self) -> usize {
         self.active_set.len()
     }
 

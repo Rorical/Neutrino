@@ -1,8 +1,8 @@
 # 20 — Evidence proofs and mandatory sanctions
 
-Status: implemented. Acceptance must be rerun for the current Guest programs
-and protocol formats. Real compressed composition is a separate gate from
-workspace checks. Checkpoint recursion remains deferred.
+Status: implemented. Workspace checks passed for the current Guest programs
+and protocol formats. Real compressed composition acceptance remains pending
+as a separate gate. Checkpoint recursion remains deferred.
 
 ## Composition
 
@@ -62,10 +62,10 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
 - [x] Chunk consumes proven sanctions without evidence verification.
 - [x] Node generation, persistent pool, gossip, import and restart paths.
 - [x] Adversarial, lifecycle, queue and native/WASM/Guest parity tests.
-- [ ] Current-program locked build, complete workspace tests, strict Clippy and
+- [x] Current-program locked build, complete workspace tests, strict Clippy and
   workspace/Guest format checks.
-- [ ] Real SP1 EvidenceProof → block → chunk composition gate: queued for the
-  current programs, with process-exit subscription and a local completion notification.
+- [ ] Real SP1 EvidenceProof → block → chunk composition gate: local acceptance
+  was cancelled. The upgraded programs require a fresh run on a suitable prover.
 
 Optional early fact compression and batch aggregation are follow-on
 optimizations; individual BFT votes never wait for an SP1 fact proof. The initial

@@ -47,7 +47,7 @@ use blst::{
         Signature as BlstSig,
     },
 };
-use rand_core::{CryptoRng, RngCore};
+use rand_core::CryptoRng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::CryptoError;
@@ -73,7 +73,7 @@ pub struct Signature(BlstSig);
 
 impl SecretKey {
     /// Sample a fresh secret key from a CSPRNG.
-    pub fn generate(rng: &mut (impl CryptoRng + RngCore)) -> Self {
+    pub fn generate(rng: &mut impl CryptoRng) -> Self {
         let mut ikm = [0_u8; 32];
         rng.fill_bytes(&mut ikm);
         let key = Self::key_gen(&ikm, &[]).expect("32-byte CSPRNG IKM is always sufficient");
@@ -289,10 +289,11 @@ impl fmt::Debug for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     fn gen_sk() -> SecretKey {
-        SecretKey::generate(&mut OsRng)
+        SecretKey::generate(&mut UnwrapErr(SysRng))
     }
 
     #[test]

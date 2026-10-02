@@ -285,9 +285,12 @@ fn evidence_block_chunk_real_compressed_recursion() {
     }];
     let mut alternate = attachments[0].clone();
     let mut bundle: sp1_sdk::SP1ProofWithPublicValues =
-        bincode::deserialize(&alternate.proof_bytes).unwrap();
+        neutrino_prover_chunk::receipt_codec::decode::<_, { 2 * 1024 * 1024 }>(
+            &alternate.proof_bytes,
+        )
+        .unwrap();
     bundle.tee_proof = Some(vec![1]);
-    alternate.proof_bytes = bincode::serialize(&bundle).unwrap();
+    alternate.proof_bytes = neutrino_prover_chunk::receipt_codec::encode(&bundle).unwrap();
     assert_eq!(alternate.statement_id(), attachments[0].statement_id());
     assert_ne!(alternate.proof_bytes, attachments[0].proof_bytes);
     neutrino_runtime_host::evidence::verify_input_receipts(&input, &[alternate]).unwrap();

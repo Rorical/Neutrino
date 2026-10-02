@@ -183,7 +183,7 @@ impl HistoryOpening {
                 let Some(sibling) = siblings.next() else {
                     return false;
                 };
-                hash = if position % 2 == 0 {
+                hash = if position.is_multiple_of(2) {
                     pair_hash(hash, *sibling)
                 } else {
                     pair_hash(*sibling, hash)

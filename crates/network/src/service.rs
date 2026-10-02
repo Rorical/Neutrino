@@ -1748,7 +1748,7 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
         .validate_messages();
 
     for topic in Topic::all_default() {
-        builder.set_topic_max_transmit_size(topic.to_ident().hash(), topic.max_transmit_size());
+        builder.max_transmit_size_for_topic(topic.max_transmit_size(), topic.to_ident().hash());
     }
 
     let config = builder
@@ -2010,14 +2010,12 @@ fn parse_topic(s: &str) -> Option<Topic> {
     // Subnet-indexed aggregate vote topics: parse the trailing index.
     let prefix = "/neutrino/aggregate_finality_votes_";
     let suffix = "/borsh";
-    if let Some(rest) = s.strip_prefix(prefix) {
-        if let Some(idx_str) = rest.strip_suffix(suffix) {
-            if let Ok(idx) = idx_str.parse::<u8>()
-                && Topic::valid_aggregate_subnet(idx)
-            {
-                return Some(Topic::AggregateFinalityVotes(idx));
-            }
-        }
+    if let Some(rest) = s.strip_prefix(prefix)
+        && let Some(idx_str) = rest.strip_suffix(suffix)
+        && let Ok(idx) = idx_str.parse::<u8>()
+        && Topic::valid_aggregate_subnet(idx)
+    {
+        return Some(Topic::AggregateFinalityVotes(idx));
     }
     None
 }
@@ -2204,10 +2202,10 @@ mod tests {
             let mut seen = HashSet::new();
             timeout(TokDuration::from_secs(10), async {
                 while seen != expected {
-                    if let Some(NetworkEvent::PeerConnected(p)) = rx.recv().await {
-                        if expected.contains(&p) {
-                            seen.insert(p);
-                        }
+                    if let Some(NetworkEvent::PeerConnected(p)) = rx.recv().await
+                        && expected.contains(&p)
+                    {
+                        seen.insert(p);
                     }
                 }
             })
@@ -2239,10 +2237,11 @@ mod tests {
         ) {
             timeout(TokDuration::from_secs(10), async {
                 loop {
-                    if let Some(NetworkEvent::GossipMessage { topic, data, .. }) = rx.recv().await {
-                        if topic == expected_topic && data == expected_data {
-                            return;
-                        }
+                    if let Some(NetworkEvent::GossipMessage { topic, data, .. }) = rx.recv().await
+                        && topic == expected_topic
+                        && data == expected_data
+                    {
+                        return;
                     }
                 }
             })
@@ -2535,10 +2534,10 @@ mod tests {
                     data,
                     message_id,
                 }) = event_rx_b.recv().await
+                    && topic == Topic::Blocks
+                    && data == garbage
                 {
-                    if topic == Topic::Blocks && data == garbage {
-                        return (message_id, propagation_source);
-                    }
+                    return (message_id, propagation_source);
                 }
             }
         })

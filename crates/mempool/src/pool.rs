@@ -390,14 +390,14 @@ mod tests {
     fn drain_up_to_zero_drains_nothing() {
         let mut pool = Mempool::new(1024);
         pool.insert(tx(1, 8)).unwrap();
-        assert!(pool.drain_up_to(0).is_empty());
+        assert_eq!(pool.drain_up_to(0), [] as [MempoolEntry; 0]);
         assert_eq!(pool.len(), 1);
     }
 
     #[test]
     fn drain_when_empty_returns_empty() {
         let mut pool = Mempool::new(1024);
-        assert!(pool.drain_up_to(usize::MAX).is_empty());
+        assert_eq!(pool.drain_up_to(usize::MAX), [] as [MempoolEntry; 0]);
     }
 
     #[test]

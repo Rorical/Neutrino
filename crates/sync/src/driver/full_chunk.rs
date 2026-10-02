@@ -249,19 +249,18 @@ pub(super) async fn on_response(
         )),
     };
     if result.is_ok() {
-        if let Some((head, blocks, next)) = advance {
-            if let Some(cursor) = driver
+        if let Some((head, blocks, next)) = advance
+            && let Some(cursor) = driver
                 .full_chunks
                 .cursors
                 .get_mut(&peer)
                 .filter(|cursor| cursor.head_block_hash == head)
-            {
-                if blocks {
-                    cursor.blocks.extend(downloaded);
-                    cursor.next_header = next;
-                } else {
-                    cursor.next_proof = next;
-                }
+        {
+            if blocks {
+                cursor.blocks.extend(downloaded);
+                cursor.next_header = next;
+            } else {
+                cursor.next_proof = next;
             }
         }
         request_next(driver, peer).await;

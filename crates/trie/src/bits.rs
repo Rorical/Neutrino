@@ -312,7 +312,7 @@ mod tests {
         let p = BitPath::empty();
         assert!(p.is_empty());
         assert_eq!(p.bit_len(), 0);
-        assert!(p.as_bytes().is_empty());
+        assert_eq!(p.as_bytes(), [] as [u8; 0]);
     }
 
     #[test]

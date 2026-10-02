@@ -328,7 +328,7 @@ pub(crate) mod tests {
         assert!(rejected.is_err());
         assert_eq!(state.post_state_root(), root);
         let witness = state.into_witness();
-        assert!(witness.witnessed_keys.is_empty());
+        assert_eq!(witness.witnessed_keys, [] as [Vec<u8>; 0]);
     }
 
     #[test]
@@ -366,7 +366,7 @@ pub(crate) mod tests {
         input.block_height += 1;
         let second = crate::apply_block(&input, &mut next);
         assert_eq!(second.accountability.executed[0].offence_id, [2; 32]);
-        assert!(load_queue(&mut next).is_empty());
+        assert_eq!(load_queue(&mut next), [] as [PendingSanction; 0]);
         assert_eq!(crate::load_validator(&mut next, &[2; 32]).stake, 70);
         assert_eq!(next.read(&offence_key(&[2; 32])), Some(vec![1]));
     }
@@ -425,11 +425,10 @@ pub(crate) mod tests {
         assert_eq!(output.applied, 1);
         assert_eq!(output.failed, 0);
         assert_eq!(crate::load_account(&mut state, &address).balance, 70);
-        assert!(load_queue(&mut state).is_empty());
-        assert!(
-            crate::load_withdrawal_queue(&mut state, &address)
-                .entries
-                .is_empty()
+        assert_eq!(load_queue(&mut state), [] as [PendingSanction; 0]);
+        assert_eq!(
+            crate::load_withdrawal_queue(&mut state, &address).entries,
+            [] as [crate::Withdrawal; 0]
         );
     }
 

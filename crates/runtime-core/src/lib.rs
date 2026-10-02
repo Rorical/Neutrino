@@ -324,10 +324,10 @@ pub mod host {
             // Always include the root node (when present) so an empty
             // access set still produces a witness the Guest can bind
             // to `pre_state_root`.
-            if self.pre_root != neutrino_trie::EMPTY_TRIE_ROOT {
-                if let Some(bytes) = self.live.trie().node_bytes(&self.pre_root) {
-                    nodes.entry(self.pre_root).or_insert_with(|| bytes.to_vec());
-                }
+            if self.pre_root != neutrino_trie::EMPTY_TRIE_ROOT
+                && let Some(bytes) = self.live.trie().node_bytes(&self.pre_root)
+            {
+                nodes.entry(self.pre_root).or_insert_with(|| bytes.to_vec());
             }
             let witness = StateWitness {
                 pre_state_root: self.pre_root,

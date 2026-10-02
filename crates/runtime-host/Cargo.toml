@@ -23,7 +23,6 @@ publish       = { workspace = true }
 sp1-sdk                       = { workspace = true }
 wasmtime                      = { workspace = true }
 borsh                         = { workspace = true }
-bincode                       = { workspace = true }
 blake3                        = { workspace = true }
 thiserror                     = { workspace = true }
 neutrino-default-runtime-core = { workspace = true }

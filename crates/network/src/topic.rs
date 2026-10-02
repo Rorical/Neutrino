@@ -72,7 +72,7 @@ impl Topic {
 
     /// Maximum permitted transmission size in bytes, per doc 06.
     ///
-    /// Enforced by gossipsub via `set_topic_max_transmit_size`. Messages
+    /// Enforced by gossipsub via `max_transmit_size_for_topic`. Messages
     /// larger than this are dropped before propagation.
     #[must_use]
     pub const fn max_transmit_size(self) -> usize {

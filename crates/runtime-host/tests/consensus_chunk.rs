@@ -266,7 +266,7 @@ fn check_guest_rejections<P: Prover>(
             .run()
             .unwrap();
         assert_ne!(report.exit_code, 0);
-        assert!(output.as_slice().is_empty());
+        assert_eq!(output.as_slice(), [] as [u8; 0]);
     }
 }
 

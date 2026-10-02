@@ -14,7 +14,8 @@ use core::fmt;
 use k256::ecdsa::{
     RecoveryId, Signature as K256Sig, SigningKey, VerifyingKey, signature::Verifier,
 };
-use rand_core::{CryptoRng, RngCore};
+use k256::elliptic_curve::Generate;
+use rand_core::CryptoRng;
 use zeroize::ZeroizeOnDrop;
 
 use crate::error::CryptoError;
@@ -30,8 +31,8 @@ pub struct PublicKey(VerifyingKey);
 
 impl SecretKey {
     /// Sample a fresh secret key from a CSPRNG.
-    pub fn generate(rng: &mut (impl CryptoRng + RngCore)) -> Self {
-        Self(SigningKey::random(rng))
+    pub fn generate(rng: &mut impl CryptoRng) -> Self {
+        Self(SigningKey::generate_from_rng(rng))
     }
 
     /// Construct from a 32-byte big-endian scalar. Returns an error if
@@ -60,10 +61,7 @@ impl SecretKey {
     /// The signature is normalised to low-`s` per BIP-62 / RFC 6979 to
     /// avoid malleability.
     pub fn sign(&self, message: &[u8]) -> Secp256k1Signature {
-        let (sig, recovery_id) = self
-            .0
-            .sign_recoverable(message)
-            .expect("RFC 6979 deterministic signing is infallible");
+        let (sig, recovery_id) = self.0.sign_recoverable(message);
         let mut out = [0_u8; 65];
         out[..64].copy_from_slice(&sig.to_bytes());
         out[64] = recovery_id.to_byte();
@@ -81,7 +79,7 @@ impl PublicKey {
 
     /// Encode as 33 bytes SEC1 compressed.
     pub fn to_bytes(&self) -> Secp256k1PublicKey {
-        let encoded = self.0.to_encoded_point(true);
+        let encoded = self.0.to_sec1_point(true);
         let bytes = encoded.as_bytes();
         // The compressed encoding of an affine point is always 33 bytes
         // (1-byte tag + 32-byte x-coordinate); the underlying crate
@@ -142,11 +140,12 @@ impl fmt::Debug for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     #[test]
     fn keygen_sign_verify_roundtrips() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let msg = b"hello, neutrino";
         let sig = sk.sign(msg);
@@ -155,7 +154,7 @@ mod tests {
 
     #[test]
     fn recovery_returns_signer_pubkey() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let msg = b"message to recover from";
         let sig = sk.sign(msg);
@@ -165,7 +164,7 @@ mod tests {
 
     #[test]
     fn verify_fails_on_tampered_message() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let sig = sk.sign(b"original");
         assert_eq!(pk.verify(b"tampered", &sig), Err(CryptoError::Verification));
@@ -173,7 +172,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_invalid_recovery_id() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let msg = b"recoverable signature";
         let mut sig = sk.sign(msg);
@@ -184,8 +183,8 @@ mod tests {
 
     #[test]
     fn verify_fails_on_wrong_pubkey() {
-        let sk1 = SecretKey::generate(&mut OsRng);
-        let sk2 = SecretKey::generate(&mut OsRng);
+        let sk1 = SecretKey::generate(&mut UnwrapErr(SysRng));
+        let sk2 = SecretKey::generate(&mut UnwrapErr(SysRng));
         let msg = b"msg";
         let sig = sk1.sign(msg);
         assert_eq!(
@@ -219,7 +218,7 @@ mod tests {
 
     #[test]
     fn pubkey_roundtrips_bytes() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk1 = sk.public_key();
         let pk2 = PublicKey::from_bytes(&pk1.to_bytes()).expect("valid");
         assert_eq!(pk1.to_bytes(), pk2.to_bytes());
@@ -227,7 +226,7 @@ mod tests {
 
     #[test]
     fn secret_key_roundtrips_bytes() {
-        let sk1 = SecretKey::generate(&mut OsRng);
+        let sk1 = SecretKey::generate(&mut UnwrapErr(SysRng));
         let bytes = sk1.to_bytes();
         let sk2 = SecretKey::from_bytes(&bytes).expect("valid");
         assert_eq!(sk1.public_key().to_bytes(), sk2.public_key().to_bytes());

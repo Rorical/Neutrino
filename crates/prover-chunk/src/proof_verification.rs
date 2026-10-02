@@ -5,8 +5,8 @@
 //! This module is shared by native callers and the guest; errors classify the
 //! artifact, while a verifier panic/resource failure cannot establish rejection.
 
+use crate::receipt_codec;
 use alloc::{string::String, vec::Vec};
-use bincode::Options;
 use core::borrow::Borrow;
 use neutrino_consensus_types::{BlockProof, ProofRejectionReason};
 use neutrino_default_runtime_core::StfPublicOutput;
@@ -17,7 +17,7 @@ use sp1_verifier::{SP1Proof, compressed::SP1CompressedVerifier};
 
 /// Maximum block proof envelope payload, matching the block-proof gossip cap.
 pub const MAX_PROOF_BYTES: usize = 2 * 1024 * 1024;
-/// Circuit version embedded by the pinned SP1 SDK 6.2.1 (not its crate version).
+/// Circuit version embedded by the pinned SP1 SDK 6.8.1 (not its crate version).
 pub const CIRCUIT_VERSION: &str = "v6.1.0";
 
 /// Verify an evidence receipt under an externally authenticated program key.
@@ -41,11 +41,7 @@ pub fn decode_verified_evidence_receipt(
     if bytes.len() > MAX_EVIDENCE_PROOF_BYTES {
         return Err(ProofRejectionReason::MalformedProof);
     }
-    let bundle: ProofBundle = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_EVIDENCE_PROOF_BYTES as u64)
-        .reject_trailing_bytes()
-        .deserialize(bytes)
+    let bundle: ProofBundle = receipt_codec::decode::<_, MAX_EVIDENCE_PROOF_BYTES>(bytes)
         .map_err(|_| ProofRejectionReason::MalformedProof)?;
     let SP1Proof::Compressed(inner) = &bundle.proof else {
         return Err(ProofRejectionReason::MalformedProof);
@@ -66,7 +62,7 @@ pub fn decode_verified_evidence_receipt(
     Ok(bundle.proof)
 }
 
-// Exact SDK 6.2.1 wire fields. Keeping the SDK host/prover itself out of the
+// Exact SDK 6.8.1 wire fields. Keeping the SDK host/prover itself out of the
 // guest avoids a dependency on native proving services. Parity is tested with
 // bundles produced by the SDK, not by a second hand-written serializer.
 #[derive(Deserialize)]
@@ -99,11 +95,7 @@ pub fn verify_block_artifact(
     // Sp1BlockProof is a borsh struct containing one Vec<u8> field.
     let bytes: Vec<u8> =
         borsh::from_slice(&proof.proof_bytes).map_err(|_| ProofRejectionReason::MalformedProof)?;
-    let bundle: ProofBundle = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_PROOF_BYTES as u64)
-        .reject_trailing_bytes()
-        .deserialize(&bytes)
+    let bundle: ProofBundle = receipt_codec::decode::<_, MAX_PROOF_BYTES>(&bytes)
         .map_err(|_| ProofRejectionReason::MalformedProof)?;
     let SP1Proof::Compressed(inner) = &bundle.proof else {
         return Err(ProofRejectionReason::MalformedProof);
@@ -148,8 +140,8 @@ fn verify_decoded_receipt(
     let SP1Proof::Compressed(proof) = &bundle.proof else {
         return Err(ProofRejectionReason::MalformedProof);
     };
-    let key_bytes = bincode::serialize(key).expect("fixed key encoding");
-    let key = bincode::deserialize::<[sp1_primitives::SP1Field; 8]>(&key_bytes)
+    let key_bytes = receipt_codec::encode(key).expect("fixed key encoding");
+    let key = receipt_codec::decode::<[sp1_primitives::SP1Field; 8], 32>(&key_bytes)
         .map_err(|_| ProofRejectionReason::VerifierRejected)?;
     SP1CompressedVerifier::new()
         .verify_compressed_with_public_values(proof, bundle.public_values.as_slice(), &key)

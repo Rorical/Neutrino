@@ -18,7 +18,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use jsonrpsee::server::{RpcModule, Server, ServerHandle};
+use jsonrpsee::server::{RpcModule, Server, ServerConfig, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 
 use crate::backend::{BlockId, QueryError, RpcBackend, RuntimeCallError, SubmitError};
@@ -80,10 +80,13 @@ pub async fn serve(
     config: RpcConfig,
 ) -> Result<ServerHandle, RpcStartError> {
     let module = build_module(backend)?;
-    let server = Server::builder()
+    let server_config = ServerConfig::builder()
         .max_connections(config.max_connections)
         .max_request_body_size(config.max_request_body_size)
         .max_response_body_size(config.max_response_body_size)
+        .build();
+    let server = Server::builder()
+        .set_config(server_config)
         .build(config.listen)
         .await
         .map_err(|err| RpcStartError::Transport(err.to_string()))?;

@@ -10,11 +10,7 @@ use bls12_381::{
     multi_miller_loop,
 };
 use neutrino_primitives::{BlsPublicKey, BlsSignature};
-// The pinned SP1 patch uses digest 0.10; upstream 0.8 uses digest 0.9.
-#[cfg(target_os = "zkvm")]
-use sha2::Sha256;
-#[cfg(not(target_os = "zkvm"))]
-use sha2_09::Sha256;
+use sha2_10::Sha256;
 
 /// Signature cipher-suite domain for min-pk POP.
 pub const SIG_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
@@ -33,12 +29,8 @@ fn verify_point(key: G1Affine, message: &[u8], signature: &BlsSignature, dst: &[
     if bool::from(key.is_identity()) || bool::from(signature.is_identity()) {
         return false;
     }
-    #[cfg(target_os = "zkvm")]
     let message_point =
         <G2Projective as HashToCurve<ExpandMsgXmd<Sha256>>>::hash_to_curve([message], dst);
-    #[cfg(not(target_os = "zkvm"))]
-    let message_point =
-        <G2Projective as HashToCurve<ExpandMsgXmd<Sha256>>>::hash_to_curve(message, dst);
     // One final exponentiation for the pairing-product identity saves guest
     // work without changing either subgroup checks or the signature equation.
     multi_miller_loop(&[

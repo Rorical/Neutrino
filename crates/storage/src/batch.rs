@@ -65,13 +65,13 @@ impl Batch {
 
     /// Returns true when no operations are queued.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
     /// Number of operations in the batch.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.ops.len()
     }
 

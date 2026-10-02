@@ -1,6 +1,6 @@
 # Proof system
 
-SP1 6.2.1 Compressed STARK is the accepted proof backend. Three Guest programs
+SP1 6.8.1 Compressed STARK is the accepted proof backend. Three Guest programs
 compose the current proof path:
 
 | Proof | Establishes | Consumed by |

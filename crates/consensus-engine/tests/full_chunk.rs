@@ -143,7 +143,7 @@ fn complete_finalization_persists_boundary_and_peer_import_checks_certificate() 
     let backend = NativeConsensusBackend { reject: false };
     let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
     let outcome = producer.finalize_chunk(0, &backend, &voter).unwrap();
-    assert!(!outcome.chunk_proof.proof_bytes.is_empty());
+    assert_ne!(outcome.chunk_proof.proof_bytes, [] as [u8; 0]);
     assert_eq!(outcome.chunk_proof.finality_cert, outcome.finality_cert);
     let state = producer.store().get_consensus_state().unwrap().unwrap();
     assert_eq!(state.statement, validate_consensus(&input).unwrap());

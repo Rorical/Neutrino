@@ -125,7 +125,7 @@ impl Node {
     }
 }
 
-fn decode_hash_tail(tail: &[u8]) -> Result<Hash, TrieError> {
+const fn decode_hash_tail(tail: &[u8]) -> Result<Hash, TrieError> {
     if tail.len() < 32 {
         return Err(TrieError::TruncatedNode);
     }

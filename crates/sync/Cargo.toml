@@ -18,15 +18,15 @@ std = []
 workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 borsh.workspace = true
 neutrino-consensus-types.workspace = true
 neutrino-network.workspace = true
 neutrino-primitives.workspace = true
 thiserror.workspace = true
-tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["full", "test-util"] }
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3.23"

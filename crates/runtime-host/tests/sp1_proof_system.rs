@@ -24,6 +24,31 @@ use sp1_sdk::blocking::{MockProver, ProverClient};
 
 const CHAIN_ID: u64 = 7;
 
+#[test]
+fn receipt_codec_matches_sdk_wire_encoding() {
+    let (wire, _) = build_block_proof(99);
+    let mut proof = wire.to_sp1().unwrap();
+    proof.tee_proof = Some(vec![4, 5]);
+    let path = std::env::temp_dir().join(format!("neutrino-sdk-wire-{}.bin", std::process::id()));
+    proof.save(&path).unwrap();
+    let sdk_bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let wire = Sp1BlockProof::from_sp1(&proof).unwrap();
+    assert_eq!(wire.bytes, sdk_bytes);
+    let decoded = wire.to_sp1().unwrap();
+    assert!(matches!(decoded.proof, sp1_sdk::SP1Proof::Compressed(_)));
+    assert_eq!(
+        decoded.public_values.as_slice(),
+        proof.public_values.as_slice()
+    );
+    assert_eq!(decoded.sp1_version, sp1_sdk::SP1_CIRCUIT_VERSION);
+    assert_eq!(decoded.tee_proof, Some(vec![4, 5]));
+    assert_eq!(
+        neutrino_prover_chunk::proof_verification::CIRCUIT_VERSION,
+        sp1_sdk::SP1_CIRCUIT_VERSION
+    );
+}
+
 static MOCK_CTX: OnceLock<ProverCtx<MockProver>> = OnceLock::new();
 
 fn mock_ctx() -> &'static ProverCtx<MockProver> {

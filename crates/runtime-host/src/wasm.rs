@@ -465,10 +465,10 @@ impl HostState {
                 .collect_path_nodes(key, &mut nodes, &mut values);
         }
         let pre_root = self.pre_state_root();
-        if pre_root != neutrino_trie::EMPTY_TRIE_ROOT {
-            if let Some(bytes) = self.live.trie().node_bytes(&pre_root) {
-                nodes.entry(pre_root).or_insert_with(|| bytes.to_vec());
-            }
+        if pre_root != neutrino_trie::EMPTY_TRIE_ROOT
+            && let Some(bytes) = self.live.trie().node_bytes(&pre_root)
+        {
+            nodes.entry(pre_root).or_insert_with(|| bytes.to_vec());
         }
         let witness = StateWitness {
             pre_state_root: pre_root,

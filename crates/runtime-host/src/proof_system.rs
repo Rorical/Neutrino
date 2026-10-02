@@ -21,10 +21,10 @@
 //! Complete chunk proving recursively verifies blocks and commits guest-checked
 //! execution and consensus transitions. Checkpoint recursion remains deferred.
 
-use bincode::Options;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::StfPublicOutput;
 use neutrino_proof_system::{ProofError, ProofSystem, public_inputs::BlockProofPublicInputs};
+use neutrino_prover_chunk::receipt_codec;
 use sp1_sdk::{
     HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin,
     SP1VerifyingKey,
@@ -43,7 +43,7 @@ use crate::{ProverCtx, Sp1HostError};
 /// the inside.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Sp1BlockProof {
-    /// `bincode::serialize(&SP1ProofWithPublicValues)` bytes.
+    /// `receipt_codec::encode(&SP1ProofWithPublicValues)` bytes.
     pub bytes: Vec<u8>,
 }
 
@@ -51,7 +51,7 @@ impl Sp1BlockProof {
     /// Serialize an SP1 proof bundle for storage on the wire.
     pub fn from_sp1(proof: &SP1ProofWithPublicValues) -> Result<Self, Sp1HostError> {
         let bytes =
-            bincode::serialize(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
+            receipt_codec::encode(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
         Ok(Self { bytes })
     }
 
@@ -63,12 +63,11 @@ impl Sp1BlockProof {
                 "block proof exceeds wire limit".to_owned(),
             ));
         }
-        bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_limit(neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES as u64)
-            .reject_trailing_bytes()
-            .deserialize::<SP1ProofWithPublicValues>(&self.bytes)
-            .map_err(|err| Sp1HostError::Codec(err.to_string()))
+        receipt_codec::decode::<
+            SP1ProofWithPublicValues,
+            { neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES },
+        >(&self.bytes)
+        .map_err(|err| Sp1HostError::Codec(err.to_string()))
     }
 }
 
@@ -80,7 +79,7 @@ impl Sp1BlockProof {
 /// [`neutrino_prover_chunk::consensus::ConsensusStatement`].
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Sp1ChunkProof {
-    /// `bincode::serialize(&SP1ProofWithPublicValues)` bytes.
+    /// `receipt_codec::encode(&SP1ProofWithPublicValues)` bytes.
     pub bytes: Vec<u8>,
 }
 
@@ -88,17 +87,13 @@ impl Sp1ChunkProof {
     /// Serialize an SP1 chunk-aggregator proof bundle for the wire.
     pub fn from_sp1(proof: &SP1ProofWithPublicValues) -> Result<Self, Sp1HostError> {
         let bytes =
-            bincode::serialize(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
+            receipt_codec::encode(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
         Ok(Self { bytes })
     }
 
     /// Decode the inner SP1 proof bundle.
     pub fn to_sp1(&self) -> Result<SP1ProofWithPublicValues, Sp1HostError> {
-        bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_limit(8 * 1024 * 1024)
-            .reject_trailing_bytes()
-            .deserialize::<SP1ProofWithPublicValues>(&self.bytes)
+        receipt_codec::decode::<SP1ProofWithPublicValues, { 8 * 1024 * 1024 }>(&self.bytes)
             .map_err(|err| Sp1HostError::Codec(err.to_string()))
     }
 }
@@ -214,7 +209,7 @@ where
             .compressed()
             .run()
             .map_err(|_| ProofError::BackendRejected)?;
-        let bytes = bincode::serialize(&proof).map_err(|_| ProofError::MalformedProof)?;
+        let bytes = receipt_codec::encode(&proof).map_err(|_| ProofError::MalformedProof)?;
         self.verify_evidence(&bytes, &expected)?;
         Ok(bytes)
     }

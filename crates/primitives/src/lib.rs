@@ -242,7 +242,7 @@ pub fn merkle_root_from_hashes(mut leaves: Vec<Hash>) -> Hash {
             concat[32..].copy_from_slice(&leaves[index * 2 + 1]);
             leaves[index] = blake3_256(&concat);
         }
-        if length % 2 != 0 {
+        if !length.is_multiple_of(2) {
             leaves[length / 2] = leaves[length - 1];
         }
         leaves.truncate(length.div_ceil(2));

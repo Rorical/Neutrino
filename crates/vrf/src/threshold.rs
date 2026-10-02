@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use neutrino_primitives::{DEFAULT_EXPECTED_PROPOSERS_PER_SLOT, FIXED_U128_ONE};
     use rand_chacha::ChaCha20Rng;
-    use rand_core::{RngCore, SeedableRng};
+    use rand_core::{Rng, SeedableRng};
 
     const E_ONE: FixedU128 = FIXED_U128_ONE;
 

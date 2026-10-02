@@ -1827,11 +1827,11 @@ mod tests {
         let mut engine = test_engine(spec.clone());
         let first = dummy_chunk(0, spec.genesis_validator_set_root);
         let prior = accountable_certificate(&first, 0);
-        assert!(
+        assert_eq!(
             engine
                 .observe_certificate_for_slashing(&first, &prior)
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [neutrino_consensus_types::SlashingEvidence; 0]
         );
         let mut later = first;
         later.end_state_root[0] ^= 1;
@@ -1864,11 +1864,11 @@ mod tests {
                 Some(quorum.clone()),
             );
         }
-        assert!(
+        assert_eq!(
             engine
                 .observe_certificate_for_slashing(&later, &honest)
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [neutrino_consensus_types::SlashingEvidence; 0]
         );
         let mut stripped = honest;
         stripped.attestations[0].unlock_quorum = None;
@@ -1902,11 +1902,9 @@ mod tests {
                 Some(quorum.clone()),
             );
         }
-        assert!(
-            engine
-                .observe_votes_for_slashing(&first)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            engine.observe_votes_for_slashing(&first).unwrap(),
+            [] as [neutrino_consensus_types::SlashingEvidence; 0]
         );
         let mut later = chunk;
         later.end_state_root[0] ^= 1;

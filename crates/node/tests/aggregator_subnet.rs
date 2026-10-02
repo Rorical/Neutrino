@@ -173,10 +173,10 @@ async fn wait_for_listen_addr(rx: &mut mpsc::Receiver<NetworkEvent>) -> Multiadd
 async fn wait_for_peer_connected(rx: &mut mpsc::Receiver<NetworkEvent>, expected: PeerId) {
     timeout(Duration::from_secs(5), async {
         loop {
-            if let NetworkEvent::PeerConnected(peer) = rx.recv().await.expect("event stream open") {
-                if peer == expected {
-                    return;
-                }
+            if let NetworkEvent::PeerConnected(peer) = rx.recv().await.expect("event stream open")
+                && peer == expected
+            {
+                return;
             }
         }
     })

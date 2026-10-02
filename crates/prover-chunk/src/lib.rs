@@ -21,5 +21,7 @@ pub mod history;
 #[cfg(feature = "sp1-verification")]
 pub mod proof_verification;
 pub mod proposer;
+#[cfg(feature = "sp1-verification")]
+pub mod receipt_codec;
 pub mod rotation;
 pub mod slashing;

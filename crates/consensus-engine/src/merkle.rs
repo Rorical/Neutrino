@@ -45,14 +45,14 @@ pub fn merkle_root_of_hashes(leaves: &[Hash]) -> Hash {
     let mut current: Vec<Hash> = leaves.to_vec();
     while current.len() > 1 {
         let mut next = Vec::with_capacity(current.len().div_ceil(2));
-        let mut iter = current.chunks_exact(2);
-        for pair in &mut iter {
+        let (pairs, remainder) = current.as_chunks::<2>();
+        for pair in pairs {
             let mut concat = [0_u8; 64];
             concat[..32].copy_from_slice(&pair[0]);
             concat[32..].copy_from_slice(&pair[1]);
             next.push(blake3_256(&concat));
         }
-        if let Some(odd) = iter.remainder().first() {
+        if let Some(odd) = remainder.first() {
             next.push(*odd);
         }
         current = next;

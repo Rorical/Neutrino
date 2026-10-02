@@ -595,10 +595,10 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<(), EngineError<DB::Error>> {
         // Reject backwards transitions so a late-arriving finalize
         // signal cannot un-rotate the set.
-        if let Some(latest) = self.store.get_latest_validator_set_index()? {
-            if effective_at <= latest {
-                return Ok(());
-            }
+        if let Some(latest) = self.store.get_latest_validator_set_index()?
+            && effective_at <= latest
+        {
+            return Ok(());
         }
         self.store
             .put_validator_set_snapshot(effective_at, &new_set)?;

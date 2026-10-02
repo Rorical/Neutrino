@@ -939,7 +939,7 @@ mod tests {
             peer,
             status: peer_status(7, 0, 0),
         });
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [SyncCommand; 0]);
         assert!(matches!(fsm.state(), SyncState::Init));
     }
 

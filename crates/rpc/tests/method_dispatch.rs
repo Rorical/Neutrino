@@ -32,7 +32,7 @@ async fn call_named(
     })
     .to_string();
     let (response, _rx) = module.raw_json_request(&req, 1).await.expect("dispatch");
-    let parsed: Value = serde_json::from_str(&response).expect("response json");
+    let parsed: Value = serde_json::from_str(response.get()).expect("response json");
     parsed.get("error").map_or_else(
         || Ok(parsed.get("result").cloned().unwrap_or(Value::Null)),
         |error| Err(error.clone()),

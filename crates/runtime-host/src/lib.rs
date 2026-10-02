@@ -325,7 +325,8 @@ fn cache_path_for(elf: &Elf) -> PathBuf {
 fn load_cached_vk_for(elf: &Elf) -> Option<SP1VerifyingKey> {
     let path = cache_path_for(elf);
     let bytes = fs::read(&path).ok()?;
-    bincode::deserialize::<SP1VerifyingKey>(&bytes).ok()
+    neutrino_prover_chunk::receipt_codec::decode::<SP1VerifyingKey, { 8 * 1024 * 1024 }>(&bytes)
+        .ok()
 }
 
 fn save_cached_vk_for(elf: &Elf, vk: &SP1VerifyingKey) -> Result<(), std::io::Error> {
@@ -333,7 +334,8 @@ fn save_cached_vk_for(elf: &Elf, vk: &SP1VerifyingKey) -> Result<(), std::io::Er
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = bincode::serialize(vk).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let bytes = neutrino_prover_chunk::receipt_codec::encode(vk)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     write_atomic(&path, &bytes)
 }
 

@@ -63,7 +63,8 @@ default-members = [
 [workspace.package]
 version       = "0.1.0"
 edition       = "2024"
-rust-version  = "1.85"
+# Compatible with the compiler bundled with SP1; the host toolchain is pinned separately.
+rust-version  = "1.96"
 authors       = ["The Neutrino Authors"]
 license       = "MIT OR Apache-2.0"
 repository    = "https://github.com/anomalyco/neutrino"
@@ -123,84 +124,65 @@ neutrino-runtime-host           = { path = "crates/runtime-host",           vers
 neutrino-default-runtime-core   = { path = "crates/runtimes/neutrino-default/core",   version = "0.1.0", default-features = false }
 neutrino-default-runtime-master = { path = "crates/runtimes/neutrino-default/master", version = "0.1.0", default-features = false }
 
-# External — pinned at major versions; cargo update controls minor/patch.
+# External — current stable baselines; committed lockfiles fix exact resolution.
 # Canonical wire codec. See docs/design/07-block-format.md.
-borsh               = { version = "1.5",  default-features = false, features = ["derive"] }
+borsh               = { version = "1.8.1",  default-features = false, features = ["derive"] }
 
 # SP1 zkVM — hard environment dependency (see AGENTS.md).
-sp1-sdk             = { version = "=6.2.1", default-features = false, features = ["blocking"] }
-sp1-build           = { version = "=6.2.1" }
+sp1-sdk             = { version = "=6.8.1", default-features = false, features = ["blocking"] }
+sp1-build           = { version = "=6.8.1" }
 # `sp1-lib` exposes the Poseidon2 syscall wrapper used by the trie
 # crate when compiled into the SP1 Guest. Outside the zkVM the syscall
 # is unreachable, so this dep is target-gated at the consumer crate.
-sp1-lib             = { version = "=6.2.1" }
+sp1-lib             = { version = "=6.8.1" }
 
-# Plonky3-derived crates pinned to SP1's fork. The trie crate uses
-# them on the host side to compute Poseidon2 digests that are
-# byte-identical to what `sp1-lib::poseidon2::Poseidon2ByteHash`
-# would produce inside the SP1 Guest. Same Poseidon2 instance the
-# `POSEIDON2` precompile is bound to (KoalaBear width 16, S-box x^3,
-# 8 external + 20 partial rounds).
-p3-field            = { version = "=0.3.3-succinct", default-features = false }
-p3-koala-bear       = { version = "=0.3.3-succinct", default-features = false }
-p3-poseidon2        = { version = "=0.3.3-succinct", default-features = false }
-p3-symmetric        = { version = "=0.3.3-succinct", default-features = false }
-# Source of the SP1-canonical Poseidon2 round constants
-# (`my_kb_16_perm`); transitively pulls slop-poseidon2 + slop-algebra.
-# Pulled in by trie's host-side software permutation.
-slop-koala-bear     = { version = "=6.2.1" }
+# Host Poseidon2 uses the canonical permutation of the pinned SP1 precompile.
+slop-algebra        = { version = "=6.8.1" }
+slop-koala-bear     = { version = "=6.8.1" }
+slop-symmetric      = { version = "=6.8.1" }
 
 # no_std + alloc compatible lazy-init for the trie's host-side
 # Poseidon2 permutation singleton.
-once_cell           = { version = "1.20", default-features = false, features = ["alloc", "race"] }
+once_cell           = { version = "1.21.4", default-features = false, features = ["alloc", "race"] }
 
-# Binary serde codec. Used for on-disk SP1 verifying-key caches. Pulled
-# in transitively by sp1-sdk regardless.
-bincode             = { version = "1.3" }
+# Binary serde codec for SP1 receipts and on-disk verifying-key caches.
+# Release 3.0.0 intentionally fails compilation; 2.0.1 is the latest usable release.
+bincode             = { version = "2.0.1", default-features = false, features = ["alloc", "serde"] }
 
 # WASM execution engine for the dynamic runtime host. `cranelift`
 # default feature is heavy; we keep it on because we need the JIT/AOT
 # compiler to execute master.wasm.
-wasmtime            = { version = "44.0", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime            = { version = "49.0.2", default-features = false, features = ["cranelift", "runtime"] }
 
 # no_std allocator for the `wasm32-unknown-unknown` builds of master.
-dlmalloc            = { version = "0.2", default-features = false }
+dlmalloc            = { version = "0.2.14", default-features = false }
 
-blake3              = { version = "1.5",  default-features = false }
-sha2                = { version = "0.10", default-features = false }
-tiny-keccak         = { version = "2.0",  features = ["keccak"] }
+blake3              = { version = "1.8.7",  default-features = false }
+sha2                = { version = "0.11.0", default-features = false }
+tiny-keccak         = { version = "2.0.2",  features = ["keccak"] }
 
-blst                = { version = "0.3" }
-ed25519-dalek       = { version = "2.1",  default-features = false, features = ["zeroize", "rand_core", "alloc"] }
-k256                = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
+blst                = { version = "0.3.17" }
+ed25519-dalek       = { version = "3.0.0",  default-features = false, features = ["zeroize", "rand_core", "alloc"] }
+k256                = { version = "0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
 
-subtle              = { version = "2.6",  default-features = false }
-zeroize             = { version = "1.8",  default-features = false, features = ["derive"] }
-# rand_core stays at 0.6 because ed25519-dalek 2.1 and k256 0.13 both
-# bind their generic Rng arguments to the rand_core 0.6 trait set.
-rand_core           = { version = "0.6",  default-features = false, features = ["getrandom"] }
-rand                = { version = "0.10" }
-# Deterministic CSPRNG paired with rand_core 0.6 for tests that need
-# both a reproducible seed and an Rng that satisfies `ed25519-dalek`,
-# `k256`, and `blst`'s rand_core 0.6 trait bounds.
-rand_chacha         = { version = "0.3" }
-rocksdb             = { version = "0.22", default-features = false }
+zeroize             = { version = "1.9.0",  default-features = false, features = ["derive"] }
+rand_core           = { version = "0.10.1", default-features = false }
+rand                = { version = "0.10.3" }
+rand_chacha         = { version = "0.10.0" }
+getrandom           = { version = "0.4.3", features = ["sys_rng"] }
+rocksdb             = { version = "0.25.0", default-features = false, features = ["bindgen-runtime"] }
 
-thiserror           = { version = "2.0" }
-hex                 = { version = "0.4",  default-features = false, features = ["alloc"] }
+thiserror           = { version = "2.0.21" }
+hex                 = { version = "0.4.3",  default-features = false, features = ["alloc"] }
 
 # JSON-RPC server for the user-facing RPC layer. Same library Substrate
 # and Reth use; supports HTTP and WebSocket on a single port.
-jsonrpsee           = { version = "0.24", default-features = false, features = ["server", "client", "macros"] }
-serde               = { version = "1.0",  features = ["derive"] }
-serde_json          = { version = "1.0" }
-async-trait         = { version = "0.1" }
-tokio               = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }
-tracing             = { version = "0.1" }
-
-# Test-only.
-proptest            = { version = "1.6" }
-proptest-derive     = { version = "0.5" }
+jsonrpsee           = { version = "0.26.1", default-features = false, features = ["server", "client", "macros"] }
+serde               = { version = "1.0.229",  features = ["derive"] }
+serde_json          = { version = "1.0.151" }
+async-trait         = { version = "0.1.92" }
+tokio               = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }
+tracing             = { version = "0.1.44" }
 
 [profile.dev]
 opt-level     = 0

@@ -135,8 +135,7 @@ fn produces_proves_and_advances_single_validator_chain() {
 
     // The runtime emits a deterministic `validator_set_root` for the
     // canonical empty runtime-side validator set; the engine wires
-    // that into `header.runtime_extra` so chunk BFT (and the future
-    // M7-new finality path) can pick it up.
+    // that into `header.runtime_extra` for consensus to authenticate.
     let expected_runtime_extra = ValidatorSet::default().root();
     assert_eq!(
         outcome.block.header.runtime_extra, expected_runtime_extra,
@@ -148,7 +147,7 @@ fn produces_proves_and_advances_single_validator_chain() {
     );
 
     // Body lanes are empty (no mempool / pools loaded).
-    assert!(outcome.block.body.transactions.is_empty());
+    assert_eq!(outcome.block.body.transactions, [] as [Vec<u8>; 0]);
 
     // The block is sealed at FSM state `BlockProduced`; the witness
     // is persisted so `prove_block` can replay it.

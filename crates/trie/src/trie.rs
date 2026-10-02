@@ -376,10 +376,10 @@ impl<H: Hasher> Trie<H> {
                     // in the partial trie can call
                     // `absorb_into_parent` without panicking on a
                     // missing node fetch.
-                    if sibling != ZERO_HASH {
-                        if let Some(bytes) = self.nodes.get(&sibling) {
-                            out_nodes.insert(sibling, bytes.clone());
-                        }
+                    if sibling != ZERO_HASH
+                        && let Some(bytes) = self.nodes.get(&sibling)
+                    {
+                        out_nodes.insert(sibling, bytes.clone());
                     }
                     consumed += 1;
                     current = descended;
@@ -743,7 +743,7 @@ fn append_bits(out: &mut Vec<bool>, path: &BitPath) {
 }
 
 fn decode_raw_key(bits: &[bool]) -> Option<Vec<u8>> {
-    if bits.len() < 32 || bits.len() % 8 != 0 {
+    if bits.len() < 32 || !bits.len().is_multiple_of(8) {
         return None;
     }
     let mut encoded = vec![0_u8; bits.len() / 8];
@@ -803,7 +803,7 @@ mod tests {
     use crate::proof::{ProofError, ProofOutcome, ProofStep, ProofTerminal};
     use alloc::vec;
     use rand_chacha::ChaCha20Rng;
-    use rand_core::{RngCore, SeedableRng};
+    use rand_core::{Rng, SeedableRng};
 
     // The generic trie corpus uses `Blake3Hasher` so the reference
     // hasher keeps the same test coverage it had before the default
@@ -1054,8 +1054,8 @@ mod tests {
     #[test]
     fn drain_pending_returns_new_entries_and_then_empties() {
         let mut trie = TestTrie::new();
-        assert!(trie.drain_pending_nodes().is_empty());
-        assert!(trie.drain_pending_values().is_empty());
+        assert_eq!(trie.drain_pending_nodes(), [] as [(Hash, Vec<u8>); 0]);
+        assert_eq!(trie.drain_pending_values(), [] as [(Hash, Vec<u8>); 0]);
 
         trie.insert(b"a", b"1".to_vec()).expect("insert");
         let nodes = trie.drain_pending_nodes();
@@ -1063,8 +1063,8 @@ mod tests {
         assert!(!nodes.is_empty(), "insert must produce at least one node");
         assert!(!values.is_empty(), "insert must produce at least one value");
         // Second drain returns nothing because no new writes happened.
-        assert!(trie.drain_pending_nodes().is_empty());
-        assert!(trie.drain_pending_values().is_empty());
+        assert_eq!(trie.drain_pending_nodes(), [] as [(Hash, Vec<u8>); 0]);
+        assert_eq!(trie.drain_pending_values(), [] as [(Hash, Vec<u8>); 0]);
 
         // Re-inserting an identical value-byte does not record a new
         // value, since the value hash already lives in the value store.

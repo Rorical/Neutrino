@@ -8,7 +8,7 @@
 use core::fmt;
 
 use ed25519_dalek::{Signature as DalekSig, Signer, SigningKey, VerifyingKey};
-use rand_core::{CryptoRng, RngCore};
+use rand_core::CryptoRng;
 use zeroize::ZeroizeOnDrop;
 
 use crate::error::CryptoError;
@@ -24,7 +24,7 @@ pub struct PublicKey(VerifyingKey);
 
 impl SecretKey {
     /// Sample a fresh secret key from a cryptographically secure RNG.
-    pub fn generate(rng: &mut (impl CryptoRng + RngCore)) -> Self {
+    pub fn generate(rng: &mut impl CryptoRng) -> Self {
         Self(SigningKey::generate(rng))
     }
 
@@ -94,11 +94,12 @@ impl fmt::Debug for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     #[test]
     fn keygen_sign_verify_roundtrips() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let msg = b"hello, neutrino";
         let sig = sk.sign(msg);
@@ -107,7 +108,7 @@ mod tests {
 
     #[test]
     fn verify_fails_on_tampered_message() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let sig = sk.sign(b"original");
         assert_eq!(pk.verify(b"tampered", &sig), Err(CryptoError::Verification));
@@ -115,8 +116,8 @@ mod tests {
 
     #[test]
     fn verify_fails_on_wrong_pubkey() {
-        let sk1 = SecretKey::generate(&mut OsRng);
-        let sk2 = SecretKey::generate(&mut OsRng);
+        let sk1 = SecretKey::generate(&mut UnwrapErr(SysRng));
+        let sk2 = SecretKey::generate(&mut UnwrapErr(SysRng));
         let msg = b"msg";
         let sig = sk1.sign(msg);
         assert_eq!(
@@ -127,7 +128,7 @@ mod tests {
 
     #[test]
     fn verify_fails_on_bit_flipped_signature() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let msg = b"msg";
         let mut sig = sk.sign(msg);
@@ -137,7 +138,7 @@ mod tests {
 
     #[test]
     fn secret_key_roundtrips_bytes() {
-        let sk1 = SecretKey::generate(&mut OsRng);
+        let sk1 = SecretKey::generate(&mut UnwrapErr(SysRng));
         let bytes = sk1.to_bytes();
         let sk2 = SecretKey::from_bytes(&bytes);
         assert_eq!(sk1.public_key().to_bytes(), sk2.public_key().to_bytes());
@@ -145,7 +146,7 @@ mod tests {
 
     #[test]
     fn public_key_roundtrips_bytes() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk1 = sk.public_key();
         let pk2 = PublicKey::from_bytes(&pk1.to_bytes()).expect("valid");
         assert_eq!(pk1.to_bytes(), pk2.to_bytes());
@@ -164,7 +165,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_noncanonical_signature_scalar() {
-        let sk = SecretKey::generate(&mut OsRng);
+        let sk = SecretKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.public_key();
         let msg = b"canonical-scalar-check";
         let mut sig = sk.sign(msg);

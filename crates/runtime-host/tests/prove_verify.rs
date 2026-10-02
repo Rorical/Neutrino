@@ -379,7 +379,8 @@ fn real_prover_demonstration() {
     let elapsed = started.elapsed();
     println!("    elapsed                 {elapsed:.2?}");
 
-    let wire_bytes = bincode::serialize(&proof_bundle.proof).expect("bincode encode proof");
+    let wire_bytes = neutrino_prover_chunk::receipt_codec::encode(&proof_bundle.proof)
+        .expect("bincode encode proof");
     // `wire_bytes.len()` is the size of a Compressed STARK proof —
     // single-digit MiB in practice, well within f64's 2^52 mantissa.
     // The `as f64` cast can lose precision past 2^52, which can't

@@ -7,7 +7,7 @@ use crate::Sp1HostError;
 /// Ordinary execution validates receipts before any WASM state mutation.
 pub fn verify_input_receipts(input: &StfInput) -> Result<(), Sp1HostError> {
     std::panic::catch_unwind(|| {
-        neutrino_default_runtime_core::accountability::validate_input(input);
+        let _checked = neutrino_default_runtime_core::accountability::validate_input(input);
         for tx in &input.transactions {
             if let Transaction::SubmitEvidence(submission) = tx {
                 neutrino_prover_chunk::proof_verification::verify_evidence_receipt(

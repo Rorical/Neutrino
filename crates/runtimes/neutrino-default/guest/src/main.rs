@@ -10,7 +10,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use neutrino_default_runtime_core::{StfInput, StfPublicOutput, Transaction, apply_block};
+use neutrino_default_runtime_core::{
+    StfInput, StfPublicOutput, Transaction, apply_block_validated,
+};
 use neutrino_runtime_abi::StateWitness;
 use neutrino_runtime_core::WitnessState;
 
@@ -23,7 +25,7 @@ fn main() {
     let (input, witness): (StfInput, StateWitness) =
         borsh::from_slice(&bytes).expect("decode (StfInput, StateWitness)");
 
-    neutrino_default_runtime_core::accountability::validate_input(&input);
+    let checked = neutrino_default_runtime_core::accountability::validate_input(&input);
     for tx in &input.transactions {
         if let Transaction::SubmitEvidence(submission) = tx {
             neutrino_prover_chunk::proof_verification::verify_evidence_receipt(
@@ -36,10 +38,10 @@ fn main() {
     }
 
     // Verifying the witness against the claimed pre_state_root is the
-    // first thing the guest does. Any tamper aborts here.
+    // checked before state execution. Any tamper aborts here.
     let mut state = WitnessState::new(&witness).expect("witness must match claimed pre_state_root");
 
-    let output: StfPublicOutput = apply_block(&input, &mut state);
+    let output: StfPublicOutput = apply_block_validated(&checked, &mut state);
 
     let output_bytes = borsh::to_vec(&output).expect("encode StfPublicOutput");
     sp1_zkvm::io::commit_slice(&output_bytes);

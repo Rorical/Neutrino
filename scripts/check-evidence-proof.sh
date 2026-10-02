@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export NEUTRINO_EVIDENCE_GATE_DIR="${NEUTRINO_EVIDENCE_GATE_DIR:-$PWD/target/proof-acceptance/evidence-pipeline}"
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-4}"
 # Show shard clock progress during long CPU runs without dumping proof objects.
 export RUST_LOG="${RUST_LOG:-info,sp1_prover::worker::controller::splicing=debug,sp1_prover::worker::controller::global=debug}"

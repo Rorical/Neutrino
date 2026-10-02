@@ -198,7 +198,7 @@ impl<DB: Database> Engine<DB> {
                 .collect::<Result<Vec<_>, _>>()?,
         };
         std::panic::catch_unwind(|| {
-            neutrino_default_runtime_core::accountability::validate_input(&input);
+            let _checked = neutrino_default_runtime_core::accountability::validate_input(&input);
         })
         .map_err(|_| ProofError::InvalidWitness)?;
         Ok(())

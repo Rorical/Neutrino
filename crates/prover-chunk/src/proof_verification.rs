@@ -13,7 +13,7 @@ use neutrino_default_runtime_core::StfPublicOutput;
 use serde::Deserialize;
 use sp1_primitives::io::SP1PublicValues;
 use sp1_recursion_executor::RecursionPublicValues;
-use sp1_verifier::{SP1Proof, compressed::SP1CompressedVerifierRaw};
+use sp1_verifier::{SP1Proof, compressed::SP1CompressedVerifier};
 
 /// Maximum block proof envelope payload, matching the block-proof gossip cap.
 pub const MAX_PROOF_BYTES: usize = 2 * 1024 * 1024;
@@ -52,15 +52,7 @@ pub fn verify_evidence_receipt(
     if values.exit_code != sp1_primitives::SP1Field::default() {
         return Err(ProofRejectionReason::VerifierRejected);
     }
-    let raw =
-        bincode::serialize(&bundle.proof).map_err(|_| ProofRejectionReason::MalformedProof)?;
-    let digest = bincode::serialize(key).expect("fixed key encoding");
-    SP1CompressedVerifierRaw::verify_with_public_values(
-        &raw,
-        bundle.public_values.as_slice(),
-        &digest,
-    )
-    .map_err(|_| ProofRejectionReason::VerifierRejected)
+    verify_decoded_receipt(&bundle, key)
 }
 
 // Exact SDK 6.2.1 wire fields. Keeping the SDK host/prover itself out of the
@@ -132,13 +124,23 @@ pub fn verify_block_artifact(
     {
         return Err(ProofRejectionReason::PublicInputsMismatch);
     }
-    let raw =
-        bincode::serialize(&bundle.proof).map_err(|_| ProofRejectionReason::MalformedProof)?;
-    let digest = bincode::serialize(block_guest_vk_digest).expect("fixed key encoding");
-    SP1CompressedVerifierRaw::verify_with_public_values(
-        &raw,
-        bundle.public_values.as_slice(),
-        &digest,
-    )
-    .map_err(|_| ProofRejectionReason::VerifierRejected)
+    verify_decoded_receipt(&bundle, block_guest_vk_digest)
+}
+
+// Keep the SDK's exact key-field decoding while passing the already decoded
+// proof directly to its verifier. The large receipt is never re-encoded or
+// decoded a second time. Envelope, exit-code and statement checks stay above.
+fn verify_decoded_receipt(
+    bundle: &ProofBundle,
+    key: &[u32; 8],
+) -> Result<(), ProofRejectionReason> {
+    let SP1Proof::Compressed(proof) = &bundle.proof else {
+        return Err(ProofRejectionReason::MalformedProof);
+    };
+    let key_bytes = bincode::serialize(key).expect("fixed key encoding");
+    let key = bincode::deserialize::<[sp1_primitives::SP1Field; 8]>(&key_bytes)
+        .map_err(|_| ProofRejectionReason::VerifierRejected)?;
+    SP1CompressedVerifier::new()
+        .verify_compressed_with_public_values(proof, bundle.public_values.as_slice(), &key)
+        .map_err(|_| ProofRejectionReason::VerifierRejected)
 }

@@ -84,6 +84,15 @@ Block-to-chunk recursion still uses the optimized syscall. Evidence facts are
 never re-executed by the block, and evidence receipts are never rechecked by the
 chunk. Performance of this exact-byte recursive verification needs measurement.
 
+The exact-receipt verifier decodes the bounded envelope once and passes its
+compressed proof directly to the SDK's typed verifier. Circuit, successful exit,
+program identity, exact public values and trailing-byte rejection remain mandatory.
+The block shell retains an immutable validated-input token while verifying receipts,
+then executes that same input without repeating its historical binding checks.
+The token cannot be decoded from witness bytes and does not authorize a receipt.
+Chunk proving and verification share a lazy in-process key; all programs use the
+disk key cache addressed by circuit version and ELF hash.
+
 ## Protocol parameters and retention
 
 There is one current unversioned format for chain specs, headers, proofs, storage
@@ -132,6 +141,16 @@ Run the workspace checks in `AGENTS.md` and the separate real gate with
 `scripts/check-evidence-proof.sh`. Native execution and mock recursion do not
 establish real compressed composition acceptance. Acceptance of a previous ELF
 cannot be carried over to changed programs.
+
+The gate atomically saves each verified evidence, block and chunk proof under
+`target/proof-acceptance/evidence-pipeline`, configurable with
+`NEUTRINO_EVIDENCE_GATE_DIR`. Checkpoint identities bind the circuit version,
+stage ELF, exact inputs and expected statement. Block inputs include the exact
+evidence receipt; chunk inputs include the exact block proof and attestations.
+Restart reuses a matching stage only after cryptographic verification against its
+current expected statement. Invalid or corrupt checkpoints fail the gate;
+unfinished writes cannot publish a successful stage. Changed programs or inputs
+use separate artifacts, so a completed predecessor never authorizes a changed ELF.
 
 Long CPU gates can run from frozen test executables and subscribe to the preceding
 process's exit with kqueue. A local macOS notification reports completion; this

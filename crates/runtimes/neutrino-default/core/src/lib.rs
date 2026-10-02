@@ -1084,10 +1084,25 @@ pub struct StfPublicOutput {
 ///   `header.receipts_root` and `BlockProofPublicInputs.receipt_root`.
 #[allow(clippy::too_many_lines)] // Keep transaction dispatch and receipt accounting together.
 pub fn apply_block<B: StateBackend>(input: &StfInput, state: &mut B) -> StfPublicOutput {
+    let checked = accountability::validate_input(input);
+    apply_block_validated(&checked, state)
+}
+
+/// Execute the exact input checked by [`accountability::validate_input`].
+///
+/// Allows execution shells to verify receipts between binding validation and
+/// state mutation without repeating historical openings. Receipt authenticity
+/// remains an execution-shell obligation, as for [`apply_block`].
+#[allow(clippy::too_many_lines)] // Keep transaction dispatch and receipt accounting together.
+pub fn apply_block_validated<B: StateBackend>(
+    checked: &accountability::ValidatedInput<'_>,
+    state: &mut B,
+) -> StfPublicOutput {
+    let input = checked.input();
     let pre = state.pre_state_root();
     let mut applied: u32 = 0;
     let mut failed: u32 = 0;
-    let (accountability, mut gas_used, mut receipts) = accountability::apply(input, state);
+    let (accountability, mut gas_used, mut receipts) = accountability::apply(checked, state);
     let mut proposer_fee: u128 = 0;
     receipts.reserve(input.transactions.len());
 

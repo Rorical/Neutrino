@@ -1,6 +1,10 @@
 //! Exact-receipt evidence → block → chunk composition and fail-closed execution.
+#[path = "support/acceptance.rs"]
+pub mod acceptance;
 #[path = "../../prover-chunk/tests/support/mod.rs"]
 pub mod support;
+
+use acceptance::{AcceptanceCache, StageIdentity};
 
 use neutrino_consensus_types::{
     Body, FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
@@ -9,7 +13,7 @@ use neutrino_consensus_types::{
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::{StfInput, Transaction};
 use neutrino_primitives::{DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG};
-use neutrino_proof_system::ProofSystem;
+use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::{
     consensus::{
         ConsensusWitness, as_chunk, validate_candidate, validate_consensus, validate_successor,
@@ -22,7 +26,9 @@ use neutrino_runtime_core::{
     StateBackend,
     host::{LiveTrie, TracingState},
 };
-use neutrino_runtime_host::{Sp1ProofSystem, wasm::WasmRuntime};
+use neutrino_runtime_host::{
+    Sp1BlockProof, Sp1ProofSystem, proof_system::Sp1ChunkProof, wasm::WasmRuntime,
+};
 use sp1_sdk::{
     HashableKey, SP1Stdin,
     blocking::{Prover, ProverClient},
@@ -162,6 +168,7 @@ fn evidence_guest_matches_native_statement_and_rejects_forgery() {
 #[allow(clippy::too_many_lines)]
 fn evidence_block_chunk_real_compressed_recursion() {
     let system = Sp1ProofSystem::new(ProverClient::builder().cpu().build()).unwrap();
+    let cache = AcceptanceCache::from_env().unwrap();
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     let mut live = LiveTrie::default();
     live.insert(
@@ -193,8 +200,19 @@ fn evidence_block_chunk_real_compressed_recursion() {
     let evidence = evidence(&first);
     let statement = validate_evidence(&evidence).unwrap();
     eprintln!("evidence gate: prove objective misconduct");
-    let bytes = system.prove_evidence(&evidence).unwrap();
-    system.verify_evidence(&bytes, &statement).unwrap();
+    let evidence_identity = StageIdentity::new(
+        "evidence",
+        &neutrino_runtime_host::DEFAULT_EVIDENCE_GUEST_ELF,
+        &borsh::to_vec(&evidence).unwrap(),
+        &borsh::to_vec(&statement).unwrap(),
+    );
+    let bytes = cache
+        .prove_or_resume(
+            &evidence_identity,
+            |bytes| system.verify_evidence(bytes, &statement),
+            || system.prove_evidence(&evidence),
+        )
+        .unwrap();
     let mut wrong = statement.clone();
     wrong.offence_id[0] ^= 1;
     assert!(system.verify_evidence(&bytes, &wrong).is_err());
@@ -217,12 +235,32 @@ fn evidence_block_chunk_real_compressed_recursion() {
     );
     let mut next = successor_fixture(&first, &input, &dry.output, &live);
     eprintln!("evidence gate: prove block with exact receipt verification");
-    let proof = system
-        .prove_block(
-            &borsh::to_vec(&(input, dry.witness)).unwrap(),
-            &next.blocks[0].public_inputs,
+    let block_input = borsh::to_vec(&(input, dry.witness)).unwrap();
+    let block_identity = StageIdentity::new(
+        "block",
+        &neutrino_runtime_host::DEFAULT_GUEST_ELF,
+        &block_input,
+        &borsh::to_vec(&(&next.blocks[0].public_inputs, &dry.output)).unwrap(),
+    );
+    let proof_bytes = cache
+        .prove_or_resume(
+            &block_identity,
+            |bytes| {
+                let proof: Sp1BlockProof =
+                    borsh::from_slice(bytes).map_err(|_| ProofError::MalformedProof)?;
+                system.verify_block(&proof, &next.blocks[0].public_inputs)?;
+                if system.block_statement(&proof)? != dry.output {
+                    return Err(ProofError::PublicInputMismatch);
+                }
+                Ok(())
+            },
+            || {
+                let proof = system.prove_block(&block_input, &next.blocks[0].public_inputs)?;
+                borsh::to_vec(&proof).map_err(|_| ProofError::MalformedProof)
+            },
         )
         .unwrap();
+    let proof: Sp1BlockProof = borsh::from_slice(&proof_bytes).unwrap();
     let claim = &mut next.finality_cert.attestations[0];
     claim.proof_hashes = vec![commitment(&neutrino_consensus_types::BlockProof {
         height: 2,
@@ -234,9 +272,25 @@ fn evidence_block_chunk_real_compressed_recursion() {
     let expected = validate_successor(&previous, &next).unwrap();
     assert!(expected.next_context.active_validators[0].slashed);
     eprintln!("evidence gate: prove and verify consensus chunk");
-    let chunk_proof = system.prove_consensus_chunk(&[proof], &next).unwrap();
-    system
-        .verify_consensus_chunk(&chunk_proof, &expected)
+    let chunk_identity = StageIdentity::new(
+        "chunk",
+        &neutrino_runtime_host::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF,
+        &borsh::to_vec(&(&next, &proof_bytes)).unwrap(),
+        &borsh::to_vec(&expected).unwrap(),
+    );
+    cache
+        .prove_or_resume(
+            &chunk_identity,
+            |bytes| {
+                let proof: Sp1ChunkProof =
+                    borsh::from_slice(bytes).map_err(|_| ProofError::MalformedProof)?;
+                system.verify_consensus_chunk(&proof, &expected)
+            },
+            || {
+                let proof = system.prove_consensus_chunk(&[proof], &next)?;
+                borsh::to_vec(&proof).map_err(|_| ProofError::MalformedProof)
+            },
+        )
         .unwrap();
 }
 

@@ -30,9 +30,10 @@ use sp1_sdk::{
     SP1VerifyingKey,
     blocking::{MockProver, ProveRequest, Prover, ProverClient},
 };
+use std::sync::{Arc, Mutex};
 
 use crate::executor::decode_witness_bundle;
-use crate::{ProverCtx, Sp1HostError, sdk_err};
+use crate::{ProverCtx, Sp1HostError};
 
 /// Wire form of an SP1 block proof.
 ///
@@ -116,6 +117,8 @@ pub struct Sp1ProofSystem<P: Prover> {
     /// Independent evidence guest; no runtime deduction logic is trusted here.
     evidence_pk: P::ProvingKey,
     evidence_vk: SP1VerifyingKey,
+    /// Initialized on first chunk use and shared by proving and verification.
+    chunk_pk: Mutex<Option<Arc<SP1ProvingKey>>>,
 }
 
 impl<P> Sp1ProofSystem<P>
@@ -129,16 +132,31 @@ where
     /// Returns [`Sp1HostError::Sdk`] if `setup` fails for either ELF.
     pub fn new(prover: P) -> Result<Self, Sp1HostError> {
         let ctx = ProverCtx::new_cached(prover)?;
-        let evidence_proving_key = ctx
-            .prover
-            .setup(crate::DEFAULT_EVIDENCE_GUEST_ELF.clone())
-            .map_err(sdk_err)?;
+        let evidence_proving_key =
+            crate::cached_proving_key(&ctx.prover, crate::DEFAULT_EVIDENCE_GUEST_ELF.clone())?;
         let evidence_vk = evidence_proving_key.verifying_key().clone();
         Ok(Self {
             ctx,
             evidence_pk: evidence_proving_key,
             evidence_vk,
+            chunk_pk: Mutex::new(None),
         })
+    }
+
+    fn chunk_proving_key(&self) -> Result<Arc<SP1ProvingKey>, Sp1HostError> {
+        let mut cached = self.chunk_pk.lock().map_err(|_| {
+            Sp1HostError::Sdk("chunk proving-key cache lock is poisoned".to_owned())
+        })?;
+        if let Some(key) = cached.as_ref() {
+            return Ok(Arc::clone(key));
+        }
+        let key = Arc::new(crate::cached_proving_key(
+            &self.ctx.prover,
+            crate::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF.clone(),
+        )?);
+        *cached = Some(Arc::clone(&key));
+        drop(cached);
+        Ok(key)
     }
 
     /// Verifying key bound to the embedded [`DEFAULT_GUEST_ELF`].
@@ -506,9 +524,7 @@ where
             stdin.write_proof(*inner, self.ctx.vk.vk.clone());
         }
         let pk = self
-            .ctx
-            .prover
-            .setup(crate::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF.clone())
+            .chunk_proving_key()
             .map_err(|_| ProofError::BackendRejected)?;
         let proof = self
             .ctx
@@ -553,9 +569,7 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
         let pk = self
-            .ctx
-            .prover
-            .setup(crate::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF.clone())
+            .chunk_proving_key()
             .map_err(|_| ProofError::BackendRejected)?;
         self.ctx
             .prover

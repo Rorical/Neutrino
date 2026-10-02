@@ -72,7 +72,8 @@ pub fn load_queue<B: StateBackend>(state: &mut B) -> Vec<PendingSanction> {
 
 /// Check input shape before any writes; receipt authenticity is an outer-shell
 /// obligation and is never inferred from an input boolean.
-pub fn validate_input(input: &StfInput) {
+#[must_use]
+pub fn validate_input(input: &StfInput) -> ValidatedInput<'_> {
     let policy = input.evidence_anchor.policy;
     assert!(
         policy.evidence_max_age_blocks > 0
@@ -106,15 +107,34 @@ pub fn validate_input(input: &StfInput) {
         count <= policy.evidence_admissions_per_block,
         "evidence admission cap"
     );
+    ValidatedInput { input }
+}
+
+/// An immutable input whose policy, evidence ordering and historical bindings
+/// have been checked.
+///
+/// Only [`validate_input`] can construct this token.
+/// It does not establish receipt authenticity; the execution shell still owns
+/// exact proof verification before invoking the state transition.
+pub struct ValidatedInput<'a> {
+    input: &'a StfInput,
+}
+
+impl ValidatedInput<'_> {
+    /// The exact input checked by [`validate_input`].
+    #[must_use]
+    pub const fn input(&self) -> &StfInput {
+        self.input
+    }
 }
 
 /// Admit all proof-authenticated claims, then execute the mandatory FIFO prefix
 /// before ordinary transactions. Returns reserved gas and autonomous receipts.
-pub fn apply<B: StateBackend>(
-    input: &StfInput,
+pub(crate) fn apply<B: StateBackend>(
+    checked: &ValidatedInput<'_>,
     state: &mut B,
 ) -> (AccountabilityOutput, u64, Vec<Receipt>) {
-    validate_input(input);
+    let input = checked.input();
     let policy = input.evidence_anchor.policy;
     let mut queue = load_queue(state);
     assert!(
@@ -227,6 +247,8 @@ pub fn withdrawal_held<B: StateBackend>(state: &mut B, address: &Address) -> boo
 
 #[cfg(test)]
 pub(crate) mod tests {
+    extern crate std;
+
     use super::*;
     use alloc::vec;
     use neutrino_consensus_types::evidence::{
@@ -295,6 +317,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn invalid_historical_binding_is_rejected_before_state_access() {
+        let mut input = input();
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
+        input.evidence_anchor.history_root[0] ^= 1;
+        let live = LiveTrie::default();
+        let mut state = TracingState::new(&live);
+        let root = state.pre_state_root();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::apply_block(&input, &mut state)
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(state.post_state_root(), root);
+        let witness = state.into_witness();
+        assert!(witness.witnessed_keys.is_empty());
+    }
+
+    #[test]
     fn fifo_holds_withdrawals_and_executes_without_new_transactions() {
         let mut input = input();
         input.evidence_anchor.policy.evidence_executions_per_block = 1;
@@ -321,7 +360,8 @@ pub(crate) mod tests {
         assert!(withdrawal_held(&mut state, &[2; 32]));
         let (post, witness) = state.into_committed_and_witness();
         let mut guest = WitnessState::new(&witness).unwrap();
-        assert_eq!(crate::apply_block(&input, &mut guest), output);
+        let checked = validate_input(&input);
+        assert_eq!(crate::apply_block_validated(&checked, &mut guest), output);
         let next_live = LiveTrie::from_trie(post);
         let mut next = TracingState::new(&next_live);
         input.transactions.clear();

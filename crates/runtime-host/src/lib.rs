@@ -263,13 +263,8 @@ where
     /// Returns [`Sp1HostError::Sdk`] if `setup` is reached and fails.
     /// Disk errors are non-fatal — they fall back to `setup`.
     pub fn new_cached_for(prover: P, elf: Elf) -> Result<Self, Sp1HostError> {
-        if let Some(vk) = load_cached_vk_for(&elf) {
-            let pk = SP1ProvingKey::new(vk.clone(), elf);
-            return Ok(Self { prover, pk, vk });
-        }
-        let pk = prover.setup(elf.clone()).map_err(sdk_err)?;
+        let pk = cached_proving_key(&prover, elf)?;
         let vk = pk.verifying_key().clone();
-        let _ = save_cached_vk_for(&elf, &vk);
         Ok(Self { prover, pk, vk })
     }
 
@@ -280,6 +275,20 @@ where
     pub fn new_cached(prover: P) -> Result<Self, Sp1HostError> {
         Self::new_cached_for(prover, DEFAULT_GUEST_ELF.clone())
     }
+}
+
+// All programs share the same circuit-version/ELF-addressed cache. Reconstruct
+// the SDK key from its verification-key material without repeating ROM setup.
+pub(crate) fn cached_proving_key<P>(prover: &P, elf: Elf) -> Result<SP1ProvingKey, Sp1HostError>
+where
+    P: Prover<ProvingKey = SP1ProvingKey>,
+{
+    if let Some(vk) = load_cached_vk_for(&elf) {
+        return Ok(SP1ProvingKey::new(vk, elf));
+    }
+    let pk = prover.setup(elf.clone()).map_err(sdk_err)?;
+    let _ = save_cached_vk_for(&elf, pk.verifying_key());
+    Ok(pk)
 }
 
 // ---------------------------------------------------------------------------

@@ -211,7 +211,7 @@ async fn tampered_state_root_blocks_import() {
     let v0 = proposer(0);
     let backend_a = build_backend(v0.clone()).await;
     let backend_b = build_backend(v0.clone()).await;
-    let genesis_head = backend_b.local_status().await.head_block_hash;
+    let genesis_head = backend_b.local_status().await.unwrap().head_block_hash;
 
     let block = produce_legitimate_block(Arc::clone(&backend_a), v0.clone()).await;
     let tampered = tamper_state_root(block, &v0);
@@ -225,7 +225,7 @@ async fn tampered_state_root_blocks_import() {
         "expected SyncBackendError::Rejected on dry-run mismatch (got {err:?})",
     );
 
-    let head_after = backend_b.local_status().await.head_block_hash;
+    let head_after = backend_b.local_status().await.unwrap().head_block_hash;
     assert_eq!(
         head_after, genesis_head,
         "head must not advance on a rejected block",
@@ -253,7 +253,7 @@ async fn sibling_block_dry_run_rejects_tampered_state_root() {
     let backend_v0 = build_backend(v0.clone()).await;
     let backend_v1 = build_backend(v1.clone()).await;
     let target = build_backend(v0.clone()).await;
-    let genesis_head = target.local_status().await.head_block_hash;
+    let genesis_head = target.local_status().await.unwrap().head_block_hash;
 
     let block_a = produce_legitimate_block(Arc::clone(&backend_v0), v0.clone()).await;
     let block_b = produce_legitimate_block(Arc::clone(&backend_v1), v1.clone()).await;
@@ -272,7 +272,7 @@ async fn sibling_block_dry_run_rejects_tampered_state_root() {
         .verify_and_import_gossip_block(block_a.clone())
         .await
         .expect("block_a imports cleanly as the extending block");
-    let head_after_a = target.local_status().await.head_block_hash;
+    let head_after_a = target.local_status().await.unwrap().head_block_hash;
     assert_eq!(head_after_a, block_a.hash());
 
     // block_b arrives → its parent (genesis) ≠ target's head
@@ -293,7 +293,7 @@ async fn sibling_block_dry_run_rejects_tampered_state_root() {
     // Head must not have moved — block_a is still the materialised
     // tip; the sibling DAG entry is not added because import
     // failed before fork-choice registration.
-    let head_after_b = target.local_status().await.head_block_hash;
+    let head_after_b = target.local_status().await.unwrap().head_block_hash;
     assert_eq!(
         head_after_b,
         block_a.hash(),
@@ -313,7 +313,7 @@ async fn sync_path_runs_dry_run_against_tampered_state_root() {
     let v0 = proposer(0);
     let backend_a = build_backend(v0.clone()).await;
     let backend_b = build_backend(v0.clone()).await;
-    let genesis_head = backend_b.local_status().await.head_block_hash;
+    let genesis_head = backend_b.local_status().await.unwrap().head_block_hash;
 
     let block = produce_legitimate_block(Arc::clone(&backend_a), v0.clone()).await;
     let tampered = tamper_state_root(block, &v0);
@@ -329,7 +329,7 @@ async fn sync_path_runs_dry_run_against_tampered_state_root() {
         "expected SyncBackendError::Rejected on sync dry-run mismatch (got {err:?})",
     );
 
-    let head_after = backend_b.local_status().await.head_block_hash;
+    let head_after = backend_b.local_status().await.unwrap().head_block_hash;
     assert_eq!(
         head_after, genesis_head,
         "head must not advance on a sync-time dry-run rejection",
@@ -343,7 +343,7 @@ async fn tampered_gas_used_blocks_import() {
     let v0 = proposer(0);
     let backend_a = build_backend(v0.clone()).await;
     let backend_b = build_backend(v0.clone()).await;
-    let genesis_head = backend_b.local_status().await.head_block_hash;
+    let genesis_head = backend_b.local_status().await.unwrap().head_block_hash;
 
     let block = produce_legitimate_block(Arc::clone(&backend_a), v0.clone()).await;
     let tampered = tamper_gas_used(block, &v0);
@@ -357,7 +357,7 @@ async fn tampered_gas_used_blocks_import() {
         "expected SyncBackendError::Rejected on gas_used mismatch (got {err:?})",
     );
 
-    let head_after = backend_b.local_status().await.head_block_hash;
+    let head_after = backend_b.local_status().await.unwrap().head_block_hash;
     assert_eq!(
         head_after, genesis_head,
         "head must not advance on a rejected block",

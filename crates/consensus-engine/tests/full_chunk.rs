@@ -244,13 +244,20 @@ fn successor_bft_uses_the_proven_validator_root_without_a_recursive_checkpoint()
         .get_block_proof(&header.hash())
         .unwrap()
         .unwrap();
+    header.parent_hash = header.hash();
     header.height = 2;
     header.slot = 2;
     let hash = engine.store_mut().put_header(&header).unwrap();
     proof.height = 2;
     proof.block_hash = hash;
     proof.public_inputs.height = 2;
+    proof.public_inputs.parent_block_hash = header.parent_hash;
     proof.public_inputs.block_hash = hash;
+    let genesis = engine.chain_spec().genesis_block_hash;
+    engine
+        .store_mut()
+        .commit_tip(hash, genesis, neutrino_storage::Batch::new())
+        .unwrap();
     engine.store_mut().put_block_proof(&hash, &proof).unwrap();
     engine.open_bft_session(successor).unwrap();
     let certificate = engine
@@ -342,4 +349,17 @@ fn local_proving_requires_a_persisted_execution_witness() {
         matches!(engine.prove_block(&hash, &neutrino_proof_system::MockProofSystem::new()),
         Err(neutrino_consensus_engine::ProveError::MissingWitness(missing)) if missing == hash)
     );
+}
+
+#[test]
+fn chunk_preparation_uses_the_materialized_branch_after_sibling_archival() {
+    let (mut engine, witness) = engine();
+    let mut sibling = witness.blocks[0].header.clone();
+    sibling.slot += 1;
+    engine.store_mut().put_header(&sibling).unwrap();
+    let prepared = engine
+        .prepare_consensus_chunk(0, &NativeConsensusBackend { reject: false })
+        .unwrap();
+    assert_eq!(prepared.witness.blocks, witness.blocks);
+    assert_ne!(prepared.witness.blocks[0].header.hash(), sibling.hash());
 }

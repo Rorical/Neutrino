@@ -157,7 +157,7 @@ fn reopen_backend_on(db: MemoryDatabase) -> Arc<ChainBackend<MemoryDatabase, Moc
 async fn double_proposal_evidence_survives_restart() {
     let backend_a = fresh_backend_on(MemoryDatabase::new());
     let v0 = proposer(0);
-    let genesis_hash = backend_a.local_status().await.head_block_hash;
+    let genesis_hash = backend_a.local_status().await.unwrap().head_block_hash;
 
     let block_a = signed_block(1, genesis_hash, 1, 0x11, &v0);
     let block_b = signed_block(1, genesis_hash, 1, 0x22, &v0);
@@ -210,7 +210,7 @@ async fn double_proposal_evidence_survives_restart() {
 async fn drain_persists_across_restart() {
     let backend_a = fresh_backend_on(MemoryDatabase::new());
     let v0 = proposer(0);
-    let genesis_hash = backend_a.local_status().await.head_block_hash;
+    let genesis_hash = backend_a.local_status().await.unwrap().head_block_hash;
 
     backend_a
         .verify_and_import_gossip_block(signed_block(1, genesis_hash, 1, 0x33, &v0))

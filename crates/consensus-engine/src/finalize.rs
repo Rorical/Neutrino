@@ -26,6 +26,8 @@ extern crate alloc;
 pub enum FinalizeError<E> {
     /// Engine bookkeeping or storage failure.
     Engine(EngineError<E>),
+    /// Staging the proven branch's materialized state failed.
+    Replay(crate::ImportError<E>),
     /// `chunk_id` did not advance by exactly one from the latest
     /// finalized chunk (or was non-zero with no prior finalization).
     NonContiguousChunkId {
@@ -91,6 +93,7 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for FinalizeError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(e) => write!(f, "engine error: {e}"),
+            Self::Replay(e) => write!(f, "branch replay failed: {e}"),
             Self::NonContiguousChunkId { latest, requested } => match latest {
                 Some(latest) => write!(
                     f,

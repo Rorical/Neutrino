@@ -22,7 +22,7 @@ fn storage_error(error: impl core::fmt::Display) -> QueryError {
     QueryError::Storage(error.to_string())
 }
 
-fn checked_header<DB: Database>(
+pub(super) fn checked_header<DB: Database>(
     engine: &Engine<DB>,
     hash: BlockHash,
 ) -> Result<Option<Header>, QueryError>
@@ -43,7 +43,7 @@ where
     checked_header(engine, hash)?.ok_or_else(|| storage_error("selected chain header is missing"))
 }
 
-fn finalized_info<DB: Database>(engine: &Engine<DB>) -> Result<FinalizedInfo, QueryError>
+pub(super) fn finalized_info<DB: Database>(engine: &Engine<DB>) -> Result<FinalizedInfo, QueryError>
 where
     DB::Error: core::fmt::Debug + core::fmt::Display,
 {
@@ -95,32 +95,24 @@ where
             if *height > engine.head_height() {
                 return Ok(None);
             }
-            // The store's height index records the most recently imported fork.
-            // RPC heights follow the selected, materialized head's ancestry.
-            let mut hash = engine.head_hash();
-            let mut expected_height = engine.head_height();
-            while expected_height > 0 {
-                let header = required_header(engine, hash)?;
-                if header.height != expected_height {
-                    return Err(storage_error("selected chain heights are not contiguous"));
+            let hash = engine
+                .store()
+                .get_block_hash_by_height(*height)
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_error("canonical height is missing"))?;
+            if *height == 0 {
+                if hash != engine.chain_spec().genesis_block_hash {
+                    return Err(storage_error("canonical genesis anchor is inconsistent"));
                 }
-                if expected_height == *height {
-                    return Ok(Some(hash));
-                }
-                hash = header.parent_hash;
-                expected_height -= 1;
-            }
-            if hash != engine.chain_spec().genesis_block_hash {
-                return Err(storage_error(
-                    "selected chain does not reach trusted genesis",
-                ));
+            } else if required_header(engine, hash)?.height != *height {
+                return Err(storage_error("canonical height does not match its header"));
             }
             Ok(Some(hash))
         }
     }
 }
 
-fn read_block<DB: Database>(
+pub(super) fn read_block<DB: Database>(
     engine: &Engine<DB>,
     hash: BlockHash,
 ) -> Result<Option<Block>, QueryError>
@@ -157,7 +149,43 @@ where
     } else {
         required_header(engine, hash)?.state_root
     };
+    let data = read_state_data(engine, root)?;
+    Ok(Trie::from_persisted(root, data.nodes, data.values))
+}
+
+pub(super) struct AuthenticatedState {
+    pub(super) nodes: BTreeMap<Hash, Vec<u8>>,
+    pub(super) values: BTreeMap<Hash, Vec<u8>>,
+}
+
+pub(super) fn read_state_data<DB: Database>(
+    engine: &Engine<DB>,
+    root: Hash,
+) -> Result<AuthenticatedState, QueryError>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
     let db = engine.store().db();
+    authenticate_state(
+        root,
+        |hash| {
+            db.get(Column::TrieNodes, &hash)
+                .map_err(storage_error)?
+                .ok_or(QueryError::StateUnavailable)
+        },
+        |hash| {
+            db.get(Column::StateValues, &hash)
+                .map_err(storage_error)?
+                .ok_or(QueryError::StateUnavailable)
+        },
+    )
+}
+
+pub(super) fn authenticate_state(
+    root: Hash,
+    mut node_bytes: impl FnMut(Hash) -> Result<Vec<u8>, QueryError>,
+    mut value_bytes: impl FnMut(Hash) -> Result<Vec<u8>, QueryError>,
+) -> Result<AuthenticatedState, QueryError> {
     let mut pending = vec![root];
     let mut nodes = BTreeMap::new();
     let mut values = BTreeMap::new();
@@ -167,10 +195,7 @@ where
         if hash == ZERO_HASH || nodes.contains_key(&hash) {
             continue;
         }
-        let bytes = db
-            .get(Column::TrieNodes, &hash)
-            .map_err(storage_error)?
-            .ok_or(QueryError::StateUnavailable)?;
+        let bytes = node_bytes(hash)?;
         if Poseidon2Hasher::hash_node(&bytes) != hash {
             return Err(storage_error("trie node does not match its content hash"));
         }
@@ -178,10 +203,7 @@ where
             Node::Leaf { value_hash, .. } => {
                 if let std::collections::btree_map::Entry::Vacant(entry) = values.entry(value_hash)
                 {
-                    let value = db
-                        .get(Column::StateValues, &value_hash)
-                        .map_err(storage_error)?
-                        .ok_or(QueryError::StateUnavailable)?;
+                    let value = value_bytes(value_hash)?;
                     if Poseidon2Hasher::hash_value(&value) != value_hash {
                         return Err(storage_error("state value does not match its content hash"));
                     }
@@ -198,7 +220,7 @@ where
         }
         nodes.insert(hash, bytes);
     }
-    Ok(Trie::from_persisted(root, nodes, values))
+    Ok(AuthenticatedState { nodes, values })
 }
 
 impl<DB, P> ChainBackend<DB, P>

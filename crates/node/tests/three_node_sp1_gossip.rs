@@ -216,7 +216,7 @@ async fn drive_follower_until_proven(handle: &mut NodeHandle, target_height: u64
                 }
             }
 
-            let proven = backend.local_progress().await.proven_height;
+            let proven = backend.local_progress().await.unwrap().proven_height;
             if proven >= target_height {
                 return (backend.head_height(), proven);
             }
@@ -438,22 +438,42 @@ async fn three_nodes_agree_with_real_sp1_proof_envelopes() {
 
     let canonical_hash = outcome.block_hash;
     assert_eq!(
-        handle_0.backend.local_status().await.head_block_hash,
+        handle_0
+            .backend
+            .local_status()
+            .await
+            .unwrap()
+            .head_block_hash,
         canonical_hash
     );
     assert_eq!(
-        handle_1.backend.local_status().await.head_block_hash,
+        handle_1
+            .backend
+            .local_status()
+            .await
+            .unwrap()
+            .head_block_hash,
         canonical_hash
     );
     assert_eq!(
-        handle_2.backend.local_status().await.head_block_hash,
+        handle_2
+            .backend
+            .local_status()
+            .await
+            .unwrap()
+            .head_block_hash,
         canonical_hash
     );
 
     assert_eq!(proven_1, 1, "follower 1 proven height");
     assert_eq!(proven_2, 1, "follower 2 proven height");
     assert_eq!(
-        handle_0.backend.local_progress().await.proven_height,
+        handle_0
+            .backend
+            .local_progress()
+            .await
+            .unwrap()
+            .proven_height,
         1,
         "producer proven height",
     );

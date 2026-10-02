@@ -6,6 +6,9 @@ EvidenceProof admission and deterministic sanction execution, proof-gated valida
 rotation, follower replay, gossip/RPC backfill and restart state restoration.
 RPC finality follows verified chunks, and state/runtime queries authenticate the
 selected block's retained state, including history and side branches by hash.
+Canonical height indexes commit with the materialized tip/state, and P2P ranges
+pin an advertised branch across reorgs. RPC failures and unavailable data are
+explicit; chunk and recursive checkpoint progress have independent wire fields.
 
 Acceptance remains distinct from implementation. Workspace build/tests/Clippy/fmt
 must pass after any protocol change. Real EvidenceProof → block → chunk compressed

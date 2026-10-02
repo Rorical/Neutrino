@@ -261,7 +261,7 @@ async fn invalid_proof_signing_detector_emits_evidence_on_precommit() {
     let v1 = proposer(1);
 
     // Step 1: import block 1 via the gossip path (peer-signed).
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
     let block_1 = signed_block(1, genesis_hash, 1, &v0);
     backend
         .verify_and_import_gossip_block(block_1.clone())
@@ -342,7 +342,7 @@ async fn prevote_does_not_trigger_invalid_proof_signing_detector() {
     let v0 = proposer(0);
     let v1 = proposer(1);
 
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
     let block_1 = signed_block(1, genesis_hash, 1, &v0);
     backend
         .verify_and_import_gossip_block(block_1.clone())
@@ -373,7 +373,7 @@ async fn ingest_rejects_invalid_proof_signing_evidence_whose_proof_verifies() {
     let v0 = proposer(0);
     let v1 = proposer(1);
 
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
     let block_1 = signed_block(1, genesis_hash, 1, &v0);
     backend
         .verify_and_import_gossip_block(block_1.clone())
@@ -417,7 +417,7 @@ async fn ingest_rejects_invalid_proof_signing_evidence_whose_proof_verifies() {
 #[tokio::test]
 async fn ordinary_precommit_does_not_accept_a_peers_substituted_proof() {
     let backend = fresh_backend();
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
     let block = signed_block(1, genesis_hash, 1, &proposer(0));
     backend
         .verify_and_import_gossip_block(block.clone())
@@ -442,7 +442,7 @@ async fn ordinary_precommit_does_not_accept_a_peers_substituted_proof() {
 #[tokio::test]
 async fn aggregate_only_proof_acceptance_attributes_every_signer() {
     let backend = fresh_backend();
-    let genesis = backend.local_status().await.head_block_hash;
+    let genesis = backend.local_status().await.unwrap().head_block_hash;
     let block = signed_block(1, genesis, 1, &proposer(0));
     backend
         .verify_and_import_gossip_block(block.clone())

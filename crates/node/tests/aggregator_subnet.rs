@@ -271,7 +271,9 @@ async fn finalized_index(handle: &NodeHandle) -> neutrino_primitives::Checkpoint
         .backend
         .local_status()
         .await
-        .finalized_checkpoint_index
+        .unwrap()
+        .finalized_chunk_id
+        .map_or(0, |id| id + 1)
 }
 
 async fn produce_and_publish_first_block(handle: &NodeHandle, producer_key: &ProposerKey) {
@@ -332,8 +334,8 @@ async fn drive_until_both_finalised(
             tokio::time::Instant::now() < deadline,
             "aggregator-subnet BFT loop did not finalise chunk 0 within timeout. \
              A.progress={:?}, B.progress={:?}, A.pending={}, B.pending={}",
-            handle_a.backend.local_progress().await,
-            handle_b.backend.local_progress().await,
+            handle_a.backend.local_progress().await.unwrap(),
+            handle_b.backend.local_progress().await.unwrap(),
             handle_a.pending_proofs.len(),
             handle_b.pending_proofs.len(),
         );

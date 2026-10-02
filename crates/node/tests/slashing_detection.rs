@@ -187,7 +187,7 @@ fn fresh_backend() -> Arc<ChainBackend<MemoryDatabase, MockProofSystem>> {
 async fn detects_double_proposal_from_two_gossiped_blocks() {
     let backend = fresh_backend();
     let v0 = proposer(0);
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
 
     let block_a = signed_block(1, genesis_hash, 1, 0x11, &v0);
     let block_b = signed_block(1, genesis_hash, 1, 0x22, &v0);
@@ -341,7 +341,7 @@ async fn aggregated_votes_do_not_trigger_double_vote_detection() {
 async fn peer_evidence_is_verified_before_pooling() {
     let backend = fresh_backend();
     let v0 = proposer(0);
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
 
     // Genuine equivocation evidence assembled out-of-band.
     let block_a = signed_block(2, genesis_hash, 1, 0x11, &v0);
@@ -385,7 +385,7 @@ async fn drain_slashing_pool_returns_items_in_fifo_order() {
     let backend = fresh_backend();
     let v0 = proposer(0);
     let v1 = proposer(1);
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
 
     // Two DoubleProposal items via direct ingest (skip the engine
     // import path so we can populate without chain side effects).
@@ -834,7 +834,7 @@ async fn invalid_vrf_evidence_construction_round_trips() {
     // VRF failure.
     let backend = fresh_backend();
     let v0 = proposer(0);
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
 
     // Build a header whose VRF proof is identically zero — this
     // deterministically fails BLS decoding with `InvalidProof`,

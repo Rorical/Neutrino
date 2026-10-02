@@ -14,7 +14,7 @@
 //!   and every follower's `verify_block` cross-checks.
 //!
 //! Convergence assertion: all 16 validators reach
-//! `finalized_checkpoint_index >= 1` within the test window — the
+//! `finalized_chunk_id == Some(0)` within the test window — the
 //! M7-new headline criterion over real SP1 envelopes.
 
 use std::sync::Arc;
@@ -337,7 +337,9 @@ async fn finalized_index(handle: &NodeHandle) -> neutrino_primitives::Checkpoint
         .backend
         .local_status()
         .await
-        .finalized_checkpoint_index
+        .unwrap()
+        .finalized_chunk_id
+        .map_or(0, |id| id + 1)
 }
 
 /// Producer (v0) drives the real production path: WASM dry-run →
@@ -409,7 +411,7 @@ async fn wait_for_all_finalised(
             let mut proven_heights = Vec::with_capacity(handles.len());
             let mut next_chunks = Vec::with_capacity(handles.len());
             for h in handles {
-                let progress = h.backend.local_progress().await;
+                let progress = h.backend.local_progress().await.unwrap();
                 head_heights.push(progress.head_height);
                 proven_heights.push(progress.proven_height);
                 next_chunks.push(h.backend.next_chunk_to_close());

@@ -115,7 +115,7 @@ async fn status_reflects_engine_head_at_genesis() {
     let engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
 
-    let status = backend.local_status().await;
+    let status = backend.local_status().await.unwrap();
     assert_eq!(status.chain_id, 9);
     assert_eq!(status.head_height, 0);
     assert_eq!(status.head_block_hash, [0xAA; 32]);
@@ -128,7 +128,7 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
     let engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
 
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
     let b1 = block(1, 1, genesis_hash, [0x11; 32]);
     let imported = backend
         .verify_and_import_gossip_block(b1.clone())
@@ -137,15 +137,23 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
     assert_eq!(imported.new_head_height, 1);
     assert_eq!(imported.new_head_hash, b1.hash());
 
-    let status = backend.local_status().await;
+    let status = backend.local_status().await.unwrap();
     assert_eq!(status.head_height, 1);
     assert_eq!(status.head_block_hash, b1.hash());
 
-    let resp = backend.blocks_by_range(1, 8, 1).await;
+    let resp = backend
+        .blocks_by_range(
+            1,
+            8,
+            1,
+            backend.local_status().await.unwrap().head_block_hash,
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.blocks.len(), 1);
     assert_eq!(resp.blocks[0].hash(), b1.hash());
 
-    let by_root = backend.blocks_by_root(&[b1.hash()]).await;
+    let by_root = backend.blocks_by_root(&[b1.hash()]).await.unwrap();
     assert_eq!(by_root.blocks.len(), 1);
 
     backend.with_engine_mut_for_test(|engine| {
@@ -158,11 +166,14 @@ async fn gossipped_block_extends_head_and_appears_in_blocks_by_range() {
         .prove_block(&b1.hash())
         .expect("prove imported block")
         .block_proof;
-    let by_height = backend.block_proofs_by_height(1, 1).await;
+    let by_height = backend
+        .block_proofs_by_height(1, 1, backend.local_status().await.unwrap().head_block_hash)
+        .await
+        .unwrap();
     assert_eq!(by_height.proofs, vec![proof.clone()]);
-    let by_hash = backend.block_proofs_by_hash(&[b1.hash()]).await;
+    let by_hash = backend.block_proofs_by_hash(&[b1.hash()]).await.unwrap();
     assert_eq!(by_hash.proofs, vec![proof]);
-    assert_eq!(backend.local_progress().await.proven_height, 1);
+    assert_eq!(backend.local_progress().await.unwrap().proven_height, 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -170,7 +181,7 @@ async fn duplicate_gossip_block_is_idempotent_and_preserves_proof_state() {
     let engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
 
-    let genesis_hash = backend.local_status().await.head_block_hash;
+    let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
     let b1 = block(1, 1, genesis_hash, [0x11; 32]);
     backend
         .verify_and_import_gossip_block(b1.clone())
@@ -186,7 +197,7 @@ async fn duplicate_gossip_block_is_idempotent_and_preserves_proof_state() {
         .prove_block(&b1.hash())
         .expect("prove first import")
         .block_proof;
-    let before = backend.local_progress().await;
+    let before = backend.local_progress().await.unwrap();
     let outcome = backend
         .verify_and_import_gossip_block(b1.clone())
         .await
@@ -194,11 +205,15 @@ async fn duplicate_gossip_block_is_idempotent_and_preserves_proof_state() {
     assert_eq!(outcome.new_head_height, 1);
     assert_eq!(outcome.new_head_hash, b1.hash());
     assert_eq!(
-        backend.local_progress().await.proven_height,
+        backend.local_progress().await.unwrap().proven_height,
         before.proven_height
     );
     assert_eq!(
-        backend.block_proofs_by_height(1, 1).await.proofs,
+        backend
+            .block_proofs_by_height(1, 1, backend.local_status().await.unwrap().head_block_hash)
+            .await
+            .unwrap()
+            .proofs,
         vec![proof]
     );
 }

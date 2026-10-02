@@ -22,9 +22,12 @@ from recursive checkpoints and checkpoint-based pruning are not implemented.
 Retention policies must preserve evidence openings, exact signed artifacts and
 admitted withdrawal obligations. Full evidence archival remains separate work.
 
-RPC height selection follows the materialized head's ancestry, because the store's
-height index can be overwritten by imported forks. Explicit hashes can address
-retained side branches. State queries load only nodes and values reachable from
+Header archival never selects a branch. The materialized tip, canonical height
+index and trie deltas commit in one batch; reorgs replace changed ancestry and
+delete stale heights. Startup validates the entire index against the tip and
+restores the retained DAG and proven statuses above the finalized anchor. RPC,
+chunk preparation and current-head P2P ranges share this index. Explicit hashes
+can address retained side branches. State queries load only nodes and values reachable from
 the selected root and check their content hashes. Unavailable nodes/values produce
 an error, while `null` from `state_getStorage` means authenticated key absence.
 This reconstruction costs work proportional to the selected state; bounded caching,

@@ -1013,7 +1013,7 @@ mod tests {
             let header = neutrino_consensus_types::Header {
                 height,
                 slot: height,
-                parent_hash: [0; 32],
+                parent_hash: engine.head_hash(),
                 proposer_index: 0,
                 vrf_proof: [0; 96],
                 state_root: [0; 32],
@@ -1028,10 +1028,13 @@ mod tests {
                 signature: [0; 96],
             };
             let hash = engine.store_mut().put_header(&header).unwrap();
+            engine
+                .commit_materialized_head(height, hash, header.state_root, None)
+                .unwrap();
             let public_inputs = neutrino_consensus_types::BlockProofPublicInputs {
                 chain_id: 7,
                 height,
-                parent_block_hash: [0; 32],
+                parent_block_hash: header.parent_hash,
                 block_hash: hash,
                 state_root_before: [0; 32],
                 state_root_after: [0; 32],

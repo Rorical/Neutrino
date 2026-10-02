@@ -236,7 +236,10 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = concrete_backend;
 
-    let local_progress = backend.local_progress().await;
+    let local_progress = backend
+        .local_progress()
+        .await
+        .map_err(|error| NodeError::Engine(error.to_string()))?;
     let driver_cfg = SyncDriverConfig {
         mode: config.role.sync_mode(),
         ..SyncDriverConfig::default()

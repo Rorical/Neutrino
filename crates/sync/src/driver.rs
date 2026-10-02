@@ -20,9 +20,8 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use neutrino_network::rpc::{
-    BlockProofByHeightRequest, BlocksByRangeRequest, ChunkProofByIdRequest, MetadataRequest,
-    RecursiveProofByIndexRequest, RecursiveProofLatestRequest, RpcInboundId, RpcProtocol,
-    RpcRequest, RpcResponse, StateByRootRequest,
+    BlockProofByHeightRequest, BlocksByRangeRequest, RecursiveProofByIndexRequest, RpcInboundId,
+    RpcProtocol, RpcRequest, RpcResponse, StateByRootRequest,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::{SyncCommand, SyncEvent, SyncMachine, SyncMode};
@@ -128,7 +127,8 @@ impl SyncDriver {
                     let index = self.full_chunks.retry_cursor.checked_rem(count).unwrap_or(0);
                     self.full_chunks.retry_cursor = self.full_chunks.retry_cursor.wrapping_add(1);
                     if let Some(peer) = self.connected_peers.iter().nth(index).copied() {
-                        self.send_rpc(peer, RpcRequest::Status(self.backend.local_status().await),
+                        let Ok(status) = self.backend.local_status().await else { continue; };
+                        self.send_rpc(peer, RpcRequest::Status(status),
                             |peer, response| OutboundOutcome::StatusResponse { peer, response }).await;
                     }
                 }
@@ -164,6 +164,7 @@ impl SyncDriver {
             NetworkEvent::PeerDisconnected(peer) => {
                 debug!(%peer, "peer disconnected");
                 self.connected_peers.remove(&peer);
+                full_chunk::on_disconnect(self, peer);
                 let cmds = self.fsm.on_event(SyncEvent::PeerDisconnected(peer));
                 self.dispatch_sync_commands(cmds).await;
             }
@@ -490,77 +491,77 @@ impl SyncDriver {
             "serving inbound RPC"
         );
         let response = match request {
-            RpcRequest::Status(_peer_status) => {
-                // Echo our own status back; peer's status arrives via a
-                // separate Status RPC initiated by us.
-                Some(RpcResponse::Status(self.backend.local_status().await))
-            }
-            RpcRequest::Metadata(MetadataRequest) => {
-                Some(RpcResponse::Metadata(self.backend.local_metadata().await))
-            }
-            RpcRequest::Ping(p) => Some(RpcResponse::Ping(p)),
-            RpcRequest::BlocksByRange(BlocksByRangeRequest {
-                start_height,
-                count,
-                step,
-            }) => Some(RpcResponse::BlocksByRange(
+            RpcRequest::Status(_) => rpc_reply(
+                RpcProtocol::Status,
+                self.backend.local_status().await,
+                RpcResponse::Status,
+            ),
+            RpcRequest::Metadata(_) => RpcResponse::Metadata(self.backend.local_metadata().await),
+            RpcRequest::Ping(payload) => RpcResponse::Ping(payload),
+            RpcRequest::BlocksByRange(req) => rpc_reply(
+                RpcProtocol::BlocksByRange,
                 self.backend
-                    .blocks_by_range(start_height, count, step)
+                    .blocks_by_range(req.start_height, req.count, req.step, req.head_block_hash)
                     .await,
-            )),
-            RpcRequest::BlocksByRoot(req) => Some(RpcResponse::BlocksByRoot(
+                RpcResponse::BlocksByRange,
+            ),
+            RpcRequest::BlocksByRoot(req) => rpc_reply(
+                RpcProtocol::BlocksByRoot,
                 self.backend.blocks_by_root(&req.roots).await,
-            )),
-            RpcRequest::StateByRoot(StateByRootRequest { state_root, paths }) => Some(
-                RpcResponse::StateByRoot(self.backend.state_nodes(state_root, &paths).await),
+                RpcResponse::BlocksByRoot,
             ),
-            RpcRequest::BlockProofByHash(req) => Some(RpcResponse::BlockProofByHash(
+            RpcRequest::StateByRoot(req) => rpc_reply(
+                RpcProtocol::StateByRoot,
+                self.backend.state_nodes(req.state_root, &req.paths).await,
+                RpcResponse::StateByRoot,
+            ),
+            RpcRequest::BlockProofByHash(req) => rpc_reply(
+                RpcProtocol::BlockProofByHash,
                 self.backend.block_proofs_by_hash(&req.roots).await,
-            )),
-            RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
-                start_height,
-                count,
-            }) => Some(RpcResponse::BlockProofByHeight(
-                self.backend
-                    .block_proofs_by_height(start_height, count)
-                    .await,
-            )),
-            RpcRequest::ChunkProofById(ChunkProofByIdRequest { chunk_ids }) => Some(
-                RpcResponse::ChunkProofById(self.backend.chunk_proofs_by_id(&chunk_ids).await),
+                RpcResponse::BlockProofByHash,
             ),
-            RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest) => {
-                match self.backend.latest_recursive_proof().await {
-                    Ok(resp) => Some(RpcResponse::RecursiveProofLatest(Box::new(resp))),
-                    Err(err) => {
-                        debug!(?err, "no latest recursive proof to serve; dropping channel");
-                        None
-                    }
-                }
-            }
-            RpcRequest::RecursiveProofByIndex(RecursiveProofByIndexRequest {
-                start_index,
-                count,
-            }) => Some(RpcResponse::RecursiveProofByIndex(
+            RpcRequest::BlockProofByHeight(req) => rpc_reply(
+                RpcProtocol::BlockProofByHeight,
                 self.backend
-                    .recursive_proofs_by_index(start_index, count)
+                    .block_proofs_by_height(req.start_height, req.count, req.head_block_hash)
                     .await,
-            )),
-            RpcRequest::FinalityCertByChunk(req) => Some(RpcResponse::FinalityCertByChunk(
+                RpcResponse::BlockProofByHeight,
+            ),
+            RpcRequest::ChunkProofById(req) => rpc_reply(
+                RpcProtocol::ChunkProofById,
+                self.backend.chunk_proofs_by_id(&req.chunk_ids).await,
+                RpcResponse::ChunkProofById,
+            ),
+            RpcRequest::RecursiveProofLatest(_) => rpc_reply(
+                RpcProtocol::RecursiveProofLatest,
+                self.backend.latest_recursive_proof().await,
+                |payload| RpcResponse::RecursiveProofLatest(Box::new(payload)),
+            ),
+            RpcRequest::RecursiveProofByIndex(req) => rpc_reply(
+                RpcProtocol::RecursiveProofByIndex,
+                self.backend
+                    .recursive_proofs_by_index(req.start_index, req.count)
+                    .await,
+                RpcResponse::RecursiveProofByIndex,
+            ),
+            RpcRequest::FinalityCertByChunk(req) => rpc_reply(
+                RpcProtocol::FinalityCertByChunk,
                 self.backend.finality_certs_by_chunk(&req.chunk_ids).await,
-            )),
-            RpcRequest::WitnessByBlock(req) => Some(RpcResponse::WitnessByBlock(
+                RpcResponse::FinalityCertByChunk,
+            ),
+            RpcRequest::WitnessByBlock(req) => rpc_reply(
+                RpcProtocol::WitnessByBlock,
                 self.backend.witnesses_by_block(&req.block_hashes).await,
-            )),
+                RpcResponse::WitnessByBlock,
+            ),
         };
-        if let Some(response) = response {
-            let _ = self
-                .cmd_tx
-                .send(NetworkCommand::SendRpcResponse {
-                    inbound_id,
-                    response,
-                })
-                .await;
-        }
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::SendRpcResponse {
+                inbound_id,
+                response,
+            })
+            .await;
     }
 
     // --------------------------------------------------------------- outbound
@@ -574,7 +575,13 @@ impl SyncDriver {
     async fn dispatch_one(&self, cmd: SyncCommand) {
         match cmd {
             SyncCommand::RequestStatus(peer) => {
-                let local = self.backend.local_status().await;
+                let local = match self.backend.local_status().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        warn!(%error, "cannot read local status");
+                        return;
+                    }
+                };
                 self.send_rpc(peer, RpcRequest::Status(local), |peer, response| {
                     OutboundOutcome::StatusResponse { peer, response }
                 })
@@ -603,6 +610,10 @@ impl SyncDriver {
                 self.send_rpc(
                     peer,
                     RpcRequest::BlocksByRange(BlocksByRangeRequest {
+                        head_block_hash: self
+                            .fsm
+                            .sync_head(peer)
+                            .expect("selected sync peer has status"),
                         start_height,
                         count,
                         step: 1,
@@ -637,6 +648,10 @@ impl SyncDriver {
                 self.send_rpc(
                     peer,
                     RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
+                        head_block_hash: self
+                            .fsm
+                            .sync_head(peer)
+                            .expect("selected sync peer has status"),
                         start_height,
                         count,
                     }),
@@ -1048,4 +1063,27 @@ fn hex_short(bytes: &[u8; 32]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+fn rpc_reply<T>(
+    protocol: RpcProtocol,
+    result: Result<T, SyncBackendError>,
+    wrap: impl FnOnce(T) -> RpcResponse,
+) -> RpcResponse {
+    use neutrino_network::rpc::RpcFailure;
+    match result {
+        Ok(payload) => wrap(payload),
+        Err(error) => {
+            let error = match error {
+                SyncBackendError::Storage(reason) => RpcFailure::Storage(reason),
+                SyncBackendError::NotAvailable(reason) | SyncBackendError::ChainBehind(reason) => {
+                    RpcFailure::Unavailable(reason)
+                }
+                SyncBackendError::Rejected(reason) | SyncBackendError::InvalidRequest(reason) => {
+                    RpcFailure::InvalidRequest(reason)
+                }
+            };
+            RpcResponse::Error { protocol, error }
+        }
+    }
 }

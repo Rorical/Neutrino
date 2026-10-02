@@ -10,6 +10,7 @@
 //! columns use stable ASCII names (`tip`, `finalized_head`,
 //! `latest_chunk_id`, ...).
 
+mod canonical;
 mod chain_store;
 mod error;
 pub mod keys;

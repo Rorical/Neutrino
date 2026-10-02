@@ -37,12 +37,10 @@ pub enum EvidenceProofAcceptance {
 pub struct ConsensusSyncTarget {
     /// Chunk awaiting proof-gated finalization.
     pub chunk_id: ChunkId,
+    /// First height to fetch when establishing a peer's branch.
+    pub start_height: Height,
     /// Last height of this chunk.
     pub end_height: Height,
-    /// First missing canonical header.
-    pub next_header: Height,
-    /// First missing block proof, or end + 1 if complete.
-    pub next_proof: Height,
 }
 
 /// Errors a backend can surface to the driver.
@@ -54,6 +52,9 @@ pub enum SyncBackendError {
     /// Backend storage failed.
     #[error("storage error: {0}")]
     Storage(String),
+    /// Request parameters are invalid or exceed supported query bounds.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     /// Backend was asked for data it does not yet have.
     #[error("not available: {0}")]
     NotAvailable(String),
@@ -132,7 +133,7 @@ pub trait SyncBackend: Send + Sync + 'static {
         Ok(None)
     }
     /// Build a [`Status`] payload reflecting the local chain head.
-    async fn local_status(&self) -> Status;
+    async fn local_status(&self) -> Result<Status, SyncBackendError>;
 
     /// Build a [`Metadata`] payload advertising local peer capabilities.
     async fn local_metadata(&self) -> Metadata {
@@ -144,7 +145,7 @@ pub trait SyncBackend: Send + Sync + 'static {
     }
 
     /// Build a [`LocalProgress`] snapshot for the sync FSM.
-    async fn local_progress(&self) -> LocalProgress;
+    async fn local_progress(&self) -> Result<LocalProgress, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/recursive_proof_latest`.
     ///
@@ -159,42 +160,72 @@ pub trait SyncBackend: Send + Sync + 'static {
         &self,
         start: CheckpointIndex,
         count: u64,
-    ) -> RecursiveProofByIndexResponse;
+    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/blocks_by_range`.
-    async fn blocks_by_range(&self, start: Height, count: u64, step: u64) -> BlocksByRangeResponse;
+    async fn blocks_by_range(
+        &self,
+        start: Height,
+        count: u64,
+        step: u64,
+        head: BlockHash,
+    ) -> Result<BlocksByRangeResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/blocks_by_root`.
-    async fn blocks_by_root(&self, roots: &[BlockHash]) -> BlocksByRootResponse;
+    async fn blocks_by_root(
+        &self,
+        roots: &[BlockHash],
+    ) -> Result<BlocksByRootResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/state_by_root`.
-    async fn state_nodes(&self, root: StateRoot, paths: &[Vec<u8>]) -> StateByRootResponse;
+    async fn state_nodes(
+        &self,
+        root: StateRoot,
+        paths: &[Vec<u8>],
+    ) -> Result<StateByRootResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/block_proof_by_hash`.
-    async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse;
+    async fn block_proofs_by_hash(
+        &self,
+        roots: &[BlockHash],
+    ) -> Result<BlockProofByHashResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/block_proof_by_height`.
-    async fn block_proofs_by_height(&self, start: Height, count: u64)
-    -> BlockProofByHeightResponse;
+    async fn block_proofs_by_height(
+        &self,
+        start: Height,
+        count: u64,
+        head: BlockHash,
+    ) -> Result<BlockProofByHeightResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/chunk_proof_by_id`.
-    async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse;
+    async fn chunk_proofs_by_id(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<ChunkProofByIdResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/finality_cert_by_chunk`.
     ///
-    /// Default impl returns an empty response; backends override
-    /// it to look up the persisted finality certificate per chunk
-    /// from the chain store.
-    async fn finality_certs_by_chunk(&self, _chunk_ids: &[ChunkId]) -> FinalityCertByChunkResponse {
-        FinalityCertByChunkResponse::default()
+    /// Backends retrieve persisted certificates or return an explicit error.
+    async fn finality_certs_by_chunk(
+        &self,
+        _chunk_ids: &[ChunkId],
+    ) -> Result<FinalityCertByChunkResponse, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "finality certificate retrieval is unsupported".to_owned(),
+        ))
     }
 
     /// Build a response to `/neutrino/req/witness_by_block`.
     ///
-    /// Default impl returns an empty response; archive nodes
-    /// override it once block witnesses are persisted (M8+).
-    async fn witnesses_by_block(&self, _block_hashes: &[BlockHash]) -> WitnessByBlockResponse {
-        WitnessByBlockResponse::default()
+    /// Backends retrieve persisted witnesses or return an explicit error.
+    async fn witnesses_by_block(
+        &self,
+        _block_hashes: &[BlockHash],
+    ) -> Result<WitnessByBlockResponse, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "witness retrieval is unsupported".to_owned(),
+        ))
     }
 
     /// Verify each `(Checkpoint, RecursiveCheckpointProof)` in chain order,

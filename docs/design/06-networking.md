@@ -18,6 +18,24 @@ the complete chunk proof before crossing into the next validator/seed boundary.
 Gossip uses the same trusted-context finalization path. Missing data triggers RPC
 backfill and prevents advancement; it never authorizes an empty chunk proof.
 
+Block and proof ranges carry a mandatory `head_block_hash` from peer status. Each
+response resolves that anchor's ancestry under one engine lock, even after the
+server reorgs. The driver tracks a per-peer branch cursor and verifies contiguous
+heights, parents and proof bindings. A verified chunk on a competing unfinalized
+branch selects its replayed state, canonical index and finality in one atomic batch.
+
+Every RPC response is a Borsh `Result<Payload, RpcFailure>`: `Unavailable`,
+`Storage` or `InvalidRequest` failures reach the requester explicitly. Missing
+bodies are never manufactured, and hash-list requests do not silently omit
+missing entries. Range responses may contain a bounded contiguous prefix; clients
+paginate from its last height. State RPC serves only authenticated nodes and values
+reachable from the requested retained root. Full-root snapshots are bounded by the
+wire size limit; nonempty subtree paths are rejected until streaming is implemented.
+
+Status advertises `finalized_chunk_id: Option<ChunkId>` and its chunk hash separately
+from the actual recursive checkpoint index/hash. Chunk 0 is `Some(0)`, genesis is
+`None`; chunk progress never increments the checkpoint cursor.
+
 Checkpoint wire/RPC surfaces remain scaffolding. There is no production recursive
 checkpoint prover or proof-only light-client bootstrap. Prover-market/bounty handling
 and erasure-coded DA sampling are also deferred.

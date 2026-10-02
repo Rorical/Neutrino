@@ -62,6 +62,7 @@ use neutrino_primitives::{
     ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
     fixed_u128_from_integer,
 };
+use neutrino_rpc::RpcBackend;
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -350,7 +351,7 @@ async fn reorg_materialises_to_new_fork_choice_head() {
         .await
         .expect("follower imports A1");
     assert_eq!(
-        follower.local_status().await.head_block_hash,
+        follower.local_status().await.unwrap().head_block_hash,
         block_a1.hash(),
         "after importing A1, follower head must be A1",
     );
@@ -376,9 +377,24 @@ async fn reorg_materialises_to_new_fork_choice_head() {
         .await
         .expect("follower imports B1 as DAG sibling");
     assert_eq!(
-        follower.local_status().await.head_block_hash,
+        follower.local_status().await.unwrap().head_block_hash,
         block_a1.hash(),
         "B1 must not displace A1 while A1 has the supporting vote",
+    );
+
+    follower.with_engine_mut_for_test(|engine| {
+        assert_eq!(
+            engine.store().get_block_hash_by_height(1).unwrap(),
+            Some(block_a1.hash())
+        );
+    });
+    assert_eq!(
+        follower
+            .blocks_by_range(1, 1, 1, block_a1.hash())
+            .await
+            .unwrap()
+            .blocks,
+        vec![block_a1.clone()]
     );
 
     // Inject a heavy vote for B1 → fork-choice picks B1.
@@ -396,7 +412,7 @@ async fn reorg_materialises_to_new_fork_choice_head() {
         "after vote injection, fork-choice head must be B1",
     );
     assert_eq!(
-        follower.local_status().await.head_block_hash,
+        follower.local_status().await.unwrap().head_block_hash,
         block_a1.hash(),
         "but the materialised head must still be A1 until materialise runs",
     );
@@ -408,7 +424,7 @@ async fn reorg_materialises_to_new_fork_choice_head() {
     assert!(moved, "materialise must report a head move");
 
     assert_eq!(
-        follower.local_status().await.head_block_hash,
+        follower.local_status().await.unwrap().head_block_hash,
         sibling_b1.hash(),
         "after materialise, follower head must be B1",
     );
@@ -416,6 +432,42 @@ async fn reorg_materialises_to_new_fork_choice_head() {
         follower.engine_state_invariant_holds(),
         "follower invariant must hold after reorg materialisation",
     );
+
+    follower.with_engine_mut_for_test(|engine| {
+        assert_eq!(
+            engine.store().get_block_hash_by_height(1).unwrap(),
+            Some(sibling_b1.hash())
+        );
+    });
+    assert_eq!(
+        follower.header_by_height(1).await.unwrap(),
+        Some(sibling_b1.header.clone())
+    );
+    assert_eq!(
+        follower
+            .blocks_by_range(1, 1, 1, sibling_b1.hash())
+            .await
+            .unwrap()
+            .blocks,
+        vec![sibling_b1.clone()]
+    );
+    // An in-flight query pinned before the reorg still gets the old branch.
+    assert_eq!(
+        follower
+            .blocks_by_range(1, 1, 1, block_a1.hash())
+            .await
+            .unwrap()
+            .blocks,
+        vec![block_a1.clone()]
+    );
+    let restarted = Engine::open(spec, follower.snapshot_database()).unwrap();
+    assert_eq!(
+        restarted.store().get_block_hash_by_height(1).unwrap(),
+        Some(sibling_b1.hash())
+    );
+    assert_eq!(restarted.state().root(), sibling_b1.header.state_root);
+    assert!(restarted.fork_choice().block(&block_a1.hash()).is_some());
+    assert!(restarted.fork_choice().block(&sibling_b1.hash()).is_some());
 
     // Idempotency: triggering materialise again is a no-op.
     let moved_again = follower

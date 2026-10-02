@@ -219,7 +219,12 @@ async fn two_nodes_agree_on_gossipped_block() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Producer (A) builds the next block and publishes it via gossip.
-    let genesis_hash = handle_a.backend.local_status().await.head_block_hash;
+    let genesis_hash = handle_a
+        .backend
+        .local_status()
+        .await
+        .unwrap()
+        .head_block_hash;
     let block = signed_block_for_slot(1, genesis_hash, 1);
     let encoded = borsh::to_vec(&block).expect("encode block");
 
@@ -260,7 +265,7 @@ async fn two_nodes_agree_on_gossipped_block() {
     // The follower's head must reflect the imported block.
     assert_eq!(import_result.new_head_height, 1);
     assert_eq!(import_result.new_head_hash, block.hash());
-    let status = handle_b.backend.local_status().await;
+    let status = handle_b.backend.local_status().await.unwrap();
     assert_eq!(status.head_height, 1);
     assert_eq!(status.head_block_hash, block.hash());
 }

@@ -22,6 +22,8 @@ pub mod prove;
 pub mod signature;
 pub mod slashing;
 pub mod store;
+#[cfg(test)]
+mod test_db;
 pub mod validator_set;
 
 pub use bft_loop::{BftAction, BftLoopError, BftSession};

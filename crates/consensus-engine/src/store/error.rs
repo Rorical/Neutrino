@@ -15,6 +15,8 @@ pub enum StoreError<E> {
     Database(E),
     /// Borsh encode / decode error.
     Codec(std::io::Error),
+    /// Persisted chain data or pointers violate a canonical-chain invariant.
+    Corrupt(&'static str),
 }
 
 impl<E: fmt::Display> fmt::Display for StoreError<E> {
@@ -22,6 +24,7 @@ impl<E: fmt::Display> fmt::Display for StoreError<E> {
         match self {
             Self::Database(err) => write!(f, "database error: {err}"),
             Self::Codec(err) => write!(f, "codec error: {err}"),
+            Self::Corrupt(reason) => write!(f, "corrupt chain data: {reason}"),
         }
     }
 }

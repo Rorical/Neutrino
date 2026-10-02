@@ -121,23 +121,26 @@ impl SyncBackend for MockBackend {
             let chunk_id = u64::try_from(state.chunk_proof_imports.len()).unwrap();
             neutrino_sync::backend::ConsensusSyncTarget {
                 chunk_id,
+                start_height: chunk_id * size + 1,
                 end_height: (chunk_id + 1) * size,
-                next_header: state.status.head_height + 1,
-                next_proof: state.proven_height + 1,
             }
         }))
     }
-    async fn local_status(&self) -> Status {
-        self.inner.lock().unwrap().status
+    async fn local_status(&self) -> Result<Status, SyncBackendError> {
+        Ok(self.inner.lock().unwrap().status)
     }
 
-    async fn local_progress(&self) -> LocalProgress {
-        let status = self.inner.lock().unwrap().status;
-        LocalProgress {
-            chain_id: status.chain_id,
-            chain_spec_hash: status.chain_spec_hash,
-            ..LocalProgress::default()
-        }
+    async fn local_progress(&self) -> Result<LocalProgress, SyncBackendError> {
+        Ok({
+            let status = self.inner.lock().unwrap().status;
+            LocalProgress {
+                chain_id: status.chain_id,
+                chain_spec_hash: status.chain_spec_hash,
+                finalized_chunk_id: None,
+                finalized_chunk_hash: [0; 32],
+                ..LocalProgress::default()
+            }
+        })
     }
 
     async fn latest_recursive_proof(
@@ -152,66 +155,98 @@ impl SyncBackend for MockBackend {
         &self,
         start: CheckpointIndex,
         count: u64,
-    ) -> RecursiveProofByIndexResponse {
-        self.inner
-            .lock()
-            .unwrap()
-            .rpc_calls
-            .push(format!("recursive_proofs_by_index({start},{count})"));
-        RecursiveProofByIndexResponse::default()
+    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError> {
+        Ok({
+            self.inner
+                .lock()
+                .unwrap()
+                .rpc_calls
+                .push(format!("recursive_proofs_by_index({start},{count})"));
+            RecursiveProofByIndexResponse::default()
+        })
     }
 
-    async fn blocks_by_range(&self, start: Height, count: u64, step: u64) -> BlocksByRangeResponse {
-        self.inner
-            .lock()
-            .unwrap()
-            .rpc_calls
-            .push(format!("blocks_by_range({start},{count},{step})"));
-        BlocksByRangeResponse::default()
+    async fn blocks_by_range(
+        &self,
+        start: Height,
+        count: u64,
+        step: u64,
+        _head: BlockHash,
+    ) -> Result<BlocksByRangeResponse, SyncBackendError> {
+        Ok({
+            self.inner
+                .lock()
+                .unwrap()
+                .rpc_calls
+                .push(format!("blocks_by_range({start},{count},{step})"));
+            BlocksByRangeResponse::default()
+        })
     }
 
-    async fn blocks_by_root(&self, roots: &[BlockHash]) -> BlocksByRootResponse {
-        self.inner
-            .lock()
-            .unwrap()
-            .rpc_calls
-            .push(format!("blocks_by_root({})", roots.len()));
-        BlocksByRootResponse::default()
+    async fn blocks_by_root(
+        &self,
+        roots: &[BlockHash],
+    ) -> Result<BlocksByRootResponse, SyncBackendError> {
+        Ok({
+            self.inner
+                .lock()
+                .unwrap()
+                .rpc_calls
+                .push(format!("blocks_by_root({})", roots.len()));
+            BlocksByRootResponse::default()
+        })
     }
 
-    async fn state_nodes(&self, _root: StateRoot, _paths: &[Vec<u8>]) -> StateByRootResponse {
-        StateByRootResponse::default()
+    async fn state_nodes(
+        &self,
+        _root: StateRoot,
+        _paths: &[Vec<u8>],
+    ) -> Result<StateByRootResponse, SyncBackendError> {
+        Ok(StateByRootResponse::default())
     }
 
-    async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse {
-        self.inner
-            .lock()
-            .unwrap()
-            .rpc_calls
-            .push(format!("block_proofs_by_hash({})", roots.len()));
-        BlockProofByHashResponse::default()
+    async fn block_proofs_by_hash(
+        &self,
+        roots: &[BlockHash],
+    ) -> Result<BlockProofByHashResponse, SyncBackendError> {
+        Ok({
+            self.inner
+                .lock()
+                .unwrap()
+                .rpc_calls
+                .push(format!("block_proofs_by_hash({})", roots.len()));
+            BlockProofByHashResponse::default()
+        })
     }
 
     async fn block_proofs_by_height(
         &self,
         start: Height,
         count: u64,
-    ) -> BlockProofByHeightResponse {
-        self.inner
-            .lock()
-            .unwrap()
-            .rpc_calls
-            .push(format!("block_proofs_by_height({start},{count})"));
-        BlockProofByHeightResponse::default()
+        _head: BlockHash,
+    ) -> Result<BlockProofByHeightResponse, SyncBackendError> {
+        Ok({
+            self.inner
+                .lock()
+                .unwrap()
+                .rpc_calls
+                .push(format!("block_proofs_by_height({start},{count})"));
+            BlockProofByHeightResponse::default()
+        })
     }
 
-    async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse {
-        self.inner
-            .lock()
-            .unwrap()
-            .rpc_calls
-            .push(format!("chunk_proofs_by_id({})", chunk_ids.len()));
-        ChunkProofByIdResponse::default()
+    async fn chunk_proofs_by_id(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<ChunkProofByIdResponse, SyncBackendError> {
+        Ok({
+            self.inner
+                .lock()
+                .unwrap()
+                .rpc_calls
+                .push(format!("chunk_proofs_by_id({})", chunk_ids.len()));
+            ChunkProofByIdResponse::default()
+        })
     }
 
     async fn verify_and_import_checkpoints(
@@ -357,6 +392,8 @@ async fn peer_connected_triggers_outbound_status_handshake() {
     backend.set_status(Status {
         chain_id: 1,
         chain_spec_hash: [0; 32],
+        finalized_chunk_id: None,
+        finalized_chunk_hash: [0; 32],
         finalized_checkpoint_index: 0,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -371,6 +408,8 @@ async fn peer_connected_triggers_outbound_status_handshake() {
         LocalProgress {
             chain_id: 1,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -407,6 +446,8 @@ async fn inbound_status_request_is_served_from_backend() {
     let local_status = Status {
         chain_id: 9,
         chain_spec_hash: [0; 32],
+        finalized_chunk_id: None,
+        finalized_chunk_hash: [0; 32],
         finalized_checkpoint_index: 3,
         finalized_checkpoint_hash: [0xAA; 32],
         head_block_hash: [0xBB; 32],
@@ -422,6 +463,8 @@ async fn inbound_status_request_is_served_from_backend() {
         LocalProgress {
             chain_id: 9,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -437,6 +480,8 @@ async fn inbound_status_request_is_served_from_backend() {
     let peer_status = Status {
         chain_id: 9,
         chain_spec_hash: [0; 32],
+        finalized_chunk_id: None,
+        finalized_chunk_hash: [0; 32],
         finalized_checkpoint_index: 1,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -482,6 +527,8 @@ async fn inbound_metadata_request_advertises_full_node_role() {
         LocalProgress {
             chain_id: 1,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -529,6 +576,8 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
     backend.set_status(Status {
         chain_id: 1,
         chain_spec_hash: [0; 32],
+        finalized_chunk_id: None,
+        finalized_chunk_hash: [0; 32],
         finalized_checkpoint_index: 0,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -543,6 +592,8 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
         LocalProgress {
             chain_id: 1,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -577,6 +628,8 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
     backend.set_status(Status {
         chain_id: 1,
         chain_spec_hash: [0; 32],
+        finalized_chunk_id: None,
+        finalized_chunk_hash: [0; 32],
         finalized_checkpoint_index: 0,
         finalized_checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
@@ -592,6 +645,8 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
         LocalProgress {
             chain_id: 1,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             ..LocalProgress::default()
         },
         cmd_tx,
@@ -622,6 +677,8 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
         .send(Ok(RpcResponse::Status(Status {
             chain_id: 1,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             finalized_checkpoint_index: 0,
             finalized_checkpoint_hash: [0; 32],
             head_block_hash: [1; 32],
@@ -796,7 +853,8 @@ fn sample_chunk_proof(chunk_id: ChunkId, end_height: Height) -> ChunkProof {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)] // Two chunks plus a rejected proof exercise the complete RPC sequence.
 async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
     let backend = MockBackend::default();
     backend.inner.lock().unwrap().full_chunk_size = Some(2);
@@ -816,8 +874,17 @@ async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
         .await
         .unwrap();
     let mut order = Vec::new();
+    let mut sent_bad_proof = false;
+    let mut branch = Vec::new();
+    let mut parent = [0; 32];
+    for height in 1..=4 {
+        let mut block = sample_block(height, height, 0);
+        block.header.parent_hash = parent;
+        parent = block.hash();
+        branch.push(block);
+    }
     while observer.chunk_proof_imports().len() < 2 {
-        let command = timeout(Duration::from_secs(3), received.recv())
+        let command = timeout(Duration::from_secs(10), received.recv())
             .await
             .unwrap()
             .unwrap();
@@ -832,7 +899,9 @@ async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
         let response = match request {
             RpcRequest::Status(_) => RpcResponse::Status(Status {
                 head_height: 4,
-                finalized_checkpoint_index: 2,
+                head_block_hash: branch.last().unwrap().hash(),
+                finalized_chunk_id: Some(1),
+                finalized_chunk_hash: [0xCC; 32],
                 ..Status::default()
             }),
             RpcRequest::BlocksByRange(request) => {
@@ -843,29 +912,45 @@ async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
                 }
                 RpcResponse::BlocksByRange(BlocksByRangeResponse {
                     blocks: (request.start_height..request.start_height + request.count)
-                        .map(|height| sample_block(height, height, 0))
+                        .map(|height| branch[usize::try_from(height - 1).unwrap()].clone())
                         .collect(),
                 })
             }
             RpcRequest::BlockProofByHeight(request) => {
                 order.push(format!("proofs {}", request.start_height));
-                RpcResponse::BlockProofByHeight(BlockProofByHeightResponse {
-                    proofs: (request.start_height..request.start_height + request.count)
-                        .map(sample_block_proof)
-                        .collect(),
-                })
+                let mut proofs: Vec<_> = (request.start_height
+                    ..request.start_height + request.count)
+                    .map(|height| {
+                        let block = &branch[usize::try_from(height - 1).unwrap()];
+                        let mut proof = sample_block_proof(height);
+                        proof.block_hash = block.hash();
+                        proof.public_inputs.block_hash = block.hash();
+                        proof.public_inputs.parent_block_hash = block.header.parent_hash;
+                        proof
+                    })
+                    .collect();
+                if !sent_bad_proof {
+                    proofs[0].block_hash = [99; 32];
+                    proofs[0].public_inputs.block_hash = [99; 32];
+                    proofs[1].public_inputs.parent_block_hash = [99; 32];
+                    sent_bad_proof = true;
+                }
+                RpcResponse::BlockProofByHeight(BlockProofByHeightResponse { proofs })
             }
             RpcRequest::ChunkProofById(request) => {
                 let id = request.chunk_ids[0];
                 order.push(format!("finality {id}"));
+                let mut proof = sample_chunk_proof(id, (id + 1) * 2);
+                proof.public_inputs.end_block_hash =
+                    branch[usize::try_from((id + 1) * 2 - 1).unwrap()].hash();
                 RpcResponse::ChunkProofById(ChunkProofByIdResponse {
-                    proofs: vec![sample_chunk_proof(id, (id + 1) * 2)],
+                    proofs: vec![proof],
                 })
             }
             other => panic!("unexpected request {other:?}"),
         };
         response_tx.send(Ok(response)).unwrap();
-        if order.len() == 6 {
+        if order.len() == 7 {
             timeout(Duration::from_secs(3), async {
                 while observer.chunk_proof_imports().len() < 2 {
                     tokio::task::yield_now().await;
@@ -879,6 +964,7 @@ async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
         order,
         [
             "blocks 1",
+            "proofs 1",
             "proofs 1",
             "finality 0",
             "blocks 3",
@@ -1137,4 +1223,40 @@ async fn block_proof_that_arrives_before_its_block_is_buffered_and_retried() {
 
     drop(event_tx);
     handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn unavailable_backend_data_returns_an_explicit_rpc_reply() {
+    use neutrino_network::rpc::{RecursiveProofLatestRequest, RpcFailure};
+    let (commands, mut received) = mpsc::channel(16);
+    let (events, event_rx) = mpsc::channel(16);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(MockBackend::default()),
+        LocalProgress::default(),
+        commands,
+        event_rx,
+    );
+    let run = tokio::spawn(driver.run());
+    let inbound_id = RpcInboundId {
+        protocol: RpcProtocol::RecursiveProofLatest,
+        raw: 17,
+    };
+    events
+        .send(NetworkEvent::RpcRequestReceived {
+            peer: random_peer(),
+            inbound_id,
+            request: RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest),
+        })
+        .await
+        .unwrap();
+    let command = timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(command, NetworkCommand::SendRpcResponse { inbound_id: id, response: RpcResponse::Error { protocol: RpcProtocol::RecursiveProofLatest, error: RpcFailure::Unavailable(_) } } if id == inbound_id)
+    );
+    drop(events);
+    run.await.unwrap().unwrap();
 }

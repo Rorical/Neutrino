@@ -32,7 +32,6 @@ use neutrino_proof_system::{BlockExecutionContext, ErasedBlockExecutor, Executio
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
-use crate::block_state::BlockState;
 use crate::body::{apply_body_roots, compute_body_roots};
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -161,8 +160,8 @@ impl<DB: Database> Engine<DB> {
     ///    `validator_set_root` commitment), sign it with the
     ///    proposer key, and persist the header / body / FSM state /
     ///    witness / tip pointer in one ordered batch.
-    /// 6. Advance the engine's in-memory head pointers and flush
-    ///    the new trie deltas to RocksDB.
+    /// 6. Publish the in-memory head after the archive, index and trie
+    ///    deltas commit atomically.
     /// 7. Return the [`ProductionOutcome`] so the chain backend can
     ///    gossip the block and the producer loop can hand it to the
     ///    SP1 prover ([`Engine::prove_block`](crate::Engine::prove_block)).
@@ -306,30 +305,18 @@ impl<DB: Database> Engine<DB> {
         let block_hash = header.hash();
         let block = Block { header, body };
 
-        // Persist: header, body, FSM state, witness, tip pointer.
-        // Ordering mirrors `import_block` so a partial write is
-        // recoverable on restart (header → body → state → tip). Also
-        // register the produced block in the fork-choice DAG so any
-        // sibling subsequently received by gossip lands in the same
-        // DAG and vote-driven head selection considers both.
-        // Should only fail if the parent is missing from the DAG
-        // (e.g. fresh-extending block built before the parent was
-        // visible). The local producer is the source of truth so we
-        // don't reject — fork-choice head() simply won't consider
-        // this block until the parent surfaces.
-        let _ = self.fork_choice.add_block(&block.header);
-        self.store_mut().put_header(&block.header)?;
-        self.store_mut().put_body(&block_hash, &block.body)?;
-        self.store_mut()
-            .put_block_state(&block_hash, BlockState::BlockProduced)?;
-        self.store_mut().put_witness(&block_hash, &witness_bytes)?;
-        self.store_mut().put_tip(block_hash)?;
-
-        // Swap the executor's mutated trie into the engine's
-        // authoritative state and flush the diff to RocksDB.
-        self.replace_state_internal(next_state);
-        self.update_head_internal(height, block_hash, state_root_after);
-        self.flush_trie_to_store()?;
+        let batch =
+            crate::store::ChainStore::<DB>::block_archive_batch(&block, Some(&witness_bytes))?;
+        let mut next_fork_choice = self.fork_choice.clone();
+        let _ = next_fork_choice.add_block(&block.header);
+        self.commit_materialized_head_with_batch(
+            height,
+            block_hash,
+            state_root_after,
+            Some(next_state),
+            batch,
+        )?;
+        self.fork_choice = next_fork_choice;
 
         Ok(Some(ProductionOutcome {
             block,

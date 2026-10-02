@@ -274,7 +274,11 @@ async fn state_invariant_holds_after_executor_equipped_import() {
         "follower's state trie must agree with head_state_root after import",
     );
     assert_eq!(
-        follower_backend.local_status().await.head_block_hash,
+        follower_backend
+            .local_status()
+            .await
+            .unwrap()
+            .head_block_hash,
         block.hash(),
         "follower's head must be the imported block",
     );
@@ -359,11 +363,11 @@ async fn follower_can_produce_after_importing_state_mutating_block() {
 
     // Convergence: both heads agree on v1's slot 2 block hash.
     assert_eq!(
-        backend_v0.local_status().await.head_block_hash,
+        backend_v0.local_status().await.unwrap().head_block_hash,
         block_s2.hash(),
     );
     assert_eq!(
-        backend_v1.local_status().await.head_block_hash,
+        backend_v1.local_status().await.unwrap().head_block_hash,
         block_s2.hash(),
     );
 

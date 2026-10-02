@@ -1,24 +1,7 @@
-//! Accept blocks and recursive checkpoint proofs sourced from peers.
+//! Verify and archive peer blocks and proofs, replay selected branches, and
+//! publish complete chunk finality with its canonical head and state atomically.
 //!
-//! The single-node M5 engine only knows how to **produce** blocks. M6
-//! gossip and the sync FSM need the inverse path: a peer hands us a
-//! signed block (or a recursive checkpoint proof) and we extend the local
-//! chain after validating what we can.
-//!
-//! Validation is intentionally limited at this milestone. The M5 mock
-//! proof system is still in use (real cryptographic verification arrives
-//! in M8+, see `docs/design/09-roadmap.md`). For now we check:
-//!
-//! - Header chain continuity (`parent_hash` matches the local head,
-//!   `height` is exactly `head + 1`).
-//! - That body Merkle roots match the header commitments.
-//! - Recursive checkpoint proofs verify under the supplied
-//!   [`ProofSystem`].
-//!
-//! Re-executing the runtime to verify the block's `state_root` is
-//! deferred to M8 along with real proof backends. Until then the engine
-//! caches the peer-reported `state_root` so subsequent block imports
-//! still see the right parent state root.
+//! Executor-equipped production imports check runtime commitments before storage.
 
 use core::fmt;
 
@@ -399,6 +382,13 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
 #[cfg(feature = "std")]
 impl<E: fmt::Debug + fmt::Display> std::error::Error for ImportError<E> {}
 
+pub(crate) struct ReplayedHead {
+    pub(crate) height: Height,
+    pub(crate) hash: BlockHash,
+    pub(crate) state_root: StateRoot,
+    pub(crate) state: Trie,
+}
+
 impl<DB: Database> Engine<DB> {
     /// Import a peer-supplied [`Block`].
     ///
@@ -470,7 +460,7 @@ impl<DB: Database> Engine<DB> {
     ///   [`Self::dry_run_block_against_head`], which re-executes
     ///   the body against the live state trie and returns the
     ///   post-execution trie. The caller commits it via
-    ///   [`Self::replace_state_internal`] in lockstep with the
+    ///   [`Self::commit_materialized_head`] in lockstep with the
     ///   head pointer update so the invariant
     ///   `self.state.root() == self.head_state_root()` survives
     ///   the import.
@@ -618,7 +608,7 @@ impl<DB: Database> Engine<DB> {
         // the block extends the materialised head, re-execute the
         // body against the parent's state trie. The executor's
         // post-state trie is captured here and committed in the
-        // head-update branch below via `replace_state_internal`, so
+        // head-update branch below via `commit_materialized_head`, so
         // the invariant `self.state.root() == self.head_state_root()`
         // is maintained across imports (the producer path already
         // maintains it via the same dance in `try_produce_block`).
@@ -649,30 +639,24 @@ impl<DB: Database> Engine<DB> {
                 // trie from persisted nodes/values and re-execute
                 // against it; this catches a malicious proposer
                 // who publishes a forged commitment for a block
-                // that does not extend our materialised head
-                // (e.g. a multi-winner slot). The post-state is
-                // verified but discarded — the materialised head
-                // stays put until fork choice picks this branch
+                // that does not extend our materialised head.
+                // Persist the verified post-state for subsequent sibling
+                // descendants; the materialized head stays put until
+                // fork choice picks this branch
                 // and `materialise_to_fork_choice_head` replays
                 // forward with the same checks.
                 let parent_state_root = parent_header
                     .as_ref()
                     .map_or_else(|| self.chain_spec().genesis_state_root, |h| h.state_root);
-                self.dry_run_block_against_parent(executor, block, parent_state_root)?;
-                None
+                Some(self.dry_run_block_against_parent(executor, block, parent_state_root)?)
             }
             (None, _) => None,
         };
 
         let hash = block.hash();
 
-        // Register in the fork-choice DAG. Any non-extending sibling
-        // imported in a multi-winner slot lands here so vote
-        // weighting can later pick the heaviest branch. Persist the
-        // header + body unconditionally; the FSM advances to
-        // `BlockProduced` regardless of whether this block extends
-        // the local materialised head.
-        self.fork_choice
+        let mut next_fork_choice = self.fork_choice.clone();
+        next_fork_choice
             .add_block(&block.header)
             .map_err(|err| match err {
                 ForkChoiceError::UnknownParent(parent) => ImportError::ParentMismatch {
@@ -684,38 +668,30 @@ impl<DB: Database> Engine<DB> {
                     actual: parent_hash,
                 },
             })?;
-        self.store_mut().put_header(&block.header)?;
-        self.store_mut().put_body(&hash, &block.body)?;
-        self.store_mut()
-            .put_block_state(&hash, BlockState::BlockProduced)?;
-
-        // Linear materialisation: advance the local head only when
-        // this block extends the current materialised tip. Branches
-        // that fork off an earlier ancestor stay in the DAG and the
-        // store but the in-memory state trie keeps following the
-        // linearly-applied chain. Reorg materialisation across the
-        // DAG (when `fork_choice_head()` outruns the linear head)
-        // is the remaining sub-task; today, an attempt to produce
-        // on top of a stale head would extend the existing chain —
-        // peers running the same fork-choice rule converge through
-        // gossip + vote weighting.
+        let mut batch = crate::store::ChainStore::<DB>::block_archive_batch(block, None)?;
         if extends_materialised_head {
-            self.store_mut().put_tip(hash)?;
-            // Commit the dry-run's post-state in lockstep with the
-            // head pointer update. After this step
-            // `self.state.root() == self.head_state_root()` holds,
-            // which is the invariant `dry_run_block_against_head`
-            // relies on for the *next* incoming block. Producers /
-            // executor-less imports skip the swap; in the
-            // executor-less case the trie remains a stale view of
-            // the chain (no production / dry-run will run against
-            // it).
-            if let Some(post_state) = post_state {
-                self.replace_state_internal(post_state);
+            self.commit_materialized_head_with_batch(
+                block.header.height,
+                hash,
+                block.header.state_root,
+                post_state,
+                batch,
+            )?;
+        } else {
+            if let Some(mut archived_state) = post_state {
+                for (key, bytes) in archived_state.drain_pending_nodes() {
+                    batch.put(neutrino_storage::Column::TrieNodes, key, bytes);
+                }
+                for (key, bytes) in archived_state.drain_pending_values() {
+                    batch.put(neutrino_storage::Column::StateValues, key, bytes);
+                }
             }
-            self.update_head_internal(block.header.height, hash, block.header.state_root);
-            self.flush_trie_to_store()?;
+            self.store_mut()
+                .db_mut()
+                .write_batch(batch)
+                .map_err(StoreError::Database)?;
         }
+        self.fork_choice = next_fork_choice;
 
         // Pending-fix #12: the import may have shifted the
         // fork-choice head off the linearly-materialised tip
@@ -748,7 +724,7 @@ impl<DB: Database> Engine<DB> {
     /// the resulting commitments against the header.
     ///
     /// On success returns the post-execution trie. The caller
-    /// (`import_block_inner`) commits it via `replace_state_internal`
+    /// (`import_block_inner`) commits it via `commit_materialized_head`
     /// in lockstep with the head pointer update so the engine's
     /// invariant survives import — pending-fix #11.
     ///
@@ -781,7 +757,7 @@ impl<DB: Database> Engine<DB> {
         // cross-check failure the scratch is dropped and the
         // engine's `self.state` is untouched. On success the
         // scratch is returned to the caller for commit via
-        // `replace_state_internal`.
+        // `commit_materialized_head`.
         let mut scratch = self.state().clone();
         scratch.drain_pending_nodes();
         scratch.drain_pending_values();
@@ -830,9 +806,8 @@ impl<DB: Database> Engine<DB> {
     /// head (e.g. multi-winner slots, late-arriving sibling on a
     /// competing branch).
     ///
-    /// The reconstructed trie is dropped after the cross-check
-    /// because the engine's materialised state continues to follow
-    /// the linearly-applied chain. If fork choice subsequently
+    /// Archive the verified post-state with the block without selecting it.
+    /// Descendants can then replay against this parent root. If fork choice
     /// promotes this branch, [`Self::materialise_to_fork_choice_head`]
     /// replays the whole new branch through the same executor with
     /// the same checks.
@@ -846,7 +821,7 @@ impl<DB: Database> Engine<DB> {
         executor: &dyn ErasedBlockExecutor,
         block: &Block,
         parent_state_root: StateRoot,
-    ) -> Result<(), ImportError<DB::Error>> {
+    ) -> Result<Trie, ImportError<DB::Error>> {
         let proposer_position = usize::try_from(block.header.proposer_index)
             .expect("u32 validator index fits usize on supported targets");
         let proposer_address = self
@@ -906,7 +881,7 @@ impl<DB: Database> Engine<DB> {
                 computed: gas_used,
             });
         }
-        Ok(())
+        Ok(scratch)
     }
 
     /// Pending-fix #12: if the fork-choice DAG's head has diverged
@@ -957,15 +932,26 @@ impl<DB: Database> Engine<DB> {
             return Ok(false);
         };
 
+        let replayed = self.replay_to_head(new_head, executor)?;
+        self.commit_materialized_head(
+            replayed.height,
+            replayed.hash,
+            replayed.state_root,
+            Some(replayed.state),
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn replay_to_head(
+        &self,
+        new_head: BlockHash,
+        executor: &dyn ErasedBlockExecutor,
+    ) -> Result<ReplayedHead, ImportError<DB::Error>> {
         let (lca_hash, new_branch) = self.find_lca_and_path_to(new_head)?;
         let (lca_state_root, lca_height) = self.lookup_block_state(lca_hash)?;
 
-        // Safety floor: refuse to retract finalised history. Today
-        // `fork_choice.add_finalized_chunk` is never called in
-        // production (a separate gap noted in the branch replay review), so
-        // the DAG's own anchor stays at genesis — meaning fork
-        // choice cannot itself enforce this. The check here is the
-        // engine-side belt to the DAG's missing braces.
+        // Also enforce the finalized floor while staging a proof-selected branch.
+        // No state, head or height index changes until replay fully succeeds.
         if let Some(finalized_chunk_id) = self.latest_finalized_chunk_id() {
             let chunk_size = self.chain_spec().consensus.chunk_size;
             let finalized_height = finalized_chunk_id
@@ -1070,14 +1056,12 @@ impl<DB: Database> Engine<DB> {
             current_state_root = state_root_after;
         }
 
-        // Commit. Replace state THEN advance the head pointers so
-        // the invariant `self.state.root() == self.head_state_root()`
-        // is maintained at every observable point.
-        self.replace_state_internal(state);
-        self.update_head_internal(current_height, current_hash, current_state_root);
-        self.store_mut().put_tip(current_hash)?;
-        self.flush_trie_to_store()?;
-        Ok(true)
+        Ok(ReplayedHead {
+            height: current_height,
+            hash: current_hash,
+            state_root: current_state_root,
+            state,
+        })
     }
 
     /// Walk back from `new_head` and the current materialised head
@@ -1337,6 +1321,29 @@ impl<DB: Database> Engine<DB> {
         proof: &ChunkProof,
         proof_system: &PS,
     ) -> Result<ImportChunkProofOutcome, ImportError<DB::Error>> {
+        self.import_chunk_proof_inner(proof, proof_system, None)
+    }
+
+    /// Verify complete chunk finality and atomically select its branch with
+    /// replayed state when the peer finalized a different unfinalized fork.
+    ///
+    /// # Errors
+    /// Returns proof, replay or storage errors without changing finality.
+    pub fn import_chunk_proof_with_dry_run<PS: ProofSystem>(
+        &mut self,
+        proof: &ChunkProof,
+        proof_system: &PS,
+        executor: &dyn ErasedBlockExecutor,
+    ) -> Result<ImportChunkProofOutcome, ImportError<DB::Error>> {
+        self.import_chunk_proof_inner(proof, proof_system, Some(executor))
+    }
+
+    fn import_chunk_proof_inner<PS: ProofSystem>(
+        &mut self,
+        proof: &ChunkProof,
+        proof_system: &PS,
+        executor: Option<&dyn ErasedBlockExecutor>,
+    ) -> Result<ImportChunkProofOutcome, ImportError<DB::Error>> {
         if self.store().get_chunk_proof(proof.chunk_id)?.as_ref() == Some(proof) {
             return Ok(ImportChunkProofOutcome {
                 chunk_id: proof.chunk_id,
@@ -1345,7 +1352,11 @@ impl<DB: Database> Engine<DB> {
             });
         }
         let mut prepared = self
-            .prepare_consensus_chunk(proof.chunk_id, proof_system)
+            .prepare_consensus_chunk_on_branch(
+                proof.chunk_id,
+                proof.public_inputs.end_block_hash,
+                proof_system,
+            )
             .map_err(|_| {
                 ImportError::InvalidChunkProof(neutrino_proof_system::ProofError::InvalidWitness)
             })?;
@@ -1365,9 +1376,21 @@ impl<DB: Database> Engine<DB> {
         }
         let backend_proof = borsh::from_slice(&proof.proof_bytes).map_err(ImportError::Codec)?;
         let finalized = self
-            .commit_consensus_chunk(&prepared.witness, &backend_proof, proof_system)
-            .map_err(|_| {
-                ImportError::InvalidChunkProof(neutrino_proof_system::ProofError::BackendRejected)
+            .commit_imported_consensus_chunk(
+                &prepared.witness,
+                &backend_proof,
+                proof_system,
+                executor,
+            )
+            .map_err(|error| match error {
+                crate::FinalizeError::Replay(error) => error,
+                crate::FinalizeError::Engine(crate::EngineError::Store(error)) => {
+                    ImportError::Store(error)
+                }
+                crate::FinalizeError::Backend(error) => ImportError::InvalidChunkProof(error),
+                _ => ImportError::InvalidChunkProof(
+                    neutrino_proof_system::ProofError::BackendRejected,
+                ),
             })?;
         Ok(ImportChunkProofOutcome {
             chunk_id: finalized.chunk.chunk_id,

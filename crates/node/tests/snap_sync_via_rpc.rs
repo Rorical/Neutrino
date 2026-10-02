@@ -153,16 +153,24 @@ async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
         let _ = run_blocking(move || backend.prove_block(&block_hash).expect("prove_block")).await;
     }
     assert_eq!(producer.head_height(), 3);
-    assert_eq!(producer.local_progress().await.proven_height, 3);
+    assert_eq!(producer.local_progress().await.unwrap().proven_height, 3);
 
     // Follower starts at genesis with no proofs.
     assert_eq!(follower.head_height(), 0);
-    assert_eq!(follower.local_progress().await.proven_height, 0);
+    assert_eq!(follower.local_progress().await.unwrap().proven_height, 0);
 
     // Step 1: header backfill via the producer's RPC handler. The
     // sync FSM's `HeaderBackfill` state issues exactly this kind of
     // `BlocksByRange` request.
-    let blocks_response = producer.blocks_by_range(1, 16, 1).await;
+    let blocks_response = producer
+        .blocks_by_range(
+            1,
+            16,
+            1,
+            producer.local_status().await.unwrap().head_block_hash,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         blocks_response.blocks.len(),
         3,
@@ -175,13 +183,20 @@ async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
     assert_eq!(imported_heads.new_head_height, 3);
     assert_eq!(follower.head_height(), 3);
     // Proofs still unimported, so proven_height is still 0.
-    assert_eq!(follower.local_progress().await.proven_height, 0);
+    assert_eq!(follower.local_progress().await.unwrap().proven_height, 0);
 
     // Step 2: proof backfill via the producer's RPC handler. The
     // sync FSM's `ProofBackfill` state issues exactly this kind of
     // `BlockProofByHeight` request and pipes the result into
     // `verify_and_import_block_proofs`.
-    let proofs_response = producer.block_proofs_by_height(1, 16).await;
+    let proofs_response = producer
+        .block_proofs_by_height(
+            1,
+            16,
+            producer.local_status().await.unwrap().head_block_hash,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         proofs_response.proofs.len(),
         3,
@@ -207,15 +222,15 @@ async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
         producer.head_height(),
         "head height"
     );
-    let producer_status = producer.local_status().await;
-    let follower_status = follower.local_status().await;
+    let producer_status = producer.local_status().await.unwrap();
+    let follower_status = follower.local_status().await.unwrap();
     assert_eq!(
         follower_status.head_block_hash, producer_status.head_block_hash,
         "head block hash",
     );
     assert_eq!(
-        follower.local_progress().await.proven_height,
-        producer.local_progress().await.proven_height,
+        follower.local_progress().await.unwrap().proven_height,
+        producer.local_progress().await.unwrap().proven_height,
         "proven height",
     );
 }

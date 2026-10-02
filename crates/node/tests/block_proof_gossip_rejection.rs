@@ -186,7 +186,7 @@ async fn block_proof_gossip_rejects_bogus_proofs_without_poisoning_fork_choice()
         Some(BlockState::BlockProduced),
         "rebuilt backend must start at BlockProduced",
     );
-    assert_eq!(backend.local_progress().await.proven_height, 0);
+    assert_eq!(backend.local_progress().await.unwrap().proven_height, 0);
 
     // ---- Class A: envelope tampering — wrong height -------------
     let mut bad_height = legit_proof.clone();
@@ -211,7 +211,7 @@ async fn block_proof_gossip_rejects_bogus_proofs_without_poisoning_fork_choice()
         Some(BlockState::BlockProduced),
         "FSM must not advance after class A rejection",
     );
-    assert_eq!(backend.local_progress().await.proven_height, 0);
+    assert_eq!(backend.local_progress().await.unwrap().proven_height, 0);
 
     // ---- Class B: public-inputs tampering — wrong state_root_after
     let mut bad_inputs = legit_proof.clone();
@@ -236,7 +236,7 @@ async fn block_proof_gossip_rejects_bogus_proofs_without_poisoning_fork_choice()
         Some(BlockState::BlockProduced),
         "FSM must not advance after class B rejection",
     );
-    assert_eq!(backend.local_progress().await.proven_height, 0);
+    assert_eq!(backend.local_progress().await.unwrap().proven_height, 0);
 
     // ---- Class C: proof-bytes tampering -------------------------
     // Flip a bit inside the opaque `proof_bytes` so the SP1 verifier
@@ -269,7 +269,7 @@ async fn block_proof_gossip_rejects_bogus_proofs_without_poisoning_fork_choice()
         Some(BlockState::BlockProduced),
         "FSM must not advance after class C rejection",
     );
-    assert_eq!(backend.local_progress().await.proven_height, 0);
+    assert_eq!(backend.local_progress().await.unwrap().proven_height, 0);
 
     // ---- Recovery: the legitimate proof still imports cleanly. ---
     // The block was never touched by the three rejections, so a
@@ -297,5 +297,5 @@ async fn block_proof_gossip_rejects_bogus_proofs_without_poisoning_fork_choice()
         Some(BlockState::Proven),
         "FSM advances to Proven after the honest proof imports",
     );
-    assert_eq!(backend.local_progress().await.proven_height, 1);
+    assert_eq!(backend.local_progress().await.unwrap().proven_height, 1);
 }

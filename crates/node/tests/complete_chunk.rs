@@ -167,7 +167,10 @@ async fn proof_job_keeps_network_responsive_and_retries_without_advancing_on_fai
     tokio::time::timeout(Duration::from_secs(5), backend.tick_bft_round_timeouts(0))
         .await
         .unwrap();
-    assert_eq!(backend.local_status().await.finalized_checkpoint_index, 0);
+    assert_eq!(
+        backend.local_status().await.unwrap().finalized_chunk_id,
+        None
+    );
     decisions.send(false).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while attempts.load(Ordering::SeqCst) < 2 {
@@ -177,17 +180,29 @@ async fn proof_job_keeps_network_responsive_and_retries_without_advancing_on_fai
     })
     .await
     .unwrap();
-    assert_eq!(backend.local_status().await.finalized_checkpoint_index, 0);
+    assert_eq!(
+        backend.local_status().await.unwrap().finalized_chunk_id,
+        None
+    );
     decisions.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while backend.local_status().await.finalized_checkpoint_index == 0 {
+        while backend
+            .local_status()
+            .await
+            .unwrap()
+            .finalized_chunk_id
+            .is_none()
+        {
             backend.tick_bft_round_timeouts(0).await;
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(backend.local_status().await.finalized_checkpoint_index, 1);
+    assert_eq!(
+        backend.local_status().await.unwrap().finalized_chunk_id,
+        Some(0)
+    );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -406,6 +421,22 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
     assert_eq!(finalized.height, 1);
     assert_eq!(finalized.state_root, spec.genesis_state_root);
 
+    let status = backend.local_status().await.unwrap();
+    assert_eq!(status.finalized_chunk_id, Some(0));
+    assert_eq!(status.finalized_checkpoint_index, 0);
+    assert_eq!(
+        status.finalized_checkpoint_hash,
+        spec.genesis_checkpoint.hash()
+    );
+    assert_ne!(
+        status.finalized_chunk_hash,
+        status.finalized_checkpoint_hash
+    );
+    assert_eq!(
+        backend.local_progress().await.unwrap().finalized_chunk_hash,
+        status.finalized_chunk_hash
+    );
+
     let mut transfer = TransferTx {
         from: sender,
         to: recipient,
@@ -457,8 +488,7 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
         Some(boundary)
     );
 
-    // A later imported sibling overwrites the store's height index. RPC height
-    // selection must still follow the materialized chain; its hash remains queryable.
+    // Archiving a sibling preserves the selected index for RPC and P2P reads.
     let mut sibling = Block {
         header: second.header.clone(),
         body: Body::default(),
@@ -482,7 +512,7 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
         engine.import_block(&sibling).unwrap();
         assert_eq!(
             engine.store().get_block_hash_by_height(2).unwrap(),
-            Some(sibling.hash())
+            Some(second.hash())
         );
         assert_eq!(engine.head_hash(), second.hash());
     });
@@ -496,6 +526,131 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
     );
     assert_account_view(&backend, &BlockId::Height(2), recipient, Some(paid)).await;
     assert_account_view(&backend, &BlockId::Hash(sibling.hash()), recipient, None).await;
+
+    assert_eq!(
+        backend
+            .blocks_by_range(2, 16, 1, second.hash())
+            .await
+            .unwrap()
+            .blocks,
+        vec![second.clone()]
+    );
+    assert_eq!(
+        backend
+            .blocks_by_range(2, 1, 1, sibling.hash())
+            .await
+            .unwrap()
+            .blocks,
+        vec![sibling.clone()]
+    );
+    assert_eq!(
+        backend
+            .blocks_by_root(&[second.hash(), sibling.hash()])
+            .await
+            .unwrap()
+            .blocks,
+        vec![second.clone(), sibling.clone()]
+    );
+    assert_eq!(
+        backend
+            .block_proofs_by_height(1, 16, second.hash())
+            .await
+            .unwrap()
+            .proofs[0]
+            .block_hash,
+        boundary
+    );
+    assert!(matches!(
+        backend.block_proofs_by_height(2, 1, second.hash()).await,
+        Err(neutrino_sync::SyncBackendError::NotAvailable(_))
+    ));
+    assert!(matches!(
+        backend.blocks_by_range(1, 1, 0, second.hash()).await,
+        Err(neutrino_sync::SyncBackendError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        backend.blocks_by_range(1, 1, 1, [99; 32]).await,
+        Err(neutrino_sync::SyncBackendError::NotAvailable(_))
+    ));
+    let old_state = backend
+        .state_nodes(finalized.state_root, &[vec![]])
+        .await
+        .unwrap();
+    assert!(old_state.values.contains(&encode_account(&initial)));
+    assert!(!old_state.values.contains(&encode_account(&paid)));
+    let head_state = backend
+        .state_nodes(second.header.state_root, &[vec![]])
+        .await
+        .unwrap();
+    assert!(head_state.values.contains(&encode_account(&paid)));
+    assert!(!head_state.values.contains(&encode_account(&initial)));
+    let snapshot_client = ChainBackend::new(
+        Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap(),
+        ready_prover(),
+    );
+    assert!(
+        snapshot_client
+            .import_state_nodes(
+                finalized.state_root,
+                vec![vec![]],
+                old_state.nodes.clone(),
+                vec![]
+            )
+            .await
+            .is_err()
+    );
+    snapshot_client
+        .import_state_nodes(
+            finalized.state_root,
+            vec![vec![]],
+            old_state.nodes.clone(),
+            old_state.values.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_client
+            .storage_at(&account_key(&sender), &BlockId::Latest)
+            .await
+            .unwrap(),
+        Some(encode_account(&initial))
+    );
+    snapshot_client
+        .import_state_nodes(
+            second.header.state_root,
+            vec![vec![]],
+            head_state.nodes.clone(),
+            head_state.values.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(snapshot_client.engine_state_invariant_holds());
+    assert_eq!(
+        snapshot_client
+            .storage_at(&account_key(&sender), &BlockId::Latest)
+            .await
+            .unwrap(),
+        Some(encode_account(&initial))
+    );
+    assert!(
+        snapshot_client
+            .import_state_nodes(ZERO_HASH, vec![], vec![], vec![vec![1]])
+            .await
+            .is_err()
+    );
+
+    assert!(matches!(
+        backend.state_nodes(finalized.state_root, &[vec![1]]).await,
+        Err(neutrino_sync::SyncBackendError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        backend.state_nodes([99; 32], &[vec![]]).await,
+        Err(neutrino_sync::SyncBackendError::NotAvailable(_))
+    ));
+    assert!(matches!(
+        backend.blocks_by_root(&[second.hash(); 17]).await,
+        Err(neutrino_sync::SyncBackendError::InvalidRequest(_))
+    ));
 
     let database = backend.with_engine_mut_for_test(|engine| engine.store().db().clone());
     let reopened = ChainBackend::new(Engine::open(spec, database).unwrap(), ready_prover());
@@ -523,6 +678,11 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
     assert!(matches!(
         reopened.block_by_hash(second.hash()).await,
         Err(QueryError::Storage(_))
+    ));
+
+    assert!(matches!(
+        reopened.blocks_by_root(&[second.hash()]).await,
+        Err(neutrino_sync::SyncBackendError::Storage(_))
     ));
 
     reopened.with_engine_mut_for_test(|engine| {
@@ -557,6 +717,17 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
             .await,
         Err(RuntimeCallError::Query(QueryError::StateUnavailable))
     );
+    assert!(matches!(
+        reopened.blocks_by_range(2, 1, 1, second.hash()).await,
+        Err(neutrino_sync::SyncBackendError::NotAvailable(_))
+    ));
+    assert!(matches!(
+        reopened
+            .state_nodes(second.header.state_root, &[vec![]])
+            .await,
+        Err(neutrino_sync::SyncBackendError::NotAvailable(_))
+    ));
+
     // Corruption and missing leaf values also fail explicitly, with old roots
     // still readable rather than falling through to a different state.
     let value_hash = Poseidon2Hasher::hash_value(&encode_account(&initial));
@@ -596,4 +767,122 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
         reopened.finalized().await,
         Err(QueryError::Storage(_))
     ));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Proof rejection, branch finalization and restart share one fixture.
+async fn imported_finality_selects_a_proven_archived_fork_and_survives_restart() {
+    use neutrino_consensus_types::{Block, Body};
+    use neutrino_crypto::bls::SecretKey;
+    use neutrino_primitives::DOMAIN_PROPOSER_SIG;
+    use neutrino_rpc::RpcBackend;
+    use neutrino_runtime_host::WasmExecutor;
+    let (mut producer, witness) = engine();
+    let prover = ready_prover();
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let finalized = producer.finalize_chunk(0, &prover, &voter).unwrap();
+    let remote = Block {
+        header: witness.blocks[0].header.clone(),
+        body: Body::default(),
+    };
+    let mut local = remote.clone();
+    local.header.slot = 2;
+    local.header.timestamp = 2 * witness.chain_spec.consensus.slot_duration_secs;
+    let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    local.header.vrf_proof = key
+        .sign(&neutrino_vrf::vrf_message(7, &witness.seed, 2))
+        .to_bytes();
+    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
+    message.extend_from_slice(&7_u64.to_le_bytes());
+    message.extend_from_slice(&local.hash());
+    local.header.signature = key.sign(&message).to_bytes();
+    let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    follower.set_evidence_programs([1; 8], [2; 8]);
+    follower.import_block(&local).unwrap();
+    follower.import_block(&remote).unwrap();
+    let proof = producer
+        .store()
+        .get_block_proof(&remote.hash())
+        .unwrap()
+        .unwrap();
+    follower
+        .store_mut()
+        .put_block_proof(&remote.hash(), &proof)
+        .unwrap();
+    follower
+        .store_mut()
+        .put_block_state(&remote.hash(), BlockState::Proven)
+        .unwrap();
+    let backend = ChainBackend::new(follower, ready_prover());
+    let executor = tokio::task::spawn_blocking(WasmExecutor::default_runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    backend.set_block_executor(executor);
+    assert_eq!(
+        backend.local_status().await.unwrap().head_block_hash,
+        local.hash()
+    );
+    let mut invalid = finalized.chunk_proof.clone();
+    invalid.proof_bytes.push(1);
+    assert!(
+        backend
+            .verify_and_import_chunk_proof(invalid)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        backend.local_status().await.unwrap().head_block_hash,
+        local.hash()
+    );
+    assert_eq!(
+        backend.local_status().await.unwrap().finalized_chunk_id,
+        None
+    );
+    backend
+        .verify_and_import_chunk_proof(finalized.chunk_proof.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.header_by_height(1).await.unwrap(),
+        Some(remote.header.clone())
+    );
+    assert_eq!(
+        backend.local_status().await.unwrap().head_block_hash,
+        remote.hash()
+    );
+    assert_eq!(backend.finalized().await.unwrap().block_hash, remote.hash());
+    assert_eq!(
+        backend
+            .blocks_by_range(1, 1, 1, local.hash())
+            .await
+            .unwrap()
+            .blocks,
+        vec![local]
+    );
+    assert_eq!(
+        backend
+            .block_proofs_by_height(1, 1, remote.hash())
+            .await
+            .unwrap()
+            .proofs[0]
+            .block_hash,
+        remote.hash()
+    );
+    let restarted = ChainBackend::new(
+        Engine::open(witness.chain_spec, backend.snapshot_database()).unwrap(),
+        ready_prover(),
+    );
+    assert_eq!(
+        restarted.local_status().await.unwrap().head_block_hash,
+        remote.hash()
+    );
+    assert_eq!(
+        restarted.local_status().await.unwrap().finalized_chunk_id,
+        Some(0)
+    );
+    assert_eq!(
+        restarted.finalized().await.unwrap().block_hash,
+        remote.hash()
+    );
 }

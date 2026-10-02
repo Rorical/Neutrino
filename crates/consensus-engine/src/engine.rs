@@ -12,10 +12,11 @@ use neutrino_consensus_types::{
 use neutrino_primitives::{
     BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot, Validator,
 };
-use neutrino_storage::Database;
+use neutrino_storage::{Batch, Column, Database};
 use neutrino_trie::Trie;
 
 use crate::bft_loop::BftSession;
+use crate::block_state::BlockState;
 use crate::clock::SlotClock;
 use crate::error::EngineError;
 use crate::proposer::ProposerKey;
@@ -130,7 +131,11 @@ impl<DB: Database> Engine<DB> {
         store.put_chain_spec_hash(spec_hash)?;
         store.put_checkpoint(&chain_spec.genesis_checkpoint)?;
         store.put_validator_set_snapshot(0, &chain_spec.initial_validators)?;
-        store.put_tip(chain_spec.genesis_block_hash)?;
+        store.commit_tip(
+            chain_spec.genesis_block_hash,
+            chain_spec.genesis_block_hash,
+            Batch::new(),
+        )?;
         store.put_finalized_head(chain_spec.genesis_block_hash)?;
         store.put_latest_checkpoint_index(0)?;
         store.put_finalized_seed(chain_spec.genesis_seed)?;
@@ -185,6 +190,8 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
+        store.validate_canonical_index(chain_spec.genesis_block_hash)?;
+
         let head_hash = store.get_tip()?.ok_or(EngineError::NotInitialised)?;
         let finalized_head = store
             .get_finalized_head()?
@@ -238,6 +245,8 @@ impl<DB: Database> Engine<DB> {
             .get_validator_set_snapshot(active_index)?
             .unwrap_or_else(|| chain_spec.initial_validators.clone());
 
+        let fork_choice = Self::restore_fork_choice(&store, finalized_head, head_hash)?;
+
         Ok(Self {
             chain_spec,
             store,
@@ -256,14 +265,52 @@ impl<DB: Database> Engine<DB> {
             slashing_monitor: SlashingMonitor::new(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
-            // Restart-resume rebuilds an empty fork-choice DAG anchored
-            // at the current finalized head; live siblings imported
-            // before the restart are dropped (they would not have been
-            // honest extensions anyway because the engine never had
-            // them in its materialized chain). The DAG re-populates as
-            // gossip catches up.
-            fork_choice: ForkChoice::new(finalized_head),
+            fork_choice,
         })
+    }
+
+    fn restore_fork_choice(
+        store: &ChainStore<DB>,
+        finalized: BlockHash,
+        head: BlockHash,
+    ) -> Result<ForkChoice, StoreError<DB::Error>> {
+        let mut headers = Vec::new();
+        for (key, bytes) in store
+            .db()
+            .iter_column(Column::Headers)
+            .map_err(StoreError::Database)?
+        {
+            let header: neutrino_consensus_types::Header = borsh::from_slice(&bytes)?;
+            if header.hash().as_slice() != key || header.height == 0 {
+                return Err(StoreError::Corrupt(
+                    "archived header key or height is inconsistent",
+                ));
+            }
+            headers.push(header);
+        }
+        headers.sort_by_key(|header| (header.height, header.hash()));
+        let mut fork = ForkChoice::new(finalized);
+        for header in headers {
+            if header.parent_hash != finalized && fork.block(&header.parent_hash).is_none() {
+                continue;
+            }
+            let hash = fork
+                .add_block(&header)
+                .map_err(|_| StoreError::Corrupt("archived DAG ancestry is inconsistent"))?;
+            if matches!(
+                store.get_block_state(&hash)?,
+                Some(BlockState::Proven | BlockState::Finalized)
+            ) {
+                fork.on_block_proof(hash, neutrino_consensus_fork_choice::ProofStatus::Proven)
+                    .map_err(|_| StoreError::Corrupt("archived DAG proof state is inconsistent"))?;
+            }
+        }
+        if head != finalized && fork.block(&head).is_none() {
+            return Err(StoreError::Corrupt(
+                "materialized head does not descend from finality",
+            ));
+        }
+        Ok(fork)
     }
 
     /// Insert a rejected `BlockProof` into the bounded cache.
@@ -560,29 +607,46 @@ impl<DB: Database> Engine<DB> {
         Ok(())
     }
 
-    /// Advance the in-memory head pointers after a block has been
-    /// produced and persisted. Crate-internal — block production is
-    /// the only legitimate caller.
-    pub(crate) const fn update_head_internal(
+    /// Persist state deltas, selected ancestry and tip together before publishing
+    /// the corresponding in-memory view. Failed writes leave that view unchanged.
+    pub(crate) fn commit_materialized_head(
         &mut self,
         height: Height,
         hash: BlockHash,
         state_root: StateRoot,
-    ) {
+        next_state: Option<Trie>,
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.commit_materialized_head_with_batch(height, hash, state_root, next_state, Batch::new())
+    }
+
+    pub(crate) fn commit_materialized_head_with_batch(
+        &mut self,
+        height: Height,
+        hash: BlockHash,
+        state_root: StateRoot,
+        next_state: Option<Trie>,
+        mut batch: Batch,
+    ) -> Result<(), StoreError<DB::Error>> {
+        if next_state
+            .as_ref()
+            .is_some_and(|state| state.root() != state_root)
+        {
+            return Err(StoreError::Corrupt("staged state root disagrees with head"));
+        }
+        let mut state = next_state.unwrap_or_else(|| self.state.clone());
+        for (hash, bytes) in state.drain_pending_nodes() {
+            batch.put(Column::TrieNodes, hash, bytes);
+        }
+        for (hash, bytes) in state.drain_pending_values() {
+            batch.put(Column::StateValues, hash, bytes);
+        }
+        self.store
+            .commit_tip(hash, self.chain_spec.genesis_block_hash, batch)?;
+        self.state = state;
         self.head_height = height;
         self.head_hash = hash;
         self.head_state_root = state_root;
-    }
-
-    /// Swap the in-memory state trie for the post-execution trie a
-    /// [`BlockExecutor`](neutrino_proof_system::BlockExecutor)
-    /// returned during production.
-    ///
-    /// Crate-internal — only [`Engine::try_produce_block`] may call
-    /// this, in lock-step with [`Self::update_head_internal`] so the
-    /// committed `head_state_root` always matches `state.root()`.
-    pub(crate) fn replace_state_internal(&mut self, next: Trie) {
-        self.state = next;
+        Ok(())
     }
 
     /// Install only after the complete finalization batch has committed.
@@ -1443,6 +1507,53 @@ mod tests {
 
         let err = Engine::open(other, saved_db).expect_err("hash mismatch");
         assert!(matches!(err, EngineError::ChainSpecMismatch { .. }));
+    }
+
+    #[test]
+    fn failed_publication_keeps_memory_and_persisted_state_in_agreement() {
+        use crate::test_db::{FaultDb, header};
+        let spec = chain_spec();
+        let mut engine = Engine::genesis(spec.clone(), FaultDb::default()).unwrap();
+        let mut next_state = engine.state().clone();
+        next_state.insert(b"alice", b"100".to_vec()).unwrap();
+        let root = next_state.root();
+        let block = neutrino_consensus_types::Block {
+            header: header(1, 1, engine.head_hash(), root),
+            body: neutrino_consensus_types::Body::default(),
+        };
+        let batch = crate::store::ChainStore::<FaultDb>::block_archive_batch(&block, None).unwrap();
+        engine.store_mut().db_mut().fail_batch = true;
+        assert!(
+            engine
+                .commit_materialized_head_with_batch(
+                    1,
+                    block.hash(),
+                    root,
+                    Some(next_state.clone()),
+                    batch
+                )
+                .is_err()
+        );
+        assert_eq!(engine.head_hash(), spec.genesis_block_hash);
+        assert_eq!(engine.state().root(), spec.genesis_state_root);
+        assert_eq!(engine.store().get_header(&block.hash()).unwrap(), None);
+        assert_eq!(engine.store().get_block_hash_by_height(1).unwrap(), None);
+        let restarted = Engine::open(spec.clone(), engine.store().db().clone()).unwrap();
+        assert_eq!(restarted.head_hash(), spec.genesis_block_hash);
+        engine.store_mut().db_mut().fail_batch = false;
+        let batch = crate::store::ChainStore::<FaultDb>::block_archive_batch(&block, None).unwrap();
+        engine
+            .commit_materialized_head_with_batch(1, block.hash(), root, Some(next_state), batch)
+            .unwrap();
+        let restarted = Engine::open(spec, engine.store().db().clone()).unwrap();
+        assert_eq!(restarted.head_hash(), block.hash());
+        assert_eq!(restarted.state().get(b"alice"), Some(b"100".to_vec()));
+        engine
+            .store_mut()
+            .db_mut()
+            .delete(Column::HeaderByHeight, &crate::store::keys::height_key(1))
+            .unwrap();
+        assert!(Engine::open(engine.chain_spec().clone(), engine.store().db().clone()).is_err());
     }
 
     #[test]

@@ -166,12 +166,11 @@ impl<DB: Database> ChainStore<DB> {
     }
 
     /// Atomically persist complete finality and its outgoing trust boundary.
-    pub(crate) fn put_consensus_finalization(
-        &mut self,
+    pub(crate) fn consensus_finalization_batch(
         witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
         proof: &ChunkProof,
         state: &crate::full_chunk::ConsensusState,
-    ) -> Result<(), StoreError<DB::Error>> {
+    ) -> Result<neutrino_storage::Batch, StoreError<DB::Error>> {
         let mut batch = neutrino_storage::Batch::new();
         let chunk = neutrino_prover_chunk::consensus::as_chunk(&state.statement.execution);
         let key = keys::chunk_id_key(chunk.chunk_id);
@@ -216,7 +215,7 @@ impl<DB: Database> ChainStore<DB> {
                 borsh::to_vec(&BlockState::Finalized)?,
             );
         }
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        Ok(batch)
     }
 
     // ---------- Generic helpers ----------
@@ -269,21 +268,41 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Headers + height/slot indexes ----------
 
-    /// Persist `header` and index it by hash, height, and slot.
+    /// Archive `header` by hash and slot without selecting its branch.
     ///
     /// Returns the header hash so callers do not have to recompute it.
-    /// The hash key is stored in the `HeaderByHeight` and `HeaderBySlot`
-    /// columns; the canonical header bytes live in `Headers`.
+    /// The canonical height index changes only through [`Self::commit_tip`].
     pub fn put_header(&mut self, header: &Header) -> Result<BlockHash, StoreError<DB::Error>> {
         let hash = header.hash();
         self.put_encoded(Column::Headers, &keys::hash_key(&hash), header)?;
-        self.put_raw(
-            Column::HeaderByHeight,
-            &keys::height_key(header.height),
-            &hash,
-        )?;
         self.put_raw(Column::HeaderBySlot, &keys::slot_key(header.slot), &hash)?;
         Ok(hash)
+    }
+
+    /// Stage a verified block archive; publication chooses whether this batch
+    /// also advances the canonical head.
+    pub(crate) fn block_archive_batch(
+        block: &neutrino_consensus_types::Block,
+        witness: Option<&[u8]>,
+    ) -> Result<neutrino_storage::Batch, StoreError<DB::Error>> {
+        let hash = block.hash();
+        let mut batch = neutrino_storage::Batch::new();
+        batch.put(Column::Headers, hash, borsh::to_vec(&block.header)?);
+        batch.put(
+            Column::HeaderBySlot,
+            keys::slot_key(block.header.slot),
+            hash,
+        );
+        batch.put(Column::Blocks, hash, borsh::to_vec(&block.body)?);
+        batch.put(
+            Column::BlockStates,
+            hash,
+            borsh::to_vec(&BlockState::BlockProduced)?,
+        );
+        if let Some(bytes) = witness {
+            batch.put(Column::Witnesses, hash, bytes.to_vec());
+        }
+        Ok(batch)
     }
 
     /// Read a header by its hash.
@@ -297,7 +316,11 @@ impl<DB: Database> ChainStore<DB> {
         height: Height,
     ) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::HeaderByHeight, &keys::height_key(height))?;
-        Ok(raw.and_then(|bytes| BlockHash::try_from(bytes.as_slice()).ok()))
+        raw.map(|bytes| {
+            BlockHash::try_from(bytes.as_slice())
+                .map_err(|_| StoreError::Corrupt("invalid canonical height hash"))
+        })
+        .transpose()
     }
 
     /// Read the canonical header at a height, following the height
@@ -309,7 +332,14 @@ impl<DB: Database> ChainStore<DB> {
         let Some(hash) = self.get_block_hash_by_height(height)? else {
             return Ok(None);
         };
-        self.get_header(&hash)
+        let header = self.get_header(&hash)?;
+        match header {
+            Some(header) if header.hash() == hash && header.height == height => Ok(Some(header)),
+            None if height == 0 => Ok(None),
+            _ => Err(StoreError::Corrupt(
+                "canonical height header is missing or inconsistent",
+            )),
+        }
     }
 
     /// Read the block hash recorded at `slot`, if any.
@@ -318,7 +348,11 @@ impl<DB: Database> ChainStore<DB> {
         slot: Slot,
     ) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::HeaderBySlot, &keys::slot_key(slot))?;
-        Ok(raw.and_then(|bytes| BlockHash::try_from(bytes.as_slice()).ok()))
+        raw.map(|bytes| {
+            BlockHash::try_from(bytes.as_slice())
+                .map_err(|_| StoreError::Corrupt("invalid block hash pointer"))
+        })
+        .transpose()
     }
 
     // ---------- Bodies ----------
@@ -507,15 +541,14 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Pointers (Finalized column) ----------
 
-    /// Write the tip pointer to `hash`.
-    pub fn put_tip(&mut self, hash: BlockHash) -> Result<(), StoreError<DB::Error>> {
-        self.put_raw(Column::Finalized, pointers::TIP, &hash)
-    }
-
     /// Read the tip pointer.
     pub fn get_tip(&self) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::Finalized, pointers::TIP)?;
-        Ok(raw.and_then(|bytes| BlockHash::try_from(bytes.as_slice()).ok()))
+        raw.map(|bytes| {
+            BlockHash::try_from(bytes.as_slice())
+                .map_err(|_| StoreError::Corrupt("invalid tip hash"))
+        })
+        .transpose()
     }
 
     /// Write the finalized-head pointer to `hash`.
@@ -526,7 +559,11 @@ impl<DB: Database> ChainStore<DB> {
     /// Read the finalized-head pointer.
     pub fn get_finalized_head(&self) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::Finalized, pointers::FINALIZED_HEAD)?;
-        Ok(raw.and_then(|bytes| BlockHash::try_from(bytes.as_slice()).ok()))
+        raw.map(|bytes| {
+            BlockHash::try_from(bytes.as_slice())
+                .map_err(|_| StoreError::Corrupt("invalid block hash pointer"))
+        })
+        .transpose()
     }
 
     /// Write the latest finalized chunk id.
@@ -544,11 +581,12 @@ impl<DB: Database> ChainStore<DB> {
     /// Read the latest finalized chunk id.
     pub fn get_latest_finalized_chunk_id(&self) -> Result<Option<ChunkId>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::Finalized, pointers::LATEST_FINALIZED_CHUNK_ID)?;
-        Ok(raw.and_then(|b| {
-            <[u8; 8]>::try_from(b.as_slice())
-                .ok()
+        raw.map(|bytes| {
+            <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_be_bytes)
-        }))
+                .map_err(|_| StoreError::Corrupt("invalid integer pointer"))
+        })
+        .transpose()
     }
 
     /// Write the latest checkpoint index.
@@ -568,11 +606,12 @@ impl<DB: Database> ChainStore<DB> {
         &self,
     ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::Finalized, pointers::LATEST_CHECKPOINT_INDEX)?;
-        Ok(raw.and_then(|b| {
-            <[u8; 8]>::try_from(b.as_slice())
-                .ok()
+        raw.map(|bytes| {
+            <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_be_bytes)
-        }))
+                .map_err(|_| StoreError::Corrupt("invalid integer pointer"))
+        })
+        .transpose()
     }
 
     /// Write the latest validator-set snapshot index.
@@ -592,11 +631,12 @@ impl<DB: Database> ChainStore<DB> {
         &self,
     ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::Finalized, pointers::LATEST_VALIDATOR_SET_INDEX)?;
-        Ok(raw.and_then(|b| {
-            <[u8; 8]>::try_from(b.as_slice())
-                .ok()
+        raw.map(|bytes| {
+            <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_be_bytes)
-        }))
+                .map_err(|_| StoreError::Corrupt("invalid integer pointer"))
+        })
+        .transpose()
     }
 
     /// Write the currently active VRF seed.
@@ -611,7 +651,11 @@ impl<DB: Database> ChainStore<DB> {
     /// Read the currently active VRF seed.
     pub fn get_finalized_seed(&self) -> Result<Option<Seed>, StoreError<DB::Error>> {
         let raw = self.get_raw(Column::Finalized, pointers::FINALIZED_SEED)?;
-        Ok(raw.and_then(|bytes| Seed::try_from(bytes.as_slice()).ok()))
+        raw.map(|bytes| {
+            Seed::try_from(bytes.as_slice())
+                .map_err(|_| StoreError::Corrupt("invalid seed pointer"))
+        })
+        .transpose()
     }
 
     /// Iterate every persisted `(hash, bytes)` pair in
@@ -823,17 +867,14 @@ mod tests {
     }
 
     #[test]
-    fn header_roundtrips_and_indexes_by_height_and_slot() {
+    fn header_archival_preserves_canonical_index() {
         let mut store = ChainStore::new(MemoryDatabase::new());
         let hdr = header(7, 9, h(99));
         let hash = store.put_header(&hdr).expect("put");
         assert_eq!(hash, hdr.hash());
         assert_eq!(store.get_header(&hash).expect("get"), Some(hdr.clone()));
-        assert_eq!(
-            store.get_header_by_height(7).expect("get"),
-            Some(hdr.clone()),
-        );
-        assert_eq!(store.get_block_hash_by_height(7).expect("get"), Some(hash));
+        assert_eq!(store.get_header_by_height(7).expect("get"), None,);
+        assert_eq!(store.get_block_hash_by_height(7).expect("get"), None);
         assert_eq!(store.get_block_hash_by_slot(9).expect("get"), Some(hash));
     }
 
@@ -1054,7 +1095,9 @@ mod tests {
     #[test]
     fn pointer_writes_and_reads_round_trip() {
         let mut store = ChainStore::new(MemoryDatabase::new());
-        store.put_tip(h(1)).expect("put");
+        store
+            .commit_tip(h(1), h(1), neutrino_storage::Batch::new())
+            .expect("put");
         store.put_finalized_head(h(2)).expect("put");
         store.put_latest_finalized_chunk_id(42).expect("put");
         store.put_latest_checkpoint_index(7).expect("put");
@@ -1072,9 +1115,14 @@ mod tests {
     #[test]
     fn overwriting_a_pointer_replaces_the_value() {
         let mut store = ChainStore::new(MemoryDatabase::new());
-        store.put_tip(h(1)).expect("put");
-        store.put_tip(h(2)).expect("put");
-        assert_eq!(store.get_tip().expect("get"), Some(h(2)));
+        store
+            .commit_tip(h(1), h(1), neutrino_storage::Batch::new())
+            .expect("put");
+        let hash = store.put_header(&header(1, 1, h(1))).unwrap();
+        store
+            .commit_tip(hash, h(1), neutrino_storage::Batch::new())
+            .expect("put");
+        assert_eq!(store.get_tip().expect("get"), Some(hash));
     }
 
     #[test]

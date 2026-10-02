@@ -17,6 +17,7 @@
 //! | `/neutrino/req/recursive_proof_latest`   | [`RecursiveProofLatestRequest`] → [`RecursiveProofLatestResponse`]   |
 //! | `/neutrino/req/recursive_proof_by_index` | [`RecursiveProofByIndexRequest`] → [`RecursiveProofByIndexResponse`] |
 //!
+//! Responses encode `RpcResult<Payload>` with explicit remote failures.
 //! Every request and response is canonically encoded with `borsh`, matching
 //! the wire format used by gossip and on-disk consensus types.
 //!
@@ -168,11 +169,15 @@ pub struct Status {
     pub chain_id: ChainId,
     /// Canonical hash of the local chain spec.
     pub chain_spec_hash: Hash,
+    /// Latest proof-finalized chunk; `None` at trusted genesis.
+    pub finalized_chunk_id: Option<ChunkId>,
+    /// Hash of that chunk, or zero when no chunk has finalized.
+    pub finalized_chunk_hash: Hash,
     /// Highest checkpoint index finalized by the local node.
     pub finalized_checkpoint_index: CheckpointIndex,
     /// Hash of the highest finalized [`Checkpoint`].
     pub finalized_checkpoint_hash: Hash,
-    /// Hash of the current local fork-choice head.
+    /// Hash of the materialized head selecting the canonical height index.
     pub head_block_hash: BlockHash,
     /// Slot of the current head.
     pub head_slot: Slot,
@@ -237,6 +242,8 @@ pub struct PingPayload {
 /// `BlocksByRange` request: stream blocks at `[start_height, start_height + count*step)`.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
 pub struct BlocksByRangeRequest {
+    /// Branch anchor from the peer status; all heights refer to its ancestry.
+    pub head_block_hash: BlockHash,
     /// First block height to include.
     pub start_height: Height,
     /// Number of blocks to include; clamped to [`MAX_BLOCKS_PER_RESPONSE`].
@@ -262,7 +269,7 @@ pub struct BlocksByRootRequest {
 /// `BlocksByRoot` response carrying the requested blocks.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlocksByRootResponse {
-    /// Blocks in the same order as the requested roots; entries omitted when unknown.
+    /// Blocks in request order. A missing entry fails the whole request.
     pub blocks: Vec<Block>,
 }
 
@@ -303,13 +310,15 @@ pub struct BlockProofByHashRequest {
 /// `BlockProofByHash` response carrying the requested block proofs.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockProofByHashResponse {
-    /// Proofs in the same order as the requested roots; entries omitted when unknown.
+    /// Proofs in request order. A missing entry fails the whole request.
     pub proofs: Vec<BlockProof>,
 }
 
 /// `BlockProofByHeight` request: fetch a contiguous proof range by height.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
 pub struct BlockProofByHeightRequest {
+    /// Branch anchor shared with the block range request.
+    pub head_block_hash: BlockHash,
     /// First block height to include.
     pub start_height: Height,
     /// Number of proofs to include; clamped to [`MAX_BLOCK_PROOFS_PER_RESPONSE`].
@@ -473,6 +482,13 @@ impl RpcRequest {
 /// stays small and equally cheap to move regardless of variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RpcResponse {
+    /// Explicit remote failure for the tagged protocol.
+    Error {
+        /// Protocol whose request could not be served.
+        protocol: RpcProtocol,
+        /// Reason data could not be served.
+        error: RpcFailure,
+    },
     /// Status handshake reply.
     Status(Status),
     /// Metadata reply.
@@ -506,6 +522,7 @@ impl RpcResponse {
     #[must_use]
     pub const fn protocol(&self) -> RpcProtocol {
         match self {
+            Self::Error { protocol, .. } => *protocol,
             Self::Status(_) => RpcProtocol::Status,
             Self::Metadata(_) => RpcProtocol::Metadata,
             Self::Ping(_) => RpcProtocol::Ping,
@@ -526,6 +543,9 @@ impl RpcResponse {
 /// Errors surfaced to RPC callers.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RpcError {
+    /// Peer explicitly reported missing data, storage failure or invalid parameters.
+    #[error("remote RPC failure: {0}")]
+    Remote(RpcFailure),
     /// libp2p reported an outbound request failure.
     #[error("outbound failure: {0}")]
     Outbound(String),
@@ -544,6 +564,23 @@ pub enum RpcError {
     #[error("failed to deliver response to peer")]
     ResponseDeliveryFailed,
 }
+
+/// Canonical wire failure shared by request/response protocols.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Error, Eq, PartialEq)]
+pub enum RpcFailure {
+    /// Requested data is not retained or not yet produced by this peer.
+    #[error("data unavailable: {0}")]
+    Unavailable(String),
+    /// Local storage failed or contained inconsistent authenticated data.
+    #[error("storage failure: {0}")]
+    Storage(String),
+    /// Request parameters do not describe a supported bounded query.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+}
+
+/// Every protocol returns either its payload or an explicit wire failure.
+pub type RpcResult<T> = Result<T, RpcFailure>;
 
 /// Stable, protocol-namespaced inbound request identifier.
 ///
@@ -670,35 +707,36 @@ where
 // --- Per-protocol type aliases ------------------------------------------------
 
 /// Codec for the Status RPC.
-pub type StatusCodec = BorshCodec<Status, Status>;
+pub type StatusCodec = BorshCodec<Status, RpcResult<Status>>;
 /// Codec for the Metadata RPC.
-pub type MetadataCodec = BorshCodec<MetadataRequest, Metadata>;
+pub type MetadataCodec = BorshCodec<MetadataRequest, RpcResult<Metadata>>;
 /// Codec for the Ping RPC.
-pub type PingCodec = BorshCodec<PingPayload, PingPayload>;
+pub type PingCodec = BorshCodec<PingPayload, RpcResult<PingPayload>>;
 /// Codec for the `BlocksByRange` RPC.
-pub type BlocksByRangeCodec = BorshCodec<BlocksByRangeRequest, BlocksByRangeResponse>;
+pub type BlocksByRangeCodec = BorshCodec<BlocksByRangeRequest, RpcResult<BlocksByRangeResponse>>;
 /// Codec for the `BlocksByRoot` RPC.
-pub type BlocksByRootCodec = BorshCodec<BlocksByRootRequest, BlocksByRootResponse>;
+pub type BlocksByRootCodec = BorshCodec<BlocksByRootRequest, RpcResult<BlocksByRootResponse>>;
 /// Codec for the `StateByRoot` RPC.
-pub type StateByRootCodec = BorshCodec<StateByRootRequest, StateByRootResponse>;
+pub type StateByRootCodec = BorshCodec<StateByRootRequest, RpcResult<StateByRootResponse>>;
 /// Codec for the `BlockProofByHash` RPC.
-pub type BlockProofByHashCodec = BorshCodec<BlockProofByHashRequest, BlockProofByHashResponse>;
+pub type BlockProofByHashCodec =
+    BorshCodec<BlockProofByHashRequest, RpcResult<BlockProofByHashResponse>>;
 /// Codec for the `BlockProofByHeight` RPC.
 pub type BlockProofByHeightCodec =
-    BorshCodec<BlockProofByHeightRequest, BlockProofByHeightResponse>;
+    BorshCodec<BlockProofByHeightRequest, RpcResult<BlockProofByHeightResponse>>;
 /// Codec for the `ChunkProofById` RPC.
-pub type ChunkProofByIdCodec = BorshCodec<ChunkProofByIdRequest, ChunkProofByIdResponse>;
+pub type ChunkProofByIdCodec = BorshCodec<ChunkProofByIdRequest, RpcResult<ChunkProofByIdResponse>>;
 /// Codec for the `RecursiveProofLatest` RPC.
 pub type RecursiveProofLatestCodec =
-    BorshCodec<RecursiveProofLatestRequest, RecursiveProofLatestResponse>;
+    BorshCodec<RecursiveProofLatestRequest, RpcResult<RecursiveProofLatestResponse>>;
 /// Codec for the `RecursiveProofByIndex` RPC.
 pub type RecursiveProofByIndexCodec =
-    BorshCodec<RecursiveProofByIndexRequest, RecursiveProofByIndexResponse>;
+    BorshCodec<RecursiveProofByIndexRequest, RpcResult<RecursiveProofByIndexResponse>>;
 /// Codec for the `FinalityCertByChunk` RPC.
 pub type FinalityCertByChunkCodec =
-    BorshCodec<FinalityCertByChunkRequest, FinalityCertByChunkResponse>;
+    BorshCodec<FinalityCertByChunkRequest, RpcResult<FinalityCertByChunkResponse>>;
 /// Codec for the `WitnessByBlock` RPC.
-pub type WitnessByBlockCodec = BorshCodec<WitnessByBlockRequest, WitnessByBlockResponse>;
+pub type WitnessByBlockCodec = BorshCodec<WitnessByBlockRequest, RpcResult<WitnessByBlockResponse>>;
 
 /// Behaviour type for the Status RPC.
 pub type StatusBehaviour = request_response::Behaviour<StatusCodec>;
@@ -811,6 +849,8 @@ mod tests {
                 RpcRequest::Status(Status {
                     chain_id: 1,
                     chain_spec_hash: [0; 32],
+                    finalized_chunk_id: None,
+                    finalized_chunk_hash: [0; 32],
                     finalized_checkpoint_index: 0,
                     finalized_checkpoint_hash: [0; 32],
                     head_block_hash: [0; 32],
@@ -826,6 +866,7 @@ mod tests {
             ),
             (
                 RpcRequest::BlocksByRange(BlocksByRangeRequest {
+                    head_block_hash: [0; 32],
                     start_height: 0,
                     count: 1,
                     step: 1,
@@ -849,6 +890,7 @@ mod tests {
             ),
             (
                 RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
+                    head_block_hash: [0; 32],
                     start_height: 0,
                     count: 1,
                 }),
@@ -909,6 +951,8 @@ mod tests {
         let status = Status {
             chain_id: 7,
             chain_spec_hash: [9; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             finalized_checkpoint_index: 12,
             finalized_checkpoint_hash: [1; 32],
             head_block_hash: [2; 32],
@@ -935,6 +979,7 @@ mod tests {
     #[test]
     fn blocks_by_range_request_round_trips() {
         let req = BlocksByRangeRequest {
+            head_block_hash: [0; 32],
             start_height: 1000,
             count: 16,
             step: 1,
@@ -959,6 +1004,8 @@ mod tests {
         let req = Status {
             chain_id: 9,
             chain_spec_hash: [8; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             finalized_checkpoint_index: 1,
             finalized_checkpoint_hash: [3; 32],
             head_block_hash: [4; 32],

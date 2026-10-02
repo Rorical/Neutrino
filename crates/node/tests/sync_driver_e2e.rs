@@ -186,7 +186,12 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
     }
     assert_eq!(producer_handle.backend.head_height(), N_BLOCKS);
     assert_eq!(
-        producer_handle.backend.local_progress().await.proven_height,
+        producer_handle
+            .backend
+            .local_progress()
+            .await
+            .unwrap()
+            .proven_height,
         N_BLOCKS
     );
 
@@ -218,8 +223,8 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
     // (Status, BlocksByRange, BlockProofByHeight, StateByRoot, ...)
     // by routing into the backend, which is exactly what makes
     // node A capable of serving node B's sync requests.
-    let producer_progress = producer_handle.backend.local_progress().await;
-    let follower_progress = follower_handle.backend.local_progress().await;
+    let producer_progress = producer_handle.backend.local_progress().await.unwrap();
+    let follower_progress = follower_handle.backend.local_progress().await.unwrap();
 
     let producer_driver = SyncDriver::new(
         SyncDriverConfig::default(),
@@ -247,18 +252,24 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
     // producer's, with a generous timeout that absorbs libp2p
     // mesh formation plus sequential blocks/proofs/finality RPCs for each chunk.
     let target_head = producer_handle.backend.head_height();
-    let target_hash = producer_handle.backend.local_status().await.head_block_hash;
+    let target_hash = producer_handle
+        .backend
+        .local_status()
+        .await
+        .unwrap()
+        .head_block_hash;
     let converged = timeout(Duration::from_secs(30), async {
         loop {
-            let progress = follower_handle.backend.local_progress().await;
+            let progress = follower_handle.backend.local_progress().await.unwrap();
             if progress.head_height == target_head
                 && progress.proven_height == target_head
                 && follower_handle
                     .backend
                     .local_status()
                     .await
-                    .finalized_checkpoint_index
-                    == N_BLOCKS
+                    .unwrap()
+                    .finalized_chunk_id
+                    == Some(N_BLOCKS - 1)
             {
                 return progress;
             }
@@ -267,12 +278,13 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
     })
     .await;
     if converged.is_err() {
-        let progress = follower_handle.backend.local_progress().await;
+        let progress = follower_handle.backend.local_progress().await.unwrap();
         panic!("follower did not converge within 30s: progress = {progress:?}");
     }
 
-    let follower_status = follower_handle.backend.local_status().await;
-    assert_eq!(follower_status.finalized_checkpoint_index, N_BLOCKS);
+    let follower_status = follower_handle.backend.local_status().await.unwrap();
+    assert_eq!(follower_status.finalized_chunk_id, Some(N_BLOCKS - 1));
+    assert_eq!(follower_status.finalized_checkpoint_index, 0);
     assert_eq!(
         follower_handle.backend.active_validator_set().await,
         producer_handle.backend.active_validator_set().await,
@@ -286,7 +298,7 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
         follower_status.head_block_hash, target_hash,
         "follower head hash matches producer",
     );
-    let follower_progress = follower_handle.backend.local_progress().await;
+    let follower_progress = follower_handle.backend.local_progress().await.unwrap();
     assert_eq!(
         follower_progress.proven_height, target_head,
         "follower proven height matches producer",

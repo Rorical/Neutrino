@@ -17,7 +17,7 @@
 //! silently dropped by `observe_finality_vote` (no session for the
 //! chunk). v0 alone has 1/2 prevote stake which falls short of the
 //! 2/3 quorum, so v0 cannot reach precommit either. After a generous
-//! wait, neither validator's `finalized_checkpoint_index` advances
+//! wait, neither validator's `finalized_chunk_id` advances
 //! past genesis.
 //!
 //! Sister to `block_proof_gossip_rejection.rs` (which covers the
@@ -403,20 +403,20 @@ async fn injected_bad_proof_prevents_chunk_finality() {
     handle_0.backend.maybe_open_bft_session_for_height(1).await;
 
     // Wait long enough that, if finality were possible, both
-    // validators would have reached `finalized_checkpoint_index >= 1`.
+    // validators would have reached `finalized_chunk_id == Some(0)`.
     // 20 s is a comfortable upper bound over the M7-new positive test
     // (which finalises in <30 s with 16 validators).
     tokio::time::sleep(Duration::from_secs(20)).await;
 
     // M7-new exit criterion 2: neither validator advances past genesis.
-    let status_0 = handle_0.backend.local_status().await;
-    let status_1 = handle_1.backend.local_status().await;
+    let status_0 = handle_0.backend.local_status().await.unwrap();
+    let status_1 = handle_1.backend.local_status().await.unwrap();
     assert_eq!(
-        status_0.finalized_checkpoint_index, 0,
+        status_0.finalized_chunk_id, None,
         "v0 must not finalize chunk 0 when the gossipped proof is invalid",
     );
     assert_eq!(
-        status_1.finalized_checkpoint_index, 0,
+        status_1.finalized_chunk_id, None,
         "v1 must not finalize chunk 0 when the gossipped proof is invalid",
     );
 
@@ -424,8 +424,8 @@ async fn injected_bad_proof_prevents_chunk_finality() {
     // proof (proven_height stays at 0). v0 has its proof locally
     // (proven_height = 1 because the tamper happened on the wire,
     // not in v0's store).
-    let progress_0 = handle_0.backend.local_progress().await;
-    let progress_1 = handle_1.backend.local_progress().await;
+    let progress_0 = handle_0.backend.local_progress().await.unwrap();
+    let progress_1 = handle_1.backend.local_progress().await.unwrap();
     assert_eq!(progress_0.proven_height, 1, "v0 has the real proof locally");
     assert_eq!(
         progress_1.proven_height, 0,

@@ -37,7 +37,7 @@ borsh                     = { workspace = true }
 thiserror                 = { workspace = true }
 
 [dev-dependencies]
-neutrino-runtime-core = { workspace = true }
+neutrino-runtime-core = { workspace = true, features = ["host"] }
 rand                      = { workspace = true }
 
 [lints]

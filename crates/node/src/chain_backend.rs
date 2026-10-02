@@ -24,6 +24,7 @@
 //! Checkpoint recursion remains unsupported.
 
 mod evidence;
+mod p2p_queries;
 mod rpc_queries;
 
 use std::collections::BTreeSet;
@@ -41,7 +42,7 @@ use neutrino_consensus_types::{
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
 use neutrino_network::rpc::{
-    self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
+    BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
     BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse,
     RecursiveProofByIndexResponse, RecursiveProofLatestResponse, StateByRootResponse, Status,
     WitnessByBlockResponse,
@@ -50,7 +51,7 @@ use neutrino_network::service::NetworkCommand;
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{
     BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
-    ZERO_HASH, blake3_256,
+    blake3_256,
 };
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
 use neutrino_runtime_abi::{TxValidationCode, TxValidity};
@@ -875,18 +876,31 @@ where
         })
     }
 
-    fn contiguous_proven_height(e: &Engine<DB>) -> Height {
+    fn contiguous_proven_height(e: &Engine<DB>) -> Result<Height, SyncBackendError> {
         let mut height = 0;
         for candidate in 1..=e.head_height() {
-            let Ok(Some(hash)) = e.store().get_block_hash_by_height(candidate) else {
+            let hash = e
+                .store()
+                .get_block_hash_by_height(candidate)
+                .map_err(p2p_queries::storage_error)?
+                .ok_or_else(|| {
+                    SyncBackendError::Storage("canonical height is missing".to_owned())
+                })?;
+            let Some(proof) = e
+                .store()
+                .get_block_proof(&hash)
+                .map_err(p2p_queries::storage_error)?
+            else {
                 break;
             };
-            let Ok(Some(_proof)) = e.store().get_block_proof(&hash) else {
-                break;
-            };
+            if proof.height != candidate || proof.block_hash != hash {
+                return Err(p2p_queries::storage_error(
+                    "canonical proof cursor is inconsistent",
+                ));
+            }
             height = candidate;
         }
-        height
+        Ok(height)
     }
 
     /// Highest contiguous block height for which a body is persisted.
@@ -895,18 +909,27 @@ where
     /// avoid auto-skipping when the local store has had no bodies
     /// written. Producers and full nodes that always persist bodies
     /// inline return the same value as [`Engine::head_height`].
-    fn contiguous_body_height(e: &Engine<DB>) -> Height {
+    fn contiguous_body_height(e: &Engine<DB>) -> Result<Height, SyncBackendError> {
         let mut height = 0;
         for candidate in 1..=e.head_height() {
-            let Ok(Some(hash)) = e.store().get_block_hash_by_height(candidate) else {
+            let hash = e
+                .store()
+                .get_block_hash_by_height(candidate)
+                .map_err(p2p_queries::storage_error)?
+                .ok_or_else(|| {
+                    SyncBackendError::Storage("canonical height is missing".to_owned())
+                })?;
+            if e.store()
+                .get_body(&hash)
+                .map_err(p2p_queries::storage_error)?
+                .is_none()
+            {
                 break;
-            };
-            let Ok(Some(_body)) = e.store().get_body(&hash) else {
-                break;
-            };
+            }
+            rpc_queries::read_block(e, hash).map_err(p2p_queries::query_error)?;
             height = candidate;
         }
-        height
+        Ok(height)
     }
 
     /// Persist a full state dump received during snap-sync. Verifies
@@ -919,55 +942,61 @@ where
         nodes: Vec<Vec<u8>>,
         values: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError> {
-        use neutrino_primitives::blake3_256;
-        use neutrino_trie::TRIE_NODE_DOMAIN;
-
-        // Verify each node's bytes hash to the content-address its
-        // peers stored it under. The trie's `Hasher` prepends a
-        // 16-byte domain tag before hashing the encoded node.
-        let mut hashed_nodes: Vec<(neutrino_primitives::Hash, Vec<u8>)> =
-            Vec::with_capacity(nodes.len());
-        for bytes in nodes {
-            let mut buf = Vec::with_capacity(TRIE_NODE_DOMAIN.len() + bytes.len());
-            buf.extend_from_slice(&TRIE_NODE_DOMAIN);
-            buf.extend_from_slice(&bytes);
-            hashed_nodes.push((blake3_256(&buf), bytes));
-        }
-        let mut hashed_values: Vec<(neutrino_primitives::Hash, Vec<u8>)> =
-            Vec::with_capacity(values.len());
-        for bytes in values {
-            let hash = blake3_256(&bytes);
-            hashed_values.push((hash, bytes));
-        }
-
-        // Rebuild the trie and confirm the root matches before
-        // touching any storage.
-        let reconstructed: neutrino_trie::Trie = neutrino_trie::Trie::from_persisted(
+        use neutrino_trie::{Hasher, Poseidon2Hasher};
+        let node_count = nodes.len();
+        let value_count = values.len();
+        let nodes: std::collections::BTreeMap<_, _> = nodes
+            .into_iter()
+            .map(|bytes| (Poseidon2Hasher::hash_node(&bytes), bytes))
+            .collect();
+        let values: std::collections::BTreeMap<_, _> = values
+            .into_iter()
+            .map(|bytes| (Poseidon2Hasher::hash_value(&bytes), bytes))
+            .collect();
+        let authenticated = rpc_queries::authenticate_state(
             root,
-            hashed_nodes.iter().cloned(),
-            hashed_values.iter().cloned(),
-        );
-        if reconstructed.root() != root {
-            return Err(SyncBackendError::Rejected(format!(
-                "reconstructed state root {:?} does not match requested {:?}",
-                reconstructed.root(),
-                root
-            )));
+            |hash| {
+                nodes
+                    .get(&hash)
+                    .cloned()
+                    .ok_or(neutrino_rpc::QueryError::StateUnavailable)
+            },
+            |hash| {
+                values
+                    .get(&hash)
+                    .cloned()
+                    .ok_or(neutrino_rpc::QueryError::StateUnavailable)
+            },
+        )
+        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+        if authenticated.nodes.len() != node_count || authenticated.values.len() != value_count {
+            return Err(SyncBackendError::Rejected(
+                "snapshot contains duplicate or unreachable entries".to_owned(),
+            ));
         }
-
-        self.with_engine_mut(|e| -> Result<(), SyncBackendError> {
-            for (hash, bytes) in &hashed_nodes {
-                e.store_mut()
-                    .put_trie_node(hash, bytes)
-                    .map_err(Self::map_store_err)?;
+        let reconstructed = neutrino_trie::Trie::from_persisted(
+            root,
+            authenticated.nodes.clone(),
+            authenticated.values.clone(),
+        );
+        self.with_engine_mut(|engine| {
+            let mut batch = neutrino_storage::Batch::new();
+            for (hash, bytes) in authenticated.nodes {
+                batch.put(neutrino_storage::Column::TrieNodes, hash, bytes);
             }
-            for (hash, bytes) in &hashed_values {
-                e.store_mut()
-                    .put_state_value(hash, bytes)
-                    .map_err(Self::map_store_err)?;
+            for (hash, bytes) in authenticated.values {
+                batch.put(neutrino_storage::Column::StateValues, hash, bytes);
             }
-            e.replace_state_with_reconstructed(reconstructed);
-            Ok(())
+            engine
+                .store_mut()
+                .db_mut()
+                .write_batch(batch)
+                .map_err(p2p_queries::storage_error)?;
+            // Historical snapshots are retained without replacing live head state.
+            if engine.head_state_root() == root {
+                engine.replace_state_with_reconstructed(reconstructed);
+            }
+            Ok::<_, SyncBackendError>(())
         })?;
 
         Ok(StateProgress {
@@ -1292,118 +1321,19 @@ where
                 .and_then(|id| id.checked_mul(size))
                 .ok_or_else(|| SyncBackendError::Rejected("height overflow".to_owned()))?;
             let start = end_height - size + 1;
-            let mut next_proof = start;
-            for height in start..=end_height {
-                let Some(header) = engine
-                    .store()
-                    .get_header_by_height(height)
-                    .map_err(Self::map_store_err)?
-                else {
-                    break;
-                };
-                if engine
-                    .store()
-                    .get_block_proof(&header.hash())
-                    .map_err(Self::map_store_err)?
-                    .is_none()
-                {
-                    break;
-                }
-                next_proof = height
-                    .checked_add(1)
-                    .ok_or_else(|| SyncBackendError::Rejected("height overflow".to_owned()))?;
-            }
             Ok(Some(neutrino_sync::backend::ConsensusSyncTarget {
                 chunk_id,
+                start_height: start,
                 end_height,
-                next_header: engine.head_height().saturating_add(1),
-                next_proof,
             }))
         })
     }
-    async fn local_status(&self) -> Status {
-        self.with_engine(|e| {
-            let head_slot = e
-                .store()
-                .get_header(&e.head_hash())
-                .ok()
-                .flatten()
-                .map_or(0, |h| h.slot);
-            // M3-new: chunk-BFT finality is now the only finality
-            // signal. The wire `finalized_checkpoint_*` field
-            // semantics are preserved (0 = genesis only, N = chunks
-            // 0..N have been BFT-finalized) by adding 1 to the latest
-            // finalized chunk id when present. Recursive checkpoint
-            // proofs are deferred (see
-            // docs/design/10-proof-system.md).
-            let (finalized_index, finalized_chunk) =
-                e.latest_finalized_chunk_id().map_or((0, None), |chunk_id| {
-                    (
-                        chunk_id.saturating_add(1),
-                        e.store().get_chunk(chunk_id).ok().flatten(),
-                    )
-                });
-            let finalized_hash = finalized_chunk
-                .as_ref()
-                .map_or(ZERO_HASH, neutrino_consensus_types::Chunk::hash);
-            Status {
-                chain_id: e.chain_spec().chain_id,
-                chain_spec_hash: e.chain_spec_hash(),
-                finalized_checkpoint_index: finalized_index,
-                finalized_checkpoint_hash: finalized_hash,
-                head_block_hash: e.head_hash(),
-                head_slot,
-                head_height: e.head_height(),
-            }
-        })
+    async fn local_status(&self) -> Result<Status, SyncBackendError> {
+        self.p2p_local_status()
     }
 
-    async fn local_progress(&self) -> LocalProgress {
-        self.with_engine(|e| {
-            let head_hash = e.head_hash();
-            let head_slot = e
-                .store()
-                .get_header(&head_hash)
-                .ok()
-                .flatten()
-                .map_or(0, |h| h.slot);
-            // M3-new: chunk-BFT finality drives the `finalized_*`
-            // fields directly; recursive checkpoint proofs are
-            // deferred. The `finalized_checkpoint_index` wire field
-            // preserves "0 = genesis only" by adding 1 to the
-            // latest finalized chunk id when present.
-            let (finalized_index, finalized_chunk) =
-                e.latest_finalized_chunk_id().map_or((0, None), |chunk_id| {
-                    (
-                        chunk_id.saturating_add(1),
-                        e.store().get_chunk(chunk_id).ok().flatten(),
-                    )
-                });
-            let (finalized_hash, finalized_state_root, finalized_block_hash, finalized_height) =
-                finalized_chunk.map_or((ZERO_HASH, ZERO_HASH, ZERO_HASH, 0), |chunk| {
-                    (
-                        chunk.hash(),
-                        chunk.end_state_root,
-                        chunk.end_block_hash,
-                        chunk.end_height,
-                    )
-                });
-
-            LocalProgress {
-                chain_id: e.chain_spec().chain_id,
-                chain_spec_hash: e.chain_spec_hash(),
-                finalized_checkpoint_index: finalized_index,
-                finalized_checkpoint_hash: finalized_hash,
-                finalized_state_root,
-                finalized_block_hash,
-                finalized_height,
-                head_height: e.head_height(),
-                head_block_hash: head_hash,
-                head_slot,
-                proven_height: Self::contiguous_proven_height(e),
-                body_height: Self::contiguous_body_height(e),
-            }
-        })
+    async fn local_progress(&self) -> Result<LocalProgress, SyncBackendError> {
+        self.p2p_local_progress()
     }
 
     async fn latest_recursive_proof(
@@ -1442,172 +1372,70 @@ where
         &self,
         start: CheckpointIndex,
         count: u64,
-    ) -> RecursiveProofByIndexResponse {
-        self.with_engine(|e| {
-            let mut items = Vec::new();
-            let latest = e.latest_checkpoint_index();
-            for index in start..start.saturating_add(count) {
-                if index == 0 || index > latest {
-                    break;
-                }
-                let Ok(Some(checkpoint)) = e.store().get_checkpoint(index) else {
-                    break;
-                };
-                let Ok(Some(proof)) = e.store().get_recursive_proof(index) else {
-                    break;
-                };
-                items.push((checkpoint, proof));
-            }
-            RecursiveProofByIndexResponse { items }
-        })
+    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError> {
+        self.p2p_recursive_proofs_by_index(start, count)
     }
 
-    async fn blocks_by_range(&self, start: Height, count: u64, step: u64) -> BlocksByRangeResponse {
-        let step = step.max(1);
-        self.with_engine(|e| {
-            let mut blocks = Vec::new();
-            let mut h = start;
-            for _ in 0..count {
-                if h > e.head_height() {
-                    break;
-                }
-                let Ok(Some(header)) = e.store().get_header_by_height(h) else {
-                    break;
-                };
-                let body = e
-                    .store()
-                    .get_body(&header.hash())
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                blocks.push(Block { header, body });
-                h = h.saturating_add(step);
-            }
-            BlocksByRangeResponse { blocks }
-        })
+    async fn blocks_by_range(
+        &self,
+        start: Height,
+        count: u64,
+        step: u64,
+        head: BlockHash,
+    ) -> Result<BlocksByRangeResponse, SyncBackendError> {
+        self.p2p_blocks_by_range(start, count, step, head)
     }
 
-    async fn blocks_by_root(&self, roots: &[BlockHash]) -> BlocksByRootResponse {
-        self.with_engine(|e| {
-            let mut blocks = Vec::with_capacity(roots.len());
-            for root in roots {
-                let Ok(Some(header)) = e.store().get_header(root) else {
-                    continue;
-                };
-                let body = e.store().get_body(root).ok().flatten().unwrap_or_default();
-                blocks.push(Block { header, body });
-            }
-            BlocksByRootResponse { blocks }
-        })
+    async fn blocks_by_root(
+        &self,
+        roots: &[BlockHash],
+    ) -> Result<BlocksByRootResponse, SyncBackendError> {
+        self.p2p_blocks_by_root(roots)
     }
 
-    async fn state_nodes(&self, root: StateRoot, _paths: &[Vec<u8>]) -> StateByRootResponse {
-        // Serve a bounded full-trie dump at the current head root. Sparse
-        // path streaming is not implemented by this endpoint.
-        self.with_engine(|e| {
-            if e.head_state_root() != root {
-                debug!(
-                    requested = ?root,
-                    local = ?e.head_state_root(),
-                    "state_nodes request does not match local head root; returning empty"
-                );
-                return StateByRootResponse::default();
-            }
-            let nodes = e
-                .store()
-                .iter_trie_nodes()
-                .ok()
-                .map(|entries| entries.into_iter().map(|(_, bytes)| bytes).collect())
-                .unwrap_or_default();
-            let values = e
-                .store()
-                .iter_state_values()
-                .ok()
-                .map(|entries| entries.into_iter().map(|(_, bytes)| bytes).collect())
-                .unwrap_or_default();
-            StateByRootResponse { nodes, values }
-        })
+    async fn state_nodes(
+        &self,
+        root: StateRoot,
+        paths: &[Vec<u8>],
+    ) -> Result<StateByRootResponse, SyncBackendError> {
+        self.p2p_state_nodes(root, paths)
     }
 
-    async fn block_proofs_by_hash(&self, roots: &[BlockHash]) -> BlockProofByHashResponse {
-        self.with_engine(|e| {
-            let mut proofs = Vec::with_capacity(roots.len());
-            let max = usize::try_from(rpc::MAX_BLOCK_PROOFS_PER_RESPONSE)
-                .expect("block proof response limit fits usize");
-            for root in roots.iter().take(max) {
-                let Ok(Some(proof)) = e.store().get_block_proof(root) else {
-                    continue;
-                };
-                proofs.push(proof);
-            }
-            BlockProofByHashResponse { proofs }
-        })
+    async fn block_proofs_by_hash(
+        &self,
+        roots: &[BlockHash],
+    ) -> Result<BlockProofByHashResponse, SyncBackendError> {
+        self.p2p_block_proofs_by_hash(roots)
     }
 
     async fn block_proofs_by_height(
         &self,
         start: Height,
         count: u64,
-    ) -> BlockProofByHeightResponse {
-        let count = count.min(rpc::MAX_BLOCK_PROOFS_PER_RESPONSE);
-        self.with_engine(|e| {
-            let mut proofs = Vec::new();
-            for height in start..start.saturating_add(count) {
-                let Ok(Some(hash)) = e.store().get_block_hash_by_height(height) else {
-                    break;
-                };
-                let Ok(Some(proof)) = e.store().get_block_proof(&hash) else {
-                    break;
-                };
-                proofs.push(proof);
-            }
-            BlockProofByHeightResponse { proofs }
-        })
+        head: BlockHash,
+    ) -> Result<BlockProofByHeightResponse, SyncBackendError> {
+        self.p2p_block_proofs_by_height(start, count, head)
     }
 
-    async fn chunk_proofs_by_id(&self, chunk_ids: &[ChunkId]) -> ChunkProofByIdResponse {
-        self.with_engine(|e| {
-            let mut proofs = Vec::with_capacity(chunk_ids.len());
-            let max = usize::try_from(rpc::MAX_CHUNK_PROOFS_PER_RESPONSE)
-                .expect("chunk proof response limit fits usize");
-            for chunk_id in chunk_ids.iter().copied().take(max) {
-                let Ok(Some(proof)) = e.store().get_chunk_proof(chunk_id) else {
-                    continue;
-                };
-                proofs.push(proof);
-            }
-            ChunkProofByIdResponse { proofs }
-        })
+    async fn chunk_proofs_by_id(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<ChunkProofByIdResponse, SyncBackendError> {
+        self.p2p_chunk_proofs_by_id(chunk_ids)
     }
 
-    async fn finality_certs_by_chunk(&self, chunk_ids: &[ChunkId]) -> FinalityCertByChunkResponse {
-        self.with_engine(|e| {
-            let max = usize::try_from(rpc::MAX_FINALITY_CERTS_PER_RESPONSE)
-                .expect("finality cert response limit fits usize");
-            let mut certs = Vec::with_capacity(chunk_ids.len().min(max));
-            for chunk_id in chunk_ids.iter().copied().take(max) {
-                let Ok(Some(cert)) = e.store().get_finality_cert(chunk_id) else {
-                    continue;
-                };
-                certs.push(cert);
-            }
-            FinalityCertByChunkResponse { certs }
-        })
+    async fn finality_certs_by_chunk(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<FinalityCertByChunkResponse, SyncBackendError> {
+        self.p2p_finality_certs_by_chunk(chunk_ids)
     }
 
-    async fn witnesses_by_block(&self, block_hashes: &[BlockHash]) -> WitnessByBlockResponse {
-        self.with_engine(|e| {
-            let max = usize::try_from(rpc::MAX_WITNESSES_PER_RESPONSE)
-                .expect("witness response limit fits usize");
-            let mut witnesses = Vec::with_capacity(block_hashes.len().min(max));
-            for hash in block_hashes.iter().copied().take(max) {
-                let Ok(Some(witness)) = e.store().get_witness(&hash) else {
-                    continue;
-                };
-                witnesses.push(witness);
-            }
-            WitnessByBlockResponse { witnesses }
-        })
+    async fn witnesses_by_block(
+        &self,
+        block_hashes: &[BlockHash],
+    ) -> Result<WitnessByBlockResponse, SyncBackendError> {
+        self.p2p_witnesses_by_block(block_hashes)
     }
 
     async fn verify_and_import_checkpoints(
@@ -1668,21 +1496,15 @@ where
     async fn import_state_nodes(
         &self,
         root: StateRoot,
-        _paths: Vec<Vec<u8>>,
+        paths: Vec<Vec<u8>>,
         nodes: Vec<Vec<u8>>,
         values: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError> {
-        // The genesis state root is empty, so peers serving it return
-        // an empty payload. Treat that as "nothing to import" rather
-        // than a failure so the FSM can advance straight into
-        // ProofBackfill.
-        if root == ZERO_HASH {
-            return Ok(StateProgress {
-                root_complete: true,
-                next_paths: vec![],
-            });
+        if paths.iter().any(|path| !path.is_empty()) {
+            return Err(SyncBackendError::InvalidRequest(
+                "subtree state import is unsupported".to_owned(),
+            ));
         }
-
         self.import_full_state_dump(root, nodes, values)
     }
 
@@ -1842,7 +1664,11 @@ where
                     .latest_finalized_chunk_id()
                     .map_or(Some(0), |id| id.checked_add(1));
                 if next != Some(proof.chunk_id)
-                    || engine.head_height() < proof.public_inputs.end_height
+                    || engine
+                        .store()
+                        .get_header(&proof.public_inputs.end_block_hash)
+                        .map_err(Self::map_store_err)?
+                        .is_none()
                 {
                     return Err(SyncBackendError::ChainBehind(
                         "chunk dependencies are not available yet".to_owned(),
@@ -1852,8 +1678,16 @@ where
             })?;
         }
         let chunk_id = proof.chunk_id;
+        let executor = self.block_executor_snapshot();
         let outcome = self
-            .with_engine_mut(|e| e.import_chunk_proof(&proof, self.proof_system.as_ref()))
+            .with_engine_mut(|engine| match executor.as_ref() {
+                Some(executor) => engine.import_chunk_proof_with_dry_run(
+                    &proof,
+                    self.proof_system.as_ref(),
+                    executor.as_ref(),
+                ),
+                None => engine.import_chunk_proof(&proof, self.proof_system.as_ref()),
+            })
             .map_err(Self::map_import_err)?;
         if self.proof_system.consensus_block_key().is_some() {
             self.start_evidence_jobs();

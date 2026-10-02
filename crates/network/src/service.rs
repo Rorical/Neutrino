@@ -259,19 +259,25 @@ struct RpcDispatch {
     pending_witness_by_block:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
 
-    inbound_status: HashMap<u64, ResponseChannel<rpc::Status>>,
-    inbound_metadata: HashMap<u64, ResponseChannel<rpc::Metadata>>,
-    inbound_ping: HashMap<u64, ResponseChannel<rpc::PingPayload>>,
-    inbound_blocks_by_range: HashMap<u64, ResponseChannel<BlocksByRangeResponse>>,
-    inbound_blocks_by_root: HashMap<u64, ResponseChannel<BlocksByRootResponse>>,
-    inbound_state_by_root: HashMap<u64, ResponseChannel<StateByRootResponse>>,
-    inbound_block_proof_by_hash: HashMap<u64, ResponseChannel<BlockProofByHashResponse>>,
-    inbound_block_proof_by_height: HashMap<u64, ResponseChannel<BlockProofByHeightResponse>>,
-    inbound_chunk_proof_by_id: HashMap<u64, ResponseChannel<ChunkProofByIdResponse>>,
-    inbound_recursive_proof_latest: HashMap<u64, ResponseChannel<RecursiveProofLatestResponse>>,
-    inbound_recursive_proof_by_index: HashMap<u64, ResponseChannel<RecursiveProofByIndexResponse>>,
-    inbound_finality_cert_by_chunk: HashMap<u64, ResponseChannel<FinalityCertByChunkResponse>>,
-    inbound_witness_by_block: HashMap<u64, ResponseChannel<WitnessByBlockResponse>>,
+    inbound_status: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Status>>>,
+    inbound_metadata: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Metadata>>>,
+    inbound_ping: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::PingPayload>>>,
+    inbound_blocks_by_range: HashMap<u64, ResponseChannel<rpc::RpcResult<BlocksByRangeResponse>>>,
+    inbound_blocks_by_root: HashMap<u64, ResponseChannel<rpc::RpcResult<BlocksByRootResponse>>>,
+    inbound_state_by_root: HashMap<u64, ResponseChannel<rpc::RpcResult<StateByRootResponse>>>,
+    inbound_block_proof_by_hash:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<BlockProofByHashResponse>>>,
+    inbound_block_proof_by_height:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<BlockProofByHeightResponse>>>,
+    inbound_chunk_proof_by_id:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<ChunkProofByIdResponse>>>,
+    inbound_recursive_proof_latest:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<RecursiveProofLatestResponse>>>,
+    inbound_recursive_proof_by_index:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<RecursiveProofByIndexResponse>>>,
+    inbound_finality_cert_by_chunk:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<FinalityCertByChunkResponse>>>,
+    inbound_witness_by_block: HashMap<u64, ResponseChannel<rpc::RpcResult<WitnessByBlockResponse>>>,
 }
 
 impl RpcDispatch {
@@ -668,17 +674,27 @@ impl NetworkService {
                 .rpc
                 .inbound_status
                 .remove(&inbound_id.raw)
-                .is_some_and(|chan| behaviour.rpc_status.send_response(chan, payload).is_ok()),
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_status
+                        .send_response(chan, Ok(payload))
+                        .is_ok()
+                }),
             (RpcProtocol::Metadata, RpcResponse::Metadata(payload)) => self
                 .rpc
                 .inbound_metadata
                 .remove(&inbound_id.raw)
-                .is_some_and(|chan| behaviour.rpc_metadata.send_response(chan, payload).is_ok()),
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_metadata
+                        .send_response(chan, Ok(payload))
+                        .is_ok()
+                }),
             (RpcProtocol::Ping, RpcResponse::Ping(payload)) => self
                 .rpc
                 .inbound_ping
                 .remove(&inbound_id.raw)
-                .is_some_and(|chan| behaviour.rpc_ping.send_response(chan, payload).is_ok()),
+                .is_some_and(|chan| behaviour.rpc_ping.send_response(chan, Ok(payload)).is_ok()),
             (RpcProtocol::BlocksByRange, RpcResponse::BlocksByRange(payload)) => self
                 .rpc
                 .inbound_blocks_by_range
@@ -686,7 +702,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_blocks_by_range
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::BlocksByRoot, RpcResponse::BlocksByRoot(payload)) => self
@@ -696,7 +712,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_blocks_by_root
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::StateByRoot, RpcResponse::StateByRoot(payload)) => self
@@ -706,7 +722,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_state_by_root
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::BlockProofByHash, RpcResponse::BlockProofByHash(payload)) => self
@@ -716,7 +732,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_block_proof_by_hash
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::BlockProofByHeight, RpcResponse::BlockProofByHeight(payload)) => self
@@ -726,7 +742,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_block_proof_by_height
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::ChunkProofById, RpcResponse::ChunkProofById(payload)) => self
@@ -736,7 +752,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_chunk_proof_by_id
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::RecursiveProofLatest, RpcResponse::RecursiveProofLatest(payload)) => self
@@ -746,7 +762,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_recursive_proof_latest
-                        .send_response(chan, *payload)
+                        .send_response(chan, Ok(*payload))
                         .is_ok()
                 }),
             (RpcProtocol::RecursiveProofByIndex, RpcResponse::RecursiveProofByIndex(payload)) => {
@@ -756,7 +772,7 @@ impl NetworkService {
                     .is_some_and(|chan| {
                         behaviour
                             .rpc_recursive_proof_by_index
-                            .send_response(chan, payload)
+                            .send_response(chan, Ok(payload))
                             .is_ok()
                     })
             }
@@ -767,7 +783,7 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_finality_cert_by_chunk
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
             (RpcProtocol::WitnessByBlock, RpcResponse::WitnessByBlock(payload)) => self
@@ -777,7 +793,127 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_witness_by_block
-                        .send_response(chan, payload)
+                        .send_response(chan, Ok(payload))
+                        .is_ok()
+                }),
+            (RpcProtocol::Status, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_status
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| behaviour.rpc_status.send_response(chan, Err(error)).is_ok()),
+            (RpcProtocol::Metadata, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_metadata
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_metadata
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::Ping, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_ping
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| behaviour.rpc_ping.send_response(chan, Err(error)).is_ok()),
+            (RpcProtocol::BlocksByRange, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_blocks_by_range
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_blocks_by_range
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::BlocksByRoot, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_blocks_by_root
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_blocks_by_root
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::StateByRoot, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_state_by_root
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_state_by_root
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::BlockProofByHash, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_block_proof_by_hash
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_block_proof_by_hash
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::BlockProofByHeight, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_block_proof_by_height
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_block_proof_by_height
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::ChunkProofById, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_chunk_proof_by_id
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_chunk_proof_by_id
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::RecursiveProofLatest, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_recursive_proof_latest
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_recursive_proof_latest
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::RecursiveProofByIndex, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_recursive_proof_by_index
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_recursive_proof_by_index
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::FinalityCertByChunk, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_finality_cert_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_finality_cert_by_chunk
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::WitnessByBlock, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_witness_by_block
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_witness_by_block
+                        .send_response(chan, Err(error))
                         .is_ok()
                 }),
             _ => false,
@@ -788,7 +924,10 @@ impl NetworkService {
         }
     }
 
-    async fn handle_rpc_status(&mut self, ev: request_response::Event<rpc::Status, rpc::Status>) {
+    async fn handle_rpc_status(
+        &mut self,
+        ev: request_response::Event<rpc::Status, rpc::RpcResult<rpc::Status>>,
+    ) {
         match ev {
             request_response::Event::Message {
                 peer,
@@ -818,7 +957,7 @@ impl NetworkService {
                 ..
             } => {
                 if let Some(tx) = self.rpc.take_outbound(RpcProtocol::Status, request_id) {
-                    let _ = tx.send(Ok(RpcResponse::Status(response)));
+                    let _ = tx.send(response.map(RpcResponse::Status).map_err(RpcError::Remote));
                 }
             }
             request_response::Event::OutboundFailure {
@@ -833,7 +972,7 @@ impl NetworkService {
 
     async fn handle_rpc_metadata(
         &mut self,
-        ev: request_response::Event<rpc::MetadataRequest, rpc::Metadata>,
+        ev: request_response::Event<rpc::MetadataRequest, rpc::RpcResult<rpc::Metadata>>,
     ) {
         match ev {
             request_response::Event::Message {
@@ -864,7 +1003,11 @@ impl NetworkService {
                 ..
             } => {
                 if let Some(tx) = self.rpc.take_outbound(RpcProtocol::Metadata, request_id) {
-                    let _ = tx.send(Ok(RpcResponse::Metadata(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::Metadata)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -879,7 +1022,7 @@ impl NetworkService {
 
     async fn handle_rpc_ping(
         &mut self,
-        ev: request_response::Event<rpc::PingPayload, rpc::PingPayload>,
+        ev: request_response::Event<rpc::PingPayload, rpc::RpcResult<rpc::PingPayload>>,
     ) {
         match ev {
             request_response::Event::Message {
@@ -910,7 +1053,7 @@ impl NetworkService {
                 ..
             } => {
                 if let Some(tx) = self.rpc.take_outbound(RpcProtocol::Ping, request_id) {
-                    let _ = tx.send(Ok(RpcResponse::Ping(response)));
+                    let _ = tx.send(response.map(RpcResponse::Ping).map_err(RpcError::Remote));
                 }
             }
             request_response::Event::OutboundFailure {
@@ -925,7 +1068,10 @@ impl NetworkService {
 
     async fn handle_rpc_blocks_by_range(
         &mut self,
-        ev: request_response::Event<rpc::BlocksByRangeRequest, BlocksByRangeResponse>,
+        ev: request_response::Event<
+            rpc::BlocksByRangeRequest,
+            rpc::RpcResult<BlocksByRangeResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -961,7 +1107,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::BlocksByRange, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::BlocksByRange(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::BlocksByRange)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -976,7 +1126,7 @@ impl NetworkService {
 
     async fn handle_rpc_blocks_by_root(
         &mut self,
-        ev: request_response::Event<rpc::BlocksByRootRequest, BlocksByRootResponse>,
+        ev: request_response::Event<rpc::BlocksByRootRequest, rpc::RpcResult<BlocksByRootResponse>>,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1012,7 +1162,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::BlocksByRoot, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::BlocksByRoot(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::BlocksByRoot)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1027,7 +1181,7 @@ impl NetworkService {
 
     async fn handle_rpc_state_by_root(
         &mut self,
-        ev: request_response::Event<rpc::StateByRootRequest, StateByRootResponse>,
+        ev: request_response::Event<rpc::StateByRootRequest, rpc::RpcResult<StateByRootResponse>>,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1060,7 +1214,11 @@ impl NetworkService {
                 ..
             } => {
                 if let Some(tx) = self.rpc.take_outbound(RpcProtocol::StateByRoot, request_id) {
-                    let _ = tx.send(Ok(RpcResponse::StateByRoot(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::StateByRoot)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1075,7 +1233,10 @@ impl NetworkService {
 
     async fn handle_rpc_block_proof_by_hash(
         &mut self,
-        ev: request_response::Event<rpc::BlockProofByHashRequest, BlockProofByHashResponse>,
+        ev: request_response::Event<
+            rpc::BlockProofByHashRequest,
+            rpc::RpcResult<BlockProofByHashResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1111,7 +1272,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::BlockProofByHash, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::BlockProofByHash(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::BlockProofByHash)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1126,7 +1291,10 @@ impl NetworkService {
 
     async fn handle_rpc_block_proof_by_height(
         &mut self,
-        ev: request_response::Event<rpc::BlockProofByHeightRequest, BlockProofByHeightResponse>,
+        ev: request_response::Event<
+            rpc::BlockProofByHeightRequest,
+            rpc::RpcResult<BlockProofByHeightResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1162,7 +1330,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::BlockProofByHeight, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::BlockProofByHeight(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::BlockProofByHeight)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1179,7 +1351,10 @@ impl NetworkService {
 
     async fn handle_rpc_chunk_proof_by_id(
         &mut self,
-        ev: request_response::Event<rpc::ChunkProofByIdRequest, ChunkProofByIdResponse>,
+        ev: request_response::Event<
+            rpc::ChunkProofByIdRequest,
+            rpc::RpcResult<ChunkProofByIdResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1215,7 +1390,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::ChunkProofById, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::ChunkProofById(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::ChunkProofById)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1230,7 +1409,10 @@ impl NetworkService {
 
     async fn handle_rpc_recursive_proof_latest(
         &mut self,
-        ev: request_response::Event<rpc::RecursiveProofLatestRequest, RecursiveProofLatestResponse>,
+        ev: request_response::Event<
+            rpc::RecursiveProofLatestRequest,
+            rpc::RpcResult<RecursiveProofLatestResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1266,7 +1448,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::RecursiveProofLatest, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::RecursiveProofLatest(Box::new(response))));
+                    let _ = tx.send(
+                        response
+                            .map(|payload| RpcResponse::RecursiveProofLatest(Box::new(payload)))
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1287,7 +1473,7 @@ impl NetworkService {
         &mut self,
         ev: request_response::Event<
             rpc::RecursiveProofByIndexRequest,
-            RecursiveProofByIndexResponse,
+            rpc::RpcResult<RecursiveProofByIndexResponse>,
         >,
     ) {
         match ev {
@@ -1324,7 +1510,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::RecursiveProofByIndex, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::RecursiveProofByIndex(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::RecursiveProofByIndex)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1343,7 +1533,10 @@ impl NetworkService {
 
     async fn handle_rpc_finality_cert_by_chunk(
         &mut self,
-        ev: request_response::Event<rpc::FinalityCertByChunkRequest, FinalityCertByChunkResponse>,
+        ev: request_response::Event<
+            rpc::FinalityCertByChunkRequest,
+            rpc::RpcResult<FinalityCertByChunkResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1379,7 +1572,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::FinalityCertByChunk, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::FinalityCertByChunk(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::FinalityCertByChunk)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -1400,7 +1597,10 @@ impl NetworkService {
 
     async fn handle_rpc_witness_by_block(
         &mut self,
-        ev: request_response::Event<rpc::WitnessByBlockRequest, WitnessByBlockResponse>,
+        ev: request_response::Event<
+            rpc::WitnessByBlockRequest,
+            rpc::RpcResult<WitnessByBlockResponse>,
+        >,
     ) {
         match ev {
             request_response::Event::Message {
@@ -1436,7 +1636,11 @@ impl NetworkService {
                     .rpc
                     .take_outbound(RpcProtocol::WitnessByBlock, request_id)
                 {
-                    let _ = tx.send(Ok(RpcResponse::WitnessByBlock(response)));
+                    let _ = tx.send(
+                        response
+                            .map(RpcResponse::WitnessByBlock)
+                            .map_err(RpcError::Remote),
+                    );
                 }
             }
             request_response::Event::OutboundFailure {
@@ -2117,6 +2321,8 @@ mod tests {
         let canned_b_status = rpc::Status {
             chain_id: 7,
             chain_spec_hash: [0xAB; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             finalized_checkpoint_index: 42,
             finalized_checkpoint_hash: [0xBB; 32],
             head_block_hash: [0xCC; 32],
@@ -2129,14 +2335,32 @@ mod tests {
             while let Some(ev) = event_rx_b.recv().await {
                 if let NetworkEvent::RpcRequestReceived {
                     inbound_id,
-                    request: RpcRequest::Status(_),
+                    request,
                     ..
                 } = ev
                 {
                     cmd_tx_b_clone
                         .send(NetworkCommand::SendRpcResponse {
                             inbound_id,
-                            response: RpcResponse::Status(canned_b_clone),
+                            response: match request {
+                                RpcRequest::Status(_) => RpcResponse::Status(canned_b_clone),
+                                RpcRequest::BlocksByRoot(_) => RpcResponse::Error {
+                                    protocol: RpcProtocol::BlocksByRoot,
+                                    error: rpc::RpcFailure::Unavailable(
+                                        "body is missing".to_owned(),
+                                    ),
+                                },
+                                RpcRequest::StateByRoot(_) => RpcResponse::Error {
+                                    protocol: RpcProtocol::StateByRoot,
+                                    error: rpc::RpcFailure::Storage("invalid trie node".to_owned()),
+                                },
+                                _ => RpcResponse::Error {
+                                    protocol: request.protocol(),
+                                    error: rpc::RpcFailure::InvalidRequest(
+                                        "unsupported request".to_owned(),
+                                    ),
+                                },
+                            },
                         })
                         .await
                         .ok();
@@ -2148,6 +2372,8 @@ mod tests {
         let a_status = rpc::Status {
             chain_id: 7,
             chain_spec_hash: [0xAB; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             finalized_checkpoint_index: 5,
             finalized_checkpoint_hash: [0xAA; 32],
             head_block_hash: [0xDD; 32],
@@ -2171,6 +2397,40 @@ mod tests {
 
         let response = response.expect("Status RPC succeeded");
         assert!(matches!(response, RpcResponse::Status(s) if s == canned_b_status));
+        for (request, expected) in [
+            (
+                RpcRequest::BlocksByRoot(rpc::BlocksByRootRequest {
+                    roots: vec![[5; 32]],
+                }),
+                rpc::RpcFailure::Unavailable("body is missing".to_owned()),
+            ),
+            (
+                RpcRequest::StateByRoot(rpc::StateByRootRequest {
+                    state_root: [6; 32],
+                    paths: vec![],
+                }),
+                rpc::RpcFailure::Storage("invalid trie node".to_owned()),
+            ),
+            (
+                RpcRequest::Ping(rpc::PingPayload { nonce: 1 }),
+                rpc::RpcFailure::InvalidRequest("unsupported request".to_owned()),
+            ),
+        ] {
+            let (response_tx, response_rx) = oneshot::channel();
+            cmd_tx_a
+                .send(NetworkCommand::SendRpcRequest {
+                    peer: peer_b,
+                    request,
+                    response_tx,
+                })
+                .await
+                .unwrap();
+            let response = timeout(TokDuration::from_secs(5), response_rx)
+                .await
+                .expect("explicit error arrives without timeout")
+                .unwrap();
+            assert!(matches!(response, Err(RpcError::Remote(error)) if error == expected));
+        }
     }
 
     /// Adversarial gossipsub scoring: peer A publishes a payload that

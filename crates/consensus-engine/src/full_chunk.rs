@@ -277,6 +277,23 @@ impl<DB: Database> Engine<DB> {
         chunk_id: ChunkId,
         proof_system: &P,
     ) -> Result<PreparedConsensusChunk<P>, FinalizeError<DB::Error>> {
+        let end = chunk_id
+            .checked_add(1)
+            .and_then(|id| id.checked_mul(self.chain_spec().consensus.chunk_size))
+            .ok_or(FinalizeError::HeightRangeOverflow)?;
+        let end_hash = self
+            .store()
+            .get_block_hash_by_height(end)?
+            .ok_or(FinalizeError::MissingBlock { height: end })?;
+        self.prepare_consensus_chunk_on_branch(chunk_id, end_hash, proof_system)
+    }
+
+    pub(crate) fn prepare_consensus_chunk_on_branch<P: ProofSystem>(
+        &self,
+        chunk_id: ChunkId,
+        end_hash: Hash,
+        proof_system: &P,
+    ) -> Result<PreparedConsensusChunk<P>, FinalizeError<DB::Error>> {
         let key = proof_system
             .consensus_block_key()
             .ok_or(ProofError::Unsupported)?;
@@ -296,11 +313,22 @@ impl<DB: Database> Engine<DB> {
         let mut blocks = Vec::new();
         let mut bodies = Vec::new();
         let mut proofs = Vec::new();
-        for height in start..=end {
+        let mut headers = Vec::new();
+        let mut cursor = end_hash;
+        for height in (start..=end).rev() {
             let header = self
                 .store()
-                .get_header_by_height(height)?
+                .get_header(&cursor)?
                 .ok_or(FinalizeError::MissingBlock { height })?;
+            if header.height != height || header.hash() != cursor {
+                return Err(ProofError::PublicInputMismatch.into());
+            }
+            cursor = header.parent_hash;
+            headers.push(header);
+        }
+        headers.reverse();
+        for header in headers {
+            let height = header.height;
             let hash = header.hash();
             let state = self
                 .store()
@@ -419,6 +447,27 @@ impl<DB: Database> Engine<DB> {
         proof: &P::ChunkProof,
         proof_system: &P,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
+        self.commit_consensus_chunk_inner(witness, proof, proof_system, false, None)
+    }
+
+    pub(crate) fn commit_imported_consensus_chunk<P: ProofSystem>(
+        &mut self,
+        witness: &ConsensusWitness,
+        proof: &P::ChunkProof,
+        proof_system: &P,
+        executor: Option<&dyn neutrino_proof_system::ErasedBlockExecutor>,
+    ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
+        self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor)
+    }
+
+    fn commit_consensus_chunk_inner<P: ProofSystem>(
+        &mut self,
+        witness: &ConsensusWitness,
+        proof: &P::ChunkProof,
+        proof_system: &P,
+        imported: bool,
+        executor: Option<&dyn neutrino_proof_system::ErasedBlockExecutor>,
+    ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
         let (context, seed, _) = self.consensus_boundary(witness.context.chunk_id)?;
         if witness.context != context
             || witness.seed != seed
@@ -428,12 +477,12 @@ impl<DB: Database> Engine<DB> {
             return Err(ProofError::PublicInputMismatch.into());
         }
         for block in &witness.blocks {
-            if self
-                .store()
-                .get_header_by_height(block.header.height)?
-                .as_ref()
-                != Some(&block.header)
-            {
+            let stored = if imported {
+                self.store().get_header(&block.header.hash())?
+            } else {
+                self.store().get_header_by_height(block.header.height)?
+            };
+            if stored.as_ref() != Some(&block.header) {
                 return Err(ProofError::PublicInputMismatch.into());
             }
         }
@@ -458,8 +507,29 @@ impl<DB: Database> Engine<DB> {
             finality: witness.finality_cert.clone(),
         });
         let state = ConsensusState { statement, history };
-        self.store_mut()
-            .put_consensus_finalization(witness, &wire, &state)?;
+        let batch =
+            crate::store::ChainStore::<DB>::consensus_finalization_batch(witness, &wire, &state)?;
+        if self.store().get_block_hash_by_height(chunk.end_height)? == Some(chunk.end_block_hash) {
+            self.store_mut()
+                .db_mut()
+                .write_batch(batch)
+                .map_err(crate::store::StoreError::Database)?;
+        } else {
+            let executor = executor.ok_or(ProofError::Unsupported)?;
+            // Proof verification precedes replay; a failed replay or DB batch
+            // cannot change either finality or the selected chain/state.
+            let replayed = self
+                .replay_to_head(chunk.end_block_hash, executor)
+                .map_err(FinalizeError::Replay)?;
+            self.commit_materialized_head_with_batch(
+                replayed.height,
+                replayed.hash,
+                replayed.state_root,
+                Some(replayed.state),
+                batch,
+            )?;
+        }
+
         self.install_consensus_state(&state);
         self.bft_sessions.remove(&chunk.chunk_id);
         let _ = self

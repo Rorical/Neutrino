@@ -22,7 +22,7 @@ use crate::{
     topic::Topic,
 };
 use libp2p::PeerId;
-use neutrino_primitives::{BlockHash, CheckpointIndex, Hash, Height, Slot, StateRoot};
+use neutrino_primitives::{BlockHash, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot};
 
 /// Sync goal selected at startup.
 ///
@@ -133,6 +133,10 @@ pub struct LocalProgress {
     pub chain_id: u64,
     /// Canonical hash of the local chain spec.
     pub chain_spec_hash: Hash,
+    /// Latest complete chunk finalized locally, independent of checkpoint recursion.
+    pub finalized_chunk_id: Option<ChunkId>,
+    /// Hash of the latest finalized chunk, or zero at genesis.
+    pub finalized_chunk_hash: Hash,
     /// Highest recursive checkpoint index finalized locally.
     pub finalized_checkpoint_index: CheckpointIndex,
     /// Hash of the highest finalized checkpoint.
@@ -357,6 +361,14 @@ impl SyncMachine {
     #[must_use]
     pub fn sync_peer(&self) -> Option<PeerId> {
         self.sync_peer.map(|p| p.peer)
+    }
+
+    /// Advertised branch anchor for the selected sync peer.
+    #[must_use]
+    pub fn sync_head(&self, peer: PeerId) -> Option<BlockHash> {
+        self.sync_peer
+            .filter(|p| p.peer == peer)
+            .map(|p| p.status.head_block_hash)
     }
 
     /// Apply an event and return the commands to execute.
@@ -873,6 +885,8 @@ mod tests {
         rpc::Status {
             chain_id,
             chain_spec_hash: [0; 32],
+            finalized_chunk_id: None,
+            finalized_chunk_hash: [0; 32],
             finalized_checkpoint_index: finalized,
             finalized_checkpoint_hash: [0xAA; 32],
             head_block_hash: [0xBB; 32],

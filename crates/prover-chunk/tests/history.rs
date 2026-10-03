@@ -411,6 +411,7 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
     .unwrap();
     let leaves = [commitment(&claim.context)];
     let anchor = EvidenceAnchor {
+        fact_guest_vk_digest: [3; 8],
         chain_spec_hash: spec.hash(),
         chunk_id: 1,
         history_root: neutrino_consensus_types::evidence::history_root(&leaves),

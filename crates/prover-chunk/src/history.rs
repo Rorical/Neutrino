@@ -181,6 +181,24 @@ pub fn authorize_evidence_at_record<'a>(
     evidence: &SlashingEvidence,
     block_key: &[u32; 8],
 ) -> Result<(&'a Validator, Hash), HistoryError> {
+    authorize_evidence_using(
+        spec,
+        source,
+        evidence,
+        block_key,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Derive guilt using immediate or recursively authenticated cryptographic facts.
+#[allow(clippy::too_many_lines)]
+pub fn authorize_evidence_using<'a>(
+    spec: &ChainSpec,
+    source: &'a HistoricalChunk,
+    evidence: &SlashingEvidence,
+    block_key: &[u32; 8],
+    verifier: &mut impl crate::facts::EvidenceVerifier,
+) -> Result<(&'a Validator, Hash), HistoryError> {
     let record_at = |chunk_id| {
         if source.chunk.chunk_id == chunk_id {
             Ok(source)
@@ -216,10 +234,20 @@ pub fn authorize_evidence_at_record<'a>(
             }
             let record = record_at(chunk_id)?;
             let validator = active_validator(&record.validators, *proposer_index)?;
-            crate::proposer::verify_header_signature(header_a, spec.chain_id, &record.validators)
-                .map_err(|_| HistoryError::Evidence)?;
-            crate::proposer::verify_header_signature(header_b, spec.chain_id, &record.validators)
-                .map_err(|_| HistoryError::Evidence)?;
+            crate::proposer::verify_header_signature_using(
+                header_a,
+                spec.chain_id,
+                &record.validators,
+                verifier,
+            )
+            .map_err(|_| HistoryError::Evidence)?;
+            crate::proposer::verify_header_signature_using(
+                header_b,
+                spec.chain_id,
+                &record.validators,
+                verifier,
+            )
+            .map_err(|_| HistoryError::Evidence)?;
             Ok((validator, penalty_id(0, validator, header_a.slot, 0)))
         }
         SlashingEvidence::InvalidVrfClaim {
@@ -232,14 +260,20 @@ pub fn authorize_evidence_at_record<'a>(
             if header.proposer_index != *proposer_index {
                 return Err(HistoryError::Evidence);
             }
-            crate::proposer::verify_header_signature(header, spec.chain_id, &record.validators)
-                .map_err(|_| HistoryError::Evidence)?;
-            let actual = crate::proposer::verify_proposer(
+            crate::proposer::verify_header_signature_using(
+                header,
+                spec.chain_id,
+                &record.validators,
+                verifier,
+            )
+            .map_err(|_| HistoryError::Evidence)?;
+            let actual = crate::proposer::verify_proposer_using(
                 header,
                 spec.chain_id,
                 &record.validators,
                 &record.seed,
                 spec.consensus.expected_proposers_per_slot,
+                verifier,
             );
             if !matches!(
                 (actual, reason),
@@ -278,18 +312,20 @@ pub fn authorize_evidence_at_record<'a>(
             }
             let record = record_at(vote_a.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
-            slashing::verify_indexed_vote(
+            slashing::verify_indexed_vote_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 vote_a,
+                verifier,
             )
             .map_err(invalid)?;
-            slashing::verify_indexed_vote(
+            slashing::verify_indexed_vote_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 vote_b,
+                verifier,
             )
             .map_err(invalid)?;
             let kind = if phase == FinalityVotePhase::Prevote {
@@ -310,13 +346,14 @@ pub fn authorize_evidence_at_record<'a>(
         } => {
             let record = record_at(vote_a.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
-            slashing::verify_lock_violation(
+            slashing::verify_lock_violation_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 (vote_a, vote_b),
                 lock_evidence,
                 quorum,
+                verifier,
             )
             .map_err(invalid)?;
             Ok((
@@ -333,19 +370,21 @@ pub fn authorize_evidence_at_record<'a>(
         } => {
             let record = record_at(vote.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
-            slashing::verify_indexed_vote(
+            slashing::verify_indexed_vote_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 vote,
+                verifier,
             )
             .map_err(invalid)?;
-            slashing::verify_attestation(
+            slashing::verify_attestation_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 &vote.data,
                 attestation,
+                verifier,
             )
             .map_err(invalid)?;
             slashing::verify_proof_acceptance(
@@ -354,7 +393,9 @@ pub fn authorize_evidence_at_record<'a>(
                 spec.consensus.chunk_size,
             )
             .map_err(invalid)?;
-            verify_rejection(rejected_proof, block_key)?;
+            if !verifier.rejects_block(rejected_proof, block_key)? {
+                return Err(HistoryError::Evidence);
+            }
             Ok((
                 validator,
                 penalty_id(5, validator, rejected_proof.height, 0),
@@ -381,18 +422,20 @@ pub fn authorize_evidence_at_record<'a>(
                 return Err(HistoryError::Evidence);
             }
             let validator = active_validator(&record.validators, *validator_index)?;
-            slashing::verify_indexed_vote(
+            slashing::verify_indexed_vote_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 vote,
+                verifier,
             )
             .map_err(invalid)?;
-            slashing::verify_indexed_vote(
+            slashing::verify_indexed_vote_using(
                 spec.chain_id,
                 &record.validators,
                 *validator_index,
                 canonical_vote,
+                verifier,
             )
             .map_err(invalid)?;
             // Same offence as ordinary double-voting, never a second deduction
@@ -417,37 +460,16 @@ pub fn authorize_evidence_at_record<'a>(
             if header.proposer_index != *proposer_index {
                 return Err(HistoryError::Evidence);
             }
-            slashing::verify_da_fraud(spec.chain_id, &record.validators, header, fraud_proof)
-                .map_err(invalid)?;
+            slashing::verify_da_fraud_using(
+                spec.chain_id,
+                &record.validators,
+                header,
+                fraud_proof,
+                verifier,
+            )
+            .map_err(invalid)?;
             Ok((validator, penalty_id(6, validator, header.slot, 0)))
         }
-    }
-}
-
-#[allow(clippy::missing_const_for_fn)] // Enabled SP1 verification is not const.
-fn verify_rejection(
-    proof: &neutrino_consensus_types::BlockProof,
-    key: &[u32; 8],
-) -> Result<(), HistoryError> {
-    #[cfg(feature = "sp1-verification")]
-    {
-        #[cfg(feature = "std")]
-        let verdict = std::panic::catch_unwind(|| {
-            crate::proof_verification::verify_block_artifact(proof, key)
-        })
-        .map_err(|_| HistoryError::Unsupported)?;
-        #[cfg(not(feature = "std"))]
-        let verdict = crate::proof_verification::verify_block_artifact(proof, key);
-        if verdict.is_err() {
-            Ok(())
-        } else {
-            Err(HistoryError::Evidence)
-        }
-    }
-    #[cfg(not(feature = "sp1-verification"))]
-    {
-        let _ = (proof, key);
-        Err(HistoryError::Unsupported)
     }
 }
 
@@ -457,13 +479,29 @@ pub fn verify_embedded_vote(
     history: &HistoryWitness,
     vote: &FinalityVote,
 ) -> Result<(), HistoryError> {
+    verify_embedded_vote_using(
+        spec,
+        history,
+        vote,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_embedded_vote_using(
+    spec: &ChainSpec,
+    history: &HistoryWitness,
+    vote: &FinalityVote,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), HistoryError> {
     let record = history.record(vote.data.chunk_id)?;
-    crate::finality::verify_vote(
+    crate::finality::verify_vote_using(
         spec.chain_id,
         &record.validators,
         vote,
         spec.consensus.bft_max_round,
         spec.consensus.chunk_size,
+        verifier,
     )
     .map_err(|_| HistoryError::Evidence)
 }

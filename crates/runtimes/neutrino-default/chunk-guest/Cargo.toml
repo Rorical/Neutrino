@@ -20,6 +20,10 @@ path = "src/consensus.rs"
 name = "neutrino-default-evidence-guest"
 path = "src/evidence.rs"
 
+[[bin]]
+name = "neutrino-default-fact-guest"
+path = "src/facts.rs"
+
 [dependencies]
 # `verify` enables `sp1_zkvm::lib::verify::verify_sp1_proof` (the
 # recursion-syscall wrapper).  Without this feature the guest cannot

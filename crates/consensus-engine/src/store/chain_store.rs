@@ -374,6 +374,22 @@ impl<DB: Database> ChainStore<DB> {
         self.put_encoded(Column::BlockProofs, &keys::hash_key(hash), proof)
     }
 
+    /// Persist a locally verified proof and its FSM transition atomically.
+    pub fn put_proven_block(
+        &mut self,
+        hash: &BlockHash,
+        proof: &BlockProof,
+    ) -> Result<(), StoreError<DB::Error>> {
+        let mut batch = neutrino_storage::Batch::new();
+        batch.put(Column::BlockProofs, *hash, borsh::to_vec(proof)?);
+        batch.put(
+            Column::BlockStates,
+            *hash,
+            borsh::to_vec(&BlockState::Proven)?,
+        );
+        self.db.write_batch(batch).map_err(StoreError::Database)
+    }
+
     /// Read a block proof by block hash.
     pub fn get_block_proof(
         &self,

@@ -21,6 +21,8 @@ use crate::db::NodeDb;
 pub(crate) struct BlockProducerConfig {
     /// Local proposer key.
     pub(crate) proposer: ProposerKey,
+    /// Bounds queued and concurrent proof work.
+    pub(crate) proving: crate::config::ProvingConfig,
     /// Slot-0 Unix timestamp.
     pub(crate) genesis_time_secs: u64,
     /// Slot duration in seconds.
@@ -47,150 +49,79 @@ pub(crate) async fn run_block_producer(
         "validator block production enabled"
     );
 
+    let mut jobs =
+        crate::proof_queue::ProofQueue::new(config.proving.concurrency, config.proving.capacity);
+    let mut failed = std::collections::BTreeSet::new();
+    let mut tick = tokio::time::Instant::now();
     loop {
-        let now = unix_now_secs();
-        let slot = current_slot(config.genesis_time_secs, config.slot_duration_secs, now);
-        if slot > last_attempted_slot {
-            attempt_slot(&backend, &cmd_tx, &config, slot).await;
-            last_attempted_slot = slot;
+        jobs.retain_pending(|hash| backend.needs_block_proof(hash));
+        for hash in backend.pending_block_proofs(jobs.available(), |hash| {
+            jobs.contains(hash) || failed.contains(hash)
+        }) {
+            jobs.push(hash, hash);
         }
-
-        // Pending-fix #4: drive every open BFT session's round
-        // timeout once per slot tick. Sessions whose
-        // `bft_round_timeout_base_secs + round * step` window has
-        // elapsed advance to the next round and re-publish their
-        // local prevote so a transient partition cannot stall
-        // finality.
-        backend.tick_bft_round_timeouts(now).await;
-
-        tokio::time::sleep(sleep_until_next_slot(
-            config.genesis_time_secs,
-            config.slot_duration_secs,
-            now,
-        ))
-        .await;
+        let worker = Arc::clone(&backend);
+        jobs.start(move |hash| worker.prove_block(&hash));
+        tokio::select! {
+            () = cmd_tx.closed() => break,
+            (hash, result) = jobs.completed(), if jobs.is_running() => {
+                match result {
+                    Ok(Ok(proven)) => {
+                        // Any completion can make the chunk ready, including an
+                        // earlier block that finished after its chunk's last block.
+                        backend.maybe_open_bft_session_for_height(proven.public_inputs.height).await;
+                        if let Some(block) = backend.block_for_publication(&hash) {
+                            for (topic, encoded) in [(Topic::Blocks, to_vec(&block)),
+                                (Topic::BlockProofs, to_vec(&proven.block_proof))] {
+                                if let Ok(data) = encoded {
+                                    let _ = cmd_tx.send(NetworkCommand::Publish { topic, data }).await;
+                                }
+                            }
+                        }
+                        info!(height = proven.public_inputs.height, ?hash, "proved and published block");
+                    }
+                    Ok(Err(error)) => { failed.insert(hash); warn!(%error, ?hash, "block proof failed; retry on next slot"); }
+                    Err(error) => { failed.insert(hash); warn!(%error, ?hash, "block prover panicked; retry on next slot"); }
+                }
+            }
+            () = tokio::time::sleep_until(tick) => {
+                let now = unix_now_secs();
+                let slot = current_slot(config.genesis_time_secs, config.slot_duration_secs, now);
+                failed.clear();
+                if slot > last_attempted_slot && jobs.available() > 0 {
+                    attempt_slot(&backend, &config, slot).await;
+                    last_attempted_slot = slot;
+                }
+                backend.tick_bft_round_timeouts(now).await;
+                tick = tokio::time::Instant::now() + sleep_until_next_slot(
+                    config.genesis_time_secs, config.slot_duration_secs, now);
+            }
+        }
     }
 }
 
 async fn attempt_slot(
     backend: &Arc<ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>>,
-    cmd_tx: &mpsc::Sender<NetworkCommand>,
     config: &BlockProducerConfig,
     slot: u64,
 ) {
     if slot == 0 {
         return;
     }
-
-    // `try_produce_block` drives a wasmtime dry-run and `prove_block`
-    // drives the SP1 prover; both are CPU-bound and the SP1 SDK
-    // spins up its own internal tokio runtime that clashes with the
-    // outer producer task. Hand the calls to a dedicated blocking
-    // thread so the slot loop's runtime stays unblocked.
-    let production = {
-        let backend = Arc::clone(backend);
-        let proposer = config.proposer.clone();
-        match tokio::task::spawn_blocking(move || backend.try_produce_block(slot, &proposer)).await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                warn!(slot, error = %err, "block production task panicked");
-                return;
-            }
+    let worker = Arc::clone(backend);
+    let proposer = config.proposer.clone();
+    match tokio::task::spawn_blocking(move || worker.try_produce_block(slot, &proposer)).await {
+        Ok(Ok(Some(outcome))) => {
+            backend.queue_header_facts(&outcome.block.header);
+            info!(slot, height = outcome.block.header.height,
+                hash = ?outcome.block_hash, "produced block; queued for proving");
         }
-    };
-
-    match production {
-        Ok(Some(outcome)) => {
-            let proof = {
-                let backend = Arc::clone(backend);
-                let block_hash = outcome.block_hash;
-                match tokio::task::spawn_blocking(move || backend.prove_block(&block_hash)).await {
-                    Ok(Ok(prove)) => prove.block_proof,
-                    Ok(Err(err)) => {
-                        warn!(slot, error = %err, "block proof generation failed");
-                        return;
-                    }
-                    Err(err) => {
-                        warn!(slot, error = %err, "block proof task panicked");
-                        return;
-                    }
-                }
-            };
-
-            // Trigger the local BFT session for the chunk this block
-            // closes (when chunk_size = 1 every block ends its own
-            // chunk; for larger chunks this is a no-op until the
-            // closing block lands). The engine emits the local
-            // prevote here and the chain_backend gossips it on the
-            // canonical finality-vote topic. Without this the
-            // producer never enters its own BFT session — its proof
-            // only goes out as gossip, and peers can finalise without
-            // it.
-            backend
-                .maybe_open_bft_session_for_height(outcome.block.header.height)
-                .await;
-
-            let data = match to_vec(&outcome.block) {
-                Ok(data) => data,
-                Err(err) => {
-                    warn!(slot, error = %err, "failed to encode produced block");
-                    return;
-                }
-            };
-            let proof_data = match to_vec(&proof) {
-                Ok(data) => data,
-                Err(err) => {
-                    warn!(slot, error = %err, "failed to encode block proof");
-                    return;
-                }
-            };
-            if cmd_tx
-                .send(NetworkCommand::Publish {
-                    topic: Topic::Blocks,
-                    data,
-                })
-                .await
-                .is_err()
-            {
-                warn!(
-                    slot,
-                    "network command channel closed; stopping block publication"
-                );
-                return;
-            }
-            if cmd_tx
-                .send(NetworkCommand::Publish {
-                    topic: Topic::BlockProofs,
-                    data: proof_data,
-                })
-                .await
-                .is_err()
-            {
-                warn!(
-                    slot,
-                    "network command channel closed; stopping block proof publication"
-                );
-                return;
-            }
-            info!(
-                slot,
-                height = outcome.block.header.height,
-                hash = ?outcome.block_hash,
-                tx_count = outcome.block.body.transactions.len(),
-                "produced and published block"
-            );
-
-            // The BFT path starts background consensus proving, including the
-            // single-validator quorum. Poll completion without generating a
-            // second proof while holding the engine mutex.
-            backend.tick_bft_round_timeouts(unix_now_secs()).await;
-        }
-        Ok(None) => debug!(slot, "validator not eligible for slot"),
-        Err(ProductionError::NonMonotonicSlot { parent_slot, .. }) => {
+        Ok(Ok(None)) => debug!(slot, "validator not eligible for slot"),
+        Ok(Err(ProductionError::NonMonotonicSlot { parent_slot, .. })) => {
             debug!(slot, parent_slot, "slot already covered by local head");
         }
-        Err(err) => warn!(slot, error = %err, "block production failed"),
+        Ok(Err(error)) => warn!(slot, %error, "block production failed"),
+        Err(error) => warn!(slot, %error, "block production task panicked"),
     }
 }
 

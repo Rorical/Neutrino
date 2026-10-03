@@ -18,7 +18,9 @@
 //!   output (covers the "tampered `post_state_root`" exit criterion).
 
 pub mod evidence;
+mod evidence_prover;
 pub mod executor;
+mod fact_cache;
 pub mod proof_system;
 pub mod wasm;
 
@@ -96,6 +98,9 @@ pub const DEFAULT_CONSENSUS_CHUNK_GUEST_ELF: Elf =
 
 /// Independent objective-evidence guest, with the same pinned SP1 toolchain.
 pub const DEFAULT_EVIDENCE_GUEST_ELF: Elf = include_elf!("neutrino-default-evidence-guest");
+
+/// Program for early reusable cryptographic facts.
+pub const DEFAULT_FACT_GUEST_ELF: Elf = include_elf!("neutrino-default-fact-guest");
 
 /// Errors produced by the SP1 host.
 #[derive(Debug, Error)]
@@ -388,10 +393,19 @@ pub fn dry_run(input: &StfInput, live: &LiveTrie, evidence_proofs: &[EvidenceArt
     }
 }
 
-fn encode_stdin(input: &StfInput, witness: &StateWitness) -> Result<Vec<u8>, Sp1HostError> {
+fn encode_stdin(
+    input: &StfInput,
+    witness: &StateWitness,
+    attachments: &[EvidenceArtifact],
+) -> Result<Vec<u8>, Sp1HostError> {
     let mut bytes = Vec::new();
     BorshSerialize::serialize(input, &mut bytes).map_err(codec_err)?;
     BorshSerialize::serialize(witness, &mut bytes).map_err(codec_err)?;
+    let memberships: Vec<_> = attachments
+        .iter()
+        .map(|attachment| &attachment.membership)
+        .collect();
+    BorshSerialize::serialize(&memberships, &mut bytes).map_err(codec_err)?;
     Ok(bytes)
 }
 
@@ -406,7 +420,7 @@ pub(crate) fn block_stdin<P: Prover>(
 ) -> Result<SP1Stdin, Sp1HostError> {
     let proofs = evidence::verify_input_receipts(input, evidence_proofs)?;
     let mut stdin = SP1Stdin::new();
-    stdin.write_vec(encode_stdin(input, witness)?);
+    stdin.write_vec(encode_stdin(input, witness, evidence_proofs)?);
     if !proofs.is_empty() {
         let key = match evidence_vk {
             Some(key) => key.clone(),

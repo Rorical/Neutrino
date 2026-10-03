@@ -116,8 +116,10 @@ fn pipeline<P: Prover<ProvingKey = SP1ProvingKey>>(prover: P, real: bool) {
     let (mut witness, mut inputs) =
         two_block_fixture(system.verifying_key().hash_u32(), runtime_hash);
     witness.evidence_guest_vk_digest = system.evidence_key().unwrap();
+    witness.fact_guest_vk_digest = system.fact_key().unwrap();
     for ((input, _), block) in inputs.iter_mut().zip(&mut witness.blocks) {
         input.evidence_anchor.evidence_guest_vk_digest = witness.evidence_guest_vk_digest;
+        input.evidence_anchor.fact_guest_vk_digest = witness.fact_guest_vk_digest;
         block.output.accountability.anchor = input.evidence_anchor;
     }
     let blocks: Vec<_> = inputs

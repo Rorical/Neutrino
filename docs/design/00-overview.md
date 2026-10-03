@@ -8,7 +8,9 @@ establish block execution, objective evidence validity and chunk consensus.
 flowchart LR
     T[Transactions and live state] --> W[WASM execution and witness capture]
     W --> B[Block Guest and block proof]
-    E[Signed evidence and historical membership] --> P[Evidence Guest and EvidenceProof]
+    S[Observed signatures and proof bytes] --> A[Fact Guest and reusable FactProof]
+    A --> P[Batch Evidence Guest and EvidenceProof]
+    E[Signed evidence and historical membership] --> P
     P --> W
     P --> B
     B --> C[Chunk Guest: BFT, VRF, boundaries and rotation]

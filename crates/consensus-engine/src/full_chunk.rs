@@ -39,10 +39,15 @@ pub struct PreparedConsensusChunk<P: ProofSystem> {
 }
 
 impl<DB: Database> Engine<DB> {
-    /// Pin both accepted programs from the configured proof backend. These are
+    /// Pin all three accepted programs from the configured proof backend. These are
     /// process configuration, never chosen by a peer or evidence reporter.
-    pub const fn set_evidence_programs(&mut self, block: [u32; 8], evidence: [u32; 8]) {
-        self.evidence_programs = Some((block, evidence));
+    pub const fn set_evidence_programs(
+        &mut self,
+        block: [u32; 8],
+        evidence: [u32; 8],
+        facts: [u32; 8],
+    ) {
+        self.evidence_programs = Some((block, evidence, facts));
     }
 
     /// Build the trusted incoming anchor for ordinary or replay execution.
@@ -50,7 +55,9 @@ impl<DB: Database> Engine<DB> {
         &self,
         height: u64,
     ) -> Result<neutrino_consensus_types::evidence::EvidenceAnchor, alloc::string::String> {
-        let Some((block_guest_vk_digest, evidence_guest_vk_digest)) = self.evidence_programs else {
+        let Some((block_guest_vk_digest, evidence_guest_vk_digest, fact_guest_vk_digest)) =
+            self.evidence_programs
+        else {
             return Ok(neutrino_consensus_types::evidence::EvidenceAnchor::default());
         };
         let spec = self.chain_spec();
@@ -82,6 +89,7 @@ impl<DB: Database> Engine<DB> {
             history_root: neutrino_prover_chunk::history::history_commitment(&history),
             block_guest_vk_digest,
             evidence_guest_vk_digest,
+            fact_guest_vk_digest,
             policy: spec.runtime,
         })
     }
@@ -91,7 +99,8 @@ impl<DB: Database> Engine<DB> {
         &self,
         evidence: &neutrino_consensus_types::SlashingEvidence,
     ) -> Result<neutrino_prover_chunk::evidence::EvidenceWitness, FinalizeError<DB::Error>> {
-        let (block_guest_vk_digest, _) = self.evidence_programs.ok_or(ProofError::Unsupported)?;
+        let (block_guest_vk_digest, _, _) =
+            self.evidence_programs.ok_or(ProofError::Unsupported)?;
         let id = neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
             .map_err(|_| ProofError::InvalidWitness)?;
         let state = self
@@ -172,7 +181,7 @@ impl<DB: Database> Engine<DB> {
         if ancestor != context.parent_block_hash
             || self
                 .evidence_programs
-                .is_some_and(|(key, _)| &key != block_key)
+                .is_some_and(|(key, _, _)| &key != block_key)
         {
             return Err(ProofError::InvalidWitness.into());
         }
@@ -202,7 +211,11 @@ impl<DB: Database> Engine<DB> {
                 transaction
             {
                 let attachment = attachments.next().ok_or(ProofError::InvalidWitness)?;
-                if !attachment.binds(&submission.statement, &anchor.evidence_guest_vk_digest) {
+                if !attachment.binds(
+                    &submission.statement,
+                    &anchor.evidence_guest_vk_digest,
+                    &anchor.fact_guest_vk_digest,
+                ) {
                     return Err(ProofError::InvalidWitness.into());
                 }
             }
@@ -354,8 +367,7 @@ impl<DB: Database> Engine<DB> {
                 return Err(ProofError::PublicInputMismatch.into());
             }
             let proof = borsh::from_slice(&wire.proof_bytes)?;
-            proof_system.verify_block(&proof, &wire.public_inputs)?;
-            let output = proof_system.block_statement(&proof)?;
+            let output = proof_system.verify_block_statement(&proof, &wire.public_inputs)?;
             let body = self
                 .store()
                 .get_body(&hash)?
@@ -379,6 +391,7 @@ impl<DB: Database> Engine<DB> {
             signature: [0; 96],
         };
         let witness = ConsensusWitness {
+            fact_guest_vk_digest: proof_system.fact_key().ok_or(ProofError::Unsupported)?,
             evidence_guest_vk_digest: proof_system.evidence_key().ok_or(ProofError::Unsupported)?,
             chain_spec: self.chain_spec().clone(),
             context,

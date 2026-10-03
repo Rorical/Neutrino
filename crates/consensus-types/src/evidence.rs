@@ -72,9 +72,84 @@ pub struct EvidenceSubmission {
     pub history: HistoryOpening,
 }
 
+/// Maximum offence statements committed by one Evidence Guest receipt.
+pub const MAX_EVIDENCE_BATCH: usize = 16;
+
+/// Compact public values of the batch Evidence Guest.
+#[derive(Clone, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct EvidenceBatch {
+    /// Pinned program authenticating all reused cryptographic facts.
+    pub fact_guest_vk_digest: [u32; 8],
+    /// Exact number of unique statements.
+    pub count: u32,
+    /// Ordered Merkle commitment to canonical statement hashes.
+    pub root: Hash,
+}
+
+impl EvidenceBatch {
+    /// Construct the committed batch and reject duplicate offence identities.
+    pub fn new(statements: &[EvidenceStatement], fact_guest_vk_digest: [u32; 8]) -> Option<Self> {
+        if statements.is_empty() || statements.len() > MAX_EVIDENCE_BATCH {
+            return None;
+        }
+        let mut seen = alloc::collections::BTreeSet::new();
+        if statements
+            .iter()
+            .any(|statement| !seen.insert(statement.offence_id))
+        {
+            return None;
+        }
+        Some(Self {
+            fact_guest_vk_digest,
+            count: u32::try_from(statements.len()).ok()?,
+            root: merkle_root_of_hashes(&statements.iter().map(commitment).collect::<Vec<_>>()),
+        })
+    }
+}
+
+/// Select one offence from a reusable batch without binding its proof to a transaction.
+#[derive(Clone, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct EvidenceMembership {
+    /// Exact batch public values.
+    pub batch: EvidenceBatch,
+    /// Counted opening in the batch's ordered statement Merkle tree.
+    pub opening: HistoryOpening,
+}
+
+impl EvidenceMembership {
+    /// Build a canonical opening for an existing statement in a bounded batch.
+    pub fn build(
+        statements: &[EvidenceStatement],
+        index: usize,
+        fact_key: [u32; 8],
+    ) -> Option<Self> {
+        Some(Self {
+            batch: EvidenceBatch::new(statements, fact_key)?,
+            opening: HistoryOpening::build(
+                &statements.iter().map(commitment).collect::<Vec<_>>(),
+                index,
+            )?,
+        })
+    }
+
+    /// Authenticate a statement and the fact program used by the batch Guest.
+    pub fn binds(&self, statement: &EvidenceStatement, fact_key: &[u32; 8]) -> bool {
+        self.batch.fact_guest_vk_digest == *fact_key
+            && self.batch.count > 0
+            && self.batch.count as usize <= MAX_EVIDENCE_BATCH
+            && self.opening.count == u64::from(self.batch.count)
+            && self.opening.verify(
+                commitment(statement),
+                counted_history_root(self.opening.count, self.batch.root),
+            )
+    }
+}
+
 /// Reusable network/storage receipt, independent of today's Merkle opening.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct EvidenceArtifact {
+    /// Membership in the recursively authenticated batch.
+    pub membership: EvidenceMembership,
     /// Evidence program identity, checked against the trusted execution anchor.
     pub evidence_guest_vk_digest: [u32; 8],
     /// Public values proved by the independent guest.
@@ -90,6 +165,7 @@ impl EvidenceArtifact {
         commitment(&(
             b"neutrino-evidence-statement",
             self.evidence_guest_vk_digest,
+            self.membership.batch.fact_guest_vk_digest,
             &self.statement,
         ))
     }
@@ -97,8 +173,14 @@ impl EvidenceArtifact {
     /// Match an attachment to the exact claim and trusted evidence program.
     /// Cryptographic verification remains the execution shell's obligation.
     #[must_use]
-    pub fn binds(&self, statement: &EvidenceStatement, key: &[u32; 8]) -> bool {
-        self.evidence_guest_vk_digest == *key
+    pub fn binds(
+        &self,
+        statement: &EvidenceStatement,
+        key: &[u32; 8],
+        fact_key: &[u32; 8],
+    ) -> bool {
+        self.membership.binds(statement, fact_key)
+            && self.evidence_guest_vk_digest == *key
             && self.statement == *statement
             && !self.proof_bytes.is_empty()
             && self.proof_bytes.len() <= MAX_EVIDENCE_PROOF_BYTES
@@ -108,6 +190,8 @@ impl EvidenceArtifact {
 /// Incoming block authorization context. The chunk authenticates every field.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct EvidenceAnchor {
+    /// Trusted early cryptographic-fact program.
+    pub fact_guest_vk_digest: [u32; 8],
     /// Full chain specification commitment.
     pub chain_spec_hash: Hash,
     /// Number of previously finalized historical chunks.
@@ -226,7 +310,8 @@ mod tests {
     use super::*;
 
     fn artifact() -> EvidenceArtifact {
-        EvidenceArtifact {
+        let mut artifact = EvidenceArtifact {
+            membership: EvidenceMembership::default(),
             evidence_guest_vk_digest: [2; 8],
             statement: EvidenceStatement {
                 chain_id: 7,
@@ -253,7 +338,11 @@ mod tests {
                 facts_commitment: [10; 32],
             },
             proof_bytes: alloc::vec![1],
-        }
+        };
+        artifact.membership =
+            EvidenceMembership::build(core::slice::from_ref(&artifact.statement), 0, [3; 8])
+                .unwrap();
+        artifact
     }
 
     #[test]
@@ -264,11 +353,19 @@ mod tests {
         assert_eq!(original.statement_id(), alternate.statement_id());
         alternate.evidence_guest_vk_digest[0] ^= 1;
         assert_ne!(original.statement_id(), alternate.statement_id());
-        assert!(!alternate.binds(&original.statement, &original.evidence_guest_vk_digest));
+        assert!(!alternate.binds(
+            &original.statement,
+            &original.evidence_guest_vk_digest,
+            &[3; 8]
+        ));
         alternate = original.clone();
         alternate.statement.facts_commitment[0] ^= 1;
         assert_ne!(original.statement_id(), alternate.statement_id());
-        assert!(!alternate.binds(&original.statement, &original.evidence_guest_vk_digest));
+        assert!(!alternate.binds(
+            &original.statement,
+            &original.evidence_guest_vk_digest,
+            &[3; 8]
+        ));
     }
 
     #[test]

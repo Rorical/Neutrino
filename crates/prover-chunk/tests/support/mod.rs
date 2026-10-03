@@ -108,6 +108,7 @@ pub fn fixture_with_live(
     };
     let input = StfInput {
         evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor {
+            fact_guest_vk_digest: [3; 8],
             chain_spec_hash: spec.hash(),
             chunk_id: 0,
             history_root: neutrino_prover_chunk::history::history_commitment(&[]),
@@ -248,6 +249,7 @@ pub fn fixture_with_live(
     cert.attestations.push(claim);
     (
         ConsensusWitness {
+            fact_guest_vk_digest: [3; 8],
             evidence_guest_vk_digest: [2; 8],
             chain_spec: spec,
             context,

@@ -29,7 +29,7 @@ Neutrino separates the chain into two cleanly decoupled layers:
 - **No SNARK wrapper in the accepted plan.** Complete chunk aggregation uses
   SP1 Compressed STARK recursion; acceptance gates are tracked in design 19.
   Recursive checkpoint proofs remain deferred.
-- **Proof-authorized sanctions.** An independent evidence Guest proves offences.
+- **Proof-authorized sanctions.** An independent fact Guest compresses signed artifacts; a batch evidence Guest proves offences.
   Blocks recursively authenticate evidence statements and execute mandatory sanctions;
   chunks consume those proven effects without rechecking the evidence. See
   [design 20](docs/design/20-evidence-proofs.md).

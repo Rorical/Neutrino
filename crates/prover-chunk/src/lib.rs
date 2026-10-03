@@ -25,3 +25,6 @@ pub mod proposer;
 pub mod receipt_codec;
 pub mod rotation;
 pub mod slashing;
+
+/// Reusable cryptographic fact compression.
+pub mod facts;

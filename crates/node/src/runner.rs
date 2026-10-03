@@ -390,7 +390,13 @@ fn build_block_producer_config(
         ))));
     }
 
+    if !config.proving.is_valid() {
+        return Err(NodeError::Engine(
+            "invalid proving concurrency/capacity".into(),
+        ));
+    }
     Ok(Some(BlockProducerConfig {
+        proving: config.proving,
         proposer,
         genesis_time_secs: chain_spec.genesis_time,
         slot_duration_secs: chain_spec.consensus.slot_duration_secs,

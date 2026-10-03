@@ -24,6 +24,7 @@
 //! Checkpoint recursion remains unsupported.
 
 mod evidence;
+mod facts;
 mod p2p_queries;
 mod rpc_queries;
 
@@ -90,6 +91,7 @@ const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 /// path the mutex can be swapped for an `RwLock`.
 pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Arc<Mutex<Engine<DB>>>,
+    fact_jobs: Mutex<Option<mpsc::Sender<Vec<neutrino_prover_chunk::facts::FactRequest>>>>,
     evidence_job_running: Arc<std::sync::atomic::AtomicBool>,
     evidence_job_cursor: std::sync::atomic::AtomicUsize,
     proof_system: Arc<P>,
@@ -245,11 +247,12 @@ where
     /// is semantically fine because slashing outcomes do not depend
     /// on the order evidence is observed.
     pub fn new(mut engine: Engine<DB>, proof_system: P) -> Self {
-        if let (Some(block), Some(evidence)) = (
+        if let (Some(block), Some(evidence), Some(facts)) = (
             proof_system.consensus_block_key(),
             proof_system.evidence_key(),
+            proof_system.fact_key(),
         ) {
-            engine.set_evidence_programs(block, evidence);
+            engine.set_evidence_programs(block, evidence, facts);
         }
         let mut slashing_pool = SlashingPool::default();
         let persisted = engine
@@ -265,6 +268,7 @@ where
         slashing_pool.load_from_disk(persisted);
         Self {
             engine: Arc::new(Mutex::new(engine)),
+            fact_jobs: Mutex::new(None),
             evidence_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             evidence_job_cursor: std::sync::atomic::AtomicUsize::new(0),
             proof_system: Arc::new(proof_system),
@@ -667,7 +671,7 @@ where
                     ));
                 }
                 self.proof_system
-                    .verify_evidence(&attachment.proof_bytes, &attachment.statement)
+                    .verify_evidence(&attachment.proof_bytes, &attachment.membership.batch)
                     .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
             }
         }
@@ -783,7 +787,88 @@ where
         &self,
         block_hash: &BlockHash,
     ) -> Result<ProveOutcome, ProveError<DB::Error>> {
-        self.with_engine_mut(|e| e.prove_block(block_hash, self.proof_system.as_ref()))
+        let job = self.with_engine_mut(|e| e.prepare_block_proof(block_hash))?;
+        let completed = job.prove(self.proof_system.as_ref())?;
+        self.with_engine_mut(|e| e.commit_block_proof(completed))
+    }
+
+    /// Recover canonical, witnessed jobs after restart or a failed proving attempt.
+    /// Only hashes are queued; witnesses are loaded when a worker starts.
+    pub(crate) fn pending_block_proofs(
+        &self,
+        limit: usize,
+        skip: impl Fn(&BlockHash) -> bool,
+    ) -> Vec<BlockHash> {
+        self.with_engine(|engine| {
+            let mut pending = Vec::new();
+            let first = engine.latest_finalized_chunk_id().map_or(1, |id| {
+                id.saturating_add(1)
+                    .saturating_mul(engine.chain_spec().consensus.chunk_size)
+                    .saturating_add(1)
+            });
+            for height in first..=engine.head_height() {
+                if pending.len() == limit {
+                    break;
+                }
+                let Ok(Some(hash)) = engine.store().get_block_hash_by_height(height) else {
+                    continue;
+                };
+                if skip(&hash) {
+                    continue;
+                }
+                if matches!(
+                    engine.store().get_block_state(&hash),
+                    Ok(Some(
+                        neutrino_consensus_engine::BlockState::BlockProduced
+                            | neutrino_consensus_engine::BlockState::PendingProof
+                    ))
+                ) && engine.store().get_witness(&hash).ok().flatten().is_some()
+                {
+                    pending.push(hash);
+                }
+            }
+            pending
+        })
+    }
+
+    pub(crate) fn needs_block_proof(&self, hash: &BlockHash) -> bool {
+        self.with_engine(|engine| {
+            let Ok(Some(header)) = engine.store().get_header(hash) else {
+                return false;
+            };
+            engine
+                .store()
+                .get_block_hash_by_height(header.height)
+                .ok()
+                .flatten()
+                == Some(*hash)
+                && matches!(
+                    engine.store().get_block_state(hash),
+                    Ok(Some(
+                        neutrino_consensus_engine::BlockState::BlockProduced
+                            | neutrino_consensus_engine::BlockState::PendingProof
+                    ))
+                )
+        })
+    }
+
+    pub(crate) fn block_for_publication(&self, hash: &BlockHash) -> Option<Block> {
+        self.with_engine(|engine| {
+            let header = engine.store().get_header(hash).ok()??;
+            if engine
+                .store()
+                .get_block_hash_by_height(header.height)
+                .ok()
+                .flatten()
+                != Some(*hash)
+            {
+                return None;
+            }
+            Some(Block {
+                header,
+                body: engine.store().get_body(hash).ok()??,
+            })
+        })
     }
 
     /// Finalize chunk `chunk_id` against the local engine state.
@@ -1037,17 +1122,15 @@ where
         f(&mut guard)
     }
 
-    /// If `height` is the last block of a chunk that has not yet been
-    /// finalised and now has every block proof in place, open a BFT
+    /// If the chunk containing `height` now has every block proof in place, open a BFT
     /// session for it and broadcast any resulting actions.
     ///
     /// Called by every code path that imports or proves a block
     /// proof (local production, gossip imports, RPC batches). Cheap
-    /// for off-boundary heights — returns immediately after a
-    /// modular check against the chain spec's `chunk_size`.
+    /// for incomplete chunks. Proofs may finish in any order.
     pub async fn maybe_open_bft_session_for_height(&self, height: Height) {
         let chunk_size = self.chunk_size().max(1);
-        if height == 0 || !height.is_multiple_of(chunk_size) {
+        if height == 0 {
             return;
         }
         let chunk_id = (height - 1) / chunk_size;
@@ -1125,6 +1208,7 @@ where
     }
 
     async fn publish_finality_vote(&self, topic: Topic, vote: &FinalityVote) {
+        self.queue_vote_facts(vote);
         let Some(publisher) = self.publisher_snapshot() else {
             return;
         };
@@ -1505,6 +1589,7 @@ where
                 },
             );
             let outcome = import_result.map_err(Self::map_import_err)?;
+            self.queue_header_facts(&block.header);
             self.forget_mined_transactions(&block.body.transactions);
             last = Some(HeadersImported {
                 new_head_height: outcome.new_head_height,
@@ -1635,6 +1720,7 @@ where
             }
             Err(other) => return Err(Self::map_import_err(other)),
         };
+        self.queue_header_facts(&block.header);
         self.forget_mined_transactions(&block.body.transactions);
         Ok(HeadersImported {
             new_head_height: outcome.new_head_height,
@@ -1749,13 +1835,14 @@ where
         for evidence in invalid_proof_evidence {
             self.pool_and_gossip_slashing(evidence).await;
         }
-        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
+        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote.clone())) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(?err, "engine rejected finality vote");
                 return;
             }
         };
+        self.queue_vote_facts(&vote);
         self.handle_bft_actions(actions).await;
     }
 
@@ -1782,13 +1869,14 @@ where
         for evidence in invalid_proof_evidence {
             self.pool_and_gossip_slashing(evidence).await;
         }
-        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote)) {
+        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote.clone())) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(?err, "engine rejected aggregate finality vote");
                 return;
             }
         };
+        self.queue_vote_facts(&vote);
         self.handle_bft_actions(actions).await;
     }
 

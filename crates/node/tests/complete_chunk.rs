@@ -49,30 +49,58 @@ impl ProofSystem for NativeConsensusBackend {
         Some([1; 8])
     }
 
+    fn fact_key(&self) -> Option<[u32; 8]> {
+        Some([3; 8])
+    }
+
     fn evidence_key(&self) -> Option<[u32; 8]> {
         Some([2; 8])
     }
 
     // Transparent native witness receipts are test-only. Production uses the
     // SP1 portable verifier; these bytes deliberately cannot pass that verifier.
-    fn prove_evidence(
+    fn prove_evidence_batch(
         &self,
-        witness: &neutrino_prover_chunk::evidence::EvidenceWitness,
-    ) -> Result<Vec<u8>, ProofError> {
-        neutrino_prover_chunk::evidence::validate_evidence(witness)
+        witnesses: &[neutrino_prover_chunk::evidence::EvidenceWitness],
+    ) -> Result<Vec<neutrino_consensus_types::evidence::EvidenceArtifact>, ProofError> {
+        let statements = witnesses
+            .iter()
+            .map(neutrino_prover_chunk::evidence::validate_evidence)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ProofError::InvalidWitness)?;
-        borsh::to_vec(witness).map_err(|_| ProofError::InvalidWitness)
+        let bytes = borsh::to_vec(witnesses).map_err(|_| ProofError::InvalidWitness)?;
+        let mut artifacts = Vec::new();
+        for (index, statement) in statements.iter().enumerate() {
+            artifacts.push(neutrino_consensus_types::evidence::EvidenceArtifact {
+                membership: neutrino_consensus_types::evidence::EvidenceMembership::build(
+                    &statements,
+                    index,
+                    [3; 8],
+                )
+                .ok_or(ProofError::InvalidWitness)?,
+                statement: statement.clone(),
+                evidence_guest_vk_digest: [2; 8],
+                proof_bytes: bytes.clone(),
+            });
+        }
+        Ok(artifacts)
     }
 
     fn verify_evidence(
         &self,
         bytes: &[u8],
-        expected: &neutrino_consensus_types::evidence::EvidenceStatement,
+        expected: &neutrino_consensus_types::evidence::EvidenceBatch,
     ) -> Result<(), ProofError> {
-        let witness = borsh::from_slice(bytes).map_err(|_| ProofError::MalformedProof)?;
-        let actual = neutrino_prover_chunk::evidence::validate_evidence(&witness)
+        let witnesses: Vec<neutrino_prover_chunk::evidence::EvidenceWitness> =
+            borsh::from_slice(bytes).map_err(|_| ProofError::MalformedProof)?;
+        let statements = witnesses
+            .iter()
+            .map(neutrino_prover_chunk::evidence::validate_evidence)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ProofError::InvalidWitness)?;
-        if &actual != expected {
+        let batch = neutrino_consensus_types::evidence::EvidenceBatch::new(&statements, [3; 8])
+            .ok_or(ProofError::InvalidWitness)?;
+        if &batch != expected {
             return Err(ProofError::PublicInputMismatch);
         }
         Ok(())
@@ -215,7 +243,7 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     use neutrino_network::{Topic, service::NetworkCommand};
     use neutrino_sync::SyncBackend;
     let (mut engine, witness) = engine();
-    engine.set_evidence_programs([1; 8], [2; 8]);
+    engine.set_evidence_programs([1; 8], [2; 8], [3; 8]);
     let (decisions, receiver) = mpsc::channel();
     decisions.send(true).unwrap();
     let prover = NativeConsensusBackend {
@@ -803,7 +831,7 @@ async fn imported_finality_selects_a_proven_archived_fork_and_survives_restart()
     message.extend_from_slice(&local.hash());
     local.header.signature = key.sign(&message).to_bytes();
     let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    follower.set_evidence_programs([1; 8], [2; 8]);
+    follower.set_evidence_programs([1; 8], [2; 8], [3; 8]);
     follower.import_block(&local).unwrap();
     follower.import_block(&remote).unwrap();
     let proof = producer

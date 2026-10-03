@@ -42,6 +42,9 @@ pub struct NodeConfig {
     pub role: NodeRole,
     /// Chain id this node participates in.
     pub chain_id: u64,
+    /// Local CPU/memory budget for concurrent block proofs.
+    #[serde(default)]
+    pub proving: ProvingConfig,
     /// Bind addresses (multiaddr) the libp2p listener attaches to.
     ///
     /// Defaults to `/ip4/0.0.0.0/tcp/0` if empty.
@@ -185,5 +188,34 @@ max_connections = 64
     fn rpc_config_omitted_means_no_rpc_listener() {
         let cfg: NodeConfig = toml::from_str("chain_id = 1\n").expect("parse minimal config");
         assert!(cfg.rpc.is_none());
+    }
+}
+
+/// Bounds queued and running block jobs; overload pauses local production.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvingConfig {
+    /// Maximum simultaneous blocking block provers.
+    pub concurrency: usize,
+    /// Maximum queued plus running blocks, including restart recovery.
+    pub capacity: usize,
+}
+
+impl Default for ProvingConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 2,
+            capacity: 16,
+        }
+    }
+}
+
+impl ProvingConfig {
+    /// Reject configurations that cannot make progress or exceed the process budget.
+    pub const fn is_valid(self) -> bool {
+        self.concurrency > 0
+            && self.concurrency <= 64
+            && self.capacity >= self.concurrency
+            && self.capacity <= 1024
     }
 }

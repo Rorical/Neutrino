@@ -221,3 +221,72 @@ fn try_produce_block_without_executor_returns_executor_error() {
         "expected ProductionError::Executor, got {err:?}",
     );
 }
+
+#[test]
+fn slow_proving_releases_engine_for_reads_and_next_block_production() {
+    use neutrino_consensus_types::BlockProofPublicInputs;
+    use neutrino_proof_system::{MockBlockProof, MockProofSystem, ProofError, ProofSystem};
+    struct SlowProof {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl ProofSystem for SlowProof {
+        type BlockProof = MockBlockProof;
+        type ChunkProof = Vec<u8>;
+        type RecursiveProof = Vec<u8>;
+        fn prove_block(
+            &self,
+            witness: &[u8],
+            inputs: &BlockProofPublicInputs,
+        ) -> Result<MockBlockProof, ProofError> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            MockProofSystem::new().prove_block(witness, inputs)
+        }
+        fn verify_block(
+            &self,
+            proof: &MockBlockProof,
+            inputs: &BlockProofPublicInputs,
+        ) -> Result<(), ProofError> {
+            MockProofSystem::new().verify_block(proof, inputs)
+        }
+    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let engine = Engine::genesis(chain_spec(), MemoryDatabase::new()).unwrap();
+    let backend = Arc::new(ChainBackend::new(
+        engine,
+        SlowProof {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        },
+    ));
+    backend.set_block_executor(WasmExecutor::default_runtime().unwrap());
+    let first = backend.try_produce_block(1, &proposer()).unwrap().unwrap();
+    let worker = Arc::clone(&backend);
+    let proof = std::thread::spawn(move || worker.prove_block(&first.block_hash));
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let observer = Arc::clone(&backend);
+    let read = std::thread::spawn(move || {
+        assert_eq!(observer.head_height(), 1);
+        let second = observer.try_produce_block(2, &proposer()).unwrap().unwrap();
+        progress_tx
+            .send((second.block.header.height, second.block_hash))
+            .unwrap();
+    });
+    let progress = progress_rx.recv_timeout(std::time::Duration::from_secs(10));
+    // Always release before asserting, so a regression fails instead of hanging.
+    release_tx.send(()).unwrap();
+    let result = proof.join().unwrap().unwrap();
+    read.join().unwrap();
+    let (height, second_hash) = progress.unwrap();
+    assert_eq!(height, 2);
+    assert_eq!(result.state, BlockState::Proven);
+    assert_eq!(backend.head_height(), 2);
+    // Pending descendants remain eligible as tentative heads. Completing
+    // the parent's proof must not roll back this later produced block.
+    assert_eq!(backend.fork_choice_head(), second_hash);
+}

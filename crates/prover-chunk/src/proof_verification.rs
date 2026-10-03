@@ -24,7 +24,7 @@ pub const CIRCUIT_VERSION: &str = "v6.1.0";
 /// Exact public values, success exit status and canonical codec are mandatory.
 pub fn verify_evidence_receipt(
     bytes: &[u8],
-    statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+    statement: &neutrino_consensus_types::evidence::EvidenceBatch,
     key: &[u32; 8],
 ) -> Result<(), ProofRejectionReason> {
     decode_verified_evidence_receipt(bytes, statement, key).map(|_| ())
@@ -34,7 +34,7 @@ pub fn verify_evidence_receipt(
 /// for the host's recursive proof stream.
 pub fn decode_verified_evidence_receipt(
     bytes: &[u8],
-    statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+    statement: &neutrino_consensus_types::evidence::EvidenceBatch,
     key: &[u32; 8],
 ) -> Result<SP1Proof, ProofRejectionReason> {
     use neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES;
@@ -43,13 +43,31 @@ pub fn decode_verified_evidence_receipt(
     }
     let bundle: ProofBundle = receipt_codec::decode::<_, MAX_EVIDENCE_PROOF_BYTES>(bytes)
         .map_err(|_| ProofRejectionReason::MalformedProof)?;
-    let SP1Proof::Compressed(inner) = &bundle.proof else {
+    verify_typed_receipt(
+        &bundle.proof,
+        bundle.public_values.as_slice(),
+        &bundle.sp1_version,
+        statement,
+        key,
+    )?;
+    Ok(bundle.proof)
+}
+
+/// Verify an already decoded receipt, retaining every envelope and exit check.
+/// Generation paths use this before serializing, avoiding a second decoding pass.
+pub fn verify_typed_receipt<T: borsh::BorshSerialize>(
+    proof: &SP1Proof,
+    public_values: &[u8],
+    version: &str,
+    expected: &T,
+    key: &[u32; 8],
+) -> Result<(), ProofRejectionReason> {
+    let SP1Proof::Compressed(inner) = proof else {
         return Err(ProofRejectionReason::MalformedProof);
     };
-    if bundle.sp1_version != CIRCUIT_VERSION
+    if version != CIRCUIT_VERSION
         || inner.proof.public_values.len() != sp1_hypercube::PROOF_MAX_NUM_PVS
-        || bundle.public_values.as_slice()
-            != borsh::to_vec(statement).expect("canonical evidence statement")
+        || public_values != borsh::to_vec(expected).expect("canonical public values")
     {
         return Err(ProofRejectionReason::PublicInputsMismatch);
     }
@@ -58,8 +76,7 @@ pub fn decode_verified_evidence_receipt(
     if values.exit_code != sp1_primitives::SP1Field::default() {
         return Err(ProofRejectionReason::VerifierRejected);
     }
-    verify_decoded_receipt(&bundle, key)?;
-    Ok(bundle.proof)
+    verify_compressed(proof, public_values, key)
 }
 
 // Exact SDK 6.8.1 wire fields. Keeping the SDK host/prover itself out of the
@@ -137,13 +154,21 @@ fn verify_decoded_receipt(
     bundle: &ProofBundle,
     key: &[u32; 8],
 ) -> Result<(), ProofRejectionReason> {
-    let SP1Proof::Compressed(proof) = &bundle.proof else {
+    verify_compressed(&bundle.proof, bundle.public_values.as_slice(), key)
+}
+
+fn verify_compressed(
+    bundle: &SP1Proof,
+    public_values: &[u8],
+    key: &[u32; 8],
+) -> Result<(), ProofRejectionReason> {
+    let SP1Proof::Compressed(proof) = bundle else {
         return Err(ProofRejectionReason::MalformedProof);
     };
     let key_bytes = receipt_codec::encode(key).expect("fixed key encoding");
     let key = receipt_codec::decode::<[sp1_primitives::SP1Field; 8], 32>(&key_bytes)
         .map_err(|_| ProofRejectionReason::VerifierRejected)?;
     SP1CompressedVerifier::new()
-        .verify_compressed_with_public_values(proof, bundle.public_values.as_slice(), &key)
+        .verify_compressed_with_public_values(proof, public_values, &key)
         .map_err(|_| ProofRejectionReason::VerifierRejected)
 }

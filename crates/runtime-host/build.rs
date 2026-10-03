@@ -1,8 +1,9 @@
-//! Builds four artefacts:
+//! Builds five artefacts:
 //! - the `neutrino-default-runtime-guest` ELF (block-prover) via
 //!   `sp1-build`, consumed by `lib.rs` through `include_elf!`,
 //! - the `neutrino-default-consensus-chunk-guest` ELF (full consensus),
-//! - the `neutrino-default-evidence-guest` ELF (objective offences),
+//! - the `neutrino-default-evidence-guest` ELF (batched objective offences),
+//! - the `neutrino-default-fact-guest` ELF (reusable cryptographic verdicts),
 //! - the `neutrino-default-runtime-master` `wasm32-unknown-unknown`
 //!   cdylib via a sub-cargo invocation; the resulting `.wasm` path
 //!   is exposed to `lib.rs` via `NEUTRINO_DEFAULT_MASTER_WASM`.

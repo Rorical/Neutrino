@@ -321,3 +321,19 @@ fn startup_requires_the_exact_embedded_runtime_hash() {
     other[0] ^= 1;
     assert!(expect_runtime_code_hash(other).is_err());
 }
+
+#[test]
+fn cached_verified_block_still_binds_exact_bytes_and_public_inputs() {
+    let system = Sp1ProofSystem::mock().unwrap();
+    let (mut proof, mut inputs) = build_block_proof(91);
+    let expected = system.verify_block_statement(&proof, &inputs).unwrap();
+    assert_eq!(
+        system.verify_block_statement(&proof, &inputs).unwrap(),
+        expected
+    );
+    inputs.gas_used += 1;
+    assert!(system.verify_block_statement(&proof, &inputs).is_err());
+    inputs.gas_used -= 1;
+    proof.bytes.push(0);
+    assert!(system.verify_block_statement(&proof, &inputs).is_err());
+}

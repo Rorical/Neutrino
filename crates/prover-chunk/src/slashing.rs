@@ -9,7 +9,7 @@ use neutrino_consensus_types::{
 };
 use neutrino_primitives::{DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Validator};
 
-use crate::{bls, execution::commitment};
+use crate::execution::commitment;
 
 /// Evidence failed authentication or does not establish a violation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,17 +32,42 @@ pub fn verify_attestation(
     vote: &FinalityVoteData,
     attestation: &PrecommitAttestation,
 ) -> Result<(), EvidenceError> {
+    verify_attestation_using(
+        chain_id,
+        validators,
+        index,
+        vote,
+        attestation,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_attestation_using(
+    chain_id: u64,
+    validators: &[Validator],
+    index: u32,
+    vote: &FinalityVoteData,
+    attestation: &PrecommitAttestation,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
     if attestation.validator_index != index
         || attestation.vote != *vote
         || vote.phase != FinalityVotePhase::Precommit
     {
         return Err(EvidenceError::Binding);
     }
-    verify_indexed_vote(chain_id, validators, index, &attestation.indexed_vote())?;
+    verify_indexed_vote_using(
+        chain_id,
+        validators,
+        index,
+        &attestation.indexed_vote(),
+        verifier,
+    )?;
     let validator = validators
         .get(index as usize)
         .ok_or(EvidenceError::Binding)?;
-    if !bls::verify(
+    if !verifier.verify(
         &validator.pubkey,
         &attestation.signing_message(chain_id),
         &attestation.signature,
@@ -82,10 +107,27 @@ pub fn verify_indexed_vote(
     index: u32,
     vote: &IndexedVote,
 ) -> Result<(), EvidenceError> {
+    verify_indexed_vote_using(
+        chain_id,
+        validators,
+        index,
+        vote,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_indexed_vote_using(
+    chain_id: u64,
+    validators: &[Validator],
+    index: u32,
+    vote: &IndexedVote,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
     let key = validators
         .get(index as usize)
         .ok_or(EvidenceError::Binding)?;
-    if !bls::verify(
+    if !verifier.verify(
         &key.pubkey,
         &vote_message(chain_id, &vote.data),
         &vote.signature,
@@ -101,6 +143,23 @@ pub fn verify_quorum(
     validators: &[Validator],
     quorum: &QuorumCertificate,
     fraction: (u64, u64),
+) -> Result<(), EvidenceError> {
+    verify_quorum_using(
+        chain_id,
+        validators,
+        quorum,
+        fraction,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_quorum_using(
+    chain_id: u64,
+    validators: &[Validator],
+    quorum: &QuorumCertificate,
+    fraction: (u64, u64),
+    verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
     let (numerator, denominator) = fraction;
     if quorum.data.phase != FinalityVotePhase::Prevote
@@ -140,7 +199,7 @@ pub fn verify_quorum(
     {
         return Err(EvidenceError::Quorum);
     }
-    if !bls::fast_aggregate_verify(
+    if !verifier.aggregate(
         &keys,
         &vote_message(chain_id, &quorum.data),
         &quorum.aggregate.signature,
@@ -160,6 +219,27 @@ pub fn verify_lock_violation(
     evidence: &LockEvidence,
     quorum: (u64, u64),
 ) -> Result<(), EvidenceError> {
+    verify_lock_violation_using(
+        chain_id,
+        validators,
+        index,
+        votes,
+        evidence,
+        quorum,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_lock_violation_using(
+    chain_id: u64,
+    validators: &[Validator],
+    index: u32,
+    votes: (&IndexedVote, &IndexedVote),
+    evidence: &LockEvidence,
+    quorum: (u64, u64),
+    verifier: &mut impl crate::facts::EvidenceVerifier,
+) -> Result<(), EvidenceError> {
     let (first, later) = votes;
     if first.data.phase != FinalityVotePhase::Precommit
         || later.data.phase != FinalityVotePhase::Precommit
@@ -169,14 +249,15 @@ pub fn verify_lock_violation(
     {
         return Err(EvidenceError::Binding);
     }
-    verify_indexed_vote(chain_id, validators, index, first)?;
-    verify_indexed_vote(chain_id, validators, index, later)?;
-    verify_attestation(
+    verify_indexed_vote_using(chain_id, validators, index, first, verifier)?;
+    verify_indexed_vote_using(chain_id, validators, index, later, verifier)?;
+    verify_attestation_using(
         chain_id,
         validators,
         index,
         &later.data,
         &evidence.attestation,
+        verifier,
     )?;
     let locked = &evidence.locked_prevote_quorum;
     if locked.data.chunk_id != first.data.chunk_id
@@ -185,20 +266,20 @@ pub fn verify_lock_violation(
     {
         return Err(EvidenceError::Binding);
     }
-    verify_quorum(chain_id, validators, locked, quorum)?;
+    verify_quorum_using(chain_id, validators, locked, quorum, verifier)?;
     if let Some(unlock) = &evidence.attestation.unlock_quorum
         && unlock.data.chunk_id == later.data.chunk_id
         && unlock.data.chunk_hash == later.data.chunk_hash
         && unlock.data.round > first.data.round
         && unlock.data.round <= later.data.round
-        && verify_quorum(chain_id, validators, unlock, quorum).is_ok()
+        && verify_quorum_using(chain_id, validators, unlock, quorum, verifier).is_ok()
     {
         return Err(EvidenceError::HonestUnlock);
     }
     Ok(())
 }
 
-fn vote_message(chain_id: u64, data: &FinalityVoteData) -> alloc::vec::Vec<u8> {
+pub(crate) fn vote_message(chain_id: u64, data: &FinalityVoteData) -> alloc::vec::Vec<u8> {
     let domain = match data.phase {
         FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
         FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
@@ -230,7 +311,24 @@ pub fn verify_da_fraud(
     header: &neutrino_consensus_types::Header,
     fraud: &neutrino_consensus_types::DaFraudProof,
 ) -> Result<(), EvidenceError> {
-    crate::proposer::verify_header_signature(header, chain_id, validators)
+    verify_da_fraud_using(
+        chain_id,
+        validators,
+        header,
+        fraud,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_da_fraud_using(
+    chain_id: u64,
+    validators: &[Validator],
+    header: &neutrino_consensus_types::Header,
+    fraud: &neutrino_consensus_types::DaFraudProof,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
+    crate::proposer::verify_header_signature_using(header, chain_id, validators, verifier)
         .map_err(|_| EvidenceError::Signature)?;
     let validator = validators
         .get(header.proposer_index as usize)
@@ -239,7 +337,7 @@ pub fn verify_da_fraud(
     if hash != fraud.bundle_hash || fraud.expected_da_root != header.da_root {
         return Err(EvidenceError::Binding);
     }
-    if !bls::verify(
+    if !verifier.verify(
         &validator.pubkey,
         &da_publication_message(chain_id, &header.hash(), &hash),
         &fraud.publication_signature,

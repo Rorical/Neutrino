@@ -33,7 +33,14 @@ fn transaction_commitment_profile() {
         let mut chunk_stdin = SP1Stdin::new();
         chunk_stdin.write_vec(bytes);
         let mut block_stdin = SP1Stdin::new();
-        block_stdin.write_vec(borsh::to_vec(&(input, state)).unwrap());
+        block_stdin.write_vec(
+            borsh::to_vec(&(
+                input,
+                state,
+                Vec::<neutrino_consensus_types::evidence::EvidenceMembership>::new(),
+            ))
+            .unwrap(),
+        );
         let (block_output, block_report) = client
             .execute(
                 neutrino_runtime_host::DEFAULT_GUEST_ELF.clone(),

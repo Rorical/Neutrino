@@ -30,26 +30,36 @@ pub fn verify_input_receipts(
             if !attachment.binds(
                 &submission.statement,
                 &input.evidence_anchor.evidence_guest_vk_digest,
+                &input.evidence_anchor.fact_guest_vk_digest,
             ) {
                 return Err(Sp1HostError::Codec("evidence attachment binding".into()));
             }
         }
-        submissions
-            .iter()
-            .zip(attachments)
-            .map(|(submission, attachment)| {
+        let mut verified = std::collections::BTreeSet::new();
+        let mut batches = std::collections::BTreeSet::new();
+        let mut proofs = Vec::new();
+        for attachment in attachments {
+            let batch = &attachment.membership.batch;
+            let identity = neutrino_consensus_types::evidence::commitment(batch);
+            let envelope = neutrino_primitives::blake3_256(&attachment.proof_bytes);
+            // Verify each distinct envelope even when it declares the same
+            // batch. Only exact bytes inherit an earlier cryptographic check.
+            if verified.insert((identity, envelope)) {
                 let proof =
                     neutrino_prover_chunk::proof_verification::decode_verified_evidence_receipt(
                         &attachment.proof_bytes,
-                        &submission.statement,
+                        batch,
                         &input.evidence_anchor.evidence_guest_vk_digest,
                     )
                     .map_err(|reason| {
                         Sp1HostError::Sdk(format!("evidence receipt rejected: {reason:?}"))
                     })?;
-                Ok(proof)
-            })
-            .collect()
+                if batches.insert(identity) {
+                    proofs.push(proof);
+                }
+            }
+        }
+        Ok(proofs)
     })
     .map_err(|_| Sp1HostError::Sdk("evidence validation failed without a verdict".into()))?
 }

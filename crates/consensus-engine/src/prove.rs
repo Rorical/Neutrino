@@ -4,6 +4,8 @@
 //! Production proofs use the SP1 Compressed STARK backend.
 
 use core::fmt;
+extern crate alloc;
+use alloc::vec::Vec;
 
 use neutrino_consensus_types::{BlockProof as WireBlockProof, BlockProofPublicInputs, Header};
 use neutrino_primitives::{BlockHash, StateRoot};
@@ -97,7 +99,7 @@ impl<E> From<borsh::io::Error> for ProveError<E> {
 pub struct ProveOutcome {
     /// Block hash that was proven.
     pub block_hash: BlockHash,
-    /// FSM state after the prove call (`Proven` on success).
+    /// Committed state: `Proven`, or `Finalized` after concurrent finalization.
     pub state: BlockState,
     /// Wire-shaped block proof persisted in the store.
     pub block_proof: WireBlockProof,
@@ -107,25 +109,44 @@ pub struct ProveOutcome {
     pub public_inputs: BlockProofPublicInputs,
 }
 
+/// Immutable proving snapshot. It carries no engine lock or mutable state.
+#[derive(Debug)]
+pub struct BlockProofJob {
+    header: Header,
+    public_inputs: BlockProofPublicInputs,
+    witness_bytes: Vec<u8>,
+}
+
+/// Result constructed only after proof verification against the snapshotted inputs.
+#[derive(Debug)]
+pub struct CompletedBlockProof {
+    job: BlockProofJob,
+    proof: WireBlockProof,
+}
+
+impl BlockProofJob {
+    /// Run expensive proving and verification outside the engine mutex.
+    pub fn prove<PS: ProofSystem>(self, backend: &PS) -> Result<CompletedBlockProof, ProofError> {
+        let proof = backend.prove_block(&self.witness_bytes, &self.public_inputs)?;
+        backend.verify_block(&proof, &self.public_inputs)?;
+        let proof = WireBlockProof {
+            height: self.header.height,
+            block_hash: self.public_inputs.block_hash,
+            public_inputs: self.public_inputs.clone(),
+            proof_bytes: borsh::to_vec(&proof).map_err(|_| ProofError::MalformedProof)?,
+        };
+        Ok(CompletedBlockProof { job: self, proof })
+    }
+}
+
 impl<DB: Database> Engine<DB> {
-    /// Prove a previously-produced block end-to-end.
-    ///
-    /// Walks the block FSM `BlockProduced → PendingProof → Proven`,
-    /// loads the sealed execution witness from the
-    /// [`Witnesses`](neutrino_storage::Column) column, invokes
-    /// `proof_system.prove_block(witness_bytes, public_inputs)`, wraps
-    /// the backend proof in a [`WireBlockProof`], persists the result,
-    /// and bumps the stored block state to [`BlockState::Proven`].
-    ///
-    /// Blocks produced through
-    /// [`Engine::try_produce_block`](crate::Engine::try_produce_block)
-    /// have their witness persisted automatically. Imported blocks require
-    /// witness generation before local proving.
-    pub fn prove_block<PS: ProofSystem>(
+    /// Snapshot a produced block and mark it pending. The returned job owns its
+    /// inputs and can prove without borrowing the engine. Completion rechecks
+    /// this snapshot before atomically persisting the verified proof and state.
+    pub fn prepare_block_proof(
         &mut self,
         block_hash: &BlockHash,
-        proof_system: &PS,
-    ) -> Result<ProveOutcome, ProveError<DB::Error>> {
+    ) -> Result<BlockProofJob, ProveError<DB::Error>> {
         // Load + sanity-check the FSM state.
         let current_state = self
             .store()
@@ -148,6 +169,9 @@ impl<DB: Database> Engine<DB> {
             .store()
             .get_header(block_hash)?
             .ok_or(ProveError::UnknownBlock(*block_hash))?;
+        if header.hash() != *block_hash {
+            return Err(ProofError::PublicInputMismatch.into());
+        }
         let state_root_before = self.parent_state_root(&header)?;
         let public_inputs = self.public_inputs_for(&header, state_root_before, block_hash);
 
@@ -156,28 +180,71 @@ impl<DB: Database> Engine<DB> {
             .get_witness(block_hash)?
             .ok_or(ProveError::MissingWitness(*block_hash))?;
 
-        // Invoke the backend.
-        let backend_proof = proof_system.prove_block(&witness_bytes, &public_inputs)?;
-        let proof_bytes = borsh::to_vec(&backend_proof)?;
-
-        let wire_proof = WireBlockProof {
-            height: header.height,
-            block_hash: *block_hash,
-            public_inputs: public_inputs.clone(),
-            proof_bytes,
-        };
-        self.store_mut().put_block_proof(block_hash, &wire_proof)?;
-
-        // Advance FSM to Proven.
-        self.store_mut()
-            .put_block_state(block_hash, BlockState::Proven)?;
-
-        Ok(ProveOutcome {
-            block_hash: *block_hash,
-            state: BlockState::Proven,
-            block_proof: wire_proof,
+        Ok(BlockProofJob {
+            header,
             public_inputs,
+            witness_bytes,
         })
+    }
+
+    /// Complete a verified job without holding a lock during backend work.
+    /// A concurrently imported proof is retained and a finalized FSM never regresses.
+    pub fn commit_block_proof(
+        &mut self,
+        completed: CompletedBlockProof,
+    ) -> Result<ProveOutcome, ProveError<DB::Error>> {
+        let CompletedBlockProof { job, proof } = completed;
+        let hash = job.public_inputs.block_hash;
+        if self.store().get_header(&hash)?.as_ref() != Some(&job.header)
+            || self.store().get_witness(&hash)?.as_ref() != Some(&job.witness_bytes)
+        {
+            return Err(ProofError::PublicInputMismatch.into());
+        }
+        let current = self
+            .store()
+            .get_block_state(&hash)?
+            .ok_or(ProveError::NoBlockState(hash))?;
+        let block_proof = if matches!(current, BlockState::Proven | BlockState::Finalized) {
+            let stored = self
+                .store()
+                .get_block_proof(&hash)?
+                .ok_or(ProofError::InvalidWitness)?;
+            if stored.public_inputs != job.public_inputs {
+                return Err(ProofError::PublicInputMismatch.into());
+            }
+            stored
+        } else {
+            self.store_mut().put_proven_block(&hash, &proof)?;
+            proof
+        };
+        self.clear_rejected_proof(&hash);
+        let status = if current == BlockState::Finalized {
+            neutrino_consensus_fork_choice::ProofStatus::Finalized
+        } else {
+            neutrino_consensus_fork_choice::ProofStatus::Proven
+        };
+        let _ = self.fork_choice.on_block_proof(hash, status);
+        Ok(ProveOutcome {
+            block_hash: hash,
+            state: if current == BlockState::Finalized {
+                current
+            } else {
+                BlockState::Proven
+            },
+            public_inputs: job.public_inputs,
+            block_proof,
+        })
+    }
+
+    /// Synchronous convenience for callers that own an engine without a mutex.
+    pub fn prove_block<PS: ProofSystem>(
+        &mut self,
+        block_hash: &BlockHash,
+        proof_system: &PS,
+    ) -> Result<ProveOutcome, ProveError<DB::Error>> {
+        let job = self.prepare_block_proof(block_hash)?;
+        let completed = job.prove(proof_system)?;
+        self.commit_block_proof(completed)
     }
 
     /// Returns the state root that preceded `header.state_root`.

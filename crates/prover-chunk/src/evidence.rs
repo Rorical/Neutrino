@@ -8,7 +8,7 @@ use neutrino_consensus_types::{
 use neutrino_primitives::ChainSpec;
 
 use crate::execution::commitment;
-use crate::history::{HistoricalChunk, HistoryError, authorize_evidence_at_record, penalty_id};
+use crate::history::{HistoricalChunk, HistoryError, authorize_evidence_using, penalty_id};
 
 /// Self-contained witness classes accepted by the evidence program.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -41,6 +41,14 @@ pub struct EvidenceWitness {
 /// Derive the public statement or fail closed. A resource failure never
 /// substitutes for a verifier rejection verdict.
 pub fn validate_evidence(input: &EvidenceWitness) -> Result<EvidenceStatement, HistoryError> {
+    validate_evidence_using(input, &mut crate::bls::DirectVerifier::default())
+}
+
+/// Derive the same statement from already proven cryptographic facts.
+pub fn validate_evidence_using(
+    input: &EvidenceWitness,
+    verifier: &mut impl crate::facts::EvidenceVerifier,
+) -> Result<EvidenceStatement, HistoryError> {
     let spec = &input.chain_spec;
     let source = &input.source;
     spec.validate().map_err(|_| HistoryError::Anchor)?;
@@ -56,20 +64,26 @@ pub fn validate_evidence(input: &EvidenceWitness) -> Result<EvidenceStatement, H
     }
     let (offender, offence_id, kind) = match &input.claim {
         EvidenceClaim::Slash(evidence) => {
-            let (validator, id) =
-                authorize_evidence_at_record(spec, source, evidence, &input.block_guest_vk_digest)?;
+            let (validator, id) = authorize_evidence_using(
+                spec,
+                source,
+                evidence,
+                &input.block_guest_vk_digest,
+                verifier,
+            )?;
             (validator, id, SanctionKind::Slash)
         }
         EvidenceClaim::Inactivity {
             validator_index,
             certificate,
         } => {
-            crate::finality::verify_finality(
+            crate::finality::verify_finality_using(
                 spec.chain_id,
                 &spec.consensus,
                 &source.validators,
                 &source.chunk,
                 certificate,
+                verifier,
             )
             .map_err(|_| HistoryError::Evidence)?;
             let validator = source
@@ -97,4 +111,50 @@ pub fn validate_evidence(input: &EvidenceWitness) -> Result<EvidenceStatement, H
         offence_id,
         facts_commitment: commitment(&input.claim),
     })
+}
+
+/// Batch Guest input. Fact statements are authenticated through the separate
+/// recursive proof stream before any offence can be committed.
+#[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct EvidenceBatchWitness {
+    /// Bounded offences, potentially from different historical chunks.
+    pub witnesses: alloc::vec::Vec<EvidenceWitness>,
+    /// Authenticated cryptographic facts, shared across all offences.
+    pub facts: alloc::vec::Vec<crate::facts::FactStatement>,
+    /// Program identity pinned by the consuming block anchor.
+    pub fact_guest_vk_digest: [u32; 8],
+}
+
+/// Derive batch statements without repeating signatures or exact-proof verification.
+/// The caller must first authenticate every fact statement through SP1 recursion.
+pub fn validate_evidence_batch(
+    input: &EvidenceBatchWitness,
+) -> Result<
+    (
+        neutrino_consensus_types::evidence::EvidenceBatch,
+        alloc::vec::Vec<EvidenceStatement>,
+    ),
+    HistoryError,
+> {
+    if input.witnesses.is_empty()
+        || input.witnesses.len() > neutrino_consensus_types::evidence::MAX_EVIDENCE_BATCH
+        || input.facts.len() > 256
+    {
+        return Err(HistoryError::Evidence);
+    }
+    let mut reader = crate::facts::FactReader::new(&input.facts)?;
+    let statements = input
+        .witnesses
+        .iter()
+        .map(|witness| validate_evidence_using(witness, &mut reader))
+        .collect::<Result<alloc::vec::Vec<_>, _>>()?;
+    if !reader.complete() {
+        return Err(HistoryError::Evidence);
+    }
+    let batch = neutrino_consensus_types::evidence::EvidenceBatch::new(
+        &statements,
+        input.fact_guest_vk_digest,
+    )
+    .ok_or(HistoryError::Evidence)?;
+    Ok((batch, statements))
 }

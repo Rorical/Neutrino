@@ -42,6 +42,10 @@ impl ProofSystem for NativeConsensusBackend {
         Some([1; 8])
     }
 
+    fn fact_key(&self) -> Option<[u32; 8]> {
+        Some([3; 8])
+    }
+
     fn evidence_key(&self) -> Option<[u32; 8]> {
         Some([2; 8])
     }
@@ -76,7 +80,7 @@ impl ProofSystem for NativeConsensusBackend {
 fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     let (mut witness, _, _) = support::fixture([1; 8], [4; 32]);
     let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    engine.set_evidence_programs([1; 8], [2; 8]);
+    engine.set_evidence_programs([1; 8], [2; 8], [3; 8]);
     let block = &witness.blocks[0];
     let hash = block.header.hash();
     engine
@@ -362,4 +366,55 @@ fn chunk_preparation_uses_the_materialized_branch_after_sibling_archival() {
         .unwrap();
     assert_eq!(prepared.witness.blocks, witness.blocks);
     assert_ne!(prepared.witness.blocks[0].header.hash(), sibling.hash());
+}
+
+#[test]
+fn proof_completion_preserves_concurrent_finalization_and_rejects_changed_snapshot() {
+    let (mut engine, witness) = engine();
+    let hash = witness.blocks[0].header.hash();
+    engine
+        .store_mut()
+        .put_block_state(&hash, BlockState::BlockProduced)
+        .unwrap();
+    engine.store_mut().put_witness(&hash, &[1, 2, 3]).unwrap();
+    let first = engine.prepare_block_proof(&hash).unwrap();
+    let second = engine.prepare_block_proof(&hash).unwrap();
+    let backend = neutrino_proof_system::MockProofSystem::new();
+    let first = first.prove(&backend).unwrap();
+    let second = second.prove(&backend).unwrap();
+    let original = engine.commit_block_proof(first).unwrap().block_proof;
+    assert_eq!(
+        engine.fork_choice().block(&hash).unwrap().proof_status,
+        neutrino_consensus_fork_choice::ProofStatus::Proven
+    );
+    engine
+        .fork_choice_mut_for_test()
+        .on_block_proof(hash, neutrino_consensus_fork_choice::ProofStatus::Finalized)
+        .unwrap();
+    engine
+        .store_mut()
+        .put_block_state(&hash, BlockState::Finalized)
+        .unwrap();
+    let duplicate = engine.commit_block_proof(second).unwrap();
+    assert_eq!(duplicate.state, BlockState::Finalized);
+    assert_eq!(duplicate.block_proof, original);
+    assert_eq!(
+        engine.fork_choice().block(&hash).unwrap().proof_status,
+        neutrino_consensus_fork_choice::ProofStatus::Finalized
+    );
+    engine
+        .store_mut()
+        .put_block_state(&hash, BlockState::BlockProduced)
+        .unwrap();
+    let stale = engine
+        .prepare_block_proof(&hash)
+        .unwrap()
+        .prove(&backend)
+        .unwrap();
+    engine.store_mut().put_witness(&hash, &[4, 5, 6]).unwrap();
+    assert!(engine.commit_block_proof(stale).is_err());
+    assert_eq!(
+        engine.store().get_block_state(&hash).unwrap(),
+        Some(BlockState::PendingProof)
+    );
 }

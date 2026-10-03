@@ -14,15 +14,17 @@ use crate::{
     execution::{
         ExecutionContext, ExecutionStatement, ProvenBlock, commitment, validate_execution,
     },
-    finality::verify_finality,
+    finality::verify_finality_using,
     history::{HistoricalChunk, HistoryError, HistoryWitness},
-    proposer::verify_proposer,
+    proposer::verify_proposer_using,
     rotation::rotate_from_witness,
 };
 
 /// Witness for a chunk whose inner execution proofs are verified separately.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ConsensusWitness {
+    /// Trusted early cryptographic-fact program.
+    pub fact_guest_vk_digest: [u32; 8],
     /// Independent evidence guest pinned by the outer verifier.
     pub evidence_guest_vk_digest: [u32; 8],
     /// Trusted chain configuration, committed by the execution context.
@@ -49,6 +51,8 @@ pub struct ConsensusWitness {
 /// incoming seed and block-program key against its own trusted checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ConsensusStatement {
+    /// Trusted early cryptographic-fact program.
+    pub fact_guest_vk_digest: [u32; 8],
     /// Accepted evidence program, shared by all recursively verified blocks.
     pub evidence_guest_vk_digest: [u32; 8],
     /// Header, execution and chunk commitments.
@@ -87,22 +91,27 @@ pub enum ConsensusError {
 /// Inner SP1 proofs must be verified by the guest using the exact block outputs
 /// and key in this witness. This function alone does not establish execution.
 pub fn validate_consensus(input: &ConsensusWitness) -> Result<ConsensusStatement, ConsensusError> {
+    let mut verifier = crate::bls::BatchVerifier::default();
     let ValidatedCandidate {
         execution,
         next_validators,
         penalties,
-    } = validate_candidate(input)?;
+    } = validate_candidate_using(input, &mut verifier)?;
     let context = &input.context;
     let spec = &input.chain_spec;
     let chunk = as_chunk(&execution);
-    verify_finality(
+    verify_finality_using(
         spec.chain_id,
         &spec.consensus,
         &context.active_validators,
         &chunk,
         &input.finality_cert,
+        &mut verifier,
     )
     .map_err(|_| ConsensusError::Finality)?;
+    if !verifier.finish() {
+        return Err(ConsensusError::Finality);
+    }
     let vrfs: Vec<_> = input
         .blocks
         .iter()
@@ -134,6 +143,7 @@ pub fn validate_consensus(input: &ConsensusWitness) -> Result<ConsensusStatement
         ..context.clone()
     };
     Ok(ConsensusStatement {
+        fact_guest_vk_digest: input.fact_guest_vk_digest,
         evidence_guest_vk_digest: input.evidence_guest_vk_digest,
         execution,
         seed: input.seed,
@@ -158,6 +168,18 @@ pub struct ValidatedCandidate {
 /// Validate a candidate before voting. Finality is checked only by
 /// [`validate_consensus`], which is the guest's entry point.
 pub fn validate_candidate(input: &ConsensusWitness) -> Result<ValidatedCandidate, ConsensusError> {
+    let mut verifier = crate::bls::BatchVerifier::default();
+    let candidate = validate_candidate_using(input, &mut verifier)?;
+    if !verifier.finish() {
+        return Err(ConsensusError::Proposer);
+    }
+    Ok(candidate)
+}
+
+fn validate_candidate_using(
+    input: &ConsensusWitness,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<ValidatedCandidate, ConsensusError> {
     validate_context(input)?;
     let context = &input.context;
     let spec = &input.chain_spec;
@@ -178,12 +200,13 @@ pub fn validate_candidate(input: &ConsensusWitness) -> Result<ValidatedCandidate
         if block.header.timestamp.abs_diff(timestamp) > 60 {
             return Err(ConsensusError::Header);
         }
-        verify_proposer(
+        verify_proposer_using(
             &block.header,
             spec.chain_id,
             &context.active_validators,
             &input.seed,
             spec.consensus.expected_proposers_per_slot,
+            verifier,
         )
         .map_err(|_| ConsensusError::Proposer)?;
     }
@@ -191,6 +214,7 @@ pub fn validate_candidate(input: &ConsensusWitness) -> Result<ValidatedCandidate
         input.history.penalties.iter().copied().collect();
     let mut offenders = Vec::new();
     let expected_anchor = neutrino_consensus_types::evidence::EvidenceAnchor {
+        fact_guest_vk_digest: input.fact_guest_vk_digest,
         chain_spec_hash: spec.hash(),
         chunk_id: context.chunk_id,
         history_root: context.history_root,
@@ -203,7 +227,7 @@ pub fn validate_candidate(input: &ConsensusWitness) -> Result<ValidatedCandidate
             return Err(ConsensusError::Context);
         }
         for vote in &body.finality_votes {
-            crate::history::verify_embedded_vote(spec, &input.history, vote)
+            crate::history::verify_embedded_vote_using(spec, &input.history, vote, verifier)
                 .map_err(ConsensusError::History)?;
         }
         for sanction in &block.output.accountability.admitted {
@@ -280,6 +304,7 @@ pub fn validate_successor(
         || input.seed != previous.next_seed
         || input.evidence_guest_vk_digest != previous.evidence_guest_vk_digest
         || input.block_guest_vk_digest != previous.execution.block_guest_vk_digest
+        || input.fact_guest_vk_digest != previous.fact_guest_vk_digest
     {
         return Err(ConsensusError::Context);
     }

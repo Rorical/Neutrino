@@ -6,7 +6,7 @@ use neutrino_consensus_types::{
 };
 use neutrino_primitives::{ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Validator};
 
-use crate::{bls, execution::commitment};
+use crate::execution::commitment;
 
 /// Authenticate an embedded vote without requiring that this one envelope
 /// already reaches quorum. Every precommit signer must carry a complete,
@@ -17,6 +17,25 @@ pub fn verify_vote(
     vote: &neutrino_consensus_types::FinalityVote,
     max_round: u32,
     block_count: u64,
+) -> Result<(), FinalityError> {
+    verify_vote_using(
+        chain_id,
+        validators,
+        vote,
+        max_round,
+        block_count,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_vote_using(
+    chain_id: u64,
+    validators: &[Validator],
+    vote: &neutrino_consensus_types::FinalityVote,
+    max_round: u32,
+    block_count: u64,
+    verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
     if !neutrino_consensus_types::attestation_coverage_valid(
         &vote.data,
@@ -45,26 +64,34 @@ pub fn verify_vote(
     let mut message = Vec::from(domain);
     message.extend_from_slice(&chain_id.to_le_bytes());
     message.extend_from_slice(&borsh::to_vec(&vote.data).expect("canonical vote encoding"));
-    if keys.is_empty() || !bls::fast_aggregate_verify(&keys, &message, &vote.signature) {
+    if keys.is_empty() || !verifier.aggregate(&keys, &message, &vote.signature) {
         return Err(FinalityError::Signature);
     }
-    verify_claims(chain_id, validators, &vote.data, &vote.attestations)?;
+    verify_claims_using(
+        chain_id,
+        validators,
+        &vote.data,
+        &vote.attestations,
+        verifier,
+    )?;
     Ok(())
 }
 
-fn verify_claims(
+fn verify_claims_using(
     chain_id: u64,
     validators: &[Validator],
     data: &FinalityVoteData,
     claims: &[neutrino_consensus_types::PrecommitAttestation],
+    verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
     for claim in claims {
-        crate::slashing::verify_attestation(
+        crate::slashing::verify_attestation_using(
             chain_id,
             validators,
             claim.validator_index,
             data,
             claim,
+            verifier,
         )
         .map_err(|_| FinalityError::Signature)?;
     }
@@ -95,6 +122,25 @@ pub fn verify_finality(
     chunk: &Chunk,
     certificate: &FinalityCert,
 ) -> Result<(), FinalityError> {
+    verify_finality_using(
+        chain_id,
+        params,
+        validators,
+        chunk,
+        certificate,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_finality_using(
+    chain_id: u64,
+    params: &ConsensusParams,
+    validators: &[Validator],
+    chunk: &Chunk,
+    certificate: &FinalityCert,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), FinalityError> {
     let root = commitment(validators);
     if certificate.chunk_id != chunk.chunk_id
         || certificate.chunk_hash != chunk.hash()
@@ -118,7 +164,13 @@ pub fn verify_finality(
     ) {
         return Err(FinalityError::Membership);
     }
-    verify_claims(chain_id, validators, &data, &certificate.attestations)?;
+    verify_claims_using(
+        chain_id,
+        validators,
+        &data,
+        &certificate.attestations,
+        verifier,
+    )?;
     let total = validators
         .iter()
         .try_fold(0_u64, |total, validator| {
@@ -144,25 +196,27 @@ pub fn verify_finality(
             params.bft_precommit_quorum_denominator,
         ),
     ] {
-        verify_phase(
+        verify_phase_using(
             chain_id,
             validators,
             certificate,
             phase,
             vote,
             (total, numerator, denominator),
+            verifier,
         )?;
     }
     Ok(())
 }
 
-fn verify_phase(
+fn verify_phase_using(
     chain_id: u64,
     validators: &[Validator],
     certificate: &FinalityCert,
     phase: FinalityVotePhase,
     vote: &AggregatedVote,
     (total, numerator, denominator): (u64, u64, u64),
+    verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
     if numerator == 0
         || denominator == 0
@@ -201,7 +255,7 @@ fn verify_phase(
     let mut message = Vec::from(domain);
     message.extend_from_slice(&chain_id.to_le_bytes());
     message.extend_from_slice(&borsh::to_vec(&data).expect("canonical vote encoding"));
-    if !bls::fast_aggregate_verify(&keys, &message, &vote.signature) {
+    if !verifier.aggregate(&keys, &message, &vote.signature) {
         return Err(FinalityError::Signature);
     }
     Ok(())

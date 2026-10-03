@@ -8,7 +8,9 @@ use acceptance::{AcceptanceCache, StageIdentity};
 
 use neutrino_consensus_types::{
     Body, FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
-    evidence::{EvidenceArtifact, EvidenceSubmission, HistoryOpening},
+    evidence::{
+        EvidenceArtifact, EvidenceBatch, EvidenceMembership, EvidenceSubmission, HistoryOpening,
+    },
 };
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::{StfInput, Transaction};
@@ -95,6 +97,12 @@ fn invalid_and_missing_attachments_are_rejected_before_guest_execution() {
     let input = submission_input(&first, input);
     let attachments = vec![EvidenceArtifact {
         evidence_guest_vk_digest: input.evidence_anchor.evidence_guest_vk_digest,
+        membership: EvidenceMembership::build(
+            &[validate_evidence(&evidence(&first)).unwrap()],
+            0,
+            first.fact_guest_vk_digest,
+        )
+        .unwrap(),
         statement: validate_evidence(&evidence(&first)).unwrap(),
         proof_bytes: vec![1, 2, 3],
     }];
@@ -129,6 +137,12 @@ fn attachment_count_order_program_and_statement_are_checked_before_proof_decode(
     let mut input = submission_input(&first, input);
     let artifact = EvidenceArtifact {
         evidence_guest_vk_digest: input.evidence_anchor.evidence_guest_vk_digest,
+        membership: EvidenceMembership::build(
+            &[validate_evidence(&evidence(&first)).unwrap()],
+            0,
+            first.fact_guest_vk_digest,
+        )
+        .unwrap(),
         statement: validate_evidence(&evidence(&first)).unwrap(),
         proof_bytes: vec![1],
     };
@@ -165,6 +179,12 @@ fn persisted_witness_roundtrips_attachments_and_rejects_trailing_bytes() {
         support::fixture([1; 8], neutrino_runtime_host::default_runtime_code_hash());
     let attachment = EvidenceArtifact {
         evidence_guest_vk_digest: input.evidence_anchor.evidence_guest_vk_digest,
+        membership: EvidenceMembership::build(
+            &[validate_evidence(&evidence(&first)).unwrap()],
+            0,
+            first.fact_guest_vk_digest,
+        )
+        .unwrap(),
         statement: validate_evidence(&evidence(&first)).unwrap(),
         proof_bytes: vec![1],
     };
@@ -188,24 +208,57 @@ fn evidence_guest_matches_native_statement_and_rejects_forgery() {
     let (first, _, _) =
         support::fixture([1; 8], neutrino_runtime_host::default_runtime_code_hash());
     let witness = evidence(&first);
-    let expected = validate_evidence(&witness).unwrap();
+    let mut recorder = neutrino_prover_chunk::facts::FactRecorder::default();
+    let statement =
+        neutrino_prover_chunk::evidence::validate_evidence_using(&witness, &mut recorder).unwrap();
+    let checks = recorder.finish().unwrap();
+    let fact_input = neutrino_prover_chunk::facts::FactWitness {
+        requests: checks.iter().map(|(request, _)| request.clone()).collect(),
+        statement: neutrino_prover_chunk::facts::FactStatement {
+            facts: checks
+                .iter()
+                .map(
+                    |(request, valid)| neutrino_prover_chunk::facts::ProvenFact {
+                        id: request.id(),
+                        valid: *valid,
+                    },
+                )
+                .collect(),
+        },
+    };
     let mut stdin = SP1Stdin::new();
-    stdin.write_vec(borsh::to_vec(&witness).unwrap());
+    stdin.write_vec(borsh::to_vec(&fact_input).unwrap());
+    let (facts, report) = mock
+        .execute(neutrino_runtime_host::DEFAULT_FACT_GUEST_ELF.clone(), stdin)
+        .run()
+        .unwrap();
+    assert_eq!(report.exit_code, 0);
+    assert_eq!(
+        facts.as_slice(),
+        borsh::to_vec(&fact_input.statement).unwrap()
+    );
+    let input = neutrino_prover_chunk::evidence::EvidenceBatchWitness {
+        witnesses: vec![witness],
+        facts: vec![fact_input.statement],
+        fact_guest_vk_digest: [3; 8],
+    };
+    let expected = EvidenceBatch::new(&[statement], [3; 8]).unwrap();
+    let mut stdin = SP1Stdin::new();
+    stdin.write_vec(borsh::to_vec(&input).unwrap());
     let (values, report) = mock
         .execute(
             neutrino_runtime_host::DEFAULT_EVIDENCE_GUEST_ELF.clone(),
             stdin,
         )
+        .deferred_proof_verification(false)
         .run()
         .unwrap();
     assert_eq!(report.exit_code, 0);
-    eprintln!(
-        "evidence guest instruction count: {}",
-        report.total_instruction_count()
-    );
     assert_eq!(values.as_slice(), borsh::to_vec(&expected).unwrap());
-    let mut bad = witness;
-    if let EvidenceClaim::Slash(SlashingEvidence::DoublePrecommit { vote_b, .. }) = &mut bad.claim {
+    let mut bad = input;
+    if let EvidenceClaim::Slash(SlashingEvidence::DoublePrecommit { vote_b, .. }) =
+        &mut bad.witnesses[0].claim
+    {
         vote_b.signature[0] ^= 1;
     }
     let mut stdin = SP1Stdin::new();
@@ -215,6 +268,7 @@ fn evidence_guest_matches_native_statement_and_rejects_forgery() {
             neutrino_runtime_host::DEFAULT_EVIDENCE_GUEST_ELF.clone(),
             stdin,
         )
+        .deferred_proof_verification(false)
         .run();
     assert!(!result.is_ok_and(|(_, report)| report.exit_code == 0));
 }
@@ -252,34 +306,48 @@ fn evidence_block_chunk_real_compressed_recursion() {
         &live,
     );
     first.evidence_guest_vk_digest = system.evidence_key().unwrap();
+    first.fact_guest_vk_digest = system.fact_key().unwrap();
+    input.evidence_anchor.fact_guest_vk_digest = first.fact_guest_vk_digest;
     input.evidence_anchor.evidence_guest_vk_digest = first.evidence_guest_vk_digest;
     first.blocks[0].output.accountability.anchor = input.evidence_anchor;
     let previous = validate_consensus(&first).unwrap();
     let evidence = evidence(&first);
     let statement = validate_evidence(&evidence).unwrap();
+    let batch =
+        EvidenceBatch::new(std::slice::from_ref(&statement), first.fact_guest_vk_digest).unwrap();
     eprintln!("evidence gate: prove objective misconduct");
     let evidence_identity = StageIdentity::new(
         "evidence",
         &neutrino_runtime_host::DEFAULT_EVIDENCE_GUEST_ELF,
         &borsh::to_vec(&evidence).unwrap(),
-        &borsh::to_vec(&statement).unwrap(),
+        &borsh::to_vec(&batch).unwrap(),
     );
     let bytes = cache
         .prove_or_resume(
             &evidence_identity,
-            |bytes| system.verify_evidence(bytes, &statement),
-            || system.prove_evidence(&evidence),
+            |bytes| system.verify_evidence(bytes, &batch),
+            || {
+                system
+                    .prove_evidence_batch(std::slice::from_ref(&evidence))
+                    .map(|artifacts| artifacts[0].proof_bytes.clone())
+            },
         )
         .unwrap();
-    let mut wrong = statement.clone();
-    wrong.offence_id[0] ^= 1;
+    let mut wrong = batch.clone();
+    wrong.root[0] ^= 1;
     assert!(system.verify_evidence(&bytes, &wrong).is_err());
     let mut corrupt = bytes.clone();
     corrupt.push(0);
-    assert!(system.verify_evidence(&corrupt, &statement).is_err());
+    assert!(system.verify_evidence(&corrupt, &batch).is_err());
     let input = submission_input(&first, input);
     let attachments = vec![EvidenceArtifact {
         evidence_guest_vk_digest: first.evidence_guest_vk_digest,
+        membership: EvidenceMembership::build(
+            std::slice::from_ref(&statement),
+            0,
+            first.fact_guest_vk_digest,
+        )
+        .unwrap(),
         statement,
         proof_bytes: bytes,
     }];

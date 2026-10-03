@@ -76,20 +76,36 @@ pub trait ProofSystem {
         None
     }
 
-    /// Prove a self-contained evidence statement. Expensive work must happen
-    /// outside consensus-engine locks.
-    fn prove_evidence(
+    /// Early cryptographic fact program accepted by evidence recursion.
+    fn fact_key(&self) -> Option<[u32; 8]> {
+        None
+    }
+
+    /// Compress observed signed artifacts before misconduct is discovered.
+    /// Implementations retain a bounded cache of verified receipts for reuse.
+    fn preprove_facts(
         &self,
-        _witness: &neutrino_prover_chunk::evidence::EvidenceWitness,
-    ) -> Result<alloc::vec::Vec<u8>, ProofError> {
+        _requests: &[neutrino_prover_chunk::facts::FactRequest],
+    ) -> Result<(), ProofError> {
         Err(ProofError::Unsupported)
     }
 
-    /// Verify canonical receipt bytes against an exact evidence statement.
+    /// Prove and verify a bounded batch. The returned attachments are verified
+    /// against their exact statements and program identities; callers need not
+    /// verify them again until they cross a storage/network trust boundary.
+    fn prove_evidence_batch(
+        &self,
+        _witnesses: &[neutrino_prover_chunk::evidence::EvidenceWitness],
+    ) -> Result<alloc::vec::Vec<neutrino_consensus_types::evidence::EvidenceArtifact>, ProofError>
+    {
+        Err(ProofError::Unsupported)
+    }
+
+    /// Verify a receipt against exact batch public values and the pinned fact program.
     fn verify_evidence(
         &self,
         _proof: &[u8],
-        _statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+        _batch: &neutrino_consensus_types::evidence::EvidenceBatch,
     ) -> Result<(), ProofError> {
         Err(ProofError::Unsupported)
     }
@@ -101,6 +117,16 @@ pub trait ProofSystem {
         _proof: &Self::BlockProof,
     ) -> Result<neutrino_default_runtime_core::StfPublicOutput, ProofError> {
         Err(ProofError::Unsupported)
+    }
+
+    /// Verify and extract the exact public output in one decoding pass.
+    fn verify_block_statement(
+        &self,
+        proof: &Self::BlockProof,
+        public_inputs: &BlockProofPublicInputs,
+    ) -> Result<neutrino_default_runtime_core::StfPublicOutput, ProofError> {
+        self.verify_block(proof, public_inputs)?;
+        self.block_statement(proof)
     }
 
     /// Prove execution and consensus including an already-collected certificate.

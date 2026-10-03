@@ -9,7 +9,7 @@ use neutrino_default_runtime_core::{
 use neutrino_network::{Topic, service::NetworkCommand};
 use neutrino_proof_system::ProofSystem;
 use neutrino_prover_chunk::{
-    evidence::{EvidenceClaim, EvidenceWitness, validate_evidence},
+    evidence::{EvidenceClaim, EvidenceWitness},
     history::penalty_id,
 };
 use neutrino_storage::Database;
@@ -49,46 +49,35 @@ where
         runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let mut produced = Vec::new();
-                for witness in witnesses {
-                    let Ok(statement) = validate_evidence(&witness) else {
-                        continue;
+                let mut batches = vec![witnesses];
+                while let Some(batch) = batches.pop() {
+                    let artifacts = match prover.prove_evidence_batch(&batch) {
+                        Ok(artifacts) => artifacts,
+                        Err(neutrino_proof_system::ProofError::InvalidWitness)
+                            if batch.len() > 1 =>
+                        {
+                            let middle = batch.len() / 2;
+                            batches.push(batch[middle..].to_vec());
+                            batches.push(batch[..middle].to_vec());
+                            continue;
+                        }
+                        Err(_) => continue,
                     };
-                    let id = statement.offence_id;
-                    let already_known = {
-                        let engine = engine.lock().expect("engine mutex");
-                        engine.state().get(&offence_key(&id)).is_some()
-                            || engine
-                                .store()
-                                .evidence_artifacts()
-                                .unwrap_or_default()
-                                .iter()
-                                .any(|a| a.statement.offence_id == id)
-                    };
-                    if already_known {
-                        continue;
-                    }
-                    let Ok(proof_bytes) = prover.prove_evidence(&witness) else {
-                        continue;
-                    };
-                    let artifact = EvidenceArtifact {
-                        evidence_guest_vk_digest: evidence_key,
-                        statement,
-                        proof_bytes,
-                    };
-                    if prover
-                        .verify_evidence(&artifact.proof_bytes, &artifact.statement)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    let stored = engine
-                        .lock()
-                        .expect("engine mutex")
-                        .store_mut()
-                        .put_evidence_artifact(&artifact)
-                        .is_ok();
-                    if stored {
-                        produced.push(artifact);
+                    for artifact in artifacts {
+                        // The backend returns verified artifacts. Storage/network
+                        // readers verify independently at their trust boundary.
+                        if artifact.evidence_guest_vk_digest != evidence_key {
+                            continue;
+                        }
+                        let stored = engine
+                            .lock()
+                            .expect("engine mutex")
+                            .store_mut()
+                            .put_evidence_artifact(&artifact)
+                            .is_ok();
+                        if stored {
+                            produced.push(artifact);
+                        }
                     }
                 }
                 produced
@@ -220,7 +209,12 @@ where
         artifact: EvidenceArtifact,
     ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
-        if artifact.proof_bytes.is_empty()
+        if Some(artifact.membership.batch.fact_guest_vk_digest) != self.proof_system.fact_key()
+            || !artifact.membership.binds(
+                &artifact.statement,
+                &self.proof_system.fact_key().unwrap_or_default(),
+            )
+            || artifact.proof_bytes.is_empty()
             || Some(artifact.evidence_guest_vk_digest) != self.proof_system.evidence_key()
             || artifact.proof_bytes.len()
                 > neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES
@@ -260,7 +254,7 @@ where
         let prover = Arc::clone(&self.proof_system);
         let result = tokio::task::spawn_blocking(move || {
             prover
-                .verify_evidence(&artifact.proof_bytes, &artifact.statement)
+                .verify_evidence(&artifact.proof_bytes, &artifact.membership.batch)
                 .map(|()| artifact)
         })
         .await;
@@ -314,7 +308,11 @@ where
                 if !submission.binds(engine.chain_spec().chain_id, height, &anchor) {
                     continue;
                 }
-                if !artifact.binds(&submission.statement, &anchor.evidence_guest_vk_digest) {
+                if !artifact.binds(
+                    &submission.statement,
+                    &anchor.evidence_guest_vk_digest,
+                    &anchor.fact_guest_vk_digest,
+                ) {
                     continue;
                 }
                 let executions = (queued.len() + selected + 1)

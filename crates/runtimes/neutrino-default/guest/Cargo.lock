@@ -584,6 +584,7 @@ name = "neutrino-default-runtime-guest"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "neutrino-consensus-types",
  "neutrino-default-runtime-core",
  "neutrino-runtime-abi",
  "neutrino-runtime-core",

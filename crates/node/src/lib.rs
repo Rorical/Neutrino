@@ -25,3 +25,5 @@ pub use chain_spec::{ChainSpecError, ChainSpecFile, ValidatorEntry};
 pub use config::{NodeConfig, NodeRole};
 pub use db::{NodeDb, NodeDbError};
 pub use runner::{NodeError, run};
+
+mod proof_queue;

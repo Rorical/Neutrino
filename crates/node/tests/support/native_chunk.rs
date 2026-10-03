@@ -44,6 +44,10 @@ impl ProofSystem for NativeChunkTestSystem {
         self.0.consensus_block_key()
     }
 
+    fn fact_key(&self) -> Option<[u32; 8]> {
+        Some([3; 8])
+    }
+
     fn evidence_key(&self) -> Option<[u32; 8]> {
         self.0.evidence_key()
     }

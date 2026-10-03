@@ -6,8 +6,6 @@ use neutrino_primitives::{DOMAIN_PROPOSER_SIG, FixedU128, Seed, Validator};
 use neutrino_vrf::{is_eligible, vrf_message};
 use sha2::{Digest, Sha256};
 
-use crate::bls;
-
 /// Proposer authentication or stake-weighted eligibility failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProposerError {
@@ -29,7 +27,26 @@ pub fn verify_proposer(
     seed: &Seed,
     expected_proposers: FixedU128,
 ) -> Result<(), ProposerError> {
-    verify_header_signature(header, chain_id, validators)?;
+    verify_proposer_using(
+        header,
+        chain_id,
+        validators,
+        seed,
+        expected_proposers,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_proposer_using(
+    header: &Header,
+    chain_id: u64,
+    validators: &[Validator],
+    seed: &Seed,
+    expected_proposers: FixedU128,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), ProposerError> {
+    verify_header_signature_using(header, chain_id, validators, verifier)?;
     let validator = usize::try_from(header.proposer_index)
         .ok()
         .and_then(|index| validators.get(index))
@@ -47,7 +64,7 @@ pub fn verify_proposer(
         .filter(|stake| *stake > 0)
         .ok_or(ProposerError::Validator)?;
     let vrf_message = vrf_message(chain_id, seed, header.slot);
-    if !bls::verify(&validator.pubkey, &vrf_message, &header.vrf_proof) {
+    if !verifier.verify(&validator.pubkey, &vrf_message, &header.vrf_proof) {
         return Err(ProposerError::Vrf);
     }
     let output = Sha256::digest(header.vrf_proof).into();
@@ -68,6 +85,21 @@ pub fn verify_header_signature(
     chain_id: u64,
     validators: &[Validator],
 ) -> Result<(), ProposerError> {
+    verify_header_signature_using(
+        header,
+        chain_id,
+        validators,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Verification with a shared key cache or an authenticated fact source.
+pub fn verify_header_signature_using(
+    header: &Header,
+    chain_id: u64,
+    validators: &[Validator],
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), ProposerError> {
     let validator = validators
         .get(header.proposer_index as usize)
         .filter(|validator| !validator.slashed && validator.effective_stake > 0)
@@ -75,7 +107,7 @@ pub fn verify_header_signature(
     let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
     message.extend_from_slice(&chain_id.to_le_bytes());
     message.extend_from_slice(&header.hash());
-    if !bls::verify(&validator.pubkey, &message, &header.signature) {
+    if !verifier.verify(&validator.pubkey, &message, &header.signature) {
         return Err(ProposerError::Signature);
     }
     Ok(())

@@ -39,7 +39,7 @@ extern crate alloc;
 #[derive(Debug)]
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
-    pub(crate) evidence_programs: Option<([u32; 8], [u32; 8])>,
+    pub(crate) evidence_programs: Option<([u32; 8], [u32; 8], [u32; 8])>,
     store: ChainStore<DB>,
     clock: SlotClock,
     state: Trie,

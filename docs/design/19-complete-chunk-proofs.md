@@ -41,3 +41,28 @@ Implementation is covered by adversarial boundary, signature/quorum, proof-key,
 rotation, accountability and native/WASM/Guest tests. Real CPU compressed composition
 must be accepted separately for the current programs; see
 [evidence proofs](20-evidence-proofs.md). Checkpoint recursion remains deferred.
+
+
+## Guest signature work
+
+Candidate and certificate verification share a checked-public-key cache and a
+bounded BLS equation batch. Signatures, aggregate signatures, attestation votes,
+attestation signatures and proposer/VRF signatures use the same verifier. Curve,
+subgroup and nonidentity checks precede batching, and membership, stake thresholds,
+POP provenance and domain/chain bindings remain mandatory. Exact duplicate equations
+are checked once. Single equations use direct verification; larger groups share one
+final exponentiation and group equal messages into one Miller-loop term.
+
+Batch coefficients are nonzero full-field scalars derived with SHA-512 from a
+length-framed transcript of every key point, message, signature and cipher-suite DST,
+plus batch length and equation index. They are deterministic Fiat-Shamir challenges,
+not prover-selected weights. The security argument uses the random-oracle model;
+unweighted summation would allow invalid signatures to cancel. At most 64 equations
+are pending. The final batch must succeed before committing a consensus statement.
+Negative decisions (invalid VRF, dishonest unlock, rejected proof) use individual
+checks or explicit proven FactProof verdicts, never a pending positive batch.
+Registration POPs keep their immediate verdict because invalid registrations are
+ignored by the existing rotation rule.
+
+References: [batch verification](https://ethresear.ch/t/fast-verification-of-multiple-bls-signatures/5407)
+and [its security conditions](https://ethresear.ch/t/security-of-bls-batch-verification/10748).

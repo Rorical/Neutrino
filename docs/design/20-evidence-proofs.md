@@ -1,13 +1,14 @@
 # 20 — Evidence proofs and mandatory sanctions
 
-Status: implemented. Workspace checks passed for the current Guest programs
-and protocol formats. Real compressed composition acceptance remains pending
-as a separate gate. Checkpoint recursion remains deferred.
+Status: implemented. Current-program workspace acceptance passed on 2026-10-03.
+Real compressed composition acceptance remains pending as a separate gate.
+Checkpoint recursion remains deferred.
 
 ## Composition
 
-An independent SP1 evidence guest proves objective offences using historical
-membership, signed artifacts and the deterministic proof-rejection verifier.
+An independent SP1 fact Guest first compresses exact cryptographic checks. The
+batch evidence Guest recursively verifies these facts and proves objective offences
+using historical membership, signed-artifact bindings and explicit verdicts.
 Its statement binds chain ID and complete chain-spec hash, the historical context, stable offender
 identity and the existing evidence-independent penalty ID. The runtime block
 guest recursively verifies this proof and authenticates the historical opening
@@ -18,19 +19,22 @@ effects; they do not replay evidence verification.
 
 ```mermaid
 flowchart LR
-    E[Signed evidence and historical membership] --> G[Evidence Guest]
-    G --> P[EvidenceProof]
+    S[Observed signed artifacts] --> F[Fact Guest]
+    F --> R[Reusable FactProof]
+    R --> G[Batch Evidence Guest]
+    E[Signed evidence and historical membership] --> G
+    G --> P[EvidenceProof with statement openings]
     P --> B[Block Guest]
     H[Authenticated historical opening] --> B
     B --> Q[Block proof: admission, FIFO, holds and deductions]
     Q --> C[Chunk Guest: consensus and validator transition]
-    C --> F[Chunk proof]
+    C --> QP[Chunk proof]
 ```
 
 Evidence proofs are reusable across blocks: public statements bind a historical
 record, not the current chain tip. A counted Merkle history supplies sparse
 openings. The root is authenticated from the previous finalized chunk, never
-from the current chunk's future certificate. Program identities are pinned by
+from the current chunk's future certificate. Fact, evidence and block program identities are pinned by
 the verifier and bound in the composed public statements.
 
 The ordinary-execution host must verify every evidence receipt before WASM
@@ -62,14 +66,31 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
 - [x] Chunk consumes proven sanctions without evidence verification.
 - [x] Node generation, persistent pool, gossip, import and restart paths.
 - [x] Adversarial, lifecycle, queue and native/WASM/Guest parity tests.
-- [x] Current-program locked build, complete workspace tests, strict Clippy and
-  workspace/Guest format checks.
+- [x] Current-program locked build, complete workspace tests (715 passed,
+  5 opt-in tests ignored), strict Clippy and workspace/Guest format checks.
+  The four Guest ELFs and WASM hashes were unchanged across these checks.
 - [ ] Real SP1 EvidenceProof → block → chunk composition gate: local acceptance
   was cancelled. The upgraded programs require a fresh run on a suitable prover.
 
-Optional early fact compression and batch aggregation are follow-on
-optimizations; individual BFT votes never wait for an SP1 fact proof. The initial
-evidence guest directly compresses self-contained signed evidence.
+Early fact compression and batch evidence proving are implemented. Individual BFT
+votes never wait for a fact proof. A bounded background worker coalesces queued
+requests without a timer, observes votes,
+attestations, headers and VRFs, compresses up to 64 cryptographic facts per receipt,
+and keeps verified results for later offence proofs. The input binds exact key,
+message (including chain and domain), signature, or complete signed block-proof
+envelope and accepted block program. An explicit false verdict establishes
+cryptographic rejection; missing facts and operational failures never do.
+
+A batch EvidenceProof recursively authenticates fact receipts and commits a counted
+Merkle root of 1–16 unique offence statements plus the fact-program identity. Its
+logical rules still authenticate historical membership, quorum, locks, signed proof
+acceptance, chain policy and evidence-independent penalty IDs. Shared facts are
+verified once, including a certificate reused for several inactivity claims.
+Each attachment carries its statement's counted Merkle opening. The transaction
+still commits only the offence statement and historical opening, so selecting a
+different valid proof or batch does not change transaction identity. The block
+Guest checks every opening, pins the fact program from its trusted anchor, and
+recursively verifies each distinct batch only once.
 
 ## Statement identity and recursive witnesses
 
@@ -78,13 +99,14 @@ opening. `Body.evidence_proofs` transports and archives one ordered attachment
 per submission, outside the transaction, vote and DA commitments. Missing,
 extra, reordered, malformed or mismatched attachments are rejected at execution
 and admission boundaries. An attachment carries the evidence program identity;
-its cache key is BLAKE3 of the domain-separated program and canonical statement.
+its cache key is BLAKE3 of the domain-separated evidence/fact programs and
+canonical statement.
 Alternative valid proofs for that statement have the same transaction identity.
 
 The ordinary host verifies each actual attachment before WASM execution. The
 proving host decodes and verifies it once, then supplies the compressed proof and
 pinned verification key through SP1's separate proof stream. The block Guest
-checks policy, historical bindings and exact statement public values, invokes
+checks policy, historical bindings, exact statement membership and batch public values, invokes
 native SP1 recursive verification and only then executes the STF. No proof bytes
 enter the STF input, and no full compressed-proof verifier runs in the block Guest.
 Production recursion cannot disable deferred verification.
@@ -97,8 +119,8 @@ composition establishes recursive acceptance. SP1's execution report does not
 count the recursive assertion syscall, so its counts cannot establish this gate.
 
 `InvalidProofSigning` still binds the exact block proof envelope signed by every
-precommit participant. Evidence Guest retains its deterministic exact-byte
-rejection verifier for that offence, and `facts_commitment` still commits the
+precommit participant. Fact Guest runs its deterministic exact-byte
+rejection verifier for that offence; Evidence Guest authenticates the verdict, and `facts_commitment` still commits the
 original signed misconduct evidence. Separating the resulting EvidenceProof
 witness changes neither guilt nor the mandatory sanctions and withdrawal holds.
 The chunk consumes block-proven effects without verifying evidence again.
@@ -126,8 +148,8 @@ Historical context commits the chunk, membership and seed, independently of a
 certificate's signer subset. Different valid certificates must produce the same
 incoming historical root. Inactivity retains the protocol's narrow meaning:
 non-inclusion in the submitted valid certificate, not proof that a validator
-never voted. The exact submitted certificate is verified inside Evidence Guest
-and committed by the claim; its resulting transaction is ordered by consensus.
+never voted. The exact submitted certificate is checked by Evidence Guest using
+recursively authenticated cryptographic facts and committed by the claim; its resulting transaction is ordered by consensus.
 Every claim binds the complete chain-spec hash and block program identity.
 
 Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 receipts
@@ -173,3 +195,22 @@ Long CPU gates can run from frozen test executables and subscribe to the precedi
 process's exit with kqueue. A local macOS notification reports completion; this
 mechanism does not send an automatic chat message or poll the prover. Keep the
 executable hash and final verdict with that run's artifacts.
+
+
+## Fact cache and scheduling
+
+Fact receipts are local acceleration artifacts, not new consensus gossip messages.
+The early queue has eight slots of at most 2 MiB and one blocking worker. The
+worker drains at most eight additional queued groups per dispatch, deduplicates
+facts, and proves misses in groups of at most 64; saturation
+skips optional precomputation. Evidence proving fills any missing facts on demand.
+Neither queueing nor receipt generation holds the engine mutex. Fact receipts are
+retained by circuit and fact-program identity under the SP1 cache directory, with
+256 receipts and 32 MiB maximum retention. Fresh receipts are verified before cache
+insertion; persisted receipts are bounded, decoded and verified again on restart.
+Corrupt files are discarded. Cache loss only costs recomputation.
+
+The real composition gate now covers FactProof → batched EvidenceProof → block →
+chunk. Native checks and execution-only Guest tests do not establish this gate;
+local real proving remains cancelled at the user's request. Batch equations and
+negative-fact omission/cancellation attacks have dedicated adversarial tests.

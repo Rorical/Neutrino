@@ -13,6 +13,7 @@ fn artifact(id: u64) -> EvidenceArtifact {
     let mut offence_id = [0; 32];
     offence_id[..8].copy_from_slice(&id.to_le_bytes());
     EvidenceArtifact {
+        membership: neutrino_consensus_types::evidence::EvidenceMembership::default(),
         evidence_guest_vk_digest: [2; 8],
         statement: EvidenceStatement {
             chain_id: 7,

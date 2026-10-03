@@ -13,8 +13,10 @@
 mod canonical;
 mod chain_store;
 mod error;
+mod history;
 pub mod keys;
 pub mod pointers;
+mod retention;
 
 pub use chain_store::{ChainStore, ContentAddressedEntries, ValidatorSetSnapshot};
 pub use error::StoreError;

@@ -1,7 +1,7 @@
 # Neutrino
 
-Shared WASM/SP1 execution, complete chunk consensus proofs and EvidenceProof
-accountability are implemented. Real compressed composition acceptance remains
+Shared WASM/SP1 execution, complete chunk consensus proofs, EvidenceProof
+accountability and recursive history proofs are implemented. Real compressed composition acceptance remains
 separate from workspace tests; see [evidence proofs](docs/design/20-evidence-proofs.md).
 
 A proof-aware, modular layer-1 blockchain built from scratch in Rust.
@@ -26,9 +26,13 @@ Neutrino separates the chain into two cleanly decoupled layers:
   and the consensus transition. Compact witnesses omit ordinary transactions.
 - **Dynamic non-proven execution.** RPC, transaction precheck, simulation, and
   ordinary full-node execution run through WASM/wasmtime.
-- **No SNARK wrapper in the accepted plan.** Complete chunk aggregation uses
+- **STARK throughout.** Complete chunk aggregation and history Fold/Merge use
   SP1 Compressed STARK recursion; acceptance gates are tracked in design 19.
-  Recursive checkpoint proofs remain deferred.
+  A history proof connects compact authenticated boundaries without replaying the chain.
+- **Proof-backed pruning.** Full and validator nodes retain the recent eight-chunk
+  window once a persisted recursive prefix covers older data. `role = "archive"`
+  keeps complete source history voluntarily. Old transactions may become globally
+  unavailable when no archive retains them; proof lag delays deletion.
 - **Proof-authorized sanctions.** An independent fact Guest compresses signed artifacts; a batch evidence Guest proves offences.
   Blocks recursively authenticate evidence statements and execute mandatory sanctions;
   chunks consume those proven effects without rechecking the evidence. See
@@ -36,7 +40,7 @@ Neutrino separates the chain into two cleanly decoupled layers:
 
 The development protocol has one current format without version numbers.
 Upgrades are incompatible; deprecated formats and migration paths are not
-maintained. Checkpoint recursion remains unimplemented.
+maintained.
 
 ## Design Documents
 
@@ -57,6 +61,7 @@ maintained. Checkpoint recursion remains unimplemented.
 | [randomness](docs/design/12-randomness.md) | Randomness |
 | [complete-chunk-proofs](docs/design/19-complete-chunk-proofs.md) | Complete chunk proofs |
 | [evidence-proofs](docs/design/20-evidence-proofs.md) | Evidence Guest, mandatory sanctions and acceptance gates |
+| [recursive-checkpoint-proofs](docs/design/21-recursive-checkpoint-proofs.md) | Fold/Merge recursion, bounded history access and anchored light-client updates |
 
 ## Prerequisites
 
@@ -85,6 +90,10 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+CPU proving is the default. NVIDIA GPU proving is available through the optional
+`cuda` feature and `[proving] backend = "cuda"`; see
+[GPU proving](docs/gpu-proving.md) for build, configuration and hardware acceptance.
 
 ## License
 

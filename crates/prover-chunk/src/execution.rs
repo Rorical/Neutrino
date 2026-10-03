@@ -31,8 +31,6 @@ pub struct ExecutionContext {
     pub active_validators: Vec<Validator>,
     /// Commitment to finalized historical consensus records.
     pub history_root: Hash,
-    /// Commitment to the canonical consumed-penalty ledger.
-    pub penalty_root: Hash,
 }
 
 /// One complete header and the statement authenticated by its inner proof.
@@ -46,16 +44,12 @@ pub struct ProvenBlock {
     pub output: StfPublicOutput,
 }
 
-/// Execution statement committed by a chunk guest.
-///
-/// The verifier must check the context and block-program commitments against
-/// its trusted inputs, in addition to verifying the SP1 aggregate proof.
+/// Native execution candidate used to derive the compact consensus statement.
+/// This alone establishes neither recursive proof validity nor finality.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ExecutionStatement {
     /// Canonical chunk commitment fields.
     pub chunk: ChunkProofPublicInputs,
-    /// Binds all configuration and incoming checkpoint fields.
-    pub context_hash: Hash,
     /// Binds the program used to verify every inner block proof.
     pub block_guest_vk_digest: [u32; 8],
 }
@@ -172,7 +166,6 @@ pub fn validate_execution(
     let first = blocks.first().ok_or(ExecutionError::Range)?;
     let last = blocks.last().ok_or(ExecutionError::Range)?;
     Ok(ExecutionStatement {
-        context_hash: commitment(context),
         block_guest_vk_digest,
         chunk: ChunkProofPublicInputs {
             chunk_id: context.chunk_id,

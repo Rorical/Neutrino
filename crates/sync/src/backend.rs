@@ -9,16 +9,16 @@
 
 use async_trait::async_trait;
 use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityVote, RecursiveCheckpointProof, SlashingEvidence,
+    Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
 };
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse, Metadata,
-    RecursiveProofByIndexResponse, RecursiveProofLatestResponse, StateByRootResponse, Status,
-    WitnessByBlockResponse, role_flags,
+    BlocksByRootResponse, CheckpointLatestResponse, ChunkProofByIdResponse,
+    FinalityCertByChunkResponse, HistoryProofByRangeResponse, Metadata, StateByRootResponse,
+    Status, WitnessByBlockResponse, role_flags,
 };
 use neutrino_network::sync::LocalProgress;
-use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
+use neutrino_primitives::{BlockHash, CheckpointIndex, ChunkId, Hash, Height, StateRoot};
 use thiserror::Error;
 
 /// Evidence-gossip verdict separates invalid receipts from local sync/cache limits.
@@ -58,6 +58,16 @@ pub enum SyncBackendError {
     /// Backend was asked for data it does not yet have.
     #[error("not available: {0}")]
     NotAvailable(String),
+    /// This provider deliberately pruned the requested history; try another provider.
+    #[error(
+        "data pruned; retained chunks start at {retained_from_chunk}, blocks at {retained_from_height}"
+    )]
+    Pruned {
+        /// Earliest complete retained chunk.
+        retained_from_chunk: ChunkId,
+        /// Earliest complete retained block payload.
+        retained_from_height: Height,
+    },
     /// Peer data could not be imported because the local chain is
     /// missing an earlier link.
     ///
@@ -69,18 +79,18 @@ pub enum SyncBackendError {
     ChainBehind(String),
 }
 
-/// Result of importing a batch of recursive checkpoint proofs.
+/// Result of authenticating a history range; full-node prefix coverage is separate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointsImported {
-    /// Highest checkpoint index now finalized locally.
+    /// Chunk count at this range endpoint, not necessarily full-node prefix coverage.
     pub new_finalized_index: CheckpointIndex,
-    /// Hash of the highest finalized checkpoint.
+    /// Hash of the authenticated range endpoint.
     pub new_finalized_hash: [u8; 32],
-    /// `end_state_root` of the highest finalized checkpoint.
+    /// State root at the range endpoint.
     pub new_finalized_state_root: StateRoot,
-    /// `end_height` of the highest finalized checkpoint.
+    /// Block height at the range endpoint.
     pub new_finalized_height: Height,
-    /// `end_block_hash` of the highest finalized checkpoint.
+    /// Block hash at the range endpoint.
     pub new_finalized_block_hash: BlockHash,
 }
 
@@ -141,26 +151,26 @@ pub trait SyncBackend: Send + Sync + 'static {
             seq_number: 0,
             vote_subnet_bits: 0,
             role_flags: role_flags::FULL_NODE,
+            retained_from_chunk: None,
+            retained_from_height: None,
         }
     }
 
     /// Build a [`LocalProgress`] snapshot for the sync FSM.
     async fn local_progress(&self) -> Result<LocalProgress, SyncBackendError>;
 
-    /// Build a response to `/neutrino/req/recursive_proof_latest`.
+    /// Build a response to `/neutrino/req/checkpoint_latest`.
     ///
     /// Returns [`SyncBackendError::NotAvailable`] when the node is still at
     /// genesis (no recursive proof produced yet).
-    async fn latest_recursive_proof(
-        &self,
-    ) -> Result<RecursiveProofLatestResponse, SyncBackendError>;
+    async fn latest_checkpoint(&self) -> Result<CheckpointLatestResponse, SyncBackendError>;
 
-    /// Build a response to `/neutrino/req/recursive_proof_by_index`.
-    async fn recursive_proofs_by_index(
+    /// Build a response to `/neutrino/req/history_proof_by_range`.
+    async fn history_proof_by_range(
         &self,
-        start: CheckpointIndex,
-        count: u64,
-    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError>;
+        start: Hash,
+        end: Hash,
+    ) -> Result<HistoryProofByRangeResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/blocks_by_range`.
     async fn blocks_by_range(
@@ -228,14 +238,14 @@ pub trait SyncBackend: Send + Sync + 'static {
         ))
     }
 
-    /// Verify each `(Checkpoint, RecursiveCheckpointProof)` in chain order,
-    /// then persist the highest accepted entry.
+    /// Verify a real conditional history range against the local trusted anchor,
+    /// then persist its authenticated endpoint.
     ///
     /// Returns the new finalized cursor (or `Err` if any item failed
     /// verification or persistence).
-    async fn verify_and_import_checkpoints(
+    async fn verify_and_import_history(
         &self,
-        items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
+        proof: HistoryProof,
     ) -> Result<CheckpointsImported, SyncBackendError>;
 
     /// Verify each block's header chain + signature, then persist.

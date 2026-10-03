@@ -2,17 +2,16 @@
 
 use borsh::BorshSerialize;
 use neutrino_consensus_engine::Engine;
+use neutrino_consensus_types::history_proof::{Checkpoint, ConsensusBoundary};
 use neutrino_network::{
     rpc::{
         self, BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
         BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse,
-        RecursiveProofByIndexResponse, StateByRootResponse, Status, WitnessByBlockResponse,
+        HistoryProofByRangeResponse, StateByRootResponse, Status, WitnessByBlockResponse,
     },
     sync::LocalProgress,
 };
-use neutrino_primitives::{
-    BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot, ZERO_HASH,
-};
+use neutrino_primitives::{BlockHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH};
 use neutrino_proof_system::ProofSystem;
 use neutrino_rpc::QueryError;
 use neutrino_storage::Database;
@@ -28,6 +27,13 @@ pub(super) fn storage_error(error: impl core::fmt::Display) -> SyncBackendError 
 pub(super) fn query_error(error: QueryError) -> SyncBackendError {
     match error {
         QueryError::Storage(reason) => SyncBackendError::Storage(reason),
+        QueryError::Pruned {
+            retained_from_chunk,
+            retained_from_height,
+        } => SyncBackendError::Pruned {
+            retained_from_chunk,
+            retained_from_height,
+        },
         other => SyncBackendError::NotAvailable(other.to_string()),
     }
 }
@@ -67,6 +73,9 @@ fn branch_hashes<DB: Database>(
 where
     DB::Error: core::fmt::Debug + core::fmt::Display,
 {
+    if count > 0 {
+        rpc_queries::ensure_payload_height(engine, start).map_err(query_error)?;
+    }
     let genesis = engine.chain_spec().genesis_block_hash;
     let tip_height = if anchor == genesis {
         0
@@ -130,16 +139,52 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
     P: ProofSystem + Send + Sync + 'static,
 {
-    fn p2p_status_snapshot(engine: &Engine<DB>) -> Result<(Status, Checkpoint), SyncBackendError> {
-        let checkpoint_index = engine.latest_checkpoint_index();
-        let checkpoint = engine
-            .store()
-            .get_checkpoint(checkpoint_index)
-            .map_err(storage_error)?
-            .ok_or_else(|| storage_error("finalized checkpoint is missing"))?;
-        if checkpoint.index != checkpoint_index {
-            return Err(storage_error("checkpoint pointer is inconsistent"));
+    pub(super) fn p2p_local_metadata(&self) -> rpc::Metadata {
+        if self.light_checkpoint().is_some() {
+            return rpc::Metadata {
+                role_flags: rpc::role_flags::LIGHT_CLIENT,
+                ..rpc::Metadata::default()
+            };
         }
+        self.with_engine(|engine| {
+            let retention = rpc_queries::retention_info(engine)?;
+            Ok::<_, QueryError>(rpc::Metadata {
+                seq_number: retention.retained_from_chunk.unwrap_or(0),
+                vote_subnet_bits: 0,
+                role_flags: rpc::role_flags::FULL_NODE
+                    | if retention.archive {
+                        rpc::role_flags::ARCHIVE
+                    } else {
+                        0
+                    },
+                retained_from_chunk: retention.retained_from_chunk,
+                retained_from_height: retention.retained_from_height,
+            })
+        })
+        .unwrap_or_default()
+    }
+
+    fn ensure_retained_chunk(engine: &Engine<DB>, id: ChunkId) -> Result<(), SyncBackendError> {
+        let retention = engine.retention_info().map_err(storage_error)?;
+        if id < retention.pruned_before_chunk {
+            return Err(SyncBackendError::Pruned {
+                retained_from_chunk: retention.pruned_before_chunk,
+                retained_from_height: retention.first_retained_height,
+            });
+        }
+        Ok(())
+    }
+
+    fn p2p_status_snapshot(
+        engine: &Engine<DB>,
+    ) -> Result<(Status, ConsensusBoundary), SyncBackendError> {
+        let covered = engine.recursive_covered_chunks();
+        let boundary = engine.canonical_boundary(covered).map_err(storage_error)?;
+        let checkpoint_hash = engine
+            .store()
+            .history_domain()
+            .map_err(storage_error)?
+            .map_or(ZERO_HASH, |domain| Checkpoint { domain, boundary }.hash());
         let finalized = rpc_queries::finalized_info(engine).map_err(query_error)?;
         let chunk_hash = match finalized.chunk_id {
             Some(id) => {
@@ -172,21 +217,53 @@ where
                 chain_spec_hash: engine.chain_spec_hash(),
                 finalized_chunk_id: finalized.chunk_id,
                 finalized_chunk_hash: chunk_hash,
-                finalized_checkpoint_index: checkpoint_index,
-                finalized_checkpoint_hash: checkpoint.hash(),
+                recursive_covered_chunks: covered,
+                checkpoint_hash,
                 head_block_hash: engine.head_hash(),
                 head_slot,
                 head_height: engine.head_height(),
             },
-            checkpoint,
+            boundary,
         ))
     }
 
     pub(super) fn p2p_local_status(&self) -> Result<Status, SyncBackendError> {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            return Ok(Status {
+                chain_id: checkpoint.domain.chain.chain_id,
+                chain_spec_hash: checkpoint.domain.chain.chain_spec_hash,
+                finalized_chunk_id: None,
+                finalized_chunk_hash: ZERO_HASH,
+                recursive_covered_chunks: checkpoint.boundary.next_chunk_id,
+                checkpoint_hash: checkpoint.hash(),
+                head_block_hash: checkpoint.boundary.block_hash,
+                head_slot: checkpoint.boundary.slot,
+                head_height: checkpoint.boundary.height,
+            });
+        }
         self.with_engine(|engine| Self::p2p_status_snapshot(engine).map(|(status, _)| status))
     }
 
     pub(super) fn p2p_local_progress(&self) -> Result<LocalProgress, SyncBackendError> {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            let boundary = checkpoint.boundary;
+            return Ok(LocalProgress {
+                chain_id: checkpoint.domain.chain.chain_id,
+                chain_spec_hash: checkpoint.domain.chain.chain_spec_hash,
+                finalized_chunk_id: None,
+                finalized_chunk_hash: ZERO_HASH,
+                recursive_covered_chunks: boundary.next_chunk_id,
+                checkpoint_hash: checkpoint.hash(),
+                finalized_state_root: boundary.state_root,
+                finalized_block_hash: boundary.block_hash,
+                finalized_height: boundary.height,
+                head_height: boundary.height,
+                head_block_hash: boundary.block_hash,
+                head_slot: boundary.slot,
+                proven_height: 0,
+                body_height: 0,
+            });
+        }
         self.with_engine(|engine| {
             let (status, checkpoint) = Self::p2p_status_snapshot(engine)?;
             Ok(LocalProgress {
@@ -194,11 +271,11 @@ where
                 chain_spec_hash: status.chain_spec_hash,
                 finalized_chunk_id: status.finalized_chunk_id,
                 finalized_chunk_hash: status.finalized_chunk_hash,
-                finalized_checkpoint_index: status.finalized_checkpoint_index,
-                finalized_checkpoint_hash: status.finalized_checkpoint_hash,
-                finalized_state_root: checkpoint.end_state_root,
-                finalized_block_hash: checkpoint.end_block_hash,
-                finalized_height: checkpoint.end_height,
+                recursive_covered_chunks: status.recursive_covered_chunks,
+                checkpoint_hash: status.checkpoint_hash,
+                finalized_state_root: checkpoint.state_root,
+                finalized_block_hash: checkpoint.block_hash,
+                finalized_height: checkpoint.height,
                 head_height: status.head_height,
                 head_block_hash: status.head_block_hash,
                 head_slot: status.head_slot,
@@ -287,6 +364,12 @@ where
             let proofs = roots
                 .iter()
                 .map(|hash| {
+                    if let Some(header) =
+                        rpc_queries::checked_header(engine, *hash).map_err(query_error)?
+                    {
+                        rpc_queries::ensure_payload_height(engine, header.height)
+                            .map_err(query_error)?;
+                    }
                     let proof = engine
                         .store()
                         .get_block_proof(hash)
@@ -346,6 +429,7 @@ where
             let proofs = ids
                 .iter()
                 .map(|id| {
+                    Self::ensure_retained_chunk(engine, *id)?;
                     let proof = engine
                         .store()
                         .get_chunk_proof(*id)
@@ -371,40 +455,34 @@ where
         })
     }
 
-    pub(super) fn p2p_recursive_proofs_by_index(
+    pub(super) fn p2p_history_proof_by_range(
         &self,
-        start: CheckpointIndex,
-        count: u64,
-    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError> {
-        self.with_engine(|engine| {
-            let mut items = Vec::new();
-            for offset in 0..count.min(rpc::MAX_RECURSIVE_PROOFS_PER_RESPONSE) {
-                let Some(index) = start.checked_add(offset) else {
-                    break;
-                };
-                let checkpoint = engine
-                    .store()
-                    .get_checkpoint(index)
-                    .map_err(storage_error)?
-                    .ok_or_else(|| missing("checkpoint is unavailable"))?;
-                let proof = engine
-                    .store()
-                    .get_recursive_proof(index)
-                    .map_err(storage_error)?
-                    .ok_or_else(|| missing("recursive proof is unavailable"))?;
-                if checkpoint.index != index
-                    || proof.checkpoint_index != index
-                    || proof.public_inputs != checkpoint
-                    || proof.checkpoint_hash != checkpoint.hash()
-                {
-                    return Err(storage_error(
-                        "recursive checkpoint envelope is inconsistent",
-                    ));
-                }
-                items.push((checkpoint, proof));
-            }
-            bounded(RecursiveProofByIndexResponse { items })
-        })
+        start: Hash,
+        end: Hash,
+    ) -> Result<HistoryProofByRangeResponse, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            let proof = self
+                .light_latest_proof()
+                .map_err(storage_error)?
+                .filter(|proof| {
+                    proof.statement.start_checkpoint().hash() == start
+                        && proof.statement.end_checkpoint().hash() == end
+                })
+                .ok_or_else(|| {
+                    SyncBackendError::NotAvailable("history range not retained".into())
+                })?;
+            return Ok(HistoryProofByRangeResponse { proof });
+        }
+        let proof = self
+            .with_engine(|engine| rpc_queries::read_history_proof(engine, start, end))
+            .map_err(query_error)?;
+        if let Some(proof) = proof {
+            return bounded(HistoryProofByRangeResponse { proof });
+        }
+        self.request_history(start, end).map_err(query_error)?;
+        Err(missing(
+            "history range is queued; await its completion announcement",
+        ))
     }
 
     pub(super) fn p2p_finality_certs_by_chunk(
@@ -416,6 +494,7 @@ where
             let certs = ids
                 .iter()
                 .map(|id| {
+                    Self::ensure_retained_chunk(engine, *id)?;
                     let cert = engine
                         .store()
                         .get_finality_cert(*id)
@@ -447,6 +526,12 @@ where
             let witnesses = hashes
                 .iter()
                 .map(|hash| {
+                    if let Some(header) =
+                        rpc_queries::checked_header(engine, *hash).map_err(query_error)?
+                    {
+                        rpc_queries::ensure_payload_height(engine, header.height)
+                            .map_err(query_error)?;
+                    }
                     engine
                         .store()
                         .get_witness(hash)

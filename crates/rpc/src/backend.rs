@@ -72,6 +72,21 @@ pub struct RuntimeCallResponse {
     pub gas_used: u64,
 }
 
+/// Actual persisted history availability, separate from the requested retention policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryRetention {
+    /// This provider retains complete history from genesis under archive policy.
+    pub archive: bool,
+    /// Earliest complete chunk payload; `None` for verifier-only nodes.
+    pub retained_from_chunk: Option<ChunkId>,
+    /// Earliest complete block payload; `None` for verifier-only nodes.
+    pub retained_from_height: Option<Height>,
+    /// Complete chunks finalized by consensus.
+    pub finalized_chunks: u64,
+    /// Authenticated endpoint coverage; full nodes publish a persisted genesis prefix.
+    pub recursive_covered_chunks: u64,
+}
+
 /// Failure to resolve or read an authenticated RPC view.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum QueryError {
@@ -84,6 +99,19 @@ pub enum QueryError {
     /// The header is retained but the corresponding block body is unavailable.
     #[error("body for the requested block is not available locally")]
     BodyUnavailable,
+    /// The requested proof range or endpoint is unknown or no longer retained.
+    #[error("requested history range or endpoint is not retained locally")]
+    HistoryUnavailable,
+    /// The requested historical payload was deliberately pruned.
+    #[error(
+        "requested data was pruned; retained chunks start at {retained_from_chunk}, blocks at {retained_from_height}"
+    )]
+    Pruned {
+        /// Actual persisted chunk retention watermark.
+        retained_from_chunk: ChunkId,
+        /// Earliest complete retained block payload.
+        retained_from_height: Height,
+    },
     /// Local storage failed or contained inconsistent content-addressed data.
     #[error("RPC storage read failed: {0}")]
     Storage(String),
@@ -131,6 +159,42 @@ pub enum SubmitError {
 /// duration of the call.
 #[async_trait]
 pub trait RpcBackend: Send + Sync + 'static {
+    /// Report actual durable retention boundaries without changing client trust.
+    async fn history_retention(&self) -> Result<HistoryRetention, QueryError> {
+        Ok(HistoryRetention::default())
+    }
+    /// Latest available complete genesis-prefix proof, encoded with canonical Borsh.
+    async fn history_latest(&self) -> Result<Vec<u8>, QueryError> {
+        Err(QueryError::StateUnavailable)
+    }
+
+    /// Queue a bounded, endpoint-pinned request or return its existing status.
+    async fn history_request(
+        &self,
+        _start: Hash,
+        _end: Hash,
+    ) -> Result<crate::HistoryJobInfo, QueryError> {
+        Err(QueryError::StateUnavailable)
+    }
+
+    /// Read the persisted status of a known job.
+    async fn history_job(&self, _id: Hash) -> Result<crate::HistoryJobInfo, QueryError> {
+        Err(QueryError::StateUnavailable)
+    }
+
+    /// Atomically observe current state and subscribe to future transitions.
+    async fn history_subscribe(
+        &self,
+        _id: Hash,
+    ) -> Result<tokio::sync::watch::Receiver<crate::HistoryJobInfo>, QueryError> {
+        Err(QueryError::StateUnavailable)
+    }
+
+    /// Read a verified cached proof of the exact requested range.
+    async fn history_proof(&self, _start: Hash, _end: Hash) -> Result<Vec<u8>, QueryError> {
+        Err(QueryError::StateUnavailable)
+    }
+
     /// Chain id this node participates in.
     fn chain_id(&self) -> ChainId;
 

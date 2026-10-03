@@ -22,7 +22,6 @@ impl NativeChunkTestSystem {
 impl ProofSystem for NativeChunkTestSystem {
     type BlockProof = <Inner as ProofSystem>::BlockProof;
     type ChunkProof = ConsensusStatement;
-    type RecursiveProof = <Inner as ProofSystem>::RecursiveProof;
 
     fn prove_block(
         &self,
@@ -83,9 +82,7 @@ impl ProofSystem for NativeChunkTestSystem {
         proof: &Self::ChunkProof,
         expected: &ConsensusStatement,
     ) -> Result<(), ProofError> {
-        if proof != expected
-            || self.consensus_block_key() != Some(expected.execution.block_guest_vk_digest)
-        {
+        if proof != expected || self.consensus_block_key() != Some(expected.programs.block) {
             return Err(ProofError::PublicInputMismatch);
         }
         Ok(())

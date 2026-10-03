@@ -5,8 +5,7 @@ use std::net::SocketAddr;
 
 /// Self-declared role for the node.
 ///
-/// This currently only feeds the FSM's [`SyncMode`](neutrino_sync::SyncMode)
-/// and a future role-flag bitmap advertised in the metadata RPC.
+/// Selects full execution or proof-only synchronization and storage.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NodeRole {
@@ -22,6 +21,17 @@ pub enum NodeRole {
 }
 
 impl NodeRole {
+    /// Archive nodes keep source history; full nodes retain the protocol window.
+    #[must_use]
+    pub const fn retention_policy(self) -> neutrino_consensus_engine::RetentionPolicy {
+        match self {
+            Self::Archive => neutrino_consensus_engine::RetentionPolicy::Archive,
+            Self::Validator | Self::Full | Self::LightClient => {
+                neutrino_consensus_engine::RetentionPolicy::Pruned
+            }
+        }
+    }
+
     /// Map the role to the FSM sync mode.
     #[must_use]
     pub const fn sync_mode(self) -> neutrino_sync::SyncMode {
@@ -42,9 +52,12 @@ pub struct NodeConfig {
     pub role: NodeRole,
     /// Chain id this node participates in.
     pub chain_id: u64,
-    /// Local CPU/memory budget for concurrent block proofs.
+    /// Proving backend, global concurrency and bounded block queue capacity.
     #[serde(default)]
     pub proving: ProvingConfig,
+    /// Explicit local trust anchor and time policy for proof-only operation.
+    #[serde(default)]
+    pub light_client: LightClientConfig,
     /// Bind addresses (multiaddr) the libp2p listener attaches to.
     ///
     /// Defaults to `/ip4/0.0.0.0/tcp/0` if empty.
@@ -78,6 +91,30 @@ pub struct NodeConfig {
     /// but external observers have no read API.
     #[serde(default)]
     pub rpc: Option<RpcConfigToml>,
+}
+
+/// Local weak-subjectivity trust configuration. Peers cannot supply this anchor.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LightClientConfig {
+    /// Local file containing a Borsh-encoded trusted `Checkpoint`.
+    /// When omitted, the chain specification's genesis is the anchor.
+    pub trusted_checkpoint_path: Option<std::path::PathBuf>,
+    /// Unix time at which the explicit checkpoint was independently trusted.
+    /// Must accompany `trusted_checkpoint_path`; genesis uses `genesis_time`.
+    pub trusted_at: Option<u64>,
+    /// Maximum tolerated future endpoint timestamp, in seconds.
+    pub max_future_drift_secs: u64,
+}
+
+impl Default for LightClientConfig {
+    fn default() -> Self {
+        Self {
+            trusted_checkpoint_path: None,
+            trusted_at: None,
+            max_future_drift_secs: 30,
+        }
+    }
 }
 
 /// TOML-deserialisable mirror of [`neutrino_rpc::RpcConfig`].
@@ -189,13 +226,101 @@ max_connections = 64
         let cfg: NodeConfig = toml::from_str("chain_id = 1\n").expect("parse minimal config");
         assert!(cfg.rpc.is_none());
     }
+
+    #[test]
+    fn proving_defaults_to_cpu_and_parses_explicit_cuda_device() {
+        let cfg: NodeConfig = toml::from_str("chain_id = 1").unwrap();
+        assert_eq!(cfg.proving.backend, ProvingBackend::Cpu);
+        assert_eq!(cfg.proving.cuda_device, None);
+        assert_eq!(cfg.proving.concurrency, 2);
+        assert_eq!(cfg.proving.capacity, 16);
+        assert!(cfg.proving.validate().is_ok());
+        let cfg: NodeConfig = toml::from_str(
+            "chain_id = 1\n[proving]\nbackend = 'cuda'\ncuda_device = 3\nconcurrency = 1",
+        )
+        .unwrap();
+        assert_eq!(cfg.proving.backend, ProvingBackend::Cuda);
+        assert_eq!(cfg.proving.cuda_device, Some(3));
+        assert_eq!(cfg.proving.concurrency, 1);
+        assert_eq!(cfg.proving.capacity, 16);
+    }
+
+    #[test]
+    fn proving_rejects_unknown_backends_fields_and_invalid_budgets() {
+        for options in [
+            "backend = 'mock'",
+            "backend = 'network'",
+            "backned = 'cuda'",
+            "cuda_device = -1",
+        ] {
+            assert!(
+                toml::from_str::<NodeConfig>(&format!("chain_id = 1\n[proving]\n{options}"))
+                    .is_err()
+            );
+        }
+        for options in [
+            "cuda_device = 0",
+            "concurrency = 0",
+            "concurrency = 65",
+            "concurrency = 3\ncapacity = 2",
+            "capacity = 1025",
+        ] {
+            let cfg: NodeConfig =
+                toml::from_str(&format!("chain_id = 1\n[proving]\n{options}")).unwrap();
+            assert!(cfg.proving.validate().is_err(), "accepted {options}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_proving_config_fails_before_network_and_chain_spec_for_every_role() {
+        for role in ["validator", "full", "archive", "light-client"] {
+            let cfg: NodeConfig = toml::from_str(&format!(
+                "chain_id = 1\nrole = '{role}'\n[proving]\ncuda_device = 0"
+            ))
+            .unwrap();
+            assert!(matches!(
+                crate::run(cfg).await,
+                Err(crate::NodeError::ProofSystem(_))
+            ));
+        }
+    }
+
+    #[cfg(not(all(feature = "cuda", target_os = "linux", target_arch = "x86_64")))]
+    #[tokio::test]
+    async fn unsupported_cuda_is_rejected_without_cpu_fallback() {
+        let cfg: NodeConfig = toml::from_str("chain_id = 1\n[proving]\nbackend = 'cuda'").unwrap();
+        let Err(crate::NodeError::ProofSystem(error)) = crate::run(cfg).await else {
+            panic!("unsupported CUDA must fail before any node services start");
+        };
+        let expected = if cfg!(feature = "cuda") {
+            "Linux x86-64"
+        } else {
+            "--features cuda"
+        };
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
-/// Bounds queued and running block jobs; overload pauses local production.
+/// Backend used by every proof stage in this node.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvingBackend {
+    /// Local CPU proving, supported on all host platforms.
+    #[default]
+    Cpu,
+    /// Local NVIDIA CUDA proving on Linux x86-64; requires the `cuda` feature.
+    Cuda,
+}
+
+/// Selects the prover, global concurrency and block queue capacity.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvingConfig {
-    /// Maximum simultaneous blocking block provers.
+    /// Shared backend for fact, evidence, block, chunk and history proofs.
+    pub backend: ProvingBackend,
+    /// CUDA device index (default 0). Invalid with the CPU backend.
+    pub cuda_device: Option<u32>,
+    /// Maximum simultaneous proving calls across all proof stages.
     pub concurrency: usize,
     /// Maximum queued plus running blocks, including restart recovery.
     pub capacity: usize,
@@ -204,6 +329,8 @@ pub struct ProvingConfig {
 impl Default for ProvingConfig {
     fn default() -> Self {
         Self {
+            backend: ProvingBackend::Cpu,
+            cuda_device: None,
             concurrency: 2,
             capacity: 16,
         }
@@ -211,11 +338,27 @@ impl Default for ProvingConfig {
 }
 
 impl ProvingConfig {
-    /// Reject configurations that cannot make progress or exceed the process budget.
-    pub const fn is_valid(self) -> bool {
-        self.concurrency > 0
-            && self.concurrency <= 64
-            && self.capacity >= self.concurrency
-            && self.capacity <= 1024
+    /// Validate budgets and backend support before starting node services.
+    ///
+    /// # Errors
+    /// Rejects invalid budgets, CPU device options and unavailable CUDA builds.
+    pub const fn validate(self) -> Result<(), &'static str> {
+        if self.concurrency == 0
+            || self.concurrency > 64
+            || self.capacity < self.concurrency
+            || self.capacity > 1024
+        {
+            return Err("proving requires 1..=64 workers and workers <= capacity <= 1024");
+        }
+        match self.backend {
+            ProvingBackend::Cpu if self.cuda_device.is_some() => {
+                Err("proving.cuda_device requires backend = cuda")
+            }
+            ProvingBackend::Cpu => Ok(()),
+            ProvingBackend::Cuda if !cfg!(feature = "cuda") => {
+                Err("CUDA requires building neutrino-node with --features cuda")
+            }
+            ProvingBackend::Cuda => neutrino_runtime_host::backend::ensure_cuda_available(),
+        }
     }
 }

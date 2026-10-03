@@ -4,13 +4,15 @@ extern crate alloc;
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
+use neutrino_consensus_types::history::is_recent_history_index;
 use neutrino_consensus_types::{AggregatedVote, ChunkProof, FinalityCert};
 use neutrino_primitives::{ChunkId, Hash};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::{
     body::ConsensusBody,
     consensus::{
-        ConsensusStatement, ConsensusWitness, as_chunk, validate_candidate, validate_consensus,
+        ConsensusStatement, ConsensusWitness, as_chunk, context_boundary, genesis_context,
+        validate_candidate, validate_consensus, validate_consensus_with_context,
     },
     execution::{ExecutionContext, ProvenBlock, commitment},
     history::{HistoricalChunk, HistoryWitness},
@@ -26,8 +28,12 @@ use crate::{BlockState, Engine, FinalizeError, FinalizeOutcome, ProposerKey};
 pub struct ConsensusState {
     /// Last verified complete statement.
     pub statement: ConsensusStatement,
-    /// Openings of the statement's outgoing historical/replay commitments.
-    pub history: HistoryWitness,
+    /// Full context retained for ordinary execution, checked against the compact output.
+    pub next_context: ExecutionContext,
+    /// Randomness for the following chunk.
+    pub next_seed: Hash,
+    /// Bounded append frontier; historical records live in the archive.
+    pub frontier: neutrino_consensus_types::history::HistoryFrontier,
 }
 
 /// Immutable snapshot carried outside the engine lock for expensive proving.
@@ -65,28 +71,16 @@ impl<DB: Database> Engine<DB> {
             .checked_sub(1)
             .and_then(|h| h.checked_div(spec.consensus.chunk_size))
             .ok_or_else(|| alloc::string::String::from("invalid evidence anchor height"))?;
-        let history = if chunk_id == 0 {
-            Vec::new()
-        } else {
-            let state = self
-                .store()
-                .get_consensus_state()
-                .map_err(|_| alloc::string::String::from("history read failed"))?
-                .ok_or_else(|| alloc::string::String::from("missing finalized history"))?;
-            state
-                .history
-                .chunks
-                .get(
-                    ..usize::try_from(chunk_id)
-                        .map_err(|_| alloc::string::String::from("history length"))?,
-                )
-                .ok_or_else(|| alloc::string::String::from("unfinalized evidence anchor"))?
-                .to_vec()
-        };
+        let frontier = self
+            .store()
+            .history_frontier(chunk_id)
+            .map_err(|_| alloc::string::String::from("unavailable historical boundary"))?;
         Ok(neutrino_consensus_types::evidence::EvidenceAnchor {
             chain_spec_hash: spec.hash(),
             chunk_id,
-            history_root: neutrino_prover_chunk::history::history_commitment(&history),
+            history_root: frontier
+                .root()
+                .ok_or_else(|| alloc::string::String::from("invalid historical boundary"))?,
             block_guest_vk_digest,
             evidence_guest_vk_digest,
             fact_guest_vk_digest,
@@ -103,15 +97,13 @@ impl<DB: Database> Engine<DB> {
             self.evidence_programs.ok_or(ProofError::Unsupported)?;
         let id = neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
             .map_err(|_| ProofError::InvalidWitness)?;
-        let state = self
+        if !is_recent_history_index(id, self.finalized_next_chunk_id()) {
+            return Err(ProofError::InvalidWitness.into());
+        }
+        let source = self
             .store()
-            .get_consensus_state()?
+            .historical_chunk(id)?
             .ok_or(ProofError::InvalidWitness)?;
-        let source = state
-            .history
-            .record(id)
-            .map_err(|_| ProofError::InvalidWitness)?
-            .clone();
         Ok(neutrino_prover_chunk::evidence::EvidenceWitness {
             chain_spec: self.chain_spec().clone(),
             source,
@@ -126,23 +118,17 @@ impl<DB: Database> Engine<DB> {
         statement: neutrino_consensus_types::evidence::EvidenceStatement,
     ) -> Result<neutrino_consensus_types::evidence::EvidenceSubmission, FinalizeError<DB::Error>>
     {
-        let state = self
+        let count = self.finalized_next_chunk_id();
+        if !is_recent_history_index(statement.context.chunk_id, count) {
+            return Err(ProofError::InvalidWitness.into());
+        }
+        let opening = self
             .store()
-            .get_consensus_state()?
-            .ok_or(ProofError::InvalidWitness)?;
-        let leaves = state
-            .history
-            .chunks
-            .iter()
-            .map(|r| commitment(&r.evidence_context()))
-            .collect::<Vec<_>>();
-        let index =
-            usize::try_from(statement.context.chunk_id).map_err(|_| ProofError::InvalidWitness)?;
-        if leaves.get(index) != Some(&commitment(&statement.context)) {
+            .historical_opening(statement.context.chunk_id, count)?;
+        if opening.record.evidence_context() != statement.context {
             return Err(ProofError::PublicInputMismatch.into());
         }
-        let history = neutrino_consensus_types::evidence::HistoryOpening::build(&leaves, index)
-            .ok_or(ProofError::InvalidWitness)?;
+        let history = opening.path;
         Ok(neutrino_consensus_types::evidence::EvidenceSubmission { statement, history })
     }
 
@@ -160,6 +146,13 @@ impl<DB: Database> Engine<DB> {
             .checked_sub(1)
             .and_then(|h| h.checked_div(self.chain_spec().consensus.chunk_size))
             .ok_or(ProofError::InvalidWitness)?;
+        if body
+            .finality_votes
+            .iter()
+            .any(|vote| !is_recent_history_index(vote.data.chunk_id, chunk_id))
+        {
+            return Err(ProofError::InvalidWitness.into());
+        }
         let (context, _, _) = self.consensus_boundary(chunk_id)?;
         let boundary_height = chunk_id
             .checked_mul(self.chain_spec().consensus.chunk_size)
@@ -233,19 +226,24 @@ impl<DB: Database> Engine<DB> {
         evidence: &neutrino_consensus_types::SlashingEvidence,
         key: &[u32; 8],
     ) -> Result<(), FinalizeError<DB::Error>> {
-        let next = self
-            .latest_finalized_chunk_id()
-            .map_or(Some(0), |id| id.checked_add(1))
+        let source_id =
+            neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
+                .map_err(|_| ProofError::InvalidWitness)?;
+        if !is_recent_history_index(source_id, self.finalized_next_chunk_id()) {
+            return Err(ProofError::InvalidWitness.into());
+        }
+        let source = self
+            .store()
+            .historical_chunk(source_id)?
             .ok_or(ProofError::InvalidWitness)?;
-        let (_, _, history) = self.consensus_boundary(next)?;
-        let (_, id) = neutrino_prover_chunk::history::authorize_evidence(
+        let (_, id) = neutrino_prover_chunk::history::authorize_evidence_at_record(
             self.chain_spec(),
-            &history,
+            &source,
             evidence,
             key,
         )
         .map_err(|_| ProofError::InvalidWitness)?;
-        if history.penalties.binary_search(&id).is_ok() {
+        if self.store().is_offence_finalized(&id)? {
             return Err(ProofError::InvalidWitness.into());
         }
         Ok(())
@@ -260,20 +258,7 @@ impl<DB: Database> Engine<DB> {
         let spec = self.chain_spec();
         if chunk_id == 0 {
             return Ok((
-                ExecutionContext {
-                    chain_id: spec.chain_id,
-                    chain_spec_hash: spec.hash(),
-                    chunk_id,
-                    chunk_size: spec.consensus.chunk_size,
-                    parent_block_hash: spec.genesis_block_hash,
-                    pre_state_root: spec.genesis_state_root,
-                    parent_slot: 0,
-                    vm_code_hash: spec.runtime_code_hash,
-                    gas_price: spec.runtime.gas_price,
-                    active_validators: spec.initial_validators.clone(),
-                    history_root: neutrino_prover_chunk::history::history_commitment(&[]),
-                    penalty_root: commitment(&Vec::<Hash>::new()),
-                },
+                genesis_context(spec),
                 spec.genesis_seed,
                 HistoryWitness::default(),
             ));
@@ -282,13 +267,21 @@ impl<DB: Database> Engine<DB> {
             .store()
             .get_consensus_state()?
             .ok_or(ProofError::InvalidWitness)?;
-        if previous.statement.next_context.chunk_id != chunk_id {
+        if previous.next_context.chunk_id != chunk_id
+            || context_boundary(&previous.next_context, previous.next_seed)
+                .map_err(|_| ProofError::InvalidWitness)?
+                != previous.statement.end
+            || previous.frontier.root() != Some(previous.statement.end.history_root)
+        {
             return Err(ProofError::PublicInputMismatch.into());
         }
         Ok((
-            previous.statement.next_context,
-            previous.statement.next_seed,
-            previous.history,
+            previous.next_context,
+            previous.next_seed,
+            HistoryWitness {
+                frontier: previous.frontier,
+                records: Vec::new(),
+            },
         ))
     }
 
@@ -310,6 +303,7 @@ impl<DB: Database> Engine<DB> {
         self.prepare_consensus_chunk_on_branch(chunk_id, end_hash, proof_system)
     }
 
+    #[allow(clippy::too_many_lines)] // Snapshot all authenticated inputs before leaving the engine lock.
     pub(crate) fn prepare_consensus_chunk_on_branch<P: ProofSystem>(
         &self,
         chunk_id: ChunkId,
@@ -319,7 +313,7 @@ impl<DB: Database> Engine<DB> {
         let key = proof_system
             .consensus_block_key()
             .ok_or(ProofError::Unsupported)?;
-        let (context, seed, history) = self.consensus_boundary(chunk_id)?;
+        let (context, seed, _) = self.consensus_boundary(chunk_id)?;
         let start = chunk_id
             .checked_mul(context.chunk_size)
             .and_then(|height| height.checked_add(1))
@@ -390,6 +384,12 @@ impl<DB: Database> Engine<DB> {
             aggregation_bits: neutrino_primitives::BitVec::default(),
             signature: [0; 96],
         };
+        let history = self.store().history_witness(
+            chunk_id,
+            bodies
+                .iter()
+                .flat_map(|body| body.finality_votes.iter().map(|vote| vote.data.chunk_id)),
+        )?;
         let witness = ConsensusWitness {
             fact_guest_vk_digest: proof_system.fact_key().ok_or(ProofError::Unsupported)?,
             evidence_guest_vk_digest: proof_system.evidence_key().ok_or(ProofError::Unsupported)?,
@@ -454,7 +454,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<(), FinalizeError<DB::Error>> {
         let candidate =
             validate_candidate(&prepared.witness).map_err(|_| ProofError::InvalidWitness)?;
-        let chunk = as_chunk(&candidate.execution);
+        let chunk = as_chunk(&candidate.execution.chunk);
         prepared.witness.finality_cert =
             self.run_chunk_bft(&chunk, chunk.hash(), voter, chunk.active_validator_set_root)?;
         validate_consensus(&prepared.witness).map_err(|_| ProofError::InvalidWitness)?;
@@ -508,29 +508,45 @@ impl<DB: Database> Engine<DB> {
                 return Err(ProofError::PublicInputMismatch.into());
             }
         }
-        let statement = validate_consensus(witness).map_err(|_| ProofError::InvalidWitness)?;
+        let validated =
+            validate_consensus_with_context(witness).map_err(|_| ProofError::InvalidWitness)?;
+        let statement = validated.statement;
         proof_system.verify_consensus_chunk(proof, &statement)?;
-        let chunk = as_chunk(&statement.execution);
+        let chunk = as_chunk(&statement.chunk);
         let wire = ChunkProof {
             finality_cert: witness.finality_cert.clone(),
             chunk_id: chunk.chunk_id,
             chunk_hash: chunk.hash(),
-            public_inputs: statement.execution.chunk.clone(),
+            public_inputs: statement.chunk.clone(),
             proof_bytes: borsh::to_vec(proof)?,
         };
-        let mut history = witness.history.clone();
-        history.penalties = validate_candidate(witness)
-            .map_err(|_| ProofError::InvalidWitness)?
-            .penalties;
-        history.chunks.push(HistoricalChunk {
+        let record = HistoricalChunk {
             chunk: chunk.clone(),
             validators: context.active_validators,
             seed,
             finality: witness.finality_cert.clone(),
-        });
-        let state = ConsensusState { statement, history };
-        let batch =
-            crate::store::ChainStore::<DB>::consensus_finalization_batch(witness, &wire, &state)?;
+        };
+        let mut frontier = witness.history.frontier.clone();
+        let history_root = frontier
+            .append(commitment(&record.evidence_context()))
+            .ok_or(ProofError::InvalidWitness)?;
+        if history_root != statement.end.history_root
+            || context_boundary(&validated.next_context, statement.end.seed)
+                .map_err(|_| ProofError::InvalidWitness)?
+                != statement.end
+        {
+            return Err(ProofError::PublicInputMismatch.into());
+        }
+        let next_seed = statement.end.seed;
+        let state = ConsensusState {
+            statement,
+            next_context: validated.next_context,
+            next_seed,
+            frontier,
+        };
+        let batch = self
+            .store()
+            .consensus_finalization_batch(witness, &wire, &state)?;
         if self.store().get_block_hash_by_height(chunk.end_height)? == Some(chunk.end_block_hash) {
             self.store_mut()
                 .db_mut()
@@ -561,7 +577,7 @@ impl<DB: Database> Engine<DB> {
             chunk_hash: chunk.hash(),
             chunk,
             chunk_proof: wire,
-            public_inputs: state.statement.execution.chunk,
+            public_inputs: state.statement.chunk,
             finality_cert: witness.finality_cert.clone(),
         })
     }

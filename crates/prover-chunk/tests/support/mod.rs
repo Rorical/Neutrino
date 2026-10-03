@@ -6,7 +6,7 @@ use neutrino_consensus_types::{
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::{StfInput, apply_block};
 use neutrino_primitives::{
-    BitVec, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE,
+    BitVec, BoundedBytes, ChainSpec, ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE,
     DOMAIN_PROPOSER_SIG, Hash, LightClientParams, ProofParams, RuntimeInfo, RuntimeParams,
     StateParams, Validator, fixed_u128_from_integer, merkle_root_of_hashes,
 };
@@ -67,18 +67,6 @@ pub fn fixture_with_live(
         last_active_chunk: 0,
     }];
     let root = commitment(&validators);
-    let checkpoint = Checkpoint {
-        chain_id: 7,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: [0; 32],
-        end_block_hash: [2; 32],
-        start_state_root: [0; 32],
-        end_state_root: live.trie().root(),
-        end_validator_set_root: root,
-        history_root: [0; 32],
-    };
     let spec = ChainSpec {
         name: BoundedBytes::new(b"consensus-test".to_vec()).unwrap(),
         chain_id: 7,
@@ -90,7 +78,6 @@ pub fn fixture_with_live(
         genesis_state_root: live.trie().root(),
         genesis_block_hash: [2; 32],
         genesis_validator_set_root: root,
-        genesis_checkpoint: checkpoint,
         consensus: ConsensusParams {
             chunk_size: 1,
             expected_proposers_per_slot: fixed_u128_from_integer(2),
@@ -190,7 +177,6 @@ pub fn fixture_with_live(
         gas_price: pi.gas_price,
         active_validators: validators.clone(),
         history_root: neutrino_prover_chunk::history::history_commitment(&[]),
-        penalty_root: commitment(&Vec::<u8>::new()),
     };
     let blocks = vec![ProvenBlock {
         header,
@@ -208,7 +194,7 @@ pub fn fixture_with_live(
         )
         .unwrap(),
     );
-    let chunk = as_chunk(&statement);
+    let chunk = as_chunk(&statement.chunk);
     let aggregate = |phase| {
         let data = FinalityVoteData {
             chunk_id: 0,

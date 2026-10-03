@@ -147,6 +147,8 @@ impl EvidenceVerifier for bls::DirectVerifier {
     }
 }
 
+// The feature-disabled stub is constant; the real receipt verifier is not.
+#[cfg_attr(not(feature = "sp1-verification"), allow(clippy::missing_const_for_fn))]
 fn block_is_valid(proof: &BlockProof, key: &[u32; 8]) -> Result<bool, HistoryError> {
     #[cfg(feature = "sp1-verification")]
     {

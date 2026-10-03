@@ -10,12 +10,14 @@
 | `runtimes/neutrino-default/master` | WASM exports and native parity adapter |
 | `runtimes/neutrino-default/guest` | SP1 block Guest |
 | `runtimes/neutrino-default/chunk-guest` | SP1 consensus chunk and evidence binaries |
+| `runtimes/neutrino-default/checkpoint-guest` | SP1 History Fold/Merge Guest |
 | `runtime-host` | Embedded artifacts, wasmtime execution and SP1 proving/verification |
 | `proof-system` | Backend/executor traits and block-only test mock |
 | `prover-chunk` | Shared consensus, evidence statements and exact signed-proof rejection |
-| `prover-checkpoint` | Deferred scaffold |
+| `prover-checkpoint` | no_std compact-boundary and Fold/Merge validation |
+| `light-client` | Explicit anchor, extension and freshness policy with durable snapshots |
 | `network`, `sync`, `mempool`, `rpc`, `node`, `cli` | Transport, full sync, admission, query and node/operator interfaces |
 
 Guest packages are outside the root workspace. `runtime-host/build.rs` builds
-three SP1 ELFs with the succinct toolchain and the master WASM with the pinned
+five SP1 ELFs with the succinct toolchain and the master WASM with the pinned
 host toolchain. See [runtime](03-execution-runtime.md) and [ABI](04-host-abi.md).

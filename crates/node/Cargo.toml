@@ -13,6 +13,7 @@ publish       = { workspace = true }
 [features]
 default = ["std"]
 std = []
+cuda = ["neutrino-runtime-host/cuda"]
 
 [lints]
 workspace = true
@@ -30,6 +31,7 @@ neutrino-consensus-types.workspace  = true
 neutrino-crypto.workspace           = true
 neutrino-default-runtime-core.workspace = true
 neutrino-mempool.workspace        = true
+neutrino-light-client.workspace   = true
 neutrino-network.workspace        = true
 neutrino-primitives.workspace     = true
 neutrino-proof-system.workspace   = true

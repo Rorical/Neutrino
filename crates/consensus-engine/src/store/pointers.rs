@@ -11,7 +11,7 @@ pub const FINALIZED_HEAD: &[u8] = b"finalized_head";
 pub const LATEST_FINALIZED_CHUNK_ID: &[u8] = b"latest_chunk_id";
 
 /// Highest checkpoint index (genesis is 0).
-pub const LATEST_CHECKPOINT_INDEX: &[u8] = b"latest_ckpt_index";
+pub const RECURSIVE_COVERED_CHUNKS: &[u8] = b"recursive_covered_chunks";
 
 /// Current VRF seed folded over the latest finalized chunk.
 ///

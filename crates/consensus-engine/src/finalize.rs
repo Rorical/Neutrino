@@ -391,12 +391,7 @@ impl<DB: Database> Engine<DB> {
         let start_block_hash = *block_hashes.first().expect("non-empty block hashes");
         let end_block_hash = *block_hashes.last().expect("non-empty block hashes");
 
-        let previous_index = self.latest_checkpoint_index();
-        let previous = self
-            .store()
-            .get_checkpoint(previous_index)?
-            .ok_or_else(|| FinalizeError::Engine(EngineError::NotInitialised))?;
-        let active_validator_set_root = previous.end_validator_set_root;
+        let active_validator_set_root = crate::validator_set_root(self.active_validator_set());
         let next_validator_set_root = if last_header.runtime_extra == ZERO_HASH {
             active_validator_set_root
         } else {

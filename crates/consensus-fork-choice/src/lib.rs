@@ -234,6 +234,27 @@ impl ForkChoice {
         Ok(())
     }
 
+    /// Remove finalized ancestors and detached forks while preserving descendant votes and boost.
+    pub fn retain_finalized_subtree(&mut self) {
+        let retained: alloc::collections::BTreeSet<_> = self
+            .blocks
+            .keys()
+            .copied()
+            .filter(|hash| *hash != self.finalized && self.block_extends(*hash, self.finalized))
+            .collect();
+        self.blocks.retain(|hash, _| retained.contains(hash));
+        self.chunks
+            .retain(|_, chunk| retained.contains(&chunk.end_block_hash));
+        self.votes
+            .retain(|_, vote| self.chunks.contains_key(&vote.data.chunk_hash));
+        if self
+            .proposer_boost
+            .is_some_and(|boost| !retained.contains(&boost.block_hash))
+        {
+            self.proposer_boost = None;
+        }
+    }
+
     /// Number of distinct validators with at least one recorded
     /// vote in this fork-choice instance. Diagnostic helper used
     /// by integration tests / operator probes to verify that the
@@ -566,5 +587,33 @@ mod tests {
             fork_choice.on_block_proof(hash(88), ProofStatus::Proven),
             Err(ForkChoiceError::UnknownBlock(hash(88)))
         );
+    }
+    #[test]
+    fn pruning_preserves_live_descendant_votes_and_boost() {
+        let mut tree = ForkChoice::default();
+        let first = tree.add_block(&header(ZERO_HASH, 1, 1)).unwrap();
+        let detached = tree.add_block(&header(ZERO_HASH, 1, 2)).unwrap();
+        let live = tree.add_block(&header(first, 2, 1)).unwrap();
+        let retired_chunk = chunk(detached, 1);
+        let live_chunk = chunk(live, 2);
+        tree.add_chunk(&retired_chunk);
+        tree.add_chunk(&live_chunk);
+        tree.add_vote(0, vote(&retired_chunk, 10));
+        tree.add_vote(1, vote(&live_chunk, 30));
+        tree.set_proposer_boost(live, 100, DEFAULT_PROPOSER_BOOST_FRACTION)
+            .unwrap();
+        let finalized = chunk(first, 0);
+        tree.add_finalized_chunk(&finalized, &cert(&finalized))
+            .unwrap();
+        let before = tree.head();
+        tree.retain_finalized_subtree();
+        assert_eq!(tree.head(), before);
+        assert!(tree.block(&first).is_none());
+        assert!(tree.block(&detached).is_none());
+        assert!(tree.block(&live).is_some());
+        assert_eq!(tree.vote_count(), 1);
+        assert_eq!(tree.proposer_boost.unwrap().block_hash, live);
+        tree.retain_finalized_subtree();
+        assert_eq!(tree.head(), live);
     }
 }

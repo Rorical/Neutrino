@@ -252,8 +252,9 @@ pub(crate) mod tests {
     use super::*;
     use alloc::vec;
     use neutrino_consensus_types::evidence::{
-        EvidenceContext, EvidenceStatement, EvidenceSubmission, HistoryOpening, history_root,
+        EvidenceContext, EvidenceStatement, EvidenceSubmission,
     };
+    use neutrino_consensus_types::history::{HistoryPath, history_root};
     use neutrino_runtime_core::{
         WitnessState,
         host::{LiveTrie, TracingState},
@@ -298,7 +299,7 @@ pub(crate) mod tests {
                 offence_id: [id; 32],
                 facts_commitment: [id; 32],
             },
-            history: HistoryOpening::build(&leaves, 0).unwrap(),
+            history: HistoryPath::build(&leaves, 0).unwrap(),
         })
     }
 

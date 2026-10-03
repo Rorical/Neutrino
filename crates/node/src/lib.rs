@@ -27,3 +27,4 @@ pub use db::{NodeDb, NodeDbError};
 pub use runner::{NodeError, run};
 
 mod proof_queue;
+mod proving_budget;

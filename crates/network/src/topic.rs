@@ -29,7 +29,7 @@ pub enum Topic {
     BlockProofs,
     /// `/neutrino/chunk_proofs/borsh`: aggregated chunk proofs.
     ChunkProofs,
-    /// `/neutrino/checkpoints/borsh`: recursive checkpoint proofs.
+    /// `/neutrino/checkpoints/borsh`: compact authenticated-endpoint availability notices.
     Checkpoints,
     /// `/neutrino/prover_bounty/borsh`: missed-deadline bounty announcements.
     ProverBounty,
@@ -85,7 +85,7 @@ impl Topic {
             | Self::FinalityVotesPrevote
             | Self::FinalityVotesPrecommit
             | Self::AggregateFinalityVotes(_) => 8 * 1024 * 1024,
-            Self::Checkpoints => 64 * 1024,
+            Self::Checkpoints => 1024,
             Self::ProverBounty => 4 * 1024,
             Self::Transactions => 128 * 1024,
         }
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(Topic::Blocks.max_transmit_size(), 8 * 1024 * 1024);
         assert_eq!(Topic::BlockProofs.max_transmit_size(), 2 * 1024 * 1024);
         assert_eq!(Topic::ChunkProofs.max_transmit_size(), 8 * 1024 * 1024);
-        assert_eq!(Topic::Checkpoints.max_transmit_size(), 64 * 1024);
+        assert_eq!(Topic::Checkpoints.max_transmit_size(), 1024);
         assert_eq!(
             Topic::FinalityVotesPrevote.max_transmit_size(),
             8 * 1024 * 1024

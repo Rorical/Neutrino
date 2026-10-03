@@ -16,6 +16,9 @@ flowchart LR
     B --> C[Chunk Guest: BFT, VRF, boundaries and rotation]
     C --> F[Finalized consensus context]
     F --> W
+    C --> HG[History Guest: Fold and Merge]
+    HG --> HP[Verified and persisted history prefix]
+    HP --> PR[Full/validator: prune covered sources outside eight-chunk window]
 ```
 
 EvidenceProof establishes an offence. Block execution recursively verifies the evidence statement,
@@ -24,8 +27,9 @@ mandatory queue. Chunk aggregation consumes block-proven effects and verifies
 consensus; it does not re-execute transactions or evidence facts.
 
 The verifier trusts the chain specification, program identities and initial
-consensus context. Checkpoint recursion and a proof-only light client remain
-unimplemented. Development upgrades are incompatible: no old proof, transaction
+consensus context. Recursive Compressed STARK history proofs connect authenticated
+boundaries and support proof-only light clients and proof-backed history pruning.
+Development upgrades are incompatible: no old proof, transaction
 or database migration path is maintained.
 
 Read [architecture](01-architecture.md), [runtime](03-execution-runtime.md),

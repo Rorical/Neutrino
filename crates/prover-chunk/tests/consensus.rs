@@ -6,8 +6,15 @@ use neutrino_prover_chunk::consensus::{ConsensusError, validate_consensus};
 fn composes_executed_block_proposer_rotation_and_both_finality_phases() {
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let statement = validate_consensus(&input).unwrap();
-    assert_eq!(statement.execution.chunk.chunk_id, 0);
-    assert_ne!(statement.next_seed, statement.seed);
+    assert_eq!(statement.chunk.chunk_id, 0);
+    assert_ne!(statement.end.seed, statement.start.seed);
+    let full = neutrino_prover_chunk::consensus::validate_consensus_with_context(&input).unwrap();
+    assert_eq!(full.statement, statement);
+    assert_eq!(
+        neutrino_prover_chunk::consensus::context_boundary(&full.next_context, statement.end.seed)
+            .unwrap(),
+        statement.end
+    );
     let mut corrupt = input.clone();
     corrupt.finality_cert.precommit.signature[0] ^= 1;
     assert_eq!(validate_consensus(&corrupt), Err(ConsensusError::Finality));
@@ -35,17 +42,25 @@ fn successor(
         consensus::{as_chunk, validate_candidate},
         history::HistoricalChunk,
     };
-    let previous = validate_consensus(first).unwrap();
+    let validated =
+        neutrino_prover_chunk::consensus::validate_consensus_with_context(first).unwrap();
+    let previous = validated.statement;
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     let mut next = first.clone();
-    next.context = previous.next_context.clone();
-    next.seed = previous.next_seed;
-    next.history.chunks.push(HistoricalChunk {
-        chunk: as_chunk(&previous.execution),
+    next.context = validated.next_context;
+    next.seed = previous.end.seed;
+    let historical = HistoricalChunk {
+        chunk: as_chunk(&previous.chunk),
         validators: first.context.active_validators.clone(),
         seed: first.seed,
         finality: first.finality_cert.clone(),
-    });
+    };
+    next.history
+        .frontier
+        .append(neutrino_prover_chunk::execution::commitment(
+            &historical.evidence_context(),
+        ))
+        .unwrap();
     let block = &mut next.blocks[0];
     block.header.height = 2;
     block.header.slot = 2;
@@ -64,7 +79,7 @@ fn successor(
     block.output.block_height = 2;
     block.output.accountability.anchor.chunk_id = next.context.chunk_id;
     block.output.accountability.anchor.history_root = next.context.history_root;
-    let chunk = as_chunk(&validate_candidate(&next).unwrap().execution);
+    let chunk = as_chunk(&validate_candidate(&next).unwrap().execution.chunk);
     next.finality_cert.chunk_id = 1;
     next.finality_cert.chunk_hash = chunk.hash();
     next.finality_cert.active_validator_set_root = chunk.active_validator_set_root;
@@ -107,8 +122,8 @@ fn successor_requires_exact_previous_consensus_boundary() {
     let previous = validate_consensus(&first).unwrap();
     let next = successor(&first);
     let statement = validate_successor(&previous, &next).unwrap();
-    assert_eq!(statement.execution.chunk.chunk_id, 1);
-    assert_eq!(statement.execution.chunk.start_height, 2);
+    assert_eq!(statement.chunk.chunk_id, 1);
+    assert_eq!(statement.chunk.start_height, 2);
     let mutations: &[Mutation] = &[
         |w| w.context.parent_block_hash[0] ^= 1,
         |w| w.context.pre_state_root[0] ^= 1,
@@ -117,9 +132,10 @@ fn successor_requires_exact_previous_consensus_boundary() {
         |w| w.context.parent_slot += 1,
         |w| w.context.active_validators[0].effective_stake += 1,
         |w| w.context.history_root[0] ^= 1,
-        |w| w.context.penalty_root[0] ^= 1,
         |w| w.seed[0] ^= 1,
         |w| w.block_guest_vk_digest[0] ^= 1,
+        |w| w.fact_guest_vk_digest[0] ^= 1,
+        |w| w.evidence_guest_vk_digest[0] ^= 1,
     ];
     for mutate in mutations {
         let mut wrong = next.clone();
@@ -130,7 +146,7 @@ fn successor_requires_exact_previous_consensus_boundary() {
         );
     }
     let mut wrong = next;
-    wrong.history.chunks.clear();
+    wrong.history.frontier = neutrino_consensus_types::history::HistoryFrontier::empty();
     assert!(validate_successor(&previous, &wrong).is_err());
 }
 

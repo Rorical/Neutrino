@@ -12,8 +12,7 @@
 //!   cross-round precommit pair when a locally-observed lock
 //!   prevote quorum exists, pending-fix #6)
 //! - [`SlashingEvidence::LongRangeForkParticipation`] (verified
-//!   against the local canonical chunk / checkpoint, pending-fix
-//!   #6)
+//!   against the authenticated canonical historical chunk)
 //!
 //! Signed DA bundle fraud is verified by the shared portable consensus helper.
 //!
@@ -32,8 +31,8 @@
 //! * **Verification** re-runs the cryptographic checks every
 //!   accepting node must independently apply to gossiped evidence.
 //!   `LongRangeForkParticipation` also consults the engine's
-//!   chain store to confirm the carried checkpoint matches the
-//!   local canonical view at the same chunk-id.
+//!   chain store to authenticate the canonical vote against the retained
+//!   chunk and historical validator set.
 //!
 //! ## Objective lock evidence
 //!
@@ -137,6 +136,18 @@ impl SlashingMonitor {
             high_water_chunk: 0,
             retention_window,
         }
+    }
+
+    /// Discard observations whose source chunks are outside retained accountability history.
+    pub(crate) fn retain_history_window(&mut self, first_chunk: u64, first_height: u64) {
+        self.seen_headers
+            .retain(|_, header| header.height >= first_height);
+        self.seen_votes
+            .retain(|(_, chunk, _, _), _| *chunk >= first_chunk);
+        self.observed_prevote_quorums
+            .retain(|(chunk, _, _), _| *chunk >= first_chunk);
+        self.attestations
+            .retain(|(_, chunk, _, _), _| *chunk >= first_chunk);
     }
 
     /// Number of header entries currently retained. Exposed for
@@ -572,15 +583,13 @@ pub enum SlashingError {
     /// The carried `VrfRejectionReason` does not match what
     /// re-running the verifier locally produces.
     VrfReasonInconsistent,
-    /// The evidence references a checkpoint or chunk the local
+    /// The evidence references a historical chunk the local
     /// node has not finalized yet, so verification cannot complete.
     /// The evidence may still be valid; the caller should drop it
     /// for now and re-ingest once the relevant chunk lands. Used by
     /// `LongRangeForkParticipation` evidence whose `chunk_id` has
     /// not been finalised locally.
     NotYetFinalizedLocally,
-    /// Evidence variant is not yet supported by the engine.
-    UnsupportedVariant,
 }
 
 impl fmt::Display for SlashingError {
@@ -609,11 +618,8 @@ impl fmt::Display for SlashingError {
                 "InvalidVrfClaim evidence: carried rejection reason does not match local verification",
             ),
             Self::NotYetFinalizedLocally => f.write_str(
-                "slashing evidence references a checkpoint or chunk the local node has not finalized yet",
+                "slashing evidence references a chunk the local node has not finalized yet",
             ),
-            Self::UnsupportedVariant => {
-                f.write_str("slashing evidence variant is not yet supported by the engine")
-            }
         }
     }
 }
@@ -703,72 +709,31 @@ const fn map_evidence_error(
     }
 }
 
-/// Verify a [`SlashingEvidence::LongRangeForkParticipation`].
+/// Verify contradictory signed votes against an authenticated historical chunk.
 ///
-/// The variant catches a validator signing a finality vote on a
-/// chunk whose hash conflicts with the canonically finalised chunk
-/// at the same `chunk_id`. Because the chunk_id is finalised on
-/// the local chain, the validator's vote necessarily references a
-/// divergent branch — the "long-range fork" the doc names.
-///
-/// Verification:
-///
-/// 1. `vote.data.chunk_id == carried_checkpoint.index` — the
-///    carried checkpoint must point at the same chunk-id the
-///    offender's vote covers.
-/// 2. `local_checkpoint.is_some() && local_chunk.is_some()` — the
-///    local chain has finalised the chunk. Without a local
-///    finalised view the verifier cannot confirm divergence and
-///    returns [`SlashingError::NotYetFinalizedLocally`].
-/// 3. `*local_checkpoint == *carried_checkpoint` — the carried
-///    checkpoint matches the local canonical view. A mismatch
-///    means either the offender is on a different fork than this
-///    verifier or the carried evidence is forged; either way the
-///    verifier returns
-///    [`SlashingError::EvidenceFieldsInconsistent`].
-/// 4. `vote.data.chunk_hash != local_chunk.hash()` — the
-///    validator's vote references a different chunk than the
-///    canonical one. If the hashes match the validator voted
-///    correctly and there is nothing to slash; returns
-///    [`SlashingError::NotEquivocating`].
-/// 5. The per-validator BLS signature on the vote verifies
-///    against the offender's public key in the active set.
-///
-/// The local checkpoint + chunk are passed as parameters (rather
-/// than looked up by this function) so the verifier stays
-/// no_std-friendly and unit-testable without an engine. The
-/// engine wrapper in `Engine::verify_slashing_evidence` does the
-/// store lookups and forwards the results.
-///
-/// # Errors
-///
-/// Returns the matching [`SlashingError`] variant on any failed
-/// check.
+/// Membership is the set active at that historical chunk, not today's validators.
+/// A canonical vote from the accused is required; mere fork participation cannot
+/// authorize a second penalty distinct from the underlying double-vote offence.
 pub fn verify_long_range_fork_participation_evidence(
     validator_index: ValidatorIndex,
     vote: &IndexedVote,
-    carried_checkpoint: &neutrino_primitives::Checkpoint,
-    local_checkpoint: Option<&neutrino_primitives::Checkpoint>,
+    canonical_vote: &IndexedVote,
     local_chunk: Option<&neutrino_consensus_types::Chunk>,
-    active_set: &[Validator],
+    historical_set: &[Validator],
     chain_id: ChainId,
 ) -> Result<(), SlashingError> {
-    if vote.data.chunk_id != carried_checkpoint.index {
+    let chunk = local_chunk.ok_or(SlashingError::NotYetFinalizedLocally)?;
+    if vote.data.chunk_id != chunk.chunk_id || canonical_vote.data.chunk_hash != chunk.hash() {
         return Err(SlashingError::EvidenceFieldsInconsistent);
     }
-    let Some(local_checkpoint) = local_checkpoint else {
-        return Err(SlashingError::NotYetFinalizedLocally);
-    };
-    let Some(local_chunk) = local_chunk else {
-        return Err(SlashingError::NotYetFinalizedLocally);
-    };
-    if local_checkpoint != carried_checkpoint {
-        return Err(SlashingError::EvidenceFieldsInconsistent);
-    }
-    if vote.data.chunk_hash == local_chunk.hash() {
-        return Err(SlashingError::NotEquivocating);
-    }
-    verify_indexed_vote_signature(validator_index, vote, active_set, chain_id)
+    verify_double_vote_evidence(
+        validator_index,
+        vote.data.phase,
+        vote,
+        canonical_vote,
+        historical_set,
+        chain_id,
+    )
 }
 
 /// Verify a [`SlashingEvidence::DoublePrevote`] or
@@ -1741,21 +1706,6 @@ mod tests {
     // Pending-fix #6 — LongRangeForkParticipation verification
     // -----------------------------------------------------------
 
-    fn dummy_checkpoint(index: u64, end_block_hash_byte: u8) -> neutrino_primitives::Checkpoint {
-        neutrino_primitives::Checkpoint {
-            chain_id: CHAIN_ID,
-            index,
-            start_height: index.saturating_mul(10),
-            end_height: index.saturating_mul(10).saturating_add(9),
-            start_block_hash: [0; 32],
-            end_block_hash: [end_block_hash_byte; 32],
-            start_state_root: [0; 32],
-            end_state_root: [0; 32],
-            end_validator_set_root: [0; 32],
-            history_root: [0; 32],
-        }
-    }
-
     fn dummy_chunk(chunk_id: u64, end_block_hash_byte: u8) -> neutrino_consensus_types::Chunk {
         neutrino_consensus_types::Chunk {
             chunk_id,
@@ -1774,201 +1724,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verify_long_range_fork_accepts_genuine_divergence() {
-        let v1 = proposer(1);
-        let active_set = validators_with_keys(2);
-        // Local canonical chunk has hash H; offender voted for H'.
-        let canonical_chunk = dummy_chunk(5, 0xCC);
-        let canonical_hash = canonical_chunk.hash();
-        let checkpoint = dummy_checkpoint(5, 0xCC);
-        // Offender's vote references chunk_hash = byte-tampered.
-        let mut divergent_hash = canonical_hash;
-        divergent_hash[0] ^= 0xFF;
-        let vote = IndexedVote {
-            data: FinalityVoteData {
-                chunk_id: 5,
-                round: 0,
-                chunk_hash: divergent_hash,
-                phase: FinalityVotePhase::Precommit,
-            },
-            signature: v1.sign_finality_vote(
-                CHAIN_ID,
-                &FinalityVoteData {
-                    chunk_id: 5,
-                    round: 0,
-                    chunk_hash: divergent_hash,
-                    phase: FinalityVotePhase::Precommit,
-                },
-            ),
+    fn signed_vote_for_chunk(chunk_id: u64, hash: [u8; 32], key: &ProposerKey) -> IndexedVote {
+        let data = FinalityVoteData {
+            chunk_id,
+            round: 0,
+            chunk_hash: hash,
+            phase: FinalityVotePhase::Precommit,
         };
-        verify_long_range_fork_participation_evidence(
-            1,
-            &vote,
-            &checkpoint,
-            Some(&checkpoint),
-            Some(&canonical_chunk),
-            &active_set,
-            CHAIN_ID,
-        )
-        .expect("divergent vote on a finalised chunk verifies");
+        let signature = key.sign_finality_vote(CHAIN_ID, &data);
+        IndexedVote { data, signature }
     }
 
     #[test]
-    fn verify_long_range_fork_rejects_matching_chunk_hash() {
-        let v1 = proposer(1);
-        let active_set = validators_with_keys(2);
-        let canonical_chunk = dummy_chunk(5, 0xCC);
-        let canonical_hash = canonical_chunk.hash();
-        let checkpoint = dummy_checkpoint(5, 0xCC);
-        // Vote references the SAME chunk_hash as the canonical
-        // chunk — the validator voted correctly; no slashing.
-        let data = FinalityVoteData {
-            chunk_id: 5,
-            round: 0,
-            chunk_hash: canonical_hash,
-            phase: FinalityVotePhase::Precommit,
-        };
-        let vote = IndexedVote {
-            data: data.clone(),
-            signature: v1.sign_finality_vote(CHAIN_ID, &data),
-        };
+    fn long_range_requires_historical_canonical_double_vote() {
+        let key = proposer(1);
+        let validators = validators_with_keys(2);
+        let chunk = dummy_chunk(5, 0xCC);
+        let vote = signed_vote_for_chunk(5, [0xDD; 32], &key);
+        let canonical = signed_vote_for_chunk(5, chunk.hash(), &key);
         assert_eq!(
             verify_long_range_fork_participation_evidence(
                 1,
                 &vote,
-                &checkpoint,
-                Some(&checkpoint),
-                Some(&canonical_chunk),
-                &active_set,
-                CHAIN_ID,
+                &canonical,
+                Some(&chunk),
+                &validators,
+                CHAIN_ID
             ),
-            Err(SlashingError::NotEquivocating)
+            Ok(())
         );
-    }
-
-    #[test]
-    fn verify_long_range_fork_defers_when_local_checkpoint_missing() {
-        let v1 = proposer(1);
-        let active_set = validators_with_keys(2);
-        let checkpoint = dummy_checkpoint(5, 0xCC);
-        let data = FinalityVoteData {
-            chunk_id: 5,
-            round: 0,
-            chunk_hash: [0xDD; 32],
-            phase: FinalityVotePhase::Precommit,
-        };
-        let vote = IndexedVote {
-            data: data.clone(),
-            signature: v1.sign_finality_vote(CHAIN_ID, &data),
-        };
         assert_eq!(
             verify_long_range_fork_participation_evidence(
                 1,
                 &vote,
-                &checkpoint,
-                None, // local checkpoint missing
-                Some(&dummy_chunk(5, 0xCC)),
-                &active_set,
-                CHAIN_ID,
+                &canonical,
+                None,
+                &validators,
+                CHAIN_ID
             ),
             Err(SlashingError::NotYetFinalizedLocally)
         );
-    }
-
-    #[test]
-    fn verify_long_range_fork_rejects_mismatched_checkpoint() {
-        let v1 = proposer(1);
-        let active_set = validators_with_keys(2);
-        let canonical_chunk = dummy_chunk(5, 0xCC);
-        // Carried checkpoint has different end_block_hash than the
-        // local canonical view.
-        let carried = dummy_checkpoint(5, 0xCC);
-        let local = dummy_checkpoint(5, 0xEE);
-        let data = FinalityVoteData {
-            chunk_id: 5,
-            round: 0,
-            chunk_hash: [0xDD; 32],
-            phase: FinalityVotePhase::Precommit,
-        };
-        let vote = IndexedVote {
-            data: data.clone(),
-            signature: v1.sign_finality_vote(CHAIN_ID, &data),
-        };
+        assert_eq!(
+            verify_long_range_fork_participation_evidence(
+                1,
+                &canonical,
+                &canonical,
+                Some(&chunk),
+                &validators,
+                CHAIN_ID
+            ),
+            Err(SlashingError::NotEquivocating)
+        );
+        let wrong_canonical = signed_vote_for_chunk(5, [0xEE; 32], &key);
         assert_eq!(
             verify_long_range_fork_participation_evidence(
                 1,
                 &vote,
-                &carried,
-                Some(&local),
-                Some(&canonical_chunk),
-                &active_set,
-                CHAIN_ID,
+                &wrong_canonical,
+                Some(&chunk),
+                &validators,
+                CHAIN_ID
             ),
             Err(SlashingError::EvidenceFieldsInconsistent)
         );
-    }
-
-    #[test]
-    fn verify_long_range_fork_rejects_mismatched_chunk_id() {
-        let v1 = proposer(1);
-        let active_set = validators_with_keys(2);
-        let canonical_chunk = dummy_chunk(5, 0xCC);
-        let checkpoint = dummy_checkpoint(5, 0xCC);
-        // Vote claims chunk_id=3 but carried checkpoint is for index=5.
-        let data = FinalityVoteData {
-            chunk_id: 3,
-            round: 0,
-            chunk_hash: [0xDD; 32],
-            phase: FinalityVotePhase::Precommit,
-        };
-        let vote = IndexedVote {
-            data: data.clone(),
-            signature: v1.sign_finality_vote(CHAIN_ID, &data),
-        };
+        let wrong_chunk = signed_vote_for_chunk(3, [0xDD; 32], &key);
         assert_eq!(
             verify_long_range_fork_participation_evidence(
                 1,
-                &vote,
-                &checkpoint,
-                Some(&checkpoint),
-                Some(&canonical_chunk),
-                &active_set,
-                CHAIN_ID,
+                &wrong_chunk,
+                &canonical,
+                Some(&chunk),
+                &validators,
+                CHAIN_ID
             ),
             Err(SlashingError::EvidenceFieldsInconsistent)
         );
-    }
-
-    #[test]
-    fn verify_long_range_fork_rejects_bad_signature() {
-        let v1 = proposer(1);
-        let v0 = proposer(0);
-        let active_set = validators_with_keys(2);
-        let canonical_chunk = dummy_chunk(5, 0xCC);
-        let checkpoint = dummy_checkpoint(5, 0xCC);
-        let data = FinalityVoteData {
-            chunk_id: 5,
-            round: 0,
-            chunk_hash: [0xDD; 32],
-            phase: FinalityVotePhase::Precommit,
-        };
-        // Signature claims to be from validator 1 (the verifier's
-        // index argument) but is actually signed by v0.
-        let _ = v1;
-        let vote = IndexedVote {
-            data: data.clone(),
-            signature: v0.sign_finality_vote(CHAIN_ID, &data),
-        };
+        let wrong_signature = signed_vote_for_chunk(5, [0xDD; 32], &proposer(0));
         assert_eq!(
             verify_long_range_fork_participation_evidence(
                 1,
-                &vote,
-                &checkpoint,
-                Some(&checkpoint),
-                Some(&canonical_chunk),
-                &active_set,
-                CHAIN_ID,
+                &wrong_signature,
+                &canonical,
+                Some(&chunk),
+                &validators,
+                CHAIN_ID
             ),
             Err(SlashingError::BadSignature)
         );

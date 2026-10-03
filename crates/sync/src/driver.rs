@@ -14,13 +14,13 @@
 //!
 //! [`NetworkService`]: neutrino_network::service::NetworkService
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
 use neutrino_network::rpc::{
-    BlockProofByHeightRequest, BlocksByRangeRequest, RecursiveProofByIndexRequest, RpcInboundId,
+    BlockProofByHeightRequest, BlocksByRangeRequest, HistoryProofByRangeRequest, RpcInboundId,
     RpcProtocol, RpcRequest, RpcResponse, StateByRootRequest,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
@@ -60,6 +60,10 @@ impl Default for SyncDriverConfig {
 /// oldest entries get evicted when the cap is reached.
 const PENDING_PROOF_BUFFER_LIMIT: usize = 256;
 
+/// Retain disconnected provider identities until the next availability event,
+/// while bounding memory even if distinct peers continuously churn.
+const HISTORY_PROVIDER_ATTEMPT_LIMIT: usize = 256;
+
 /// Stage 5 sync driver — the engine-side bridge between the libp2p
 /// network service and the sync state machine.
 pub struct SyncDriver {
@@ -83,6 +87,17 @@ pub struct SyncDriver {
     /// round to refetch it, costing one BFT-mesh-settle's worth of
     /// latency on every reorder.
     pending_proofs: Vec<neutrino_consensus_types::BlockProof>,
+    /// Latest availability event. Its sequence preserves a notice that races with
+    /// an older pending range request's eventual unavailable response.
+    history_announcement: Option<(u64, neutrino_network::PeerId)>,
+    /// Providers attempted for the current exact range and availability round.
+    history_attempts: BTreeSet<neutrino_network::PeerId>,
+    history_attempt_range: Option<(neutrino_primitives::Hash, neutrino_primitives::Hash)>,
+    /// Only this request may advance state or release the in-flight slot.
+    active_history_request: Option<HistoryRequest>,
+    next_history_nonce: u64,
+    /// Compatible in-flight status updates, capped at the provider-round limit.
+    deferred_history_status: BTreeMap<neutrino_network::PeerId, neutrino_network::rpc::Status>,
 }
 
 impl SyncDriver {
@@ -107,6 +122,12 @@ impl SyncDriver {
             outbound_tx,
             connected_peers: BTreeSet::new(),
             pending_proofs: Vec::new(),
+            history_announcement: None,
+            history_attempts: BTreeSet::new(),
+            history_attempt_range: None,
+            active_history_request: None,
+            next_history_nonce: 0,
+            deferred_history_status: BTreeMap::new(),
         }
     }
 
@@ -157,16 +178,29 @@ impl SyncDriver {
         match event {
             NetworkEvent::PeerConnected(peer) => {
                 debug!(%peer, "peer connected, dispatching FSM event");
-                self.connected_peers.insert(peer);
+                if self.connected_peers.insert(peer) {
+                    full_chunk::on_connect(self, peer);
+                }
                 let cmds = self.fsm.on_event(SyncEvent::PeerConnected(peer));
                 self.dispatch_sync_commands(cmds).await;
             }
             NetworkEvent::PeerDisconnected(peer) => {
                 debug!(%peer, "peer disconnected");
                 self.connected_peers.remove(&peer);
+                let interrupted_history = self
+                    .active_history_request
+                    .is_some_and(|request| request.peer == peer);
+                if interrupted_history {
+                    self.active_history_request = None;
+                }
+                self.deferred_history_status.remove(&peer);
                 full_chunk::on_disconnect(self, peer);
                 let cmds = self.fsm.on_event(SyncEvent::PeerDisconnected(peer));
                 self.dispatch_sync_commands(cmds).await;
+                if interrupted_history {
+                    self.resume_deferred_history_status().await;
+                }
+                self.try_next_history_provider().await;
             }
             NetworkEvent::NewListenAddr(addr) => {
                 debug!(%addr, "node listening on new address");
@@ -201,6 +235,8 @@ impl SyncDriver {
     /// peer so the next [`rpc::Status`] response can advance into
     /// HeaderBackfill again.
     async fn reset_and_rehandshake(&mut self) {
+        self.active_history_request = None;
+        self.deferred_history_status.clear();
         let cmds = self.fsm.on_event(SyncEvent::Reset);
         self.dispatch_sync_commands(cmds).await;
         let peers: Vec<_> = self.connected_peers.iter().copied().collect();
@@ -208,6 +244,30 @@ impl SyncDriver {
             let cmds = self.fsm.on_event(SyncEvent::PeerConnected(peer));
             self.dispatch_sync_commands(cmds).await;
         }
+    }
+
+    async fn handle_checkpoint_announcement(
+        &mut self,
+        data: &[u8],
+        source: neutrino_network::PeerId,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+        let Ok(announcement) =
+            borsh::from_slice::<neutrino_network::rpc::CheckpointAnnouncement>(data)
+        else {
+            return MessageAcceptance::Reject;
+        };
+        // A new range can become available without moving the endpoint. Always
+        // relay its notice and refresh status; the FSM decides whether an anchored
+        // fetch is still needed. The announcement itself never advances trust.
+        let generation = self
+            .history_announcement
+            .map_or(1, |(generation, _)| generation.wrapping_add(1));
+        self.history_announcement = Some((generation, source));
+        self.history_attempts.clear();
+        debug!(range_id = ?announcement.range_id, "history range became available");
+        self.dispatch_one(SyncCommand::RequestStatus(source)).await;
+        MessageAcceptance::Accept
     }
 
     /// Dispatch one gossip message to the matching topic handler and
@@ -240,8 +300,7 @@ impl SyncDriver {
             };
         }
         if topic == Topic::Checkpoints {
-            // Checkpoint recursion has no implemented production verifier.
-            return neutrino_network::libp2p::gossipsub::MessageAcceptance::Ignore;
+            return self.handle_checkpoint_announcement(&data, source).await;
         }
         if topic == Topic::Transactions {
             self.backend.submit_transaction(data).await;
@@ -532,17 +591,17 @@ impl SyncDriver {
                 self.backend.chunk_proofs_by_id(&req.chunk_ids).await,
                 RpcResponse::ChunkProofById,
             ),
-            RpcRequest::RecursiveProofLatest(_) => rpc_reply(
-                RpcProtocol::RecursiveProofLatest,
-                self.backend.latest_recursive_proof().await,
-                |payload| RpcResponse::RecursiveProofLatest(Box::new(payload)),
+            RpcRequest::CheckpointLatest(_) => rpc_reply(
+                RpcProtocol::CheckpointLatest,
+                self.backend.latest_checkpoint().await,
+                |payload| RpcResponse::CheckpointLatest(Box::new(payload)),
             ),
-            RpcRequest::RecursiveProofByIndex(req) => rpc_reply(
-                RpcProtocol::RecursiveProofByIndex,
+            RpcRequest::HistoryProofByRange(req) => rpc_reply(
+                RpcProtocol::HistoryProofByRange,
                 self.backend
-                    .recursive_proofs_by_index(req.start_index, req.count)
+                    .history_proof_by_range(req.start_checkpoint_hash, req.end_checkpoint_hash)
                     .await,
-                RpcResponse::RecursiveProofByIndex,
+                |payload| RpcResponse::HistoryProofByRange(Box::new(payload)),
             ),
             RpcRequest::FinalityCertByChunk(req) => rpc_reply(
                 RpcProtocol::FinalityCertByChunk,
@@ -566,13 +625,77 @@ impl SyncDriver {
 
     // --------------------------------------------------------------- outbound
 
-    async fn dispatch_sync_commands(&self, cmds: Vec<SyncCommand>) {
+    async fn dispatch_sync_commands(&mut self, cmds: Vec<SyncCommand>) {
         for cmd in cmds {
             self.dispatch_one(cmd).await;
         }
     }
 
-    async fn dispatch_one(&self, cmd: SyncCommand) {
+    async fn request_history(
+        &mut self,
+        peer: neutrino_network::PeerId,
+        start_checkpoint_hash: neutrino_primitives::Hash,
+        end_checkpoint_hash: neutrino_primitives::Hash,
+    ) {
+        if self.active_history_request.is_some() {
+            return;
+        }
+        let range = (start_checkpoint_hash, end_checkpoint_hash);
+        if self.history_attempt_range != Some(range) {
+            self.history_attempt_range = Some(range);
+            self.history_attempts.clear();
+        }
+        if self.history_attempts.len() >= HISTORY_PROVIDER_ATTEMPT_LIMIT
+            || !self.history_attempts.insert(peer)
+        {
+            let _ = self.fsm.on_event(SyncEvent::RpcFailed {
+                protocol: RpcProtocol::HistoryProofByRange,
+                peer,
+                error: "provider attempts exhausted for this availability event".to_owned(),
+            });
+            return;
+        }
+        let notice_generation = self
+            .history_announcement
+            .map_or(0, |(generation, _)| generation);
+        let Some(nonce) = self.next_history_nonce.checked_add(1) else {
+            let _ = self.fsm.on_event(SyncEvent::RpcFailed {
+                protocol: RpcProtocol::HistoryProofByRange,
+                peer,
+                error: "history request identity exhausted".to_owned(),
+            });
+            return;
+        };
+        self.next_history_nonce = nonce;
+        let request = HistoryRequest {
+            peer,
+            start_checkpoint_hash,
+            end_checkpoint_hash,
+            nonce,
+            notice_generation,
+        };
+        self.active_history_request = Some(request);
+        let sent = self
+            .send_rpc(
+                peer,
+                RpcRequest::HistoryProofByRange(HistoryProofByRangeRequest {
+                    start_checkpoint_hash,
+                    end_checkpoint_hash,
+                }),
+                move |_, response| OutboundOutcome::HistoryProof { request, response },
+            )
+            .await;
+        if !sent {
+            self.active_history_request = None;
+            let _ = self.fsm.on_event(SyncEvent::RpcFailed {
+                protocol: RpcProtocol::HistoryProofByRange,
+                peer,
+                error: "network command channel closed".to_owned(),
+            });
+        }
+    }
+
+    async fn dispatch_one(&mut self, cmd: SyncCommand) {
         match cmd {
             SyncCommand::RequestStatus(peer) => {
                 let local = match self.backend.local_status().await {
@@ -587,20 +710,13 @@ impl SyncDriver {
                 })
                 .await;
             }
-            SyncCommand::RequestRecursiveProofs {
+            SyncCommand::RequestHistoryProof {
                 peer,
-                start_index,
-                count,
+                start_checkpoint_hash,
+                end_checkpoint_hash,
             } => {
-                self.send_rpc(
-                    peer,
-                    RpcRequest::RecursiveProofByIndex(RecursiveProofByIndexRequest {
-                        start_index,
-                        count,
-                    }),
-                    move |peer, response| OutboundOutcome::RecursiveProofs { peer, response },
-                )
-                .await;
+                self.request_history(peer, start_checkpoint_hash, end_checkpoint_hash)
+                    .await;
             }
             SyncCommand::RequestBlocks {
                 peer,
@@ -674,7 +790,12 @@ impl SyncDriver {
 
     /// Convenience: send an outbound RPC, spawning a forwarder task that
     /// translates the `oneshot` result into an [`OutboundOutcome`].
-    async fn send_rpc<F>(&self, peer: neutrino_network::PeerId, request: RpcRequest, wrap: F)
+    async fn send_rpc<F>(
+        &self,
+        peer: neutrino_network::PeerId,
+        request: RpcRequest,
+        wrap: F,
+    ) -> bool
     where
         F: FnOnce(
                 neutrino_network::PeerId,
@@ -695,7 +816,7 @@ impl SyncDriver {
             .is_err()
         {
             warn!(%peer, "command channel closed; cannot send RPC");
-            return;
+            return false;
         }
         let outbound_tx = self.outbound_tx.clone();
         tokio::spawn(async move {
@@ -709,6 +830,7 @@ impl SyncDriver {
             };
             let _ = outbound_tx.send(wrap(peer, result)).await;
         });
+        true
     }
 
     async fn handle_rpc_failure(
@@ -729,39 +851,35 @@ impl SyncDriver {
         match outcome {
             OutboundOutcome::Consensus {
                 peer,
+                connection,
                 step,
                 response,
             } => {
-                full_chunk::on_response(self, peer, step, response).await;
+                full_chunk::on_response(self, peer, connection, step, response).await;
             }
-            OutboundOutcome::StatusResponse { peer, response } => match response {
-                Ok(RpcResponse::Status(status)) => {
-                    if full_chunk::on_status(self, peer, status).await {
-                        return;
-                    }
-                    let cmds = self.fsm.on_event(SyncEvent::PeerStatus { peer, status });
-                    self.dispatch_sync_commands(cmds).await;
+            OutboundOutcome::StatusResponse { peer, response } => {
+                self.handle_status_response(peer, response).await;
+            }
+            OutboundOutcome::HistoryProof { request, response } => {
+                if self.active_history_request != Some(request) {
+                    return;
                 }
-                Ok(other) => warn!(?other, "unexpected response type for Status RPC"),
-                Err(err) => {
-                    self.handle_rpc_failure(RpcProtocol::Status, peer, err)
-                        .await;
+                self.active_history_request = None;
+                self.handle_history_rpc_response(
+                    request.peer,
+                    request.start_checkpoint_hash,
+                    request.end_checkpoint_hash,
+                    response,
+                )
+                .await;
+                if let Some((generation, source)) = self.history_announcement
+                    && generation != request.notice_generation
+                {
+                    self.dispatch_one(SyncCommand::RequestStatus(source)).await;
                 }
-            },
-            OutboundOutcome::RecursiveProofs { peer, response } => match response {
-                Ok(RpcResponse::RecursiveProofByIndex(payload)) => {
-                    self.handle_recursive_proofs_response(peer, payload.items)
-                        .await;
-                }
-                Ok(other) => warn!(
-                    ?other,
-                    "unexpected response type for RecursiveProofByIndex RPC"
-                ),
-                Err(err) => {
-                    self.handle_rpc_failure(RpcProtocol::RecursiveProofByIndex, peer, err)
-                        .await;
-                }
-            },
+                self.resume_deferred_history_status().await;
+                self.try_next_history_provider().await;
+            }
             OutboundOutcome::Blocks { peer, response } => match response {
                 Ok(RpcResponse::BlocksByRange(payload)) => {
                     self.handle_blocks_response(peer, payload.blocks).await;
@@ -815,26 +933,139 @@ impl SyncDriver {
         }
     }
 
-    async fn handle_recursive_proofs_response(
+    async fn handle_status_response(
         &mut self,
         peer: neutrino_network::PeerId,
-        items: Vec<(
-            neutrino_primitives::Checkpoint,
-            neutrino_consensus_types::RecursiveCheckpointProof,
-        )>,
+        response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     ) {
-        if items.is_empty() {
-            // Peer reported no more checkpoints; treat as transient and
-            // surface a soft failure so the FSM clears `in_flight`.
+        if !self.connected_peers.contains(&peer) {
+            return;
+        }
+        match response {
+            Ok(RpcResponse::Status(status)) => {
+                if self.active_history_request.is_some() {
+                    let local = self.fsm.progress();
+                    if status.chain_id == local.chain_id
+                        && status.chain_spec_hash == local.chain_spec_hash
+                        && status.recursive_covered_chunks > local.recursive_covered_chunks
+                        && (self.deferred_history_status.len() < HISTORY_PROVIDER_ATTEMPT_LIMIT
+                            || self.deferred_history_status.contains_key(&peer))
+                    {
+                        self.deferred_history_status.insert(peer, status);
+                    }
+                    return;
+                }
+                if full_chunk::on_status(self, peer, status).await {
+                    return;
+                }
+                let commands = self.fsm.on_event(SyncEvent::PeerStatus { peer, status });
+                self.dispatch_sync_commands(commands).await;
+            }
+            Ok(other) => warn!(?other, "unexpected response type for Status RPC"),
+            Err(error) => {
+                self.handle_rpc_failure(RpcProtocol::Status, peer, error)
+                    .await;
+            }
+        }
+        self.try_next_history_provider().await;
+    }
+
+    async fn resume_deferred_history_status(&mut self) {
+        // Consume only already-received, bounded hints. An exhausted provider
+        // must not prevent the next queued target from making progress.
+        while self.active_history_request.is_none() {
+            let Some((peer, status)) = self.take_deferred_history_status() else {
+                break;
+            };
+            self.handle_status_response(peer, Ok(RpcResponse::Status(status)))
+                .await;
+        }
+    }
+
+    fn take_deferred_history_status(
+        &mut self,
+    ) -> Option<(neutrino_network::PeerId, neutrino_network::rpc::Status)> {
+        let local = self.fsm.progress().recursive_covered_chunks;
+        self.deferred_history_status
+            .retain(|_, status| status.recursive_covered_chunks > local);
+        let (&peer, &status) = self
+            .deferred_history_status
+            .iter()
+            .max_by_key(|(_, status)| status.recursive_covered_chunks)?;
+        self.deferred_history_status.remove(&peer);
+        Some((peer, status))
+    }
+
+    async fn try_next_history_provider(&mut self) {
+        if self.fsm.mode() != SyncMode::LightClient || self.active_history_request.is_some() {
+            return;
+        }
+        let Some(peer) = self
+            .connected_peers
+            .iter()
+            .find(|peer| !self.history_attempts.contains(peer))
+            // A target can change while the last request is pending. Let the
+            // request gate observe that new range even after the old round was
+            // exhausted; an unchanged range emits no network request.
+            .or_else(|| self.connected_peers.iter().next())
+            .copied()
+        else {
+            return;
+        };
+        let commands = self.fsm.retry_history_from(peer);
+        self.dispatch_sync_commands(commands).await;
+    }
+
+    async fn handle_history_rpc_response(
+        &mut self,
+        peer: neutrino_network::PeerId,
+        start: neutrino_primitives::Hash,
+        end: neutrino_primitives::Hash,
+        response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
+    ) {
+        match response {
+            Ok(RpcResponse::HistoryProofByRange(payload)) => {
+                self.handle_history_proof_response(peer, payload.proof, start, end)
+                    .await;
+            }
+            Ok(other) => {
+                warn!(
+                    ?other,
+                    "unexpected response type for HistoryProofByRange RPC"
+                );
+                let commands = self.fsm.on_event(SyncEvent::RpcFailed {
+                    protocol: RpcProtocol::HistoryProofByRange,
+                    peer,
+                    error: "unexpected history response type".to_owned(),
+                });
+                self.dispatch_sync_commands(commands).await;
+            }
+            Err(err) => {
+                self.handle_rpc_failure(RpcProtocol::HistoryProofByRange, peer, err)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_history_proof_response(
+        &mut self,
+        peer: neutrino_network::PeerId,
+        proof: neutrino_consensus_types::HistoryProof,
+        start: neutrino_primitives::Hash,
+        end: neutrino_primitives::Hash,
+    ) {
+        if proof.statement.start_checkpoint().hash() != start
+            || proof.statement.end_checkpoint().hash() != end
+        {
             let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                protocol: RpcProtocol::RecursiveProofByIndex,
+                protocol: RpcProtocol::HistoryProofByRange,
                 peer,
-                error: "empty checkpoint batch".to_owned(),
+                error: "history response does not match requested endpoints".to_owned(),
             });
             self.dispatch_sync_commands(cmds).await;
             return;
         }
-        match self.backend.verify_and_import_checkpoints(items).await {
+        match self.backend.verify_and_import_history(proof).await {
             Ok(cp) => {
                 let cmds = self.fsm.on_event(SyncEvent::CheckpointsAdvanced {
                     new_finalized_index: cp.new_finalized_index,
@@ -846,9 +1077,9 @@ impl SyncDriver {
                 self.dispatch_sync_commands(cmds).await;
             }
             Err(err) => {
-                warn!(?err, "rejected recursive proof batch");
+                warn!(?err, "rejected history range proof");
                 let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                    protocol: RpcProtocol::RecursiveProofByIndex,
+                    protocol: RpcProtocol::HistoryProofByRange,
                     peer,
                     error: err.to_string(),
                 });
@@ -1026,6 +1257,7 @@ impl SyncDriver {
 enum OutboundOutcome {
     Consensus {
         peer: neutrino_network::PeerId,
+        connection: Option<u64>,
         step: full_chunk::Step,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     },
@@ -1033,8 +1265,8 @@ enum OutboundOutcome {
         peer: neutrino_network::PeerId,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     },
-    RecursiveProofs {
-        peer: neutrino_network::PeerId,
+    HistoryProof {
+        request: HistoryRequest,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     },
     Blocks {
@@ -1052,6 +1284,15 @@ enum OutboundOutcome {
         start_height: u64,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryRequest {
+    peer: neutrino_network::PeerId,
+    start_checkpoint_hash: neutrino_primitives::Hash,
+    end_checkpoint_hash: neutrino_primitives::Hash,
+    nonce: u64,
+    notice_generation: u64,
 }
 
 // Compact hex helper for debug logs; the full chain primitives use lowercase
@@ -1076,6 +1317,13 @@ fn rpc_reply<T>(
         Err(error) => {
             let error = match error {
                 SyncBackendError::Storage(reason) => RpcFailure::Storage(reason),
+                SyncBackendError::Pruned {
+                    retained_from_chunk,
+                    retained_from_height,
+                } => RpcFailure::Pruned {
+                    retained_from_chunk,
+                    retained_from_height,
+                },
                 SyncBackendError::NotAvailable(reason) | SyncBackendError::ChainBehind(reason) => {
                     RpcFailure::Unavailable(reason)
                 }

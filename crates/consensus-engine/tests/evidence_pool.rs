@@ -6,7 +6,7 @@ use neutrino_consensus_engine::store::ChainStore;
 use neutrino_consensus_types::evidence::{
     EvidenceArtifact, EvidenceContext, EvidenceStatement, MAX_EVIDENCE_PROOF_BYTES, SanctionKind,
 };
-use neutrino_storage::MemoryDatabase;
+use neutrino_storage::{Column, Database, MemoryDatabase};
 
 fn artifact(id: u64) -> EvidenceArtifact {
     let (witness, _, _) = support::fixture([1; 8], [4; 32]);
@@ -48,9 +48,9 @@ fn verified_pool_survives_restart_preserves_first_receipt_and_expires_at_finalit
         restarted.evidence_artifacts().unwrap(),
         vec![original.clone()]
     );
-    restarted.prune_evidence_artifacts(10, 10, &[]).unwrap();
+    restarted.prune_evidence_artifacts(10, 10).unwrap();
     assert_eq!(restarted.evidence_artifacts().unwrap(), vec![original]);
-    restarted.prune_evidence_artifacts(11, 10, &[]).unwrap();
+    restarted.prune_evidence_artifacts(11, 10).unwrap();
     assert_eq!(
         restarted.evidence_artifacts().unwrap(),
         [] as [EvidenceArtifact; 0]
@@ -71,7 +71,11 @@ fn persistent_pool_enforces_receipt_and_entry_bounds() {
     item.statement.offence_id[..8].copy_from_slice(&256_u64.to_le_bytes());
     assert!(store.put_evidence_artifact(&item).is_err());
     assert_eq!(store.evidence_artifacts().unwrap().len(), 256);
-    store.prune_evidence_artifacts(1, 1024, &[[0; 32]]).unwrap();
+    store
+        .db_mut()
+        .put(Column::FinalizedOffences, &[0; 32], &1_u64.to_be_bytes())
+        .unwrap();
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     store.put_evidence_artifact(&item).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap().len(), 256);
 }
@@ -83,11 +87,18 @@ fn finalization_releases_cache_capacity_without_discarding_reorg_candidates() {
     let pending = artifact(2);
     store.put_evidence_artifact(&original).unwrap();
     store.put_evidence_artifact(&pending).unwrap();
-    // The node supplies only the ledger from a proof-gated finalized boundary.
+    // The index receives admissions only in the proof-gated finalization batch.
     // A receipt consumed merely on the materialized head remains recoverable.
     store
-        .prune_evidence_artifacts(1, 1024, &[original.statement.offence_id])
+        .db_mut()
+        .put(
+            Column::FinalizedOffences,
+            &original.statement.offence_id,
+            &1_u64.to_be_bytes(),
+        )
         .unwrap();
+    let mut store = ChainStore::new(store.into_db());
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap(), vec![pending]);
 }
 
@@ -104,8 +115,14 @@ fn pool_identity_is_scoped_to_program_and_exact_statement() {
     }
     assert_eq!(store.evidence_artifacts().unwrap().len(), 3);
     store
-        .prune_evidence_artifacts(1, 1024, &[original.statement.offence_id])
+        .db_mut()
+        .put(
+            Column::FinalizedOffences,
+            &original.statement.offence_id,
+            &1_u64.to_be_bytes(),
+        )
         .unwrap();
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     assert_eq!(
         store.evidence_artifacts().unwrap(),
         [] as [EvidenceArtifact; 0]
@@ -121,7 +138,11 @@ fn attachment_bytes_do_not_change_roots_and_survive_body_archive() {
             borsh::to_vec(&neutrino_default_runtime_core::Transaction::SubmitEvidence(
                 neutrino_consensus_types::evidence::EvidenceSubmission {
                     statement: original.statement.clone(),
-                    history: neutrino_consensus_types::evidence::HistoryOpening::default(),
+                    history: neutrino_consensus_types::history::HistoryPath {
+                        index: 0,
+                        count: 1,
+                        siblings: vec![[0; 32]; 64],
+                    },
                 },
             ))
             .unwrap(),

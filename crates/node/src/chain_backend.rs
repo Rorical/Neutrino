@@ -1,7 +1,7 @@
 //! Real [`SyncBackend`] backed by a [`ChainStore`] + [`ProofSystem`].
 //!
 //! Read methods serve directly from the chain store; write methods route
-//! through [`Engine::import_block`] and [`Engine::import_recursive_proof`]
+//! through [`Engine::import_block`] and [`Engine::import_history_proof`]
 //! so every imported artifact is validated before persistence and the
 //! engine's in-memory head pointers stay consistent.
 //!
@@ -21,10 +21,12 @@
 //! after the configured precommit quorum and complete proof verification.
 //! Followers execute imported blocks through the installed executor, verify
 //! block proofs, and authenticate the full consensus boundary before proceeding.
-//! Checkpoint recursion remains unsupported.
+//! Verified history compaction runs independently of Chunk finality.
 
 mod evidence;
 mod facts;
+mod history;
+mod light;
 mod p2p_queries;
 mod rpc_queries;
 
@@ -38,22 +40,19 @@ use neutrino_consensus_engine::{
     vrf_rejection_reason,
 };
 use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityVote, RecursiveCheckpointProof, SlashingEvidence,
+    Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
 };
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, FinalityCertByChunkResponse,
-    RecursiveProofByIndexResponse, RecursiveProofLatestResponse, StateByRootResponse, Status,
-    WitnessByBlockResponse,
+    BlocksByRootResponse, CheckpointLatestResponse, ChunkProofByIdResponse,
+    FinalityCertByChunkResponse, HistoryProofByRangeResponse, Metadata, StateByRootResponse,
+    Status, WitnessByBlockResponse,
 };
 use neutrino_network::service::NetworkCommand;
 use neutrino_network::sync::LocalProgress;
-use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
-    blake3_256,
-};
+use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot, blake3_256};
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
 use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 use neutrino_storage::Database;
@@ -92,9 +91,12 @@ const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Arc<Mutex<Engine<DB>>>,
     fact_jobs: Mutex<Option<mpsc::Sender<Vec<neutrino_prover_chunk::facts::FactRequest>>>>,
+    history: Arc<history::HistoryRuntime>,
+    light: Mutex<Option<light::LightRuntime>>,
     evidence_job_running: Arc<std::sync::atomic::AtomicBool>,
     evidence_job_cursor: std::sync::atomic::AtomicUsize,
     proof_system: Arc<P>,
+    proving_budget: Arc<crate::proving_budget::ProvingBudget>,
     consensus_proof_task: Mutex<Option<ConsensusProofTask<P>>>,
     mempool: Mutex<Mempool>,
     /// Channel used to publish gossip messages produced by the BFT
@@ -269,9 +271,12 @@ where
         Self {
             engine: Arc::new(Mutex::new(engine)),
             fact_jobs: Mutex::new(None),
+            history: Arc::new(history::HistoryRuntime::default()),
+            light: Mutex::new(None),
             evidence_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             evidence_job_cursor: std::sync::atomic::AtomicUsize::new(0),
             proof_system: Arc::new(proof_system),
+            proving_budget: Arc::new(crate::proving_budget::ProvingBudget::new(2)),
             consensus_proof_task: Mutex::new(None),
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
@@ -374,7 +379,10 @@ where
             .network_publisher
             .lock()
             .expect("ChainBackend network_publisher poisoned") = Some(publisher);
-        self.start_evidence_jobs();
+        if self.light_checkpoint().is_none() {
+            self.start_evidence_jobs();
+            self.start_history_jobs();
+        }
     }
 
     /// Install the local validator's BLS key used by the BFT loop to
@@ -520,6 +528,7 @@ where
             return;
         }
         self.start_evidence_jobs();
+        self.start_history_jobs();
         let Some(publisher) = self.publisher_snapshot() else {
             return;
         };
@@ -573,6 +582,7 @@ where
         proposer: &ProposerKey,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
         self.start_evidence_jobs();
+        self.start_history_jobs();
         if self.proof_system.consensus_block_key().is_some()
             && !self.with_engine(|e| {
                 let next_chunk = e
@@ -788,8 +798,17 @@ where
         block_hash: &BlockHash,
     ) -> Result<ProveOutcome, ProveError<DB::Error>> {
         let job = self.with_engine_mut(|e| e.prepare_block_proof(block_hash))?;
+        let permit = self
+            .proving_budget
+            .acquire(crate::proving_budget::ProvingPriority::Critical);
         let completed = job.prove(self.proof_system.as_ref())?;
+        drop(permit);
         self.with_engine_mut(|e| e.commit_block_proof(completed))
+    }
+
+    /// Configure the shared proving limit before starting background workers.
+    pub fn set_proving_concurrency(&self, concurrency: usize) {
+        self.proving_budget.set_capacity(concurrency);
     }
 
     /// Recover canonical, witnessed jobs after restart or a failed proving attempt.
@@ -886,11 +905,17 @@ where
         chunk_id: u64,
         voter: &ProposerKey,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        self.with_engine_mut(|e| e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter))
+        let outcome = self
+            .with_engine_mut(|e| e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter))?;
+        self.start_history_jobs();
+        Ok(outcome)
     }
 
     /// Current head height, snapshotted under the engine mutex.
     pub fn head_height(&self) -> neutrino_primitives::Height {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            return checkpoint.boundary.height;
+        }
         self.with_engine(neutrino_consensus_engine::Engine::head_height)
     }
 
@@ -903,6 +928,9 @@ where
     /// [`Self::try_materialise_to_fork_choice_head`]
     /// (pending-fix #12) to converge the two heads.
     pub fn fork_choice_head(&self) -> BlockHash {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            return checkpoint.boundary.block_hash;
+        }
         self.with_engine(neutrino_consensus_engine::Engine::fork_choice_head)
     }
 
@@ -914,6 +942,9 @@ where
     /// Used by integration tests + operator-side health probes
     /// to confirm the finalisation pipeline is feeding fork choice.
     pub fn fork_choice_finalized(&self) -> BlockHash {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            return checkpoint.boundary.block_hash;
+        }
         self.with_engine(neutrino_consensus_engine::Engine::fork_choice_finalized)
     }
 
@@ -984,8 +1015,12 @@ where
     }
 
     fn contiguous_proven_height(e: &Engine<DB>) -> Result<Height, SyncBackendError> {
-        let mut height = 0;
-        for candidate in 1..=e.head_height() {
+        let first = e
+            .retention_info()
+            .map_err(p2p_queries::storage_error)?
+            .first_retained_height;
+        let mut height = first.saturating_sub(1);
+        for candidate in first..=e.head_height() {
             let hash = e
                 .store()
                 .get_block_hash_by_height(candidate)
@@ -1017,8 +1052,12 @@ where
     /// written. Producers and full nodes that always persist bodies
     /// inline return the same value as [`Engine::head_height`].
     fn contiguous_body_height(e: &Engine<DB>) -> Result<Height, SyncBackendError> {
-        let mut height = 0;
-        for candidate in 1..=e.head_height() {
+        let first = e
+            .retention_info()
+            .map_err(p2p_queries::storage_error)?
+            .first_retained_height;
+        let mut height = first.saturating_sub(1);
+        for candidate in first..=e.head_height() {
             let hash = e
                 .store()
                 .get_block_hash_by_height(candidate)
@@ -1155,7 +1194,7 @@ where
                             )
                         })?;
                 Ok(Some(neutrino_prover_chunk::consensus::as_chunk(
-                    &candidate.execution,
+                    &candidate.execution.chunk,
                 )))
             })
         } else {
@@ -1303,7 +1342,9 @@ where
             }
         };
         let prover = Arc::clone(&self.proof_system);
+        let budget = Arc::clone(&self.proving_budget);
         let task = tokio::task::spawn_blocking(move || {
+            let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Critical);
             let proof = prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
             Ok::<_, neutrino_proof_system::ProofError>((prepared.witness, proof))
         });
@@ -1343,6 +1384,7 @@ where
         match outcome {
             Ok(outcome) => {
                 self.start_evidence_jobs();
+                self.start_history_jobs();
                 let publisher = self
                     .network_publisher
                     .lock()
@@ -1412,6 +1454,9 @@ where
     async fn consensus_sync_target(
         &self,
     ) -> Result<Option<neutrino_sync::backend::ConsensusSyncTarget>, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            return Ok(None);
+        }
         self.poll_consensus_proof().await;
         if self.proof_system.consensus_block_key().is_none() {
             return Ok(None);
@@ -1438,48 +1483,40 @@ where
         self.p2p_local_status()
     }
 
+    async fn local_metadata(&self) -> Metadata {
+        self.p2p_local_metadata()
+    }
+
     async fn local_progress(&self) -> Result<LocalProgress, SyncBackendError> {
         self.p2p_local_progress()
     }
 
-    async fn latest_recursive_proof(
-        &self,
-    ) -> Result<RecursiveProofLatestResponse, SyncBackendError> {
-        self.with_engine(|e| {
-            let latest = e.latest_checkpoint_index();
-            // index 0 is the genesis checkpoint — no recursive proof yet.
-            if latest == 0 {
-                return Err(SyncBackendError::NotAvailable(
-                    "no recursive proof beyond genesis".to_owned(),
-                ));
-            }
-            let checkpoint = e
-                .store()
-                .get_checkpoint(latest)
-                .map_err(Self::map_store_err)?
+    async fn latest_checkpoint(&self) -> Result<CheckpointLatestResponse, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            let proof = self
+                .light_latest_proof()
+                .map_err(SyncBackendError::Storage)?
+                .filter(|proof| proof.statement.start.next_chunk_id == 0)
                 .ok_or_else(|| {
-                    SyncBackendError::Storage(format!("checkpoint at index {latest} missing"))
+                    SyncBackendError::NotAvailable("no genesis-prefix receipt retained".into())
                 })?;
-            let proof = e
-                .store()
-                .get_recursive_proof(latest)
-                .map_err(Self::map_store_err)?
-                .ok_or_else(|| {
-                    SyncBackendError::Storage(format!("recursive proof at index {latest} missing"))
-                })?;
-            Ok(RecursiveProofLatestResponse {
-                checkpoint,
-                recursive_proof: proof,
-            })
-        })
+            return Ok(CheckpointLatestResponse { proof });
+        }
+        let proof = self
+            .with_engine(Engine::latest_history_proof)
+            .map_err(|error| SyncBackendError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                SyncBackendError::NotAvailable("no recursive prefix proof available".into())
+            })?;
+        Ok(CheckpointLatestResponse { proof })
     }
 
-    async fn recursive_proofs_by_index(
+    async fn history_proof_by_range(
         &self,
-        start: CheckpointIndex,
-        count: u64,
-    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError> {
-        self.p2p_recursive_proofs_by_index(start, count)
+        start: Hash,
+        end: Hash,
+    ) -> Result<HistoryProofByRangeResponse, SyncBackendError> {
+        self.p2p_history_proof_by_range(start, end)
     }
 
     async fn blocks_by_range(
@@ -1544,30 +1581,41 @@ where
         self.p2p_witnesses_by_block(block_hashes)
     }
 
-    async fn verify_and_import_checkpoints(
+    async fn verify_and_import_history(
         &self,
-        items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
+        proof: HistoryProof,
     ) -> Result<CheckpointsImported, SyncBackendError> {
-        let mut last: Option<CheckpointsImported> = None;
-        for (_cp, proof) in items {
-            let outcome = self
-                .with_engine_mut(|e| e.import_recursive_proof(&proof, self.proof_system.as_ref()))
-                .map_err(Self::map_import_err)?;
-            last = Some(CheckpointsImported {
-                new_finalized_index: outcome.checkpoint_index,
-                new_finalized_hash: outcome.checkpoint_hash,
-                new_finalized_state_root: proof.public_inputs.end_state_root,
-                new_finalized_height: proof.public_inputs.end_height,
-                new_finalized_block_hash: proof.public_inputs.end_block_hash,
-            });
+        if self.light_checkpoint().is_some() {
+            return self.accept_light_history(proof).await;
         }
-        last.ok_or_else(|| SyncBackendError::Rejected("empty recursive proof batch".to_owned()))
+        let statement = proof.statement;
+        let spec = self.with_engine(|engine| engine.chain_spec().clone());
+        let prover = Arc::clone(&self.proof_system);
+        let verified = tokio::task::spawn_blocking(move || {
+            neutrino_proof_system::verify_history_proof(prover.as_ref(), &spec, proof)
+        })
+        .await
+        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?
+        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+        self.with_engine_mut(|engine| engine.commit_verified_history(verified))
+            .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+        self.start_history_jobs();
+        Ok(CheckpointsImported {
+            new_finalized_index: statement.end.next_chunk_id,
+            new_finalized_hash: statement.end_checkpoint().hash(),
+            new_finalized_state_root: statement.end.state_root,
+            new_finalized_height: statement.end.height,
+            new_finalized_block_hash: statement.end.block_hash,
+        })
     }
 
     async fn verify_and_import_headers(
         &self,
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
+        }
         // Pending-fix #7 follow-on: route sync-driver header batches
         // through the executor-equipped import path so re-execution
         // catches forged commitments on sync-replay too. Backends
@@ -1607,6 +1655,9 @@ where
         nodes: Vec<Vec<u8>>,
         values: Vec<Vec<u8>>,
     ) -> Result<StateProgress, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
+        }
         if paths.iter().any(|path| !path.is_empty()) {
             return Err(SyncBackendError::InvalidRequest(
                 "subtree state import is unsupported".to_owned(),
@@ -1620,6 +1671,9 @@ where
         start: Height,
         proofs: Vec<BlockProof>,
     ) -> Result<ProofsImported, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
+        }
         let mut expected_height = start;
         let mut last_height = None;
         let mut imported_heights: Vec<Height> = Vec::new();
@@ -1675,6 +1729,9 @@ where
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
+        }
         self.authorize_incoming_consensus_body(&block)?;
         // Slashing detection runs first: a peer that gossips a
         // validly-signed but non-extending header (e.g. an
@@ -1730,6 +1787,9 @@ where
     }
 
     async fn submit_transaction(&self, bytes: Vec<u8>) {
+        if self.light_checkpoint().is_some() {
+            return;
+        }
         match Self::submit_transaction(self, bytes) {
             Ok(_) => {}
             Err(err) => debug!(?err, "mempool admission rejected a gossipped transaction"),
@@ -1740,15 +1800,12 @@ where
         &self,
         proof: ChunkProof,
     ) -> Result<ChunkProofImported, SyncBackendError> {
+        if self.light_checkpoint().is_some() {
+            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
+        }
         {
             let certificate = &proof.finality_cert;
-            let chunk = neutrino_prover_chunk::consensus::as_chunk(
-                &neutrino_prover_chunk::execution::ExecutionStatement {
-                    chunk: proof.public_inputs.clone(),
-                    context_hash: [0; 32],
-                    block_guest_vk_digest: [0; 8],
-                },
-            );
+            let chunk = neutrino_prover_chunk::consensus::as_chunk(&proof.public_inputs);
             let evidence = self
                 .with_engine_mut(|engine| {
                     engine.observe_certificate_for_slashing(&chunk, certificate)
@@ -1799,6 +1856,7 @@ where
             .map_err(Self::map_import_err)?;
         if self.proof_system.consensus_block_key().is_some() {
             self.start_evidence_jobs();
+            self.start_history_jobs();
         }
         debug!(
             chunk_id,
@@ -1812,6 +1870,19 @@ where
     }
 
     async fn ingest_finality_vote(&self, vote: FinalityVote) {
+        if self.light_checkpoint().is_some() {
+            return;
+        }
+        if self.with_engine(|engine| {
+            let count = engine.finalized_next_chunk_id();
+            vote.data.chunk_id < count
+                && !neutrino_consensus_types::history::is_recent_history_index(
+                    vote.data.chunk_id,
+                    count,
+                )
+        }) {
+            return;
+        }
         trace!(
             chunk_id = vote.data.chunk_id,
             round = vote.data.round,
@@ -1847,6 +1918,19 @@ where
     }
 
     async fn ingest_aggregate_finality_vote(&self, subnet: u8, vote: FinalityVote) {
+        if self.light_checkpoint().is_some() {
+            return;
+        }
+        if self.with_engine(|engine| {
+            let count = engine.finalized_next_chunk_id();
+            vote.data.chunk_id < count
+                && !neutrino_consensus_types::history::is_recent_history_index(
+                    vote.data.chunk_id,
+                    count,
+                )
+        }) {
+            return;
+        }
         // Aggregated votes carry the same payload as raw votes; for
         // M7-A they take the same engine ingest path. M7-C will add
         // per-subnet routing so partial-vote aggregators on one
@@ -1884,10 +1968,16 @@ where
         &self,
         artifact: neutrino_consensus_types::evidence::EvidenceArtifact,
     ) -> neutrino_sync::EvidenceProofAcceptance {
+        if self.light_checkpoint().is_some() {
+            return neutrino_sync::EvidenceProofAcceptance::Deferred;
+        }
         self.accept_evidence_artifact(artifact).await
     }
 
     async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {
+        if self.light_checkpoint().is_some() {
+            return;
+        }
         // Verify the peer-supplied evidence cryptographically before
         // pooling it: a forged claim must not poison the pool that
         // the producer will later include in a block body. The
@@ -1895,15 +1985,26 @@ where
         // mesh-wide propagation and the M7-B detector already
         // gossipped locally-detected items via
         // `pool_and_gossip_slashing`.
-        let historical = self.proof_system.consensus_block_key().is_some_and(|key| {
-            self.with_engine(|e| {
-                e.verify_historical_slashing_evidence(&evidence, &key)
-                    .is_ok()
-            })
+        let accepted = self.with_engine(|engine| {
+            let historical =
+                neutrino_prover_chunk::history::evidence_chunk_id(engine.chain_spec(), &evidence)
+                    .is_ok_and(|id| {
+                        engine
+                            .latest_finalized_chunk_id()
+                            .is_some_and(|last| id <= last)
+                    });
+            if historical {
+                self.proof_system.consensus_block_key().is_some_and(|key| {
+                    engine
+                        .verify_historical_slashing_evidence(&evidence, &key)
+                        .is_ok()
+                })
+            } else {
+                engine.verify_slashing_evidence(&evidence).is_ok()
+            }
         });
-        if !historical && let Err(err) = self.with_engine(|e| e.verify_slashing_evidence(&evidence))
-        {
-            debug!(?err, "rejected peer-supplied slashing evidence");
+        if !accepted {
+            debug!("rejected peer-supplied slashing evidence");
             return;
         }
         // InvalidProofSigning evidence carries the rejected proof
@@ -1923,6 +2024,7 @@ where
         }
         if self.insert_persistent(&evidence) {
             self.start_evidence_jobs();
+            self.start_history_jobs();
             trace!("pooled peer-supplied slashing evidence");
         }
     }

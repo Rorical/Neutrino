@@ -52,15 +52,37 @@ pub struct EvidenceStatement {
     pub facts_commitment: Hash,
 }
 
-/// Sparse opening in the counted, odd-leaf-promoting historical Merkle tree.
-#[derive(Clone, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
-pub struct HistoryOpening {
-    /// Leaf index, equal to the historical chunk index.
+/// Opening in the counted, odd-leaf-promoting evidence batch Merkle tree.
+#[derive(Clone, Debug, Default, Eq, PartialEq, BorshSerialize)]
+pub struct MerkleOpening {
+    /// Statement index within the evidence batch.
     pub index: u64,
     /// Exact leaf count; prevents ambiguous tree shapes.
     pub count: u64,
     /// Bottom-up siblings; promoted odd nodes consume no sibling.
     pub siblings: Vec<Hash>,
+}
+
+impl BorshDeserialize for MerkleOpening {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let index = u64::deserialize_reader(reader)?;
+        let count = u64::deserialize_reader(reader)?;
+        let length = u32::deserialize_reader(reader)?;
+        if length > 64 {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                "evidence membership path length",
+            ));
+        }
+        let siblings = (0..length)
+            .map(|_| Hash::deserialize_reader(reader))
+            .collect::<borsh::io::Result<Vec<_>>>()?;
+        Ok(Self {
+            index,
+            count,
+            siblings,
+        })
+    }
 }
 
 /// Consensus evidence claim, including its current history opening.
@@ -69,7 +91,7 @@ pub struct EvidenceSubmission {
     /// Public statement authenticated by the receipt.
     pub statement: EvidenceStatement,
     /// Inclusion in the block's incoming trusted historical root.
-    pub history: HistoryOpening,
+    pub history: crate::history::HistoryPath,
 }
 
 /// Maximum offence statements committed by one Evidence Guest receipt.
@@ -113,7 +135,7 @@ pub struct EvidenceMembership {
     /// Exact batch public values.
     pub batch: EvidenceBatch,
     /// Counted opening in the batch's ordered statement Merkle tree.
-    pub opening: HistoryOpening,
+    pub opening: MerkleOpening,
 }
 
 impl EvidenceMembership {
@@ -125,7 +147,7 @@ impl EvidenceMembership {
     ) -> Option<Self> {
         Some(Self {
             batch: EvidenceBatch::new(statements, fact_key)?,
-            opening: HistoryOpening::build(
+            opening: MerkleOpening::build(
                 &statements.iter().map(commitment).collect::<Vec<_>>(),
                 index,
             )?,
@@ -140,7 +162,7 @@ impl EvidenceMembership {
             && self.opening.count == u64::from(self.batch.count)
             && self.opening.verify(
                 commitment(statement),
-                counted_history_root(self.opening.count, self.batch.root),
+                counted_merkle_root(self.opening.count, self.batch.root),
             )
     }
 }
@@ -211,17 +233,17 @@ pub fn commitment<T: BorshSerialize>(value: &T) -> Hash {
     blake3_256(&borsh::to_vec(value).expect("canonical evidence encoding"))
 }
 
-/// Root bound to both the leaf count and the evidence-history domain.
-pub fn counted_history_root(count: u64, root: Hash) -> Hash {
-    commitment(&(b"neutrino-evidence-history", count, root))
+/// Root bound to both the leaf count and the evidence membership domain.
+pub fn counted_merkle_root(count: u64, root: Hash) -> Hash {
+    commitment(&(b"neutrino-evidence-membership", count, root))
 }
 
-/// Build the canonical historical root from already hashed contexts.
-pub fn history_root(leaves: &[Hash]) -> Hash {
-    counted_history_root(leaves.len() as u64, merkle_root_of_hashes(leaves))
+/// Build the counted evidence batch commitment from statement hashes.
+pub fn merkle_commitment(leaves: &[Hash]) -> Hash {
+    counted_merkle_root(leaves.len() as u64, merkle_root_of_hashes(leaves))
 }
 
-impl HistoryOpening {
+impl MerkleOpening {
     /// Produce an opening for an existing leaf.
     pub fn build(leaves: &[Hash], index: usize) -> Option<Self> {
         if index >= leaves.len() {
@@ -276,7 +298,7 @@ impl HistoryOpening {
             position /= 2;
             width = width.div_ceil(2);
         }
-        siblings.next().is_none() && counted_history_root(self.count, hash) == expected_root
+        siblings.next().is_none() && counted_merkle_root(self.count, hash) == expected_root
     }
 }
 
@@ -297,6 +319,7 @@ impl EvidenceSubmission {
             && statement.block_guest_vk_digest == anchor.block_guest_vk_digest
             && self.history.index == statement.context.chunk_id
             && self.history.count == anchor.chunk_id
+            && crate::history::is_recent_history_index(statement.context.chunk_id, anchor.chunk_id)
             && self
                 .history
                 .verify(commitment(&statement.context), anchor.history_root)
@@ -373,7 +396,7 @@ mod tests {
         let original = artifact();
         let submission = EvidenceSubmission {
             statement: original.statement.clone(),
-            history: HistoryOpening::default(),
+            history: crate::history::HistoryPath::default(),
         };
         let mut body = crate::Body {
             transactions: alloc::vec![borsh::to_vec(&submission).unwrap()],
@@ -395,9 +418,9 @@ mod tests {
     fn historical_openings_bind_every_shape_count_and_position() {
         for count in 1..70 {
             let leaves: Vec<_> = (0..count).map(|n| commitment(&n)).collect();
-            let root = history_root(&leaves);
+            let root = merkle_commitment(&leaves);
             for index in 0..count {
-                let opening = HistoryOpening::build(&leaves, index).unwrap();
+                let opening = MerkleOpening::build(&leaves, index).unwrap();
                 assert!(opening.verify(leaves[index], root));
                 let mut tampered = opening.clone();
                 tampered.count += 1;
@@ -407,6 +430,39 @@ mod tests {
                 assert!(!tampered.verify(leaves[index], root));
             }
         }
-        assert!(!HistoryOpening::default().verify([0; 32], [0; 32]));
+        assert!(!MerkleOpening::default().verify([0; 32], [0; 32]));
+    }
+
+    #[test]
+    fn evidence_window_includes_the_eighth_chunk_and_exact_block_age() {
+        use crate::history::{HistoryPath, history_root};
+
+        let mut statement = artifact().statement;
+        statement.context.end_height = 128;
+        let mut leaves = alloc::vec![[0; 32]; 8];
+        leaves[0] = commitment(&statement.context);
+        let mut anchor = EvidenceAnchor {
+            chain_spec_hash: statement.chain_spec_hash,
+            chunk_id: 8,
+            history_root: history_root(&leaves),
+            block_guest_vk_digest: statement.block_guest_vk_digest,
+            policy: RuntimeParams::default(),
+            ..EvidenceAnchor::default()
+        };
+        let mut submission = EvidenceSubmission {
+            statement,
+            history: HistoryPath::build(&leaves, 0).unwrap(),
+        };
+        assert!(submission.binds(7, 1025, &anchor));
+        assert!(submission.binds(7, 1152, &anchor));
+        assert!(!submission.binds(7, 1153, &anchor));
+
+        leaves.push([1; 32]);
+        anchor.chunk_id = 9;
+        anchor.history_root = history_root(&leaves);
+        anchor.policy.evidence_max_age_blocks = 2048;
+        submission.history = HistoryPath::build(&leaves, 0).unwrap();
+        assert!(submission.history.verify(leaves[0], anchor.history_root));
+        assert!(!submission.binds(7, 1153, &anchor));
     }
 }

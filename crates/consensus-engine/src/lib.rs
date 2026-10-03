@@ -14,11 +14,13 @@ pub mod engine;
 pub mod error;
 pub mod finalize;
 pub mod full_chunk;
+pub mod history;
 pub mod import;
 pub mod merkle;
 pub mod produce;
 pub mod proposer;
 pub mod prove;
+pub mod retention;
 pub mod signature;
 pub mod slashing;
 pub mod store;
@@ -35,7 +37,6 @@ pub use error::EngineError;
 pub use finalize::{FinalizeError, FinalizeOutcome};
 pub use import::{
     ImportBlockOutcome, ImportBlockProofOutcome, ImportChunkProofOutcome, ImportError,
-    ImportRecursiveProofOutcome,
 };
 pub use merkle::{EMPTY_MERKLE_ROOT, hash_leaf, merkle_root, merkle_root_of_hashes};
 pub use produce::{ProductionConfig, ProductionError, ProductionOutcome};
@@ -58,3 +59,7 @@ pub enum EngineState {
     /// Node has stopped due to a fatal error.
     Stopped,
 }
+
+pub use history::{HistoryImportOutcome, PreparedHistoryFold};
+
+pub use retention::{RetentionInfo, RetentionPolicy};

@@ -42,13 +42,15 @@ pub enum RpcNamespace {
 }
 
 pub mod backend;
+pub mod history;
 pub mod server;
 pub mod types;
 
 pub use backend::{
-    BlockId, FinalizedInfo, HeadInfo, QueryError, RpcBackend, RuntimeCallError,
+    BlockId, FinalizedInfo, HeadInfo, HistoryRetention, QueryError, RpcBackend, RuntimeCallError,
     RuntimeCallResponse, SubmitError,
 };
+pub use history::{HistoryJobInfo, HistoryJobStatus};
 pub use server::{RpcConfig, RpcContext, RpcStartError, build_module, serve};
 pub use types::{
     BlockIdJson, BlockJson, BodyJson, BytesHex, FinalizedInfoJson, HashHex, HeadInfoJson,

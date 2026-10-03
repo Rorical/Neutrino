@@ -17,9 +17,8 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_rpc::RpcBackend;
 #[path = "support/native_chunk.rs"]
@@ -59,18 +58,6 @@ fn chain_spec() -> ChainSpec {
     };
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash: BlockHash = [0xCA; 32];
-    let checkpoint = Checkpoint {
-        chain_id: CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     let consensus = ConsensusParams {
         chunk_size: 1,
         expected_proposers_per_slot: fixed_u128_from_integer(8),
@@ -87,7 +74,6 @@ fn chain_spec() -> ChainSpec {
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus,
         proof,
         state: StateParams::default(),
@@ -284,7 +270,7 @@ async fn follower_drives_real_sync_driver_against_real_chain_backend() {
 
     let follower_status = follower_handle.backend.local_status().await.unwrap();
     assert_eq!(follower_status.finalized_chunk_id, Some(N_BLOCKS - 1));
-    assert_eq!(follower_status.finalized_checkpoint_index, 0);
+    assert_eq!(follower_status.recursive_covered_chunks, 0);
     assert_eq!(
         follower_handle.backend.active_validator_set().await,
         producer_handle.backend.active_validator_set().await,

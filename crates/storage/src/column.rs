@@ -26,8 +26,8 @@ pub enum Column {
     ChunkProofs,
     /// Recursive checkpoints, keyed by checkpoint index.
     Checkpoints,
-    /// Recursive proof bytes, keyed by checkpoint index.
-    RecursiveProofs,
+    /// Verified range proof artifacts, keyed by semantic range ID.
+    HistoryProofs,
     /// Finality certificates, keyed by chunk id.
     FinalityCerts,
     /// Execution witnesses, keyed by block hash.
@@ -46,12 +46,32 @@ pub enum Column {
     SlashingPool,
     /// Node-local metadata such as chain-spec hash.
     Meta,
+    /// Immutable compact statements of finalized chunks.
+    ChunkStatements,
+    /// Canonical consensus boundaries, keyed by covered chunk count.
+    ConsensusBoundaries,
+    /// Finalized historical records, keyed by chunk ID.
+    HistoricalChunks,
+    /// Content-addressed immutable binary history nodes.
+    HistoryNodes,
+    /// Bounded append frontiers, keyed by covered chunk count.
+    HistoryFrontiers,
+    /// Verified history range IDs, keyed by boundary count pair.
+    HistoryRangeIndex,
+    /// Bounded metadata for cached noncanonical arbitrary proof intervals.
+    HistoryRangeCache,
+    /// Durable background history jobs.
+    HistoryJobs,
+    /// Durable leases retaining child ranges while background jobs depend on them.
+    HistoryPins,
+    /// Offence admissions authenticated by finalized block proofs.
+    FinalizedOffences,
     /// Reusable objective-evidence receipts keyed by offence ID.
     EvidenceProofs,
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 20] = [
+pub const ALL_COLUMNS: [Column; 30] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -63,7 +83,7 @@ pub const ALL_COLUMNS: [Column; 20] = [
     Column::BlockStates,
     Column::ChunkProofs,
     Column::Checkpoints,
-    Column::RecursiveProofs,
+    Column::HistoryProofs,
     Column::FinalityCerts,
     Column::Witnesses,
     Column::ValidatorSetSnapshots,
@@ -71,6 +91,16 @@ pub const ALL_COLUMNS: [Column; 20] = [
     Column::Mempool,
     Column::SlashingPool,
     Column::Meta,
+    Column::ChunkStatements,
+    Column::ConsensusBoundaries,
+    Column::HistoricalChunks,
+    Column::HistoryNodes,
+    Column::HistoryFrontiers,
+    Column::HistoryRangeIndex,
+    Column::HistoryRangeCache,
+    Column::HistoryJobs,
+    Column::HistoryPins,
+    Column::FinalizedOffences,
     Column::EvidenceProofs,
 ];
 
@@ -90,7 +120,7 @@ impl Column {
             Self::BlockStates => "block_states",
             Self::ChunkProofs => "chunk_proofs",
             Self::Checkpoints => "checkpoints",
-            Self::RecursiveProofs => "recursive_proofs",
+            Self::HistoryProofs => "history_proofs",
             Self::FinalityCerts => "finality_certs",
             Self::Witnesses => "witnesses",
             Self::ValidatorSetSnapshots => "validator_set_snap",
@@ -98,6 +128,16 @@ impl Column {
             Self::Mempool => "mempool",
             Self::SlashingPool => "slashing_pool",
             Self::Meta => "meta",
+            Self::ChunkStatements => "chunk_statements",
+            Self::ConsensusBoundaries => "consensus_boundaries",
+            Self::HistoricalChunks => "historical_chunks",
+            Self::HistoryNodes => "history_nodes",
+            Self::HistoryFrontiers => "history_frontiers",
+            Self::HistoryRangeIndex => "history_range_index",
+            Self::HistoryRangeCache => "history_range_cache",
+            Self::HistoryJobs => "history_jobs",
+            Self::HistoryPins => "history_pins",
+            Self::FinalizedOffences => "finalized_offences",
             Self::EvidenceProofs => "evidence_proofs",
         }
     }
@@ -109,7 +149,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 20);
+        assert_eq!(ALL_COLUMNS.len(), 30);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -119,7 +159,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 20] = [
+        let names: [&str; 30] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -131,7 +171,7 @@ mod tests {
             "block_states",
             "chunk_proofs",
             "checkpoints",
-            "recursive_proofs",
+            "history_proofs",
             "finality_certs",
             "witnesses",
             "validator_set_snap",
@@ -139,6 +179,16 @@ mod tests {
             "mempool",
             "slashing_pool",
             "meta",
+            "chunk_statements",
+            "consensus_boundaries",
+            "historical_chunks",
+            "history_nodes",
+            "history_frontiers",
+            "history_range_index",
+            "history_range_cache",
+            "history_jobs",
+            "history_pins",
+            "finalized_offences",
             "evidence_proofs",
         ];
         for (column, expected) in ALL_COLUMNS.iter().zip(names) {

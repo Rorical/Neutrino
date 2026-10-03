@@ -24,7 +24,6 @@ struct NativeConsensusBackend {
 impl ProofSystem for NativeConsensusBackend {
     type BlockProof = StfPublicOutput;
     type ChunkProof = ConsensusStatement;
-    type RecursiveProof = Vec<u8>;
 
     fn prove_block(
         &self,
@@ -187,7 +186,7 @@ async fn proof_job_keeps_network_responsive_and_retries_without_advancing_on_fai
     backend.set_local_voter(ProposerKey::from_ikm(&[42; 32], 0).unwrap());
     backend.with_engine_mut_for_test(|engine| {
         engine
-            .open_bft_session(as_chunk(&validate_consensus(&witness).unwrap().execution))
+            .open_bft_session(as_chunk(&validate_consensus(&witness).unwrap().chunk))
             .unwrap()
     });
     // The worker deliberately waits for a test-controlled result. Neither the
@@ -439,7 +438,7 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
         .unwrap();
     engine.finalize_chunk(0, &prover, &voter).unwrap();
     assert_eq!(
-        engine.latest_checkpoint_index(),
+        engine.recursive_covered_chunks(),
         0,
         "checkpoint index is independent of chunk finality"
     );
@@ -457,15 +456,9 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
 
     let status = backend.local_status().await.unwrap();
     assert_eq!(status.finalized_chunk_id, Some(0));
-    assert_eq!(status.finalized_checkpoint_index, 0);
-    assert_eq!(
-        status.finalized_checkpoint_hash,
-        spec.genesis_checkpoint.hash()
-    );
-    assert_ne!(
-        status.finalized_chunk_hash,
-        status.finalized_checkpoint_hash
-    );
+    assert_eq!(status.recursive_covered_chunks, 0);
+    assert_eq!(status.checkpoint_hash, neutrino_primitives::ZERO_HASH);
+    assert_ne!(status.finalized_chunk_hash, status.checkpoint_hash);
     assert_eq!(
         backend.local_progress().await.unwrap().finalized_chunk_hash,
         status.finalized_chunk_hash

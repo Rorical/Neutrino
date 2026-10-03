@@ -48,7 +48,6 @@ fn context() -> ExecutionContext {
         gas_price: 9,
         active_validators: vec![validator()],
         history_root: commitment(&Vec::<u8>::new()),
-        penalty_root: commitment(&Vec::<u8>::new()),
     }
 }
 
@@ -197,7 +196,6 @@ fn authenticates_incoming_boundaries_and_commits_program_identity() {
     let first = validate_execution(&context(), &valid, [1; 8]).unwrap();
     let second = validate_execution(&context(), &valid, [2; 8]).unwrap();
     assert_ne!(first, second);
-    assert_eq!(first.context_hash, commitment(&context()));
 }
 
 fn chunk() -> Chunk {

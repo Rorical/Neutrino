@@ -16,7 +16,7 @@
 //!   [`Hasher::hash_value`].
 //! * The empty trie has root [`crate::EMPTY_TRIE_ROOT`] (`[0; 32]`).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -78,19 +78,61 @@ impl<H: Hasher> Trie<H> {
         self.root
     }
 
-    /// Total number of distinct nodes ever produced. Reflects the
-    /// crate's append-only node store; production storage handles
-    /// refcounted pruning out-of-band.
+    /// Number of distinct nodes currently retained.
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
-    /// Total number of distinct values ever stored. Append-only for
-    /// the same reason as [`Trie::node_count`].
+    /// Number of distinct values currently retained.
     #[must_use]
     pub fn value_count(&self) -> usize {
         self.values.len()
+    }
+
+    /// Remove entries unreachable from the current root and the supplied roots.
+    ///
+    /// Every retained node and value is checked before any mutation. Missing or
+    /// corrupt state leaves the trie unchanged. The caller must commit matching
+    /// persistent deletions atomically before installing this pruned snapshot.
+    pub fn retain_roots(&mut self, roots: &[Hash]) -> Result<(), TrieError> {
+        let mut nodes = BTreeSet::new();
+        let mut values = BTreeSet::new();
+        let mut pending = roots.to_vec();
+        pending.push(self.root);
+        while let Some(hash) = pending.pop() {
+            if hash == ZERO_HASH || !nodes.insert(hash) {
+                continue;
+            }
+            let bytes = self
+                .nodes
+                .get(&hash)
+                .ok_or(TrieError::MissingRetainedEntry)?;
+            if H::hash_node(bytes) != hash {
+                return Err(TrieError::RetainedHashMismatch);
+            }
+            match Node::decode(bytes)? {
+                Node::Leaf { value_hash, .. } => {
+                    if values.insert(value_hash) {
+                        let value = self
+                            .values
+                            .get(&value_hash)
+                            .ok_or(TrieError::MissingRetainedEntry)?;
+                        if H::hash_value(value) != value_hash {
+                            return Err(TrieError::RetainedHashMismatch);
+                        }
+                    }
+                }
+                Node::Branch { left, right } => pending.extend([left, right]),
+                Node::Extension { child, .. } => pending.push(child),
+            }
+        }
+        self.nodes.retain(|hash, _| nodes.contains(hash));
+        self.values.retain(|hash, _| values.contains(hash));
+        self.pending_nodes.retain(|(hash, _)| nodes.contains(hash));
+        self.pending_values
+            .retain(|(hash, _)| values.contains(hash));
+        Ok(())
     }
 
     /// Drain every trie-node `(hash, bytes)` pair produced since the
@@ -832,6 +874,57 @@ mod tests {
         assert_eq!(trie.node_count(), 0);
         assert_eq!(trie.value_count(), 0);
         assert_eq!(trie.get(b"missing"), None);
+    }
+
+    #[test]
+    fn pruning_preserves_current_and_leased_roots_then_reclaims_released_state() {
+        let mut trie = TestTrie::new();
+        trie.insert(b"account", b"old".to_vec()).unwrap();
+        let old_root = trie.root();
+        trie.insert(b"account", b"middle".to_vec()).unwrap();
+        let middle_root = trie.root();
+        trie.insert(b"account", b"current".to_vec()).unwrap();
+        let current_root = trie.root();
+        trie.retain_roots(&[old_root]).unwrap();
+        assert_eq!(trie.root(), current_root);
+        assert_eq!(trie.get(b"account"), Some(b"current".to_vec()));
+        assert!(trie.node_bytes(&old_root).is_some());
+        assert!(trie.node_bytes(&middle_root).is_none());
+        assert_eq!(trie.node_count(), 2);
+        assert_eq!(trie.value_count(), 2);
+        assert_eq!(trie.pending_nodes.len(), 2);
+        assert_eq!(trie.pending_values.len(), 2);
+        let nodes = trie.drain_pending_nodes();
+        let values = trie.drain_pending_values();
+        let restored = TestTrie::from_persisted(old_root, nodes, values);
+        assert_eq!(restored.get(b"account"), Some(b"old".to_vec()));
+        trie.retain_roots(&[]).unwrap();
+        assert!(trie.node_bytes(&old_root).is_none());
+        assert_eq!(trie.node_count(), 1);
+        assert_eq!(trie.value_count(), 1);
+    }
+
+    #[test]
+    fn pruning_checks_reachable_state_before_deleting_anything() {
+        let mut trie = TestTrie::new();
+        trie.insert(b"account", b"old".to_vec()).unwrap();
+        trie.insert(b"account", b"current".to_vec()).unwrap();
+        let original = trie.clone();
+        assert_eq!(
+            trie.retain_roots(&[[99; 32]]),
+            Err(TrieError::MissingRetainedEntry)
+        );
+        assert_eq!(trie.nodes, original.nodes);
+        assert_eq!(trie.values, original.values);
+        let value_hash = <crate::Blake3Hasher as Hasher>::hash_value(b"current");
+        trie.values.insert(value_hash, b"corrupt".to_vec());
+        let corrupt_values = trie.values.clone();
+        assert_eq!(trie.retain_roots(&[]), Err(TrieError::RetainedHashMismatch));
+        assert_eq!(trie.nodes, original.nodes);
+        assert_eq!(trie.values, corrupt_values);
+        trie.values.remove(&value_hash);
+        assert_eq!(trie.retain_roots(&[]), Err(TrieError::MissingRetainedEntry));
+        assert_eq!(trie.nodes, original.nodes);
     }
 
     #[test]

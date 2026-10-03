@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "neutrino-default-checkpoint-guest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "SP1 bounded self-recursive history Guest."
+
+[dependencies]
+sp1-zkvm = { version = "=6.8.1", features = ["verify"] }
+borsh = { version = "1.8.1", default-features = false, features = ["derive"] }
+sha2 = { version = "0.11.0", default-features = false }
+neutrino-consensus-types = { path = "../../../consensus-types", default-features = false }
+neutrino-prover-checkpoint = { path = "../../../prover-checkpoint", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
+debug = false
+panic = "abort"

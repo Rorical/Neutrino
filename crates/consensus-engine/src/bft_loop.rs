@@ -489,7 +489,11 @@ impl<DB: Database> Engine<DB> {
         vote: FinalityVote,
     ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
         let chunk_id = vote.data.chunk_id;
-        if !self.bft_sessions.contains_key(&chunk_id) {
+        let next = self.finalized_next_chunk_id();
+        if (chunk_id < next
+            && !neutrino_consensus_types::history::is_recent_history_index(chunk_id, next))
+            || !self.bft_sessions.contains_key(&chunk_id)
+        {
             return Ok(Vec::new());
         }
         let chain_id = self.chain_spec().chain_id;
@@ -622,7 +626,7 @@ impl<DB: Database> Engine<DB> {
     }
 
     /// Read the validator-set root committed by the previous complete chunk,
-    /// using the genesis checkpoint before any chunk is finalized. Every BFT session binds
+    /// using the chain spec before any chunk is finalized. Every BFT session binds
     /// this root so equivocations across a validator-set rotation
     /// cannot finalize.
     fn previous_validator_set_root(
@@ -630,15 +634,10 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<neutrino_primitives::Hash, BftLoopError<DB::Error>> {
         if let Some(state) = self.store().get_consensus_state()? {
             return Ok(neutrino_prover_chunk::execution::commitment(
-                &state.statement.next_context.active_validators,
+                &state.next_context.active_validators,
             ));
         }
-        let previous_index = self.latest_checkpoint_index();
-        let previous = self
-            .store()
-            .get_checkpoint(previous_index)?
-            .ok_or(BftLoopError::Engine(EngineError::NotInitialised))?;
-        Ok(previous.end_validator_set_root)
+        Ok(self.chain_spec().genesis_validator_set_root)
     }
 
     /// Inspect every open BFT session and advance the round on
@@ -1001,8 +1000,8 @@ mod tests {
     use crate::validator_set::validator_set_root;
     use neutrino_consensus_types::Chunk;
     use neutrino_primitives::{
-        BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-        ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+        BlockHash, BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams,
+        RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
     };
     use neutrino_storage::MemoryDatabase;
 
@@ -1116,18 +1115,7 @@ mod tests {
         let proof = ProofParams::default();
         let vs_root = validator_set_root(&validators);
         let genesis_block_hash: BlockHash = [0xAA; 32];
-        let checkpoint = Checkpoint {
-            chain_id: 7,
-            index: 0,
-            start_height: 0,
-            end_height: 0,
-            start_block_hash: ZERO_HASH,
-            end_block_hash: genesis_block_hash,
-            start_state_root: ZERO_HASH,
-            end_state_root: ZERO_HASH,
-            end_validator_set_root: vs_root,
-            history_root: ZERO_HASH,
-        };
+
         // M7-C: keep the foundational session tests deterministic by
         // pinning `expected_aggregators_per_round` to a value so
         // small that no validator clears the VRF threshold. Tests
@@ -1148,7 +1136,6 @@ mod tests {
             genesis_state_root: ZERO_HASH,
             genesis_block_hash,
             genesis_validator_set_root: vs_root,
-            genesis_checkpoint: checkpoint,
             consensus,
             proof,
             state: StateParams::default(),
@@ -1194,7 +1181,7 @@ mod tests {
         let spec = chain_spec_with(1);
         let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let actions = engine.open_bft_session(chunk).expect("open session");
         assert_eq!(actions.len(), 3);
         assert!(matches!(actions[0], BftAction::BroadcastPrevote(_)));
@@ -1212,7 +1199,7 @@ mod tests {
         let spec = chain_spec_with(3);
         let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let actions = engine
             .open_bft_session(chunk.clone())
             .expect("open session");
@@ -1291,7 +1278,7 @@ mod tests {
         let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
 
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let _ = engine
             .open_bft_session(chunk.clone())
             .expect("open session");
@@ -1364,7 +1351,7 @@ mod tests {
     fn opening_the_same_chunk_twice_errors() {
         let spec = chain_spec_with(2);
         let mut engine = test_engine(spec.clone());
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         engine.open_bft_session(chunk.clone()).expect("first open");
         let err = engine
             .open_bft_session(chunk)
@@ -1385,7 +1372,7 @@ mod tests {
             "spec must elect v0 into the aggregator committee"
         );
 
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let actions = engine
             .open_bft_session(chunk.clone())
             .expect("open session");
@@ -1447,7 +1434,7 @@ mod tests {
         engine.set_local_voter(proposer(0));
         let chunk_id: ChunkId = 11;
         let chunk = {
-            let mut c = dummy_chunk(chunk_id, spec.genesis_checkpoint.end_validator_set_root);
+            let mut c = dummy_chunk(chunk_id, spec.genesis_validator_set_root);
             c.start_height = chunk_id + 1;
             c.end_height = chunk_id + 1;
             c
@@ -1475,7 +1462,7 @@ mod tests {
             !engine.local_is_aggregator_for(0, 0),
             "spec must not elect any aggregator"
         );
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let actions = engine.open_bft_session(chunk).expect("open session");
         assert!(actions.iter().all(|a| !matches!(
             a,
@@ -1488,7 +1475,7 @@ mod tests {
         let spec = chain_spec_with(3);
         let mut engine = test_engine(spec.clone());
         // No local_voter configured: this is a follower-only node.
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let actions = engine
             .open_bft_session(chunk.clone())
             .expect("open session");
@@ -1625,7 +1612,7 @@ mod tests {
         let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
 
-        let chunk = dummy_chunk(0, spec.genesis_checkpoint.end_validator_set_root);
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
         let chunk_hash = chunk.hash();
         let _ = engine.open_bft_session(chunk).expect("open session");
         // After open, session has v0's prevote. With 3 validators

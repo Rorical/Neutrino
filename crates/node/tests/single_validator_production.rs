@@ -28,8 +28,8 @@ use neutrino_consensus_engine::{BlockState, Engine, ProposerKey, validator_set_r
 use neutrino_default_runtime_core::ValidatorSet;
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
-    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
+    RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -63,18 +63,6 @@ fn chain_spec() -> ChainSpec {
     };
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash = [0xCC; 32];
-    let checkpoint = Checkpoint {
-        chain_id: CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     let consensus = ConsensusParams {
         chunk_size: 2,
         // Single validator must clear the eligibility threshold for
@@ -93,7 +81,6 @@ fn chain_spec() -> ChainSpec {
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus,
         proof,
         state: StateParams::default(),
@@ -233,7 +220,6 @@ fn slow_proving_releases_engine_for_reads_and_next_block_production() {
     impl ProofSystem for SlowProof {
         type BlockProof = MockBlockProof;
         type ChunkProof = Vec<u8>;
-        type RecursiveProof = Vec<u8>;
         fn prove_block(
             &self,
             witness: &[u8],

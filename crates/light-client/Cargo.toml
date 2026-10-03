@@ -12,7 +12,13 @@ publish       = { workspace = true }
 
 [features]
 default = ["std"]
-std = []
+std = ["neutrino-consensus-types/std", "neutrino-primitives/std", "neutrino-prover-checkpoint/std", "borsh/std"]
+
+[dependencies]
+borsh = { workspace = true }
+neutrino-consensus-types = { workspace = true }
+neutrino-primitives = { workspace = true }
+neutrino-prover-checkpoint = { workspace = true, default-features = false }
 
 [lints]
 workspace = true

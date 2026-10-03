@@ -276,19 +276,6 @@ impl ChainSpecFile {
         let genesis_validator_set_root =
             neutrino_consensus_engine::validator_set::validator_set_root(&validators);
 
-        let canonical_genesis_checkpoint = neutrino_primitives::Checkpoint {
-            chain_id: self.chain_id,
-            index: 0,
-            start_height: 0,
-            end_height: 0,
-            start_block_hash: ZERO_HASH,
-            end_block_hash: genesis_block_hash,
-            start_state_root: ZERO_HASH,
-            end_state_root: genesis_state_root,
-            end_validator_set_root: genesis_validator_set_root,
-            history_root: ZERO_HASH,
-        };
-
         let spec = ChainSpec {
             name,
             chain_id: self.chain_id,
@@ -300,7 +287,6 @@ impl ChainSpecFile {
             genesis_state_root,
             genesis_block_hash,
             genesis_validator_set_root,
-            genesis_checkpoint: canonical_genesis_checkpoint,
             consensus,
             proof: proof_params,
             state,

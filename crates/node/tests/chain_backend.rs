@@ -14,8 +14,8 @@ use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height, LightClientParams,
-    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    BlockHash, BoundedBytes, ChainSpec, ConsensusParams, Height, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
 };
 use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
@@ -44,18 +44,6 @@ fn spec() -> ChainSpec {
     let proof = ProofParams::default();
     let vs_root = validator_set_root(&validators());
     let genesis_block_hash: BlockHash = [0xAA; 32];
-    let checkpoint = Checkpoint {
-        chain_id: TEST_CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     ChainSpec {
         name: BoundedBytes::new(b"chain-backend-test".to_vec()).unwrap(),
         chain_id: TEST_CHAIN_ID,
@@ -67,7 +55,6 @@ fn spec() -> ChainSpec {
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus: ConsensusParams::default(),
         proof,
         state: StateParams::default(),
@@ -119,8 +106,121 @@ async fn status_reflects_engine_head_at_genesis() {
     assert_eq!(status.chain_id, 9);
     assert_eq!(status.head_height, 0);
     assert_eq!(status.head_block_hash, [0xAA; 32]);
-    assert_eq!(status.finalized_checkpoint_index, 0);
+    assert_eq!(status.recursive_covered_chunks, 0);
     assert_eq!(backend.chain_id(), 9);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn archive_capability_requires_actual_complete_history() {
+    use neutrino_consensus_engine::RetentionPolicy;
+    use neutrino_network::rpc::role_flags;
+    let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+    engine
+        .set_retention_policy(RetentionPolicy::Archive)
+        .unwrap();
+    let backend = ChainBackend::new(engine, MockProofSystem::new());
+    let metadata = backend.local_metadata().await;
+    assert_eq!(
+        metadata.role_flags,
+        role_flags::FULL_NODE | role_flags::ARCHIVE
+    );
+    assert_eq!(metadata.retained_from_chunk, Some(0));
+    assert_eq!(metadata.retained_from_height, Some(1));
+    let retention = neutrino_rpc::RpcBackend::history_retention(&backend)
+        .await
+        .unwrap();
+    assert!(retention.archive);
+    assert_eq!(retention.recursive_covered_chunks, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queries_distinguish_persisted_pruning_from_unknown_hashes() {
+    use neutrino_consensus_engine::{RetentionInfo, RetentionPolicy};
+    use neutrino_network::rpc::role_flags;
+    use neutrino_rpc::{QueryError, RpcBackend};
+    use neutrino_storage::{Column, Database};
+    use neutrino_sync::SyncBackendError;
+    let mut chain = spec();
+    chain.consensus.chunk_size = 2;
+    chain.proof.slot_budget_per_chunk = 2;
+    let engine = Engine::genesis(chain, MemoryDatabase::new()).unwrap();
+    let backend = ChainBackend::new(engine, MockProofSystem::new());
+    let first = block(1, 1, [0xAA; 32], [0x11; 32]);
+    let anchor = block(2, 2, first.hash(), [0x22; 32]);
+    backend
+        .verify_and_import_gossip_block(first.clone())
+        .await
+        .unwrap();
+    backend
+        .verify_and_import_gossip_block(anchor.clone())
+        .await
+        .unwrap();
+    // Query-layer fixture for an already atomically committed pruning watermark;
+    // the engine's retention suite separately proves deletion authorization.
+    backend.with_engine_mut_for_test(|engine| {
+        let db = engine.store_mut().db_mut();
+        db.put(
+            Column::Meta,
+            b"history_retention",
+            &borsh::to_vec(&RetentionInfo {
+                policy: RetentionPolicy::Pruned,
+                pruned_before_chunk: 1,
+                first_retained_height: 3,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        db.delete(Column::HeaderByHeight, &1_u64.to_be_bytes())
+            .unwrap();
+        db.delete(Column::Headers, &first.hash()).unwrap();
+        db.delete(Column::Blocks, &first.hash()).unwrap();
+        db.delete(Column::Blocks, &anchor.hash()).unwrap();
+    });
+    let error = QueryError::Pruned {
+        retained_from_chunk: 1,
+        retained_from_height: 3,
+    };
+    assert_eq!(backend.block_by_height(1).await, Err(error.clone()));
+    assert_eq!(backend.block_by_hash(anchor.hash()).await, Err(error));
+    assert_eq!(
+        backend.header_by_height(2).await.unwrap(),
+        Some(anchor.header.clone())
+    );
+    assert_eq!(backend.block_by_hash(first.hash()).await.unwrap(), None);
+    assert!(matches!(
+        backend.blocks_by_range(1, 1, 1, anchor.hash()).await,
+        Err(SyncBackendError::Pruned {
+            retained_from_chunk: 1,
+            retained_from_height: 3
+        })
+    ));
+    assert!(matches!(
+        backend.chunk_proofs_by_id(&[0]).await,
+        Err(SyncBackendError::Pruned { .. })
+    ));
+    assert!(matches!(
+        backend.blocks_by_root(&[first.hash()]).await,
+        Err(SyncBackendError::NotAvailable(_))
+    ));
+    let metadata = backend.local_metadata().await;
+    assert_eq!(metadata.role_flags, role_flags::FULL_NODE);
+    assert_eq!(metadata.retained_from_chunk, Some(1));
+    assert_eq!(metadata.retained_from_height, Some(3));
+    assert_eq!(backend.local_progress().await.unwrap().body_height, 2);
+    assert!(
+        !RpcBackend::history_retention(&backend)
+            .await
+            .unwrap()
+            .archive
+    );
+    assert!(matches!(
+        backend.history_proof_by_range([8; 32], [9; 32]).await,
+        Err(SyncBackendError::NotAvailable(_))
+    ));
+    assert_eq!(
+        RpcBackend::history_proof(&backend, [8; 32], [9; 32]).await,
+        Err(QueryError::HistoryUnavailable)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

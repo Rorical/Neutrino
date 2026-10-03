@@ -30,9 +30,8 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 #[path = "support/native_chunk.rs"]
 pub mod native_chunk;
@@ -77,18 +76,6 @@ fn chain_spec(count: u8) -> ChainSpec {
     };
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash: BlockHash = [0xAA; 32];
-    let checkpoint = Checkpoint {
-        chain_id: TEST_CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     let consensus = ConsensusParams {
         chunk_size: 1,
         // VRF eligibility budget high enough that v0 reliably clears
@@ -110,7 +97,6 @@ fn chain_spec(count: u8) -> ChainSpec {
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus,
         proof,
         state: StateParams::default(),
@@ -199,7 +185,7 @@ fn all_bft_topics() -> Vec<Topic> {
     for subnet in 0..u8::try_from(VOTE_SUBNETS).expect("subnet fits u8") {
         topics.push(Topic::AggregateFinalityVotes(subnet));
     }
-    // Recursive checkpoint proofs remain deferred.
+    // This fixture accepts only native chunk statements; real recursion has its own gate.
     topics
 }
 

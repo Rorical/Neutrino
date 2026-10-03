@@ -1,11 +1,11 @@
 //! Fact reuse and batch evidence proving. All returned receipts are verified once.
 
 use crate::{
-    Sp1ProofSystem,
+    ProgramProver, Sp1ProofSystem,
     fact_cache::{FactReceipt, verify_receipt},
 };
 use neutrino_consensus_types::evidence::{
-    EvidenceArtifact, EvidenceBatch, EvidenceMembership, HistoryOpening, MAX_EVIDENCE_BATCH,
+    EvidenceArtifact, EvidenceBatch, EvidenceMembership, MAX_EVIDENCE_BATCH, MerkleOpening,
 };
 use neutrino_proof_system::ProofError;
 use neutrino_prover_chunk::{
@@ -16,13 +16,10 @@ use neutrino_prover_chunk::{
     facts::{FactRecorder, FactRequest, FactStatement, FactWitness, MAX_FACTS, ProvenFact},
     receipt_codec,
 };
-use sp1_sdk::{
-    HashableKey, SP1Proof, SP1ProvingKey, SP1Stdin,
-    blocking::{ProveRequest, Prover},
-};
+use sp1_sdk::{HashableKey, SP1Proof, SP1Stdin, blocking::ProveRequest};
 use std::{collections::BTreeSet, sync::Arc};
 
-impl<P: Prover<ProvingKey = SP1ProvingKey> + Send + Sync> Sp1ProofSystem<P> {
+impl<P: ProgramProver> Sp1ProofSystem<P> {
     pub(super) fn compress_facts(
         &self,
         requests: &[FactRequest],
@@ -170,7 +167,7 @@ impl<P: Prover<ProvingKey = SP1ProvingKey> + Send + Sync> Sp1ProofSystem<P> {
             .map(|(index, statement)| EvidenceArtifact {
                 membership: EvidenceMembership {
                     batch: batch.clone(),
-                    opening: HistoryOpening::build(&leaves, index).expect("existing batch leaf"),
+                    opening: MerkleOpening::build(&leaves, index).expect("existing batch leaf"),
                 },
                 evidence_guest_vk_digest: self.evidence_vk.hash_u32(),
                 statement,

@@ -16,15 +16,13 @@ use neutrino_prover_chunk::{
 fn fixture() -> (ChainSpec, HistoryWitness) {
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let proven = validate_consensus(&input).unwrap();
-    let history = HistoryWitness {
-        chunks: vec![HistoricalChunk {
-            chunk: as_chunk(&proven.execution),
-            validators: input.context.active_validators,
-            seed: input.seed,
-            finality: input.finality_cert,
-        }],
-        penalties: vec![],
+    let record = HistoricalChunk {
+        chunk: as_chunk(&proven.chunk),
+        validators: input.context.active_validators,
+        seed: input.seed,
+        finality: input.finality_cert,
     };
+    let history = HistoryWitness::from_history(&[record], &[0]).unwrap();
     (input.chain_spec, history)
 }
 
@@ -53,26 +51,103 @@ fn double_vote() -> SlashingEvidence {
 }
 
 #[test]
-fn history_and_replay_openings_cannot_be_substituted_or_reordered() {
-    let (_, mut history) = fixture();
-    let root = neutrino_prover_chunk::history::history_commitment(&history.chunks);
-    let penalties = commitment(&history.penalties);
-    assert_eq!(history.authenticate(1, root, penalties), Ok(()));
-    history.chunks[0].validators[0].withdrawal_credentials[0] ^= 1;
+fn history_openings_cannot_be_substituted_or_reordered() {
+    let (_, history) = fixture();
+    let root = history.frontier.root().unwrap();
+    assert_eq!(history.authenticate(1, root), Ok(()));
+    let mut wrong = history.clone();
+    wrong.records[0].record.validators[0].withdrawal_credentials[0] ^= 1;
+    assert_eq!(wrong.authenticate(1, root), Err(HistoryError::Anchor));
+    assert_eq!(history.authenticate(0, root), Err(HistoryError::Anchor));
+    let mut wrong = history.clone();
+    wrong.records[0].path.siblings[0][0] ^= 1;
+    assert_eq!(wrong.authenticate(1, root), Err(HistoryError::Anchor));
+    let mut wrong = history.clone();
+    wrong.records.push(wrong.records[0].clone());
+    assert_eq!(wrong.authenticate(1, root), Err(HistoryError::Anchor));
+    let mut wrong = history;
+    wrong.frontier.count = 2;
+    assert_eq!(wrong.authenticate(1, root), Err(HistoryError::Anchor));
+}
+
+#[test]
+fn authenticated_old_votes_expire_at_the_eight_chunk_boundary() {
+    use neutrino_consensus_types::history::{HistoryFrontier, HistoryPath};
+    use neutrino_prover_chunk::history::{HistoricalOpening, verify_embedded_vote};
+
+    let (spec, initial) = fixture();
+    let source = initial.records[0].record.clone();
+    let vote = source.finality.precommit_vote();
+    let records: Vec<_> = (0..9)
+        .map(|id| {
+            let mut record = source.clone();
+            record.chunk.chunk_id = id;
+            record.chunk.start_height = id + 1;
+            record.chunk.end_height = id + 1;
+            record.finality.chunk_id = id;
+            record.finality.chunk_hash = record.chunk.hash();
+            record
+        })
+        .collect();
+    let latest = HistoryWitness::from_history(&records[..8], &[0, 7]).unwrap();
+    latest
+        .authenticate(8, latest.frontier.root().unwrap())
+        .unwrap();
+    verify_embedded_vote(&spec, &latest, &vote).unwrap();
+
+    let recent = HistoryWitness::from_history(&records, &[1, 8]).unwrap();
+    recent
+        .authenticate(9, recent.frontier.root().unwrap())
+        .unwrap();
+    assert!(HistoryWitness::from_history(&records, &[0]).is_none());
+
+    // The old record still has a valid membership proof and signed vote. Its
+    // exclusion is a protocol rule, including when an archive can supply it.
+    let leaves: Vec<_> = records
+        .iter()
+        .map(|record| commitment(&record.evidence_context()))
+        .collect();
+    let stale = HistoryWitness {
+        frontier: HistoryFrontier::from_leaves(&leaves).unwrap(),
+        records: vec![HistoricalOpening {
+            record: source,
+            path: HistoryPath::build(&leaves, 0).unwrap(),
+        }],
+    };
+    let root = stale.frontier.root().unwrap();
+    assert!(stale.records[0].path.verify(leaves[0], root));
+    assert_eq!(stale.authenticate(9, root), Err(HistoryError::Anchor));
     assert_eq!(
-        history.authenticate(1, root, penalties),
+        verify_embedded_vote(&spec, &stale, &vote),
         Err(HistoryError::Anchor)
     );
-    assert_eq!(
-        history.authenticate(0, root, penalties),
-        Err(HistoryError::Anchor)
+}
+
+#[test]
+fn historical_read_budgets_reject_declared_lengths_before_allocation() {
+    use neutrino_consensus_types::history::HistoryFrontier;
+    use neutrino_prover_chunk::history::{MAX_HISTORY_READS, MAX_HISTORY_RECORD_BYTES};
+    let mut encoded = borsh::to_vec(&HistoryFrontier::empty()).unwrap();
+    encoded.extend_from_slice(&u32::try_from(MAX_HISTORY_READS + 1).unwrap().to_le_bytes());
+    assert!(borsh::from_slice::<HistoryWitness>(&encoded).is_err());
+
+    let mut encoded = borsh::to_vec(&HistoryFrontier::empty()).unwrap();
+    encoded.extend_from_slice(&1_u32.to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(MAX_HISTORY_RECORD_BYTES + 1)
+            .unwrap()
+            .to_le_bytes(),
     );
-    let (_, mut history) = fixture();
-    history.penalties = vec![[2; 32], [1; 32]];
-    assert_eq!(
-        history.authenticate(1, root, commitment(&history.penalties)),
-        Err(HistoryError::Anchor)
-    );
+    assert!(borsh::from_slice::<HistoryWitness>(&encoded).is_err());
+
+    let (_, witness) = fixture();
+    let decoded = borsh::from_slice::<HistoryWitness>(&borsh::to_vec(&witness).unwrap()).unwrap();
+    assert_eq!(decoded, witness);
+    decoded
+        .authenticate(1, witness.frontier.root().unwrap())
+        .unwrap();
+    assert!(HistoryWitness::from_history(&[], &[0]).is_none());
+    assert!(witness.record(1).is_err());
 }
 
 #[test]
@@ -111,7 +186,7 @@ fn rejected_proof_requires_the_exact_signed_artifact() {
     };
     let witness = EvidenceWitness {
         chain_spec: spec,
-        source: history.chunks[0].clone(),
+        source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(evidence.clone()),
         block_guest_vk_digest: [1; 8],
     };
@@ -134,19 +209,15 @@ fn finalized_divergence_requires_actual_equivocation_and_shares_its_replay_id() 
         unreachable!()
     };
     let data = FinalityVoteData {
-        chunk_hash: history.chunks[0].chunk.hash(),
+        chunk_hash: history.records[0].record.chunk.hash(),
         ..vote_a.data
     };
     let mut message = Vec::from(DOMAIN_PRECOMMIT);
     message.extend_from_slice(&7_u64.to_le_bytes());
     message.extend_from_slice(&borsh::to_vec(&data).unwrap());
-    let mut checkpoint = spec.genesis_checkpoint.clone();
-    checkpoint.end_block_hash = history.chunks[0].chunk.end_block_hash;
-    checkpoint.end_state_root = history.chunks[0].chunk.end_state_root;
     let mut evidence = SlashingEvidence::LongRangeForkParticipation {
         validator_index: 0,
         vote: vote_a,
-        canonical_finalized_chunk: checkpoint,
         canonical_vote: IndexedVote {
             data,
             signature: key.sign(&message).to_bytes(),
@@ -154,7 +225,7 @@ fn finalized_divergence_requires_actual_equivocation_and_shares_its_replay_id() 
     };
     let witness = EvidenceWitness {
         chain_spec: spec,
-        source: history.chunks[0].clone(),
+        source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(double_vote()),
         block_guest_vk_digest: [1; 8],
     };
@@ -234,10 +305,10 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
     let (spec, mut history) = fixture();
     let participating = EvidenceWitness {
         chain_spec: spec.clone(),
-        source: history.chunks[0].clone(),
+        source: history.records[0].record.clone(),
         claim: EvidenceClaim::Inactivity {
             validator_index: 0,
-            certificate: history.chunks[0].finality.clone(),
+            certificate: history.records[0].record.finality.clone(),
         },
         block_guest_vk_digest: [1; 8],
     };
@@ -247,7 +318,7 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
     );
     // A genuine quorum may omit a positive-stake validator; authorization is
     // explicitly certificate non-inclusion, not proof of an absent network vote.
-    let record = &mut history.chunks[0];
+    let record = &mut history.records[0].record;
     let mut missing = record.validators[0].clone();
     missing.pubkey = SecretKey::key_gen(&[43; 32], &[])
         .unwrap()
@@ -341,20 +412,32 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
         certificate: alternate,
     };
     assert!(neutrino_prover_chunk::evidence::validate_evidence(&evidence).is_ok());
-    let root = neutrino_prover_chunk::history::history_commitment(&history.chunks);
+    let root = neutrino_prover_chunk::history::history_commitment(
+        &history
+            .records
+            .iter()
+            .map(|opening| opening.record.clone())
+            .collect::<Vec<_>>(),
+    );
     let mut forged = history.clone();
-    forged.chunks[0].finality.precommit.signature[0] ^= 1;
+    forged.records[0].record.finality.precommit.signature[0] ^= 1;
     assert_eq!(
         root,
-        neutrino_prover_chunk::history::history_commitment(&forged.chunks)
+        neutrino_prover_chunk::history::history_commitment(
+            &forged
+                .records
+                .iter()
+                .map(|opening| opening.record.clone())
+                .collect::<Vec<_>>()
+        )
     );
     // A stored certificate may differ; the submitted certificate must authenticate.
-    evidence.source.finality = forged.chunks[0].finality.clone();
+    evidence.source.finality = forged.records[0].record.finality.clone();
     let accepted = validate_evidence(&evidence).unwrap();
     assert_eq!(accepted.offender.withdrawal_credentials, [9; 32]);
     evidence.claim = EvidenceClaim::Inactivity {
         validator_index: 1,
-        certificate: forged.chunks[0].finality.clone(),
+        certificate: forged.records[0].record.finality.clone(),
     };
     assert_eq!(validate_evidence(&evidence), Err(HistoryError::Evidence));
 }
@@ -364,7 +447,7 @@ fn evidence_guest_statement_binds_identity_rules_and_canonical_event() {
     let (spec, history) = fixture();
     let mut witness = EvidenceWitness {
         chain_spec: spec,
-        source: history.chunks[0].clone(),
+        source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(double_vote()),
         block_guest_vk_digest: [1; 8],
     };
@@ -400,11 +483,12 @@ fn evidence_guest_statement_binds_identity_rules_and_canonical_event() {
 
 #[test]
 fn evidence_submission_rejects_wrong_anchor_window_and_history() {
-    use neutrino_consensus_types::evidence::{EvidenceAnchor, EvidenceSubmission, HistoryOpening};
+    use neutrino_consensus_types::evidence::{EvidenceAnchor, EvidenceSubmission};
+    use neutrino_consensus_types::history::HistoryPath;
     let (spec, history) = fixture();
     let claim = validate_evidence(&EvidenceWitness {
         chain_spec: spec.clone(),
-        source: history.chunks[0].clone(),
+        source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(double_vote()),
         block_guest_vk_digest: [1; 8],
     })
@@ -414,14 +498,14 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
         fact_guest_vk_digest: [3; 8],
         chain_spec_hash: spec.hash(),
         chunk_id: 1,
-        history_root: neutrino_consensus_types::evidence::history_root(&leaves),
+        history_root: neutrino_consensus_types::history::history_root(&leaves),
         block_guest_vk_digest: [1; 8],
         evidence_guest_vk_digest: [2; 8],
         policy: spec.runtime,
     };
     let submission = EvidenceSubmission {
         statement: claim,
-        history: HistoryOpening::build(&leaves, 0).unwrap(),
+        history: HistoryPath::build(&leaves, 0).unwrap(),
     };
     assert!(submission.binds(7, 2, &anchor));
     assert!(!submission.binds(8, 2, &anchor));

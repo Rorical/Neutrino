@@ -38,5 +38,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: CUDA client integration (no GPU required)
+        run: |
+          cargo test --locked -p neutrino-node -p neutrino-runtime-host --features neutrino-node/cuda
+          cargo clippy --locked --all-targets -p neutrino-node -p neutrino-runtime-host --features neutrino-node/cuda -- -D warnings
+
       - name: Format
         run: cargo fmt --all -- --check

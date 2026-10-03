@@ -1,8 +1,9 @@
 # 20 — Evidence proofs and mandatory sanctions
 
-Status: implemented. Current-program workspace acceptance passed on 2026-10-03.
+Status: implemented. Current-program workspace and CUDA-client checks passed on
+2026-10-03; see the [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
 Real compressed composition acceptance remains pending as a separate gate.
-Checkpoint recursion remains deferred.
+History recursion composes completed Chunk statements; it never rechecks evidence offences.
 
 ## Composition
 
@@ -66,11 +67,13 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
 - [x] Chunk consumes proven sanctions without evidence verification.
 - [x] Node generation, persistent pool, gossip, import and restart paths.
 - [x] Adversarial, lifecycle, queue and native/WASM/Guest parity tests.
-- [x] Current-program locked build, complete workspace tests (715 passed,
-  5 opt-in tests ignored), strict Clippy and workspace/Guest format checks.
-  The four Guest ELFs and WASM hashes were unchanged across these checks.
-- [ ] Real SP1 EvidenceProof → block → chunk composition gate: local acceptance
+- [x] Current-program workspace build, tests (819 passed), strict Clippy and
+  workspace/Guest formatting passed on 2026-10-03. CUDA-client tests and strict
+  Clippy passed; final retention/reconnect fixes also passed sync-driver regressions.
+- [ ] Real SP1 EvidenceProof → block → chunk → History composition gate: local acceptance
   was cancelled. The upgraded programs require a fresh run on a suitable prover.
+  An opt-in CUDA gate uses the same fixture with independent local verification;
+  see [GPU proving](../gpu-proving.md). Hardware acceptance remains pending.
 
 Early fact compression and batch evidence proving are implemented. Individual BFT
 votes never wait for a fact proof. A bounded background worker coalesces queued
@@ -143,6 +146,14 @@ Defaults are 1,024 blocks for evidence admission, 2,048 blocks for unbonding,
 requires `evidence_max_age_blocks + chunk_size < unbonding_delay_blocks` and
 nonzero bounded queue throughput. A full FIFO therefore drains within 64
 advancing blocks at default throughput. An admitted obligation does not expire.
+
+Evidence must also reference one of the eight preceding finalized chunks:
+for incoming chunk `n`, source IDs must lie in `[n.saturating_sub(8), n)`.
+Both the block-age limit and this chunk window apply, including on archive nodes.
+The eighth preceding chunk is admissible; the ninth is rejected even with a valid
+membership proof and signatures. This rule also bounds ordinary embedded votes.
+Pruning never expires an admitted FIFO obligation or removes its current-state
+withdrawal hold or offence replay marker.
 
 Historical context commits the chunk, membership and seed, independently of a
 certificate's signer subset. Different valid certificates must produce the same

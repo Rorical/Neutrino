@@ -4,12 +4,12 @@
 use alloc::vec::Vec;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use neutrino_consensus_types::history_proof::Checkpoint;
 use neutrino_consensus_types::{
-    BlockProof, Body, Chunk, ChunkProof, FinalityCert, Header, RecursiveCheckpointProof,
-    SlashingEvidence,
+    BlockProof, Body, Chunk, ChunkProof, FinalityCert, Header, SlashingEvidence,
 };
 use neutrino_primitives::{
-    BlockHash, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Seed, Slot, Validator,
+    BlockHash, CheckpointIndex, ChunkId, Hash, Height, Seed, Slot, Validator,
 };
 use neutrino_storage::{Column, Database};
 
@@ -43,7 +43,7 @@ pub type ContentAddressedEntries = Vec<(Hash, Vec<u8>)>;
 /// iteration over numeric keys matches numeric order.
 #[derive(Debug)]
 pub struct ChainStore<DB> {
-    db: DB,
+    pub(super) db: DB,
 }
 
 impl<DB> ChainStore<DB> {
@@ -108,20 +108,17 @@ impl<DB: Database> ChainStore<DB> {
         self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)
     }
 
-    /// Drop expired receipts or offences in the authenticated, sorted finalized
-    /// ledger. Unfinalized execution is retained for re-admission after reorg.
+    /// Drop expired receipts or offences admitted by authenticated finalized blocks.
+    /// Unfinalized execution is retained for re-admission after reorg.
     pub fn prune_evidence_artifacts(
         &mut self,
         finalized_height: u64,
         max_age: u64,
-        finalized_penalties: &[Hash],
     ) -> Result<(), StoreError<DB::Error>> {
         let mut batch = neutrino_storage::Batch::new();
         for artifact in self.evidence_artifacts()? {
             if finalized_height.saturating_sub(artifact.statement.context.end_height) >= max_age
-                || finalized_penalties
-                    .binary_search(&artifact.statement.offence_id)
-                    .is_ok()
+                || self.is_offence_finalized(&artifact.statement.offence_id)?
             {
                 batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
@@ -163,12 +160,13 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Atomically persist complete finality and its outgoing trust boundary.
     pub(crate) fn consensus_finalization_batch(
+        &self,
         witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
         proof: &ChunkProof,
         state: &crate::full_chunk::ConsensusState,
     ) -> Result<neutrino_storage::Batch, StoreError<DB::Error>> {
         let mut batch = neutrino_storage::Batch::new();
-        let chunk = neutrino_prover_chunk::consensus::as_chunk(&state.statement.execution);
+        let chunk = neutrino_prover_chunk::consensus::as_chunk(&state.statement.chunk);
         let key = keys::chunk_id_key(chunk.chunk_id);
         batch.put(Column::Chunks, key, borsh::to_vec(&chunk)?);
         batch.put(Column::ChunkProofs, key, borsh::to_vec(proof)?);
@@ -188,12 +186,8 @@ impl<DB: Database> ChainStore<DB> {
             pointers::FINALIZED_HEAD,
             chunk.end_block_hash,
         );
-        batch.put(
-            Column::Finalized,
-            pointers::FINALIZED_SEED,
-            state.statement.next_seed,
-        );
-        let next = &state.statement.next_context;
+        batch.put(Column::Finalized, pointers::FINALIZED_SEED, state.next_seed);
+        let next = &state.next_context;
         batch.put(
             Column::ValidatorSetSnapshots,
             keys::checkpoint_index_key(next.chunk_id),
@@ -204,7 +198,56 @@ impl<DB: Database> ChainStore<DB> {
             pointers::LATEST_VALIDATOR_SET_INDEX,
             keys::checkpoint_index_key(next.chunk_id),
         );
+        if let Some(domain) = self.history_domain()? {
+            for boundary in [state.statement.start, state.statement.end] {
+                let checkpoint = Checkpoint { domain, boundary };
+                batch.put(
+                    Column::Checkpoints,
+                    keys::chunk_id_key(boundary.next_chunk_id),
+                    borsh::to_vec(&checkpoint)?,
+                );
+                batch.put(
+                    Column::Checkpoints,
+                    checkpoint.hash(),
+                    borsh::to_vec(&checkpoint)?,
+                );
+            }
+        }
+        batch.put(
+            Column::ChunkStatements,
+            key,
+            borsh::to_vec(&state.statement)?,
+        );
+        batch.put(
+            Column::ConsensusBoundaries,
+            keys::chunk_id_key(state.statement.start.next_chunk_id),
+            borsh::to_vec(&state.statement.start)?,
+        );
+        batch.put(
+            Column::ConsensusBoundaries,
+            keys::chunk_id_key(state.statement.end.next_chunk_id),
+            borsh::to_vec(&state.statement.end)?,
+        );
+        let record = neutrino_prover_chunk::history::HistoricalChunk {
+            chunk,
+            validators: witness.context.active_validators.clone(),
+            seed: witness.seed,
+            finality: witness.finality_cert.clone(),
+        };
+        let frontier = self.append_history_batch(&mut batch, &record)?;
+        if frontier != state.frontier || frontier.root() != Some(state.statement.end.history_root) {
+            return Err(StoreError::Corrupt(
+                "proven history append differs from archive",
+            ));
+        }
         for block in &witness.blocks {
+            for admission in &block.output.accountability.admitted {
+                batch.put(
+                    Column::FinalizedOffences,
+                    admission.offence_id,
+                    block.header.height.to_be_bytes(),
+                );
+            }
             batch.put(
                 Column::BlockStates,
                 block.header.hash(),
@@ -216,7 +259,7 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Generic helpers ----------
 
-    fn put_encoded<T: BorshSerialize>(
+    pub(super) fn put_encoded<T: BorshSerialize>(
         &mut self,
         column: Column,
         key: &[u8],
@@ -228,7 +271,7 @@ impl<DB: Database> ChainStore<DB> {
             .map_err(StoreError::Database)
     }
 
-    fn get_decoded<T: BorshDeserialize>(
+    pub(super) fn get_decoded<T: BorshDeserialize>(
         &self,
         column: Column,
         key: &[u8],
@@ -243,7 +286,7 @@ impl<DB: Database> ChainStore<DB> {
         }
     }
 
-    fn put_raw(
+    pub(super) fn put_raw(
         &mut self,
         column: Column,
         key: &[u8],
@@ -254,7 +297,7 @@ impl<DB: Database> ChainStore<DB> {
             .map_err(StoreError::Database)
     }
 
-    fn get_raw(
+    pub(super) fn get_raw(
         &self,
         column: Column,
         key: &[u8],
@@ -489,42 +532,20 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Checkpoints ----------
 
-    /// Persist `checkpoint` keyed by `checkpoint.index`.
-    pub fn put_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<(), StoreError<DB::Error>> {
-        self.put_encoded(
-            Column::Checkpoints,
-            &keys::checkpoint_index_key(checkpoint.index),
-            checkpoint,
-        )
-    }
-
     /// Read the checkpoint at `index`.
     pub fn get_checkpoint(
         &self,
         index: CheckpointIndex,
     ) -> Result<Option<Checkpoint>, StoreError<DB::Error>> {
-        self.get_decoded(Column::Checkpoints, &keys::checkpoint_index_key(index))
-    }
-
-    /// Persist a recursive checkpoint proof keyed by checkpoint index.
-    pub fn put_recursive_proof(
-        &mut self,
-        index: CheckpointIndex,
-        proof: &RecursiveCheckpointProof,
-    ) -> Result<(), StoreError<DB::Error>> {
-        self.put_encoded(
-            Column::RecursiveProofs,
-            &keys::checkpoint_index_key(index),
-            proof,
-        )
-    }
-
-    /// Read a recursive checkpoint proof by checkpoint index.
-    pub fn get_recursive_proof(
-        &self,
-        index: CheckpointIndex,
-    ) -> Result<Option<RecursiveCheckpointProof>, StoreError<DB::Error>> {
-        self.get_decoded(Column::RecursiveProofs, &keys::checkpoint_index_key(index))
+        let checkpoint: Option<Checkpoint> =
+            self.get_decoded(Column::Checkpoints, &keys::checkpoint_index_key(index))?;
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.boundary.next_chunk_id != index)
+        {
+            return Err(StoreError::Corrupt("checkpoint count index mismatch"));
+        }
+        Ok(checkpoint)
     }
 
     /// Persist a validator-set snapshot keyed by checkpoint index.
@@ -602,22 +623,22 @@ impl<DB: Database> ChainStore<DB> {
     }
 
     /// Write the latest checkpoint index.
-    pub fn put_latest_checkpoint_index(
+    pub fn put_recursive_covered_chunks(
         &mut self,
         index: CheckpointIndex,
     ) -> Result<(), StoreError<DB::Error>> {
         self.put_raw(
             Column::Finalized,
-            pointers::LATEST_CHECKPOINT_INDEX,
+            pointers::RECURSIVE_COVERED_CHUNKS,
             &keys::checkpoint_index_key(index),
         )
     }
 
     /// Read the latest checkpoint index.
-    pub fn get_latest_checkpoint_index(
+    pub fn get_recursive_covered_chunks(
         &self,
     ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::LATEST_CHECKPOINT_INDEX)?;
+        let raw = self.get_raw(Column::Finalized, pointers::RECURSIVE_COVERED_CHUNKS)?;
         raw.map(|bytes| {
             <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_be_bytes)
@@ -863,18 +884,37 @@ mod tests {
         }
     }
 
-    fn checkpoint(index: u64, prev_hash: Hash) -> Checkpoint {
+    fn checkpoint(index: u64, parent: Hash) -> Checkpoint {
+        use neutrino_consensus_types::history_proof::{
+            ChainBinding, ConsensusBoundary, ExecutionPrograms, ProofDomain,
+        };
         Checkpoint {
-            chain_id: 7,
-            index,
-            start_height: 1,
-            end_height: 128,
-            start_block_hash: prev_hash,
-            end_block_hash: h(20),
-            start_state_root: h(21),
-            end_state_root: h(22),
-            end_validator_set_root: h(17),
-            history_root: h(23),
+            domain: ProofDomain {
+                chain: ChainBinding {
+                    chain_id: 7,
+                    chain_spec_hash: h(1),
+                    chunk_size: 128,
+                    runtime_code_hash: h(2),
+                    gas_price: 0,
+                },
+                execution: ExecutionPrograms {
+                    fact: [1; 8],
+                    evidence: [2; 8],
+                    block: [3; 8],
+                },
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
+            boundary: ConsensusBoundary {
+                next_chunk_id: index,
+                height: index * 128,
+                block_hash: parent,
+                state_root: h(22),
+                slot: index * 128,
+                validators_root: h(17),
+                seed: h(24),
+                history_root: h(23),
+            },
         }
     }
 
@@ -901,12 +941,12 @@ mod tests {
         assert_eq!(store.get_chunk_proof(0).expect("get"), None);
         assert_eq!(store.get_finality_cert(0).expect("get"), None);
         assert_eq!(store.get_checkpoint(0).expect("get"), None);
-        assert_eq!(store.get_recursive_proof(0).expect("get"), None);
+        assert_eq!(store.history_proof(&h(0)).expect("get"), None);
         assert_eq!(store.get_validator_set_snapshot(0).expect("get"), None);
         assert_eq!(store.get_tip().expect("get"), None);
         assert_eq!(store.get_finalized_head().expect("get"), None);
         assert_eq!(store.get_latest_finalized_chunk_id().expect("get"), None);
-        assert_eq!(store.get_latest_checkpoint_index().expect("get"), None);
+        assert_eq!(store.get_recursive_covered_chunks().expect("get"), None);
         assert_eq!(store.get_chain_spec_hash().expect("get"), None);
     }
 
@@ -1069,20 +1109,31 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_and_recursive_proof_roundtrip() {
+    fn checkpoint_and_range_artifact_roundtrip() {
+        use neutrino_consensus_types::history_proof::{HistoryProof, HistoryStatement};
         let mut store = ChainStore::new(MemoryDatabase::new());
-        let cp = checkpoint(3, h(100));
-        store.put_checkpoint(&cp).expect("put");
-        assert_eq!(store.get_checkpoint(3).expect("get"), Some(cp.clone()));
-
-        let rp = RecursiveCheckpointProof {
-            checkpoint_index: 3,
-            checkpoint_hash: cp.hash(),
-            public_inputs: cp.clone(),
-            proof_bytes: vec![0xAB, 0xCD],
+        let start = checkpoint(0, h(100));
+        let end = checkpoint(3, h(101));
+        let proof = HistoryProof {
+            statement: HistoryStatement {
+                domain: start.domain,
+                start: start.boundary,
+                end: end.boundary,
+            },
+            receipt: neutrino_primitives::BoundedBytes::new(vec![0xAB, 0xCD]).unwrap(),
         };
-        store.put_recursive_proof(3, &rp).expect("put");
-        assert_eq!(store.get_recursive_proof(3).expect("get"), Some(rp));
+        store.commit_history_artifact(&proof, true).unwrap();
+        assert_eq!(
+            store.history_proof_for_range(0, 3).unwrap(),
+            Some(proof.clone())
+        );
+        assert_eq!(
+            store.history_proof(&proof.statement.range_id()).unwrap(),
+            Some(proof)
+        );
+        assert_eq!(store.get_checkpoint(3).unwrap(), Some(end));
+        assert_eq!(store.checkpoint_by_hash(&end.hash()).unwrap(), Some(end));
+        assert_eq!(store.get_recursive_covered_chunks().unwrap(), Some(3));
     }
 
     #[test]
@@ -1113,7 +1164,7 @@ mod tests {
             .expect("put");
         store.put_finalized_head(h(2)).expect("put");
         store.put_latest_finalized_chunk_id(42).expect("put");
-        store.put_latest_checkpoint_index(7).expect("put");
+        store.put_recursive_covered_chunks(7).expect("put");
         store.put_chain_spec_hash(h(99)).expect("put");
         assert_eq!(store.get_tip().expect("get"), Some(h(1)));
         assert_eq!(store.get_finalized_head().expect("get"), Some(h(2)));
@@ -1121,7 +1172,7 @@ mod tests {
             store.get_latest_finalized_chunk_id().expect("get"),
             Some(42)
         );
-        assert_eq!(store.get_latest_checkpoint_index().expect("get"), Some(7));
+        assert_eq!(store.get_recursive_covered_chunks().expect("get"), Some(7));
         assert_eq!(store.get_chain_spec_hash().expect("get"), Some(h(99)));
     }
 

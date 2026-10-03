@@ -65,6 +65,15 @@ impl Default for MockBackend {
 
 #[async_trait]
 impl RpcBackend for MockBackend {
+    async fn history_retention(&self) -> Result<neutrino_rpc::HistoryRetention, QueryError> {
+        Ok(neutrino_rpc::HistoryRetention {
+            archive: false,
+            retained_from_chunk: Some(4),
+            retained_from_height: Some(8_193),
+            finalized_chunks: 12,
+            recursive_covered_chunks: 12,
+        })
+    }
     fn chain_id(&self) -> ChainId {
         self.chain_id
     }
@@ -397,6 +406,14 @@ async fn unavailable_data_is_an_error_instead_of_a_null_result() {
         (QueryError::StateUnavailable, -32021),
         (QueryError::Storage("disk read failed".to_owned()), -32022),
         (QueryError::BodyUnavailable, -32023),
+        (QueryError::HistoryUnavailable, -32025),
+        (
+            QueryError::Pruned {
+                retained_from_chunk: 4,
+                retained_from_height: 8_193,
+            },
+            -32024,
+        ),
     ] {
         let module = build_module(Arc::new(MockBackend {
             query_error: Some(error),
@@ -420,6 +437,28 @@ async fn unavailable_data_is_an_error_instead_of_a_null_result() {
         ] {
             let error = call_named(&module, method, params).await.expect_err(method);
             assert_eq!(error["code"], code);
+            if code == -32024 {
+                assert_eq!(
+                    error["data"],
+                    json!({ "retained_from_chunk": 4, "retained_from_height": 8_193 })
+                );
+            }
         }
     }
+}
+
+#[tokio::test]
+async fn history_retention_reports_actual_availability_and_proof_coverage() {
+    let module = build_module(Arc::new(MockBackend::default())).unwrap();
+    let result: Value = module.call("history_getRetention", [(); 0]).await.unwrap();
+    assert_eq!(
+        result,
+        json!({
+            "archive": false,
+            "retained_from_chunk": 4,
+            "retained_from_height": 8_193,
+            "finalized_chunks": 12,
+            "recursive_covered_chunks": 12,
+        })
+    );
 }

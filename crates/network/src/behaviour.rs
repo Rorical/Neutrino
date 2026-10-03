@@ -2,9 +2,9 @@
 
 use crate::rpc::{
     BlockProofByHashBehaviour, BlockProofByHeightBehaviour, BlocksByRangeBehaviour,
-    BlocksByRootBehaviour, ChunkProofByIdBehaviour, FinalityCertByChunkBehaviour,
-    MetadataBehaviour, PingBehaviour, RecursiveProofByIndexBehaviour,
-    RecursiveProofLatestBehaviour, StateByRootBehaviour, StatusBehaviour, WitnessByBlockBehaviour,
+    BlocksByRootBehaviour, CheckpointLatestBehaviour, ChunkProofByIdBehaviour,
+    FinalityCertByChunkBehaviour, HistoryProofByRangeBehaviour, MetadataBehaviour, PingBehaviour,
+    StateByRootBehaviour, StatusBehaviour, WitnessByBlockBehaviour,
 };
 use libp2p::{
     connection_limits, gossipsub, identify,
@@ -55,10 +55,10 @@ pub struct NeutrinoBehaviour {
     pub rpc_block_proof_by_height: BlockProofByHeightBehaviour,
     /// `/neutrino/req/chunk_proof_by_id` request/response.
     pub rpc_chunk_proof_by_id: ChunkProofByIdBehaviour,
-    /// `/neutrino/req/recursive_proof_latest` request/response.
-    pub rpc_recursive_proof_latest: RecursiveProofLatestBehaviour,
-    /// `/neutrino/req/recursive_proof_by_index` request/response.
-    pub rpc_recursive_proof_by_index: RecursiveProofByIndexBehaviour,
+    /// `/neutrino/req/checkpoint_latest` request/response.
+    pub rpc_checkpoint_latest: CheckpointLatestBehaviour,
+    /// `/neutrino/req/history_proof_by_range` request/response.
+    pub rpc_history_proof_by_range: HistoryProofByRangeBehaviour,
     /// `/neutrino/req/finality_cert_by_chunk` request/response.
     pub rpc_finality_cert_by_chunk: FinalityCertByChunkBehaviour,
     /// `/neutrino/req/witness_by_block` request/response.

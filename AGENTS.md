@@ -42,13 +42,19 @@ have passed.
   admit sanctions and execute the mandatory FIFO. Chunks consume proven effects
   and verify complete consensus without repeating STF/evidence work.
 - Complete chunk proofs are the only finalization path. Certificates and mandatory
-  precommit attestations are required. Checkpoint recursion remains deferred;
-  `prover-checkpoint` is a scaffold and production recursion returns `Unsupported`.
+  precommit attestations are required. A separate checkpoint Guest folds Chunk
+  receipts and merges adjacent History ranges using Compressed STARK recursion.
+  History coverage never gates chunk finality. Read `docs/design/21-recursive-checkpoint-proofs.md`
+  before changing recursion, history storage or light-client trust policy.
+- Historical consensus references are restricted to the preceding eight finalized
+  chunks. Full/validator nodes prune older raw data only below saved recursive
+  coverage; archive nodes preserve history. Proof jobs pin receipts and boundaries,
+  not old transaction bodies or execution state. Current sanctions remain live state.
 - There is one current protocol format with unversioned types, fields and paths.
   Incompatible development upgrades replace formats directly. Do not introduce
   deprecated variants, compatibility shims, fake recursive proofs or empty-proof
   finalization paths.
-- Workspace checks and real compressed EvidenceProof → block → chunk composition
+- Workspace checks and real compressed EvidenceProof → block → chunk → History composition
   are separate acceptance gates. Do not carry results over between changed ELFs.
 
 ## Runtime crate layout

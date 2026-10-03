@@ -5,7 +5,7 @@ the pinned block program and exact public values, then validates the complete
 execution/consensus transition. Native and Guest paths share `prover-chunk` logic.
 
 The verifier supplies the trusted chain specification and incoming context:
-parent hash/state, active validators, seed, historical records and consumed penalties.
+parent hash/state, active validators, seed and the authenticated history root.
 The proof cannot establish the canonicality of an arbitrary starting anchor.
 
 For each block the Guest authenticates its header projection through the block
@@ -25,7 +25,9 @@ domain/chain/round/chunk binding and mandatory precommit attestation coverage.
 Attestations retain individually signed votes, exact ordered proof-envelope hashes
 and signed unlock claims. It derives validator activation/exit/stake changes from
 authenticated runtime state, verifies registrations, consumes block-proven sanctions,
-and commits the next validator set, seed, history and penalty ledger.
+and commits the next validator root, seed and history root in a compact boundary.
+The full next context is retained by the node. Sanction replay protection is owned
+by permanent Block STF offence markers; Chunk has no duplicate penalty ledger.
 
 Historical commitments exclude certificate signer subsets; alternative valid quorum
 certificates cannot produce different history roots. Evidence validity is proved by
@@ -40,7 +42,15 @@ path. `FinalityCert` is mandatory in the chunk proof wire format.
 Implementation is covered by adversarial boundary, signature/quorum, proof-key,
 rotation, accountability and native/WASM/Guest tests. Real CPU compressed composition
 must be accepted separately for the current programs; see
-[evidence proofs](20-evidence-proofs.md). Checkpoint recursion remains deferred.
+[evidence proofs](20-evidence-proofs.md).
+
+The [checkpoint Guest](21-recursive-checkpoint-proofs.md) consumes compact start/end
+boundaries with the Chunk and certificate bindings. Chunk history witnesses contain
+only actually referenced records, fixed 64-level membership paths and an append
+frontier. They never enumerate all earlier chunks. For incoming chunk `n`, only
+indices `[n.saturating_sub(8), n)` are admissible. Reads are capped at eight records
+and 8 MiB of encoded record data, with bounds enforced during decoding. Node opening
+generation uses indexed tree nodes; it does not scan the chain history.
 
 
 ## Guest signature work

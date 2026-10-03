@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use neutrino_consensus_engine::Engine;
-use neutrino_consensus_types::{Block, Header};
+use neutrino_consensus_engine::{Engine, RetentionPolicy};
+use neutrino_consensus_types::{Block, Header, HistoryProof};
 use neutrino_mempool::InsertError;
 use neutrino_primitives::{BlockHash, ChainId, Hash, Height, Validator, ZERO_HASH};
 use neutrino_proof_system::ProofSystem;
 use neutrino_rpc::{
-    BlockId, FinalizedInfo, HeadInfo, QueryError, RpcBackend, RuntimeCallError,
+    BlockId, FinalizedInfo, HeadInfo, HistoryRetention, QueryError, RpcBackend, RuntimeCallError,
     RuntimeCallResponse, SubmitError,
 };
 use neutrino_storage::{Column, Database};
@@ -20,6 +20,91 @@ use super::ChainBackend;
 
 fn storage_error(error: impl core::fmt::Display) -> QueryError {
     QueryError::Storage(error.to_string())
+}
+
+pub(super) fn retention_info<DB: Database>(
+    engine: &Engine<DB>,
+) -> Result<HistoryRetention, QueryError>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    let retention = engine.retention_info().map_err(storage_error)?;
+    Ok(HistoryRetention {
+        archive: retention.policy == RetentionPolicy::Archive && retention.pruned_before_chunk == 0,
+        retained_from_chunk: Some(retention.pruned_before_chunk),
+        retained_from_height: Some(retention.first_retained_height),
+        finalized_chunks: engine
+            .latest_finalized_chunk_id()
+            .map_or(0, |id| id.saturating_add(1)),
+        recursive_covered_chunks: engine.recursive_covered_chunks(),
+    })
+}
+
+pub(super) fn ensure_payload_height<DB: Database>(
+    engine: &Engine<DB>,
+    height: Height,
+) -> Result<(), QueryError>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    let retention = engine.retention_info().map_err(storage_error)?;
+    if height > 0 && height < retention.first_retained_height {
+        return Err(QueryError::Pruned {
+            retained_from_chunk: retention.pruned_before_chunk,
+            retained_from_height: retention.first_retained_height,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_history_endpoints<DB: Database>(
+    engine: &Engine<DB>,
+    start: Hash,
+    end: Hash,
+) -> Result<(), QueryError>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    for hash in [start, end] {
+        if engine
+            .store()
+            .checkpoint_by_hash(&hash)
+            .map_err(storage_error)?
+            .is_none()
+        {
+            return Err(QueryError::HistoryUnavailable);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn read_history_proof<DB: Database>(
+    engine: &Engine<DB>,
+    start: Hash,
+    end: Hash,
+) -> Result<Option<HistoryProof>, QueryError>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    ensure_history_endpoints(engine, start, end)?;
+    let proof = engine
+        .history_proof_by_endpoints(start, end)
+        .map_err(storage_error)?;
+    if proof.is_none() {
+        let start = engine
+            .store()
+            .checkpoint_by_hash(&start)
+            .map_err(storage_error)?
+            .ok_or(QueryError::HistoryUnavailable)?;
+        let retention = engine.retention_info().map_err(storage_error)?;
+        if start.boundary.next_chunk_id < retention.pruned_before_chunk {
+            return Err(QueryError::Pruned {
+                retained_from_chunk: retention.pruned_before_chunk,
+                retained_from_height: retention.first_retained_height,
+            });
+        }
+    }
+    Ok(proof)
 }
 
 pub(super) fn checked_header<DB: Database>(
@@ -98,8 +183,11 @@ where
             let hash = engine
                 .store()
                 .get_block_hash_by_height(*height)
-                .map_err(storage_error)?
-                .ok_or_else(|| storage_error("canonical height is missing"))?;
+                .map_err(storage_error)?;
+            let Some(hash) = hash else {
+                ensure_payload_height(engine, *height)?;
+                return Err(storage_error("canonical height is missing"));
+            };
             if *height == 0 {
                 if hash != engine.chain_spec().genesis_block_hash {
                     return Err(storage_error("canonical genesis anchor is inconsistent"));
@@ -122,6 +210,7 @@ where
     let Some(header) = checked_header(engine, hash)? else {
         return Ok(None);
     };
+    ensure_payload_height(engine, header.height)?;
     let body = engine
         .store()
         .get_body(&hash)
@@ -144,12 +233,18 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display,
 {
     let hash = resolve_id(engine, at)?.ok_or(QueryError::BlockNotFound)?;
-    let root = if hash == engine.chain_spec().genesis_block_hash {
-        engine.chain_spec().genesis_state_root
+    let (root, height) = if hash == engine.chain_spec().genesis_block_hash {
+        (engine.chain_spec().genesis_state_root, 0)
     } else {
-        required_header(engine, hash)?.state_root
+        let header = required_header(engine, hash)?;
+        (header.state_root, header.height)
     };
-    let data = read_state_data(engine, root)?;
+    let data = read_state_data(engine, root).or_else(|error| {
+        if error == QueryError::StateUnavailable {
+            ensure_payload_height(engine, height)?;
+        }
+        Err(error)
+    })?;
     Ok(Trie::from_persisted(root, data.nodes, data.values))
 }
 
@@ -230,6 +325,9 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     async fn rpc_state_snapshot(&self, at: &BlockId) -> Result<Trie, QueryError> {
+        if self.light_checkpoint().is_some() {
+            return Err(QueryError::StateUnavailable);
+        }
         let engine = Arc::clone(&self.engine);
         let at = at.clone();
         tokio::task::spawn_blocking(move || {
@@ -248,6 +346,67 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
     P: ProofSystem + Send + Sync + 'static,
 {
+    async fn history_retention(&self) -> Result<HistoryRetention, QueryError> {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            return Ok(HistoryRetention {
+                finalized_chunks: checkpoint.boundary.next_chunk_id,
+                recursive_covered_chunks: checkpoint.boundary.next_chunk_id,
+                ..HistoryRetention::default()
+            });
+        }
+        self.with_engine(retention_info)
+    }
+
+    async fn history_latest(&self) -> Result<Vec<u8>, QueryError> {
+        if self.light_checkpoint().is_some() {
+            return borsh::to_vec(
+                &self
+                    .light_latest_proof()
+                    .map_err(storage_error)?
+                    .ok_or(QueryError::HistoryUnavailable)?,
+            )
+            .map_err(storage_error);
+        }
+        let proof = self
+            .with_engine(neutrino_consensus_engine::Engine::latest_history_proof)
+            .map_err(storage_error)?
+            .ok_or(QueryError::HistoryUnavailable)?;
+        borsh::to_vec(&proof).map_err(storage_error)
+    }
+    async fn history_request(
+        &self,
+        start: Hash,
+        end: Hash,
+    ) -> Result<neutrino_rpc::HistoryJobInfo, QueryError> {
+        self.request_history(start, end)
+    }
+    async fn history_job(&self, id: Hash) -> Result<neutrino_rpc::HistoryJobInfo, QueryError> {
+        self.history_job_status(id)
+    }
+    async fn history_subscribe(
+        &self,
+        id: Hash,
+    ) -> Result<tokio::sync::watch::Receiver<neutrino_rpc::HistoryJobInfo>, QueryError> {
+        self.subscribe_history(id)
+    }
+    async fn history_proof(&self, start: Hash, end: Hash) -> Result<Vec<u8>, QueryError> {
+        if self.light_checkpoint().is_some() {
+            let proof = self
+                .light_latest_proof()
+                .map_err(storage_error)?
+                .filter(|proof| {
+                    proof.statement.start_checkpoint().hash() == start
+                        && proof.statement.end_checkpoint().hash() == end
+                })
+                .ok_or(QueryError::HistoryUnavailable)?;
+            return borsh::to_vec(&proof).map_err(storage_error);
+        }
+        let proof = self
+            .with_engine(|engine| read_history_proof(engine, start, end))?
+            .ok_or(QueryError::HistoryUnavailable)?;
+        borsh::to_vec(&proof).map_err(storage_error)
+    }
+
     fn chain_id(&self) -> ChainId {
         Self::chain_id(self)
     }
@@ -266,6 +425,15 @@ where
     }
 
     async fn head(&self) -> Result<HeadInfo, QueryError> {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            let boundary = checkpoint.boundary;
+            return Ok(HeadInfo {
+                height: boundary.height,
+                hash: boundary.block_hash,
+                slot: boundary.slot,
+                state_root: boundary.state_root,
+            });
+        }
         self.with_engine(|engine| {
             let hash = engine.head_hash();
             let slot = if hash == engine.chain_spec().genesis_block_hash {
@@ -291,14 +459,35 @@ where
     }
 
     async fn finalized(&self) -> Result<FinalizedInfo, QueryError> {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            let boundary = checkpoint.boundary;
+            return Ok(FinalizedInfo {
+                chunk_id: boundary.next_chunk_id.checked_sub(1),
+                block_hash: boundary.block_hash,
+                height: boundary.height,
+                state_root: boundary.state_root,
+            });
+        }
         self.with_engine(finalized_info)
     }
 
     async fn active_validator_set(&self) -> Vec<Validator> {
+        if self.light_checkpoint().is_some() {
+            return Vec::new();
+        }
         self.with_engine(|engine| engine.active_validator_set().to_vec())
     }
 
     async fn resolve_block_id(&self, id: &BlockId) -> Result<Option<BlockHash>, QueryError> {
+        if let Some(checkpoint) = self.light_checkpoint() {
+            let boundary = checkpoint.boundary;
+            return Ok(match id {
+                BlockId::Latest | BlockId::Finalized => Some(boundary.block_hash),
+                BlockId::Hash(hash) if *hash == boundary.block_hash => Some(*hash),
+                BlockId::Height(height) if *height == boundary.height => Some(boundary.block_hash),
+                _ => None,
+            });
+        }
         self.with_engine(|engine| resolve_id(engine, id))
     }
 
@@ -333,6 +522,11 @@ where
     }
 
     async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, SubmitError> {
+        if self.light_checkpoint().is_some() {
+            return Err(SubmitError::Rejected {
+                reason: "proof-only node has no transaction execution state".into(),
+            });
+        }
         Self::submit_transaction(self, bytes).map_err(|error| match error {
             InsertError::Duplicate => SubmitError::Duplicate,
             InsertError::CapacityExceeded => SubmitError::Full,

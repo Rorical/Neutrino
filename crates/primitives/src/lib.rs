@@ -131,15 +131,15 @@ pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 = 14 * 24 * 60 * 60;
 pub const DEFAULT_LOCK_WINDOW_CHUNKS: u64 = 64;
 /// Default recent-state retention in blocks.
 pub const DEFAULT_KEEP_STATE_BLOCKS: u64 = DEFAULT_CHUNK_SIZE * 4;
-/// Default checkpoint pruning delay.
-pub const DEFAULT_PRUNING_DELAY_CHECKPOINTS: u64 = 2;
+/// Default pruning delay measured in newly covered chunks.
+pub const DEFAULT_PRUNING_DELAY_CHUNKS: u64 = 2;
 /// Default witness retention beyond the proving window.
 pub const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = DEFAULT_CHUNK_SIZE;
-/// Default state snapshot interval in checkpoints.
-pub const DEFAULT_SNAPSHOT_INTERVAL_CHECKPOINTS: u64 = 1024;
-/// Default external anchor interval in checkpoints.
-pub const DEFAULT_ANCHOR_INTERVAL_CHECKPOINTS: u64 = 1024;
-/// Default user-facing stale-checkpoint alert threshold in seconds.
+/// Default state snapshot interval measured in newly covered chunks.
+pub const DEFAULT_SNAPSHOT_INTERVAL_CHUNKS: u64 = 1024;
+/// Default external anchor interval measured in newly covered chunks.
+pub const DEFAULT_ANCHOR_INTERVAL_CHUNKS: u64 = 1024;
+/// Default maximum age of an advancing light-client endpoint in seconds.
 pub const DEFAULT_LIGHT_CLIENT_STALE_THRESHOLD_SECS: u64 =
     4 * DEFAULT_CHUNK_SIZE * DEFAULT_SLOT_DURATION_SECS;
 /// Maximum canonical chain name length.
@@ -155,7 +155,7 @@ pub const DOMAIN_PROPOSER_SIG: DomainTag = *b"NEUTRINO_PROPOSE";
 pub const DOMAIN_PREVOTE: DomainTag = *b"NEUTRINO_PREVOTE";
 /// Finality precommit domain.
 pub const DOMAIN_PRECOMMIT: DomainTag = *b"NEUTRINO_PRECOMM";
-/// Explicit precommit proof-artifact and unlock commitments (wire revision 2).
+/// Explicit precommit proof-artifact and unlock commitments.
 pub const DOMAIN_VOTE_ATTESTATION: DomainTag = *b"NEUTRINO_VOTE___";
 /// Domain for a proposer's signed publication of exact DA bundle bytes.
 pub const DOMAIN_DA_PUBLICATION: DomainTag = *b"NEUTRINO_DA_PUB_";
@@ -165,6 +165,18 @@ pub const DOMAIN_DEPOSIT_POP: DomainTag = *b"NEUTRINO_DEP_POP";
 pub const DOMAIN_VOLUNTARY_EXIT: DomainTag = *b"NEUTRINO_VEXIT__";
 /// Future chunk-aggregator proof domain.
 pub const DOMAIN_AGG_PROOF: DomainTag = *b"NEUTRINO_AGGPRF_";
+/// Canonical compact consensus-context commitment.
+pub const DOMAIN_CONTEXT: DomainTag = *b"NEUTRINO_CONTEXT";
+/// Conditional history-range identity.
+pub const DOMAIN_HISTORY_STATEMENT: DomainTag = *b"NEUTRINO_HISTORY";
+/// Authenticated checkpoint endpoint identity.
+pub const DOMAIN_CHECKPOINT: DomainTag = *b"NEUTRINO_CHECKPT";
+/// Occupied/empty history leaf commitment.
+pub const DOMAIN_HISTORY_LEAF: DomainTag = *b"NEUTRINO_HSTLEAF";
+/// Internal history tree node commitment.
+pub const DOMAIN_HISTORY_NODE: DomainTag = *b"NEUTRINO_HSTNODE";
+/// Counted history root commitment.
+pub const DOMAIN_HISTORY_ROOT: DomainTag = *b"NEUTRINO_HSTROOT";
 
 /// Converts an integer into `Q64.64`.
 pub const fn fixed_u128_from_integer(value: u64) -> FixedU128 {
@@ -370,13 +382,16 @@ impl<const MAX_LEN: usize> BorshSerialize for BoundedBytes<MAX_LEN> {
 
 impl<const MAX_LEN: usize> BorshDeserialize for BoundedBytes<MAX_LEN> {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let bytes = Vec::<u8>::deserialize_reader(reader)?;
-        Self::new(bytes).map_err(|_| {
-            borsh::io::Error::new(
+        let len = u32::deserialize_reader(reader)? as usize;
+        if len > MAX_LEN {
+            return Err(borsh::io::Error::new(
                 borsh::io::ErrorKind::InvalidData,
                 "bounded bytes exceed maximum length",
-            )
-        })
+            ));
+        }
+        let mut inner = alloc::vec![0; len];
+        reader.read_exact(&mut inner)?;
+        Ok(Self { inner })
     }
 }
 
@@ -693,12 +708,12 @@ impl Default for ProofParams {
 pub struct StateParams {
     /// Recent state retained by full/pruned nodes.
     pub keep_state_blocks: u64,
-    /// Checkpoint delay before coverage-prunable data can be deleted.
-    pub pruning_delay_checkpoints: u64,
+    /// Newly covered chunks required before coverage-prunable data can be deleted.
+    pub pruning_delay_chunks: u64,
     /// Witness retention after proving.
     pub witness_retention_blocks: u64,
-    /// State snapshot publishing interval.
-    pub snapshot_interval_checkpoints: u64,
+    /// Snapshot interval measured by covered chunk progress, independent of proof grouping.
+    pub snapshot_interval_chunks: u64,
     /// State-trie hash function.
     pub state_trie_hash: HashAlgorithm,
 }
@@ -707,9 +722,9 @@ impl Default for StateParams {
     fn default() -> Self {
         Self {
             keep_state_blocks: DEFAULT_KEEP_STATE_BLOCKS,
-            pruning_delay_checkpoints: DEFAULT_PRUNING_DELAY_CHECKPOINTS,
+            pruning_delay_chunks: DEFAULT_PRUNING_DELAY_CHUNKS,
             witness_retention_blocks: DEFAULT_WITNESS_RETENTION_BLOCKS,
-            snapshot_interval_checkpoints: DEFAULT_SNAPSHOT_INTERVAL_CHECKPOINTS,
+            snapshot_interval_chunks: DEFAULT_SNAPSHOT_INTERVAL_CHUNKS,
             state_trie_hash: HashAlgorithm::Blake3,
         }
     }
@@ -720,9 +735,9 @@ impl Default for StateParams {
 pub struct LightClientParams {
     /// Weak-subjectivity period in seconds.
     pub weak_subjectivity_period_secs: u64,
-    /// External anchor interval in checkpoints.
-    pub anchor_interval_checkpoints: u64,
-    /// User-facing stale-checkpoint threshold in seconds.
+    /// Anchor interval measured by covered chunk progress, independent of proof grouping.
+    pub anchor_interval_chunks: u64,
+    /// Maximum accepted age of an advancing light-client endpoint in seconds.
     pub stale_threshold_secs: u64,
 }
 
@@ -730,7 +745,7 @@ impl Default for LightClientParams {
     fn default() -> Self {
         Self {
             weak_subjectivity_period_secs: DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS,
-            anchor_interval_checkpoints: DEFAULT_ANCHOR_INTERVAL_CHECKPOINTS,
+            anchor_interval_chunks: DEFAULT_ANCHOR_INTERVAL_CHUNKS,
             stale_threshold_secs: DEFAULT_LIGHT_CLIENT_STALE_THRESHOLD_SECS,
         }
     }
@@ -760,11 +775,11 @@ pub const DEFAULT_INACTIVITY_LEAK_AMOUNT: u128 = 1;
 /// Runtime-execution constants covered by the chain-spec hash.
 ///
 /// Captures the chain's fee-market and consensus-economics knobs.
-/// Adding new fields is non-breaking on the wire format because
-/// borsh deserialization is positional and new entries must append.
-/// `Default` returns the canonical no-fee, full-stake-slash, 32-block
-/// unbonding configuration. Real
-/// chains override individual fields through `chain-spec.toml`:
+/// Borsh uses one positional wire format; adding or reordering fields is an
+/// incompatible protocol change, with no fallback for previous layouts.
+/// `Default` returns the canonical no-fee, full-stake-slash configuration with
+/// [`DEFAULT_UNBONDING_DELAY_BLOCKS`] (2048 blocks). Chains override individual
+/// fields through `chain-spec.toml`:
 ///
 /// ```toml
 /// gas_price = "3"
@@ -805,10 +820,7 @@ pub struct RuntimeParams {
 
 impl Default for RuntimeParams {
     fn default() -> Self {
-        // Defaults for the execution parameters in
-        // `crates/node/src/chain_backend.rs` so chains that omit a
-        // `runtime` block from their chain-spec keep the pre-existing
-        // behavior.
+        // Canonical execution and accountability policy for new chain specifications.
         Self {
             evidence_max_age_blocks: 1024,
             evidence_max_pending: 1024,
@@ -819,39 +831,6 @@ impl Default for RuntimeParams {
             slash_amount: DEFAULT_SLASH_AMOUNT,
             inactivity_leak_amount: DEFAULT_INACTIVITY_LEAK_AMOUNT,
         }
-    }
-}
-
-/// Recursive-checkpoint public inputs stored at genesis and after finalized chunks.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Checkpoint {
-    /// Chain identifier.
-    pub chain_id: ChainId,
-    /// Recursive checkpoint index.
-    pub index: CheckpointIndex,
-    /// Previous checkpoint boundary height. For checkpoint `n > 0`, the
-    /// covered chunk starts at `start_height + 1`; genesis uses zero.
-    pub start_height: Height,
-    /// Last covered canonical block height.
-    pub end_height: Height,
-    /// Previous checkpoint boundary block hash, or zero at genesis.
-    pub start_block_hash: BlockHash,
-    /// Last covered block hash.
-    pub end_block_hash: BlockHash,
-    /// Previous checkpoint boundary state root, or zero at genesis.
-    pub start_state_root: StateRoot,
-    /// State root after the covered range.
-    pub end_state_root: StateRoot,
-    /// Active validator-set commitment after the covered range.
-    pub end_validator_set_root: Hash,
-    /// Authenticated history accumulator root.
-    pub history_root: Hash,
-}
-
-impl Checkpoint {
-    /// Computes `BLAKE3(borsh(self))`.
-    pub fn hash(&self) -> Hash {
-        blake3_256(&borsh::to_vec(self).expect("borsh serialization of Checkpoint is infallible"))
     }
 }
 
@@ -878,8 +857,6 @@ pub struct ChainSpec {
     pub genesis_block_hash: BlockHash,
     /// Validator-set root effective at genesis.
     pub genesis_validator_set_root: Hash,
-    /// Genesis checkpoint accepted as recursion base case.
-    pub genesis_checkpoint: Checkpoint,
     /// Consensus constants.
     pub consensus: ConsensusParams,
     /// Proof constants.
@@ -902,35 +879,10 @@ impl ChainSpec {
         blake3_256(&borsh::to_vec(self).expect("borsh serialization of ChainSpec is infallible"))
     }
 
-    /// Computes the canonical genesis checkpoint from the chain-spec fields.
-    pub fn canonical_genesis_checkpoint(&self) -> Checkpoint {
-        Checkpoint {
-            chain_id: self.chain_id,
-            index: 0,
-            start_height: 0,
-            end_height: 0,
-            start_block_hash: ZERO_HASH,
-            end_block_hash: self.genesis_block_hash,
-            start_state_root: ZERO_HASH,
-            end_state_root: self.genesis_state_root,
-            end_validator_set_root: self.genesis_validator_set_root,
-            history_root: ZERO_HASH,
-        }
-    }
-
-    /// Computes `BLAKE3(borsh(genesis_checkpoint))`.
-    pub fn genesis_checkpoint_hash(&self) -> Hash {
-        self.genesis_checkpoint.hash()
-    }
-
     /// Validates consistency of consensus-critical chain-spec fields.
     pub fn validate(&self) -> Result<(), ChainSpecError> {
         if self.chain_id == 0 {
             return Err(ChainSpecError::ZeroChainId);
-        }
-
-        if self.genesis_checkpoint != self.canonical_genesis_checkpoint() {
-            return Err(ChainSpecError::InvalidGenesisCheckpoint);
         }
 
         self.consensus.validate()?;
@@ -955,6 +907,12 @@ impl ChainSpec {
 
         if self.initial_validators.is_empty() {
             return Err(ChainSpecError::EmptyValidatorSet);
+        }
+
+        if self.genesis_validator_set_root
+            != blake3_256(&borsh::to_vec(&self.initial_validators).expect("canonical validators"))
+        {
+            return Err(ChainSpecError::InvalidGenesisValidatorRoot);
         }
 
         let mut total_stake = 0_u64;
@@ -1039,9 +997,9 @@ impl ProofParams {
 impl StateParams {
     fn validate(&self) -> Result<(), ChainSpecError> {
         if self.keep_state_blocks == 0
-            || self.pruning_delay_checkpoints == 0
+            || self.pruning_delay_chunks == 0
             || self.witness_retention_blocks == 0
-            || self.snapshot_interval_checkpoints == 0
+            || self.snapshot_interval_chunks == 0
         {
             return Err(ChainSpecError::ZeroStateParameter);
         }
@@ -1053,7 +1011,7 @@ impl StateParams {
 impl LightClientParams {
     fn validate(&self) -> Result<(), ChainSpecError> {
         if self.weak_subjectivity_period_secs == 0
-            || self.anchor_interval_checkpoints == 0
+            || self.anchor_interval_chunks == 0
             || self.stale_threshold_secs == 0
         {
             return Err(ChainSpecError::ZeroLightClientParameter);
@@ -1078,8 +1036,8 @@ pub enum ChainSpecError {
     InvalidEvidencePolicy,
     /// Chain ID zero is reserved as invalid.
     ZeroChainId,
-    /// The embedded genesis checkpoint is not canonical for the spec fields.
-    InvalidGenesisCheckpoint,
+    /// The declared genesis validator commitment does not match the ordered set.
+    InvalidGenesisValidatorRoot,
     /// At least one consensus parameter was zero.
     ZeroConsensusParameter,
     /// A quorum numerator/denominator pair was invalid.
@@ -1114,7 +1072,9 @@ impl fmt::Display for ChainSpecError {
         match self {
             Self::InvalidEvidencePolicy => f.write_str("invalid evidence queue/window policy"),
             Self::ZeroChainId => f.write_str("chain ID must be non-zero"),
-            Self::InvalidGenesisCheckpoint => f.write_str("genesis checkpoint is not canonical"),
+            Self::InvalidGenesisValidatorRoot => {
+                f.write_str("genesis validator root is not canonical")
+            }
             Self::ZeroConsensusParameter => f.write_str("consensus parameters must be non-zero"),
             Self::InvalidQuorum => f.write_str("BFT quorum fraction is invalid"),
             Self::InvalidFixedPointParameter => f.write_str("fixed-point parameter is invalid"),
@@ -1184,6 +1144,12 @@ mod tests {
             DOMAIN_DEPOSIT_POP,
             DOMAIN_VOLUNTARY_EXIT,
             DOMAIN_AGG_PROOF,
+            DOMAIN_CONTEXT,
+            DOMAIN_HISTORY_STATEMENT,
+            DOMAIN_CHECKPOINT,
+            DOMAIN_HISTORY_LEAF,
+            DOMAIN_HISTORY_NODE,
+            DOMAIN_HISTORY_ROOT,
         ];
 
         for tag in tags {
@@ -1195,6 +1161,9 @@ mod tests {
     fn bounded_bytes_rejects_oversized_input() {
         let result = BoundedBytes::<2>::new(vec![1, 2, 3]);
         assert!(matches!(result, Err(BoundsError { actual: 3, max: 2 })));
+        let error = borsh::from_slice::<BoundedBytes<2>>(&3_u32.to_le_bytes()).unwrap_err();
+        assert_eq!(error.kind(), borsh::io::ErrorKind::InvalidData);
+        assert!(borsh::from_slice::<BoundedBytes<2>>(&[2, 0, 0, 0, 1]).is_err());
     }
 
     #[test]
@@ -1216,15 +1185,9 @@ mod tests {
     }
 
     #[test]
-    fn chain_spec_validates_canonical_genesis_checkpoint() {
-        let mut spec = test_chain_spec();
-        spec.genesis_checkpoint = spec.canonical_genesis_checkpoint();
-
+    fn chain_spec_validates_genesis_validator_root() {
+        let spec = test_chain_spec();
         assert_eq!(spec.validate(), Ok(()));
-        assert_eq!(
-            spec.genesis_checkpoint_hash(),
-            spec.genesis_checkpoint.hash()
-        );
         assert_ne!(spec.hash(), ZERO_HASH);
     }
 
@@ -1242,12 +1205,10 @@ mod tests {
         ] as [Mutation; 7]
         {
             let mut spec = test_chain_spec();
-            spec.genesis_checkpoint = spec.canonical_genesis_checkpoint();
             mutate(&mut spec.runtime);
             assert_eq!(spec.validate(), Err(ChainSpecError::InvalidEvidencePolicy));
         }
         let mut spec = test_chain_spec();
-        spec.genesis_checkpoint = spec.canonical_genesis_checkpoint();
         spec.runtime.evidence_max_age_blocks = 1;
         spec.runtime.unbonding_delay_blocks = spec.consensus.chunk_size + 1;
         assert_eq!(spec.validate(), Err(ChainSpecError::InvalidEvidencePolicy));
@@ -1256,33 +1217,19 @@ mod tests {
     }
 
     #[test]
-    fn chain_spec_rejects_noncanonical_genesis_checkpoint() {
+    fn chain_spec_rejects_noncanonical_genesis_validator_root() {
         let mut spec = test_chain_spec();
-        spec.genesis_checkpoint.end_height = 1;
-
+        spec.genesis_validator_set_root = [99; 32];
         assert_eq!(
             spec.validate(),
-            Err(ChainSpecError::InvalidGenesisCheckpoint)
+            Err(ChainSpecError::InvalidGenesisValidatorRoot)
         );
     }
 
     fn test_chain_spec() -> ChainSpec {
         let consensus = ConsensusParams::default();
         let proof = ProofParams::default();
-        let checkpoint = Checkpoint {
-            chain_id: 7,
-            index: 0,
-            start_height: 0,
-            end_height: 0,
-            start_block_hash: ZERO_HASH,
-            end_block_hash: [1; 32],
-            start_state_root: ZERO_HASH,
-            end_state_root: [2; 32],
-            end_validator_set_root: [3; 32],
-            history_root: ZERO_HASH,
-        };
-
-        ChainSpec {
+        let mut spec = ChainSpec {
             name: BoundedBytes::new(b"local-testnet".to_vec()).expect("name fits"),
             chain_id: 7,
             genesis_time: 1_800_000_000,
@@ -1293,7 +1240,6 @@ mod tests {
             genesis_state_root: [2; 32],
             genesis_block_hash: [1; 32],
             genesis_validator_set_root: [3; 32],
-            genesis_checkpoint: checkpoint,
             consensus,
             proof,
             state: StateParams::default(),
@@ -1309,6 +1255,9 @@ mod tests {
                 last_active_chunk: 0,
             }],
             metadata: BoundedBytes::new(Vec::new()).expect("empty metadata fits"),
-        }
+        };
+        spec.genesis_validator_set_root =
+            blake3_256(&borsh::to_vec(&spec.initial_validators).expect("canonical validators"));
+        spec
     }
 }

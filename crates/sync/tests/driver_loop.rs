@@ -16,19 +16,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityVote, RecursiveCheckpointProof, SlashingEvidence,
+    Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
 };
 use neutrino_network::PeerId;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, ChunkProofByIdResponse, MetadataRequest, RecursiveProofByIndexResponse,
-    RecursiveProofLatestResponse, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse,
-    StateByRootResponse, Status, role_flags,
+    BlocksByRootResponse, CheckpointLatestResponse, ChunkProofByIdResponse,
+    HistoryProofByRangeResponse, MetadataRequest, RpcInboundId, RpcProtocol, RpcRequest,
+    RpcResponse, StateByRootResponse, Status, role_flags,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::LocalProgress;
-use neutrino_primitives::{BlockHash, Checkpoint, CheckpointIndex, ChunkId, Height, StateRoot};
+use neutrino_primitives::{BlockHash, CheckpointIndex, ChunkId, Hash, Height, StateRoot};
 use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
     SyncBackend, SyncBackendError, SyncDriver, SyncDriverConfig,
@@ -143,27 +143,25 @@ impl SyncBackend for MockBackend {
         })
     }
 
-    async fn latest_recursive_proof(
-        &self,
-    ) -> Result<RecursiveProofLatestResponse, SyncBackendError> {
+    async fn latest_checkpoint(&self) -> Result<CheckpointLatestResponse, SyncBackendError> {
         Err(SyncBackendError::NotAvailable(
             "mock has no proof".to_owned(),
         ))
     }
 
-    async fn recursive_proofs_by_index(
+    async fn history_proof_by_range(
         &self,
-        start: CheckpointIndex,
-        count: u64,
-    ) -> Result<RecursiveProofByIndexResponse, SyncBackendError> {
-        Ok({
-            self.inner
-                .lock()
-                .unwrap()
-                .rpc_calls
-                .push(format!("recursive_proofs_by_index({start},{count})"));
-            RecursiveProofByIndexResponse::default()
-        })
+        start: Hash,
+        end: Hash,
+    ) -> Result<HistoryProofByRangeResponse, SyncBackendError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .rpc_calls
+            .push(format!("history_proof_by_range({start:?},{end:?})"));
+        Err(SyncBackendError::NotAvailable(
+            "mock has no history proof".to_owned(),
+        ))
     }
 
     async fn blocks_by_range(
@@ -249,22 +247,21 @@ impl SyncBackend for MockBackend {
         })
     }
 
-    async fn verify_and_import_checkpoints(
+    async fn verify_and_import_history(
         &self,
-        items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
+        proof: HistoryProof,
     ) -> Result<CheckpointsImported, SyncBackendError> {
-        let target = self.inner.lock().unwrap().advance_to_index;
-        // The driver feeds the FSM a single advance per RPC; assume the
-        // mock accepted the full batch and the new cursor is `target`.
-        let last = items.last().ok_or_else(|| {
-            SyncBackendError::Rejected("empty checkpoint batch in mock".to_owned())
-        })?;
+        let checkpoint = proof.statement.end_checkpoint();
+        let mut state = self.inner.lock().unwrap();
+        let target = state.advance_to_index;
+        state.rpc_calls.push("history_import".to_owned());
+        drop(state);
         Ok(CheckpointsImported {
             new_finalized_index: target,
-            new_finalized_hash: last.0.hash(),
-            new_finalized_state_root: last.0.end_state_root,
-            new_finalized_height: last.0.end_height,
-            new_finalized_block_hash: last.0.end_block_hash,
+            new_finalized_hash: checkpoint.hash(),
+            new_finalized_state_root: checkpoint.boundary.state_root,
+            new_finalized_height: checkpoint.boundary.height,
+            new_finalized_block_hash: checkpoint.boundary.block_hash,
         })
     }
 
@@ -394,8 +391,8 @@ async fn peer_connected_triggers_outbound_status_handshake() {
         chain_spec_hash: [0; 32],
         finalized_chunk_id: None,
         finalized_chunk_hash: [0; 32],
-        finalized_checkpoint_index: 0,
-        finalized_checkpoint_hash: [0; 32],
+        recursive_covered_chunks: 0,
+        checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
         head_slot: 0,
         head_height: 0,
@@ -448,8 +445,8 @@ async fn inbound_status_request_is_served_from_backend() {
         chain_spec_hash: [0; 32],
         finalized_chunk_id: None,
         finalized_chunk_hash: [0; 32],
-        finalized_checkpoint_index: 3,
-        finalized_checkpoint_hash: [0xAA; 32],
+        recursive_covered_chunks: 3,
+        checkpoint_hash: [0xAA; 32],
         head_block_hash: [0xBB; 32],
         head_slot: 99,
         head_height: 88,
@@ -482,8 +479,8 @@ async fn inbound_status_request_is_served_from_backend() {
         chain_spec_hash: [0; 32],
         finalized_chunk_id: None,
         finalized_chunk_hash: [0; 32],
-        finalized_checkpoint_index: 1,
-        finalized_checkpoint_hash: [0; 32],
+        recursive_covered_chunks: 1,
+        checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
         head_slot: 1,
         head_height: 1,
@@ -578,8 +575,8 @@ async fn gossipped_block_is_imported_and_advances_fsm_head() {
         chain_spec_hash: [0; 32],
         finalized_chunk_id: None,
         finalized_chunk_hash: [0; 32],
-        finalized_checkpoint_index: 0,
-        finalized_checkpoint_hash: [0; 32],
+        recursive_covered_chunks: 0,
+        checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
         head_slot: 0,
         head_height: 0,
@@ -630,8 +627,8 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
         chain_spec_hash: [0; 32],
         finalized_chunk_id: None,
         finalized_chunk_hash: [0; 32],
-        finalized_checkpoint_index: 0,
-        finalized_checkpoint_hash: [0; 32],
+        recursive_covered_chunks: 0,
+        checkpoint_hash: [0; 32],
         head_block_hash: [0; 32],
         head_slot: 0,
         head_height: 0,
@@ -679,8 +676,8 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
             chain_spec_hash: [0; 32],
             finalized_chunk_id: None,
             finalized_chunk_hash: [0; 32],
-            finalized_checkpoint_index: 0,
-            finalized_checkpoint_hash: [0; 32],
+            recursive_covered_chunks: 0,
+            checkpoint_hash: [0; 32],
             head_block_hash: [1; 32],
             head_slot: 1,
             head_height: 1,
@@ -976,6 +973,312 @@ async fn complete_sync_requires_chunk_proof_before_fetching_the_next_chunk() {
     run.await.unwrap().unwrap();
 }
 
+async fn next_full_sync_request(
+    commands: &mut mpsc::Receiver<NetworkCommand>,
+) -> (RpcRequest, HistoryReply) {
+    loop {
+        match timeout(Duration::from_secs(6), commands.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            NetworkCommand::SendRpcRequest {
+                request,
+                response_tx,
+                ..
+            } => return (request, response_tx),
+            NetworkCommand::Subscribe(_) => {}
+            other => panic!("unexpected full-sync command {other:?}"),
+        }
+    }
+}
+
+async fn assert_no_full_sync_request(commands: &mut mpsc::Receiver<NetworkCommand>) {
+    // These regressions pause Tokio time. Advance past two retry intervals to
+    // prove that an obsolete response cannot make the active request slot idle.
+    let request = timeout(Duration::from_secs(11), async {
+        loop {
+            match commands.recv().await.expect("driver command channel") {
+                NetworkCommand::SendRpcRequest { request, .. } => return request,
+                NetworkCommand::Subscribe(_) => {}
+                other => panic!("unexpected full-sync command {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        request.is_err(),
+        "obsolete response released active request: {request:?}"
+    );
+}
+
+fn linked_full_sync_blocks() -> Vec<Block> {
+    let first = sample_block(1, 1, 0);
+    let mut second = sample_block(2, 2, 0);
+    second.header.parent_hash = first.hash();
+    vec![first, second]
+}
+
+async fn next_full_sync_payload_request(
+    commands: &mut mpsc::Receiver<NetworkCommand>,
+    status: Status,
+) -> (RpcRequest, HistoryReply) {
+    loop {
+        let (request, response) = next_full_sync_request(commands).await;
+        if matches!(request, RpcRequest::Status(_)) {
+            response.send(Ok(RpcResponse::Status(status))).unwrap();
+        } else {
+            return (request, response);
+        }
+    }
+}
+
+async fn assert_no_full_sync_payload_request(
+    commands: &mut mpsc::Receiver<NetworkCommand>,
+    status: Status,
+) {
+    // A periodic Status may already be queued before the new payload request.
+    // Reply explicitly: a wrongly released slot then emits another payload,
+    // which fails this assertion across two paused-time retry intervals.
+    let request = timeout(Duration::from_secs(11), async {
+        loop {
+            match commands.recv().await.expect("driver command channel") {
+                NetworkCommand::SendRpcRequest {
+                    request: RpcRequest::Status(_),
+                    response_tx,
+                    ..
+                } => response_tx.send(Ok(RpcResponse::Status(status))).unwrap(),
+                NetworkCommand::SendRpcRequest { request, .. } => return request,
+                NetworkCommand::Subscribe(_) => {}
+                other => panic!("unexpected full-sync command {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        request.is_err(),
+        "obsolete response released active payload request: {request:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_sync_does_not_repeat_payload_requests_below_a_provider_pruning_floor() {
+    let backend = MockBackend::default();
+    backend.inner.lock().unwrap().full_chunk_size = Some(2);
+    let (commands, mut received) = mpsc::channel(64);
+    let (events, event_rx) = mpsc::channel(16);
+    let run = tokio::spawn(
+        SyncDriver::new(
+            SyncDriverConfig::default(),
+            Arc::new(backend.clone()),
+            LocalProgress::default(),
+            commands,
+            event_rx,
+        )
+        .run(),
+    );
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let status = Status {
+        finalized_chunk_id: Some(3),
+        finalized_chunk_hash: [3; 32],
+        head_height: 8,
+        head_block_hash: [8; 32],
+        ..Status::default()
+    };
+    let (request, response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    response.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::BlocksByRange(range) if range.start_height == 1));
+    response
+        .send(Err(neutrino_network::rpc::RpcError::Remote(
+            neutrino_network::rpc::RpcFailure::Pruned {
+                retained_from_chunk: 2,
+                retained_from_height: 5,
+            },
+        )))
+        .unwrap();
+    for _ in 0..3 {
+        let (request, response) = next_full_sync_request(&mut received).await;
+        assert!(matches!(request, RpcRequest::Status(_)));
+        response.send(Ok(RpcResponse::Status(status))).unwrap();
+    }
+    let (request, response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    backend.inner.lock().unwrap().chunk_proof_imports = vec![0, 1];
+    response.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, _response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::BlocksByRange(range) if range.start_height == 5));
+    drop(events);
+    run.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_pruned_response_cannot_poison_a_reconnected_providers_availability() {
+    let backend = MockBackend::default();
+    backend.inner.lock().unwrap().full_chunk_size = Some(2);
+    let (commands, mut received) = mpsc::channel(64);
+    let (events, event_rx) = mpsc::channel(16);
+    let run = tokio::spawn(
+        SyncDriver::new(
+            SyncDriverConfig::default(),
+            Arc::new(backend),
+            LocalProgress::default(),
+            commands,
+            event_rx,
+        )
+        .run(),
+    );
+    let peer = random_peer();
+    let status = Status {
+        head_height: 8,
+        head_block_hash: [8; 32],
+        ..Status::default()
+    };
+    events
+        .send(NetworkEvent::PeerConnected(peer))
+        .await
+        .unwrap();
+    let (_, response) = next_full_sync_request(&mut received).await;
+    response.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, old_response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::BlocksByRange(_)));
+    events
+        .send(NetworkEvent::PeerDisconnected(peer))
+        .await
+        .unwrap();
+    events
+        .send(NetworkEvent::PeerConnected(peer))
+        .await
+        .unwrap();
+    let (request, response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    response.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, current_response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::BlocksByRange(range) if range.start_height == 1));
+    old_response
+        .send(Err(neutrino_network::rpc::RpcError::Remote(
+            neutrino_network::rpc::RpcFailure::Pruned {
+                retained_from_chunk: 2,
+                retained_from_height: 5,
+            },
+        )))
+        .unwrap();
+    assert_no_full_sync_request(&mut received).await;
+    current_response
+        .send(Ok(RpcResponse::BlocksByRange(BlocksByRangeResponse {
+            blocks: linked_full_sync_blocks(),
+        })))
+        .unwrap();
+    let (request, _response) = next_full_sync_request(&mut received).await;
+    assert!(matches!(request, RpcRequest::BlockProofByHeight(range) if range.start_height == 1));
+    drop(events);
+    run.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_block_response_cannot_release_a_reconnected_request_or_rewind_its_cursor() {
+    let backend = MockBackend::default();
+    backend.inner.lock().unwrap().full_chunk_size = Some(2);
+    let observer = backend.clone();
+    let (commands, mut received) = mpsc::channel(64);
+    let (events, event_rx) = mpsc::channel(16);
+    let run = tokio::spawn(
+        SyncDriver::new(
+            SyncDriverConfig::default(),
+            Arc::new(backend),
+            LocalProgress::default(),
+            commands,
+            event_rx,
+        )
+        .run(),
+    );
+    let peer = random_peer();
+    let status = Status {
+        head_height: 8,
+        head_block_hash: [8; 32],
+        finalized_chunk_id: Some(3),
+        ..Status::default()
+    };
+    events
+        .send(NetworkEvent::PeerConnected(peer))
+        .await
+        .unwrap();
+    let (request, response) = next_full_sync_request(&mut received).await;
+    assert!(
+        matches!(&request, RpcRequest::Status(_)),
+        "expected initial Status, got {request:?}"
+    );
+    response.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, old_response) = next_full_sync_payload_request(&mut received, status).await;
+    assert!(
+        matches!(&request, RpcRequest::BlocksByRange(_)),
+        "expected initial Blocks, got {request:?}"
+    );
+    events
+        .send(NetworkEvent::PeerDisconnected(peer))
+        .await
+        .unwrap();
+    events
+        .send(NetworkEvent::PeerConnected(peer))
+        .await
+        .unwrap();
+    let (request, response) = next_full_sync_request(&mut received).await;
+    assert!(
+        matches!(&request, RpcRequest::Status(_)),
+        "expected reconnect Status, got {request:?}"
+    );
+    response.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, current_response) = next_full_sync_payload_request(&mut received, status).await;
+    assert!(
+        matches!(&request, RpcRequest::BlocksByRange(range) if range.start_height == 1),
+        "expected reconnect Blocks from 1, got {request:?}"
+    );
+    let blocks = linked_full_sync_blocks();
+    current_response
+        .send(Ok(RpcResponse::BlocksByRange(BlocksByRangeResponse {
+            blocks: blocks.clone(),
+        })))
+        .unwrap();
+    let (request, proof_response) = next_full_sync_payload_request(&mut received, status).await;
+    assert!(
+        matches!(&request, RpcRequest::BlockProofByHeight(range) if range.start_height == 1),
+        "expected current Proofs from 1, got {request:?}"
+    );
+    old_response
+        .send(Ok(RpcResponse::BlocksByRange(BlocksByRangeResponse {
+            blocks: vec![blocks[0].clone()],
+        })))
+        .unwrap();
+    assert_no_full_sync_payload_request(&mut received, status).await;
+    assert_eq!(observer.inner.lock().unwrap().status.head_height, 2);
+    let proofs = blocks
+        .iter()
+        .map(|block| {
+            let mut proof = sample_block_proof(block.header.height);
+            proof.block_hash = block.hash();
+            proof.public_inputs.block_hash = block.hash();
+            proof.public_inputs.parent_block_hash = block.header.parent_hash;
+            proof
+        })
+        .collect();
+    proof_response
+        .send(Ok(RpcResponse::BlockProofByHeight(
+            BlockProofByHeightResponse { proofs },
+        )))
+        .unwrap();
+    let (request, _response) = next_full_sync_payload_request(&mut received, status).await;
+    assert!(
+        matches!(&request, RpcRequest::ChunkProofById(range) if range.chunk_ids == vec![0]),
+        "expected current Finality for chunk 0, got {request:?}"
+    );
+    drop(events);
+    run.await.unwrap().unwrap();
+}
+
 fn sample_finality_vote(chunk_id: ChunkId) -> FinalityVote {
     use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
     use neutrino_primitives::BitVec;
@@ -1227,7 +1530,7 @@ async fn block_proof_that_arrives_before_its_block_is_buffered_and_retried() {
 
 #[tokio::test(start_paused = true)]
 async fn unavailable_backend_data_returns_an_explicit_rpc_reply() {
-    use neutrino_network::rpc::{RecursiveProofLatestRequest, RpcFailure};
+    use neutrino_network::rpc::{CheckpointLatestRequest, RpcFailure};
     let (commands, mut received) = mpsc::channel(16);
     let (events, event_rx) = mpsc::channel(16);
     let driver = SyncDriver::new(
@@ -1239,14 +1542,14 @@ async fn unavailable_backend_data_returns_an_explicit_rpc_reply() {
     );
     let run = tokio::spawn(driver.run());
     let inbound_id = RpcInboundId {
-        protocol: RpcProtocol::RecursiveProofLatest,
+        protocol: RpcProtocol::CheckpointLatest,
         raw: 17,
     };
     events
         .send(NetworkEvent::RpcRequestReceived {
             peer: random_peer(),
             inbound_id,
-            request: RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest),
+            request: RpcRequest::CheckpointLatest(CheckpointLatestRequest),
         })
         .await
         .unwrap();
@@ -1255,8 +1558,680 @@ async fn unavailable_backend_data_returns_an_explicit_rpc_reply() {
         .unwrap()
         .unwrap();
     assert!(
-        matches!(command, NetworkCommand::SendRpcResponse { inbound_id: id, response: RpcResponse::Error { protocol: RpcProtocol::RecursiveProofLatest, error: RpcFailure::Unavailable(_) } } if id == inbound_id)
+        matches!(command, NetworkCommand::SendRpcResponse { inbound_id: id, response: RpcResponse::Error { protocol: RpcProtocol::CheckpointLatest, error: RpcFailure::Unavailable(_) } } if id == inbound_id)
     );
     drop(events);
     run.await.unwrap().unwrap();
+}
+
+fn sample_history_proof() -> HistoryProof {
+    use neutrino_consensus_types::history_proof::{
+        ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProofDomain,
+    };
+    let start = ConsensusBoundary {
+        next_chunk_id: 1,
+        height: 2,
+        block_hash: [1; 32],
+        state_root: [2; 32],
+        slot: 2,
+        validators_root: [3; 32],
+        seed: [4; 32],
+        history_root: [5; 32],
+    };
+    HistoryProof {
+        statement: HistoryStatement {
+            domain: ProofDomain {
+                chain: ChainBinding {
+                    chain_id: 1,
+                    chain_spec_hash: [0; 32],
+                    chunk_size: 2,
+                    runtime_code_hash: [2; 32],
+                    gas_price: 0,
+                },
+                execution: ExecutionPrograms {
+                    fact: [1; 8],
+                    evidence: [2; 8],
+                    block: [3; 8],
+                },
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
+            start,
+            end: ConsensusBoundary {
+                next_chunk_id: 5,
+                height: 10,
+                slot: 10,
+                block_hash: [6; 32],
+                state_root: [7; 32],
+                history_root: [8; 32],
+                ..start
+            },
+        },
+        receipt: neutrino_primitives::BoundedBytes::new(vec![1]).unwrap(),
+    }
+}
+
+type HistoryReply =
+    tokio::sync::oneshot::Sender<Result<RpcResponse, neutrino_network::rpc::RpcError>>;
+
+struct PendingLightRange {
+    backend: MockBackend,
+    proof: HistoryProof,
+    events: mpsc::Sender<NetworkEvent>,
+    commands: mpsc::Receiver<NetworkCommand>,
+    runner: tokio::task::JoinHandle<Result<(), neutrino_sync::SyncDriverError>>,
+    peer: PeerId,
+    status: Status,
+    response: Option<HistoryReply>,
+}
+
+impl PendingLightRange {
+    async fn new() -> Self {
+        let backend = MockBackend::default();
+        backend.inner.lock().unwrap().full_chunk_size = Some(2);
+        backend.set_advance(5, 10);
+        let proof = sample_history_proof();
+        let local = LocalProgress {
+            chain_id: 1,
+            recursive_covered_chunks: 1,
+            checkpoint_hash: proof.statement.start_checkpoint().hash(),
+            head_height: 2,
+            ..LocalProgress::default()
+        };
+        let (cmd_tx, commands) = mpsc::channel(32);
+        let (events, event_rx) = mpsc::channel(32);
+        let driver = SyncDriver::new(
+            SyncDriverConfig {
+                mode: neutrino_network::SyncMode::LightClient,
+                ..SyncDriverConfig::default()
+            },
+            Arc::new(backend.clone()),
+            local,
+            cmd_tx,
+            event_rx,
+        );
+        let mut pending = Self {
+            events,
+            commands,
+            runner: tokio::spawn(driver.run()),
+            peer: random_peer(),
+            status: Status {
+                chain_id: 1,
+                chain_spec_hash: [0; 32],
+                finalized_chunk_id: Some(4),
+                finalized_chunk_hash: [4; 32],
+                recursive_covered_chunks: 5,
+                checkpoint_hash: proof.statement.end_checkpoint().hash(),
+                head_block_hash: [6; 32],
+                head_slot: 10,
+                head_height: 10,
+            },
+            response: None,
+            backend,
+            proof,
+        };
+        pending
+            .events
+            .send(NetworkEvent::PeerConnected(pending.peer))
+            .await
+            .unwrap();
+        pending.reply_status().await;
+        pending.response = Some(pending.suffix_request().await);
+        pending
+    }
+
+    async fn next_request(&mut self) -> (PeerId, RpcRequest, HistoryReply) {
+        loop {
+            match self.commands.recv().await.unwrap() {
+                NetworkCommand::SendRpcRequest {
+                    peer,
+                    request,
+                    response_tx,
+                } => return (peer, request, response_tx),
+                NetworkCommand::ReportGossipValidation { acceptance, .. } => assert_eq!(
+                    acceptance,
+                    neutrino_network::libp2p::gossipsub::MessageAcceptance::Accept
+                ),
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
+    }
+
+    async fn reply_status(&mut self) {
+        let (_, request, response) = self.next_request().await;
+        assert!(matches!(request, RpcRequest::Status(_)));
+        response.send(Ok(RpcResponse::Status(self.status))).unwrap();
+    }
+
+    async fn suffix_request(&mut self) -> HistoryReply {
+        let (_, request, response) = self.next_request().await;
+        assert!(matches!(request, RpcRequest::HistoryProofByRange(ref range)
+            if range.start_checkpoint_hash == self.proof.statement.start_checkpoint().hash()
+                && range.end_checkpoint_hash == self.status.checkpoint_hash));
+        response
+    }
+
+    fn unavailable(&mut self) {
+        self.response
+            .take()
+            .unwrap()
+            .send(Err(neutrino_network::rpc::RpcError::Remote(
+                neutrino_network::rpc::RpcFailure::Unavailable("pending".to_owned()),
+            )))
+            .unwrap();
+    }
+
+    async fn announce(&self, range_id: Hash) {
+        let data = borsh::to_vec(&neutrino_network::rpc::CheckpointAnnouncement {
+            covered_chunks: self.status.recursive_covered_chunks,
+            checkpoint_hash: self.status.checkpoint_hash,
+            range_id,
+        })
+        .unwrap();
+        let message_id = neutrino_network::libp2p::gossipsub::MessageId::from(
+            neutrino_primitives::blake3_256(&data).to_vec(),
+        );
+        self.events
+            .send(NetworkEvent::GossipMessage {
+                propagation_source: self.peer,
+                topic: neutrino_network::Topic::Checkpoints,
+                data,
+                message_id,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn assert_quiescent(&mut self) {
+        assert!(
+            timeout(Duration::from_secs(1), self.next_request())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn stop(self) {
+        drop(self.events);
+        self.runner.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn light_mode_requests_an_exact_suffix_even_with_a_full_backend() {
+    let mut pending = PendingLightRange::new().await;
+    pending.unavailable();
+    pending.assert_quiescent().await;
+    // The endpoint and peer status did not move, but a new suffix is now available.
+    pending.announce([2; 32]).await;
+    pending.reply_status().await;
+    let _response = pending.suffix_request().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn range_notice_arriving_before_unavailable_response_is_not_lost() {
+    let mut pending = PendingLightRange::new().await;
+    pending.announce([2; 32]).await;
+    pending.reply_status().await;
+    // Status sees the old request still in flight, so it cannot fetch yet.
+    pending.assert_quiescent().await;
+    pending.unavailable();
+    // The stored availability event refreshes status once after the old failure.
+    pending.reply_status().await;
+    let _response = pending.suffix_request().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn light_relay_miss_tries_a_connected_full_provider_for_the_same_range() {
+    let mut pending = PendingLightRange::new().await;
+    let provider = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(provider))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    pending.unavailable();
+    let (peer, request, response) = pending.next_request().await;
+    assert_eq!(peer, provider);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(ref range)
+        if range.start_checkpoint_hash == pending.proof.statement.start_checkpoint().hash()
+            && range.end_checkpoint_hash == pending.proof.statement.end_checkpoint().hash()));
+    response
+        .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+            HistoryProofByRangeResponse {
+                proof: pending.proof.clone(),
+            },
+        ))))
+        .unwrap();
+    let command = pending.commands.recv().await.unwrap();
+    assert!(matches!(
+        command,
+        NetworkCommand::Subscribe(neutrino_network::Topic::Checkpoints)
+    ));
+    assert_eq!(pending.backend.rpc_calls(), vec!["history_import"]);
+    pending.assert_quiescent().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn pruned_history_provider_never_changes_the_clients_trusted_anchor() {
+    let mut pending = PendingLightRange::new().await;
+    let archive = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(archive))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    pending
+        .response
+        .take()
+        .unwrap()
+        .send(Err(neutrino_network::rpc::RpcError::Remote(
+            neutrino_network::rpc::RpcFailure::Pruned {
+                retained_from_chunk: 4,
+                retained_from_height: 9,
+            },
+        )))
+        .unwrap();
+    let (provider, request, response) = pending.next_request().await;
+    assert_eq!(provider, archive);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.start_checkpoint_hash == pending.proof.statement.start_checkpoint().hash()
+            && range.end_checkpoint_hash == pending.proof.statement.end_checkpoint().hash()));
+    assert_eq!(pending.backend.rpc_calls(), [] as [String; 0]);
+    response
+        .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+            HistoryProofByRangeResponse {
+                proof: pending.proof.clone(),
+            },
+        ))))
+        .unwrap();
+    assert!(matches!(
+        pending.commands.recv().await.unwrap(),
+        NetworkCommand::Subscribe(neutrino_network::Topic::Checkpoints)
+    ));
+    assert_eq!(pending.backend.rpc_calls(), vec!["history_import"]);
+    pending.assert_quiescent().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn exhausted_history_providers_stay_quiet_without_another_availability_event() {
+    let mut pending = PendingLightRange::new().await;
+    let provider = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(provider))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    pending.unavailable();
+    let (peer, request, response) = pending.next_request().await;
+    assert_eq!(peer, provider);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(_)));
+    pending.response = Some(response);
+    pending.unavailable();
+    pending.assert_quiescent().await;
+    assert_eq!(pending.backend.rpc_calls(), Vec::<String>::new());
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reconnect_and_unchanged_status_do_not_rearm_an_exhausted_history_provider() {
+    let mut pending = PendingLightRange::new().await;
+    pending.unavailable();
+    pending.assert_quiescent().await;
+    for _ in 0..2 {
+        pending
+            .events
+            .send(NetworkEvent::PeerDisconnected(pending.peer))
+            .await
+            .unwrap();
+        pending
+            .events
+            .send(NetworkEvent::PeerConnected(pending.peer))
+            .await
+            .unwrap();
+        pending.reply_status().await;
+        pending.assert_quiescent().await;
+    }
+    pending.announce([3; 32]).await;
+    pending.reply_status().await;
+    let _response = pending.suffix_request().await;
+    pending.stop().await;
+}
+
+async fn assert_disconnected_history_outcome_is_ignored(stale_success: bool) {
+    let mut pending = PendingLightRange::new().await;
+    let replacement = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(replacement))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    let (peer, request, current_response) = pending.next_request().await;
+    assert_eq!(peer, replacement);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(_)));
+    if stale_success {
+        pending
+            .response
+            .take()
+            .unwrap()
+            .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+                HistoryProofByRangeResponse {
+                    proof: pending.proof.clone(),
+                },
+            ))))
+            .unwrap();
+    } else {
+        pending.unavailable();
+    }
+    pending.assert_quiescent().await;
+    assert_eq!(pending.backend.rpc_calls(), [] as [String; 0]);
+    // A new provider's status cannot release the replacement's active slot.
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    current_response
+        .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+            HistoryProofByRangeResponse {
+                proof: pending.proof.clone(),
+            },
+        ))))
+        .unwrap();
+    assert!(matches!(
+        pending.commands.recv().await.unwrap(),
+        NetworkCommand::Subscribe(neutrino_network::Topic::Checkpoints)
+    ));
+    assert_eq!(pending.backend.rpc_calls(), vec!["history_import"]);
+    pending.assert_quiescent().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn disconnected_history_failure_cannot_release_a_replacement_request() {
+    assert_disconnected_history_outcome_is_ignored(false).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn disconnected_history_success_cannot_import_or_release_a_replacement_request() {
+    assert_disconnected_history_outcome_is_ignored(true).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn higher_status_during_history_request_is_deferred_until_current_success() {
+    let mut pending = PendingLightRange::new().await;
+    let provider = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(provider))
+        .await
+        .unwrap();
+    let (_, request, response) = pending.next_request().await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    let later = Status {
+        recursive_covered_chunks: 7,
+        checkpoint_hash: [7; 32],
+        head_height: 14,
+        ..pending.status
+    };
+    response.send(Ok(RpcResponse::Status(later))).unwrap();
+    pending.assert_quiescent().await;
+    pending
+        .response
+        .take()
+        .unwrap()
+        .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+            HistoryProofByRangeResponse {
+                proof: pending.proof.clone(),
+            },
+        ))))
+        .unwrap();
+    assert!(matches!(
+        pending.commands.recv().await.unwrap(),
+        NetworkCommand::Subscribe(neutrino_network::Topic::Checkpoints)
+    ));
+    let (peer, request, _response) = pending.next_request().await;
+    assert_eq!(peer, provider);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.start_checkpoint_hash == pending.proof.statement.end_checkpoint().hash()
+            && range.end_checkpoint_hash == later.checkpoint_hash));
+    assert_eq!(pending.backend.rpc_calls(), vec!["history_import"]);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn late_status_from_a_disconnected_provider_cannot_change_the_history_target() {
+    let mut pending = PendingLightRange::new().await;
+    let provider = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(provider))
+        .await
+        .unwrap();
+    let (_, request, response) = pending.next_request().await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(provider))
+        .await
+        .unwrap();
+    pending.assert_quiescent().await;
+    response
+        .send(Ok(RpcResponse::Status(Status {
+            recursive_covered_chunks: 7,
+            checkpoint_hash: [7; 32],
+            ..pending.status
+        })))
+        .unwrap();
+    pending.assert_quiescent().await;
+    pending.unavailable();
+    pending.assert_quiescent().await;
+    assert_eq!(pending.backend.rpc_calls(), [] as [String; 0]);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn disconnect_replays_newer_deferred_status_even_after_old_range_provider_exhaustion() {
+    let mut pending = PendingLightRange::new().await;
+    let replacement = random_peer();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(replacement))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    pending.unavailable();
+    let (peer, _, response) = pending.next_request().await;
+    assert_eq!(peer, replacement);
+    pending.response = Some(response);
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(pending.peer))
+        .await
+        .unwrap();
+    let (_, request, status_response) = pending.next_request().await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    let newer = Status {
+        recursive_covered_chunks: 7,
+        checkpoint_hash: [7; 32],
+        ..pending.status
+    };
+    status_response
+        .send(Ok(RpcResponse::Status(newer)))
+        .unwrap();
+    pending.assert_quiescent().await;
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(replacement))
+        .await
+        .unwrap();
+    let (peer, request, _current_response) = pending.next_request().await;
+    assert_eq!(peer, pending.peer);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.start_checkpoint_hash == pending.proof.statement.start_checkpoint().hash()
+            && range.end_checkpoint_hash == newer.checkpoint_hash));
+    pending.unavailable();
+    pending.assert_quiescent().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn old_response_from_same_peer_and_range_cannot_replace_a_new_request() {
+    let mut pending = PendingLightRange::new().await;
+    let old_response = pending.response.take().unwrap();
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(pending.peer))
+        .await
+        .unwrap();
+    pending.reply_status().await;
+    pending.assert_quiescent().await;
+    pending.announce([4; 32]).await;
+    pending.reply_status().await;
+    pending.response = Some(pending.suffix_request().await);
+    old_response
+        .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+            HistoryProofByRangeResponse {
+                proof: pending.proof.clone(),
+            },
+        ))))
+        .unwrap();
+    pending.assert_quiescent().await;
+    assert_eq!(pending.backend.rpc_calls(), [] as [String; 0]);
+    pending.unavailable();
+    pending.assert_quiescent().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn disconnecting_highest_deferred_peer_preserves_other_progress_notifications() {
+    let mut pending = PendingLightRange::new().await;
+    let highest = random_peer();
+    let available = random_peer();
+    for (peer, covered, endpoint) in [(highest, 10, [10; 32]), (available, 7, [7; 32])] {
+        pending
+            .events
+            .send(NetworkEvent::PeerConnected(peer))
+            .await
+            .unwrap();
+        let (_, request, response) = pending.next_request().await;
+        assert!(matches!(request, RpcRequest::Status(_)));
+        response
+            .send(Ok(RpcResponse::Status(Status {
+                recursive_covered_chunks: covered,
+                checkpoint_hash: endpoint,
+                ..pending.status
+            })))
+            .unwrap();
+        pending.assert_quiescent().await;
+    }
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(highest))
+        .await
+        .unwrap();
+    pending.assert_quiescent().await;
+    pending
+        .response
+        .take()
+        .unwrap()
+        .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
+            HistoryProofByRangeResponse {
+                proof: pending.proof.clone(),
+            },
+        ))))
+        .unwrap();
+    assert!(matches!(
+        pending.commands.recv().await.unwrap(),
+        NetworkCommand::Subscribe(neutrino_network::Topic::Checkpoints)
+    ));
+    let (peer, request, _response) = pending.next_request().await;
+    assert_eq!(peer, available);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.start_checkpoint_hash == pending.proof.statement.end_checkpoint().hash()
+            && range.end_checkpoint_hash == [7; 32]));
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn exhausted_deferred_hint_cannot_block_another_available_range() {
+    let mut pending = PendingLightRange::new().await;
+    for peer in [random_peer(), random_peer()] {
+        pending
+            .events
+            .send(NetworkEvent::PeerConnected(peer))
+            .await
+            .unwrap();
+        pending.reply_status().await;
+        pending.assert_quiescent().await;
+    }
+    pending.unavailable();
+    let (second, request, response) = pending.next_request().await;
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(_)));
+    pending.response = Some(response);
+    pending.unavailable();
+    let (_, request, response) = pending.next_request().await;
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(_)));
+    pending.response = Some(response);
+    for (peer, covered, endpoint) in [
+        (pending.peer, 5, pending.status.checkpoint_hash),
+        (second, 3, [3; 32]),
+    ] {
+        pending
+            .events
+            .send(NetworkEvent::PeerDisconnected(peer))
+            .await
+            .unwrap();
+        pending
+            .events
+            .send(NetworkEvent::PeerConnected(peer))
+            .await
+            .unwrap();
+        let (_, request, response) = pending.next_request().await;
+        assert!(matches!(request, RpcRequest::Status(_)));
+        response
+            .send(Ok(RpcResponse::Status(Status {
+                recursive_covered_chunks: covered,
+                checkpoint_hash: endpoint,
+                ..pending.status
+            })))
+            .unwrap();
+        pending.assert_quiescent().await;
+    }
+    pending.unavailable();
+    let (peer, request, _response) = pending.next_request().await;
+    assert_eq!(peer, second);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.start_checkpoint_hash == pending.proof.statement.start_checkpoint().hash()
+            && range.end_checkpoint_hash == [3; 32]));
+    pending.stop().await;
 }

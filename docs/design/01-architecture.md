@@ -8,7 +8,8 @@ Expensive proof generation runs outside the engine lock.
 `runtime-abi` carries Borsh wire types. `runtime-core` provides authenticated
 state backends. The default runtime's `core` owns the STF and is compiled into
 its WASM `master` and SP1 block `guest`. `runtime-host` embeds the WASM and the
-block, evidence and consensus chunk Guest programs.
+fact, evidence, block, consensus chunk and checkpoint Guest programs. The node selects one
+CPU or optional CUDA prover for all five stages; verification remains local.
 
 A producer executes a block, stores the execution witness, generates and verifies
 its block proof, and assembles a candidate chunk. BFT signs the candidate before
@@ -17,6 +18,13 @@ the trusted incoming context and atomically stores the next context. A follower
 executes imported blocks and verifies each chunk boundary before continuing.
 
 The next context authenticates parent hash/state, validators, seed, historical
-records and consumed penalties. Validator rotation is derived and installed by
+root. Only actually referenced records and their fixed-depth openings enter each
+Chunk witness. Block STF offence markers provide sanction replay protection.
+Validator rotation is derived and installed by
 complete chunk finalization; there is no separate runtime-query rotation bridge.
 See [chunk proofs](19-complete-chunk-proofs.md) for the complete statement.
+
+History Fold/Merge joins proven compact boundaries in background jobs. A full node
+checks those boundaries against its own finality; a proof-only light client instead
+extends an explicit trusted anchor and atomically replaces its latest receipt and
+trust state. Neither path treats a peer advertisement as an authenticated anchor.

@@ -6,7 +6,7 @@ use neutrino_proof_system::ProofSystem;
 use neutrino_prover_chunk::consensus::validate_consensus;
 use neutrino_runtime_host::Sp1ProofSystem;
 use sp1_sdk::{
-    HashableKey, SP1ProvingKey,
+    HashableKey,
     blocking::{Prover, ProverClient},
 };
 
@@ -72,7 +72,7 @@ fn two_block_fixture(
     witness
         .bodies
         .push(neutrino_prover_chunk::body::ConsensusBody::default());
-    let chunk = as_chunk(&validate_candidate(&witness).unwrap().execution);
+    let chunk = as_chunk(&validate_candidate(&witness).unwrap().execution.chunk);
     witness.finality_cert.chunk_hash = chunk.hash();
     for (phase, domain, aggregate) in [
         (
@@ -109,7 +109,7 @@ fn two_block_fixture(
 }
 
 #[allow(clippy::too_many_lines)] // Explicit end-to-end proving stages and their negative assertions.
-fn pipeline<P: Prover<ProvingKey = SP1ProvingKey>>(prover: P, real: bool) {
+fn pipeline<P: neutrino_runtime_host::ProgramProver>(prover: P, real: bool) {
     eprintln!("consensus gate: initialize block program");
     let system = Sp1ProofSystem::new(prover).unwrap();
     let runtime_hash = neutrino_runtime_host::default_runtime_code_hash();
@@ -212,14 +212,14 @@ fn pipeline<P: Prover<ProvingKey = SP1ProvingKey>>(prover: P, real: bool) {
     eprintln!("consensus gate: verify consensus chunk and negative bindings");
     system.verify_consensus_chunk(&proof, &expected).unwrap();
     let mut wrong_anchor = expected.clone();
-    wrong_anchor.execution.context_hash[0] ^= 1;
+    wrong_anchor.start.state_root[0] ^= 1;
     assert!(
         system
             .verify_consensus_chunk(&proof, &wrong_anchor)
             .is_err()
     );
     let mut wrong_key = expected;
-    wrong_key.execution.block_guest_vk_digest[0] ^= 1;
+    wrong_key.programs.block[0] ^= 1;
     assert!(system.verify_consensus_chunk(&proof, &wrong_key).is_err());
 }
 
@@ -272,7 +272,7 @@ fn check_guest_rejections<P: Prover>(
     }
 }
 
-fn check_rejection_classifier<P: Prover<ProvingKey = SP1ProvingKey>>(
+fn check_rejection_classifier<P: neutrino_runtime_host::ProgramProver>(
     system: &Sp1ProofSystem<P>,
     proof: &neutrino_runtime_host::proof_system::Sp1BlockProof,
     block: &neutrino_prover_chunk::execution::ProvenBlock,

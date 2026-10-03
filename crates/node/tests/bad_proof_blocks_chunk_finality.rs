@@ -37,9 +37,8 @@ use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams,
-    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
-    fixed_u128_from_integer,
+    BlockHash, BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
@@ -79,18 +78,6 @@ fn chain_spec(count: u8) -> ChainSpec {
     };
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash: BlockHash = [0xFE; 32];
-    let checkpoint = Checkpoint {
-        chain_id: TEST_CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     let consensus = ConsensusParams {
         chunk_size: 1,
         expected_proposers_per_slot: fixed_u128_from_integer(u64::from(count) + 4),
@@ -109,7 +96,6 @@ fn chain_spec(count: u8) -> ChainSpec {
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus,
         proof,
         state: StateParams::default(),

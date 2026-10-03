@@ -13,13 +13,10 @@ use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::ChainSpec;
-use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor, expect_runtime_code_hash};
-use sp1_sdk::blocking::CpuProver;
-
-/// Concrete `ChainBackend` parameterisation used by the production
-/// node binary: RocksDB-backed `NodeDb` storage + SP1 CPU prover.
-type NodeBackend = ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>;
 use neutrino_rpc::{RpcBackend, RpcStartError};
+use neutrino_runtime_host::{
+    ProgramProver, Sp1HostError, Sp1ProofSystem, WasmExecutor, expect_runtime_code_hash,
+};
 use neutrino_storage::Database;
 use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
 use thiserror::Error;
@@ -28,7 +25,7 @@ use tracing::{info, warn};
 
 use crate::chain_backend::ChainBackend;
 use crate::chain_spec::{ChainSpecError, ChainSpecFile, decode_hex_exact};
-use crate::config::{NodeConfig, NodeRole};
+use crate::config::{NodeConfig, NodeRole, ProvingBackend};
 use crate::db::{NodeDb, NodeDbError};
 use crate::producer::{BlockProducerConfig, run_block_producer};
 
@@ -96,65 +93,46 @@ pub enum NodeError {
 /// # Errors
 ///
 /// Surfaces any of the variants of [`NodeError`].
-#[allow(clippy::too_many_lines)]
 pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
-    let local_key = Keypair::generate_ed25519();
-    let local_peer_id = neutrino_network::PeerId::from(local_key.public());
-    info!(%local_peer_id, role = ?config.role, chain_id = config.chain_id, "starting node");
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(256);
-    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(256);
-
-    let mut svc = NetworkService::new(local_key, cmd_rx, event_tx)?;
-
-    // Bind every configured listener.
-    for addr in config.effective_listen() {
-        let parsed = addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
-            addr: addr.clone(),
-            source,
-        })?;
-        match svc.listen_on(parsed) {
-            Ok(id) => info!(%addr, ?id, "listening"),
-            Err(err) => warn!(%addr, ?err, "listen failed"),
+    config
+        .proving
+        .validate()
+        .map_err(|error| NodeError::ProofSystem(error.into()))?;
+    if config.role == NodeRole::LightClient {
+        return Box::pin(run_with_prover(config, || {
+            Ok(sp1_sdk::blocking::ProverClient::builder().light().build())
+        }))
+        .await;
+    }
+    match config.proving.backend {
+        ProvingBackend::Cpu => {
+            Box::pin(run_with_prover(config, || {
+                Ok(sp1_sdk::blocking::ProverClient::builder().cpu().build())
+            }))
+            .await
+        }
+        ProvingBackend::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                let device = config.proving.cuda_device.unwrap_or(0);
+                Box::pin(run_with_prover(config, move || {
+                    neutrino_runtime_host::backend::cuda_prover(device)
+                }))
+                .await
+            }
+            #[cfg(not(feature = "cuda"))]
+            Err(NodeError::ProofSystem(
+                "CUDA requires --features cuda".into(),
+            ))
         }
     }
+}
 
-    // Spawn the network service.
-    let network_handle = tokio::spawn(svc.run());
-
-    // Dial bootnodes if any.
-    for addr in &config.bootnodes {
-        let parsed = addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
-            addr: addr.clone(),
-            source,
-        })?;
-        if cmd_tx.send(NetworkCommand::Dial(parsed)).await.is_err() {
-            warn!(%addr, "network command channel closed while dialing bootnode");
-        }
-    }
-
-    // Subscribe to gossip topics: caller-overridable, but Stage 5 just
-    // subscribes to every canonical topic.
-    let topics_to_subscribe: Vec<Topic> = config.subscribe_topics.as_ref().map_or_else(
-        || Topic::STATIC.to_vec(),
-        |names| {
-            names
-                .iter()
-                .filter_map(|name| {
-                    topic_from_name(name).or_else(|| {
-                        warn!(topic = %name, "unknown topic name; ignoring");
-                        None
-                    })
-                })
-                .collect()
-        },
-    );
-    for topic in topics_to_subscribe {
-        if cmd_tx.send(NetworkCommand::Subscribe(topic)).await.is_err() {
-            warn!(?topic, "network command channel closed before subscribe");
-        }
-    }
-
+#[allow(clippy::too_many_lines)]
+async fn run_with_prover<P: ProgramProver + 'static>(
+    config: NodeConfig,
+    build_prover: impl FnOnce() -> Result<P, Sp1HostError>,
+) -> Result<(), NodeError> {
     // Every node now requires a `chain_spec_path`; the stub fallback
     // from earlier M6 bring-up was removed once the persistent
     // ChainBackend stabilised. Misconfigured deployments must fail
@@ -199,12 +177,11 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     let production_config = build_block_producer_config(&config, &chain_spec)?;
     let db = open_node_db(&config)?;
     let engine = open_or_initialise_engine(db, chain_spec)?;
-    // SP1 CPU prover for production. Setup is paid once (then cached
-    // to disk by `Sp1ProofSystem::new`), so subsequent node restarts
-    // are fast. CudaProver / NetworkProver swap in here later.
-    let cpu_prover = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+    let prover = build_prover().map_err(|error| NodeError::ProofSystem(error.to_string()))?;
     let proof_system =
-        Sp1ProofSystem::new(cpu_prover).map_err(|err| NodeError::ProofSystem(err.to_string()))?;
+        Sp1ProofSystem::new(prover).map_err(|error| NodeError::ProofSystem(error.to_string()))?;
+    info!(backend = ?config.proving.backend, cuda_device = ?config.proving.cuda_device,
+        concurrency = config.proving.concurrency, "SP1 proving backend initialized");
     info!(
         chain_id = config.chain_id,
         backend = "ChainBackend",
@@ -212,14 +189,128 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         "using real engine backend"
     );
     let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
-    // Install the WASM block executor so the producer loop's
-    // dry-run path can build SP1 witnesses. The embedded default-
-    // runtime master cdylib is the only runtime today; on-chain
-    // upgrades will install a different `WasmExecutor` per
-    // activation epoch.
-    let block_executor =
-        WasmExecutor::default_runtime().map_err(|err| NodeError::ProofSystem(err.to_string()))?;
-    concrete_backend.set_block_executor(block_executor);
+    concrete_backend.set_proving_concurrency(config.proving.concurrency);
+    if config.role == NodeRole::LightClient {
+        let (spec, domain) = concrete_backend
+            .history_profile()
+            .map_err(NodeError::ProofSystem)?;
+        let (anchor, trusted_at) = match (
+            &config.light_client.trusted_checkpoint_path,
+            config.light_client.trusted_at,
+        ) {
+            (Some(path), Some(trusted_at)) => {
+                let bytes = std::fs::read(path)?;
+                if bytes.len() > 1024 {
+                    return Err(NodeError::ProofSystem(
+                        "trusted checkpoint exceeds size limit".into(),
+                    ));
+                }
+                let anchor = borsh::from_slice(&bytes).map_err(|error| {
+                    NodeError::ProofSystem(format!("trusted checkpoint: {error}"))
+                })?;
+                (anchor, trusted_at)
+            }
+            (None, None) => (
+                neutrino_consensus_types::history_proof::Checkpoint {
+                    domain,
+                    boundary: neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(
+                        &spec,
+                    ),
+                },
+                spec.genesis_time,
+            ),
+            _ => {
+                return Err(NodeError::ProofSystem(
+                    "trusted_checkpoint_path and trusted_at must be configured together".into(),
+                ));
+            }
+        };
+        concrete_backend
+            .initialize_light(
+                anchor,
+                trusted_at,
+                config.light_client.max_future_drift_secs,
+            )
+            .map_err(NodeError::ProofSystem)?;
+    } else {
+        concrete_backend
+            .set_retention_policy(config.role.retention_policy())
+            .map_err(NodeError::ProofSystem)?;
+        concrete_backend
+            .initialize_history()
+            .map_err(NodeError::ProofSystem)?;
+        // Install the WASM block executor so the producer loop's
+        // dry-run path can build SP1 witnesses. The embedded default-
+        // runtime master cdylib is the only runtime today; on-chain
+        // upgrades will install a different `WasmExecutor` per
+        // activation epoch.
+        let block_executor = WasmExecutor::default_runtime()
+            .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
+        concrete_backend.set_block_executor(block_executor);
+    }
+    let local_key = Keypair::generate_ed25519();
+    let local_peer_id = neutrino_network::PeerId::from(local_key.public());
+    info!(%local_peer_id, role = ?config.role, chain_id = config.chain_id, "starting node");
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(256);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(256);
+
+    let mut svc = NetworkService::new(local_key, cmd_rx, event_tx)?;
+
+    // Bind every configured listener.
+    for addr in config.effective_listen() {
+        let parsed = addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
+            addr: addr.clone(),
+            source,
+        })?;
+        match svc.listen_on(parsed) {
+            Ok(id) => info!(%addr, ?id, "listening"),
+            Err(err) => warn!(%addr, ?err, "listen failed"),
+        }
+    }
+
+    // Spawn the network service.
+    let network_handle = tokio::spawn(svc.run());
+
+    // Dial bootnodes if any.
+    for addr in &config.bootnodes {
+        let parsed = addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
+            addr: addr.clone(),
+            source,
+        })?;
+        if cmd_tx.send(NetworkCommand::Dial(parsed)).await.is_err() {
+            warn!(%addr, "network command channel closed while dialing bootnode");
+        }
+    }
+
+    // Subscribe to gossip topics: caller-overridable, but Stage 5 just
+    // subscribes to every canonical topic.
+    let topics_to_subscribe: Vec<Topic> = config.subscribe_topics.as_ref().map_or_else(
+        || {
+            if config.role == NodeRole::LightClient {
+                vec![Topic::Checkpoints]
+            } else {
+                Topic::STATIC.to_vec()
+            }
+        },
+        |names| {
+            names
+                .iter()
+                .filter_map(|name| {
+                    topic_from_name(name).or_else(|| {
+                        warn!(topic = %name, "unknown topic name; ignoring");
+                        None
+                    })
+                })
+                .collect()
+        },
+    );
+    for topic in topics_to_subscribe {
+        if cmd_tx.send(NetworkCommand::Subscribe(topic)).await.is_err() {
+            warn!(?topic, "network command channel closed before subscribe");
+        }
+    }
+
     // Enable the multi-validator chunk-BFT loop. Every node installs
     // the network publisher so peer-detected slashing evidence and
     // aggregator emissions can broadcast; validator nodes
@@ -231,8 +322,7 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(cfg) = production_config.as_ref() {
         concrete_backend.set_local_voter(cfg.proposer.clone());
     }
-    let producer_job: Option<(Arc<NodeBackend>, BlockProducerConfig)> =
-        production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
+    let producer_job = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = concrete_backend;
 
@@ -349,7 +439,7 @@ fn open_or_initialise_engine(
             Engine::open(chain_spec, db).map_err(|err| NodeError::Engine(err.to_string()))?;
         info!(
             head_height = engine.head_height(),
-            latest_checkpoint_index = engine.latest_checkpoint_index(),
+            recursive_covered_chunks = engine.recursive_covered_chunks(),
             "engine resumed from persistent state"
         );
         Ok(engine)
@@ -390,11 +480,6 @@ fn build_block_producer_config(
         ))));
     }
 
-    if !config.proving.is_valid() {
-        return Err(NodeError::Engine(
-            "invalid proving concurrency/capacity".into(),
-        ));
-    }
     Ok(Some(BlockProducerConfig {
         proving: config.proving,
         proposer,

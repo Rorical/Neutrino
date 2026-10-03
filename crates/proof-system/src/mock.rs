@@ -43,7 +43,6 @@ impl MockProofSystem {
 impl ProofSystem for MockProofSystem {
     type BlockProof = MockBlockProof;
     type ChunkProof = alloc::vec::Vec<u8>;
-    type RecursiveProof = alloc::vec::Vec<u8>;
 
     fn classify_block_rejection(
         &self,

@@ -1,11 +1,14 @@
 //! Composition of execution, proposer, finality and validator-transition checks.
 //!
-//! Historical membership and sanction replay state are opened against the
+//! Historical membership is opened against the
 //! incoming context and extended into the next chunk's authenticated context.
+//! Block-proven runtime offence markers own sanction replay protection.
 
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_consensus_types::{Body, Chunk};
+pub use neutrino_consensus_types::history_proof::ConsensusStatement;
+use neutrino_consensus_types::history_proof::{ChainBinding, ConsensusBoundary, ExecutionPrograms};
+use neutrino_consensus_types::{Body, Chunk, ChunkProofPublicInputs};
 use neutrino_primitives::{ChainSpec, Hash, Seed, merkle_root_of_hashes};
 use neutrino_runtime_abi::StateWitness;
 
@@ -15,7 +18,7 @@ use crate::{
         ExecutionContext, ExecutionStatement, ProvenBlock, commitment, validate_execution,
     },
     finality::verify_finality_using,
-    history::{HistoricalChunk, HistoryError, HistoryWitness},
+    history::{HistoryError, HistoryWitness},
     proposer::verify_proposer_using,
     rotation::rotate_from_witness,
 };
@@ -39,7 +42,7 @@ pub struct ConsensusWitness {
     pub bodies: Vec<ConsensusBody>,
     /// Trie witness for post-chunk validator records.
     pub post_state: StateWitness,
-    /// Authenticated history, consumed penalties and inactivity sources.
+    /// Authenticated append frontier and referenced historical records.
     pub history: HistoryWitness,
     /// Both BFT phases, signing the derived chunk commitment.
     pub finality_cert: neutrino_consensus_types::FinalityCert,
@@ -47,24 +50,58 @@ pub struct ConsensusWitness {
     pub block_guest_vk_digest: [u32; 8],
 }
 
-/// Guest-committed statement. The verifier must authenticate the context,
-/// incoming seed and block-program key against its own trusted checkpoint.
-#[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
-pub struct ConsensusStatement {
-    /// Trusted early cryptographic-fact program.
-    pub fact_guest_vk_digest: [u32; 8],
-    /// Accepted evidence program, shared by all recursively verified blocks.
-    pub evidence_guest_vk_digest: [u32; 8],
-    /// Header, execution and chunk commitments.
-    pub execution: ExecutionStatement,
-    /// Incoming authenticated randomness.
-    pub seed: Seed,
-    /// Randomness derived from verified VRFs in canonical block order.
-    pub next_seed: Seed,
-    /// Commitment to the exact finality certificate verified in the guest.
-    pub finality_cert_hash: Hash,
-    /// Fully derived incoming context for the immediately following chunk.
+/// Native result retaining the full context outside the compact public statement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedConsensus {
+    /// Exact fixed-size values committed by the Chunk Guest.
+    pub statement: ConsensusStatement,
+    /// Complete next active set used by ordinary node execution.
     pub next_context: ExecutionContext,
+}
+
+/// Construct the canonical execution context from a validated chain specification.
+pub fn genesis_context(spec: &ChainSpec) -> ExecutionContext {
+    ExecutionContext {
+        chain_id: spec.chain_id,
+        chain_spec_hash: spec.hash(),
+        chunk_id: 0,
+        chunk_size: spec.consensus.chunk_size,
+        parent_block_hash: spec.genesis_block_hash,
+        pre_state_root: spec.genesis_state_root,
+        parent_slot: 0,
+        vm_code_hash: spec.runtime_code_hash,
+        gas_price: spec.runtime.gas_price,
+        active_validators: spec.initial_validators.clone(),
+        history_root: neutrino_consensus_types::history::empty_history_root(),
+    }
+}
+
+/// Compact a complete execution context without losing any authenticated field.
+pub fn context_boundary(
+    context: &ExecutionContext,
+    seed: Seed,
+) -> Result<ConsensusBoundary, ConsensusError> {
+    boundary_with_validators(context, seed, commitment(&context.active_validators))
+}
+
+fn boundary_with_validators(
+    context: &ExecutionContext,
+    seed: Seed,
+    validators_root: Hash,
+) -> Result<ConsensusBoundary, ConsensusError> {
+    Ok(ConsensusBoundary {
+        next_chunk_id: context.chunk_id,
+        height: context
+            .chunk_id
+            .checked_mul(context.chunk_size)
+            .ok_or(ConsensusError::Context)?,
+        block_hash: context.parent_block_hash,
+        state_root: context.pre_state_root,
+        slot: context.parent_slot,
+        validators_root,
+        seed,
+        history_root: context.history_root,
+    })
 }
 
 /// Failure while constructing a guest consensus statement.
@@ -91,15 +128,21 @@ pub enum ConsensusError {
 /// Inner SP1 proofs must be verified by the guest using the exact block outputs
 /// and key in this witness. This function alone does not establish execution.
 pub fn validate_consensus(input: &ConsensusWitness) -> Result<ConsensusStatement, ConsensusError> {
+    Ok(validate_consensus_with_context(input)?.statement)
+}
+
+/// Verify consensus once and retain the ordinary-execution context for the host.
+pub fn validate_consensus_with_context(
+    input: &ConsensusWitness,
+) -> Result<ValidatedConsensus, ConsensusError> {
     let mut verifier = crate::bls::BatchVerifier::default();
     let ValidatedCandidate {
         execution,
         next_validators,
-        penalties,
     } = validate_candidate_using(input, &mut verifier)?;
     let context = &input.context;
     let spec = &input.chain_spec;
-    let chunk = as_chunk(&execution);
+    let chunk = as_chunk(&execution.chunk);
     verify_finality_using(
         spec.chain_id,
         &spec.consensus,
@@ -117,13 +160,17 @@ pub fn validate_consensus(input: &ConsensusWitness) -> Result<ConsensusStatement
         .iter()
         .map(|block| block.header.vrf_proof)
         .collect();
-    let mut history = input.history.chunks.clone();
-    history.push(HistoricalChunk {
-        chunk,
-        validators: context.active_validators.clone(),
+    let historical = neutrino_consensus_types::evidence::EvidenceContext {
+        chunk_id: chunk.chunk_id,
+        chunk_hash: chunk.hash(),
+        end_height: chunk.end_height,
+        validators_root: chunk.active_validator_set_root,
         seed: input.seed,
-        finality: input.finality_cert.clone(),
-    });
+    };
+    let mut frontier = input.history.frontier.clone();
+    let history_root = frontier
+        .append(commitment(&historical))
+        .ok_or(ConsensusError::Context)?;
     let next_context = ExecutionContext {
         chunk_id: context
             .chunk_id
@@ -138,17 +185,36 @@ pub fn validate_consensus(input: &ConsensusWitness) -> Result<ConsensusStatement
             .header
             .slot,
         active_validators: next_validators,
-        history_root: crate::history::history_commitment(&history),
-        penalty_root: commitment(&penalties),
-        ..context.clone()
+        history_root,
+        chain_id: context.chain_id,
+        chain_spec_hash: context.chain_spec_hash,
+        chunk_size: context.chunk_size,
+        vm_code_hash: context.vm_code_hash,
+        gas_price: context.gas_price,
     };
-    Ok(ConsensusStatement {
-        fact_guest_vk_digest: input.fact_guest_vk_digest,
-        evidence_guest_vk_digest: input.evidence_guest_vk_digest,
-        execution,
-        seed: input.seed,
-        next_seed: neutrino_vrf::fold_seed(&input.seed, &vrfs),
-        finality_cert_hash: commitment(&input.finality_cert),
+    let start = boundary_with_validators(
+        context,
+        input.seed,
+        execution.chunk.active_validator_set_root,
+    )?;
+    let end = boundary_with_validators(
+        &next_context,
+        neutrino_vrf::fold_seed(&input.seed, &vrfs),
+        execution.chunk.next_validator_set_root,
+    )?;
+    Ok(ValidatedConsensus {
+        statement: ConsensusStatement {
+            chain: ChainBinding::from_spec(spec),
+            programs: ExecutionPrograms {
+                fact: input.fact_guest_vk_digest,
+                evidence: input.evidence_guest_vk_digest,
+                block: input.block_guest_vk_digest,
+            },
+            start,
+            end,
+            chunk: execution.chunk,
+            finality_cert_hash: commitment(&input.finality_cert),
+        },
         next_context,
     })
 }
@@ -161,8 +227,6 @@ pub struct ValidatedCandidate {
     pub execution: ExecutionStatement,
     /// Validator transition authenticated against the exact chunk-end state.
     pub next_validators: Vec<neutrino_primitives::Validator>,
-    /// Updated consumed-penalty ledger.
-    pub penalties: Vec<Hash>,
 }
 
 /// Validate a candidate before voting. Finality is checked only by
@@ -187,7 +251,7 @@ fn validate_candidate_using(
         .map_err(|_| ConsensusError::Execution)?;
     input
         .history
-        .authenticate(context.chunk_id, context.history_root, context.penalty_root)
+        .authenticate(context.chunk_id, context.history_root)
         .map_err(ConsensusError::History)?;
     for (block, body) in input.blocks.iter().zip(&input.bodies) {
         body.validate(&block.header, &block.output.transaction_summary)?;
@@ -210,8 +274,6 @@ fn validate_candidate_using(
         )
         .map_err(|_| ConsensusError::Proposer)?;
     }
-    let mut penalties: alloc::collections::BTreeSet<_> =
-        input.history.penalties.iter().copied().collect();
     let mut offenders = Vec::new();
     let expected_anchor = neutrino_consensus_types::evidence::EvidenceAnchor {
         fact_guest_vk_digest: input.fact_guest_vk_digest,
@@ -231,11 +293,6 @@ fn validate_candidate_using(
                 .map_err(ConsensusError::History)?;
         }
         for sanction in &block.output.accountability.admitted {
-            if !penalties.insert(sanction.offence_id) {
-                return Err(ConsensusError::History(
-                    crate::history::HistoryError::Replay,
-                ));
-            }
             if sanction.kind == neutrino_consensus_types::evidence::SanctionKind::Slash {
                 offenders.push(sanction.offender.clone());
             }
@@ -263,7 +320,6 @@ fn validate_candidate_using(
     Ok(ValidatedCandidate {
         execution,
         next_validators,
-        penalties: penalties.into_iter().collect(),
     })
 }
 
@@ -281,13 +337,20 @@ fn validate_context(input: &ConsensusWitness) -> Result<(), ConsensusError> {
         return Err(ConsensusError::Context);
     }
     if context.chunk_id == 0
-        && (context.parent_block_hash != spec.genesis_block_hash
-            || context.pre_state_root != spec.genesis_state_root
-            || context.active_validators != spec.initial_validators
-            || input.seed != spec.genesis_seed
-            || context.parent_slot != 0
-            || context.history_root != crate::history::history_commitment(&[])
-            || context.penalty_root != commitment(&Vec::<Hash>::new()))
+        && (context != &genesis_context(spec) || input.seed != spec.genesis_seed)
+    {
+        return Err(ConsensusError::Context);
+    }
+    let requested: alloc::collections::BTreeSet<_> = input
+        .bodies
+        .iter()
+        .flat_map(|body| body.finality_votes.iter().map(|vote| vote.data.chunk_id))
+        .collect();
+    if requested.len() != input.history.records.len()
+        || requested
+            .iter()
+            .zip(&input.history.records)
+            .any(|(id, opening)| *id != opening.record.chunk.chunk_id)
     {
         return Err(ConsensusError::Context);
     }
@@ -300,11 +363,11 @@ pub fn validate_successor(
     previous: &ConsensusStatement,
     input: &ConsensusWitness,
 ) -> Result<ConsensusStatement, ConsensusError> {
-    if input.context != previous.next_context
-        || input.seed != previous.next_seed
-        || input.evidence_guest_vk_digest != previous.evidence_guest_vk_digest
-        || input.block_guest_vk_digest != previous.execution.block_guest_vk_digest
-        || input.fact_guest_vk_digest != previous.fact_guest_vk_digest
+    if context_boundary(&input.context, input.seed)? != previous.end
+        || ChainBinding::from_spec(&input.chain_spec) != previous.chain
+        || input.evidence_guest_vk_digest != previous.programs.evidence
+        || input.block_guest_vk_digest != previous.programs.block
+        || input.fact_guest_vk_digest != previous.programs.fact
     {
         return Err(ConsensusError::Context);
     }
@@ -312,8 +375,7 @@ pub fn validate_successor(
 }
 
 /// Recover the canonical chunk signed by both BFT phases.
-pub const fn as_chunk(statement: &ExecutionStatement) -> Chunk {
-    let pi = &statement.chunk;
+pub const fn as_chunk(pi: &ChunkProofPublicInputs) -> Chunk {
     Chunk {
         chunk_id: pi.chunk_id,
         start_height: pi.start_height,

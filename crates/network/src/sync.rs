@@ -2,9 +2,9 @@
 //! §"Sync state machine".
 //!
 //! ```text
-//!     Init → CheckpointBackfill → HeaderBackfill → StateFetch
-//!                              \                            \
-//!                               → Following (light client)   → ProofBackfill → BodyBackfill (archive) → Following
+//!     Light: Init → CheckpointBackfill → Following
+//!     Full:  Init → HeaderBackfill → StateFetch → ProofBackfill → Following
+//!     Archive additionally fetches retained block bodies.
 //! ```
 //!
 //! [`SyncMachine`] is a **pure state machine**: it owns no I/O, performs no
@@ -31,10 +31,10 @@ use neutrino_primitives::{BlockHash, CheckpointIndex, ChunkId, Hash, Height, Slo
 pub enum SyncMode {
     /// `Init → CheckpointBackfill → Following`.
     ///
-    /// The light client verifies recursive checkpoint proofs and serves
-    /// state queries through Merkle-proof RPCs only.
+    /// The light client advances an independently trusted boundary with recursive
+    /// history receipts; it does not download block bodies or state.
     LightClient,
-    /// `Init → CheckpointBackfill → HeaderBackfill → StateFetch →
+    /// `Init → HeaderBackfill → StateFetch →
     /// ProofBackfill → Following`.
     Snap,
     /// Same as [`SyncMode::Snap`] plus `BodyBackfill` before `Following`.
@@ -49,14 +49,14 @@ pub enum SyncMode {
 pub enum SyncState {
     /// Waiting for the first peer handshake.
     Init,
-    /// Streaming `(Checkpoint, RecursiveCheckpointProof)` from genesis or
+    /// Fetching a proven suffix from the exact local genesis or
     /// the weak-subjectivity anchor.
     CheckpointBackfill {
-        /// Highest checkpoint index already finalized locally.
+        /// Chunk count at the locally authenticated endpoint.
         local_finalized_index: CheckpointIndex,
-        /// Target checkpoint index advertised by the chosen sync peer.
+        /// Chunk count advertised at the chosen peer endpoint.
         target_index: CheckpointIndex,
-        /// True while a `RecursiveProofByIndex` RPC is in flight.
+        /// True while a `HistoryProofByRange` RPC is in flight.
         in_flight: bool,
     },
     /// Streaming headers (via `BlocksByRange`) up to the latest finalized
@@ -137,17 +137,17 @@ pub struct LocalProgress {
     pub finalized_chunk_id: Option<ChunkId>,
     /// Hash of the latest finalized chunk, or zero at genesis.
     pub finalized_chunk_hash: Hash,
-    /// Highest recursive checkpoint index finalized locally.
-    pub finalized_checkpoint_index: CheckpointIndex,
-    /// Hash of the highest finalized checkpoint.
-    pub finalized_checkpoint_hash: Hash,
-    /// `end_state_root` of the highest finalized checkpoint.
+    /// Authenticated recursive endpoint chunk count; full nodes publish a genesis prefix.
+    pub recursive_covered_chunks: CheckpointIndex,
+    /// Hash of the locally authenticated recursive endpoint.
+    pub checkpoint_hash: Hash,
+    /// State root at the locally authenticated recursive endpoint.
     pub finalized_state_root: StateRoot,
-    /// `end_block_hash` of the highest finalized checkpoint.
+    /// Block hash at the locally authenticated recursive endpoint.
     pub finalized_block_hash: BlockHash,
-    /// `end_height` of the highest finalized checkpoint.
+    /// Block height at the locally authenticated recursive endpoint.
     pub finalized_height: Height,
-    /// Highest header height stored locally (≥ `finalized_height`).
+    /// Highest authenticated head height (light clients need not store its header).
     pub head_height: Height,
     /// Hash of the local head block.
     pub head_block_hash: BlockHash,
@@ -180,9 +180,9 @@ pub enum SyncEvent {
     /// Driver imported and verified a batch of recursive checkpoints. The
     /// new local finalized cursor is reported back as part of the event.
     CheckpointsAdvanced {
-        /// New highest checkpoint index.
+        /// Chunk count at the newly authenticated endpoint.
         new_finalized_index: CheckpointIndex,
-        /// New highest checkpoint hash.
+        /// Hash of the newly authenticated endpoint.
         new_finalized_hash: Hash,
         /// New `end_state_root`.
         new_finalized_state_root: StateRoot,
@@ -234,13 +234,13 @@ pub enum SyncCommand {
     /// Send a [`rpc::Status`] handshake to the given peer.
     RequestStatus(PeerId),
     /// Fetch a batch of recursive checkpoints from the peer.
-    RequestRecursiveProofs {
+    RequestHistoryProof {
         /// Peer to query.
         peer: PeerId,
-        /// First checkpoint index to fetch.
-        start_index: CheckpointIndex,
-        /// Number of checkpoints to fetch.
-        count: u64,
+        /// Exact current trusted endpoint.
+        start_checkpoint_hash: Hash,
+        /// Exact requested peer endpoint.
+        end_checkpoint_hash: Hash,
     },
     /// Fetch a batch of blocks / headers from the peer.
     RequestBlocks {
@@ -282,8 +282,6 @@ pub enum SyncCommand {
 /// Configurable batch sizes the FSM uses when emitting RPC requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyncBatchSizes {
-    /// Number of recursive checkpoints requested per RPC.
-    pub recursive_proof_batch: u64,
     /// Number of blocks requested per `BlocksByRange` RPC.
     pub block_batch: u64,
     /// Number of block proofs requested per `BlockProofByHeight` RPC.
@@ -293,7 +291,6 @@ pub struct SyncBatchSizes {
 impl Default for SyncBatchSizes {
     fn default() -> Self {
         Self {
-            recursive_proof_batch: 32,
             block_batch: 16,
             block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
         }
@@ -331,7 +328,6 @@ impl SyncMachine {
             progress,
             sync_peer: None,
             batch_sizes: SyncBatchSizes {
-                recursive_proof_batch: 32,
                 block_batch: 16,
                 block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
             },
@@ -343,6 +339,12 @@ impl SyncMachine {
     pub const fn with_batch_sizes(mut self, batch_sizes: SyncBatchSizes) -> Self {
         self.batch_sizes = batch_sizes;
         self
+    }
+
+    /// Selected synchronization role.
+    #[must_use]
+    pub const fn mode(&self) -> SyncMode {
+        self.mode
     }
 
     /// Current state.
@@ -414,6 +416,36 @@ impl SyncMachine {
         }
     }
 
+    /// Retry the same anchored range from another provider after unavailability.
+    /// The driver bounds provider attempts; changing provider never changes the
+    /// requested endpoint or treats that provider as a new trust anchor.
+    pub fn retry_history_from(&mut self, peer: PeerId) -> Vec<SyncCommand> {
+        if self.mode != SyncMode::LightClient {
+            return Vec::new();
+        }
+        let SyncState::CheckpointBackfill {
+            local_finalized_index,
+            target_index,
+            in_flight: false,
+        } = self.state
+        else {
+            return Vec::new();
+        };
+        let Some(target) = self.sync_peer.as_mut() else {
+            return Vec::new();
+        };
+        if target.status.recursive_covered_chunks <= local_finalized_index {
+            return Vec::new();
+        }
+        target.peer = peer;
+        self.state = SyncState::CheckpointBackfill {
+            local_finalized_index,
+            target_index,
+            in_flight: true,
+        };
+        self.emit_checkpoint_fetch(peer, local_finalized_index)
+    }
+
     // --- Event handlers ------------------------------------------------------
 
     const fn reset(&mut self) -> Vec<SyncCommand> {
@@ -430,9 +462,14 @@ impl SyncMachine {
 
     fn on_peer_disconnected(&mut self, peer: PeerId) -> Vec<SyncCommand> {
         if self.sync_peer.is_some_and(|s| s.peer == peer) {
-            // Lost our sync peer; clear it and fall back to Init.
-            self.sync_peer = None;
-            self.state = SyncState::Init;
+            if self.mode == SyncMode::LightClient
+                && let SyncState::CheckpointBackfill { in_flight, .. } = &mut self.state
+            {
+                *in_flight = false;
+            } else {
+                self.sync_peer = None;
+                self.state = SyncState::Init;
+            }
         }
         Vec::new()
     }
@@ -447,8 +484,30 @@ impl SyncMachine {
             return Vec::new();
         }
 
-        let is_ahead = status.finalized_checkpoint_index > self.progress.finalized_checkpoint_index
-            || status.head_height > self.progress.head_height;
+        if self.mode == SyncMode::LightClient
+            && status.recursive_covered_chunks == self.progress.recursive_covered_chunks
+            && status.checkpoint_hash != self.progress.checkpoint_hash
+        {
+            return Vec::new();
+        }
+
+        if self.mode == SyncMode::LightClient
+            && matches!(
+                self.state,
+                SyncState::CheckpointBackfill {
+                    in_flight: true,
+                    ..
+                }
+            )
+        {
+            // The active request owns its provider and exact endpoint until its
+            // response or disconnect. The driver retains newer status for later.
+            return Vec::new();
+        }
+
+        let is_ahead = status.recursive_covered_chunks > self.progress.recursive_covered_chunks
+            || (self.mode != SyncMode::LightClient
+                && status.head_height > self.progress.head_height);
 
         if !is_ahead {
             // Either equal or behind. In LightClient mode, equal finalized
@@ -456,7 +515,8 @@ impl SyncMachine {
             // safely Follow.
             if matches!(self.state, SyncState::Init)
                 && self.mode == SyncMode::LightClient
-                && status.finalized_checkpoint_index == self.progress.finalized_checkpoint_index
+                && status.recursive_covered_chunks == self.progress.recursive_covered_chunks
+                && status.checkpoint_hash == self.progress.checkpoint_hash
             {
                 return self.enter_following();
             }
@@ -471,15 +531,18 @@ impl SyncMachine {
 
         match self.state {
             SyncState::Init => self.advance_to_checkpoint_backfill(status),
+            SyncState::Following if self.mode == SyncMode::LightClient => {
+                self.advance_to_checkpoint_backfill(status)
+            }
             SyncState::CheckpointBackfill { in_flight, .. } => {
                 // Update target with the latest peer view. Issue a new RPC
                 // only if we are not already waiting on one.
-                let local = self.progress.finalized_checkpoint_index;
-                let target = status.finalized_checkpoint_index.max(local);
+                let local = self.progress.recursive_covered_chunks;
+                let target = status.recursive_covered_chunks.max(local);
                 self.state = SyncState::CheckpointBackfill {
                     local_finalized_index: local,
                     target_index: target,
-                    in_flight,
+                    in_flight: true,
                 };
                 if in_flight {
                     Vec::new()
@@ -492,8 +555,11 @@ impl SyncMachine {
     }
 
     fn advance_to_checkpoint_backfill(&mut self, status: &rpc::Status) -> Vec<SyncCommand> {
-        let local = self.progress.finalized_checkpoint_index;
-        let target = status.finalized_checkpoint_index;
+        if self.mode != SyncMode::LightClient {
+            return self.advance_to_header_backfill(status.head_height);
+        }
+        let local = self.progress.recursive_covered_chunks;
+        let target = status.recursive_covered_chunks;
         if target == local {
             return match self.mode {
                 SyncMode::LightClient => self.enter_following(),
@@ -519,12 +585,16 @@ impl SyncMachine {
         peer: PeerId,
         local_finalized_index: CheckpointIndex,
     ) -> Vec<SyncCommand> {
-        // Request indices strictly above the local finalized index.
-        let start_index = local_finalized_index.saturating_add(1);
-        vec![SyncCommand::RequestRecursiveProofs {
+        let Some(target) = self.sync_peer else {
+            return Vec::new();
+        };
+        if target.status.recursive_covered_chunks <= local_finalized_index {
+            return Vec::new();
+        }
+        vec![SyncCommand::RequestHistoryProof {
             peer,
-            start_index,
-            count: self.batch_sizes.recursive_proof_batch,
+            start_checkpoint_hash: self.progress.checkpoint_hash,
+            end_checkpoint_hash: target.status.checkpoint_hash,
         }]
     }
 
@@ -536,17 +606,22 @@ impl SyncMachine {
         new_finalized_height: Height,
         new_finalized_block_hash: BlockHash,
     ) -> Vec<SyncCommand> {
-        // Persist local progress before reading the state below.
-        self.progress.finalized_checkpoint_index = new_finalized_index;
-        self.progress.finalized_checkpoint_hash = new_finalized_hash;
+        // Full-node finality and published prefix coverage come from the backend,
+        // never from an arbitrary suffix imported by a light-client flow.
+        if self.mode != SyncMode::LightClient {
+            return Vec::new();
+        }
+        let SyncState::CheckpointBackfill { target_index, .. } = self.state else {
+            return Vec::new();
+        };
+        if new_finalized_index <= self.progress.recursive_covered_chunks {
+            return Vec::new();
+        }
+        self.progress.recursive_covered_chunks = new_finalized_index;
+        self.progress.checkpoint_hash = new_finalized_hash;
         self.progress.finalized_state_root = new_finalized_state_root;
         self.progress.finalized_height = new_finalized_height;
         self.progress.finalized_block_hash = new_finalized_block_hash;
-
-        let SyncState::CheckpointBackfill { target_index, .. } = self.state else {
-            // Stale event; ignore.
-            return Vec::new();
-        };
 
         if new_finalized_index >= target_index {
             // Reached the peer's reported finalized cursor.
@@ -773,6 +848,15 @@ impl SyncMachine {
         peer: PeerId,
         _error: &str,
     ) -> Vec<SyncCommand> {
+        if self.mode == SyncMode::LightClient
+            && matches!(
+                protocol,
+                RpcProtocol::HistoryProofByRange | RpcProtocol::CheckpointLatest
+            )
+            && self.sync_peer.is_none_or(|target| target.peer != peer)
+        {
+            return Vec::new();
+        }
         // Clear in_flight on the matching state and let the driver retry.
         match (&self.state, protocol) {
             (
@@ -781,7 +865,7 @@ impl SyncMachine {
                     target_index,
                     ..
                 },
-                RpcProtocol::RecursiveProofByIndex | RpcProtocol::RecursiveProofLatest,
+                RpcProtocol::HistoryProofByRange | RpcProtocol::CheckpointLatest,
             ) => {
                 let (local, target) = (*local_finalized_index, *target_index);
                 self.state = SyncState::CheckpointBackfill {
@@ -789,7 +873,7 @@ impl SyncMachine {
                     target_index: target,
                     in_flight: false,
                 };
-                self.emit_checkpoint_fetch(peer, local)
+                Vec::new()
             }
             (
                 SyncState::HeaderBackfill {
@@ -887,8 +971,8 @@ mod tests {
             chain_spec_hash: [0; 32],
             finalized_chunk_id: None,
             finalized_chunk_hash: [0; 32],
-            finalized_checkpoint_index: finalized,
-            finalized_checkpoint_hash: [0xAA; 32],
+            recursive_covered_chunks: finalized,
+            checkpoint_hash: if finalized == 0 { [0; 32] } else { [0xAA; 32] },
             head_block_hash: [0xBB; 32],
             head_slot: head,
             head_height: head,
@@ -962,7 +1046,7 @@ mod tests {
 
     #[test]
     fn init_to_checkpoint_backfill_when_peer_is_ahead() {
-        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
+        let mut fsm = SyncMachine::new(SyncMode::LightClient, fresh_progress(7));
         let peer = pid();
         let cmds = fsm.on_event(SyncEvent::PeerStatus {
             peer,
@@ -982,10 +1066,10 @@ mod tests {
         }
         assert_eq!(
             cmds,
-            vec![SyncCommand::RequestRecursiveProofs {
+            vec![SyncCommand::RequestHistoryProof {
                 peer,
-                start_index: 1,
-                count: 32,
+                start_checkpoint_hash: [0; 32],
+                end_checkpoint_hash: [0xAA; 32],
             }]
         );
     }
@@ -1021,36 +1105,43 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_backfill_targets_peer_live_head_after_finalized_cursor() {
-        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
-        let peer = pid();
-        fsm.on_event(SyncEvent::PeerStatus {
-            peer,
-            status: peer_status(7, 2, 300),
-        });
-
-        let cmds = fsm.on_event(SyncEvent::CheckpointsAdvanced {
-            new_finalized_index: 2,
-            new_finalized_hash: [2; 32],
-            new_finalized_state_root: [2; 32],
-            new_finalized_height: 256,
-            new_finalized_block_hash: [2; 32],
-        });
-
-        match fsm.state() {
-            SyncState::HeaderBackfill { target_height, .. } => {
-                assert_eq!(*target_height, 300);
-            }
-            other => panic!("expected HeaderBackfill, got {other:?}"),
-        }
-        assert_eq!(
-            cmds,
-            vec![SyncCommand::RequestBlocks {
+    fn full_sync_ignores_recursive_lag_and_targets_live_blocks() {
+        for mode in [SyncMode::Snap, SyncMode::Archive] {
+            let mut fsm = SyncMachine::new(mode, fresh_progress(7));
+            let peer = pid();
+            let cmds = fsm.on_event(SyncEvent::PeerStatus {
                 peer,
-                start_height: 1,
-                count: 16,
-            }]
-        );
+                status: peer_status(7, 2, 300),
+            });
+            assert!(matches!(
+                fsm.state(),
+                SyncState::HeaderBackfill {
+                    target_height: 300,
+                    ..
+                }
+            ));
+            assert!(
+                cmds.iter()
+                    .any(|command| matches!(command, SyncCommand::RequestBlocks { .. }))
+            );
+            assert!(
+                !cmds
+                    .iter()
+                    .any(|command| matches!(command, SyncCommand::RequestHistoryProof { .. }))
+            );
+            let before = *fsm.progress();
+            assert_eq!(
+                fsm.on_event(SyncEvent::CheckpointsAdvanced {
+                    new_finalized_index: 99,
+                    new_finalized_hash: [99; 32],
+                    new_finalized_state_root: [99; 32],
+                    new_finalized_height: 999,
+                    new_finalized_block_hash: [99; 32],
+                }),
+                [] as [SyncCommand; 0]
+            );
+            assert_eq!(*fsm.progress(), before);
+        }
     }
 
     #[test]
@@ -1074,7 +1165,7 @@ mod tests {
                 // Should request next batch.
                 assert!(
                     cmds.iter()
-                        .any(|c| matches!(c, SyncCommand::RequestRecursiveProofs { .. }))
+                        .any(|c| matches!(c, SyncCommand::RequestHistoryProof { .. }))
                 );
                 assert!(matches!(fsm.state(), SyncState::CheckpointBackfill { .. }));
             } else {
@@ -1096,40 +1187,17 @@ mod tests {
             peer,
             status: peer_status(7, 2, 256),
         });
-        assert!(matches!(fsm.state(), SyncState::CheckpointBackfill { .. }));
-
-        // Driver imports checkpoint 1.
-        let cmds = fsm.on_event(SyncEvent::CheckpointsAdvanced {
-            new_finalized_index: 1,
-            new_finalized_hash: [1; 32],
-            new_finalized_state_root: [1; 32],
-            new_finalized_height: 128,
-            new_finalized_block_hash: [1; 32],
-        });
-        assert!(matches!(fsm.state(), SyncState::CheckpointBackfill { .. }));
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, SyncCommand::RequestRecursiveProofs { .. }))
-        );
-
-        // Driver imports checkpoint 2 (target reached) → HeaderBackfill.
-        let cmds = fsm.on_event(SyncEvent::CheckpointsAdvanced {
-            new_finalized_index: 2,
-            new_finalized_hash: [2; 32],
-            new_finalized_state_root: [2; 32],
-            new_finalized_height: 256,
-            new_finalized_block_hash: [2; 32],
-        });
-        match fsm.state() {
-            SyncState::HeaderBackfill { target_height, .. } => {
-                assert_eq!(*target_height, 256);
+        assert!(matches!(
+            fsm.state(),
+            SyncState::HeaderBackfill {
+                target_height: 256,
+                ..
             }
-            other => panic!("expected HeaderBackfill, got {other:?}"),
-        }
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, SyncCommand::RequestBlocks { .. }))
-        );
+        ));
+        // The full-node backend obtains finality from complete Chunk proofs;
+        // emulate its independently authenticated finalized state cursor.
+        fsm.progress.finalized_state_root = [2; 32];
+        fsm.progress.finalized_height = 256;
 
         // Driver imports headers up to height 256.
         let cmds = fsm.on_event(SyncEvent::HeadersAdvanced {
@@ -1178,13 +1246,9 @@ mod tests {
             peer,
             status: peer_status(7, 1, 256),
         });
-        fsm.on_event(SyncEvent::CheckpointsAdvanced {
-            new_finalized_index: 1,
-            new_finalized_hash: [1; 32],
-            new_finalized_state_root: [1; 32],
-            new_finalized_height: 256,
-            new_finalized_block_hash: [1; 32],
-        });
+        // The full backend supplied this finalized Chunk state independently.
+        fsm.progress.finalized_state_root = [1; 32];
+        fsm.progress.finalized_height = 256;
         // Should now be in HeaderBackfill.
         assert!(matches!(fsm.state(), SyncState::HeaderBackfill { .. }));
         fsm.on_event(SyncEvent::HeadersAdvanced {
@@ -1221,7 +1285,7 @@ mod tests {
             peer,
             status: peer_status(7, 5, 640),
         });
-        assert!(matches!(fsm.state(), SyncState::CheckpointBackfill { .. }));
+        assert!(matches!(fsm.state(), SyncState::HeaderBackfill { .. }));
 
         fsm.on_event(SyncEvent::PeerDisconnected(peer));
         assert!(matches!(fsm.state(), SyncState::Init));
@@ -1229,26 +1293,116 @@ mod tests {
     }
 
     #[test]
-    fn rpc_failure_clears_in_flight_and_retries() {
-        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
+    fn history_unavailable_waits_for_notification() {
+        let mut fsm = SyncMachine::new(SyncMode::LightClient, fresh_progress(7));
         let peer = pid();
         fsm.on_event(SyncEvent::PeerStatus {
             peer,
             status: peer_status(7, 5, 640),
         });
         let cmds = fsm.on_event(SyncEvent::RpcFailed {
-            protocol: RpcProtocol::RecursiveProofByIndex,
+            protocol: RpcProtocol::HistoryProofByRange,
             peer,
             error: "transport closed".to_owned(),
         });
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, SyncCommand::RequestRecursiveProofs { .. }))
-        );
+        assert_eq!(cmds, [] as [SyncCommand; 0]);
         match fsm.state() {
             SyncState::CheckpointBackfill { in_flight, .. } => assert!(!in_flight),
             other => panic!("expected CheckpointBackfill, got {other:?}"),
         }
+        let resumed = fsm.on_event(SyncEvent::PeerStatus {
+            peer,
+            status: peer_status(7, 5, 640),
+        });
+        assert!(
+            resumed
+                .iter()
+                .any(|cmd| matches!(cmd, SyncCommand::RequestHistoryProof { .. }))
+        );
+    }
+
+    #[test]
+    fn history_provider_failover_preserves_anchors_and_single_in_flight_request() {
+        let mut local = fresh_progress(7);
+        local.recursive_covered_chunks = 2;
+        local.checkpoint_hash = [2; 32];
+        let mut fsm = SyncMachine::new(SyncMode::LightClient, local);
+        let original = pid();
+        let replacement = pid();
+        let status = peer_status(7, 5, 640);
+        fsm.on_event(SyncEvent::PeerStatus {
+            peer: original,
+            status,
+        });
+        assert_eq!(fsm.retry_history_from(replacement), [] as [SyncCommand; 0]);
+        fsm.on_event(SyncEvent::PeerDisconnected(original));
+        assert_eq!(
+            fsm.retry_history_from(replacement),
+            vec![SyncCommand::RequestHistoryProof {
+                peer: replacement,
+                start_checkpoint_hash: local.checkpoint_hash,
+                end_checkpoint_hash: status.checkpoint_hash,
+            }]
+        );
+        assert_eq!(fsm.retry_history_from(original), [] as [SyncCommand; 0]);
+        assert_eq!(fsm.progress(), &local);
+        let mut full = SyncMachine::new(SyncMode::Snap, local);
+        assert_eq!(full.retry_history_from(original), [] as [SyncCommand; 0]);
+    }
+
+    #[test]
+    fn light_client_ignores_larger_header_heads_with_older_recursive_coverage() {
+        let mut local = fresh_progress(7);
+        local.recursive_covered_chunks = 10;
+        local.checkpoint_hash = [10; 32];
+        local.head_height = 1_280;
+        let mut fsm = SyncMachine::new(SyncMode::LightClient, local);
+        fsm.state = SyncState::Following;
+        let peer = pid();
+        assert_eq!(
+            fsm.on_event(SyncEvent::PeerStatus {
+                peer,
+                status: peer_status(7, 9, 5_000),
+            }),
+            [] as [SyncCommand; 0]
+        );
+        assert_eq!(fsm.state(), &SyncState::Following);
+        let commands = fsm.on_event(SyncEvent::PeerStatus {
+            peer,
+            status: peer_status(7, 20, 2_560),
+        });
+        assert!(matches!(
+            commands.as_slice(),
+            [SyncCommand::RequestHistoryProof { .. }]
+        ));
+    }
+
+    #[test]
+    fn in_flight_history_keeps_its_provider_target_and_ignores_foreign_failures() {
+        let mut fsm = SyncMachine::new(SyncMode::LightClient, fresh_progress(7));
+        let original = pid();
+        let other = pid();
+        fsm.on_event(SyncEvent::PeerStatus {
+            peer: original,
+            status: peer_status(7, 5, 640),
+        });
+        let state = fsm.state().clone();
+        assert_eq!(
+            fsm.on_event(SyncEvent::PeerStatus {
+                peer: other,
+                status: peer_status(7, 20, 2_560),
+            }),
+            [] as [SyncCommand; 0]
+        );
+        fsm.on_event(SyncEvent::PeerDisconnected(other));
+        fsm.on_event(SyncEvent::RpcFailed {
+            protocol: RpcProtocol::HistoryProofByRange,
+            peer: other,
+            error: "old request".to_owned(),
+        });
+        assert_eq!(fsm.state(), &state);
+        assert_eq!(fsm.sync_peer(), Some(original));
+        assert_eq!(fsm.retry_history_from(other), [] as [SyncCommand; 0]);
     }
 
     #[test]
@@ -1309,9 +1463,38 @@ mod tests {
             peer,
             status: peer_status(7, 5, 640),
         });
-        assert!(matches!(fsm.state(), SyncState::CheckpointBackfill { .. }));
+        assert!(matches!(fsm.state(), SyncState::HeaderBackfill { .. }));
         fsm.on_event(SyncEvent::Reset);
         assert!(matches!(fsm.state(), SyncState::Init));
         assert_eq!(fsm.sync_peer(), None);
+    }
+    #[test]
+    fn light_client_requires_endpoint_identity_and_resumes_on_new_status() {
+        let mut fsm = SyncMachine::new(SyncMode::LightClient, fresh_progress(7));
+        let peer = pid();
+        let mut conflict = peer_status(7, 0, 0);
+        conflict.checkpoint_hash = [99; 32];
+        assert_eq!(
+            fsm.on_event(SyncEvent::PeerStatus {
+                peer,
+                status: conflict
+            }),
+            [] as [SyncCommand; 0]
+        );
+        assert_eq!(fsm.state(), &SyncState::Init);
+        fsm.on_event(SyncEvent::PeerStatus {
+            peer,
+            status: peer_status(7, 0, 0),
+        });
+        assert_eq!(fsm.state(), &SyncState::Following);
+        let commands = fsm.on_event(SyncEvent::PeerStatus {
+            peer,
+            status: peer_status(7, 1, 128),
+        });
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, SyncCommand::RequestHistoryProof { .. }))
+        );
     }
 }

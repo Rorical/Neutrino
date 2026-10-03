@@ -24,6 +24,10 @@ pub enum TrieError {
     /// into bytes; this can only happen for an attacker-supplied
     /// encoding.
     BitPathTooLong,
+    /// A retained root reaches a missing node or value.
+    MissingRetainedEntry,
+    /// A retained node or value does not match its content address.
+    RetainedHashMismatch,
 }
 
 impl fmt::Display for TrieError {
@@ -39,6 +43,8 @@ impl fmt::Display for TrieError {
             Self::BitPathTooLong => {
                 f.write_str("trie bit-path length does not fit in a byte buffer")
             }
+            Self::MissingRetainedEntry => f.write_str("retained trie entry is missing"),
+            Self::RetainedHashMismatch => f.write_str("retained trie entry hash mismatch"),
         }
     }
 }

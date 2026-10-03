@@ -6,8 +6,8 @@
 //! pre-validates every cross-checked field of
 //! [`BlockProofPublicInputs`] (`chain_id`, `height`, `block_gas_limit`,
 //! `gas_price`, `proposer_address`, `pre_state_root`) against the SP1
-//! input, drives the configured SP1 prover (mock / cpu / cuda /
-//! network), and cross-checks the committed [`StfPublicOutput`]
+//! input, drives the configured SP1 CPU/CUDA prover (mock in tests),
+//! and cross-checks the committed [`StfPublicOutput`]
 //! (`pre_state_root`, `post_state_root`, `gas_used`, `receipts_root`)
 //! against the same `BlockProofPublicInputs` before returning the
 //! wire proof.
@@ -19,15 +19,14 @@
 //! the proof.
 //!
 //! Complete chunk proving recursively verifies blocks and commits guest-checked
-//! execution and consensus transitions. Checkpoint recursion remains deferred.
+//! execution and consensus transitions. Recursive history composition verifies bounded child receipts.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::StfPublicOutput;
 use neutrino_proof_system::{ProofError, ProofSystem, public_inputs::BlockProofPublicInputs};
 use neutrino_prover_chunk::receipt_codec;
 use sp1_sdk::{
-    HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1ProvingKey, SP1Stdin,
-    SP1VerifyingKey,
+    HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1Stdin, SP1VerifyingKey,
     blocking::{MockProver, ProveRequest, Prover, ProverClient},
 };
 use std::{
@@ -36,7 +35,7 @@ use std::{
 };
 
 use crate::executor::decode_witness_bundle;
-use crate::{ProverCtx, Sp1HostError};
+use crate::{ProgramProver, ProverCtx, Sp1HostError};
 
 /// Wire form of an SP1 block proof.
 ///
@@ -129,14 +128,16 @@ pub struct Sp1ProofSystem<P: Prover> {
     pub(super) evidence_pk: P::ProvingKey,
     pub(super) evidence_vk: SP1VerifyingKey,
     /// Initialized on first chunk use and shared by proving and verification.
-    chunk_pk: Mutex<Option<Arc<SP1ProvingKey>>>,
+    chunk_pk: Mutex<Option<Arc<P::ProvingKey>>>,
+    pub(super) history_pk: Mutex<Option<Arc<P::ProvingKey>>>,
+    pub(super) histories: Mutex<VecDeque<super::history_prover::CachedHistory>>,
     /// Exact-byte cache scoped to this immutable prover/program identity.
     blocks: Mutex<VecDeque<VerifiedBlock>>,
 }
 
 impl<P> Sp1ProofSystem<P>
 where
-    P: Prover<ProvingKey = SP1ProvingKey>,
+    P: ProgramProver,
 {
     /// Build with an existing prover handle.  Disk-caches the
     /// block verifying key; also initializes the evidence and fact programs.
@@ -145,11 +146,13 @@ where
     /// Returns [`Sp1HostError::Sdk`] if `setup` fails for any ELF.
     pub fn new(prover: P) -> Result<Self, Sp1HostError> {
         let ctx = ProverCtx::new_cached(prover)?;
-        let evidence_proving_key =
-            crate::cached_proving_key(&ctx.prover, crate::DEFAULT_EVIDENCE_GUEST_ELF.clone())?;
+        let evidence_proving_key = ctx
+            .prover
+            .setup_program(crate::DEFAULT_EVIDENCE_GUEST_ELF.clone())?;
         let evidence_vk = evidence_proving_key.verifying_key().clone();
-        let fact_proving_key =
-            crate::cached_proving_key(&ctx.prover, crate::DEFAULT_FACT_GUEST_ELF.clone())?;
+        let fact_proving_key = ctx
+            .prover
+            .setup_program(crate::DEFAULT_FACT_GUEST_ELF.clone())?;
         let fact_vk = fact_proving_key.verifying_key().clone();
         let facts = super::fact_cache::FactCache::load(&fact_vk);
         Ok(Self {
@@ -161,21 +164,24 @@ where
             evidence_pk: evidence_proving_key,
             evidence_vk,
             chunk_pk: Mutex::new(None),
+            history_pk: Mutex::new(None),
+            histories: Mutex::new(VecDeque::new()),
             blocks: Mutex::new(VecDeque::new()),
         })
     }
 
-    fn chunk_proving_key(&self) -> Result<Arc<SP1ProvingKey>, Sp1HostError> {
+    pub(super) fn chunk_proving_key(&self) -> Result<Arc<P::ProvingKey>, Sp1HostError> {
         let mut cached = self.chunk_pk.lock().map_err(|_| {
             Sp1HostError::Sdk("chunk proving-key cache lock is poisoned".to_owned())
         })?;
         if let Some(key) = cached.as_ref() {
             return Ok(Arc::clone(key));
         }
-        let key = Arc::new(crate::cached_proving_key(
-            &self.ctx.prover,
-            crate::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF.clone(),
-        )?);
+        let key = Arc::new(
+            self.ctx
+                .prover
+                .setup_program(crate::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF.clone())?,
+        );
         *cached = Some(Arc::clone(&key));
         drop(cached);
         Ok(key)
@@ -202,13 +208,43 @@ impl Sp1ProofSystem<MockProver> {
 
 impl<P> ProofSystem for Sp1ProofSystem<P>
 where
-    P: Prover<ProvingKey = SP1ProvingKey> + Send + Sync,
+    P: ProgramProver,
 {
     type BlockProof = Sp1BlockProof;
     type ChunkProof = Sp1ChunkProof;
 
-    // Checkpoint recursion has no implemented backend.
-    type RecursiveProof = Vec<u8>;
+    fn history_domain(
+        &self,
+        spec: &neutrino_primitives::ChainSpec,
+    ) -> Result<neutrino_consensus_types::history_proof::ProofDomain, ProofError> {
+        self.trusted_history_domain(spec)
+    }
+
+    fn prove_history_fold(
+        &self,
+        spec: &neutrino_primitives::ChainSpec,
+        previous: Option<&neutrino_consensus_types::history_proof::HistoryProof>,
+        chunks: &[Self::ChunkProof],
+    ) -> Result<neutrino_proof_system::VerifiedHistory, ProofError> {
+        self.fold_history(spec, previous, chunks)
+    }
+
+    fn prove_history_merge(
+        &self,
+        spec: &neutrino_primitives::ChainSpec,
+        left: &neutrino_consensus_types::history_proof::HistoryProof,
+        right: &neutrino_consensus_types::history_proof::HistoryProof,
+    ) -> Result<neutrino_proof_system::VerifiedHistory, ProofError> {
+        self.merge_history(spec, left, right)
+    }
+
+    fn verify_history(
+        &self,
+        spec: &neutrino_primitives::ChainSpec,
+        proof: &neutrino_consensus_types::history_proof::HistoryProof,
+    ) -> Result<(), ProofError> {
+        self.verify_history_receipt(spec, proof)
+    }
 
     fn consensus_block_key(&self) -> Option<[u32; 8]> {
         Some(self.ctx.vk.hash_u32())
@@ -439,7 +475,7 @@ where
 
 impl<P> Sp1ProofSystem<P>
 where
-    P: Prover<ProvingKey = SP1ProvingKey> + Send + Sync,
+    P: ProgramProver,
 {
     fn verified_block(
         &self,
@@ -589,9 +625,9 @@ where
         proof: &Sp1ChunkProof,
         expected: &neutrino_prover_chunk::consensus::ConsensusStatement,
     ) -> Result<(), ProofError> {
-        if expected.fact_guest_vk_digest != self.fact_vk.hash_u32()
-            || expected.execution.block_guest_vk_digest != self.ctx.vk.hash_u32()
-            || expected.evidence_guest_vk_digest != self.evidence_vk.hash_u32()
+        if expected.programs.fact != self.fact_vk.hash_u32()
+            || expected.programs.block != self.ctx.vk.hash_u32()
+            || expected.programs.evidence != self.evidence_vk.hash_u32()
         {
             return Err(ProofError::PublicInputMismatch);
         }

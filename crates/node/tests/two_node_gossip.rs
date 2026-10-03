@@ -26,8 +26,8 @@ use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BlockHash, BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, Height, LightClientParams,
-    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
+    BlockHash, BoundedBytes, ChainSpec, ConsensusParams, Height, LightClientParams, ProofParams,
+    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH,
 };
 use neutrino_proof_system::MockProofSystem;
 use neutrino_storage::MemoryDatabase;
@@ -59,18 +59,6 @@ fn spec() -> ChainSpec {
     let proof = ProofParams::default();
     let vs_root = validator_set_root(&validators());
     let genesis_block_hash: BlockHash = [0xAA; 32];
-    let checkpoint = Checkpoint {
-        chain_id: TEST_CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: ZERO_HASH,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     ChainSpec {
         name: BoundedBytes::new(b"two-node-test".to_vec()).expect("name fits"),
         chain_id: TEST_CHAIN_ID,
@@ -82,7 +70,6 @@ fn spec() -> ChainSpec {
         genesis_state_root: ZERO_HASH,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus: ConsensusParams::default(),
         proof,
         state: StateParams::default(),

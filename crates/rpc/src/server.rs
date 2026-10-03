@@ -112,6 +112,7 @@ fn register_methods(module: &mut RpcModule<RpcContext>) -> Result<(), RpcStartEr
     register_state_methods(module)?;
     register_mempool_methods(module)?;
     register_runtime_methods(module)?;
+    register_history_methods(module)?;
     Ok(())
 }
 
@@ -333,6 +334,95 @@ fn parse_optional_block_id(
     }
 }
 
+fn register_history_methods(module: &mut RpcModule<RpcContext>) -> Result<(), RpcStartError> {
+    module
+        .register_async_method("history_getRetention", |_, ctx, _| async move {
+            ctx.backend()
+                .history_retention()
+                .await
+                .map_err(|error| query_err(&error))
+        })
+        .map_err(reg_err)?;
+    module
+        .register_async_method("history_getLatest", |_, ctx, _| async move {
+            ctx.backend
+                .history_latest()
+                .await
+                .map(BytesHex)
+                .map_err(|error| query_err(&error))
+        })
+        .map_err(reg_err)?;
+    module
+        .register_async_method("history_proveRange", |params, ctx, _| async move {
+            let (start, end): (HashHex, HashHex) = params.parse()?;
+            ctx.backend
+                .history_request(start.0, end.0)
+                .await
+                .map_err(|error| query_err(&error))
+        })
+        .map_err(reg_err)?;
+    module
+        .register_async_method("history_getJob", |params, ctx, _| async move {
+            let (id,): (HashHex,) = params.parse()?;
+            ctx.backend
+                .history_job(id.0)
+                .await
+                .map_err(|error| query_err(&error))
+        })
+        .map_err(reg_err)?;
+    module
+        .register_async_method("history_getProof", |params, ctx, _| async move {
+            let (start, end): (HashHex, HashHex) = params.parse()?;
+            ctx.backend
+                .history_proof(start.0, end.0)
+                .await
+                .map(BytesHex)
+                .map_err(|error| query_err(&error))
+        })
+        .map_err(reg_err)?;
+    module
+        .register_subscription(
+            "history_subscribeJob",
+            "history_job",
+            "history_unsubscribeJob",
+            |params, pending, ctx, _| async move {
+                let id = match params.parse::<(HashHex,)>() {
+                    Ok((id,)) => id,
+                    Err(error) => {
+                        pending.reject(error).await;
+                        return Ok(());
+                    }
+                };
+                let mut receiver = match ctx.backend.history_subscribe(id.0).await {
+                    Ok(receiver) => receiver,
+                    Err(error) => {
+                        pending.reject(query_err(&error)).await;
+                        return Ok(());
+                    }
+                };
+                let sink = pending.accept().await?;
+                loop {
+                    let current = receiver.borrow_and_update().clone();
+                    let terminal = current.status.is_terminal();
+                    let message = serde_json::value::to_raw_value(&current)?;
+                    sink.send(message).await?;
+                    if terminal {
+                        break;
+                    }
+                    tokio::select! {
+                        () = sink.closed() => break,
+                        changed = receiver.changed() => { if changed.is_err() { break; } }
+                    }
+                }
+                drop(sink);
+                drop(receiver);
+                Ok::<(), jsonrpsee::core::SubscriptionError>(())
+            },
+        )
+        .map_err(reg_err)?;
+    Ok(())
+}
+
 fn reg_err(err: impl core::fmt::Display) -> RpcStartError {
     RpcStartError::Registration(err.to_string())
 }
@@ -366,6 +456,20 @@ fn query_err(err: &QueryError) -> ErrorObjectOwned {
         QueryError::StateUnavailable => -32021,
         QueryError::Storage(_) => -32022,
         QueryError::BodyUnavailable => -32023,
+        QueryError::HistoryUnavailable => -32025,
+        QueryError::Pruned {
+            retained_from_chunk,
+            retained_from_height,
+        } => {
+            return ErrorObjectOwned::owned(
+                -32024,
+                err.to_string(),
+                Some(serde_json::json!({
+                    "retained_from_chunk": retained_from_chunk,
+                    "retained_from_height": retained_from_height,
+                })),
+            );
+        }
     };
     ErrorObjectOwned::owned(code, err.to_string(), None::<()>)
 }

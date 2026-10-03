@@ -24,6 +24,7 @@ where
         if guard.as_ref().is_none_or(mpsc::Sender::is_closed) {
             let (tx, mut rx) = mpsc::channel::<Vec<FactRequest>>(8);
             let prover = Arc::clone(&self.proof_system);
+            let budget = Arc::clone(&self.proving_budget);
             runtime.spawn(async move {
                 while let Some(mut requests) = rx.recv().await {
                     // Coalesce already queued groups without delaying consensus
@@ -36,7 +37,11 @@ where
                         requests.extend(group);
                     }
                     let prover = Arc::clone(&prover);
-                    match tokio::task::spawn_blocking(move || prover.preprove_facts(&requests)).await {
+                    let budget = Arc::clone(&budget);
+                    match tokio::task::spawn_blocking(move || {
+                        let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Normal);
+                        prover.preprove_facts(&requests)
+                    }).await {
                         Ok(Ok(())) => {},
                         Ok(Err(error)) => tracing::debug!(%error, "early fact proof unavailable; evidence will prove on demand"),
                         Err(error) => tracing::warn!(%error, "early fact worker panicked"),
@@ -59,19 +64,24 @@ where
 
     pub(super) fn queue_vote_facts(&self, vote: &neutrino_consensus_types::FinalityVote) {
         let requests = self.with_engine(|engine| {
+            let next = engine.finalized_next_chunk_id();
+            if vote.data.chunk_id < next
+                && !neutrino_consensus_types::history::is_recent_history_index(
+                    vote.data.chunk_id,
+                    next,
+                )
+            {
+                return Vec::new();
+            }
             let validators = engine
                 .store()
-                .get_consensus_state()
+                .historical_chunk(vote.data.chunk_id)
                 .ok()
                 .flatten()
-                .and_then(|state| {
-                    state
-                        .history
-                        .record(vote.data.chunk_id)
-                        .ok()
-                        .map(|record| record.validators.clone())
-                })
-                .unwrap_or_else(|| engine.active_validator_set().to_vec());
+                .map_or_else(
+                    || engine.active_validator_set().to_vec(),
+                    |record| record.validators,
+                );
             neutrino_prover_chunk::facts::vote_requests(
                 engine.chain_spec().chain_id,
                 &validators,
@@ -85,18 +95,16 @@ where
         let requests = self.with_engine(|engine| {
             let id =
                 header.height.saturating_sub(1) / engine.chain_spec().consensus.chunk_size.max(1);
+            let next = engine.finalized_next_chunk_id();
+            if id < next && !neutrino_consensus_types::history::is_recent_history_index(id, next) {
+                return Vec::new();
+            }
             let historical = engine
                 .store()
-                .get_consensus_state()
+                .historical_chunk(id)
                 .ok()
                 .flatten()
-                .and_then(|state| {
-                    state
-                        .history
-                        .record(id)
-                        .ok()
-                        .map(|record| (record.validators.clone(), record.seed))
-                });
+                .map(|record| (record.validators, record.seed));
             let (validators, seed) = historical.unwrap_or_else(|| {
                 (
                     engine.active_validator_set().to_vec(),

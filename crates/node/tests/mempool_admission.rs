@@ -17,8 +17,8 @@ use neutrino_default_runtime_core::{
 use neutrino_mempool::InsertError;
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
-    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
+    RuntimeParams, StateParams, Validator, fixed_u128_from_integer,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
@@ -100,18 +100,6 @@ fn seeded_chain_spec_and_trie(alice_addr: Address, balance: u128) -> (ChainSpec,
     // engine seeds from `genesis_state_root`), so the genesis
     // checkpoint stays canonical even as we install Alice's
     // pre-funded account.
-    let checkpoint = Checkpoint {
-        chain_id: CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: state_root,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     let spec = ChainSpec {
         name: BoundedBytes::new(b"mempool-admission".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
@@ -123,7 +111,6 @@ fn seeded_chain_spec_and_trie(alice_addr: Address, balance: u128) -> (ChainSpec,
         genesis_state_root: state_root,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus,
         proof,
         state: StateParams::default(),
@@ -187,10 +174,10 @@ fn submit_transaction_rejects_proof_admission() {
                 offence_id: [0; 32],
                 facts_commitment: [0; 32],
             },
-            history: neutrino_consensus_types::evidence::HistoryOpening {
+            history: neutrino_consensus_types::history::HistoryPath {
                 index: 0,
                 count: 1,
-                siblings: vec![],
+                siblings: vec![[0; 32]; 64],
             },
         });
     let bytes = borsh::to_vec(&submission).expect("encode tx");

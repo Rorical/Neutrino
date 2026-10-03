@@ -8,14 +8,10 @@ use core::fmt;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use neutrino_consensus_fork_choice::{ForkChoiceError, ProofStatus};
-use neutrino_consensus_types::{
-    Block, BlockProof, BlockProofPublicInputs, ChunkProof, RecursiveCheckpointProof,
-    RecursiveProofPublicInputs,
-};
+use neutrino_consensus_types::history::is_recent_history_index;
+use neutrino_consensus_types::{Block, BlockProof, BlockProofPublicInputs, ChunkProof};
 use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
-use neutrino_primitives::{
-    BlockHash, Checkpoint, CheckpointIndex, ChunkHash, ChunkId, Height, Slot, StateRoot,
-};
+use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Height, Slot, StateRoot};
 use neutrino_proof_system::{
     BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome, ProofError, ProofSystem,
 };
@@ -54,15 +50,6 @@ pub struct ImportBlockOutcome {
     pub new_head_slot: Slot,
 }
 
-/// Successful outcome of [`Engine::import_recursive_proof`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ImportRecursiveProofOutcome {
-    /// Index of the imported checkpoint.
-    pub checkpoint_index: CheckpointIndex,
-    /// Hash of the imported checkpoint.
-    pub checkpoint_hash: BlockHash,
-}
-
 /// Successful outcome of [`Engine::import_block_proof`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportBlockProofOutcome {
@@ -83,7 +70,7 @@ pub struct ImportChunkProofOutcome {
     pub chunk_hash: ChunkHash,
 }
 
-/// Failures while importing a peer-supplied block or recursive proof.
+/// Failures while importing a peer-supplied block or complete chunk proof.
 #[derive(Debug)]
 pub enum ImportError<E> {
     /// Header height is not `head + 1`.
@@ -186,6 +173,13 @@ pub enum ImportError<E> {
         /// Roots re-derived from the body.
         computed: Box<BodyRoots>,
     },
+    /// An embedded vote targets a chunk outside the preceding eight finalized chunks.
+    HistoricalVoteOutsideWindow {
+        /// Chunk containing the imported block.
+        chunk_id: ChunkId,
+        /// Historical chunk claimed by the embedded vote.
+        referenced_chunk: ChunkId,
+    },
     /// Stored header's parent is required to reconstruct proof public inputs.
     MissingParentHeader {
         /// Parent hash that should have been present.
@@ -207,36 +201,6 @@ pub enum ImportError<E> {
         /// Block hash whose proof inputs were inconsistent.
         hash: BlockHash,
     },
-    /// Imported recursive proof carries the wrong chain id.
-    ChainIdMismatch {
-        /// Local chain id from the chain spec.
-        expected: u64,
-        /// Chain id embedded in the imported checkpoint.
-        actual: u64,
-    },
-    /// Recursive proof's checkpoint index does not extend by one.
-    NonContiguousCheckpointIndex {
-        /// Expected index (local latest + 1).
-        expected: CheckpointIndex,
-        /// Actual index supplied by the peer.
-        actual: CheckpointIndex,
-    },
-    /// Recursive proof's checkpoint index does not match its embedded
-    /// `public_inputs.index`.
-    CheckpointIndexInconsistent {
-        /// Index on the wire envelope.
-        envelope: CheckpointIndex,
-        /// Index in the embedded checkpoint public inputs.
-        public_inputs: CheckpointIndex,
-    },
-    /// Recursive proof's checkpoint hash does not match the embedded
-    /// public inputs.
-    CheckpointHashInconsistent {
-        /// Hash on the wire envelope.
-        envelope: BlockHash,
-        /// Re-derived hash from the embedded checkpoint.
-        public_inputs: BlockHash,
-    },
     /// Backend proof bytes failed to decode under the active backend.
     Codec(borsh::io::Error),
     /// Block proof verification rejected the proof.
@@ -250,8 +214,6 @@ pub enum ImportError<E> {
         /// Chunk id in the embedded public inputs.
         public_inputs: ChunkId,
     },
-    /// Recursive proof verification rejected the proof.
-    InvalidRecursiveProof(ProofError),
     /// Underlying chain store / database error.
     Store(StoreError<E>),
 }
@@ -318,6 +280,13 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                 f,
                 "block body roots mismatch: header {header:?}, computed {computed:?}"
             ),
+            Self::HistoricalVoteOutsideWindow {
+                chunk_id,
+                referenced_chunk,
+            } => write!(
+                f,
+                "embedded vote for chunk {referenced_chunk} is outside chunk {chunk_id}'s history window"
+            ),
             Self::MissingParentHeader { parent_hash } => {
                 write!(f, "parent header {parent_hash:?} is missing")
             }
@@ -336,27 +305,6 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                     "block proof for {hash:?} does not match canonical public inputs"
                 )
             }
-            Self::ChainIdMismatch { expected, actual } => {
-                write!(f, "chain id mismatch: local {expected}, peer {actual}")
-            }
-            Self::NonContiguousCheckpointIndex { expected, actual } => write!(
-                f,
-                "recursive checkpoint index {actual} is non-contiguous; expected {expected}"
-            ),
-            Self::CheckpointIndexInconsistent {
-                envelope,
-                public_inputs,
-            } => write!(
-                f,
-                "recursive proof envelope index {envelope} does not match public inputs index {public_inputs}"
-            ),
-            Self::CheckpointHashInconsistent {
-                envelope,
-                public_inputs,
-            } => write!(
-                f,
-                "recursive proof envelope hash {envelope:?} does not match re-derived hash {public_inputs:?}"
-            ),
             Self::Codec(err) => write!(f, "borsh decode of backend proof failed: {err}"),
             Self::InvalidBlockProof(err) => {
                 write!(f, "block proof verification rejected: {err:?}")
@@ -371,9 +319,6 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                 f,
                 "chunk proof envelope id {envelope} does not match public inputs id {public_inputs}"
             ),
-            Self::InvalidRecursiveProof(err) => {
-                write!(f, "recursive proof verification rejected: {err:?}")
-            }
             Self::Store(err) => write!(f, "store error: {err}"),
         }
     }
@@ -606,6 +551,19 @@ impl<DB: Database> Engine<DB> {
                 computed: Box::new(computed_roots),
             });
         }
+        let chunk_id =
+            block.header.height.saturating_sub(1) / self.chain_spec().consensus.chunk_size;
+        if let Some(vote) = block
+            .body
+            .finality_votes
+            .iter()
+            .find(|vote| !is_recent_history_index(vote.data.chunk_id, chunk_id))
+        {
+            return Err(ImportError::HistoricalVoteOutsideWindow {
+                chunk_id,
+                referenced_chunk: vote.data.chunk_id,
+            });
+        }
 
         // Pending-fix #7 (dry-run cross-check) + pending-fix #11
         // (follower state replay): when an executor is supplied and
@@ -707,12 +665,6 @@ impl<DB: Database> Engine<DB> {
         // above happens FIRST, so a failed reorg leaves the engine
         // at the just-imported block, not at an inconsistent state.
         self.materialise_to_fork_choice_head(executor)?;
-
-        // If this header completes the covering range of a previously
-        // imported recursive proof, advance the finalized seed now
-        // so subsequent VRF-eligibility checks observe the right
-        // seed. The helper is idempotent and cheap when no advance
-        // is possible.
 
         Ok(ImportBlockOutcome {
             block_hash: hash,
@@ -1369,10 +1321,10 @@ impl<DB: Database> Engine<DB> {
             .map_err(|_| {
                 ImportError::InvalidChunkProof(neutrino_proof_system::ProofError::InvalidWitness)
             })?;
-        if proof.chunk_id != statement.execution.chunk.chunk_id
-            || proof.public_inputs != statement.execution.chunk
+        if proof.chunk_id != statement.chunk.chunk_id
+            || proof.public_inputs != statement.chunk
             || proof.chunk_hash
-                != neutrino_prover_chunk::consensus::as_chunk(&statement.execution).hash()
+                != neutrino_prover_chunk::consensus::as_chunk(&statement.chunk).hash()
         {
             return Err(ImportError::InvalidChunkProof(
                 neutrino_proof_system::ProofError::PublicInputMismatch,
@@ -1400,75 +1352,6 @@ impl<DB: Database> Engine<DB> {
             chunk_id: finalized.chunk.chunk_id,
             end_height: finalized.chunk.end_height,
             chunk_hash: finalized.chunk_hash,
-        })
-    }
-
-    /// Import a peer-supplied recursive checkpoint proof.
-    ///
-    /// The proof's `public_inputs` carry the [`Checkpoint`] under
-    /// recursion. The function verifies internal consistency (chain id,
-    /// index extension, hash), borsh-decodes the backend proof, runs
-    /// `proof_system.verify_recursive` on the public inputs, and then
-    /// persists the checkpoint, the recursive proof, and the
-    /// `latest_checkpoint_index` pointer.
-    ///
-    /// # Errors
-    ///
-    /// Returns any [`ImportError`] variant on validation, decode, or
-    /// store failure.
-    pub fn import_recursive_proof<PS: ProofSystem>(
-        &mut self,
-        proof: &RecursiveCheckpointProof,
-        proof_system: &PS,
-    ) -> Result<ImportRecursiveProofOutcome, ImportError<DB::Error>> {
-        let checkpoint: &Checkpoint = &proof.public_inputs;
-
-        if checkpoint.chain_id != self.chain_spec().chain_id {
-            return Err(ImportError::ChainIdMismatch {
-                expected: self.chain_spec().chain_id,
-                actual: checkpoint.chain_id,
-            });
-        }
-
-        let expected_index = self.latest_checkpoint_index().saturating_add(1);
-        if proof.checkpoint_index != expected_index {
-            return Err(ImportError::NonContiguousCheckpointIndex {
-                expected: expected_index,
-                actual: proof.checkpoint_index,
-            });
-        }
-        if proof.checkpoint_index != checkpoint.index {
-            return Err(ImportError::CheckpointIndexInconsistent {
-                envelope: proof.checkpoint_index,
-                public_inputs: checkpoint.index,
-            });
-        }
-
-        let recomputed_hash = checkpoint.hash();
-        if proof.checkpoint_hash != recomputed_hash {
-            return Err(ImportError::CheckpointHashInconsistent {
-                envelope: proof.checkpoint_hash,
-                public_inputs: recomputed_hash,
-            });
-        }
-
-        let backend_proof: PS::RecursiveProof =
-            borsh::from_slice(&proof.proof_bytes).map_err(ImportError::Codec)?;
-        let public_inputs: RecursiveProofPublicInputs = checkpoint.clone();
-        proof_system
-            .verify_recursive(&backend_proof, &public_inputs)
-            .map_err(ImportError::InvalidRecursiveProof)?;
-
-        self.store_mut().put_checkpoint(checkpoint)?;
-        self.store_mut()
-            .put_recursive_proof(proof.checkpoint_index, proof)?;
-        self.store_mut()
-            .put_latest_checkpoint_index(proof.checkpoint_index)?;
-        self.install_checkpoint_index(proof.checkpoint_index);
-
-        Ok(ImportRecursiveProofOutcome {
-            checkpoint_index: proof.checkpoint_index,
-            checkpoint_hash: recomputed_hash,
         })
     }
 
@@ -1566,18 +1449,7 @@ mod tests {
         let proof = ProofParams::default();
         let vs_root = validator_set_root(&validators());
         let genesis_block_hash: BlockHash = [0xAA; 32];
-        let checkpoint = Checkpoint {
-            chain_id: TEST_CHAIN_ID,
-            index: 0,
-            start_height: 0,
-            end_height: 0,
-            start_block_hash: ZERO_HASH,
-            end_block_hash: genesis_block_hash,
-            start_state_root: ZERO_HASH,
-            end_state_root: ZERO_HASH,
-            end_validator_set_root: vs_root,
-            history_root: ZERO_HASH,
-        };
+
         ChainSpec {
             name: BoundedBytes::new(b"m6-import-test".to_vec()).expect("name fits"),
             chain_id: TEST_CHAIN_ID,
@@ -1589,7 +1461,6 @@ mod tests {
             genesis_state_root: ZERO_HASH,
             genesis_block_hash,
             genesis_validator_set_root: vs_root,
-            genesis_checkpoint: checkpoint,
             consensus: ConsensusParams::default(),
             proof,
             state: StateParams::default(),
@@ -1702,6 +1573,45 @@ mod tests {
             Err(ImportError::BodyRootsMismatch { .. }) => {}
             other => panic!("expected BodyRootsMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn import_block_rejects_expired_embedded_votes_before_storage() {
+        use neutrino_consensus_types::{FinalityVote, FinalityVoteData, FinalityVotePhase};
+
+        let mut spec = spec();
+        spec.consensus.chunk_size = 1;
+        spec.proof.slot_budget_per_chunk = 1;
+        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).unwrap();
+        for height in 1..10 {
+            let next = block(height, height, engine.head_hash(), [5; 32]);
+            engine.import_block(&next).unwrap();
+        }
+        let mut next = block(10, 10, engine.head_hash(), [5; 32]);
+        next.body.finality_votes.push(FinalityVote {
+            data: FinalityVoteData {
+                chunk_id: 0,
+                round: 0,
+                chunk_hash: [7; 32],
+                phase: FinalityVotePhase::Prevote,
+            },
+            signature: [0; 96],
+            aggregation_bits: neutrino_primitives::BitVec::from_bytes(1, vec![0]).unwrap(),
+            attestations: vec![],
+        });
+        let roots = compute_body_roots(&next.body);
+        next.header.votes_root = roots.votes_root;
+        next.header.da_root = roots.da_root;
+        next.header.signature = proposer().sign_proposer_message(TEST_CHAIN_ID, &next.hash());
+        assert!(matches!(
+            engine.import_block(&next),
+            Err(ImportError::HistoricalVoteOutsideWindow {
+                chunk_id: 9,
+                referenced_chunk: 0,
+            })
+        ));
+        assert_eq!(engine.head_height(), 9);
+        assert!(engine.store().get_header(&next.hash()).unwrap().is_none());
     }
 
     #[test]

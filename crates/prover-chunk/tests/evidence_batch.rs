@@ -18,7 +18,7 @@ use neutrino_prover_chunk::{
 
 fn bad_vrf() -> EvidenceWitness {
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
-    let chunk = as_chunk(&validate_consensus(&input).unwrap().execution);
+    let chunk = as_chunk(&validate_consensus(&input).unwrap().chunk);
     let mut header = input.blocks[0].header.clone();
     header.vrf_proof = [0; 96];
     let mut message = Vec::from(DOMAIN_PROPOSER_SIG);

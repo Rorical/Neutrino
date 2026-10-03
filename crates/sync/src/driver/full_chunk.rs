@@ -7,7 +7,7 @@ use neutrino_network::{
     PeerId,
     rpc::{
         BlockProofByHeightRequest, BlocksByRangeRequest, ChunkProofByIdRequest, RpcError,
-        RpcRequest, RpcResponse, Status,
+        RpcFailure, RpcRequest, RpcResponse, Status,
     },
     service::NetworkCommand,
     topic::Topic,
@@ -17,9 +17,13 @@ use neutrino_network::{
 pub(super) struct FullChunkSync {
     pub(super) enabled: bool,
     pub(super) in_flight: bool,
+    active_request: Option<(PeerId, u64, Step)>,
     pub(super) retry_cursor: usize,
     peers: BTreeMap<PeerId, Status>,
     cursors: BTreeMap<PeerId, Cursor>,
+    retained_from_chunk: BTreeMap<PeerId, u64>,
+    connections: BTreeMap<PeerId, u64>,
+    next_connection: u64,
 }
 
 #[derive(Clone)]
@@ -31,7 +35,7 @@ struct Cursor {
     blocks: BTreeMap<u64, [u8; 32]>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Step {
     Blocks {
         head: [u8; 32],
@@ -46,12 +50,32 @@ pub(super) enum Step {
     Finality(u64),
 }
 
+pub(super) fn on_connect(driver: &mut SyncDriver, peer: PeerId) {
+    if let Some(connection) = driver.full_chunks.next_connection.checked_add(1) {
+        driver.full_chunks.next_connection = connection;
+        driver.full_chunks.connections.insert(peer, connection);
+    }
+}
+
 pub(super) fn on_disconnect(driver: &mut SyncDriver, peer: PeerId) {
+    if driver
+        .full_chunks
+        .active_request
+        .is_some_and(|(owner, _, _)| owner == peer)
+    {
+        driver.full_chunks.active_request = None;
+        driver.full_chunks.in_flight = false;
+    }
     driver.full_chunks.peers.remove(&peer);
     driver.full_chunks.cursors.remove(&peer);
+    driver.full_chunks.retained_from_chunk.remove(&peer);
+    driver.full_chunks.connections.remove(&peer);
 }
 
 pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Status) -> bool {
+    if driver.fsm.mode() == neutrino_network::SyncMode::LightClient {
+        return false;
+    }
     match driver.backend.consensus_sync_target().await {
         Ok(None) => return false,
         Err(error) => {
@@ -80,12 +104,23 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
 }
 
 async fn request_next(driver: &mut SyncDriver, peer: PeerId) {
+    let Some(connection) = driver.full_chunks.connections.get(&peer).copied() else {
+        return;
+    };
     let Some(remote) = driver.full_chunks.peers.get(&peer).copied() else {
         return;
     };
     let Ok(Some(target)) = driver.backend.consensus_sync_target().await else {
         return;
     };
+    if driver
+        .full_chunks
+        .retained_from_chunk
+        .get(&peer)
+        .is_some_and(|floor| target.chunk_id < *floor)
+    {
+        return;
+    }
     let Ok(local) = driver.backend.local_status().await else {
         return;
     };
@@ -158,25 +193,86 @@ async fn request_next(driver: &mut SyncDriver, peer: PeerId) {
     } else {
         return;
     };
+    send_request(driver, peer, connection, request, step).await;
+}
+
+async fn send_request(
+    driver: &mut SyncDriver,
+    peer: PeerId,
+    connection: u64,
+    request: RpcRequest,
+    step: Step,
+) {
     driver.full_chunks.in_flight = true;
-    driver
+    driver.full_chunks.active_request = Some((peer, connection, step));
+    let sent = driver
         .send_rpc(peer, request, move |peer, response| {
             OutboundOutcome::Consensus {
                 peer,
+                connection: Some(connection),
                 step,
                 response,
             }
         })
         .await;
+    if !sent {
+        release_request(driver, peer, Some(connection), step);
+    }
+}
+
+fn record_pruning_floor(
+    driver: &mut SyncDriver,
+    peer: PeerId,
+    connection: Option<u64>,
+    response: &Result<RpcResponse, RpcError>,
+) -> bool {
+    let Err(RpcError::Remote(RpcFailure::Pruned {
+        retained_from_chunk,
+        ..
+    })) = response
+    else {
+        return false;
+    };
+    if connection.is_some() && driver.full_chunks.connections.get(&peer).copied() == connection {
+        driver
+            .full_chunks
+            .retained_from_chunk
+            .insert(peer, *retained_from_chunk);
+    }
+    true
+}
+
+fn release_request(
+    driver: &mut SyncDriver,
+    peer: PeerId,
+    connection: Option<u64>,
+    step: Step,
+) -> bool {
+    let Some(connection_id) = connection else {
+        return false;
+    };
+    if driver.full_chunks.connections.get(&peer).copied() != Some(connection_id)
+        || driver.full_chunks.active_request != Some((peer, connection_id, step))
+    {
+        return false;
+    }
+    driver.full_chunks.active_request = None;
+    driver.full_chunks.in_flight = false;
+    true
 }
 
 pub(super) async fn on_response(
     driver: &mut SyncDriver,
     peer: PeerId,
+    connection: Option<u64>,
     step: Step,
     response: Result<RpcResponse, RpcError>,
 ) {
-    driver.full_chunks.in_flight = false;
+    if !release_request(driver, peer, connection, step)
+        || record_pruning_floor(driver, peer, connection, &response)
+    {
+        return;
+    }
     let mut advance = None;
     let mut downloaded = Vec::new();
     let result = match (step, response) {

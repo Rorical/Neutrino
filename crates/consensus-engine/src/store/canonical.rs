@@ -30,6 +30,7 @@ impl<DB: Database> ChainStore<DB> {
         genesis: BlockHash,
         mut batch: Batch,
     ) -> Result<(), StoreError<DB::Error>> {
+        let anchor_height = self.retention_info()?.first_retained_height - 1;
         let old_height = match self.get_tip()? {
             Some(old) if old != genesis => {
                 let height = self.chain_header(old)?.height;
@@ -67,12 +68,18 @@ impl<DB: Database> ChainStore<DB> {
         } else {
             staged_header(hash)?.height
         };
+        if height < anchor_height {
+            return Err(StoreError::Corrupt("head predates retained anchor"));
+        }
         let mut cursor = hash;
         let mut expected = height;
         let mut updates = Vec::new();
         while expected > 0 {
             if self.get_block_hash_by_height(expected)? == Some(cursor) {
                 break;
+            }
+            if expected <= anchor_height {
+                return Err(StoreError::Corrupt("reorg crosses retained anchor"));
             }
             let header = staged_header(cursor)?;
             if header.height != expected {
@@ -118,8 +125,13 @@ impl<DB: Database> ChainStore<DB> {
         } else {
             self.chain_header(cursor)?.height
         };
+        let info = self.retention_info()?;
+        let anchor_height = info.first_retained_height - 1;
+        if height < anchor_height {
+            return Err(StoreError::Corrupt("tip precedes retained anchor"));
+        }
         let mut expected = height;
-        while expected > 0 {
+        while expected > anchor_height {
             let header = self.chain_header(cursor)?;
             if header.height != expected || self.get_block_hash_by_height(expected)? != Some(cursor)
             {
@@ -130,9 +142,27 @@ impl<DB: Database> ChainStore<DB> {
             cursor = header.parent_hash;
             expected -= 1;
         }
-        if cursor != genesis || self.get_block_hash_by_height(0)? != Some(genesis) {
+        let anchor = if info.pruned_before_chunk == 0 {
+            genesis
+        } else {
+            let boundary = self
+                .consensus_boundary(info.pruned_before_chunk)?
+                .ok_or(StoreError::Corrupt("retained consensus anchor is missing"))?;
+            if boundary.height != anchor_height
+                || self.chain_header(boundary.block_hash)?.state_root != boundary.state_root
+            {
+                return Err(StoreError::Corrupt(
+                    "retained consensus anchor is inconsistent",
+                ));
+            }
+            boundary.block_hash
+        };
+        if cursor != anchor
+            || self.get_block_hash_by_height(anchor_height)? != Some(anchor)
+            || self.get_block_hash_by_height(0)? != Some(genesis)
+        {
             return Err(StoreError::Corrupt(
-                "canonical genesis anchor is inconsistent",
+                "canonical retained anchor is inconsistent",
             ));
         }
         let entries = self
@@ -141,7 +171,10 @@ impl<DB: Database> ChainStore<DB> {
             .map_err(StoreError::Database)?;
         let count = u64::try_from(entries.len())
             .map_err(|_| StoreError::Corrupt("height index size overflow"))?;
-        if Some(count) != height.checked_add(1) {
+        let expected_count = height
+            .checked_sub(anchor_height)
+            .and_then(|n| n.checked_add(if anchor_height == 0 { 1 } else { 2 }));
+        if Some(count) != expected_count {
             return Err(StoreError::Corrupt(
                 "canonical index contains missing or stale heights",
             ));

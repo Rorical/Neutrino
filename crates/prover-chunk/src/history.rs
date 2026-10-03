@@ -1,11 +1,14 @@
-//! Authenticated historical membership and replay protection for proven offences.
+//! Authenticated historical membership and objective offence validation.
 //!
 //! Roots belong to the incoming consensus context. Opening a history root does
 //! not establish its canonicality: the verifier authenticates that context from
 //! the preceding chunk statement (or the chain's genesis specification).
 
 use alloc::vec::Vec;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::{BorshDeserialize, BorshSerialize, io};
+use neutrino_consensus_types::history::{
+    HISTORY_RETENTION_CHUNKS, HistoryFrontier, HistoryPath, is_recent_history_index,
+};
 use neutrino_consensus_types::{
     Chunk, FinalityCert, FinalityVote, FinalityVotePhase, SlashingEvidence, VrfRejectionReason,
 };
@@ -31,7 +34,7 @@ pub struct HistoricalChunk {
 /// Certificates are reverified when used for inactivity authorization;
 /// their non-unique encodings must never split the next consensus boundary.
 pub fn history_commitment(chunks: &[HistoricalChunk]) -> Hash {
-    neutrino_consensus_types::evidence::history_root(
+    neutrino_consensus_types::history::history_root(
         &chunks
             .iter()
             .map(|record| commitment(&record.evidence_context()))
@@ -52,14 +55,74 @@ impl HistoricalChunk {
     }
 }
 
-/// Openings of incoming history and penalty roots.
-#[derive(Clone, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+/// Maximum distinct historical reads in one consensus witness.
+pub const MAX_HISTORY_READS: usize = 8;
+const _: () = assert!(MAX_HISTORY_READS as u64 == HISTORY_RETENTION_CHUNKS);
+/// Total canonical historical-record bytes admitted per witness.
+pub const MAX_HISTORY_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
+/// One record authenticated against the incoming counted history root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalOpening {
+    /// Canonical historical record. Certificate bytes are not part of its leaf.
+    pub record: HistoricalChunk,
+    /// Fixed-depth membership path for that record's chunk ID.
+    pub path: HistoryPath,
+}
+
+impl BorshSerialize for HistoricalOpening {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        borsh::to_vec(&self.record)?.serialize(writer)?;
+        self.path.serialize(writer)
+    }
+}
+
+impl HistoricalOpening {
+    fn read_bounded<R: io::Read>(reader: &mut R, budget: &mut usize) -> io::Result<Self> {
+        let length = u32::deserialize_reader(reader)? as usize;
+        *budget = budget.checked_sub(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "historical record byte budget")
+        })?;
+        let mut bytes = alloc::vec![0; length];
+        reader.read_exact(&mut bytes)?;
+        let record = borsh::from_slice(&bytes)?;
+        let path = HistoryPath::deserialize_reader(reader)?;
+        Ok(Self { record, path })
+    }
+}
+
+impl BorshDeserialize for HistoricalOpening {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let mut budget = MAX_HISTORY_RECORD_BYTES;
+        Self::read_bounded(reader, &mut budget)
+    }
+}
+
+/// Bounded append frontier and only the records actually read by this chunk.
+#[derive(Clone, Debug, Default, Eq, PartialEq, BorshSerialize)]
 pub struct HistoryWitness {
-    /// Complete chronological history. A future sparse opening can replace this
-    /// encoding without changing which historical facts must be authenticated.
-    pub chunks: Vec<HistoricalChunk>,
-    /// Strictly sorted, unique identifiers of penalties already consumed.
-    pub penalties: Vec<Hash>,
+    /// Canonical prefix shape authenticated against the incoming history root.
+    pub frontier: HistoryFrontier,
+    /// Strictly increasing chunk IDs; no duplicate or unused openings.
+    pub records: Vec<HistoricalOpening>,
+}
+
+impl BorshDeserialize for HistoryWitness {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let frontier = HistoryFrontier::deserialize_reader(reader)?;
+        let length = u32::deserialize_reader(reader)? as usize;
+        if length > MAX_HISTORY_READS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "historical read count",
+            ));
+        }
+        let mut budget = MAX_HISTORY_RECORD_BYTES;
+        let records = (0..length)
+            .map(|_| HistoricalOpening::read_bounded(reader, &mut budget))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self { frontier, records })
+    }
 }
 
 /// Historical authorization failure. No failure authorizes a punishment.
@@ -69,8 +132,6 @@ pub enum HistoryError {
     Anchor,
     /// Evidence does not objectively establish the claimed offence.
     Evidence,
-    /// A penalty has already been applied, including earlier in this chunk.
-    Replay,
     /// Runtime transaction does not match its authorized evidence or amount.
     Transaction,
     /// A rule lacks an objective witness or its verifier is unavailable.
@@ -78,35 +139,81 @@ pub enum HistoryError {
 }
 
 impl HistoryWitness {
-    /// Authenticate openings before any signature or transaction authorization.
-    pub fn authenticate(
-        &self,
-        chunk_id: u64,
-        history_root: Hash,
-        penalty_root: Hash,
-    ) -> Result<(), HistoryError> {
-        if u64::try_from(self.chunks.len()).ok() != Some(chunk_id)
-            || history_commitment(&self.chunks) != history_root
-            || commitment(&self.penalties) != penalty_root
-            || self.penalties.windows(2).any(|pair| pair[0] >= pair[1])
-            || self.chunks.iter().enumerate().any(|(index, record)| {
-                u64::try_from(index).ok() != Some(record.chunk.chunk_id)
-                    || record.chunk.active_validator_set_root != commitment(&record.validators)
-                    || record.finality.chunk_hash != record.chunk.hash()
-                    || record.finality.chunk_id != record.chunk.chunk_id
-            })
+    /// Authenticate bounded reads and the append position before using records.
+    pub fn authenticate(&self, chunk_id: u64, history_root: Hash) -> Result<(), HistoryError> {
+        if self.frontier.count != chunk_id
+            || self.frontier.root() != Some(history_root)
+            || self.records.len() > MAX_HISTORY_READS
+            || self
+                .records
+                .windows(2)
+                .any(|pair| pair[0].record.chunk.chunk_id >= pair[1].record.chunk.chunk_id)
         {
             return Err(HistoryError::Anchor);
+        }
+        let mut budget = MAX_HISTORY_RECORD_BYTES;
+        for opening in &self.records {
+            let record = &opening.record;
+            let context = record.evidence_context();
+            let size = borsh::object_length(record).map_err(|_| HistoryError::Anchor)?;
+            budget = budget.checked_sub(size).ok_or(HistoryError::Anchor)?;
+            if !is_recent_history_index(record.chunk.chunk_id, chunk_id)
+                || opening.path.index != record.chunk.chunk_id
+                || opening.path.count != chunk_id
+                || !opening.path.verify(commitment(&context), history_root)
+                || record.chunk.active_validator_set_root != context.validators_root
+                || record.finality.chunk_hash != context.chunk_hash
+                || record.finality.chunk_id != record.chunk.chunk_id
+            {
+                return Err(HistoryError::Anchor);
+            }
         }
         Ok(())
     }
 
-    /// Look up only finalized historical membership, never today's indices.
+    /// Construct selected openings from archive records (not a proving-time scan).
+    pub fn from_history(history: &[HistoricalChunk], requested: &[u64]) -> Option<Self> {
+        let count = u64::try_from(history.len()).ok()?;
+        if requested.len() > MAX_HISTORY_READS
+            || requested.windows(2).any(|pair| pair[0] >= pair[1])
+            || requested
+                .iter()
+                .any(|id| !is_recent_history_index(*id, count))
+        {
+            return None;
+        }
+        let leaves: Vec<_> = history
+            .iter()
+            .map(|record| commitment(&record.evidence_context()))
+            .collect();
+        let frontier = HistoryFrontier::from_leaves(&leaves)?;
+        let records = requested
+            .iter()
+            .map(|id| {
+                let index = usize::try_from(*id).ok()?;
+                let record = history.get(index)?.clone();
+                if record.chunk.chunk_id != *id {
+                    return None;
+                }
+                Some(HistoricalOpening {
+                    record,
+                    path: HistoryPath::build(&leaves, index)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { frontier, records })
+    }
+
+    /// Look up only authenticated requested historical membership.
     pub fn record(&self, chunk_id: u64) -> Result<&HistoricalChunk, HistoryError> {
-        usize::try_from(chunk_id)
+        if !is_recent_history_index(chunk_id, self.frontier.count) {
+            return Err(HistoryError::Anchor);
+        }
+        self.records
+            .binary_search_by_key(&chunk_id, |opening| opening.record.chunk.chunk_id)
             .ok()
-            .and_then(|index| self.chunks.get(index))
-            .filter(|record| record.chunk.chunk_id == chunk_id)
+            .and_then(|index| self.records.get(index))
+            .map(|opening| &opening.record)
             .ok_or(HistoryError::Anchor)
     }
 }
@@ -404,7 +511,6 @@ pub fn authorize_evidence_using<'a>(
         SlashingEvidence::LongRangeForkParticipation {
             validator_index,
             vote,
-            canonical_finalized_chunk: checkpoint,
             canonical_vote,
         } => {
             let record = record_at(vote.data.chunk_id)?;
@@ -414,10 +520,6 @@ pub fn authorize_evidence_using<'a>(
                 || canonical.round != vote.data.round
                 || canonical.phase != vote.data.phase
                 || vote.data.chunk_hash == canonical.chunk_hash
-                || checkpoint.chain_id != spec.chain_id
-                || checkpoint.index != record.chunk.chunk_id
-                || checkpoint.end_block_hash != record.chunk.end_block_hash
-                || checkpoint.end_state_root != record.chunk.end_state_root
             {
                 return Err(HistoryError::Evidence);
             }

@@ -14,8 +14,8 @@
 //! | `/neutrino/req/block_proof_by_hash`      | [`BlockProofByHashRequest`] → [`BlockProofByHashResponse`] |
 //! | `/neutrino/req/block_proof_by_height`    | [`BlockProofByHeightRequest`] → [`BlockProofByHeightResponse`] |
 //! | `/neutrino/req/chunk_proof_by_id`        | [`ChunkProofByIdRequest`] → [`ChunkProofByIdResponse`]   |
-//! | `/neutrino/req/recursive_proof_latest`   | [`RecursiveProofLatestRequest`] → [`RecursiveProofLatestResponse`]   |
-//! | `/neutrino/req/recursive_proof_by_index` | [`RecursiveProofByIndexRequest`] → [`RecursiveProofByIndexResponse`] |
+//! | `/neutrino/req/checkpoint_latest`   | [`CheckpointLatestRequest`] → [`CheckpointLatestResponse`]   |
+//! | `/neutrino/req/history_proof_by_range` | [`HistoryProofByRangeRequest`] → [`HistoryProofByRangeResponse`] |
 //!
 //! Responses encode `RpcResult<Payload>` with explicit remote failures.
 //! Every request and response is canonically encoded with `borsh`, matching
@@ -30,12 +30,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use core::marker::PhantomData;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{StreamProtocol, request_response};
-use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityCert, RecursiveCheckpointProof,
-};
-use neutrino_primitives::{
-    BlockHash, ChainId, Checkpoint, CheckpointIndex, ChunkId, Hash, Height, Slot, StateRoot,
-};
+use neutrino_consensus_types::{Block, BlockProof, ChunkProof, FinalityCert, HistoryProof};
+use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot};
 use std::io;
 use thiserror::Error;
 
@@ -57,10 +53,10 @@ pub const PROTOCOL_BLOCK_PROOF_BY_HASH: &str = "/neutrino/req/block_proof_by_has
 pub const PROTOCOL_BLOCK_PROOF_BY_HEIGHT: &str = "/neutrino/req/block_proof_by_height";
 /// `ChunkProofById` RPC protocol id.
 pub const PROTOCOL_CHUNK_PROOF_BY_ID: &str = "/neutrino/req/chunk_proof_by_id";
-/// `RecursiveProofLatest` RPC protocol id.
-pub const PROTOCOL_RECURSIVE_PROOF_LATEST: &str = "/neutrino/req/recursive_proof_latest";
-/// `RecursiveProofByIndex` RPC protocol id.
-pub const PROTOCOL_RECURSIVE_PROOF_BY_INDEX: &str = "/neutrino/req/recursive_proof_by_index";
+/// `CheckpointLatest` RPC protocol id.
+pub const PROTOCOL_CHECKPOINT_LATEST: &str = "/neutrino/req/checkpoint_latest";
+/// `HistoryProofByRange` RPC protocol id.
+pub const PROTOCOL_HISTORY_PROOF_BY_RANGE: &str = "/neutrino/req/history_proof_by_range";
 /// `FinalityCertByChunk` RPC protocol id.
 pub const PROTOCOL_FINALITY_CERT_BY_CHUNK: &str = "/neutrino/req/finality_cert_by_chunk";
 /// `WitnessByBlock` RPC protocol id.
@@ -79,11 +75,6 @@ pub const DEFAULT_MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_BLOCKS_PER_RESPONSE: u64 = 16;
 /// Maximum number of paths queried in a single `StateByRoot` request.
 pub const MAX_STATE_PATHS_PER_REQUEST: u64 = 256;
-/// Maximum number of recursive checkpoint proofs returned in one batch.
-///
-/// Each recursive proof is small (≤ 64 KiB per doc 06), so a higher batch
-/// size is safe than for block payloads.
-pub const MAX_RECURSIVE_PROOFS_PER_RESPONSE: u64 = 64;
 /// Maximum number of block proofs returned in one response.
 pub const MAX_BLOCK_PROOFS_PER_RESPONSE: u64 = 8;
 /// Maximum number of chunk proofs returned in one response.
@@ -120,10 +111,10 @@ pub enum RpcProtocol {
     BlockProofByHeight,
     /// Doc 06 `/neutrino/req/chunk_proof_by_id`.
     ChunkProofById,
-    /// Doc 06 `/neutrino/req/recursive_proof_latest`.
-    RecursiveProofLatest,
-    /// Doc 06 `/neutrino/req/recursive_proof_by_index`.
-    RecursiveProofByIndex,
+    /// Doc 06 `/neutrino/req/checkpoint_latest`.
+    CheckpointLatest,
+    /// Doc 06 `/neutrino/req/history_proof_by_range`.
+    HistoryProofByRange,
     /// Doc 06 `/neutrino/req/finality_cert_by_chunk`.
     FinalityCertByChunk,
     /// Doc 06 `/neutrino/req/witness_by_block`.
@@ -144,8 +135,8 @@ impl RpcProtocol {
             Self::BlockProofByHash => PROTOCOL_BLOCK_PROOF_BY_HASH,
             Self::BlockProofByHeight => PROTOCOL_BLOCK_PROOF_BY_HEIGHT,
             Self::ChunkProofById => PROTOCOL_CHUNK_PROOF_BY_ID,
-            Self::RecursiveProofLatest => PROTOCOL_RECURSIVE_PROOF_LATEST,
-            Self::RecursiveProofByIndex => PROTOCOL_RECURSIVE_PROOF_BY_INDEX,
+            Self::CheckpointLatest => PROTOCOL_CHECKPOINT_LATEST,
+            Self::HistoryProofByRange => PROTOCOL_HISTORY_PROOF_BY_RANGE,
             Self::FinalityCertByChunk => PROTOCOL_FINALITY_CERT_BY_CHUNK,
             Self::WitnessByBlock => PROTOCOL_WITNESS_BY_BLOCK,
         }
@@ -172,10 +163,10 @@ pub struct Status {
     pub finalized_chunk_id: Option<ChunkId>,
     /// Hash of that chunk, or zero when no chunk has finalized.
     pub finalized_chunk_hash: Hash,
-    /// Highest checkpoint index finalized by the local node.
-    pub finalized_checkpoint_index: CheckpointIndex,
-    /// Hash of the highest finalized [`Checkpoint`].
-    pub finalized_checkpoint_hash: Hash,
+    /// Authenticated recursive endpoint chunk count; full nodes publish a genesis prefix.
+    pub recursive_covered_chunks: u64,
+    /// Hash of the latest authenticated checkpoint endpoint.
+    pub checkpoint_hash: Hash,
     /// Hash of the materialized head selecting the canonical height index.
     pub head_block_hash: BlockHash,
     /// Slot of the current head.
@@ -203,6 +194,10 @@ pub struct Metadata {
     pub vote_subnet_bits: u16,
     /// Self-declared role flags, see [`RoleFlags`].
     pub role_flags: u32,
+    /// Earliest complete chunk payload still served; `None` makes no availability claim.
+    pub retained_from_chunk: Option<ChunkId>,
+    /// Earliest complete block payload still served; genesis is not a block payload.
+    pub retained_from_height: Option<Height>,
 }
 
 /// Self-declared role bits a peer advertises in [`Metadata`].
@@ -224,7 +219,7 @@ pub mod role_flags {
     pub const FALLBACK_PROVER: u32 = 1 << 5;
     /// Light client; verifier-only.
     pub const LIGHT_CLIENT: u32 = 1 << 6;
-    /// Archive node retaining all bodies, proofs, and witnesses forever.
+    /// Archive provider retaining complete history from genesis without a pruning gap.
     pub const ARCHIVE: u32 = 1 << 7;
 }
 
@@ -345,39 +340,46 @@ pub struct ChunkProofByIdResponse {
     pub proofs: Vec<ChunkProof>,
 }
 
-/// `RecursiveProofLatest` request: fetch the peer's latest recursive checkpoint.
+/// `CheckpointLatest` request: fetch the peer's latest recursive checkpoint.
 ///
 /// Cheap query used by light clients on bootstrap and by full nodes on
 /// initial peer handshake to learn how far the peer has advanced.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RecursiveProofLatestRequest;
+pub struct CheckpointLatestRequest;
 
-/// `RecursiveProofLatest` response carrying the peer's latest checkpoint
-/// and its recursive proof.
+/// Latest available authenticated conditional history range.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
-pub struct RecursiveProofLatestResponse {
-    /// Latest checkpoint the peer has finalized and proven.
-    pub checkpoint: Checkpoint,
-    /// Recursive proof binding the entire chain history.
-    pub recursive_proof: RecursiveCheckpointProof,
+pub struct CheckpointLatestResponse {
+    /// A real compressed receipt and its exact public statement.
+    pub proof: HistoryProof,
 }
 
-/// `RecursiveProofByIndex` request: fetch a contiguous range of recursive
-/// checkpoints starting at `start_index` for `count` entries.
+/// Request an exact anchored suffix; endpoint hashes identify both forks and heights.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
-pub struct RecursiveProofByIndexRequest {
-    /// First checkpoint index to include.
-    pub start_index: CheckpointIndex,
-    /// Number of checkpoints to include; clamped to
-    /// [`MAX_RECURSIVE_PROOFS_PER_RESPONSE`].
-    pub count: u64,
+pub struct HistoryProofByRangeRequest {
+    /// Exact locally authenticated start endpoint.
+    pub start_checkpoint_hash: Hash,
+    /// Exact requested target endpoint.
+    pub end_checkpoint_hash: Hash,
 }
 
-/// `RecursiveProofByIndex` response carrying recursive checkpoint proofs.
-#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
-pub struct RecursiveProofByIndexResponse {
-    /// Recursive checkpoint proofs in ascending index order.
-    pub items: Vec<(Checkpoint, RecursiveCheckpointProof)>,
+/// A single authenticated range, or an explicit unavailable RPC error.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct HistoryProofByRangeResponse {
+    /// Exact requested conditional range and bounded compressed receipt.
+    pub proof: HistoryProof,
+}
+
+/// Lightweight availability announcement; never accepted as a proof or trust anchor.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointAnnouncement {
+    /// Number of chunks covered by the endpoint advertised by the sender.
+    pub covered_chunks: u64,
+    /// Endpoint identity; receivers request and verify an anchored range.
+    pub checkpoint_hash: Hash,
+    /// Completed conditional range identity, distinguishing new suffix availability
+    /// from an already announced prefix with the same endpoint.
+    pub range_id: Hash,
 }
 
 /// `FinalityCertByChunk` request: fetch the BFT finality certificate
@@ -443,9 +445,9 @@ pub enum RpcRequest {
     /// Chunk proof fetch by chunk id.
     ChunkProofById(ChunkProofByIdRequest),
     /// Latest recursive checkpoint fetch.
-    RecursiveProofLatest(RecursiveProofLatestRequest),
-    /// Range of recursive checkpoint proofs by index.
-    RecursiveProofByIndex(RecursiveProofByIndexRequest),
+    CheckpointLatest(CheckpointLatestRequest),
+    /// Exact anchored history proof by endpoint identity.
+    HistoryProofByRange(HistoryProofByRangeRequest),
     /// Finality certificate fetch by chunk id.
     FinalityCertByChunk(FinalityCertByChunkRequest),
     /// Execution witness fetch by block hash.
@@ -466,8 +468,8 @@ impl RpcRequest {
             Self::BlockProofByHash(_) => RpcProtocol::BlockProofByHash,
             Self::BlockProofByHeight(_) => RpcProtocol::BlockProofByHeight,
             Self::ChunkProofById(_) => RpcProtocol::ChunkProofById,
-            Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
-            Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
+            Self::CheckpointLatest(_) => RpcProtocol::CheckpointLatest,
+            Self::HistoryProofByRange(_) => RpcProtocol::HistoryProofByRange,
             Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
             Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
         }
@@ -476,8 +478,8 @@ impl RpcRequest {
 
 /// Host-facing umbrella response enum used by the event surface.
 ///
-/// [`RecursiveProofLatestResponse`] inlines a full [`Checkpoint`] and a
-/// [`RecursiveCheckpointProof`] (~520 bytes); it is boxed here so the enum
+/// [`CheckpointLatestResponse`] carries a fixed statement and a bounded receipt;
+/// it is boxed here so the enum
 /// stays small and equally cheap to move regardless of variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RpcResponse {
@@ -506,10 +508,10 @@ pub enum RpcResponse {
     BlockProofByHeight(BlockProofByHeightResponse),
     /// `ChunkProofById` reply.
     ChunkProofById(ChunkProofByIdResponse),
-    /// `RecursiveProofLatest` reply (boxed to keep the enum compact).
-    RecursiveProofLatest(Box<RecursiveProofLatestResponse>),
-    /// `RecursiveProofByIndex` reply.
-    RecursiveProofByIndex(RecursiveProofByIndexResponse),
+    /// `CheckpointLatest` reply (boxed to keep the enum compact).
+    CheckpointLatest(Box<CheckpointLatestResponse>),
+    /// `HistoryProofByRange` reply.
+    HistoryProofByRange(Box<HistoryProofByRangeResponse>),
     /// `FinalityCertByChunk` reply.
     FinalityCertByChunk(FinalityCertByChunkResponse),
     /// `WitnessByBlock` reply.
@@ -531,8 +533,8 @@ impl RpcResponse {
             Self::BlockProofByHash(_) => RpcProtocol::BlockProofByHash,
             Self::BlockProofByHeight(_) => RpcProtocol::BlockProofByHeight,
             Self::ChunkProofById(_) => RpcProtocol::ChunkProofById,
-            Self::RecursiveProofLatest(_) => RpcProtocol::RecursiveProofLatest,
-            Self::RecursiveProofByIndex(_) => RpcProtocol::RecursiveProofByIndex,
+            Self::CheckpointLatest(_) => RpcProtocol::CheckpointLatest,
+            Self::HistoryProofByRange(_) => RpcProtocol::HistoryProofByRange,
             Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
             Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
         }
@@ -570,6 +572,16 @@ pub enum RpcFailure {
     /// Requested data is not retained or not yet produced by this peer.
     #[error("data unavailable: {0}")]
     Unavailable(String),
+    /// Payload was deliberately removed after verified recursive coverage.
+    #[error(
+        "data pruned; retained chunks start at {retained_from_chunk}, blocks at {retained_from_height}"
+    )]
+    Pruned {
+        /// Actual persisted retention watermark, not a requested policy.
+        retained_from_chunk: ChunkId,
+        /// First block payload height above that watermark.
+        retained_from_height: Height,
+    },
     /// Local storage failed or contained inconsistent authenticated data.
     #[error("storage failure: {0}")]
     Storage(String),
@@ -724,12 +736,12 @@ pub type BlockProofByHeightCodec =
     BorshCodec<BlockProofByHeightRequest, RpcResult<BlockProofByHeightResponse>>;
 /// Codec for the `ChunkProofById` RPC.
 pub type ChunkProofByIdCodec = BorshCodec<ChunkProofByIdRequest, RpcResult<ChunkProofByIdResponse>>;
-/// Codec for the `RecursiveProofLatest` RPC.
-pub type RecursiveProofLatestCodec =
-    BorshCodec<RecursiveProofLatestRequest, RpcResult<RecursiveProofLatestResponse>>;
-/// Codec for the `RecursiveProofByIndex` RPC.
-pub type RecursiveProofByIndexCodec =
-    BorshCodec<RecursiveProofByIndexRequest, RpcResult<RecursiveProofByIndexResponse>>;
+/// Codec for the `CheckpointLatest` RPC.
+pub type CheckpointLatestCodec =
+    BorshCodec<CheckpointLatestRequest, RpcResult<CheckpointLatestResponse>>;
+/// Codec for the `HistoryProofByRange` RPC.
+pub type HistoryProofByRangeCodec =
+    BorshCodec<HistoryProofByRangeRequest, RpcResult<HistoryProofByRangeResponse>>;
 /// Codec for the `FinalityCertByChunk` RPC.
 pub type FinalityCertByChunkCodec =
     BorshCodec<FinalityCertByChunkRequest, RpcResult<FinalityCertByChunkResponse>>;
@@ -754,10 +766,10 @@ pub type BlockProofByHashBehaviour = request_response::Behaviour<BlockProofByHas
 pub type BlockProofByHeightBehaviour = request_response::Behaviour<BlockProofByHeightCodec>;
 /// Behaviour type for the `ChunkProofById` RPC.
 pub type ChunkProofByIdBehaviour = request_response::Behaviour<ChunkProofByIdCodec>;
-/// Behaviour type for the `RecursiveProofLatest` RPC.
-pub type RecursiveProofLatestBehaviour = request_response::Behaviour<RecursiveProofLatestCodec>;
-/// Behaviour type for the `RecursiveProofByIndex` RPC.
-pub type RecursiveProofByIndexBehaviour = request_response::Behaviour<RecursiveProofByIndexCodec>;
+/// Behaviour type for the `CheckpointLatest` RPC.
+pub type CheckpointLatestBehaviour = request_response::Behaviour<CheckpointLatestCodec>;
+/// Behaviour type for the `HistoryProofByRange` RPC.
+pub type HistoryProofByRangeBehaviour = request_response::Behaviour<HistoryProofByRangeCodec>;
 /// Behaviour type for the `FinalityCertByChunk` RPC.
 pub type FinalityCertByChunkBehaviour = request_response::Behaviour<FinalityCertByChunkCodec>;
 /// Behaviour type for the `WitnessByBlock` RPC.
@@ -831,12 +843,12 @@ mod tests {
             "/neutrino/req/chunk_proof_by_id"
         );
         assert_eq!(
-            RpcProtocol::RecursiveProofLatest.protocol_id(),
-            "/neutrino/req/recursive_proof_latest"
+            RpcProtocol::CheckpointLatest.protocol_id(),
+            "/neutrino/req/checkpoint_latest"
         );
         assert_eq!(
-            RpcProtocol::RecursiveProofByIndex.protocol_id(),
-            "/neutrino/req/recursive_proof_by_index"
+            RpcProtocol::HistoryProofByRange.protocol_id(),
+            "/neutrino/req/history_proof_by_range"
         );
     }
 
@@ -849,8 +861,8 @@ mod tests {
                     chain_spec_hash: [0; 32],
                     finalized_chunk_id: None,
                     finalized_chunk_hash: [0; 32],
-                    finalized_checkpoint_index: 0,
-                    finalized_checkpoint_hash: [0; 32],
+                    recursive_covered_chunks: 0,
+                    checkpoint_hash: [0; 32],
                     head_block_hash: [0; 32],
                     head_slot: 0,
                     head_height: 0,
@@ -899,15 +911,15 @@ mod tests {
                 RpcProtocol::ChunkProofById,
             ),
             (
-                RpcRequest::RecursiveProofLatest(RecursiveProofLatestRequest),
-                RpcProtocol::RecursiveProofLatest,
+                RpcRequest::CheckpointLatest(CheckpointLatestRequest),
+                RpcProtocol::CheckpointLatest,
             ),
             (
-                RpcRequest::RecursiveProofByIndex(RecursiveProofByIndexRequest {
-                    start_index: 0,
-                    count: 1,
+                RpcRequest::HistoryProofByRange(HistoryProofByRangeRequest {
+                    start_checkpoint_hash: [1; 32],
+                    end_checkpoint_hash: [2; 32],
                 }),
-                RpcProtocol::RecursiveProofByIndex,
+                RpcProtocol::HistoryProofByRange,
             ),
         ];
         for (req, expected) in cases {
@@ -916,32 +928,39 @@ mod tests {
     }
 
     #[test]
-    fn recursive_proof_response_round_trips() {
-        let checkpoint = Checkpoint {
-            chain_id: 1,
-            index: 7,
-            start_height: 0,
-            end_height: 128,
-            start_block_hash: [0; 32],
-            end_block_hash: [1; 32],
-            start_state_root: [0; 32],
-            end_state_root: [2; 32],
-            end_validator_set_root: [3; 32],
-            history_root: [4; 32],
+    fn history_range_request_binds_both_endpoints() {
+        let request = HistoryProofByRangeRequest {
+            start_checkpoint_hash: [1; 32],
+            end_checkpoint_hash: [2; 32],
         };
-        let proof = RecursiveCheckpointProof {
-            checkpoint_index: checkpoint.index,
-            checkpoint_hash: checkpoint.hash(),
-            public_inputs: checkpoint.clone(),
-            proof_bytes: vec![0x10, 0x20, 0x30],
+        let bytes = to_vec(&request).unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(
+            from_slice::<HistoryProofByRangeRequest>(&bytes).unwrap(),
+            request
+        );
+        assert!(from_slice::<HistoryProofByRangeRequest>(&bytes[..63]).is_err());
+    }
+
+    #[test]
+    fn history_response_bounds_receipt_before_reading_payload() {
+        use neutrino_consensus_types::history_proof::{
+            HISTORY_STATEMENT_BYTES, MAX_HISTORY_RECEIPT_BYTES,
         };
-        let resp = RecursiveProofLatestResponse {
-            checkpoint,
-            recursive_proof: proof,
-        };
-        let bytes = to_vec(&resp).unwrap();
-        let decoded: RecursiveProofLatestResponse = from_slice(&bytes).unwrap();
-        assert_eq!(decoded, resp);
+        let mut encoded = vec![0_u8; HISTORY_STATEMENT_BYTES];
+        encoded.extend_from_slice(
+            &u32::try_from(MAX_HISTORY_RECEIPT_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(from_slice::<HistoryProofByRangeResponse>(&encoded).is_err());
+        encoded.truncate(HISTORY_STATEMENT_BYTES);
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.push(7);
+        let response = from_slice::<HistoryProofByRangeResponse>(&encoded).unwrap();
+        assert_eq!(to_vec(&response).unwrap(), encoded);
+        encoded.push(8);
+        assert!(from_slice::<HistoryProofByRangeResponse>(&encoded).is_err());
     }
 
     #[test]
@@ -951,8 +970,8 @@ mod tests {
             chain_spec_hash: [9; 32],
             finalized_chunk_id: None,
             finalized_chunk_hash: [0; 32],
-            finalized_checkpoint_index: 12,
-            finalized_checkpoint_hash: [1; 32],
+            recursive_covered_chunks: 12,
+            checkpoint_hash: [1; 32],
             head_block_hash: [2; 32],
             head_slot: 99,
             head_height: 88,
@@ -968,10 +987,23 @@ mod tests {
             seq_number: 1,
             vote_subnet_bits: 0b0000_0000_0000_0110,
             role_flags: role_flags::FULL_NODE | role_flags::VALIDATOR,
+            retained_from_chunk: Some(8),
+            retained_from_height: Some(16_385),
         };
         let bytes = to_vec(&meta).unwrap();
         let decoded: Metadata = from_slice(&bytes).unwrap();
         assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn pruning_failure_preserves_the_actual_retention_boundary_on_wire() {
+        let failure = RpcFailure::Pruned {
+            retained_from_chunk: 12,
+            retained_from_height: 24_577,
+        };
+        let encoded = to_vec(&failure).unwrap();
+        assert_eq!(from_slice::<RpcFailure>(&encoded).unwrap(), failure);
+        assert_ne!(failure, RpcFailure::Unavailable("still proving".to_owned()));
     }
 
     #[test]
@@ -1004,8 +1036,8 @@ mod tests {
             chain_spec_hash: [8; 32],
             finalized_chunk_id: None,
             finalized_chunk_hash: [0; 32],
-            finalized_checkpoint_index: 1,
-            finalized_checkpoint_hash: [3; 32],
+            recursive_covered_chunks: 1,
+            checkpoint_hash: [3; 32],
             head_block_hash: [4; 32],
             head_slot: 1,
             head_height: 1,

@@ -1,6 +1,7 @@
 //! Background evidence proving and persistent receipt admission.
 
 use super::ChainBackend;
+use neutrino_consensus_types::history::{HISTORY_RETENTION_CHUNKS, is_recent_history_index};
 use neutrino_consensus_types::{Body, evidence::EvidenceArtifact};
 use neutrino_default_runtime_core::{
     Transaction,
@@ -44,6 +45,7 @@ where
         }
         let engine = Arc::clone(&self.engine);
         let prover = Arc::clone(&self.proof_system);
+        let budget = Arc::clone(&self.proving_budget);
         let running = Arc::clone(&self.evidence_job_running);
         let publisher = self.publisher_snapshot();
         runtime.spawn(async move {
@@ -51,7 +53,12 @@ where
                 let mut produced = Vec::new();
                 let mut batches = vec![witnesses];
                 while let Some(batch) = batches.pop() {
-                    let artifacts = match prover.prove_evidence_batch(&batch) {
+                    let result = {
+                        let _permit =
+                            budget.acquire(crate::proving_budget::ProvingPriority::Normal);
+                        prover.prove_evidence_batch(&batch)
+                    };
+                    let artifacts = match result {
                         Ok(artifacts) => artifacts,
                         Err(neutrino_proof_system::ProofError::InvalidWitness)
                             if batch.len() > 1 =>
@@ -109,20 +116,20 @@ where
 
     fn select_evidence_jobs(&self, block_key: [u32; 8]) -> Vec<EvidenceWitness> {
         self.with_engine_mut(|engine| {
-            let Ok(Some(state)) = engine.store().get_consensus_state() else {
+            let next_chunk = engine.finalized_next_chunk_id();
+            if next_chunk == 0 {
                 return Vec::new();
-            };
+            }
             let finalized_height = engine
                 .latest_finalized_chunk_id()
                 .and_then(|id| id.checked_add(1))
                 .and_then(|n| n.checked_mul(engine.chain_spec().consensus.chunk_size))
                 .unwrap_or(0);
             let max_age = engine.chain_spec().runtime.evidence_max_age_blocks;
-            if let Err(error) = engine.store_mut().prune_evidence_artifacts(
-                finalized_height,
-                max_age,
-                &state.history.penalties,
-            ) {
+            if let Err(error) = engine
+                .store_mut()
+                .prune_evidence_artifacts(finalized_height, max_age)
+            {
                 tracing::warn!(?error, "evidence pool pruning failed");
             }
             let mut witnesses = Vec::new();
@@ -163,14 +170,17 @@ where
                     }
                 }
             }
-            for source in state.history.chunks.iter().rev() {
+            for chunk_id in next_chunk.saturating_sub(HISTORY_RETENTION_CHUNKS)..next_chunk {
+                let Ok(Some(source)) = engine.store().historical_chunk(chunk_id) else {
+                    continue;
+                };
                 if engine
                     .head_height()
                     .saturating_add(1)
                     .saturating_sub(source.chunk.end_height)
                     > engine.chain_spec().runtime.evidence_max_age_blocks
                 {
-                    break;
+                    continue;
                 }
                 for (index, validator) in source.validators.iter().enumerate() {
                     if witnesses.len() >= 16 {
@@ -233,6 +243,11 @@ where
             let Ok(anchor) = engine.evidence_anchor(height) else {
                 return Deferred;
             };
+            if artifact.statement.context.chunk_id < anchor.chunk_id
+                && !is_recent_history_index(artifact.statement.context.chunk_id, anchor.chunk_id)
+            {
+                return Rejected;
+            }
             if artifact.statement.context.end_height >= height
                 || height - artifact.statement.context.end_height
                     > anchor.policy.evidence_max_age_blocks

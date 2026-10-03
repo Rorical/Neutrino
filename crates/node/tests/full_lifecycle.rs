@@ -28,8 +28,8 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
-    BoundedBytes, ChainSpec, Checkpoint, ConsensusParams, LightClientParams, ProofParams,
-    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
+    RuntimeParams, StateParams, Validator, fixed_u128_from_integer,
 };
 use neutrino_rpc::{BlockId, RpcBackend};
 use neutrino_runtime_core::host::LiveTrie;
@@ -123,18 +123,6 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         expected_proposers_per_slot: fixed_u128_from_integer(8),
         ..ConsensusParams::default()
     };
-    let checkpoint = Checkpoint {
-        chain_id: CHAIN_ID,
-        index: 0,
-        start_height: 0,
-        end_height: 0,
-        start_block_hash: ZERO_HASH,
-        end_block_hash: genesis_block_hash,
-        start_state_root: ZERO_HASH,
-        end_state_root: state_root,
-        end_validator_set_root: vs_root,
-        history_root: ZERO_HASH,
-    };
     let spec = ChainSpec {
         name: BoundedBytes::new(b"full-lifecycle".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
@@ -146,7 +134,6 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         genesis_state_root: state_root,
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
-        genesis_checkpoint: checkpoint,
         consensus,
         proof,
         state: StateParams::default(),

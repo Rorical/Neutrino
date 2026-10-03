@@ -7,14 +7,16 @@
 extern crate alloc;
 
 pub mod evidence;
+pub mod history;
+pub mod history_proof;
+pub use history_proof::{Checkpoint, HistoryProof, HistoryStatement};
 
 use alloc::vec::Vec;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-pub use neutrino_primitives::Checkpoint;
 use neutrino_primitives::{
-    BitVec, BlockHash, BlsSignature, ChainId, CheckpointIndex, ChunkHash, ChunkId, Hash, Height,
-    Slot, StateRoot, ValidatorIndex, blake3_256,
+    BitVec, BlockHash, BlsSignature, ChainId, ChunkHash, ChunkId, Hash, Height, Slot, StateRoot,
+    ValidatorIndex, blake3_256,
 };
 
 /// Engine-canonical block header.
@@ -467,8 +469,6 @@ pub enum SlashingEvidence {
         validator_index: ValidatorIndex,
         /// Vote on the long-range fork.
         vote: IndexedVote,
-        /// Canonical finalized checkpoint that the vote conflicts with.
-        canonical_finalized_chunk: Checkpoint,
         /// Same validator's conflicting vote for the canonical chunk in the
         /// same phase and round. Mere fork divergence cannot prove misconduct.
         canonical_vote: IndexedVote,
@@ -605,9 +605,6 @@ pub struct ChunkProofPublicInputs {
     pub da_root: Hash,
 }
 
-/// Public inputs committed by a recursive checkpoint proof.
-pub type RecursiveProofPublicInputs = Checkpoint;
-
 /// Opaque block proof artifact gossiped outside the block body.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockProof {
@@ -636,24 +633,10 @@ pub struct ChunkProof {
     pub proof_bytes: Vec<u8>,
 }
 
-/// Opaque recursive checkpoint proof artifact.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct RecursiveCheckpointProof {
-    /// Checkpoint index proven by this artifact.
-    pub checkpoint_index: CheckpointIndex,
-    /// Hash of the checkpoint public input.
-    pub checkpoint_hash: Hash,
-    /// Public inputs the recursive backend binds.
-    pub public_inputs: RecursiveProofPublicInputs,
-    /// Backend-defined proof bytes.
-    pub proof_bytes: Vec<u8>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use borsh::{from_slice, to_vec};
-    use neutrino_primitives::ZERO_HASH;
 
     fn hash(byte: u8) -> Hash {
         [byte; 32]
@@ -720,21 +703,6 @@ mod tests {
         IndexedVote {
             data: vote_data(phase),
             signature: sig(17),
-        }
-    }
-
-    fn checkpoint() -> Checkpoint {
-        Checkpoint {
-            chain_id: 1,
-            index: 2,
-            start_height: 3,
-            end_height: 4,
-            start_block_hash: hash(18),
-            end_block_hash: hash(19),
-            start_state_root: hash(20),
-            end_state_root: hash(21),
-            end_validator_set_root: hash(22),
-            history_root: hash(23),
         }
     }
 
@@ -889,7 +857,6 @@ mod tests {
             SlashingEvidence::LongRangeForkParticipation {
                 validator_index: 6,
                 vote: indexed_vote(FinalityVotePhase::Prevote),
-                canonical_finalized_chunk: checkpoint(),
                 canonical_vote: indexed_vote(FinalityVotePhase::Prevote),
             },
             SlashingEvidence::DaCommitmentFraud {
@@ -967,27 +934,10 @@ mod tests {
             public_inputs: chunk_inputs,
             proof_bytes: vec![76, 77],
         };
-        let recursive_inputs = checkpoint();
-        let recursive_proof = RecursiveCheckpointProof {
-            checkpoint_index: recursive_inputs.index,
-            checkpoint_hash: recursive_inputs.hash(),
-            public_inputs: recursive_inputs,
-            proof_bytes: vec![78, 79],
-        };
-
-        let (saved_block, saved_chunk, saved_recursive) = (
-            block_proof.clone(),
-            chunk_proof.clone(),
-            recursive_proof.clone(),
-        );
         let encoded =
-            to_vec(&(saved_block, saved_chunk, saved_recursive)).expect("proofs serialize");
-        let decoded: (BlockProof, ChunkProof, RecursiveCheckpointProof) =
-            from_slice(&encoded).expect("proofs deserialize");
-
+            to_vec(&(block_proof.clone(), chunk_proof.clone())).expect("proofs serialize");
+        let decoded: (BlockProof, ChunkProof) = from_slice(&encoded).expect("proofs deserialize");
         assert_eq!(decoded.0, block_proof);
         assert_eq!(decoded.1, chunk_proof);
-        assert_eq!(decoded.2, recursive_proof);
-        assert_ne!(decoded.2.checkpoint_hash, ZERO_HASH);
     }
 }

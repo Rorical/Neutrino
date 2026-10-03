@@ -17,7 +17,6 @@ struct NativeConsensusBackend {
 impl ProofSystem for NativeConsensusBackend {
     type BlockProof = StfPublicOutput;
     type ChunkProof = ConsensusStatement;
-    type RecursiveProof = Vec<u8>;
 
     fn prove_block(
         &self,
@@ -153,18 +152,18 @@ fn complete_finalization_persists_boundary_and_peer_import_checks_certificate() 
     assert_eq!(state.statement, validate_consensus(&input).unwrap());
     assert_eq!(
         producer.active_validator_set(),
-        state.statement.next_context.active_validators
+        state.next_context.active_validators
     );
-    assert_eq!(state.history.chunks.len(), 1);
+    assert_eq!(state.frontier.count, 1);
     let restarted = Engine::open(input.chain_spec, producer.store().db().clone()).unwrap();
     assert_eq!(restarted.latest_finalized_chunk_id(), Some(0));
     assert_eq!(
         restarted.active_validator_set(),
-        state.statement.next_context.active_validators
+        state.next_context.active_validators
     );
     assert_eq!(
         restarted.consensus_boundary(1).unwrap().0,
-        state.statement.next_context
+        state.next_context
     );
 
     let (mut follower, _) = engine();
@@ -232,9 +231,7 @@ fn successor_bft_uses_the_proven_validator_root_without_a_recursive_checkpoint()
     let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
     let outcome = engine.finalize_chunk(0, &backend, &voter).unwrap();
     let state = engine.store().get_consensus_state().unwrap().unwrap();
-    let root = neutrino_prover_chunk::execution::commitment(
-        &state.statement.next_context.active_validators,
-    );
+    let root = neutrino_prover_chunk::execution::commitment(&state.next_context.active_validators);
     assert_ne!(root, outcome.chunk.active_validator_set_root);
     let mut successor = outcome.chunk;
     successor.chunk_id = 1;
@@ -286,8 +283,9 @@ fn persisted_certificate_restores_accountability_after_restart_and_rotation() {
     rotated[0].pubkey = *ProposerKey::from_ikm(&[43; 32], 0)
         .unwrap()
         .public_key_bytes();
-    engine.set_active_validator_set(2, rotated).unwrap();
     let mut restarted = Engine::open(input.chain_spec, engine.store().db().clone()).unwrap();
+    // Native harness rotates after restoring a consistent proof-gated snapshot.
+    restarted.set_active_validator_set(2, rotated).unwrap();
     let mut conflicting_chunk = outcome.chunk;
     conflicting_chunk.end_state_root[0] ^= 1;
     let mut certificate = outcome.finality_cert;
@@ -417,4 +415,61 @@ fn proof_completion_preserves_concurrent_finalization_and_rejects_changed_snapsh
         engine.store().get_block_state(&hash).unwrap(),
         Some(BlockState::PendingProof)
     );
+}
+
+#[test]
+fn history_preparation_uses_immutable_finalized_boundaries_without_advancing_coverage() {
+    use neutrino_consensus_types::history_proof::{ChainBinding, ExecutionPrograms, ProofDomain};
+    let (mut engine, input) = engine();
+    let domain = ProofDomain {
+        chain: ChainBinding::from_spec(&input.chain_spec),
+        execution: ExecutionPrograms {
+            fact: [3; 8],
+            evidence: [2; 8],
+            block: [1; 8],
+        },
+        chunk: [4; 8],
+        checkpoint: [5; 8],
+    };
+    engine.set_history_domain(domain).unwrap();
+    assert!(engine.latest_history_proof().unwrap().is_none());
+    assert!(engine.prepare_history_fold(0, 1).is_err());
+    let backend = NativeConsensusBackend { reject: false };
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    engine.finalize_chunk(0, &backend, &voter).unwrap();
+    assert_eq!(engine.finalized_next_chunk_id(), 1);
+    assert_eq!(engine.recursive_covered_chunks(), 0);
+    let prepared = engine.prepare_history_fold(0, 1).unwrap();
+    assert_eq!(prepared.chunks.len(), 1);
+    let end = engine.canonical_boundary(1).unwrap();
+    assert_eq!(prepared.statements[0].end, end);
+    let start = engine.store().get_checkpoint(0).unwrap().unwrap();
+    let checkpoint = engine.store().get_checkpoint(1).unwrap().unwrap();
+    assert_eq!(checkpoint.boundary, end);
+    assert!(
+        engine
+            .history_proof_by_endpoints(start.hash(), checkpoint.hash())
+            .unwrap()
+            .is_none()
+    );
+    assert!(engine.prepare_history_fold(0, 0).is_err());
+    assert!(engine.prepare_history_fold(0, 2).is_err());
+    assert!(
+        engine
+            .history_endpoints(checkpoint.hash(), start.hash())
+            .is_err()
+    );
+    let restarted = Engine::open(input.chain_spec, engine.store().db().clone()).unwrap();
+    assert_eq!(restarted.canonical_boundary(1).unwrap(), end);
+    assert_eq!(
+        restarted
+            .store()
+            .historical_opening(0, 1)
+            .unwrap()
+            .record
+            .chunk
+            .chunk_id,
+        0
+    );
+    assert_eq!(restarted.recursive_covered_chunks(), 0);
 }

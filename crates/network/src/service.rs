@@ -26,11 +26,11 @@ use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::rpc::{
     self, BlockProofByHashCodec, BlockProofByHashResponse, BlockProofByHeightCodec,
     BlockProofByHeightResponse, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec,
-    BlocksByRootResponse, ChunkProofByIdCodec, ChunkProofByIdResponse, FinalityCertByChunkCodec,
-    FinalityCertByChunkResponse, MetadataCodec, PingCodec, RecursiveProofByIndexCodec,
-    RecursiveProofByIndexResponse, RecursiveProofLatestCodec, RecursiveProofLatestResponse,
-    RpcError, RpcInboundId, RpcProtocol, RpcRequest, RpcResponse, StateByRootCodec,
-    StateByRootResponse, StatusCodec, WitnessByBlockCodec, WitnessByBlockResponse,
+    BlocksByRootResponse, CheckpointLatestCodec, CheckpointLatestResponse, ChunkProofByIdCodec,
+    ChunkProofByIdResponse, FinalityCertByChunkCodec, FinalityCertByChunkResponse,
+    HistoryProofByRangeCodec, HistoryProofByRangeResponse, MetadataCodec, PingCodec, RpcError,
+    RpcInboundId, RpcProtocol, RpcRequest, RpcResponse, StateByRootCodec, StateByRootResponse,
+    StatusCodec, WitnessByBlockCodec, WitnessByBlockResponse,
 };
 use crate::topic::Topic;
 use futures::StreamExt;
@@ -250,9 +250,9 @@ struct RpcDispatch {
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_chunk_proof_by_id:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_recursive_proof_latest:
+    pending_checkpoint_latest:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_recursive_proof_by_index:
+    pending_history_proof_by_range:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_finality_cert_by_chunk:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
@@ -271,10 +271,10 @@ struct RpcDispatch {
         HashMap<u64, ResponseChannel<rpc::RpcResult<BlockProofByHeightResponse>>>,
     inbound_chunk_proof_by_id:
         HashMap<u64, ResponseChannel<rpc::RpcResult<ChunkProofByIdResponse>>>,
-    inbound_recursive_proof_latest:
-        HashMap<u64, ResponseChannel<rpc::RpcResult<RecursiveProofLatestResponse>>>,
-    inbound_recursive_proof_by_index:
-        HashMap<u64, ResponseChannel<rpc::RpcResult<RecursiveProofByIndexResponse>>>,
+    inbound_checkpoint_latest:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<CheckpointLatestResponse>>>,
+    inbound_history_proof_by_range:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<HistoryProofByRangeResponse>>>,
     inbound_finality_cert_by_chunk:
         HashMap<u64, ResponseChannel<rpc::RpcResult<FinalityCertByChunkResponse>>>,
     inbound_witness_by_block: HashMap<u64, ResponseChannel<rpc::RpcResult<WitnessByBlockResponse>>>,
@@ -303,10 +303,8 @@ impl RpcDispatch {
             RpcProtocol::BlockProofByHash => self.pending_block_proof_by_hash.insert(id, tx),
             RpcProtocol::BlockProofByHeight => self.pending_block_proof_by_height.insert(id, tx),
             RpcProtocol::ChunkProofById => self.pending_chunk_proof_by_id.insert(id, tx),
-            RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.insert(id, tx),
-            RpcProtocol::RecursiveProofByIndex => {
-                self.pending_recursive_proof_by_index.insert(id, tx)
-            }
+            RpcProtocol::CheckpointLatest => self.pending_checkpoint_latest.insert(id, tx),
+            RpcProtocol::HistoryProofByRange => self.pending_history_proof_by_range.insert(id, tx),
             RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.insert(id, tx),
             RpcProtocol::WitnessByBlock => self.pending_witness_by_block.insert(id, tx),
         };
@@ -327,8 +325,8 @@ impl RpcDispatch {
             RpcProtocol::BlockProofByHash => self.pending_block_proof_by_hash.remove(&id),
             RpcProtocol::BlockProofByHeight => self.pending_block_proof_by_height.remove(&id),
             RpcProtocol::ChunkProofById => self.pending_chunk_proof_by_id.remove(&id),
-            RpcProtocol::RecursiveProofLatest => self.pending_recursive_proof_latest.remove(&id),
-            RpcProtocol::RecursiveProofByIndex => self.pending_recursive_proof_by_index.remove(&id),
+            RpcProtocol::CheckpointLatest => self.pending_checkpoint_latest.remove(&id),
+            RpcProtocol::HistoryProofByRange => self.pending_history_proof_by_range.remove(&id),
             RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.remove(&id),
             RpcProtocol::WitnessByBlock => self.pending_witness_by_block.remove(&id),
         }
@@ -531,11 +529,11 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcChunkProofById(ev)) => {
                 self.handle_rpc_chunk_proof_by_id(ev).await;
             }
-            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcRecursiveProofLatest(ev)) => {
-                self.handle_rpc_recursive_proof_latest(ev).await;
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcCheckpointLatest(ev)) => {
+                self.handle_rpc_checkpoint_latest(ev).await;
             }
-            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcRecursiveProofByIndex(ev)) => {
-                self.handle_rpc_recursive_proof_by_index(ev).await;
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcHistoryProofByRange(ev)) => {
+                self.handle_rpc_history_proof_by_range(ev).await;
             }
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcFinalityCertByChunk(ev)) => {
                 self.handle_rpc_finality_cert_by_chunk(ev).await;
@@ -641,11 +639,11 @@ impl NetworkService {
             RpcRequest::ChunkProofById(req) => {
                 behaviour.rpc_chunk_proof_by_id.send_request(&peer, req)
             }
-            RpcRequest::RecursiveProofLatest(req) => behaviour
-                .rpc_recursive_proof_latest
-                .send_request(&peer, req),
-            RpcRequest::RecursiveProofByIndex(req) => behaviour
-                .rpc_recursive_proof_by_index
+            RpcRequest::CheckpointLatest(req) => {
+                behaviour.rpc_checkpoint_latest.send_request(&peer, req)
+            }
+            RpcRequest::HistoryProofByRange(req) => behaviour
+                .rpc_history_proof_by_range
                 .send_request(&peer, req),
             RpcRequest::FinalityCertByChunk(req) => behaviour
                 .rpc_finality_cert_by_chunk
@@ -755,27 +753,26 @@ impl NetworkService {
                         .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
-            (RpcProtocol::RecursiveProofLatest, RpcResponse::RecursiveProofLatest(payload)) => self
+            (RpcProtocol::CheckpointLatest, RpcResponse::CheckpointLatest(payload)) => self
                 .rpc
-                .inbound_recursive_proof_latest
+                .inbound_checkpoint_latest
                 .remove(&inbound_id.raw)
                 .is_some_and(|chan| {
                     behaviour
-                        .rpc_recursive_proof_latest
+                        .rpc_checkpoint_latest
                         .send_response(chan, Ok(*payload))
                         .is_ok()
                 }),
-            (RpcProtocol::RecursiveProofByIndex, RpcResponse::RecursiveProofByIndex(payload)) => {
-                self.rpc
-                    .inbound_recursive_proof_by_index
-                    .remove(&inbound_id.raw)
-                    .is_some_and(|chan| {
-                        behaviour
-                            .rpc_recursive_proof_by_index
-                            .send_response(chan, Ok(payload))
-                            .is_ok()
-                    })
-            }
+            (RpcProtocol::HistoryProofByRange, RpcResponse::HistoryProofByRange(payload)) => self
+                .rpc
+                .inbound_history_proof_by_range
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_history_proof_by_range
+                        .send_response(chan, Ok(*payload))
+                        .is_ok()
+                }),
             (RpcProtocol::FinalityCertByChunk, RpcResponse::FinalityCertByChunk(payload)) => self
                 .rpc
                 .inbound_finality_cert_by_chunk
@@ -876,23 +873,23 @@ impl NetworkService {
                         .send_response(chan, Err(error))
                         .is_ok()
                 }),
-            (RpcProtocol::RecursiveProofLatest, RpcResponse::Error { error, .. }) => self
+            (RpcProtocol::CheckpointLatest, RpcResponse::Error { error, .. }) => self
                 .rpc
-                .inbound_recursive_proof_latest
+                .inbound_checkpoint_latest
                 .remove(&inbound_id.raw)
                 .is_some_and(|chan| {
                     behaviour
-                        .rpc_recursive_proof_latest
+                        .rpc_checkpoint_latest
                         .send_response(chan, Err(error))
                         .is_ok()
                 }),
-            (RpcProtocol::RecursiveProofByIndex, RpcResponse::Error { error, .. }) => self
+            (RpcProtocol::HistoryProofByRange, RpcResponse::Error { error, .. }) => self
                 .rpc
-                .inbound_recursive_proof_by_index
+                .inbound_history_proof_by_range
                 .remove(&inbound_id.raw)
                 .is_some_and(|chan| {
                     behaviour
-                        .rpc_recursive_proof_by_index
+                        .rpc_history_proof_by_range
                         .send_response(chan, Err(error))
                         .is_ok()
                 }),
@@ -1407,11 +1404,11 @@ impl NetworkService {
         }
     }
 
-    async fn handle_rpc_recursive_proof_latest(
+    async fn handle_rpc_checkpoint_latest(
         &mut self,
         ev: request_response::Event<
-            rpc::RecursiveProofLatestRequest,
-            rpc::RpcResult<RecursiveProofLatestResponse>,
+            rpc::CheckpointLatestRequest,
+            rpc::RpcResult<CheckpointLatestResponse>,
         >,
     ) {
         match ev {
@@ -1423,16 +1420,16 @@ impl NetworkService {
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::RecursiveProofLatest);
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::CheckpointLatest);
                 self.rpc
-                    .inbound_recursive_proof_latest
+                    .inbound_checkpoint_latest
                     .insert(inbound_id.raw, channel);
                 let _ = self
                     .event_tx
                     .send(NetworkEvent::RpcRequestReceived {
                         peer,
                         inbound_id,
-                        request: RpcRequest::RecursiveProofLatest(request),
+                        request: RpcRequest::CheckpointLatest(request),
                     })
                     .await;
             }
@@ -1446,34 +1443,30 @@ impl NetworkService {
             } => {
                 if let Some(tx) = self
                     .rpc
-                    .take_outbound(RpcProtocol::RecursiveProofLatest, request_id)
+                    .take_outbound(RpcProtocol::CheckpointLatest, request_id)
                 {
                     let _ = tx.send(
                         response
-                            .map(|payload| RpcResponse::RecursiveProofLatest(Box::new(payload)))
+                            .map(|payload| RpcResponse::CheckpointLatest(Box::new(payload)))
                             .map_err(RpcError::Remote),
                     );
                 }
             }
             request_response::Event::OutboundFailure {
                 request_id, error, ..
-            } => self.complete_outbound_failure(
-                RpcProtocol::RecursiveProofLatest,
-                request_id,
-                &error,
-            ),
+            } => self.complete_outbound_failure(RpcProtocol::CheckpointLatest, request_id, &error),
             request_response::Event::InboundFailure { error, .. } => {
-                warn!(?error, "inbound failure on RecursiveProofLatest RPC");
+                warn!(?error, "inbound failure on CheckpointLatest RPC");
             }
             request_response::Event::ResponseSent { .. } => {}
         }
     }
 
-    async fn handle_rpc_recursive_proof_by_index(
+    async fn handle_rpc_history_proof_by_range(
         &mut self,
         ev: request_response::Event<
-            rpc::RecursiveProofByIndexRequest,
-            rpc::RpcResult<RecursiveProofByIndexResponse>,
+            rpc::HistoryProofByRangeRequest,
+            rpc::RpcResult<HistoryProofByRangeResponse>,
         >,
     ) {
         match ev {
@@ -1485,16 +1478,16 @@ impl NetworkService {
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::RecursiveProofByIndex);
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::HistoryProofByRange);
                 self.rpc
-                    .inbound_recursive_proof_by_index
+                    .inbound_history_proof_by_range
                     .insert(inbound_id.raw, channel);
                 let _ = self
                     .event_tx
                     .send(NetworkEvent::RpcRequestReceived {
                         peer,
                         inbound_id,
-                        request: RpcRequest::RecursiveProofByIndex(request),
+                        request: RpcRequest::HistoryProofByRange(request),
                     })
                     .await;
             }
@@ -1508,24 +1501,26 @@ impl NetworkService {
             } => {
                 if let Some(tx) = self
                     .rpc
-                    .take_outbound(RpcProtocol::RecursiveProofByIndex, request_id)
+                    .take_outbound(RpcProtocol::HistoryProofByRange, request_id)
                 {
                     let _ = tx.send(
                         response
-                            .map(RpcResponse::RecursiveProofByIndex)
+                            .map(|payload| RpcResponse::HistoryProofByRange(Box::new(payload)))
                             .map_err(RpcError::Remote),
                     );
                 }
             }
             request_response::Event::OutboundFailure {
                 request_id, error, ..
-            } => self.complete_outbound_failure(
-                RpcProtocol::RecursiveProofByIndex,
-                request_id,
-                &error,
-            ),
+            } => {
+                self.complete_outbound_failure(
+                    RpcProtocol::HistoryProofByRange,
+                    request_id,
+                    &error,
+                );
+            }
             request_response::Event::InboundFailure { error, .. } => {
-                warn!(?error, "inbound failure on RecursiveProofByIndex RPC");
+                warn!(?error, "inbound failure on HistoryProofByRange RPC");
             }
             request_response::Event::ResponseSent { .. } => {}
         }
@@ -1706,21 +1701,20 @@ fn build_behaviour(
         rpc_block_proof_by_hash: build_rpc_block_proof_by_hash(),
         rpc_block_proof_by_height: build_rpc_block_proof_by_height(),
         rpc_chunk_proof_by_id: build_rpc_chunk_proof_by_id(),
-        rpc_recursive_proof_latest: build_rpc_recursive_proof_latest(),
-        rpc_recursive_proof_by_index: build_rpc_recursive_proof_by_index(),
+        rpc_checkpoint_latest: build_rpc_checkpoint_latest(),
+        rpc_history_proof_by_range: build_rpc_history_proof_by_range(),
         rpc_finality_cert_by_chunk: build_rpc_finality_cert_by_chunk(),
         rpc_witness_by_block: build_rpc_witness_by_block(),
     })
 }
 
+fn gossip_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
+    let digest = blake3_256(&message.data);
+    gossipsub::MessageId::from(digest.to_vec())
+}
+
 /// Build the gossipsub behaviour with doc 06 settings.
 fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkError> {
-    // Doc 06: message ID = hash of the encoded message. We use BLAKE3-256.
-    let message_id_fn = |message: &gossipsub::Message| {
-        let digest = blake3_256(&message.data);
-        gossipsub::MessageId::from(digest.to_vec())
-    };
-
     // Global ceiling matches the largest per-topic limit (blocks @ 8 MiB).
     // Per-topic caps tighten this further below.
     let global_max = Topic::all_default()
@@ -1737,7 +1731,7 @@ fn build_gossipsub(local_key: &Keypair) -> Result<gossipsub::Behaviour, NetworkE
         .history_gossip(6)
         .history_length(10)
         .validation_mode(gossipsub::ValidationMode::Strict)
-        .message_id_fn(message_id_fn)
+        .message_id_fn(gossip_message_id)
         .max_transmit_size(global_max)
         .duplicate_cache_time(Duration::from_secs(60))
         // Manual validation lets us forward an application-level
@@ -1956,22 +1950,22 @@ fn build_rpc_chunk_proof_by_id() -> rpc::ChunkProofByIdBehaviour {
     )
 }
 
-fn build_rpc_recursive_proof_latest() -> rpc::RecursiveProofLatestBehaviour {
+fn build_rpc_checkpoint_latest() -> rpc::CheckpointLatestBehaviour {
     request_response::Behaviour::with_codec(
-        RecursiveProofLatestCodec::default(),
+        CheckpointLatestCodec::default(),
         [(
-            RpcProtocol::RecursiveProofLatest.stream_protocol(),
+            RpcProtocol::CheckpointLatest.stream_protocol(),
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
     )
 }
 
-fn build_rpc_recursive_proof_by_index() -> rpc::RecursiveProofByIndexBehaviour {
+fn build_rpc_history_proof_by_range() -> rpc::HistoryProofByRangeBehaviour {
     request_response::Behaviour::with_codec(
-        RecursiveProofByIndexCodec::default(),
+        HistoryProofByRangeCodec::default(),
         [(
-            RpcProtocol::RecursiveProofByIndex.stream_protocol(),
+            RpcProtocol::HistoryProofByRange.stream_protocol(),
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
@@ -2032,6 +2026,37 @@ mod tests {
         let _ = tracing_subscriber::fmt()
             .with_span_events(FmtSpan::NONE)
             .try_init();
+    }
+
+    #[test]
+    fn different_completed_ranges_at_one_endpoint_have_distinct_message_ids() {
+        let prefix = rpc::CheckpointAnnouncement {
+            covered_chunks: 5,
+            checkpoint_hash: [5; 32],
+            range_id: [1; 32],
+        };
+        let suffix = rpc::CheckpointAnnouncement {
+            range_id: [2; 32],
+            ..prefix
+        };
+        let message = |announcement| gossipsub::Message {
+            source: None,
+            data: borsh::to_vec(&announcement).unwrap(),
+            sequence_number: None,
+            topic: Topic::Checkpoints.to_ident().hash(),
+        };
+        let first = message(prefix);
+        let second = message(suffix);
+        assert_eq!(first.data.len(), 72);
+        assert_eq!(
+            borsh::from_slice::<rpc::CheckpointAnnouncement>(&second.data).unwrap(),
+            suffix
+        );
+        assert_ne!(gossip_message_id(&first), gossip_message_id(&second));
+        assert_eq!(
+            gossip_message_id(&first),
+            gossip_message_id(&message(prefix))
+        );
     }
 
     #[test]
@@ -2322,8 +2347,8 @@ mod tests {
             chain_spec_hash: [0xAB; 32],
             finalized_chunk_id: None,
             finalized_chunk_hash: [0; 32],
-            finalized_checkpoint_index: 42,
-            finalized_checkpoint_hash: [0xBB; 32],
+            recursive_covered_chunks: 42,
+            checkpoint_hash: [0xBB; 32],
             head_block_hash: [0xCC; 32],
             head_slot: 100,
             head_height: 99,
@@ -2373,8 +2398,8 @@ mod tests {
             chain_spec_hash: [0xAB; 32],
             finalized_chunk_id: None,
             finalized_chunk_hash: [0; 32],
-            finalized_checkpoint_index: 5,
-            finalized_checkpoint_hash: [0xAA; 32],
+            recursive_covered_chunks: 5,
+            checkpoint_hash: [0xAA; 32],
             head_block_hash: [0xDD; 32],
             head_slot: 1,
             head_height: 1,

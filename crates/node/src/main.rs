@@ -73,6 +73,14 @@ fn print_usage() {
     eprintln!("    proposer_ikm_hex = \"<64 hex chars>\"     # validator only");
     eprintln!("    proposer_index   = 0                    # validator only");
     eprintln!("    subscribe_topics = [\"/neutrino/blocks/borsh\", ...]");
+    eprintln!();
+    eprintln!("    [proving]");
+    eprintln!(
+        "    backend          = \"cpu\"              # or cuda (Linux x86-64, --features cuda)"
+    );
+    eprintln!("    concurrency      = 2");
+    eprintln!("    capacity         = 16");
+    eprintln!("    # cuda_device    = 0                    # CUDA only");
 }
 
 fn init_tracing() {

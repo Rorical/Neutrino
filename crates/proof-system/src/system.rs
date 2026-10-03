@@ -2,7 +2,7 @@
 //!
 //! The complete chunk interface binds authenticated consensus witnesses as well
 //! as recursive block proofs.
-//! Recursive checkpoints are still deferred.
+//! Recursive history proofs authenticate bounded ranges and trusted program identities.
 //!
 //! [`MockProofSystem`]: super::mock::MockProofSystem
 
@@ -10,7 +10,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use core::fmt::Debug;
 
 use crate::error::ProofError;
-use crate::public_inputs::{BlockProofPublicInputs, RecursiveProofPublicInputs};
+use crate::history::VerifiedHistory;
+use crate::public_inputs::BlockProofPublicInputs;
+use neutrino_consensus_types::history_proof::{HistoryProof, ProofDomain};
+use neutrino_primitives::ChainSpec;
 
 /// Backend-agnostic proof system interface.
 ///
@@ -24,11 +27,6 @@ pub trait ProofSystem {
 
     /// Proof of the complete execution and consensus chunk statement.
     type ChunkProof: BorshDeserialize + BorshSerialize + Clone + Debug + Eq + Send + Sync;
-
-    /// Reserved proof type for checkpoint recursion; no backend is implemented.
-    ///
-    /// TODO: deferred by the SP1 rewrite.
-    type RecursiveProof: BorshDeserialize + BorshSerialize + Clone + Debug + Eq;
 
     /// Produces a block proof from the execution witness and public
     /// inputs the engine has already validated.
@@ -147,34 +145,34 @@ pub trait ProofSystem {
         Err(ProofError::Unsupported)
     }
 
-    /// Folds a fresh chunk proof onto the previous recursive proof,
-    /// producing the next recursive checkpoint proof.
-    ///
-    /// TODO: deferred by the SP1 rewrite. Backends that implement only
-    /// block proofs should use the default [`ProofError::Unsupported`]
-    /// result.
-    ///
-    /// At the genesis recursion step, `previous` is `None`; subsequent
-    /// recursions must supply the immediately preceding recursive
-    /// proof. Backends bind the entire previous recursive proof into
-    /// the new circuit so the recursion is tamper-evident.
-    fn prove_recursive(
-        &self,
-        _previous: Option<&Self::RecursiveProof>,
-        _chunk_proof: &Self::ChunkProof,
-        _public_inputs: &RecursiveProofPublicInputs,
-    ) -> Result<Self::RecursiveProof, ProofError> {
+    /// Derive the complete trusted profile from this backend and chain specification.
+    fn history_domain(&self, _spec: &ChainSpec) -> Result<ProofDomain, ProofError> {
         Err(ProofError::Unsupported)
     }
 
-    /// Verifies a recursive proof against its public inputs.
-    ///
-    /// TODO: deferred by the SP1 rewrite.
-    fn verify_recursive(
+    /// Prove a nonempty batch, optionally extending an authenticated earlier range.
+    fn prove_history_fold(
         &self,
-        _proof: &Self::RecursiveProof,
-        _public_inputs: &RecursiveProofPublicInputs,
-    ) -> Result<(), ProofError> {
+        _spec: &ChainSpec,
+        _previous: Option<&HistoryProof>,
+        _chunks: &[Self::ChunkProof],
+    ) -> Result<VerifiedHistory, ProofError> {
+        Err(ProofError::Unsupported)
+    }
+
+    /// Prove the composition of two adjacent nonempty authenticated ranges.
+    fn prove_history_merge(
+        &self,
+        _spec: &ChainSpec,
+        _left: &HistoryProof,
+        _right: &HistoryProof,
+    ) -> Result<VerifiedHistory, ProofError> {
+        Err(ProofError::Unsupported)
+    }
+
+    /// Authenticate a compressed history receipt and its exact trusted domain.
+    /// Use `verify_history_proof` to obtain the token accepted by engine storage.
+    fn verify_history(&self, _spec: &ChainSpec, _proof: &HistoryProof) -> Result<(), ProofError> {
         Err(ProofError::Unsupported)
     }
 }

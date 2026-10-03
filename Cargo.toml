@@ -112,7 +112,7 @@ neutrino-consensus-fork-choice  = { path = "crates/consensus-fork-choice",  vers
 neutrino-consensus-chunk-bft    = { path = "crates/consensus-chunk-bft",    version = "0.1.0" }
 neutrino-proof-system           = { path = "crates/proof-system",           version = "0.1.0", default-features = false }
 neutrino-prover-chunk           = { path = "crates/prover-chunk",           version = "0.1.0" }
-neutrino-prover-checkpoint      = { path = "crates/prover-checkpoint",      version = "0.1.0" }
+neutrino-prover-checkpoint      = { path = "crates/prover-checkpoint",      version = "0.1.0", default-features = false }
 neutrino-consensus-engine       = { path = "crates/consensus-engine",       version = "0.1.0" }
 neutrino-network                = { path = "crates/network",                version = "0.1.0" }
 neutrino-sync                   = { path = "crates/sync",                   version = "0.1.0" }

@@ -26,11 +26,13 @@ consensus proof bytes. The certificate includes both BFT aggregate signatures an
 one signed precommit attestation per signer. Attestations bind exact ordered Borsh
 block-proof envelope hashes and the signer's unlock declaration.
 
-An `EvidenceSubmission` carries the statement, exact compressed receipt and sparse
-historical opening. Stable offence IDs prevent duplicate penalties across aliases
+An `EvidenceSubmission` carries the statement and sparse historical opening.
+Compressed evidence receipts are separate recursive proof attachments, so proof
+encoding does not alter transaction identity. Stable offence IDs prevent duplicate penalties across aliases
 or chunks. Historical context excludes certificate signer subsets.
 
 Types, protocol paths and stored metadata have no format version numbers. Program
 and configuration content hashes authenticate their identities.
-Checkpoint types are reserved for deferred recursion and are not accepted by an
-implemented production recursion backend.
+`HistoryProof` carries one fixed-size `HistoryStatement` and one bounded compressed
+STARK receipt. A `Checkpoint` is its domain and endpoint boundary, not a second
+independently supplied network assertion. See [history proofs](21-recursive-checkpoint-proofs.md).

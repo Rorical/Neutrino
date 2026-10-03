@@ -9,8 +9,7 @@ use borsh::to_vec;
 use neutrino_consensus_engine::{ProductionError, ProposerKey};
 use neutrino_network::Topic;
 use neutrino_network::service::NetworkCommand;
-use neutrino_runtime_host::Sp1ProofSystem;
-use sp1_sdk::blocking::CpuProver;
+use neutrino_runtime_host::{ProgramProver, Sp1ProofSystem};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -31,8 +30,8 @@ pub(crate) struct BlockProducerConfig {
 
 /// Run validator production until the network command channel closes or the
 /// task is aborted during node shutdown.
-pub(crate) async fn run_block_producer(
-    backend: Arc<ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>>,
+pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
+    backend: Arc<ChainBackend<NodeDb, Sp1ProofSystem<P>>>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
     config: BlockProducerConfig,
 ) {
@@ -100,8 +99,8 @@ pub(crate) async fn run_block_producer(
     }
 }
 
-async fn attempt_slot(
-    backend: &Arc<ChainBackend<NodeDb, Sp1ProofSystem<CpuProver>>>,
+async fn attempt_slot<P: ProgramProver + 'static>(
+    backend: &Arc<ChainBackend<NodeDb, Sp1ProofSystem<P>>>,
     config: &BlockProducerConfig,
     slot: u64,
 ) {

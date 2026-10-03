@@ -17,13 +17,16 @@
 //!   [`StfPublicOutput`], and check it equals the caller's expected
 //!   output (covers the "tampered `post_state_root`" exit criterion).
 
+pub mod backend;
 pub mod evidence;
 mod evidence_prover;
 pub mod executor;
 mod fact_cache;
+mod history_prover;
 pub mod proof_system;
 pub mod wasm;
 
+pub use backend::ProgramProver;
 pub use executor::{
     BlockWitness, ExecutorError, WasmExecutor, decode_witness_bundle, encode_witness_bundle,
 };
@@ -90,6 +93,9 @@ use thiserror::Error;
 /// Embedded default-runtime SP1 block Guest compiled by `build.rs`.
 /// The production verifier pins this program's verifying key.
 pub const DEFAULT_GUEST_ELF: Elf = include_elf!("neutrino-default-runtime-guest");
+
+/// Embedded recursive history Guest. All final artifacts remain compressed STARKs.
+pub const DEFAULT_CHECKPOINT_GUEST_ELF: Elf = include_elf!("neutrino-default-checkpoint-guest");
 
 /// Guest that verifies execution bindings, BLS finality, VRF and rotation.
 /// Historical consensus evidence is still fail-closed in this guest.
@@ -163,9 +169,9 @@ pub struct DryRun {
 pub struct ProverCtx<P: Prover> {
     /// Underlying prover (env, cpu, mock, network, light, cuda).
     pub prover: P,
-    /// Preprocessed proving key for [`DEFAULT_GUEST_ELF`].
+    /// Preprocessed proving key for this context's program.
     pub pk: P::ProvingKey,
-    /// Verifying key bound to [`DEFAULT_GUEST_ELF`].
+    /// Verifying key bound to this context's program.
     pub vk: SP1VerifyingKey,
 }
 
@@ -250,28 +256,21 @@ impl<P: Prover> ProverCtx<P> {
 
 impl<P> ProverCtx<P>
 where
-    P: Prover<ProvingKey = SP1ProvingKey>,
+    P: ProgramProver,
 {
     /// Build a context for `elf`, consulting the on-disk verifying-key
     /// cache before calling `setup`.
     ///
-    /// `pk = (vk, elf)`. Caching `vk` on disk lets future invocations
-    /// skip the expensive program-ROM preprocessing pass. The cache
-    /// file name embeds `BLAKE3(elf_bytes)` and `SP1_CIRCUIT_VERSION`
-    /// so keys for different program hashes and SP1 circuits remain isolated
-    /// without colliding — this is what makes the path forward-
-    /// compatible with on-chain runtime upgrades.
-    ///
-    /// Only available for provers whose [`Prover::ProvingKey`] is
-    /// [`SP1ProvingKey`] (`MockProver`, `CpuProver`, `CudaProver`,
-    /// `LightProver`). `EnvProver` wraps its own `EnvProvingKey` and
-    /// is served by [`Self::new`].
+    /// CPU keys reuse disk-cached ROM preprocessing, keyed by ELF hash and
+    /// SP1 circuit identity. CUDA retains a live server session key whose
+    /// verifying key must match the locally cached program identity.
+    /// `EnvProver` is served by [`Self::new`].
     ///
     /// # Errors
     /// Returns [`Sp1HostError::Sdk`] if `setup` is reached and fails.
     /// Disk errors are non-fatal — they fall back to `setup`.
     pub fn new_cached_for(prover: P, elf: Elf) -> Result<Self, Sp1HostError> {
-        let pk = cached_proving_key(&prover, elf)?;
+        let pk = prover.setup_program(elf)?;
         let vk = pk.verifying_key().clone();
         Ok(Self { prover, pk, vk })
     }

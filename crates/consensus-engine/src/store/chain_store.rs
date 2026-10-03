@@ -405,13 +405,18 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Block proofs ----------
 
-    /// Persist a block proof keyed by the block hash it covers.
+    /// Persist the first verified receipt for a block. Callers authenticate the
+    /// receipt before storage; a later valid encoding cannot replace the exact
+    /// bytes bound by a validator's signed attestation.
     pub fn put_block_proof(
         &mut self,
         hash: &BlockHash,
         proof: &BlockProof,
     ) -> Result<(), StoreError<DB::Error>> {
-        self.put_encoded(Column::BlockProofs, &keys::hash_key(hash), proof)
+        if self.retained_block_proof(hash, proof)?.is_none() {
+            self.put_encoded(Column::BlockProofs, &keys::hash_key(hash), proof)?;
+        }
+        Ok(())
     }
 
     /// Persist a locally verified proof and its FSM transition atomically.
@@ -421,13 +426,39 @@ impl<DB: Database> ChainStore<DB> {
         proof: &BlockProof,
     ) -> Result<(), StoreError<DB::Error>> {
         let mut batch = neutrino_storage::Batch::new();
-        batch.put(Column::BlockProofs, *hash, borsh::to_vec(proof)?);
-        batch.put(
-            Column::BlockStates,
-            *hash,
-            borsh::to_vec(&BlockState::Proven)?,
-        );
+        if self.retained_block_proof(hash, proof)?.is_none() {
+            batch.put(Column::BlockProofs, *hash, borsh::to_vec(proof)?);
+        }
+        if self.get_block_state(hash)? != Some(BlockState::Finalized) {
+            batch.put(
+                Column::BlockStates,
+                *hash,
+                borsh::to_vec(&BlockState::Proven)?,
+            );
+        }
         self.db.write_batch(batch).map_err(StoreError::Database)
+    }
+
+    fn retained_block_proof(
+        &self,
+        hash: &BlockHash,
+        proof: &BlockProof,
+    ) -> Result<Option<BlockProof>, StoreError<DB::Error>> {
+        if proof.block_hash != *hash
+            || proof.public_inputs.block_hash != *hash
+            || proof.height != proof.public_inputs.height
+        {
+            return Err(StoreError::Corrupt("block receipt binding mismatch"));
+        }
+        let retained = self.get_block_proof(hash)?;
+        if retained.as_ref().is_some_and(|existing| {
+            existing.height != proof.height
+                || existing.block_hash != *hash
+                || existing.public_inputs != proof.public_inputs
+        }) {
+            return Err(StoreError::Corrupt("stored block receipt binding changed"));
+        }
+        Ok(retained)
     }
 
     /// Read a block proof by block hash.
@@ -1001,6 +1032,24 @@ mod tests {
             proof_bytes: vec![1, 2, 3, 4],
         };
         store.put_block_proof(&hash, &proof).expect("put");
+        assert_eq!(
+            store.get_block_proof(&hash).expect("get"),
+            Some(proof.clone())
+        );
+        let mut alternate = proof.clone();
+        alternate.proof_bytes.push(5);
+        store
+            .put_block_proof(&hash, &alternate)
+            .expect("alternate verified receipt");
+        store
+            .put_proven_block(&hash, &alternate)
+            .expect("concurrent completion");
+        assert_eq!(
+            store.get_block_proof(&hash).expect("get"),
+            Some(proof.clone())
+        );
+        alternate.public_inputs.gas_used += 1;
+        assert!(store.put_block_proof(&hash, &alternate).is_err());
         assert_eq!(store.get_block_proof(&hash).expect("get"), Some(proof));
     }
 
@@ -1062,7 +1111,8 @@ mod tests {
 
         let cp = neutrino_consensus_types::ChunkProof {
             finality_cert: FinalityCert {
-                attestations: Vec::new(),
+                prevote_attestations: Vec::new(),
+                precommit_attestations: Vec::new(),
                 chunk_id: 2,
                 round: 0,
                 chunk_hash: c.hash(),
@@ -1093,7 +1143,8 @@ mod tests {
         assert_eq!(store.get_chunk_proof(2).expect("get"), Some(cp));
 
         let cert = FinalityCert {
-            attestations: Vec::new(),
+            prevote_attestations: Vec::new(),
+            precommit_attestations: Vec::new(),
             chunk_id: 2,
             round: 0,
             chunk_hash: c.hash(),

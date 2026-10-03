@@ -694,7 +694,8 @@ mod tests {
             signature: [0; 96],
         };
         let finality = FinalityCert {
-            attestations: Vec::new(),
+            prevote_attestations: Vec::new(),
+            precommit_attestations: Vec::new(),
             chunk_id: id,
             round: 0,
             chunk_hash: chunk.hash(),

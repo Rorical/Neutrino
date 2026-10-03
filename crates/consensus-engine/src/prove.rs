@@ -217,7 +217,6 @@ impl<DB: Database> Engine<DB> {
             self.store_mut().put_proven_block(&hash, &proof)?;
             proof
         };
-        self.clear_rejected_proof(&hash);
         let status = if current == BlockState::Finalized {
             neutrino_consensus_fork_choice::ProofStatus::Finalized
         } else {

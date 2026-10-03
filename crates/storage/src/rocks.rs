@@ -234,7 +234,11 @@ mod tests {
 
     #[test]
     fn durable_signing_batch_preserves_prior_finality_after_abrupt_exit() {
+        use std::io::{BufRead, Read, Write};
+        use std::process::Stdio;
+
         const CHILD_PATH: &str = "NEUTRINO_DURABILITY_CHILD_DB";
+        const SYNCED: &str = "NEUTRINO_DURABILITY_SYNCED\n";
         if let Some(path) = std::env::var_os(CHILD_PATH) {
             let mut db = RocksDbDatabase::open(path).expect("open child database");
             let mut finality = Batch::new();
@@ -245,17 +249,54 @@ mod tests {
             signing.put(Column::BftSessions, b"chunk", b"saved-session");
             db.write_batch_durable(signing)
                 .expect("synchronize signing and prior WAL");
-            // Skip database destructors and their normal shutdown flush.
-            std::process::exit(0);
+            // The parent kills this process only after the synchronized write.
+            // Waiting avoids libc/C++ exit handlers and normal database flushes.
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(SYNCED.as_bytes())
+                .expect("signal synchronized write");
+            stdout.flush().expect("flush synchronization signal");
+            std::io::stdin()
+                .read_exact(&mut [0])
+                .expect("parent keeps input open until terminating child");
+            panic!("parent must terminate the synchronized child without shutdown");
         }
         let path = temp_db_path("durable-abrupt-exit");
-        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg("rocks::tests::durable_signing_batch_preserves_prior_finality_after_abrupt_exit")
-            .env(CHILD_PATH, &path)
-            .status()
-            .expect("run crash child");
-        assert!(status.success());
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("test executable"),
+        )
+        .arg("--exact")
+        .arg("rocks::tests::durable_signing_batch_preserves_prior_finality_after_abrupt_exit")
+        .arg("--nocapture")
+        .env(CHILD_PATH, &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run crash child");
+        let mut output = std::io::BufReader::new(child.stdout.take().expect("child output pipe"));
+        let mut transcript = String::new();
+        while !transcript.ends_with(SYNCED) {
+            assert_ne!(
+                output
+                    .read_line(&mut transcript)
+                    .expect("read synchronization signal"),
+                0,
+                "child exited before synchronizing its write: {transcript}"
+            );
+        }
+        child.kill().expect("terminate without database shutdown");
+        let status = child.wait().expect("reap terminated child");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "child must be killed with SIGKILL"
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(!status.success(), "child must be forcibly terminated");
         let db = RocksDbDatabase::open(&path).expect("recover child WAL");
         assert_eq!(
             get(&db, Column::Finalized, b"latest_chunk_id"),

@@ -31,6 +31,8 @@ pub enum Topic {
     ChunkProofs,
     /// `/neutrino/checkpoints/borsh`: compact authenticated-endpoint availability notices.
     Checkpoints,
+    /// Fully proven next-chunk branch availability; rounds are advisory.
+    BftCandidates,
     /// `/neutrino/prover_bounty/borsh`: missed-deadline bounty announcements.
     ProverBounty,
     /// `/neutrino/finality_votes_prevote/borsh`: BFT prevote votes.
@@ -44,7 +46,7 @@ pub enum Topic {
 
 impl Topic {
     /// All non-subnet topics, in canonical order.
-    pub const STATIC: [Self; 10] = [
+    pub const STATIC: [Self; 11] = [
         Self::Blocks,
         Self::Transactions,
         Self::SlashingEvidence,
@@ -52,6 +54,7 @@ impl Topic {
         Self::BlockProofs,
         Self::ChunkProofs,
         Self::Checkpoints,
+        Self::BftCandidates,
         Self::ProverBounty,
         Self::FinalityVotesPrevote,
         Self::FinalityVotesPrecommit,
@@ -86,6 +89,7 @@ impl Topic {
             | Self::FinalityVotesPrecommit
             | Self::AggregateFinalityVotes(_) => 8 * 1024 * 1024,
             Self::Checkpoints => 1024,
+            Self::BftCandidates => 16 * 1024,
             Self::ProverBounty => 4 * 1024,
             Self::Transactions => 128 * 1024,
         }
@@ -102,6 +106,7 @@ impl Topic {
             Self::BlockProofs => "/neutrino/block_proofs/borsh".to_owned(),
             Self::ChunkProofs => "/neutrino/chunk_proofs/borsh".to_owned(),
             Self::Checkpoints => "/neutrino/checkpoints/borsh".to_owned(),
+            Self::BftCandidates => "/neutrino/bft_candidates/borsh".to_owned(),
             Self::ProverBounty => "/neutrino/prover_bounty/borsh".to_owned(),
             Self::FinalityVotesPrevote => "/neutrino/finality_votes_prevote/borsh".to_owned(),
             Self::FinalityVotesPrecommit => "/neutrino/finality_votes_precommit/borsh".to_owned(),

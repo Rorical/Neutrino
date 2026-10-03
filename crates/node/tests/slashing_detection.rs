@@ -158,7 +158,16 @@ fn partial_vote(
         bits.push(position == voter_position);
     }
     FinalityVote {
-        attestations: Vec::new(),
+        attestations: vec![signer.attest_vote(
+            TEST_CHAIN_ID,
+            data.clone(),
+            if phase == FinalityVotePhase::Prevote {
+                vec![]
+            } else {
+                vec![[0; 32]]
+            },
+            None,
+        )],
         aggregation_bits: bits,
         data,
         signature,
@@ -235,6 +244,74 @@ async fn detects_double_prevote_from_two_partial_votes() {
             ..
         }]
     ));
+}
+
+fn conflicting_prevote(round: u32, hash: u8, aggregate: bool) -> FinalityVote {
+    let mut vote = partial_vote(0, round, FinalityVotePhase::Prevote, hash, &proposer(1), 2);
+    if aggregate {
+        let other = partial_vote(0, round, FinalityVotePhase::Prevote, hash, &proposer(0), 2);
+        let signatures = [
+            neutrino_crypto::bls::Signature::from_bytes(&vote.signature).unwrap(),
+            neutrino_crypto::bls::Signature::from_bytes(&other.signature).unwrap(),
+        ];
+        vote.signature =
+            neutrino_crypto::bls::aggregate_signatures(&signatures.iter().collect::<Vec<_>>())
+                .unwrap()
+                .to_bytes();
+        vote.aggregation_bits = BitVec::from_bytes(2, vec![3]).unwrap();
+        vote.attestations.extend(other.attestations);
+    }
+    vote
+}
+
+#[tokio::test]
+async fn stale_and_wrong_target_votes_preserve_raw_and_aggregate_attribution() {
+    for round in [0, 1] {
+        for aggregate in [false, true] {
+            let backend = fresh_backend();
+            let mut chunk = historical_chunk_fixture();
+            chunk.chunk_id = 0;
+            chunk.start_height = 1;
+            chunk.end_height = 1;
+            // This native detector fixture opens bookkeeping only; it cannot
+            // produce a complete Chunk proof or establish finality.
+            let target_hash = chunk.hash();
+            backend.with_engine_mut_for_test(|engine| {
+                engine.open_bft_session_at(chunk, 100).unwrap();
+                engine.tick_bft_round_timeouts(108).unwrap();
+                assert_eq!(engine.bft_session(0).unwrap().round(), 1);
+            });
+
+            // Round zero is stale; round one has the wrong target. Both must
+            // remain attributable even though neither can enter the live FSM.
+            let vote_a = conflicting_prevote(round, 0xAA, aggregate);
+            let vote_b = conflicting_prevote(round, 0xBB, aggregate);
+            for vote in [vote_a, vote_b] {
+                if aggregate {
+                    backend.ingest_aggregate_finality_vote(0, vote).await;
+                } else {
+                    backend.ingest_finality_vote(vote).await;
+                }
+            }
+            let evidence = backend.drain_slashing_pool(8);
+            assert_eq!(evidence.len(), if aggregate { 2 } else { 1 });
+            for item in evidence {
+                let SlashingEvidence::DoublePrevote { vote_a, vote_b, .. } = item else {
+                    panic!("expected attributable double prevote, got {item:?}");
+                };
+                assert_eq!(vote_a.data.round, round);
+                assert_eq!(vote_b.data.round, round);
+                assert_ne!(vote_a.data.chunk_hash, vote_b.data.chunk_hash);
+            }
+            backend.with_engine_mut_for_test(|engine| {
+                let session = engine.bft_session(0).unwrap();
+                assert_eq!(session.round(), 1);
+                assert_eq!(session.chunk_hash(), target_hash);
+                assert!(!session.prevote_quorum_observed());
+                assert!(!session.precommit_quorum_observed());
+            });
+        }
+    }
 }
 
 #[tokio::test]
@@ -374,8 +451,8 @@ async fn drain_slashing_pool_returns_items_in_fifo_order() {
     let v1 = proposer(1);
     let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
 
-    // Two DoubleProposal items via direct ingest (skip the engine
-    // import path so we can populate without chain side effects).
+    // Two distinct current-chunk offences via direct ingest, so both are
+    // authenticated without changing the engine's finalized boundary.
     let block_a = signed_block(3, genesis_hash, 1, 0x33, &v0);
     let block_b = signed_block(3, genesis_hash, 1, 0x44, &v0);
     let evidence_one = SlashingEvidence::DoubleProposal {
@@ -384,8 +461,8 @@ async fn drain_slashing_pool_returns_items_in_fifo_order() {
         header_b: block_b.header,
     };
 
-    let prevote_a = partial_vote(7, 0, FinalityVotePhase::Prevote, 0x55, &v1, 2);
-    let prevote_b = partial_vote(7, 0, FinalityVotePhase::Prevote, 0x66, &v1, 2);
+    let prevote_a = partial_vote(0, 0, FinalityVotePhase::Prevote, 0x55, &v1, 2);
+    let prevote_b = partial_vote(0, 0, FinalityVotePhase::Prevote, 0x66, &v1, 2);
     let evidence_two = SlashingEvidence::DoublePrevote {
         validator_index: 1,
         vote_a: IndexedVote {
@@ -457,6 +534,8 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let mut v0_prevote = partial_vote(0, 0, FinalityVotePhase::Prevote, 0xCC, &v0, 3);
     v0_prevote.data.chunk_hash = chunk_hash;
     v0_prevote.signature = v0.sign_finality_vote(TEST_CHAIN_ID, &v0_prevote.data);
+    v0_prevote.attestations =
+        vec![v0.attest_vote(TEST_CHAIN_ID, v0_prevote.data.clone(), vec![], None)];
     backend.ingest_finality_vote(v0_prevote).await;
 
     // Step 2: v1's prevote crosses 2/3 stake.
@@ -468,6 +547,8 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let mut v1_prevote = v1_prevote;
     v1_prevote.data.chunk_hash = chunk_hash;
     v1_prevote.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_prevote.data);
+    v1_prevote.attestations =
+        vec![v1.attest_vote(TEST_CHAIN_ID, v1_prevote.data.clone(), vec![], None)];
 
     backend.ingest_finality_vote(v1_prevote).await;
 
@@ -478,7 +559,7 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let mut v1_precommit_r0 = partial_vote(0, 0, FinalityVotePhase::Precommit, 0xCC, &v1, 3);
     v1_precommit_r0.data.chunk_hash = chunk_hash;
     v1_precommit_r0.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r0.data);
-    v1_precommit_r0.attestations = vec![v1.attest_precommit(
+    v1_precommit_r0.attestations = vec![v1.attest_vote(
         TEST_CHAIN_ID,
         v1_precommit_r0.data.clone(),
         vec![[0x44; 32]],
@@ -498,7 +579,7 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let mut v1_precommit_r1 = partial_vote(0, 1, FinalityVotePhase::Precommit, 0xDD, &v1, 3);
     v1_precommit_r1.data.chunk_hash = conflicting_hash;
     v1_precommit_r1.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r1.data);
-    v1_precommit_r1.attestations = vec![v1.attest_precommit(
+    v1_precommit_r1.attestations = vec![v1.attest_vote(
         TEST_CHAIN_ID,
         v1_precommit_r1.data.clone(),
         vec![[0x55; 32]],
@@ -560,7 +641,8 @@ fn historical_record_fixture(
         signature: [0; 96],
     };
     let finality = neutrino_consensus_types::FinalityCert {
-        attestations: Vec::new(),
+        prevote_attestations: Vec::new(),
+        precommit_attestations: Vec::new(),
         chunk_id: chunk.chunk_id,
         round: 0,
         chunk_hash: chunk.hash(),
@@ -616,12 +698,12 @@ async fn long_range_evidence_requires_a_local_finalized_historical_record() {
 }
 
 #[tokio::test]
-async fn long_range_evidence_rejects_a_mismatched_canonical_vote() {
+async fn stored_future_historical_record_does_not_authorize_peer_evidence() {
     use neutrino_storage::{Column, Database};
     let backend = fresh_backend();
     let record = historical_record_fixture(historical_chunk_fixture());
-    // Native detector fixture: archive a known historical record. This does not
-    // simulate checkpoint verification or authorize any runtime sanction.
+    // A stored observation ahead of local finality has no authenticated
+    // source context. Its presence cannot authorize peer evidence.
     backend.with_engine_mut_for_test(|engine| {
         engine
             .store_mut()
@@ -639,12 +721,12 @@ async fn long_range_evidence_rejects_a_mismatched_canonical_vote() {
     assert_eq!(
         backend.slashing_pool_len(),
         0,
-        "a signature over an alternative supposed canonical chunk is insufficient"
+        "a stored future record cannot supply authenticated historical membership"
     );
 }
 
 #[tokio::test]
-async fn long_range_evidence_against_historical_canonical_vote_is_pooled_after_restart() {
+async fn stored_future_historical_record_does_not_authorize_evidence_after_restart() {
     use neutrino_storage::{Column, Database};
     let record = historical_record_fixture(historical_chunk_fixture());
     let spec = spec(2);
@@ -659,11 +741,25 @@ async fn long_range_evidence_against_historical_canonical_vote_is_pooled_after_r
         )
         .unwrap();
     let restarted = Engine::open(spec, engine.store().db().clone()).unwrap();
+    assert_eq!(restarted.latest_finalized_chunk_id(), None);
+    assert_eq!(
+        restarted
+            .store()
+            .historical_chunk(record.chunk.chunk_id)
+            .unwrap(),
+        Some(record.clone()),
+        "the untrusted stored observation survives restart"
+    );
     let backend = ChainBackend::new(restarted, MockProofSystem);
-    let evidence = long_range_evidence_fixture(record.chunk.hash());
-    backend.ingest_slashing_evidence(evidence.clone()).await;
-    assert_eq!(backend.slashing_pool_len(), 1);
-    assert_eq!(backend.drain_slashing_pool(10), vec![evidence]);
+    backend
+        .ingest_slashing_evidence(long_range_evidence_fixture(record.chunk.hash()))
+        .await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "restart cannot authenticate evidence from an unfinalized record"
+    );
+    assert_eq!(backend.drain_slashing_pool(10), Vec::new());
 }
 
 #[tokio::test]
@@ -711,4 +807,89 @@ async fn invalid_vrf_evidence_construction_round_trips() {
         1,
         "wrong-reason evidence must be rejected by the verifier"
     );
+}
+
+#[tokio::test]
+async fn future_signed_votes_and_candidates_cannot_evict_current_accountability() {
+    let backend = fresh_backend();
+    let v0 = proposer(0);
+    let v1 = proposer(1);
+    backend
+        .ingest_finality_vote(partial_vote(0, 0, FinalityVotePhase::Prevote, 0xAA, &v1, 2))
+        .await;
+
+    let mut chunk = historical_chunk_fixture();
+    chunk.chunk_id = 10_000;
+    chunk.start_height = 10_001;
+    chunk.end_height = 10_001;
+    chunk.start_state_root = ZERO_HASH;
+    chunk.active_validator_set_root = validator_set_root(&validators(2));
+    let data = FinalityVoteData {
+        chunk_id: chunk.chunk_id,
+        round: 0,
+        chunk_hash: chunk.hash(),
+        phase: FinalityVotePhase::Prevote,
+    };
+    let claims: Vec<_> = [&v0, &v1]
+        .into_iter()
+        .map(|signer| signer.attest_vote(TEST_CHAIN_ID, data.clone(), vec![], None))
+        .collect();
+    let signatures: Vec<_> = claims
+        .iter()
+        .map(|claim| neutrino_crypto::bls::Signature::from_bytes(&claim.vote_signature).unwrap())
+        .collect();
+    let aggregate = neutrino_consensus_types::AggregatedVote {
+        aggregation_bits: BitVec::from_bytes(2, vec![3]).unwrap(),
+        signature: neutrino_crypto::bls::aggregate_signatures(
+            &signatures.iter().collect::<Vec<_>>(),
+        )
+        .unwrap()
+        .to_bytes(),
+    };
+    let quorum = neutrino_consensus_types::QuorumCertificate {
+        data: data.clone(),
+        aggregate: aggregate.clone(),
+    };
+    // These are real signatures under the local active keys, not malformed
+    // input. Their future consensus context has not been authenticated.
+    neutrino_prover_chunk::slashing::verify_quorum(TEST_CHAIN_ID, &validators(2), &quorum, (2, 3))
+        .unwrap();
+    let future = FinalityVote {
+        data,
+        aggregation_bits: aggregate.aggregation_bits,
+        signature: aggregate.signature,
+        attestations: claims,
+    };
+    backend
+        .ingest_finality_vote(partial_vote(
+            10_000,
+            0,
+            FinalityVotePhase::Prevote,
+            0xCC,
+            &v1,
+            2,
+        ))
+        .await;
+    backend
+        .ingest_aggregate_finality_vote(0, future.clone())
+        .await;
+    assert!(!backend.bft_vote_needs_candidate(&future).await);
+    let candidate = neutrino_consensus_types::BftCandidate {
+        chunk,
+        round: 1,
+        justification: Some(quorum),
+    };
+    assert!(!backend.validate_bft_candidate_hint(&candidate).await);
+    assert!(backend.consider_bft_candidate(candidate).await.is_err());
+    assert_eq!(backend.slashing_pool_len(), 0);
+    backend
+        .ingest_finality_vote(partial_vote(0, 0, FinalityVotePhase::Prevote, 0xBB, &v1, 2))
+        .await;
+    assert!(matches!(
+        backend.drain_slashing_pool(8).as_slice(),
+        [SlashingEvidence::DoublePrevote {
+            validator_index: 1,
+            ..
+        }]
+    ));
 }

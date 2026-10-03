@@ -5,6 +5,7 @@
 //! reuse this struct via additional `impl` blocks).
 
 use alloc::collections::{BTreeMap, VecDeque};
+use core::cell::RefCell;
 
 use neutrino_consensus_types::{
     FinalityVote, FinalityVotePhase, Header, SlashingEvidence, VrfRejectionReason,
@@ -59,6 +60,8 @@ pub struct Engine<DB: Database> {
     /// Equivocation detector for the M7-B slashing pipeline. See
     /// [`crate::slashing`].
     pub(crate) slashing_monitor: SlashingMonitor,
+    /// Bounded cache of exact native BLS equations, never consensus decisions.
+    pub(crate) bls_verifier: RefCell<crate::bls_verdicts::NativeBlsVerifier>,
     /// In-memory cache of rejected block proofs.
     ///
     /// Populated by the local
@@ -71,10 +74,9 @@ pub struct Engine<DB: Database> {
     /// re-verify the rejection.
     ///
     /// Bounded by [`MAX_REJECTED_PROOFS_CACHED`]: once the map is
-    /// full, the oldest insertion is evicted to make room. Honest
-    /// `import_block_proof` on the same block hash also clears its
-    /// entry (a peer's earlier corrupted gossip should not slash
-    /// any future signer once an honest proof lands).
+    /// full, the oldest insertion is evicted to make room. An accepted alternate
+    /// envelope for the same block does not erase an exact rejected envelope's
+    /// verdict; the signer's attestation identifies the proof bytes it accepted.
     pub(crate) rejected_proofs: BTreeMap<
         BlockHash,
         (
@@ -163,6 +165,7 @@ impl<DB: Database> Engine<DB> {
             local_voter: None,
             evidence_programs: None,
             slashing_monitor: SlashingMonitor::new(),
+            bls_verifier: RefCell::default(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
             fork_choice: ForkChoice::new(genesis_block_hash),
@@ -174,6 +177,10 @@ impl<DB: Database> Engine<DB> {
     /// Verifies that the stored chain-spec hash matches `chain_spec`
     /// and decodes the current stored format. Rehydrates
     /// the in-memory head and finalization pointers from the store.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep boundary validation and reconstruction ordered before BFT recovery."
+    )]
     pub fn open(chain_spec: ChainSpec, db: DB) -> Result<Self, EngineError<DB::Error>> {
         chain_spec.validate()?;
         let store = ChainStore::new(db);
@@ -295,6 +302,7 @@ impl<DB: Database> Engine<DB> {
             local_voter: None,
             evidence_programs: None,
             slashing_monitor: SlashingMonitor::new(),
+            bls_verifier: RefCell::default(),
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
             fork_choice,
@@ -402,9 +410,9 @@ impl<DB: Database> Engine<DB> {
 
     /// Insert a rejected `BlockProof` into the bounded cache.
     ///
-    /// Honest re-import of the same block hash clears its entry via
-    /// [`Self::clear_rejected_proof`]; otherwise the cache is FIFO
-    /// and bounded at [`MAX_REJECTED_PROOFS_CACHED`] entries so a
+    /// The latest rejected envelope per block is retained independently of
+    /// successful alternate envelopes. The cache is FIFO and bounded at
+    /// [`MAX_REJECTED_PROOFS_CACHED`] entries so a
     /// long-running node never grows the cache unboundedly.
     pub(crate) fn record_rejected_proof(
         &mut self,
@@ -436,22 +444,6 @@ impl<DB: Database> Engine<DB> {
             Entry::Vacant(slot) => {
                 slot.insert((proof, reason));
                 self.rejected_proofs_order.push_back(block_hash);
-            }
-        }
-    }
-
-    /// Clear a previously-cached rejected `BlockProof` (called when
-    /// the same block hash subsequently imports cleanly).
-    pub(crate) fn clear_rejected_proof(&mut self, block_hash: &BlockHash) {
-        if self.rejected_proofs.remove(block_hash).is_some() {
-            // Removing from VecDeque is O(n) but the queue is bounded
-            // at MAX_REJECTED_PROOFS_CACHED so the constant is small.
-            if let Some(idx) = self
-                .rejected_proofs_order
-                .iter()
-                .position(|h| h == block_hash)
-            {
-                self.rejected_proofs_order.remove(idx);
             }
         }
     }
@@ -742,6 +734,7 @@ impl<DB: Database> Engine<DB> {
         self.active_validator_set
             .clone_from(&state.next_context.active_validators);
         self.rebind_local_voter();
+        self.retain_accountability_observations();
     }
 
     /// Publish a bootstrap only after its state and every canonical pointer are durable.
@@ -759,6 +752,7 @@ impl<DB: Database> Engine<DB> {
         self.fork_choice = ForkChoice::new(consensus.boundary.block_hash);
         self.bft_sessions.clear();
         self.slashing_monitor = SlashingMonitor::new();
+        self.bls_verifier = RefCell::default();
         self.rejected_proofs.clear();
         self.rejected_proofs_order.clear();
     }
@@ -770,9 +764,9 @@ impl<DB: Database> Engine<DB> {
 
     /// Observe a signed header for slashing detection.
     ///
-    /// Verifies the proposer signature first (so a malformed peer
-    /// cannot pollute the equivocation monitor) and then records
-    /// the header. Returns [`SlashingEvidence::DoubleProposal`] if
+    /// Authenticates the header's current or retained historical validator
+    /// context, verifies the proposer signature, and then records the header.
+    /// Returns [`SlashingEvidence::DoubleProposal`] if
     /// the same proposer has already been observed signing a
     /// *different* header at the same slot.
     ///
@@ -783,21 +777,17 @@ impl<DB: Database> Engine<DB> {
     /// # Errors
     ///
     /// Returns the matching [`SlashingError`] variant on signature
-    /// failure.
+    /// failure or when the source is outside the accountability window.
     pub fn observe_header_for_slashing(
         &mut self,
         header: &Header,
     ) -> Result<Option<SlashingEvidence>, SlashingError> {
-        // Re-use the engine's existing signature verifier; the
-        // result type is mapped onto the slashing crate's error
-        // enum for caller uniformity.
-        crate::signature::verify_header_signature(
-            header,
-            self.active_validator_set(),
-            self.chain_spec().chain_id,
-        )
-        .map_err(slashing_signature_to_slashing_err)?;
-        Ok(self.slashing_monitor.record_header(header))
+        let source_chunk = self.accountability_chunk_for_height(header.height)?;
+        let (validators, _) = self.accountability_header_context(header)?;
+        crate::signature::verify_header_signature(header, &validators, self.chain_spec().chain_id)
+            .map_err(slashing_signature_to_slashing_err)?;
+        self.retain_accountability_observations();
+        Ok(self.slashing_monitor.record_header(source_chunk, header))
     }
 
     /// Subnet index used by the M7-C aggregator role to route the
@@ -908,21 +898,89 @@ impl<DB: Database> Engine<DB> {
             .any(|selection| selection.validator_index == local_idx)
     }
 
-    fn accountability_validators(
+    fn accountability_context(
         &self,
-        chunk_id: u64,
-    ) -> Result<alloc::vec::Vec<Validator>, SlashingError> {
-        if let Some(record) = self
+        chunk_id: ChunkId,
+    ) -> Result<(alloc::vec::Vec<Validator>, Seed), SlashingError> {
+        let next = self.finalized_next_chunk_id();
+        if chunk_id == next {
+            return Ok((self.active_validator_set().to_vec(), self.finalized_seed()));
+        }
+        if !neutrino_consensus_types::history::is_recent_history_index(chunk_id, next) {
+            return Err(SlashingError::SourceOutsideAccountabilityWindow);
+        }
+        let record = self
             .store()
             .historical_chunk(chunk_id)
-            .map_err(|_| SlashingError::BadSignature)?
-        {
-            return Ok(record.validators);
+            .map_err(|_| SlashingError::NotYetFinalizedLocally)?
+            .ok_or(SlashingError::NotYetFinalizedLocally)?;
+        Ok((record.validators, record.seed))
+    }
+
+    /// Recheck unlock policy while reusing only the exact BLS equation verdict.
+    pub(crate) fn verify_bft_unlock_quorum(
+        &self,
+        validators: &[Validator],
+        vote: &neutrino_consensus_types::FinalityVoteData,
+        quorum: &neutrino_consensus_types::QuorumCertificate,
+    ) -> Result<(), neutrino_prover_chunk::slashing::EvidenceError> {
+        let params = &self.chain_spec().consensus;
+        if vote.round > params.bft_max_round {
+            return Err(neutrino_prover_chunk::slashing::EvidenceError::Binding);
         }
-        if chunk_id < self.finalized_next_chunk_id() {
-            return Err(SlashingError::NotYetFinalizedLocally);
+        neutrino_prover_chunk::slashing::verify_unlock_using(
+            self.chain_spec().chain_id,
+            validators,
+            vote,
+            quorum,
+            (
+                params.bft_prevote_quorum_numerator,
+                params.bft_prevote_quorum_denominator,
+            ),
+            &mut *self.bls_verifier.borrow_mut(),
+        )
+    }
+
+    fn accountability_validators(
+        &self,
+        chunk_id: ChunkId,
+    ) -> Result<alloc::vec::Vec<Validator>, SlashingError> {
+        self.accountability_context(chunk_id)
+            .map(|(validators, _)| validators)
+    }
+
+    fn accountability_chunk_for_height(&self, height: Height) -> Result<ChunkId, SlashingError> {
+        height
+            .checked_sub(1)
+            .and_then(|offset| offset.checked_div(self.chain_spec().consensus.chunk_size))
+            .ok_or(SlashingError::EvidenceFieldsInconsistent)
+    }
+
+    fn accountability_header_context(
+        &self,
+        header: &Header,
+    ) -> Result<(alloc::vec::Vec<Validator>, Seed), SlashingError> {
+        let source = self.accountability_chunk_for_height(header.height)?;
+        let context = self.accountability_context(source)?;
+        let index = usize::try_from(header.proposer_index).expect("u32 fits usize");
+        let proposer = context
+            .0
+            .get(index)
+            .ok_or(SlashingError::ValidatorIndexOutOfBounds {
+                index: header.proposer_index,
+                len: context.0.len(),
+            })?;
+        if proposer.slashed || proposer.effective_stake == 0 {
+            return Err(SlashingError::EvidenceFieldsInconsistent);
         }
-        Ok(self.active_validator_set().to_vec())
+        Ok(context)
+    }
+
+    fn retain_accountability_observations(&mut self) {
+        let first = self
+            .finalized_next_chunk_id()
+            .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
+        self.slashing_monitor.retain_history_window(first);
     }
 
     /// Attribute every signer of an aggregate, retaining all independently valid evidence.
@@ -948,15 +1006,12 @@ impl<DB: Database> Engine<DB> {
         if slashing::extract_single_signer(vote, validators.len()).is_some() {
             return Ok(alloc::vec![vote.clone()]);
         }
-        if vote.data.phase != neutrino_consensus_types::FinalityVotePhase::Precommit {
-            return Ok(alloc::vec::Vec::new());
-        }
-        neutrino_prover_chunk::finality::verify_vote(
+        neutrino_prover_chunk::finality::verify_vote_signatures_using(
             self.chain_spec().chain_id,
             &validators,
             vote,
-            self.chain_spec().consensus.bft_max_round,
-            self.chain_spec().consensus.chunk_size,
+            &self.chain_spec().consensus,
+            &mut *self.bls_verifier.borrow_mut(),
         )
         .map_err(|_| SlashingError::BadSignature)?;
         Ok(vote
@@ -984,14 +1039,16 @@ impl<DB: Database> Engine<DB> {
         certificate: &neutrino_consensus_types::FinalityCert,
     ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
         let validators = self.accountability_validators(chunk.chunk_id)?;
-        neutrino_prover_chunk::finality::verify_finality(
+        neutrino_prover_chunk::finality::verify_finality_using(
             self.chain_spec().chain_id,
             &self.chain_spec().consensus,
             &validators,
             chunk,
             certificate,
+            &mut *self.bls_verifier.borrow_mut(),
         )
         .map_err(|_| SlashingError::BadSignature)?;
+        self.retain_accountability_observations();
         // Rehydrate the persisted canonical certificate so restart/rotation does
         // not discard attribution for a conflicting finality certificate.
         if let Some(record) = self
@@ -999,6 +1056,7 @@ impl<DB: Database> Engine<DB> {
             .historical_chunk(chunk.chunk_id)
             .map_err(|_| SlashingError::BadSignature)?
         {
+            let prior_prevote = record.finality.prevote_vote();
             let prior = record.finality.precommit_vote();
             self.slashing_monitor.record_prevote_quorum(
                 neutrino_consensus_types::QuorumCertificate {
@@ -1009,8 +1067,10 @@ impl<DB: Database> Engine<DB> {
                     aggregate: record.finality.prevote,
                 },
             );
+            self.observe_votes_for_slashing(&prior_prevote)?;
             self.observe_votes_for_slashing(&prior)?;
         }
+        let prevote = certificate.prevote_vote();
         let vote = certificate.precommit_vote();
         self.slashing_monitor
             .record_prevote_quorum(neutrino_consensus_types::QuorumCertificate {
@@ -1020,7 +1080,8 @@ impl<DB: Database> Engine<DB> {
                 },
                 aggregate: certificate.prevote.clone(),
             });
-        let mut evidence = self.observe_votes_for_slashing(&vote)?;
+        let mut evidence = self.observe_votes_for_slashing(&prevote)?;
+        evidence.extend(self.observe_votes_for_slashing(&vote)?);
         evidence.extend(self.observe_vote_for_invalid_proof_signing(&vote)?);
         Ok(evidence)
     }
@@ -1059,20 +1120,22 @@ impl<DB: Database> Engine<DB> {
             &validators,
             self.chain_spec().chain_id,
         )?;
+        self.retain_accountability_observations();
         for attestation in &vote.attestations {
-            if slashing::verify_precommit_attestation(
+            if slashing::verify_vote_attestation_using(
                 attestation,
                 signer,
                 &indexed.data,
                 &validators,
                 self.chain_spec().chain_id,
+                &mut *self.bls_verifier.borrow_mut(),
             )
             .is_ok()
             {
                 if let Some(quorum) = &attestation.unlock_quorum
                     && quorum.data.chunk_id == indexed.data.chunk_id
                     && quorum.data.round <= indexed.data.round
-                    && neutrino_prover_chunk::slashing::verify_quorum(
+                    && neutrino_prover_chunk::slashing::verify_quorum_using(
                         self.chain_spec().chain_id,
                         &validators,
                         quorum,
@@ -1080,6 +1143,7 @@ impl<DB: Database> Engine<DB> {
                             self.chain_spec().consensus.bft_prevote_quorum_numerator,
                             self.chain_spec().consensus.bft_prevote_quorum_denominator,
                         ),
+                        &mut *self.bls_verifier.borrow_mut(),
                     )
                     .is_ok()
                 {
@@ -1117,10 +1181,8 @@ impl<DB: Database> Engine<DB> {
     /// cannot pollute the slashing pool with claims attributed to a
     /// validator who did not actually sign.
     ///
-    /// Only individual-signer votes (single bit set on the
-    /// aggregation bitmap) participate; aggregated votes do not
-    /// attribute to a specific signer until subnet-level detection
-    /// lands.
+    /// This helper consumes individual votes recovered by the public entry
+    /// point from an aggregate's mandatory per-signer attestations.
     ///
     /// # Errors
     ///
@@ -1178,12 +1240,13 @@ impl<DB: Database> Engine<DB> {
             };
             if let Some((rejected_proof, reason)) = self.rejected_proofs.get(&block_hash) {
                 let Some(attestation) = vote.attestations.iter().find(|attestation| {
-                    slashing::verify_precommit_attestation(
+                    slashing::verify_vote_attestation_using(
                         attestation,
                         signer,
                         &indexed.data,
                         &validators,
                         self.chain_spec().chain_id,
+                        &mut *self.bls_verifier.borrow_mut(),
                     )
                     .is_ok()
                         && slashing::verify_proof_acceptance(
@@ -1228,8 +1291,7 @@ impl<DB: Database> Engine<DB> {
     }
 
     /// Verify peer-supplied [`SlashingEvidence`] against the
-    /// engine's current active validator set, chain spec, and
-    /// finalized seed.
+    /// authenticated current or retained historical validator context and seed.
     ///
     /// Used by the chain backend when ingesting evidence off
     /// `Topic::SlashingEvidence` so a node refuses to pool forged
@@ -1247,13 +1309,7 @@ impl<DB: Database> Engine<DB> {
                 proposer_index,
                 header_a,
                 header_b,
-            } => verify_double_proposal_evidence(
-                *proposer_index,
-                header_a,
-                header_b,
-                self.active_validator_set(),
-                self.chain_spec().chain_id,
-            ),
+            } => self.verify_historical_double_proposal(*proposer_index, header_a, header_b),
             SlashingEvidence::DoublePrevote {
                 validator_index,
                 vote_a,
@@ -1282,15 +1338,7 @@ impl<DB: Database> Engine<DB> {
                 proposer_index,
                 header,
                 reason,
-            } => verify_invalid_vrf_claim_evidence(
-                *proposer_index,
-                header,
-                *reason,
-                self.active_validator_set(),
-                self.chain_spec().chain_id,
-                &self.finalized_seed(),
-                self.chain_spec().consensus.expected_proposers_per_slot,
-            ),
+            } => self.verify_historical_invalid_vrf(*proposer_index, header, *reason),
             SlashingEvidence::LockViolation {
                 validator_index,
                 vote_a,
@@ -1336,6 +1384,43 @@ impl<DB: Database> Engine<DB> {
         }
     }
 
+    fn verify_historical_double_proposal(
+        &self,
+        index: u32,
+        header_a: &Header,
+        header_b: &Header,
+    ) -> Result<(), SlashingError> {
+        let source = self.accountability_chunk_for_height(header_a.height)?;
+        if self.accountability_chunk_for_height(header_b.height)? != source {
+            return Err(SlashingError::EvidenceFieldsInconsistent);
+        }
+        verify_double_proposal_evidence(
+            index,
+            header_a,
+            header_b,
+            &self.accountability_header_context(header_a)?.0,
+            self.chain_spec().chain_id,
+        )
+    }
+
+    fn verify_historical_invalid_vrf(
+        &self,
+        index: u32,
+        header: &Header,
+        reason: VrfRejectionReason,
+    ) -> Result<(), SlashingError> {
+        let (validators, seed) = self.accountability_header_context(header)?;
+        verify_invalid_vrf_claim_evidence(
+            index,
+            header,
+            reason,
+            &validators,
+            self.chain_spec().chain_id,
+            &seed,
+            self.chain_spec().consensus.expected_proposers_per_slot,
+        )
+    }
+
     fn verify_da_commitment_fraud(
         &self,
         index: u32,
@@ -1347,7 +1432,7 @@ impl<DB: Database> Engine<DB> {
         }
         neutrino_prover_chunk::slashing::verify_da_fraud(
             self.chain_spec().chain_id,
-            self.active_validator_set(),
+            &self.accountability_header_context(header)?.0,
             header,
             fraud,
         )
@@ -1363,6 +1448,7 @@ impl<DB: Database> Engine<DB> {
         vote: &neutrino_consensus_types::IndexedVote,
         canonical_vote: &neutrino_consensus_types::IndexedVote,
     ) -> Result<(), SlashingError> {
+        let _ = self.accountability_validators(vote.data.chunk_id)?;
         let record = self
             .store()
             .historical_chunk(vote.data.chunk_id)
@@ -1442,6 +1528,76 @@ mod tests {
             initial_validators: validators(),
             metadata: BoundedBytes::new(Vec::new()).expect("empty metadata fits"),
         }
+    }
+
+    #[test]
+    fn cached_vote_equations_do_not_outlive_active_membership_or_source_window() {
+        use neutrino_consensus_types::FinalityVoteData;
+        use neutrino_crypto::bls::{Signature, aggregate_signatures};
+        let keys: Vec<_> = (0..2)
+            .map(|index| ProposerKey::from_ikm(&[42 + index; 32], u32::from(index)).unwrap())
+            .collect();
+        let mut spec = chain_spec();
+        spec.initial_validators = keys
+            .iter()
+            .map(|key| Validator {
+                pubkey: *key.public_key_bytes(),
+                ..validators()[0].clone()
+            })
+            .collect();
+        spec.genesis_validator_set_root = validator_set_root(&spec.initial_validators);
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            chunk_hash: [7; 32],
+            round: 1,
+            phase: FinalityVotePhase::Prevote,
+        };
+        let signatures: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                Signature::from_bytes(&key.sign_finality_vote(spec.chain_id, &data)).unwrap()
+            })
+            .collect();
+        let vote = FinalityVote {
+            attestations: keys
+                .iter()
+                .map(|key| key.attest_vote(spec.chain_id, data.clone(), Vec::new(), None))
+                .collect(),
+            data,
+            aggregation_bits: neutrino_primitives::BitVec::from_bytes(2, vec![3]).unwrap(),
+            signature: aggregate_signatures(&signatures.iter().collect::<Vec<_>>())
+                .unwrap()
+                .to_bytes(),
+        };
+        for slashed in [false, true] {
+            let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
+            assert_eq!(
+                engine.observe_votes_for_slashing(&vote).unwrap(),
+                Vec::new()
+            );
+            assert_eq!(
+                engine.observe_votes_for_slashing(&vote).unwrap(),
+                Vec::new()
+            );
+            let mut inactive = spec.initial_validators.clone();
+            inactive[0].slashed = slashed;
+            if !slashed {
+                inactive[0].effective_stake = 0;
+            }
+            engine.set_active_validator_set(1, inactive).unwrap();
+            assert!(engine.observe_votes_for_slashing(&vote).is_err());
+        }
+        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).unwrap();
+        assert_eq!(
+            engine.observe_votes_for_slashing(&vote).unwrap(),
+            Vec::new()
+        );
+        // Exercise the window predicate after authenticated local finality advances.
+        engine.latest_finalized_chunk_id = Some(9);
+        assert_eq!(
+            engine.observe_votes_for_slashing(&vote),
+            Err(SlashingError::SourceOutsideAccountabilityWindow),
+        );
     }
 
     #[test]

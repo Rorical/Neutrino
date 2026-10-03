@@ -41,8 +41,12 @@ have passed.
 - Fact Guest compresses exact cryptographic verdicts; batch Evidence Guest proves objective offences. Blocks recursively verify evidence statements using separate proof attachments,
   admit sanctions and execute the mandatory FIFO. Chunks consume proven effects
   and verify complete consensus without repeating STF/evidence work.
-- Complete chunk proofs are the only finalization path. Certificates and mandatory
-  precommit attestations are required. A separate checkpoint Guest folds Chunk
+- Complete chunk proofs are the only finalization path. Certificates retain mandatory
+  prevote and precommit attestations. Conflicting prevotes require a separately
+  verified quorum strictly between the retained lock round and the new round;
+  the current round cannot authorize its own prevotes. Read
+  `docs/design/22-bft-candidate-replacement.md` before changing BFT target selection.
+  A separate checkpoint Guest folds Chunk
   receipts and merges adjacent History ranges using Compressed STARK recursion.
   History coverage never gates chunk finality. Read `docs/design/21-recursive-checkpoint-proofs.md`
   before changing recursion, history storage or light-client trust policy.

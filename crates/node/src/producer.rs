@@ -91,7 +91,6 @@ pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
                     attempt_slot(&backend, &config, slot).await;
                     last_attempted_slot = slot;
                 }
-                backend.tick_bft_round_timeouts(now).await;
                 tick = tokio::time::Instant::now() + sleep_until_next_slot(
                     config.genesis_time_secs, config.slot_duration_secs, now);
             }

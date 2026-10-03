@@ -136,7 +136,8 @@ where
         prevote: vote.clone(),
         precommit: vote,
         active_validator_set_root: spec.genesis_validator_set_root,
-        attestations: Vec::new(),
+        prevote_attestations: Vec::new(),
+        precommit_attestations: Vec::new(),
     };
     let record = HistoricalChunk {
         chunk: chunk.clone(),

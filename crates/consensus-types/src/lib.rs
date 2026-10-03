@@ -7,6 +7,8 @@
 extern crate alloc;
 
 pub mod bootstrap;
+pub mod candidate;
+pub use candidate::BftCandidate;
 pub mod evidence;
 pub mod history;
 pub mod history_proof;
@@ -166,25 +168,27 @@ pub struct FinalityVote {
     pub data: FinalityVoteData,
     /// Aggregate BLS signature.
     pub signature: BlsSignature,
-    /// Mandatory per-signer proof/unlock commitments for precommits; empty for
-    /// prevotes. An aggregate alone cannot attribute proof-byte acceptance.
-    pub attestations: Vec<PrecommitAttestation>,
+    /// Mandatory individual signer attestations for both phases. Prevotes sign
+    /// unlock declarations; precommits additionally bind exact proof bytes.
+    pub attestations: Vec<VoteAttestation>,
 }
 
-/// Explicit, independently signed statement accompanying a precommit.
+/// Explicit, independently signed statement accompanying a finality vote.
 ///
 /// The signature covers the vote and its individual signature, ordered hashes of `BlockProof`
 /// envelopes, and the exact optional unlock certificate. Removing a certificate
-/// or substituting proof bytes therefore invalidates the signature.
+/// or substituting proof bytes therefore invalidates the signature. Prevotes
+/// carry an empty proof list and explicitly sign their unlock declaration.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PrecommitAttestation {
-    /// Individual precommit signature, retained for evidence after aggregation.
+pub struct VoteAttestation {
+    /// Individual vote signature, retained for evidence after aggregation.
     pub vote_signature: BlsSignature,
     /// Index in the authenticated validator set for this chunk.
     pub validator_index: ValidatorIndex,
-    /// Exact precommit covered by this attestation.
+    /// Exact vote covered by this attestation.
     pub vote: FinalityVoteData,
-    /// BLAKE3(borsh(BlockProof)), ordered by block height within the chunk.
+    /// BLAKE3(borsh(BlockProof)), ordered by block height for precommits; empty
+    /// for prevotes, which do not claim proof-byte acceptance.
     pub proof_hashes: Vec<Hash>,
     /// The signer's claimed unlock justification, including an explicit `None`.
     pub unlock_quorum: Option<QuorumCertificate>,
@@ -192,7 +196,7 @@ pub struct PrecommitAttestation {
     pub signature: BlsSignature,
 }
 
-impl PrecommitAttestation {
+impl VoteAttestation {
     /// Canonical bytes signed by the validator (excluding the signature itself).
     #[must_use]
     pub fn signing_message(&self, chain_id: u64) -> Vec<u8> {
@@ -206,24 +210,21 @@ impl PrecommitAttestation {
                 &self.proof_hashes,
                 &self.unlock_quorum,
             ))
-            .expect("canonical precommit attestation"),
+            .expect("canonical vote attestation"),
         );
         bytes
     }
 }
 
-/// Check exact precommit signer coverage and complete proof-list lengths.
+/// Check exact signer coverage and the phase's proof-list requirements.
 /// Cryptographic verification and expected validator bitmap length are caller duties.
 #[must_use]
 pub fn attestation_coverage_valid(
     vote: &FinalityVoteData,
     bits: &BitVec,
-    claims: &[PrecommitAttestation],
+    claims: &[VoteAttestation],
     block_count: u64,
 ) -> bool {
-    if vote.phase == FinalityVotePhase::Prevote {
-        return claims.is_empty();
-    }
     if block_count == 0 || claims.is_empty() {
         return false;
     }
@@ -232,7 +233,12 @@ pub fn attestation_coverage_valid(
         if claim.vote != *vote
             || bits.get(claim.validator_index) != Some(true)
             || !seen.insert(claim.validator_index)
-            || u64::try_from(claim.proof_hashes.len()).ok() != Some(block_count)
+            || match vote.phase {
+                FinalityVotePhase::Prevote => !claim.proof_hashes.is_empty(),
+                FinalityVotePhase::Precommit => {
+                    u64::try_from(claim.proof_hashes.len()).ok() != Some(block_count)
+                }
+            }
         {
             return false;
         }
@@ -243,7 +249,7 @@ pub fn attestation_coverage_valid(
         == seen.len()
 }
 
-impl PrecommitAttestation {
+impl VoteAttestation {
     /// Recover the independently signed vote for objective evidence.
     #[must_use]
     pub fn indexed_vote(&self) -> IndexedVote {
@@ -255,6 +261,22 @@ impl PrecommitAttestation {
 }
 
 impl FinalityCert {
+    /// Recover the accountable prevote envelope, including signed unlock claims.
+    #[must_use]
+    pub fn prevote_vote(&self) -> FinalityVote {
+        FinalityVote {
+            data: FinalityVoteData {
+                chunk_id: self.chunk_id,
+                round: self.round,
+                chunk_hash: self.chunk_hash,
+                phase: FinalityVotePhase::Prevote,
+            },
+            aggregation_bits: self.prevote.aggregation_bits.clone(),
+            signature: self.prevote.signature,
+            attestations: self.prevote_attestations.clone(),
+        }
+    }
+
     /// Recover the accountable precommit envelope without losing individual signatures.
     #[must_use]
     pub fn precommit_vote(&self) -> FinalityVote {
@@ -267,7 +289,7 @@ impl FinalityCert {
             },
             aggregation_bits: self.precommit.aggregation_bits.clone(),
             signature: self.precommit.signature,
-            attestations: self.attestations.clone(),
+            attestations: self.precommit_attestations.clone(),
         }
     }
 }
@@ -315,8 +337,10 @@ pub struct QuorumCertificate {
 /// Finality certificate proving prevote and precommit quorum for one chunk.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FinalityCert {
+    /// Complete per-signer prevote accountability statements.
+    pub prevote_attestations: Vec<VoteAttestation>,
     /// Complete per-signer precommit accountability statements.
-    pub attestations: Vec<PrecommitAttestation>,
+    pub precommit_attestations: Vec<VoteAttestation>,
     /// Finalized chunk identifier.
     pub chunk_id: ChunkId,
     /// BFT round that finalized the chunk.
@@ -371,9 +395,9 @@ pub enum ProofRejectionReason {
 pub struct LockEvidence {
     /// Earlier prevote quorum that locked the validator.
     pub locked_prevote_quorum: QuorumCertificate,
-    /// The later signer's authenticated unlock claim. Absence of a locally
-    /// observed certificate is never evidence of absence.
-    pub attestation: PrecommitAttestation,
+    /// The later prevote or precommit signer's authenticated unlock claim.
+    /// Absence of a locally observed certificate is never evidence of absence.
+    pub attestation: VoteAttestation,
 }
 
 /// Evidence that a published DA bundle does not match its committed root.
@@ -454,7 +478,7 @@ pub enum SlashingEvidence {
         /// chunk_id must cover the height of `rejected_proof`.
         vote: IndexedVote,
         /// Explicit acceptance of this exact proof envelope by the offender.
-        attestation: PrecommitAttestation,
+        attestation: VoteAttestation,
         /// Exact block proof envelope bound by the attestation. Any
         /// verifier re-runs `proof_system.verify_block` on this and
         /// expects rejection.
@@ -758,7 +782,8 @@ mod tests {
     #[test]
     fn finality_cert_round_trips() {
         let cert = FinalityCert {
-            attestations: Vec::new(),
+            prevote_attestations: Vec::new(),
+            precommit_attestations: Vec::new(),
             chunk_id: 41,
             round: 42,
             chunk_hash: hash(43),
@@ -785,8 +810,8 @@ mod tests {
         assert_ne!(base.hash(), original);
     }
 
-    fn test_attestation(unlock_quorum: Option<QuorumCertificate>) -> PrecommitAttestation {
-        PrecommitAttestation {
+    fn test_attestation(unlock_quorum: Option<QuorumCertificate>) -> VoteAttestation {
+        VoteAttestation {
             vote_signature: [0; 96],
             validator_index: 5,
             vote: vote_data(FinalityVotePhase::Precommit),
@@ -922,7 +947,8 @@ mod tests {
         };
         let chunk_proof = ChunkProof {
             finality_cert: FinalityCert {
-                attestations: Vec::new(),
+                prevote_attestations: Vec::new(),
+                precommit_attestations: Vec::new(),
                 chunk_id: 3,
                 round: 0,
                 chunk_hash: chunk().hash(),

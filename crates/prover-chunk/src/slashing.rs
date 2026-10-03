@@ -4,10 +4,10 @@
 //! verifier. A local rejection cache is not a substitute for these bindings.
 
 use neutrino_consensus_types::{
-    BlockProof, FinalityVoteData, FinalityVotePhase, IndexedVote, LockEvidence,
-    PrecommitAttestation, QuorumCertificate,
+    BlockProof, FinalityVoteData, FinalityVotePhase, IndexedVote, LockEvidence, QuorumCertificate,
+    VoteAttestation,
 };
-use neutrino_primitives::{DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Validator};
+use neutrino_primitives::{ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Validator};
 
 use crate::execution::commitment;
 
@@ -30,7 +30,7 @@ pub fn verify_attestation(
     validators: &[Validator],
     index: u32,
     vote: &FinalityVoteData,
-    attestation: &PrecommitAttestation,
+    attestation: &VoteAttestation,
 ) -> Result<(), EvidenceError> {
     verify_attestation_using(
         chain_id,
@@ -48,13 +48,10 @@ pub fn verify_attestation_using(
     validators: &[Validator],
     index: u32,
     vote: &FinalityVoteData,
-    attestation: &PrecommitAttestation,
+    attestation: &VoteAttestation,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
-    if attestation.validator_index != index
-        || attestation.vote != *vote
-        || vote.phase != FinalityVotePhase::Precommit
-    {
+    if attestation.validator_index != index || attestation.vote != *vote {
         return Err(EvidenceError::Binding);
     }
     verify_indexed_vote_using(
@@ -79,7 +76,7 @@ pub fn verify_attestation_using(
 
 /// Bind complete proof bytes and metadata to their signed chunk position.
 pub fn verify_proof_acceptance(
-    attestation: &PrecommitAttestation,
+    attestation: &VoteAttestation,
     proof: &BlockProof,
     chunk_size: u64,
 ) -> Result<(), EvidenceError> {
@@ -91,7 +88,8 @@ pub fn verify_proof_acceptance(
         .and_then(|position| position.checked_sub(1))
         .and_then(|position| usize::try_from(position).ok())
         .ok_or(EvidenceError::Binding)?;
-    if chunk_size == 0
+    if attestation.vote.phase != FinalityVotePhase::Precommit
+        || chunk_size == 0
         || usize::try_from(chunk_size).ok() != Some(attestation.proof_hashes.len())
         || attestation.proof_hashes.get(offset) != Some(&commitment(proof))
     {
@@ -164,7 +162,9 @@ pub fn verify_quorum_using(
     let (numerator, denominator) = fraction;
     if quorum.data.phase != FinalityVotePhase::Prevote
         || numerator == 0
+        || denominator == 0
         || numerator > denominator
+        || u128::from(numerator) * 3 < u128::from(denominator) * 2
         || usize::try_from(quorum.aggregate.aggregation_bits.bit_len()).ok()
             != Some(validators.len())
     {
@@ -209,7 +209,56 @@ pub fn verify_quorum_using(
     Ok(())
 }
 
-/// Prove a conflicting later precommit has an explicitly signed invalid unlock.
+/// Authenticate a carried prevote quorum as an unlock declaration for this vote.
+pub fn verify_unlock_quorum(
+    chain_id: u64,
+    validators: &[Validator],
+    vote: &FinalityVoteData,
+    unlock: &QuorumCertificate,
+    params: &ConsensusParams,
+) -> Result<(), EvidenceError> {
+    if vote.round > params.bft_max_round {
+        return Err(EvidenceError::Binding);
+    }
+    verify_unlock_using(
+        chain_id,
+        validators,
+        vote,
+        unlock,
+        (
+            params.bft_prevote_quorum_numerator,
+            params.bft_prevote_quorum_denominator,
+        ),
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Authenticate a carried prevote quorum using a shared signature verifier.
+///
+/// A prevote's justification must predate its own round, preventing the vote from
+/// authorizing the very quorum it helps create. Precommits may use their current
+/// round's prevote quorum. The caller separately enforces any earlier local lock.
+pub fn verify_unlock_using(
+    chain_id: u64,
+    validators: &[Validator],
+    vote: &FinalityVoteData,
+    unlock: &QuorumCertificate,
+    quorum: (u64, u64),
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
+    if unlock.data.chunk_id != vote.chunk_id
+        || unlock.data.chunk_hash != vote.chunk_hash
+        || match vote.phase {
+            FinalityVotePhase::Prevote => unlock.data.round >= vote.round,
+            FinalityVotePhase::Precommit => unlock.data.round > vote.round,
+        }
+    {
+        return Err(EvidenceError::Binding);
+    }
+    verify_quorum_using(chain_id, validators, unlock, quorum, verifier)
+}
+
+/// Prove a conflicting later vote has an explicitly signed invalid unlock.
 /// Missing network observations never enter this decision.
 pub fn verify_lock_violation(
     chain_id: u64,
@@ -242,7 +291,6 @@ pub fn verify_lock_violation_using(
 ) -> Result<(), EvidenceError> {
     let (first, later) = votes;
     if first.data.phase != FinalityVotePhase::Precommit
-        || later.data.phase != FinalityVotePhase::Precommit
         || first.data.chunk_id != later.data.chunk_id
         || first.data.round >= later.data.round
         || first.data.chunk_hash == later.data.chunk_hash
@@ -268,11 +316,8 @@ pub fn verify_lock_violation_using(
     }
     verify_quorum_using(chain_id, validators, locked, quorum, verifier)?;
     if let Some(unlock) = &evidence.attestation.unlock_quorum
-        && unlock.data.chunk_id == later.data.chunk_id
-        && unlock.data.chunk_hash == later.data.chunk_hash
         && unlock.data.round > first.data.round
-        && unlock.data.round <= later.data.round
-        && verify_quorum_using(chain_id, validators, unlock, quorum, verifier).is_ok()
+        && verify_unlock_using(chain_id, validators, &later.data, unlock, quorum, verifier).is_ok()
     {
         return Err(EvidenceError::HonestUnlock);
     }

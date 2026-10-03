@@ -24,6 +24,13 @@ server reorgs. The driver tracks a per-peer branch cursor and verifies contiguou
 heights, parents and proof bindings. A verified chunk on a competing unfinalized
 branch selects its replayed state, canonical index and finality in one atomic batch.
 
+Bounded `BftCandidate` gossip and `CandidateByChunk` RPC advertise available
+unfinalized targets. The driver retains the vote's propagation source, fetches
+unknown candidates and backfills their fixed endpoint through ordinary block/proof
+requests. Advertised rounds are advisory; complete candidate validation and local
+timeout or authenticated quorum rules govern signing. See
+[candidate replacement](22-bft-candidate-replacement.md).
+
 Every RPC response is a Borsh `Result<Payload, RpcFailure>`: `Unavailable`,
 `Pruned`, `Storage` or `InvalidRequest` failures reach the requester explicitly. Missing
 bodies are never manufactured, and hash-list requests do not silently omit

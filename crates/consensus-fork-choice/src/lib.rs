@@ -450,7 +450,8 @@ mod tests {
 
     fn cert(chunk: &Chunk) -> FinalityCert {
         FinalityCert {
-            attestations: Vec::new(),
+            prevote_attestations: Vec::new(),
+            precommit_attestations: Vec::new(),
             chunk_id: chunk.chunk_id,
             round: 0,
             chunk_hash: chunk.hash(),

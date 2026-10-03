@@ -1,4 +1,6 @@
 //! Native consensus backend tests for asynchronous proof scheduling, not SP1 soundness.
+#[path = "complete_chunk/bft_proof_notifications.rs"]
+mod bft_proof_notifications;
 #[path = "../../prover-chunk/tests/support/mod.rs"]
 pub mod support;
 
@@ -176,13 +178,14 @@ async fn proof_job_keeps_network_responsive_and_retries_without_advancing_on_fai
     let (engine, witness) = engine();
     let (decisions, receiver) = mpsc::channel();
     let attempts = Arc::new(AtomicUsize::new(0));
-    let backend = ChainBackend::new(
+    let backend = Arc::new(ChainBackend::new(
         engine,
         NativeConsensusBackend {
             decisions: Mutex::new(receiver),
             attempts: Arc::clone(&attempts),
         },
-    );
+    ));
+    let actor = tokio::spawn(Arc::clone(&backend).run_consensus_proof_notifications());
     backend.set_local_voter(ProposerKey::from_ikm(&[42; 32], 0).unwrap());
     backend.with_engine_mut_for_test(|engine| {
         engine
@@ -231,6 +234,8 @@ async fn proof_job_keeps_network_responsive_and_retries_without_advancing_on_fai
         Some(0)
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    actor.abort();
+    assert!(actor.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -339,6 +344,48 @@ fn ready_prover() -> NativeConsensusBackend {
         decisions: Mutex::new(receiver),
         attempts: Arc::new(AtomicUsize::new(0)),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn historical_long_range_evidence_requires_the_finalized_canonical_hash_after_restart() {
+    use neutrino_consensus_types::{
+        FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
+    };
+    let (mut engine, witness) = engine();
+    engine.set_evidence_programs([1; 8], [2; 8], [3; 8]);
+    let prover = ready_prover();
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let finalized = engine.finalize_chunk(0, &prover, &voter).unwrap();
+    let reopened = Engine::open(witness.chain_spec, engine.store().db().clone()).unwrap();
+    assert_eq!(reopened.latest_finalized_chunk_id(), Some(0));
+    let backend = ChainBackend::new(reopened, prover);
+    let sign = |chunk_hash| {
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            round: 0,
+            chunk_hash,
+            phase: FinalityVotePhase::Precommit,
+        };
+        IndexedVote {
+            signature: voter.sign_finality_vote(7, &data),
+            data,
+        }
+    };
+    let evidence = |canonical_hash| SlashingEvidence::LongRangeForkParticipation {
+        validator_index: 0,
+        vote: sign([0xEF; 32]),
+        canonical_vote: sign(canonical_hash),
+    };
+    backend.ingest_slashing_evidence(evidence([0x11; 32])).await;
+    assert_eq!(
+        backend.slashing_pool_len(),
+        0,
+        "a signed alternate canonical hash cannot replace the finalized record"
+    );
+    let valid = evidence(finalized.chunk_proof.chunk_hash);
+    backend.ingest_slashing_evidence(valid.clone()).await;
+    assert_eq!(backend.slashing_pool_len(), 1);
+    assert_eq!(backend.drain_slashing_pool(10), vec![valid]);
 }
 
 async fn assert_account_view(

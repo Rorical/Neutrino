@@ -329,17 +329,24 @@ not authenticate an attacker-supplied replacement for the client's entire databa
 
 ## Acceptance and boundaries
 
-Local checks passed on 2026-10-03 after durable BFT signing and authenticated
-full/validator bootstrap: locked workspace build and tests (889 passed, six
-ignored), strict workspace Clippy, CUDA-enabled node Clippy across all targets,
-and workspace/Guest formatting checks.
-The tests cover durable-write failure, abrupt RocksDB process exit, interrupted
-snapshot download and installation, saved-branch recovery, validator activation,
-bootstrap/signing races, checkpoint lag and stale provider responses. Native and
-mock-adapter fixtures are separate from real compressed composition acceptance;
-those expensive gates remained ignored and no GPU proving was run. Local logs
-are retained under `target/verification/` rather than the reboot-cleared temporary
-directory.
+The current higher-round BFT format passed local checks on 2026-10-03: locked
+workspace build and tests (939 passed, zero failed, six ignored), strict workspace
+Clippy, CUDA-enabled node Clippy across all targets, and workspace/Guest formatting
+checks. The tests cover durable-write failure, RocksDB recovery after SIGKILL
+following a synchronized write, interrupted snapshot download and installation,
+saved-branch recovery, validator activation, bootstrap/signing races, checkpoint
+lag and stale provider responses.
+
+BFT coverage includes legal higher-round candidate replacement with retained
+locks, same-round quorum admission that preserves pending precommits, signing
+recovery across durable-write gaps, immutable block receipts and stale proof-job
+fencing. A 16-validator test uses the production SyncDriver and completes finality
+through ChunkProofById RPC while withholding precommit and ChunkProof gossip from
+one node. Native and mock-adapter fixtures remain separate from real compressed
+composition acceptance; those expensive gates remained ignored after the user
+cancelled local proving, and no GPU proving was run. CUDA Clippy establishes
+compilation only. Local logs are retained under `target/verification/` rather than
+the reboot-cleared temporary directory.
 
 Native/Guest tests cover boundary and program mutations, empty/overflowed ranges,
 branch mismatch, grouping-invariant endpoint identities, bounded decoding, tree

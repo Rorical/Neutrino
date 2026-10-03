@@ -38,6 +38,8 @@ Neutrino separates the chain into two cleanly decoupled layers:
   and atomically install execution and consensus state before resuming sync.
 - **Durable validator signing.** Vote/attestation and proposer reservations are
   synchronized before signing. Round, lock and local votes survive restart.
+  Higher-round candidate changes preserve locks and require earlier quorum
+  justification before a conflicting prevote.
 - **Proof-authorized sanctions.** An independent fact Guest compresses signed artifacts; a batch evidence Guest proves offences.
   Blocks recursively authenticate evidence statements and execute mandatory sanctions;
   chunks consume those proven effects without rechecking the evidence. See
@@ -67,6 +69,7 @@ maintained.
 | [complete-chunk-proofs](docs/design/19-complete-chunk-proofs.md) | Complete chunk proofs |
 | [evidence-proofs](docs/design/20-evidence-proofs.md) | Evidence Guest, mandatory sanctions and acceptance gates |
 | [recursive-checkpoint-proofs](docs/design/21-recursive-checkpoint-proofs.md) | Fold/Merge recursion, bounded history access and anchored light-client updates |
+| [BFT candidate replacement](docs/design/22-bft-candidate-replacement.md) | Higher-round targets, signed unlock claims, recovery and proof-task fencing |
 
 ## Prerequisites
 

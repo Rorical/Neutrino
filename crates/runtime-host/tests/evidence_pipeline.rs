@@ -466,7 +466,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         )
         .unwrap();
     let proof: Sp1BlockProof = borsh::from_slice(&proof_bytes).unwrap();
-    let claim = &mut next.finality_cert.attestations[0];
+    let claim = &mut next.finality_cert.precommit_attestations[0];
     claim.proof_hashes = vec![commitment(&neutrino_consensus_types::BlockProof {
         height: 2,
         block_hash: next.blocks[0].header.hash(),
@@ -630,8 +630,13 @@ fn successor_fixture(
         message.extend_from_slice(&borsh::to_vec(&data).unwrap());
         aggregate.signature = key.sign(&message).to_bytes();
     }
+    let prevote = next.finality_cert.prevote_vote();
+    let claim = &mut next.finality_cert.prevote_attestations[0];
+    claim.vote = prevote.data;
+    claim.vote_signature = prevote.signature;
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
     let vote = next.finality_cert.precommit_vote();
-    let claim = &mut next.finality_cert.attestations[0];
+    let claim = &mut next.finality_cert.precommit_attestations[0];
     claim.vote = vote.data;
     claim.vote_signature = next.finality_cert.precommit.signature;
     claim.proof_hashes = vec![[1; 32]];

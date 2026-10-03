@@ -23,8 +23,12 @@ omits transaction bytes and supplies only consensus-consumed votes and block out
 
 A `ChunkProof` carries a mandatory `FinalityCert`, chunk metadata and opaque complete
 consensus proof bytes. The certificate includes both BFT aggregate signatures and
-one signed precommit attestation per signer. Attestations bind exact ordered Borsh
-block-proof envelope hashes and the signer's unlock declaration.
+separate complete prevote/precommit attestation lists. `VoteAttestation` binds the
+individual vote signature and the signer's unlock declaration. Precommits also
+bind exact ordered Borsh block-proof envelope hashes; prevote proof lists are empty.
+The node retains its first verified block receipt so later valid encodings cannot
+replace signed proof bytes. Different validators may accept different valid
+receipt encodings for the same block statement.
 
 An `EvidenceSubmission` carries the statement and sparse historical opening.
 Compressed evidence receipts are separate recursive proof attachments, so proof

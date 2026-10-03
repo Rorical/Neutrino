@@ -601,8 +601,7 @@ pub fn verify_embedded_vote_using(
         spec.chain_id,
         &record.validators,
         vote,
-        spec.consensus.bft_max_round,
-        spec.consensus.chunk_size,
+        &spec.consensus,
         verifier,
     )
     .map_err(|_| HistoryError::Evidence)

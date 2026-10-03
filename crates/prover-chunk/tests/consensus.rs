@@ -106,8 +106,13 @@ fn successor(
         message.extend_from_slice(&borsh::to_vec(&data).unwrap());
         aggregate.signature = key.sign(&message).to_bytes();
     }
+    let prevote = next.finality_cert.prevote_vote();
+    let claim = &mut next.finality_cert.prevote_attestations[0];
+    claim.vote = prevote.data;
+    claim.vote_signature = prevote.signature;
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
     let data = next.finality_cert.precommit_vote().data;
-    let claim = &mut next.finality_cert.attestations[0];
+    let claim = &mut next.finality_cert.precommit_attestations[0];
     claim.vote = data;
     claim.vote_signature = next.finality_cert.precommit.signature;
     claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
@@ -155,15 +160,28 @@ fn finality_requires_complete_authentic_accountability() {
     type Mutation = fn(&mut neutrino_consensus_types::FinalityCert);
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let mutations: &[Mutation] = &[
-        |c| c.attestations.clear(),
-        |c| c.attestations.push(c.attestations[0].clone()),
-        |c| c.attestations[0].validator_index = 1,
-        |c| c.attestations[0].proof_hashes.clear(),
-        |c| c.attestations[0].proof_hashes.push([2; 32]),
-        |c| c.attestations[0].proof_hashes[0][0] ^= 1,
-        |c| c.attestations[0].vote.round += 1,
-        |c| c.attestations[0].vote_signature[0] ^= 1,
-        |c| c.attestations[0].signature[0] ^= 1,
+        |c| c.prevote_attestations.clear(),
+        |c| {
+            c.prevote_attestations
+                .push(c.prevote_attestations[0].clone());
+        },
+        |c| c.prevote_attestations[0].validator_index = 1,
+        |c| c.prevote_attestations[0].proof_hashes.push([2; 32]),
+        |c| c.prevote_attestations[0].vote.round += 1,
+        |c| c.prevote_attestations[0].vote_signature[0] ^= 1,
+        |c| c.prevote_attestations[0].signature[0] ^= 1,
+        |c| c.precommit_attestations.clear(),
+        |c| {
+            c.precommit_attestations
+                .push(c.precommit_attestations[0].clone());
+        },
+        |c| c.precommit_attestations[0].validator_index = 1,
+        |c| c.precommit_attestations[0].proof_hashes.clear(),
+        |c| c.precommit_attestations[0].proof_hashes.push([2; 32]),
+        |c| c.precommit_attestations[0].proof_hashes[0][0] ^= 1,
+        |c| c.precommit_attestations[0].vote.round += 1,
+        |c| c.precommit_attestations[0].vote_signature[0] ^= 1,
+        |c| c.precommit_attestations[0].signature[0] ^= 1,
     ];
     for mutate in mutations {
         let mut invalid = input.clone();

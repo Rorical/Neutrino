@@ -42,7 +42,7 @@ use neutrino_consensus_types::{
 };
 #[cfg(test)]
 use neutrino_primitives::{BitVec, ChainId};
-use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, ValidatorIndex};
+use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Hash, ValidatorIndex};
 use neutrino_storage::Database;
 
 use crate::engine::Engine;
@@ -54,6 +54,9 @@ extern crate alloc;
 
 #[path = "bft_persistence.rs"]
 mod persistence;
+
+#[path = "bft_candidates.rs"]
+mod candidates;
 
 /// Progress of the local validator's own signed votes inside one
 /// BFT session. Monotonic: once `Precommitted`, the session never
@@ -96,6 +99,7 @@ pub struct BftSession {
     local_identity: Option<neutrino_primitives::BlsPublicKey>,
     local_votes: Vec<FinalityVote>,
     highest_lock: Option<QuorumCertificate>,
+    prevote_justification: Option<QuorumCertificate>,
     /// Whether the local validator was elected as an aggregator for
     /// `(chunk_id, current_round)`. Re-derived inside
     /// [`Engine::tick_bft_round_timeouts`] when a round advance fires.
@@ -133,7 +137,7 @@ impl BftSession {
         self.chunk_hash
     }
 
-    /// Last block of the fixed branch this session signed.
+    /// Last block of the current round's candidate branch.
     #[must_use]
     pub const fn end_block_hash(&self) -> BlockHash {
         self.chunk.end_block_hash
@@ -213,6 +217,42 @@ impl BftSession {
     pub const fn highest_lock_quorum(&self) -> Option<&QuorumCertificate> {
         self.highest_lock.as_ref()
     }
+
+    /// Exact target and certificate identity for proof work created by this session.
+    #[must_use]
+    pub fn quorum_identity(&self) -> Option<BftQuorumIdentity> {
+        let certificate = self
+            .bft
+            .try_finalize(true, self.chunk.active_validator_set_root)
+            .ok()??;
+        Some(BftQuorumIdentity::from_certificate(&certificate))
+    }
+}
+
+/// Immutable identity used to fence asynchronous proof work against BFT changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BftQuorumIdentity {
+    /// Sequential chunk identifier.
+    pub chunk_id: ChunkId,
+    /// Candidate commitment signed by this quorum.
+    pub chunk_hash: ChunkHash,
+    /// Round that produced the quorum.
+    pub round: u32,
+    /// Exact finality certificate commitment.
+    pub certificate_hash: Hash,
+}
+
+impl BftQuorumIdentity {
+    /// Identify an exact authenticated certificate snapshot.
+    #[must_use]
+    pub fn from_certificate(certificate: &neutrino_consensus_types::FinalityCert) -> Self {
+        Self {
+            chunk_id: certificate.chunk_id,
+            chunk_hash: certificate.chunk_hash,
+            round: certificate.round,
+            certificate_hash: neutrino_prover_chunk::execution::commitment(certificate),
+        }
+    }
 }
 
 /// External effect the engine wants the caller to perform after a
@@ -253,7 +293,7 @@ pub enum BftAction {
     /// The 2/3 precommit quorum has been reached for this chunk.
     /// Caller should invoke
     /// [`Engine::finalize_chunk`](crate::Engine::finalize_chunk).
-    QuorumReached(ChunkId),
+    QuorumReached(BftQuorumIdentity),
 }
 
 /// Failures while driving the live BFT loop.
@@ -276,9 +316,11 @@ pub enum BftLoopError<E> {
     },
     /// The active validator set has no positive unslashed stake.
     EmptyActiveSet,
+    /// The proposed branch failed complete current-backend candidate validation.
+    Candidate(crate::FinalizeError<E>),
 }
 
-impl<E: fmt::Display> fmt::Display for BftLoopError<E> {
+impl<E: fmt::Debug + fmt::Display> fmt::Display for BftLoopError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bft(err) => write!(f, "chunk-BFT: {err}"),
@@ -292,6 +334,7 @@ impl<E: fmt::Display> fmt::Display for BftLoopError<E> {
             Self::EmptyActiveSet => {
                 f.write_str("active validator set has no positive unslashed stake")
             }
+            Self::Candidate(error) => write!(f, "invalid BFT candidate: {error}"),
         }
     }
 }
@@ -401,16 +444,28 @@ impl<DB: Database> Engine<DB> {
     /// # Errors
     ///
     /// Same conditions as [`Self::open_bft_session`].
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Keep reserve, sign, durable session commit and publication ordering together."
-    )]
     pub fn open_bft_session_at(
         &mut self,
         chunk: Chunk,
         now_secs: u64,
     ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
+        self.open_bft_session_initial(chunk, now_secs, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep reserve, sign, durable session commit and publication ordering together."
+    )]
+    fn open_bft_session_initial(
+        &mut self,
+        chunk: Chunk,
+        now_secs: u64,
+        initial: Option<(u32, QuorumCertificate)>,
+    ) -> Result<Vec<BftAction>, BftLoopError<DB::Error>> {
         let chunk_id = chunk.chunk_id;
+        if chunk_id != self.finalized_next_chunk_id() {
+            return Err(EngineError::Signing(crate::signing::SigningViolation::Conflict).into());
+        }
         if self.bft_sessions.contains_key(&chunk_id) {
             return Err(BftLoopError::SessionAlreadyOpen { chunk_id });
         }
@@ -422,13 +477,17 @@ impl<DB: Database> Engine<DB> {
             return Err(BftLoopError::EmptyActiveSet);
         }
         let consensus = &self.chain_spec().consensus;
-        let round = self
+        let reserved_round = self
             .active_local_voter()
             .as_ref()
             .map(|voter| self.signing_round_for(voter.public_key_bytes(), chunk_id))
             .transpose()?
             .flatten()
             .unwrap_or(0);
+        let round = initial.as_ref().map_or(reserved_round, |(round, _)| *round);
+        if round < reserved_round {
+            return Err(EngineError::Signing(crate::signing::SigningViolation::Regression).into());
+        }
         let bft = ChunkBft::with_quorum(
             self.chain_spec().chain_id,
             chunk.clone(),
@@ -460,6 +519,7 @@ impl<DB: Database> Engine<DB> {
                 .map(|voter| *voter.public_key_bytes()),
             local_votes: Vec::new(),
             highest_lock: None,
+            prevote_justification: initial.map(|(_, quorum)| quorum),
             is_local_aggregator,
             subnet,
             last_published_aggregate_prevote_stake: 0,
@@ -469,6 +529,12 @@ impl<DB: Database> Engine<DB> {
 
         let mut actions = Vec::new();
         self.recover_session_signing(&mut session)?;
+        self.ensure_bft_candidate_lock(&session)?;
+        // Preserve the full candidate before the first reservation. If this
+        // write succeeds and signing is interrupted, restart can recover the
+        // original branch even after fork choice selects a sibling.
+        self.persist_bft_session(&session)?;
+        self.bft_sessions.insert(chunk_id, session.clone());
         for vote in &session.local_votes {
             actions.push(match vote.data.phase {
                 FinalityVotePhase::Prevote => BftAction::BroadcastPrevote(vote.clone()),
@@ -476,7 +542,11 @@ impl<DB: Database> Engine<DB> {
             });
         }
         if session.precommit_quorum_observed() {
-            actions.push(BftAction::QuorumReached(chunk_id));
+            actions.push(BftAction::QuorumReached(
+                session
+                    .quorum_identity()
+                    .expect("precommit quorum has a certificate"),
+            ));
         }
         if let Some(voter) = self.active_local_voter()
             && !session.local_prevoted()
@@ -490,7 +560,7 @@ impl<DB: Database> Engine<DB> {
                     phase: FinalityVotePhase::Prevote,
                 },
                 Vec::new(),
-                None,
+                session.prevote_justification.clone(),
             )?;
             session.bft.add_prevote(prevote.clone())?;
             session.local = LocalVoteProgress::Prevoted;
@@ -585,7 +655,11 @@ impl<DB: Database> Engine<DB> {
                 }
             }
             if session.precommit_quorum_observed() {
-                actions.push(BftAction::QuorumReached(chunk_id));
+                actions.push(BftAction::QuorumReached(
+                    session
+                        .quorum_identity()
+                        .expect("precommit quorum has a certificate"),
+                ));
             }
             // Pending-fix #6: capture peer_quorum BEFORE
             // recompute_quorum_transitions transitions the session.
@@ -782,7 +856,11 @@ impl<DB: Database> Engine<DB> {
                     }
                 }
                 if session.precommit_quorum_observed() {
-                    actions.push(BftAction::QuorumReached(chunk_id));
+                    actions.push(BftAction::QuorumReached(
+                        session
+                            .quorum_identity()
+                            .expect("precommit quorum has a certificate"),
+                    ));
                 }
                 self.bft_sessions.insert(chunk_id, session.clone());
             }
@@ -824,6 +902,7 @@ impl<DB: Database> Engine<DB> {
             session.last_published_aggregate_precommit_stake = 0;
             session.round_started_at_secs = now_secs;
             if let Some(local_voter) = voter.as_ref() {
+                self.ensure_bft_candidate_lock(&session)?;
                 let prevote = self.sign_vote_durable(
                     local_voter,
                     FinalityVoteData {
@@ -833,7 +912,7 @@ impl<DB: Database> Engine<DB> {
                         phase: FinalityVotePhase::Prevote,
                     },
                     Vec::new(),
-                    None,
+                    session.prevote_justification.clone(),
                 )?;
                 session.bft.add_prevote(prevote.clone())?;
                 session.local = LocalVoteProgress::Prevoted;
@@ -926,6 +1005,7 @@ impl<DB: Database> Engine<DB> {
             if let Some(voter) = self.active_local_voter()
                 && !session.local_precommitted()
             {
+                self.ensure_bft_candidate_lock(session)?;
                 if self.stored_bft_proof_hashes(&session.chunk)?
                     != Some(session.proof_hashes.clone())
                 {
@@ -958,6 +1038,10 @@ impl<DB: Database> Engine<DB> {
                         .current_aggregate(FinalityVotePhase::Prevote)
                         .expect("prevote quorum was reached"),
                 };
+                // Preserve mandatory individual prevote declarations before a
+                // precommit reservation; a raw QC cannot recover those claims.
+                self.persist_bft_session(session)?;
+                self.bft_sessions.insert(session.chunk_id, session.clone());
                 let precommit = self.sign_vote_durable(
                     &voter,
                     data,
@@ -985,7 +1069,11 @@ impl<DB: Database> Engine<DB> {
             // finalize path does not produce a cert that the verifier
             // will reject.
             session.peer_quorum = PeerQuorumProgress::PrecommitQuorumObserved;
-            actions.push(BftAction::QuorumReached(session.chunk_id));
+            actions.push(BftAction::QuorumReached(
+                session
+                    .quorum_identity()
+                    .expect("precommit quorum has a certificate"),
+            ));
         }
         Ok(())
     }
@@ -1072,7 +1160,7 @@ fn build_local_vote(
         bits.push(position == voter_position);
     }
     FinalityVote {
-        attestations: Vec::new(),
+        attestations: vec![voter.attest_vote(chain_id, data.clone(), Vec::new(), None)],
         aggregation_bits: bits,
         data,
         signature,
@@ -1168,12 +1256,8 @@ mod tests {
             active_set_len,
         );
         if phase == FinalityVotePhase::Precommit {
-            vote.attestations.push(voter.attest_precommit(
-                chain_id,
-                vote.data.clone(),
-                vec![[1; 32]],
-                None,
-            ));
+            vote.attestations =
+                vec![voter.attest_vote(chain_id, vote.data.clone(), vec![[1; 32]], None)];
         }
         vote
     }
@@ -1282,7 +1366,7 @@ mod tests {
         assert_eq!(actions.len(), 3);
         assert!(matches!(actions[0], BftAction::BroadcastPrevote(_)));
         assert!(matches!(actions[1], BftAction::BroadcastPrecommit(_)));
-        assert!(matches!(actions[2], BftAction::QuorumReached(0)));
+        assert!(matches!(actions[2], BftAction::QuorumReached(identity) if identity.chunk_id == 0));
         let session = engine.bft_session(0).expect("session present");
         assert!(session.local_prevoted());
         assert!(session.local_precommitted());
@@ -1339,7 +1423,7 @@ mod tests {
             .observe_finality_vote(v1_precommit)
             .expect("ingest v1 precommit");
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], BftAction::QuorumReached(0)));
+        assert!(matches!(actions[0], BftAction::QuorumReached(identity) if identity.chunk_id == 0));
         let session = engine.bft_session(0).expect("session present");
         assert!(session.precommit_quorum_observed());
     }
@@ -1528,7 +1612,7 @@ mod tests {
         let spec = chain_spec_with_aggregators(3);
         let mut engine = test_engine(spec.clone());
         engine.set_local_voter(proposer(0));
-        let chunk_id: ChunkId = 11;
+        let chunk_id: ChunkId = 0;
         let chunk = {
             let mut c = dummy_chunk(chunk_id, spec.genesis_validator_set_root);
             c.start_height = chunk_id + 1;
@@ -1612,7 +1696,7 @@ mod tests {
                 .expect("ingest precommit");
             if actions
                 .iter()
-                .any(|a| matches!(a, BftAction::QuorumReached(0)))
+                .any(|a| matches!(a, BftAction::QuorumReached(identity) if identity.chunk_id == 0))
             {
                 quorum_seen = true;
             }
@@ -1783,14 +1867,12 @@ mod tests {
                 },
             ),
         };
-        v1_precommit_r1
-            .attestations
-            .push(proposer(1).attest_precommit(
-                spec.chain_id,
-                v1_precommit_r1.data.clone(),
-                Vec::new(),
-                None,
-            ));
+        v1_precommit_r1.attestations.push(proposer(1).attest_vote(
+            spec.chain_id,
+            v1_precommit_r1.data.clone(),
+            Vec::new(),
+            None,
+        ));
         let evidence = engine
             .observe_vote_for_slashing(&v1_precommit_r1)
             .expect("v1 cross-round precommit recorded")
@@ -1860,9 +1942,16 @@ mod tests {
         let signatures: Vec<_> = (0..2)
             .map(|index| {
                 let voter = proposer(index);
-                if phase == FinalityVotePhase::Precommit {
-                    attestations.push(voter.attest_precommit(7, data.clone(), vec![[1; 32]], None));
-                }
+                attestations.push(voter.attest_vote(
+                    7,
+                    data.clone(),
+                    if phase == FinalityVotePhase::Precommit {
+                        vec![[1; 32]]
+                    } else {
+                        Vec::new()
+                    },
+                    None,
+                ));
                 neutrino_crypto::bls::Signature::from_bytes(&voter.sign_finality_vote(7, &data))
                     .unwrap()
             })
@@ -1898,7 +1987,8 @@ mod tests {
                 aggregation_bits: precommit.aggregation_bits,
                 signature: precommit.signature,
             },
-            attestations: precommit.attestations,
+            prevote_attestations: prevote.attestations,
+            precommit_attestations: precommit.attestations,
         }
     }
 
@@ -1922,7 +2012,11 @@ mod tests {
         let evidence = engine
             .observe_certificate_for_slashing(&later, &certificate)
             .unwrap();
-        assert_eq!(evidence.len(), 2, "no individual vote gossip was received");
+        assert_eq!(
+            evidence.len(),
+            4,
+            "both phases carry individual declarations"
+        );
         for item in &evidence {
             assert!(matches!(
                 item,
@@ -1938,15 +2032,38 @@ mod tests {
             },
             aggregate: certificate.prevote.clone(),
         };
+        let earlier = aggregate_attested(&later, FinalityVotePhase::Prevote, 1);
+        let prevote_unlock = QuorumCertificate {
+            data: earlier.data,
+            aggregate: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: earlier.aggregation_bits,
+                signature: earlier.signature,
+            },
+        };
         let mut honest = certificate;
-        for claim in &mut honest.attestations {
-            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_precommit(
+        for claim in &mut honest.prevote_attestations {
+            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_vote(
+                7,
+                claim.vote.clone(),
+                Vec::new(),
+                Some(prevote_unlock.clone()),
+            );
+        }
+        for claim in &mut honest.precommit_attestations {
+            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_vote(
                 7,
                 claim.vote.clone(),
                 claim.proof_hashes.clone(),
                 Some(quorum.clone()),
             );
         }
+        let mut engine = test_engine(spec.clone());
+        engine
+            .observe_certificate_for_slashing(
+                &dummy_chunk(0, spec.genesis_validator_set_root),
+                &prior,
+            )
+            .unwrap();
         assert_eq!(
             engine
                 .observe_certificate_for_slashing(&later, &honest)
@@ -1954,7 +2071,7 @@ mod tests {
             [] as [neutrino_consensus_types::SlashingEvidence; 0]
         );
         let mut stripped = honest;
-        stripped.attestations[0].unlock_quorum = None;
+        stripped.precommit_attestations[0].unlock_quorum = None;
         assert!(
             engine
                 .observe_certificate_for_slashing(&later, &stripped)
@@ -1978,7 +2095,7 @@ mod tests {
         };
         let mut first = aggregate_attested(&chunk, FinalityVotePhase::Precommit, 0);
         for claim in &mut first.attestations {
-            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_precommit(
+            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_vote(
                 7,
                 claim.vote.clone(),
                 claim.proof_hashes.clone(),
@@ -1996,6 +2113,325 @@ mod tests {
         assert_eq!(evidence.len(), 2);
         for item in evidence {
             engine.verify_slashing_evidence(&item).unwrap();
+        }
+    }
+
+    #[test]
+    fn aggregate_illegal_prevotes_remain_attributable_when_the_signed_unlock_is_invalid() {
+        let mut spec = chain_spec_with(2);
+        spec.consensus.chunk_size = 1;
+        spec.proof.slot_budget_per_chunk = 1;
+        let mut engine = test_engine(spec.clone());
+        let first = dummy_chunk(0, spec.genesis_validator_set_root);
+        engine
+            .observe_certificate_for_slashing(&first, &accountable_certificate(&first, 0))
+            .unwrap();
+        let mut later = first;
+        later.end_state_root[0] ^= 1;
+        let mut vote = aggregate_attested(&later, FinalityVotePhase::Prevote, 2);
+        let circular = QuorumCertificate {
+            data: vote.data.clone(),
+            aggregate: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: vote.aggregation_bits.clone(),
+                signature: vote.signature,
+            },
+        };
+        for claim in &mut vote.attestations {
+            *claim = proposer(u8::try_from(claim.validator_index).unwrap()).attest_vote(
+                spec.chain_id,
+                vote.data.clone(),
+                Vec::new(),
+                Some(circular.clone()),
+            );
+        }
+        assert!(
+            neutrino_prover_chunk::finality::verify_vote(
+                spec.chain_id,
+                &spec.initial_validators,
+                &vote,
+                &spec.consensus,
+            )
+            .is_err()
+        );
+        let evidence = engine.observe_votes_for_slashing(&vote).unwrap();
+        assert_eq!(evidence.len(), 2);
+        for item in evidence {
+            let neutrino_consensus_types::SlashingEvidence::LockViolation { vote_b, .. } = &item
+            else {
+                panic!("the signed circular unlock must establish a lock violation");
+            };
+            assert_eq!(vote_b.data.phase, FinalityVotePhase::Prevote);
+            engine.verify_slashing_evidence(&item).unwrap();
+        }
+    }
+
+    #[test]
+    fn signed_future_votes_cannot_erase_retained_accountability() {
+        let mut spec = chain_spec_with(2);
+        spec.consensus.chunk_size = 1;
+        spec.proof.slot_budget_per_chunk = 1;
+        let mut engine = test_engine(spec.clone());
+        let first = dummy_chunk(0, spec.genesis_validator_set_root);
+        engine
+            .observe_certificate_for_slashing(&first, &accountable_certificate(&first, 0))
+            .unwrap();
+        let mut later = first.clone();
+        later.end_state_root[0] ^= 1;
+        let later_vote = aggregate_attested(&later, FinalityVotePhase::Prevote, 2);
+        assert_eq!(
+            engine
+                .observe_votes_for_slashing(&later_vote)
+                .unwrap()
+                .len(),
+            2
+        );
+        let retained = engine.slashing_monitor.vote_entry_count();
+
+        let mut future = first;
+        future.chunk_id = u64::MAX;
+        let future_vote = aggregate_attested(&future, FinalityVotePhase::Prevote, 1);
+        neutrino_prover_chunk::finality::verify_vote_signatures(
+            spec.chain_id,
+            &spec.initial_validators,
+            &future_vote,
+            &spec.consensus,
+        )
+        .expect("the attack has authentic vote and declaration signatures");
+        let outside = crate::slashing::SlashingError::SourceOutsideAccountabilityWindow;
+        assert_eq!(
+            engine.observe_votes_for_slashing(&future_vote),
+            Err(outside.clone())
+        );
+        assert_eq!(
+            engine.observe_certificate_for_slashing(&future, &accountable_certificate(&future, 1)),
+            Err(outside.clone())
+        );
+        let individual = test_vote(
+            u64::MAX,
+            future.hash(),
+            1,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(0),
+            2,
+        );
+        assert_eq!(
+            engine.observe_vote_for_slashing(&individual),
+            Err(outside.clone())
+        );
+        assert_eq!(
+            engine.observe_vote_for_invalid_proof_signing(&future_vote),
+            Err(outside)
+        );
+        assert_eq!(engine.slashing_monitor.vote_entry_count(), retained);
+
+        // No fresh claim is supplied: the prior lock, its QC, and the cached
+        // later declaration must all survive the authentic future payload.
+        let mut retry = test_vote(
+            0,
+            later.hash(),
+            2,
+            FinalityVotePhase::Prevote,
+            spec.chain_id,
+            &proposer(0),
+            2,
+        );
+        retry.attestations.clear();
+        let offence = engine.observe_vote_for_slashing(&retry).unwrap().unwrap();
+        assert!(matches!(
+            offence,
+            neutrino_consensus_types::SlashingEvidence::LockViolation { .. }
+        ));
+        engine.verify_slashing_evidence(&offence).unwrap();
+    }
+
+    #[test]
+    fn signed_extreme_slots_cannot_erase_double_proposal_observations() {
+        let spec = chain_spec_with(2);
+        let mut engine = test_engine(spec.clone());
+        let signer = proposer(0);
+        let mut first = crate::test_db::header(1, 7, spec.genesis_block_hash, ZERO_HASH);
+        first.signature = signer.sign_proposer_message(spec.chain_id, &first.hash());
+        assert!(
+            engine
+                .observe_header_for_slashing(&first)
+                .unwrap()
+                .is_none()
+        );
+        let mut extreme = first.clone();
+        extreme.slot = u64::MAX;
+        extreme.signature = signer.sign_proposer_message(spec.chain_id, &extreme.hash());
+        assert!(
+            engine
+                .observe_header_for_slashing(&extreme)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(engine.slashing_monitor.header_entry_count(), 2);
+
+        let mut future = extreme;
+        future.height = u64::MAX;
+        future.signature = signer.sign_proposer_message(spec.chain_id, &future.hash());
+        assert_eq!(
+            engine.observe_header_for_slashing(&future),
+            Err(crate::slashing::SlashingError::SourceOutsideAccountabilityWindow)
+        );
+        assert_eq!(engine.slashing_monitor.header_entry_count(), 2);
+        let mut conflicting = first;
+        conflicting.state_root[0] ^= 1;
+        conflicting.signature = signer.sign_proposer_message(spec.chain_id, &conflicting.hash());
+        let offence = engine
+            .observe_header_for_slashing(&conflicting)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            offence,
+            neutrino_consensus_types::SlashingEvidence::DoubleProposal { .. }
+        ));
+        engine.verify_slashing_evidence(&offence).unwrap();
+    }
+
+    #[test]
+    fn inactive_source_proposers_cannot_enter_header_attribution() {
+        for slashed in [false, true] {
+            let spec = chain_spec_with(2);
+            let mut engine = test_engine(spec.clone());
+            let mut validators = spec.initial_validators.clone();
+            validators[0].slashed = slashed;
+            if !slashed {
+                validators[0].effective_stake = 0;
+            }
+            engine
+                .set_active_validator_set(1, validators.clone())
+                .unwrap();
+            let signer = proposer(0);
+            let mut first = crate::test_db::header(1, 7, spec.genesis_block_hash, ZERO_HASH);
+            first.signature = signer.sign_proposer_message(spec.chain_id, &first.hash());
+            crate::signature::verify_header_signature(&first, &validators, spec.chain_id)
+                .expect("the inactive source has an authentic BLS signature");
+            assert_eq!(
+                neutrino_prover_chunk::proposer::verify_header_signature(
+                    &first,
+                    spec.chain_id,
+                    &validators,
+                ),
+                Err(neutrino_prover_chunk::proposer::ProposerError::Validator)
+            );
+            let inactive = crate::slashing::SlashingError::EvidenceFieldsInconsistent;
+            assert_eq!(
+                engine.observe_header_for_slashing(&first),
+                Err(inactive.clone())
+            );
+            let mut second = first.clone();
+            second.state_root[0] ^= 1;
+            second.signature = signer.sign_proposer_message(spec.chain_id, &second.hash());
+            assert_eq!(
+                engine.verify_slashing_evidence(
+                    &neutrino_consensus_types::SlashingEvidence::DoubleProposal {
+                        proposer_index: 0,
+                        header_a: first.clone(),
+                        header_b: second,
+                    }
+                ),
+                Err(inactive.clone())
+            );
+            assert_eq!(
+                engine.verify_slashing_evidence(
+                    &neutrino_consensus_types::SlashingEvidence::InvalidVrfClaim {
+                        proposer_index: 0,
+                        header: first,
+                        reason: neutrino_consensus_types::VrfRejectionReason::BadSignature,
+                    }
+                ),
+                Err(inactive)
+            );
+            assert_eq!(engine.slashing_monitor.header_entry_count(), 0);
+        }
+    }
+
+    #[test]
+    fn inactive_source_single_signers_cannot_bypass_attribution_guards() {
+        for slashed in [false, true] {
+            let spec = chain_spec_with(2);
+            let mut engine = test_engine(spec.clone());
+            let partial = test_vote(
+                0,
+                [0x99; 32],
+                1,
+                FinalityVotePhase::Prevote,
+                spec.chain_id,
+                &proposer(1),
+                2,
+            );
+            let indexed = partial.attestations[0].indexed_vote();
+            crate::slashing::verify_indexed_vote_signature(
+                1,
+                &indexed,
+                &spec.initial_validators,
+                spec.chain_id,
+            )
+            .expect("the inactive signer test uses an authentic individual signature");
+            let mut validators = spec.initial_validators.clone();
+            validators[1].slashed = slashed;
+            if !slashed {
+                validators[1].effective_stake = 0;
+            }
+            engine
+                .set_active_validator_set(1, validators.clone())
+                .unwrap();
+            let inactive = crate::slashing::SlashingError::EvidenceFieldsInconsistent;
+            assert_eq!(
+                crate::slashing::verify_indexed_vote_signature(
+                    1,
+                    &indexed,
+                    &validators,
+                    spec.chain_id
+                ),
+                Err(inactive.clone())
+            );
+            assert_eq!(
+                crate::slashing::verify_vote_attestation(
+                    &partial.attestations[0],
+                    1,
+                    &partial.data,
+                    &validators,
+                    spec.chain_id
+                ),
+                Err(inactive.clone())
+            );
+            assert!(
+                neutrino_prover_chunk::finality::verify_vote_signatures(
+                    spec.chain_id,
+                    &validators,
+                    &partial,
+                    &spec.consensus,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                engine.observe_votes_for_slashing(&partial),
+                Err(inactive.clone())
+            );
+            let conflicting = test_vote(
+                0,
+                [0x88; 32],
+                1,
+                FinalityVotePhase::Prevote,
+                spec.chain_id,
+                &proposer(1),
+                2,
+            );
+            assert_eq!(
+                engine.verify_slashing_evidence(
+                    &neutrino_consensus_types::SlashingEvidence::DoublePrevote {
+                        validator_index: 1,
+                        vote_a: indexed,
+                        vote_b: conflicting.attestations[0].indexed_vote(),
+                    }
+                ),
+                Err(inactive)
+            );
+            assert_eq!(engine.slashing_monitor.vote_entry_count(), 0);
         }
     }
 }

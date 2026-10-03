@@ -240,7 +240,17 @@ fn certificate(chunk: &Chunk) -> FinalityCert {
         }
     };
     FinalityCert {
-        attestations: vec![signed_attestation(
+        prevote_attestations: vec![signed_attestation(
+            FinalityVoteData {
+                chunk_id: chunk.chunk_id,
+                round: 0,
+                chunk_hash: chunk.hash(),
+                phase: FinalityVotePhase::Prevote,
+            },
+            Vec::new(),
+            None,
+        )],
+        precommit_attestations: vec![signed_attestation(
             FinalityVoteData {
                 chunk_id: chunk.chunk_id,
                 round: 0,
@@ -282,10 +292,22 @@ fn verifies_both_bft_phases_and_rejects_replay_and_bad_signers() {
         verify_finality(7, &params, &validators, &chunk, &bad),
         Err(FinalityError::Signature)
     );
-    bad = cert.clone();
-    bad.prevote.aggregation_bits = BitVec::from_bytes(1, vec![0]).unwrap();
+    let mut minority_chunk = chunk.clone();
+    let mut heavier = validator();
+    heavier.pubkey = SecretKey::key_gen(&[43; 32], &[])
+        .unwrap()
+        .public_key()
+        .to_bytes();
+    heavier.effective_stake = 200;
+    let weighted = vec![validator(), heavier];
+    minority_chunk.active_validator_set_root = commitment(&weighted);
+    let mut minority = certificate(&minority_chunk);
+    // A complete, authentic claim covers the one signer. Its 100 stake out of
+    // 300 still falls below quorum, independently of attestation coverage.
+    minority.prevote.aggregation_bits = BitVec::from_bytes(2, vec![1]).unwrap();
+    minority.precommit.aggregation_bits = BitVec::from_bytes(2, vec![1]).unwrap();
     assert_eq!(
-        verify_finality(7, &params, &validators, &chunk, &bad),
+        verify_finality(7, &params, &weighted, &minority_chunk, &minority),
         Err(FinalityError::Quorum)
     );
     bad = cert;
@@ -372,11 +394,14 @@ fn signed_attestation(
     vote: FinalityVoteData,
     hashes: Vec<[u8; 32]>,
     unlock_quorum: Option<neutrino_consensus_types::QuorumCertificate>,
-) -> neutrino_consensus_types::PrecommitAttestation {
-    let mut message = Vec::from(DOMAIN_PRECOMMIT);
+) -> neutrino_consensus_types::VoteAttestation {
+    let mut message = Vec::from(match vote.phase {
+        FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
+        FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
+    });
     message.extend_from_slice(&7_u64.to_le_bytes());
     message.extend_from_slice(&borsh::to_vec(&vote).unwrap());
-    let mut claim = neutrino_consensus_types::PrecommitAttestation {
+    let mut claim = neutrino_consensus_types::VoteAttestation {
         vote_signature: key().sign(&message).to_bytes(),
         validator_index: 0,
         vote,
@@ -483,6 +508,261 @@ fn signed_unlock_cannot_be_omitted_or_substituted_to_slash_an_honest_voter() {
     assert!(
         verify_lock_violation(7, &[validator()], 0, (&first, &later), &evidence, (3, 2)).is_err()
     );
+}
+
+fn attested_vote(
+    data: FinalityVoteData,
+    unlock: Option<neutrino_consensus_types::QuorumCertificate>,
+) -> neutrino_consensus_types::FinalityVote {
+    let hashes = if data.phase == FinalityVotePhase::Precommit {
+        vec![[1; 32]; 2]
+    } else {
+        Vec::new()
+    };
+    let claim = signed_attestation(data.clone(), hashes, unlock);
+    neutrino_consensus_types::FinalityVote {
+        data,
+        signature: claim.vote_signature,
+        aggregation_bits: BitVec::from_bytes(1, vec![1]).unwrap(),
+        attestations: vec![claim],
+    }
+}
+
+#[test]
+fn prevote_unlock_must_precede_its_round_while_precommit_can_use_the_current_quorum() {
+    use neutrino_prover_chunk::finality::verify_vote;
+    let params = ConsensusParams {
+        chunk_size: 2,
+        ..ConsensusParams::default()
+    };
+    let active = [validator()];
+    let prevote = signed_vote(2, 2, FinalityVotePhase::Prevote).data;
+    let precommit = signed_vote(2, 2, FinalityVotePhase::Precommit).data;
+    assert!(verify_vote(7, &active, &attested_vote(prevote.clone(), None), &params).is_ok());
+    for data in [prevote.clone(), precommit.clone()] {
+        let vote = attested_vote(data, Some(signed_quorum(1, 2)));
+        verify_vote(7, &active, &vote, &params).unwrap();
+        assert!(verify_vote(8, &active, &vote, &params).is_err());
+    }
+    let self_authorizing = attested_vote(prevote, Some(signed_quorum(2, 2)));
+    assert_eq!(
+        verify_vote(7, &active, &self_authorizing, &params),
+        Err(FinalityError::Target)
+    );
+    let current_precommit = attested_vote(precommit, Some(signed_quorum(2, 2)));
+    verify_vote(7, &active, &current_precommit, &params).unwrap();
+}
+
+#[test]
+fn signed_unlock_declarations_authenticate_every_quorum_condition() {
+    use neutrino_prover_chunk::finality::verify_vote;
+    type Mutation = fn(&mut neutrino_consensus_types::QuorumCertificate);
+    let mutations: &[Mutation] = &[
+        |qc| qc.data.chunk_id += 1,
+        |qc| qc.data.chunk_hash[0] ^= 1,
+        |qc| qc.data.round = 3,
+        |qc| qc.data.phase = FinalityVotePhase::Precommit,
+        |qc| qc.aggregate.signature[0] ^= 1,
+        |qc| qc.aggregate.aggregation_bits = BitVec::from_bytes(1, vec![0]).unwrap(),
+        |qc| qc.aggregate.aggregation_bits = BitVec::from_bytes(2, vec![1]).unwrap(),
+    ];
+    let params = ConsensusParams {
+        chunk_size: 2,
+        ..ConsensusParams::default()
+    };
+    for mutate in mutations {
+        let mut quorum = signed_quorum(1, 2);
+        mutate(&mut quorum);
+        // Re-sign the declaration so its signature is valid: only the QC fails.
+        let vote = attested_vote(
+            signed_vote(2, 2, FinalityVotePhase::Prevote).data,
+            Some(quorum),
+        );
+        assert!(verify_vote(7, &[validator()], &vote, &params).is_err());
+    }
+    let vote = attested_vote(
+        signed_vote(2, 2, FinalityVotePhase::Prevote).data,
+        Some(signed_quorum(1, 2)),
+    );
+    let mut inactive = validator();
+    inactive.slashed = true;
+    assert!(verify_vote(7, &[inactive], &vote, &params).is_err());
+    let mut wrong = vote.clone();
+    wrong.attestations[0].unlock_quorum = None;
+    assert!(verify_vote(7, &[validator()], &wrong, &params).is_err());
+    wrong = vote;
+    wrong.attestations[0].proof_hashes.push([9; 32]);
+    assert!(verify_vote(7, &[validator()], &wrong, &params).is_err());
+}
+
+#[test]
+fn authenticates_signed_bad_unlocks_for_attribution_without_admitting_them() {
+    use neutrino_prover_chunk::finality::{verify_vote, verify_vote_signatures};
+    let params = ConsensusParams {
+        chunk_size: 2,
+        ..ConsensusParams::default()
+    };
+    let mut invalid = signed_quorum(1, 2);
+    invalid.aggregate.signature = signed_quorum(1, 3).aggregate.signature;
+    for phase in [FinalityVotePhase::Prevote, FinalityVotePhase::Precommit] {
+        let vote = attested_vote(signed_vote(2, 2, phase).data, Some(invalid.clone()));
+        // The signer authenticated the malformed QC; its invalidity is not a
+        // reason to discard the individual evidence needed for accountability.
+        verify_vote_signatures(7, &[validator()], &vote, &params).unwrap();
+        assert_eq!(
+            verify_vote(7, &[validator()], &vote, &params),
+            Err(FinalityError::Target)
+        );
+        assert_eq!(
+            verify_vote_signatures(8, &[validator()], &vote, &params),
+            Err(FinalityError::Signature)
+        );
+        let mut bad = vote.clone();
+        bad.attestations[0].signature[0] ^= 1;
+        assert_eq!(
+            verify_vote_signatures(7, &[validator()], &bad, &params),
+            Err(FinalityError::Signature)
+        );
+        bad = vote.clone();
+        bad.signature = signed_vote(2, 3, phase).signature;
+        assert_eq!(
+            verify_vote_signatures(7, &[validator()], &bad, &params),
+            Err(FinalityError::Signature)
+        );
+        bad = vote;
+        bad.attestations.clear();
+        assert_eq!(
+            verify_vote_signatures(7, &[validator()], &bad, &params),
+            Err(FinalityError::Membership)
+        );
+    }
+}
+
+#[test]
+fn conflicting_locked_prevotes_are_objectively_proven_with_direct_and_fact_verifiers() {
+    use neutrino_consensus_types::LockEvidence;
+    use neutrino_prover_chunk::{
+        facts::{FactReader, FactRecorder, FactStatement, FactWitness, ProvenFact, validate_facts},
+        slashing::{EvidenceError, verify_lock_violation, verify_lock_violation_using},
+    };
+    let first = signed_vote(0, 1, FinalityVotePhase::Precommit);
+    let later = signed_vote(2, 2, FinalityVotePhase::Prevote);
+    let mut false_signature = signed_quorum(1, 2);
+    false_signature.aggregate.signature = signed_quorum(1, 3).aggregate.signature;
+    for unlock in [
+        None,
+        Some(signed_quorum(0, 2)),
+        Some(signed_quorum(2, 2)),
+        Some(signed_quorum(3, 2)),
+        Some(false_signature),
+    ] {
+        let evidence = LockEvidence {
+            locked_prevote_quorum: signed_quorum(0, 1),
+            attestation: signed_attestation(later.data.clone(), Vec::new(), unlock),
+        };
+        verify_lock_violation(7, &[validator()], 0, (&first, &later), &evidence, (2, 3)).unwrap();
+        let mut recorder = FactRecorder::default();
+        verify_lock_violation_using(
+            7,
+            &[validator()],
+            0,
+            (&first, &later),
+            &evidence,
+            (2, 3),
+            &mut recorder,
+        )
+        .unwrap();
+        let checks = recorder.finish().unwrap();
+        let facts = validate_facts(&FactWitness {
+            requests: checks.iter().map(|(request, _)| request.clone()).collect(),
+            statement: FactStatement {
+                facts: checks
+                    .iter()
+                    .map(|(request, valid)| ProvenFact {
+                        id: request.id(),
+                        valid: *valid,
+                    })
+                    .collect(),
+            },
+        })
+        .unwrap();
+        let mut reader = FactReader::new(&[facts]).unwrap();
+        verify_lock_violation_using(
+            7,
+            &[validator()],
+            0,
+            (&first, &later),
+            &evidence,
+            (2, 3),
+            &mut reader,
+        )
+        .unwrap();
+        assert!(reader.complete());
+    }
+    let mut honest = LockEvidence {
+        locked_prevote_quorum: signed_quorum(0, 1),
+        attestation: signed_attestation(later.data.clone(), Vec::new(), Some(signed_quorum(1, 2))),
+    };
+    assert_eq!(
+        verify_lock_violation(7, &[validator()], 0, (&first, &later), &honest, (2, 3)),
+        Err(EvidenceError::HonestUnlock)
+    );
+    honest.attestation.unlock_quorum = None;
+    assert_eq!(
+        verify_lock_violation(7, &[validator()], 0, (&first, &later), &honest, (2, 3)),
+        Err(EvidenceError::Signature)
+    );
+}
+
+#[test]
+fn quorum_thresholds_cannot_bypass_the_bft_intersection_requirement() {
+    use neutrino_prover_chunk::slashing::verify_quorum;
+    let candidate = chunk();
+    let cert = certificate(&candidate);
+    let quorum = signed_quorum(0, 1);
+    for (numerator, denominator) in [(1, 2), (1, 3), (0, 1), (2, 1)] {
+        let params = ConsensusParams {
+            chunk_size: 2,
+            bft_prevote_quorum_numerator: numerator,
+            bft_prevote_quorum_denominator: denominator,
+            ..ConsensusParams::default()
+        };
+        assert!(verify_finality(7, &params, &[validator()], &candidate, &cert).is_err());
+        assert!(verify_quorum(7, &[validator()], &quorum, (numerator, denominator)).is_err());
+    }
+    for fraction in [(2, 3), (3, 4), (u64::MAX, u64::MAX)] {
+        verify_quorum(7, &[validator()], &quorum, fraction).unwrap();
+    }
+}
+
+#[test]
+fn unlock_quorum_crypto_obeys_the_same_batched_and_direct_decision() {
+    use neutrino_prover_chunk::{
+        bls::BatchVerifier,
+        finality::{verify_vote, verify_vote_using},
+    };
+    let params = ConsensusParams {
+        chunk_size: 2,
+        ..ConsensusParams::default()
+    };
+    for valid in [true, false] {
+        let mut quorum = signed_quorum(1, 2);
+        if !valid {
+            // Both are valid curve points, but the replacement signs another target.
+            quorum.aggregate.signature = signed_quorum(1, 3).aggregate.signature;
+        }
+        let vote = attested_vote(
+            signed_vote(2, 2, FinalityVotePhase::Prevote).data,
+            Some(quorum),
+        );
+        let mut batch = BatchVerifier::default();
+        let framed = verify_vote_using(7, &[validator()], &vote, &params, &mut batch).is_ok();
+        assert_eq!(framed && batch.finish(), valid);
+        assert_eq!(
+            verify_vote(7, &[validator()], &vote, &params).is_ok(),
+            valid
+        );
+    }
 }
 
 #[test]

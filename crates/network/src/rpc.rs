@@ -30,7 +30,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use core::marker::PhantomData;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{StreamProtocol, request_response};
-use neutrino_consensus_types::{Block, BlockProof, ChunkProof, FinalityCert, HistoryProof};
+use neutrino_consensus_types::{
+    BftCandidate, Block, BlockProof, ChunkProof, FinalityCert, HistoryProof,
+};
 use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot};
 use std::io;
 use thiserror::Error;
@@ -61,6 +63,9 @@ pub const PROTOCOL_HISTORY_PROOF_BY_RANGE: &str = "/neutrino/req/history_proof_b
 pub const PROTOCOL_FINALITY_CERT_BY_CHUNK: &str = "/neutrino/req/finality_cert_by_chunk";
 /// `WitnessByBlock` RPC protocol id.
 pub const PROTOCOL_WITNESS_BY_BLOCK: &str = "/neutrino/req/witness_by_block";
+
+/// Current next-chunk candidate discovery protocol.
+pub const PROTOCOL_CANDIDATE_BY_CHUNK: &str = "/neutrino/req/candidate_by_chunk";
 
 /// Default maximum request payload size in bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
@@ -117,6 +122,8 @@ pub enum RpcProtocol {
     FinalityCertByChunk,
     /// Doc 06 `/neutrino/req/witness_by_block`.
     WitnessByBlock,
+    /// Query a fully proven next-chunk candidate.
+    CandidateByChunk,
 }
 
 impl RpcProtocol {
@@ -137,6 +144,7 @@ impl RpcProtocol {
             Self::HistoryProofByRange => PROTOCOL_HISTORY_PROOF_BY_RANGE,
             Self::FinalityCertByChunk => PROTOCOL_FINALITY_CERT_BY_CHUNK,
             Self::WitnessByBlock => PROTOCOL_WITNESS_BY_BLOCK,
+            Self::CandidateByChunk => PROTOCOL_CANDIDATE_BY_CHUNK,
         }
     }
 
@@ -411,6 +419,22 @@ pub struct WitnessByBlockResponse {
     pub witnesses: Vec<Vec<u8>>,
 }
 
+/// Discover the current candidate, or an exact target referenced by a vote.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateByChunkRequest {
+    /// Only the provider's next unfinalized chunk is served.
+    pub chunk_id: ChunkId,
+    /// Exact semantic target, or `None` to discover the active candidate.
+    pub chunk_hash: Option<Hash>,
+}
+
+/// A bounded candidate hint; branch data is fetched through ordinary anchored RPCs.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct CandidateByChunkResponse {
+    /// Fully verified provider branch and optional prior-round quorum.
+    pub candidate: BftCandidate,
+}
+
 /// Host-facing umbrella request enum used by the command surface.
 ///
 /// Never serialized to the wire — each variant maps to a different
@@ -443,6 +467,8 @@ pub enum RpcRequest {
     FinalityCertByChunk(FinalityCertByChunkRequest),
     /// Execution witness fetch by block hash.
     WitnessByBlock(WitnessByBlockRequest),
+    /// Discover a proven candidate branch.
+    CandidateByChunk(CandidateByChunkRequest),
 }
 
 impl RpcRequest {
@@ -463,6 +489,7 @@ impl RpcRequest {
             Self::HistoryProofByRange(_) => RpcProtocol::HistoryProofByRange,
             Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
             Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
+            Self::CandidateByChunk(_) => RpcProtocol::CandidateByChunk,
         }
     }
 }
@@ -507,6 +534,8 @@ pub enum RpcResponse {
     FinalityCertByChunk(FinalityCertByChunkResponse),
     /// `WitnessByBlock` reply.
     WitnessByBlock(WitnessByBlockResponse),
+    /// Candidate availability reply.
+    CandidateByChunk(Box<CandidateByChunkResponse>),
 }
 
 impl RpcResponse {
@@ -528,6 +557,7 @@ impl RpcResponse {
             Self::HistoryProofByRange(_) => RpcProtocol::HistoryProofByRange,
             Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
             Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
+            Self::CandidateByChunk(_) => RpcProtocol::CandidateByChunk,
         }
     }
 }
@@ -765,6 +795,12 @@ pub type HistoryProofByRangeBehaviour = request_response::Behaviour<HistoryProof
 pub type FinalityCertByChunkBehaviour = request_response::Behaviour<FinalityCertByChunkCodec>;
 /// Behaviour type for the `WitnessByBlock` RPC.
 pub type WitnessByBlockBehaviour = request_response::Behaviour<WitnessByBlockCodec>;
+
+/// Codec for bounded candidate discovery.
+pub type CandidateByChunkCodec =
+    BorshCodec<CandidateByChunkRequest, RpcResult<CandidateByChunkResponse>>;
+/// Candidate request/response behaviour.
+pub type CandidateByChunkBehaviour = request_response::Behaviour<CandidateByChunkCodec>;
 
 #[cfg(test)]
 mod tests {

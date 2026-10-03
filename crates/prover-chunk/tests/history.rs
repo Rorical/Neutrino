@@ -153,7 +153,7 @@ fn historical_read_budgets_reject_declared_lengths_before_allocation() {
 #[test]
 #[cfg(feature = "sp1-verification")]
 fn rejected_proof_requires_the_exact_signed_artifact() {
-    use neutrino_consensus_types::{BlockProof, PrecommitAttestation, ProofRejectionReason};
+    use neutrino_consensus_types::{BlockProof, ProofRejectionReason, VoteAttestation};
     let (spec, history) = fixture();
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
@@ -166,7 +166,7 @@ fn rejected_proof_requires_the_exact_signed_artifact() {
         public_inputs: input.blocks[0].public_inputs.clone(),
         proof_bytes: vec![0xff],
     };
-    let mut attestation = PrecommitAttestation {
+    let mut attestation = VoteAttestation {
         vote_signature: vote.signature,
         validator_index: 0,
         vote: vote.data.clone(),
@@ -351,8 +351,13 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
         aggregate.signature = key.sign(&message).to_bytes();
         aggregate.aggregation_bits = BitVec::from_bytes(2, vec![1]).unwrap();
     }
+    let prevote = record.finality.prevote_vote();
+    let claim = &mut record.finality.prevote_attestations[0];
+    claim.vote = prevote.data;
+    claim.vote_signature = prevote.signature;
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
     let data = record.finality.precommit_vote().data;
-    let claim = &mut record.finality.attestations[0];
+    let claim = &mut record.finality.precommit_attestations[0];
     claim.vote = data;
     claim.vote_signature = record.finality.precommit.signature;
     claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
@@ -393,11 +398,16 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
         message.extend_from_slice(&borsh::to_vec(&data).unwrap());
         aggregate.signature = key.sign(&message).to_bytes();
     }
+    let prevote = alternate.prevote_vote();
+    let claim = &mut alternate.prevote_attestations[0];
+    claim.vote = prevote.data;
+    claim.vote_signature = prevote.signature;
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
     let vote = alternate.precommit_vote();
-    alternate.attestations[0].vote = vote.data;
-    alternate.attestations[0].vote_signature = alternate.precommit.signature;
-    alternate.attestations[0].signature = key
-        .sign(&alternate.attestations[0].signing_message(7))
+    alternate.precommit_attestations[0].vote = vote.data;
+    alternate.precommit_attestations[0].vote_signature = alternate.precommit.signature;
+    alternate.precommit_attestations[0].signature = key
+        .sign(&alternate.precommit_attestations[0].signing_message(7))
         .to_bytes();
     neutrino_prover_chunk::finality::verify_finality(
         7,

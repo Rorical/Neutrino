@@ -9,13 +9,13 @@
 
 use async_trait::async_trait;
 use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
+    BftCandidate, Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
 };
 use neutrino_network::rpc::{
     BlockProofByHashResponse, BlockProofByHeightResponse, BlocksByRangeResponse,
-    BlocksByRootResponse, CheckpointLatestResponse, ChunkProofByIdResponse,
-    FinalityCertByChunkResponse, HistoryProofByRangeResponse, Metadata, StateByRootResponse,
-    Status, WitnessByBlockResponse, role_flags,
+    BlocksByRootResponse, CandidateByChunkResponse, CheckpointLatestResponse,
+    ChunkProofByIdResponse, FinalityCertByChunkResponse, HistoryProofByRangeResponse, Metadata,
+    StateByRootResponse, Status, WitnessByBlockResponse, role_flags,
 };
 use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, CheckpointIndex, ChunkId, Hash, Height, StateRoot};
@@ -142,6 +142,38 @@ pub trait SyncBackend: Send + Sync + 'static {
     async fn consensus_sync_target(&self) -> Result<Option<ConsensusSyncTarget>, SyncBackendError> {
         Ok(None)
     }
+    /// Whether this backend supports current-program candidate branch synchronization.
+    fn supports_bft_candidate_sync(&self) -> bool {
+        false
+    }
+    /// Discover a fully proven next-chunk target, optionally by its exact hash.
+    async fn bft_candidate(
+        &self,
+        _chunk_id: ChunkId,
+        _hash: Option<Hash>,
+    ) -> Result<CandidateByChunkResponse, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "candidate unavailable".into(),
+        ))
+    }
+    /// Authenticate local boundary/range and any carried QC before caching a hint.
+    async fn validate_bft_candidate_hint(&self, _candidate: &BftCandidate) -> bool {
+        false
+    }
+    /// Whether an authenticated next-chunk vote needs exact candidate discovery.
+    async fn bft_vote_needs_candidate(&self, _vote: &FinalityVote) -> bool {
+        false
+    }
+    /// Independently authenticate a downloaded branch and apply local round/lock policy.
+    async fn consider_bft_candidate(
+        &self,
+        _candidate: BftCandidate,
+    ) -> Result<(), SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "candidate replacement unavailable".into(),
+        ))
+    }
+
     /// Build a [`Status`] payload reflecting the local chain head.
     async fn local_status(&self) -> Result<Status, SyncBackendError>;
 

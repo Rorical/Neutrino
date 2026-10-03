@@ -34,6 +34,7 @@ struct SavedSession {
     local_identity: Option<BlsPublicKey>,
     local_votes: Vec<FinalityVote>,
     highest_lock: Option<QuorumCertificate>,
+    prevote_justification: Option<QuorumCertificate>,
 }
 
 fn current_vote(session: &BftSession, phase: FinalityVotePhase) -> Option<FinalityVote> {
@@ -49,6 +50,39 @@ fn current_vote(session: &BftSession, phase: FinalityVotePhase) -> Option<Finali
             phase,
         },
     })
+}
+
+/// Restore a reserved precommit only with its durable exact receipts and complete
+/// signed prevote coverage; a raw QC cannot replace the retained declarations.
+fn recover_reserved_precommit<E>(
+    session: &mut BftSession,
+    vote: &FinalityVote,
+) -> Result<(), BftLoopError<E>> {
+    let claim = vote
+        .attestations
+        .first()
+        .expect("durable signer attaches claim");
+    if claim.proof_hashes != session.proof_hashes {
+        return Err(EngineError::Signing(crate::signing::SigningViolation::Conflict).into());
+    }
+    if let Some(lock) = &claim.unlock_quorum {
+        let retained = session
+            .bft
+            .current_aggregate(FinalityVotePhase::Prevote)
+            .ok_or_else(|| StoreError::Corrupt("reserved precommit lost its prevote claims"))?;
+        if !session.bft.prevote_quorum_reached()
+            || (0..lock.aggregate.aggregation_bits.bit_len()).any(|index| {
+                lock.aggregate.aggregation_bits.get(index) == Some(true)
+                    && retained.aggregation_bits.get(index) != Some(true)
+            })
+        {
+            return Err(StoreError::Corrupt("reserved precommit prevote quorum changed").into());
+        }
+        session.highest_lock = Some(lock.clone());
+    }
+    session.bft.add_precommit(vote.clone())?;
+    session.local = LocalVoteProgress::Precommitted;
+    Ok(())
 }
 
 impl<DB: Database> Engine<DB> {
@@ -69,6 +103,7 @@ impl<DB: Database> Engine<DB> {
             local_identity: session.local_identity,
             local_votes: session.local_votes.clone(),
             highest_lock: session.highest_lock.clone(),
+            prevote_justification: session.prevote_justification.clone(),
         };
         let bytes = borsh::to_vec(&saved).map_err(StoreError::Codec)?;
         if bytes.len() > MAX_SESSION_BYTES {
@@ -102,6 +137,11 @@ impl<DB: Database> Engine<DB> {
             );
             if id < floor {
                 continue;
+            }
+            if id != floor {
+                return Err(
+                    StoreError::Corrupt("saved BFT session has no authenticated boundary").into(),
+                );
             }
             if bytes.len() > MAX_SESSION_BYTES {
                 return Err(StoreError::Corrupt("saved BFT session exceeds bound").into());
@@ -176,9 +216,8 @@ impl<DB: Database> Engine<DB> {
         }
         if let Some(lock) = &saved.highest_lock
             && (lock.data.chunk_id != id
-                || lock.data.chunk_hash != saved.chunk.hash()
                 || lock.data.round > saved.round
-                || neutrino_prover_chunk::slashing::verify_quorum(
+                || neutrino_prover_chunk::slashing::verify_quorum_using(
                     spec.chain_id,
                     &saved.validators,
                     lock,
@@ -186,10 +225,34 @@ impl<DB: Database> Engine<DB> {
                         params.bft_prevote_quorum_numerator,
                         params.bft_prevote_quorum_denominator,
                     ),
+                    &mut *self.bls_verifier.borrow_mut(),
                 )
                 .is_err())
         {
             return Err(StoreError::Corrupt("invalid saved lock quorum").into());
+        }
+        if let Some(justification) = &saved.prevote_justification {
+            let data = FinalityVoteData {
+                chunk_id: id,
+                chunk_hash: saved.chunk.hash(),
+                round: saved.round,
+                phase: FinalityVotePhase::Prevote,
+            };
+            if self
+                .verify_bft_unlock_quorum(&saved.validators, &data, justification)
+                .is_err()
+            {
+                return Err(StoreError::Corrupt("invalid saved prevote justification").into());
+            }
+        }
+        if saved.highest_lock.as_ref().is_some_and(|lock| {
+            lock.data.chunk_hash != saved.chunk.hash()
+                && saved
+                    .prevote_justification
+                    .as_ref()
+                    .is_none_or(|quorum| quorum.data.round <= lock.data.round)
+        }) {
+            return Err(StoreError::Corrupt("saved candidate violates retained lock").into());
         }
         let mut local = LocalVoteProgress::Idle;
         for vote in &saved.local_votes {
@@ -205,6 +268,15 @@ impl<DB: Database> Engine<DB> {
             }
             match vote.data.phase {
                 FinalityVotePhase::Prevote if local == LocalVoteProgress::Idle => {
+                    if vote
+                        .attestations
+                        .first()
+                        .is_none_or(|claim| claim.unlock_quorum != saved.prevote_justification)
+                    {
+                        return Err(
+                            StoreError::Corrupt("saved prevote justification changed").into()
+                        );
+                    }
                     bft.add_prevote(vote.clone())
                         .map_err(|_| StoreError::Corrupt("invalid saved local prevote"))?;
                     local = LocalVoteProgress::Prevoted;
@@ -244,6 +316,7 @@ impl<DB: Database> Engine<DB> {
             local_identity: saved.local_identity,
             local_votes: saved.local_votes,
             highest_lock: saved.highest_lock,
+            prevote_justification: saved.prevote_justification,
             is_local_aggregator: false,
             subnet: self.subnet_for_chunk(id),
             last_published_aggregate_prevote_stake: 0,
@@ -305,6 +378,7 @@ impl<DB: Database> Engine<DB> {
             && !session.local_prevoted()
             && !session.precommit_quorum_observed()
         {
+            self.ensure_bft_candidate_lock(&session)?;
             let prevote = self.sign_vote_durable(
                 &voter,
                 FinalityVoteData {
@@ -314,7 +388,7 @@ impl<DB: Database> Engine<DB> {
                     phase: FinalityVotePhase::Prevote,
                 },
                 Vec::new(),
-                None,
+                session.prevote_justification.clone(),
             )?;
             session.bft.add_prevote(prevote.clone())?;
             session.local = LocalVoteProgress::Prevoted;
@@ -345,7 +419,11 @@ impl<DB: Database> Engine<DB> {
             }
         }
         if session.precommit_quorum_observed() {
-            actions.push(BftAction::QuorumReached(id));
+            actions.push(BftAction::QuorumReached(
+                session
+                    .quorum_identity()
+                    .expect("precommit quorum has a certificate"),
+            ));
         }
         emit_aggregator_actions(&mut session, &mut actions);
         self.persist_bft_session(&session)?;
@@ -375,9 +453,22 @@ impl<DB: Database> Engine<DB> {
         let Some(voter) = self.active_local_voter() else {
             return Ok(());
         };
+        if let Some(lock) = self.reserved_signing_lock(&voter, session.chunk_id)?
+            && session
+                .highest_lock
+                .as_ref()
+                .is_none_or(|prior| prior.data.round < lock.data.round)
+        {
+            session.highest_lock = Some(lock);
+        }
         let Some(progress) = self.reserved_signing_progress(&voter, session.chunk_id)? else {
             return Ok(());
         };
+        // A replacement target is committed before its first signature. A
+        // crash in that window leaves only the previous round's journal.
+        if progress.round < session.round() && session.local == LocalVoteProgress::Idle {
+            return Ok(());
+        }
         if progress.round == session.round()
             && progress.prevoted == session.local_prevoted()
             && progress.precommitted == session.local_precommitted()
@@ -408,31 +499,21 @@ impl<DB: Database> Engine<DB> {
             }
             match vote.data.phase {
                 FinalityVotePhase::Prevote => {
-                    session.bft.add_prevote(vote.clone())?;
-                    session.local = LocalVoteProgress::Prevoted;
-                }
-                FinalityVotePhase::Precommit => {
-                    let claim = vote
+                    if vote
                         .attestations
                         .first()
-                        .expect("durable signer attaches claim");
-                    if claim.proof_hashes != session.proof_hashes {
+                        .is_none_or(|claim| claim.unlock_quorum != session.prevote_justification)
+                    {
                         return Err(EngineError::Signing(
                             crate::signing::SigningViolation::Conflict,
                         )
                         .into());
                     }
-                    if let Some(lock) = &claim.unlock_quorum {
-                        session.bft.add_prevote(FinalityVote {
-                            data: lock.data.clone(),
-                            attestations: Vec::new(),
-                            signature: lock.aggregate.signature,
-                            aggregation_bits: lock.aggregate.aggregation_bits.clone(),
-                        })?;
-                        session.highest_lock = Some(lock.clone());
-                    }
-                    session.bft.add_precommit(vote.clone())?;
-                    session.local = LocalVoteProgress::Precommitted;
+                    session.bft.add_prevote(vote.clone())?;
+                    session.local = LocalVoteProgress::Prevoted;
+                }
+                FinalityVotePhase::Precommit => {
+                    recover_reserved_precommit(session, &vote)?;
                 }
             }
             if !session

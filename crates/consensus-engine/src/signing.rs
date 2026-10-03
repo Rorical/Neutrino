@@ -58,6 +58,7 @@ struct VoteWatermark {
     round: u32,
     prevote: Option<VoteIntent>,
     precommit: Option<VoteIntent>,
+    locked: Option<QuorumCertificate>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -137,6 +138,38 @@ impl<DB: Database> Engine<DB> {
                 return Err(StoreError::Corrupt("signing watermark intent changed").into());
             }
         }
+        if let Some(lock) = &watermark.locked {
+            let precommit = FinalityVoteData {
+                phase: FinalityVotePhase::Precommit,
+                ..lock.data.clone()
+            };
+            let bytes = self
+                .store()
+                .db()
+                .get(
+                    Column::SigningJournal,
+                    &intent_key(&watermark.identity, &precommit),
+                )
+                .map_err(StoreError::Database)?
+                .ok_or(StoreError::Corrupt("journal lock has no signed precommit"))?;
+            let intent: VoteIntent = borsh::from_slice(&bytes)?;
+            if intent.data != precommit
+                || intent.unlock_quorum.as_ref() != Some(lock)
+                || lock.data.round > watermark.round
+                || self
+                    .verify_bft_unlock_quorum(self.active_validator_set(), &precommit, lock)
+                    .is_err()
+            {
+                return Err(StoreError::Corrupt("invalid durable signing lock").into());
+            }
+        }
+        if watermark
+            .precommit
+            .as_ref()
+            .is_some_and(|intent| intent.unlock_quorum != watermark.locked)
+        {
+            return Err(StoreError::Corrupt("journal precommit lock mismatch").into());
+        }
         Ok(())
     }
     fn validate_signing_key(&self, voter: &ProposerKey) -> Result<(), EngineError<DB::Error>> {
@@ -188,6 +221,7 @@ impl<DB: Database> Engine<DB> {
                 round: data.round,
                 prevote: None,
                 precommit: None,
+                locked: None,
             },
         };
         if watermark.spec != self.chain_spec().hash()
@@ -197,6 +231,7 @@ impl<DB: Database> Engine<DB> {
             return Err(StoreError::Corrupt("signing journal identity mismatch").into());
         }
         self.validate_vote_watermark(&watermark)?;
+        self.validate_vote_unlock(&intent, watermark.locked.as_ref())?;
         if data.round < watermark.round {
             return Err(EngineError::Signing(SigningViolation::Regression));
         }
@@ -213,6 +248,9 @@ impl<DB: Database> Engine<DB> {
             return Err(EngineError::Signing(SigningViolation::Conflict));
         }
         *entry = Some(intent.clone());
+        if data.phase == FinalityVotePhase::Precommit {
+            watermark.locked.clone_from(&intent.unlock_quorum);
+        }
         let mut batch = Batch::new();
         batch.put(Column::SigningJournal, key, borsh::to_vec(&watermark)?);
         batch.put(
@@ -235,15 +273,54 @@ impl<DB: Database> Engine<DB> {
             data,
             attestations: Vec::new(),
         };
-        if vote.data.phase == FinalityVotePhase::Precommit {
-            vote.attestations.push(voter.attest_precommit(
-                self.chain_spec().chain_id,
-                vote.data.clone(),
-                intent.proof_hashes,
-                intent.unlock_quorum,
-            ));
-        }
+        vote.attestations.push(voter.attest_vote(
+            self.chain_spec().chain_id,
+            vote.data.clone(),
+            intent.proof_hashes,
+            intent.unlock_quorum,
+        ));
         Ok(vote)
+    }
+
+    fn validate_vote_unlock(
+        &self,
+        intent: &VoteIntent,
+        locked: Option<&QuorumCertificate>,
+    ) -> Result<(), EngineError<DB::Error>> {
+        let spec = self.chain_spec();
+        if intent.data.round > spec.consensus.bft_max_round
+            || (intent.data.phase == FinalityVotePhase::Prevote && !intent.proof_hashes.is_empty())
+        {
+            return Err(EngineError::Signing(SigningViolation::Conflict));
+        }
+        if let Some(unlock) = &intent.unlock_quorum
+            && self
+                .verify_bft_unlock_quorum(self.active_validator_set(), &intent.data, unlock)
+                .is_err()
+        {
+            return Err(EngineError::Signing(SigningViolation::Conflict));
+        }
+        if let Some(lock) = locked
+            && intent.data.chunk_hash != lock.data.chunk_hash
+            && intent
+                .unlock_quorum
+                .as_ref()
+                .is_none_or(|unlock| unlock.data.round <= lock.data.round)
+        {
+            return Err(EngineError::Signing(SigningViolation::Conflict));
+        }
+        // Live precommits are emitted only after the current-round prevote QC.
+        // Retaining that exact QC in the journal makes a lock survive even if
+        // the subsequent session write is interrupted.
+        if intent.data.phase == FinalityVotePhase::Precommit
+            && intent
+                .unlock_quorum
+                .as_ref()
+                .is_none_or(|unlock| unlock.data.round != intent.data.round)
+        {
+            return Err(EngineError::Signing(SigningViolation::Conflict));
+        }
+        Ok(())
     }
 
     pub(crate) fn signing_round_for(
@@ -337,6 +414,30 @@ impl<DB: Database> Engine<DB> {
             .transpose()
     }
 
+    pub(crate) fn reserved_signing_lock(
+        &self,
+        voter: &ProposerKey,
+        chunk_id: u64,
+    ) -> Result<Option<QuorumCertificate>, EngineError<DB::Error>> {
+        let bytes = self
+            .store()
+            .db()
+            .get(
+                Column::SigningJournal,
+                &vote_key(voter.public_key_bytes(), chunk_id),
+            )
+            .map_err(StoreError::Database)?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let watermark: VoteWatermark = borsh::from_slice(&bytes)?;
+        if watermark.identity != *voter.public_key_bytes() || watermark.chunk_id != chunk_id {
+            return Err(StoreError::Corrupt("signing lock identity mismatch").into());
+        }
+        self.validate_vote_watermark(&watermark)?;
+        Ok(watermark.locked)
+    }
+
     pub(crate) fn verify_saved_local_vote(
         &self,
         identity: BlsPublicKey,
@@ -354,15 +455,11 @@ impl<DB: Database> Engine<DB> {
         {
             return Err(StoreError::Corrupt("saved local vote identity mismatch").into());
         }
-        let (proof_hashes, unlock_quorum) = if vote.data.phase == FinalityVotePhase::Precommit {
-            let claim = vote
-                .attestations
-                .first()
-                .ok_or(StoreError::Corrupt("saved local attestation missing"))?;
-            (claim.proof_hashes.clone(), claim.unlock_quorum.clone())
-        } else {
-            (Vec::new(), None)
+        let [claim] = vote.attestations.as_slice() else {
+            return Err(StoreError::Corrupt("saved local attestation coverage changed").into());
         };
+        let (proof_hashes, unlock_quorum) =
+            (claim.proof_hashes.clone(), claim.unlock_quorum.clone());
         let expected = VoteIntent {
             data: vote.data.clone(),
             validator_index: index,

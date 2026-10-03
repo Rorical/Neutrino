@@ -191,8 +191,8 @@ fn single_validator_finalisation_records_real_bft_votes_and_attestation() {
     );
     let cert = &finalized.finality_cert;
     assert_eq!(cert.chunk_hash, finalized.chunk_hash);
-    assert_eq!(cert.attestations.len(), 1);
-    let attestation = &cert.attestations[0];
+    assert_eq!(cert.precommit_attestations.len(), 1);
+    let attestation = &cert.precommit_attestations[0];
     assert_eq!(attestation.validator_index, 0);
     assert_eq!(attestation.vote, cert.precommit_vote().data);
     assert_eq!(

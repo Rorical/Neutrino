@@ -117,9 +117,109 @@ fn batch_openings_bind_count_order_identity_and_reject_duplicate_offences() {
     assert!(EvidenceBatch::new(&[], [3; 8]).is_none());
 }
 
+fn locked_prevote() -> EvidenceWitness {
+    use neutrino_consensus_types::{
+        AggregatedVote, FinalityVoteData, FinalityVotePhase, IndexedVote, LockEvidence,
+        QuorumCertificate, VoteAttestation,
+    };
+    use neutrino_primitives::{BitVec, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE};
+    let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    let signed = |phase, round, hash| {
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            phase,
+            round,
+            chunk_hash: [hash; 32],
+        };
+        let domain = if phase == FinalityVotePhase::Prevote {
+            DOMAIN_PREVOTE
+        } else {
+            DOMAIN_PRECOMMIT
+        };
+        let mut message = Vec::from(domain);
+        message.extend_from_slice(&7_u64.to_le_bytes());
+        message.extend_from_slice(&borsh::to_vec(&data).unwrap());
+        IndexedVote {
+            data,
+            signature: key.sign(&message).to_bytes(),
+        }
+    };
+    let first = signed(FinalityVotePhase::Precommit, 0, 1);
+    let later = signed(FinalityVotePhase::Prevote, 2, 2);
+    let locking = signed(FinalityVotePhase::Prevote, 0, 1);
+    let mut claim = VoteAttestation {
+        validator_index: 0,
+        vote: later.data.clone(),
+        vote_signature: later.signature,
+        proof_hashes: Vec::new(),
+        unlock_quorum: None,
+        signature: [0; 96],
+    };
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    let mut witness = bad_vrf();
+    witness.claim = EvidenceClaim::Slash(SlashingEvidence::LockViolation {
+        validator_index: 0,
+        vote_a: first,
+        vote_b: later,
+        lock_evidence: LockEvidence {
+            locked_prevote_quorum: QuorumCertificate {
+                data: locking.data,
+                aggregate: AggregatedVote {
+                    aggregation_bits: BitVec::from_bytes(1, vec![1]).unwrap(),
+                    signature: locking.signature,
+                },
+            },
+            attestation: claim,
+        },
+    });
+    witness
+}
+
+#[test]
+fn locked_prevote_produces_an_authenticated_batch_statement() {
+    let witness = locked_prevote();
+    let expected = neutrino_prover_chunk::evidence::validate_evidence(&witness).unwrap();
+    let mut recorder = FactRecorder::default();
+    assert_eq!(
+        validate_evidence_using(&witness, &mut recorder).unwrap(),
+        expected
+    );
+    let checks = recorder.finish().unwrap();
+    let facts = validate_facts(&FactWitness {
+        requests: checks.iter().map(|(request, _)| request.clone()).collect(),
+        statement: FactStatement {
+            facts: checks
+                .iter()
+                .map(|(request, valid)| ProvenFact {
+                    id: request.id(),
+                    valid: *valid,
+                })
+                .collect(),
+        },
+    })
+    .unwrap();
+    let mut batch_input = EvidenceBatchWitness {
+        witnesses: vec![witness],
+        facts: vec![facts],
+        fact_guest_vk_digest: [3; 8],
+    };
+    let (batch, statements) = validate_evidence_batch(&batch_input).unwrap();
+    assert_eq!(statements, vec![expected]);
+    let membership = EvidenceMembership::build(&statements, 0, [3; 8]).unwrap();
+    assert_eq!(membership.batch, batch);
+    assert!(membership.binds(&statements[0], &[3; 8]));
+    let EvidenceClaim::Slash(SlashingEvidence::LockViolation { lock_evidence, .. }) =
+        &mut batch_input.witnesses[0].claim
+    else {
+        unreachable!()
+    };
+    lock_evidence.attestation.vote_signature[0] ^= 1;
+    assert!(validate_evidence_batch(&batch_input).is_err());
+}
+
 fn inactivity_claims() -> [EvidenceWitness; 2] {
     use neutrino_consensus_types::{
-        AggregatedVote, FinalityVoteData, FinalityVotePhase, PrecommitAttestation,
+        AggregatedVote, FinalityVoteData, FinalityVotePhase, VoteAttestation,
     };
     use neutrino_crypto::bls::aggregate_signatures;
     use neutrino_primitives::{BitVec, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE};
@@ -172,22 +272,32 @@ fn inactivity_claims() -> [EvidenceWitness; 2] {
     };
     certificate.prevote = aggregate(FinalityVotePhase::Prevote);
     certificate.precommit = aggregate(FinalityVotePhase::Precommit);
-    certificate.attestations = keys[..4]
-        .iter()
-        .enumerate()
-        .map(|(index, key)| {
-            let mut claim = PrecommitAttestation {
-                validator_index: u32::try_from(index).unwrap(),
-                vote: data(FinalityVotePhase::Precommit),
-                vote_signature: sign(key, FinalityVotePhase::Precommit).to_bytes(),
-                proof_hashes: vec![[1; 32]],
-                unlock_quorum: None,
-                signature: [0; 96],
-            };
-            claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
-            claim
-        })
-        .collect();
+    let claims = |phase| {
+        keys[..4]
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let mut claim = VoteAttestation {
+                    validator_index: u32::try_from(index).unwrap(),
+                    vote: data(phase),
+                    vote_signature: sign(key, phase).to_bytes(),
+                    proof_hashes: if phase == FinalityVotePhase::Precommit {
+                        vec![[1; 32]]
+                    } else {
+                        Vec::new()
+                    },
+                    unlock_quorum: None,
+                    signature: [0; 96],
+                };
+                claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+                claim
+            })
+            .collect()
+    };
+    let prevote_attestations = claims(FinalityVotePhase::Prevote);
+    let precommit_attestations = claims(FinalityVotePhase::Precommit);
+    certificate.prevote_attestations = prevote_attestations;
+    certificate.precommit_attestations = precommit_attestations;
     first.source.finality = certificate.clone();
     first.claim = EvidenceClaim::Inactivity {
         validator_index: 4,

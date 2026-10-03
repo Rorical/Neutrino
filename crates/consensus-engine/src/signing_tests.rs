@@ -61,6 +61,29 @@ fn data(round: u32, hash: Hash, phase: FinalityVotePhase) -> FinalityVoteData {
     }
 }
 
+fn quorum_for(spec: &ChainSpec, mut data: FinalityVoteData) -> QuorumCertificate {
+    data.phase = FinalityVotePhase::Prevote;
+    let signatures: Vec<_> = (0..spec.initial_validators.len())
+        .map(|index| key(u32::try_from(index).unwrap()).sign_finality_vote(spec.chain_id, &data))
+        .map(|bytes| neutrino_crypto::bls::Signature::from_bytes(&bytes).unwrap())
+        .collect();
+    QuorumCertificate {
+        data,
+        aggregate: neutrino_consensus_types::AggregatedVote {
+            aggregation_bits: BitVec::from_bytes(
+                u32::try_from(signatures.len()).unwrap(),
+                vec![(1 << signatures.len()) - 1],
+            )
+            .unwrap(),
+            signature: neutrino_crypto::bls::aggregate_signatures(
+                &signatures.iter().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .to_bytes(),
+        },
+    }
+}
+
 fn chunk(spec: &ChainSpec) -> Chunk {
     Chunk {
         chunk_id: 0,
@@ -131,9 +154,9 @@ fn peer_prevote(spec: &ChainSpec, candidate: &Chunk, index: u32) -> FinalityVote
     }
     FinalityVote {
         signature: key(index).sign_finality_vote(spec.chain_id, &data),
-        data,
+        data: data.clone(),
         aggregation_bits,
-        attestations: Vec::new(),
+        attestations: vec![key(index).attest_vote(spec.chain_id, data.clone(), Vec::new(), None)],
     }
 }
 
@@ -179,24 +202,26 @@ fn vote_reservation_survives_restart_and_refuses_conflict_or_older_round() {
 
 #[test]
 fn full_attestation_and_key_identity_are_reserved() {
-    let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+    let spec = spec();
+    let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
     let precommit = data(0, [1; 32], FinalityVotePhase::Precommit);
+    let quorum = Some(quorum_for(&spec, precommit.clone()));
     engine
-        .sign_vote_durable(&key(0), precommit.clone(), vec![[3; 32]], None)
+        .sign_vote_durable(&key(0), precommit.clone(), vec![[3; 32]], quorum.clone())
         .unwrap();
     assert!(matches!(
-        engine.sign_vote_durable(&key(0), precommit.clone(), vec![[4; 32]], None),
+        engine.sign_vote_durable(&key(0), precommit.clone(), vec![[4; 32]], quorum.clone()),
         Err(EngineError::Signing(SigningViolation::Conflict))
     ));
     // A different public key has independent signing state; a reused index does not.
     assert!(
         engine
-            .sign_vote_durable(&key(1), precommit.clone(), vec![[4; 32]], None)
+            .sign_vote_durable(&key(1), precommit.clone(), vec![[4; 32]], quorum.clone())
             .is_ok()
     );
     let wrong_index = ProposerKey::from_ikm(&[1; 32], 1).unwrap();
     assert!(matches!(
-        engine.sign_vote_durable(&wrong_index, precommit, vec![[3; 32]], None),
+        engine.sign_vote_durable(&wrong_index, precommit, vec![[3; 32]], quorum),
         Err(EngineError::Signing(SigningViolation::KeyNotActive))
     ));
 }
@@ -291,21 +316,24 @@ fn active_position_rebinding_preserves_the_public_key_signing_journal() {
         restored.sign_proposal_durable(&rebound, 14, [1; 32]),
         Err(EngineError::Signing(SigningViolation::Regression))
     ));
+    let precommit = FinalityVoteData {
+        chunk_id: 1,
+        ..data(0, [1; 32], FinalityVotePhase::Precommit)
+    };
+    let quorum = quorum_for(restored.chain_spec(), precommit.clone());
     let vote = restored
-        .sign_vote_durable(
-            &rebound,
-            FinalityVoteData {
-                chunk_id: 1,
-                ..data(0, [1; 32], FinalityVotePhase::Precommit)
-            },
-            vec![[3; 32]],
-            None,
-        )
+        .sign_vote_durable(&rebound, precommit, vec![[3; 32]], Some(quorum))
         .unwrap();
     assert_eq!(vote.aggregation_bits.get(2), Some(true));
     assert_eq!(vote.aggregation_bits.get(0), Some(false));
     assert_eq!(vote.attestations[0].validator_index, 2);
-    neutrino_prover_chunk::finality::verify_vote(7, &active, &vote, 0, 1).unwrap();
+    neutrino_prover_chunk::finality::verify_vote(
+        7,
+        &active,
+        &vote,
+        &restored.chain_spec().consensus,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -409,22 +437,23 @@ fn crash_after_vote_intent_before_session_commit_recovers_original_vote() {
     let spec = spec();
     let mut engine = Engine::genesis(spec.clone(), FaultDb::default()).unwrap();
     engine.set_local_voter(key(0));
-    engine.store_mut().db_mut().fail_durable_after = Some(1);
+    engine.store_mut().db_mut().fail_durable_after = Some(2);
     assert!(engine.open_bft_session_at(chunk(&spec), 100).is_err());
-    assert!(engine.bft_session(0).is_none());
+    assert!(!engine.bft_session(0).unwrap().local_prevoted());
     assert_eq!(
         engine
             .store()
             .db()
             .iter_column(Column::BftSessions)
-            .unwrap(),
-        Vec::<(Vec<u8>, Vec<u8>)>::new()
+            .unwrap()
+            .len(),
+        1
     );
     let mut db = engine.store().db().clone();
     db.fail_durable_after = None;
     let mut restarted = Engine::open(spec.clone(), db).unwrap();
     restarted.set_local_voter(key(0));
-    let actions = restarted.open_bft_session_at(chunk(&spec), 101).unwrap();
+    let actions = restarted.resume_bft_actions().unwrap();
     assert!(
         actions
             .iter()
@@ -506,7 +535,7 @@ fn crash_after_precommit_reservation_recovers_original_unlock_quorum() {
     let (mut engine, candidate) = engine_with_proof(&spec);
     engine.set_local_voter(key(0));
     engine.open_bft_session_at(candidate.clone(), 100).unwrap();
-    engine.store_mut().db_mut().fail_durable_after = Some(1);
+    engine.store_mut().db_mut().fail_durable_after = Some(2);
     assert!(
         engine
             .observe_finality_vote(peer_prevote(&spec, &candidate, 1))
@@ -552,7 +581,7 @@ fn in_process_retry_does_not_change_reserved_unlock_claim_when_quorum_grows() {
     let (mut engine, candidate) = engine_with_proof(&spec);
     engine.set_local_voter(key(0));
     engine.open_bft_session_at(candidate.clone(), 100).unwrap();
-    engine.store_mut().db_mut().fail_durable_after = Some(1);
+    engine.store_mut().db_mut().fail_durable_after = Some(2);
     assert!(
         engine
             .observe_finality_vote(peer_prevote(&spec, &candidate, 1))
@@ -598,7 +627,12 @@ fn restart_rejects_changed_block_receipt_before_signing() {
     receipt.proof_bytes.push(2);
     engine
         .store_mut()
-        .put_block_proof(&candidate.end_block_hash, &receipt)
+        .db_mut()
+        .put(
+            Column::BlockProofs,
+            &candidate.end_block_hash,
+            &borsh::to_vec(&receipt).unwrap(),
+        )
         .unwrap();
     assert!(Engine::open(spec, engine.store().db().clone()).is_err());
 }
@@ -682,14 +716,14 @@ fn direct_finalization_recovers_existing_session_without_prior_node_resume() {
     let mut peer = peer_prevote(&spec, &candidate, 1);
     peer.data.phase = FinalityVotePhase::Precommit;
     peer.signature = key(1).sign_finality_vote(spec.chain_id, &peer.data);
-    peer.attestations.push(key(1).attest_precommit(
+    peer.attestations = vec![key(1).attest_vote(
         spec.chain_id,
         peer.data.clone(),
         vec![neutrino_prover_chunk::execution::commitment(&proof)],
         None,
-    ));
+    )];
     engine.observe_finality_vote(peer).unwrap();
-    engine.store_mut().db_mut().fail_durable_after = Some(1);
+    engine.store_mut().db_mut().fail_durable_after = Some(2);
     assert!(
         engine
             .observe_finality_vote(peer_prevote(&spec, &candidate, 1))
@@ -717,4 +751,51 @@ fn direct_finalization_recovers_existing_session_without_prior_node_resume() {
     .unwrap();
     assert!(restarted.local_voter().is_none());
     assert!(restarted.bft_session(0).unwrap().local_precommitted());
+}
+
+#[test]
+fn durable_lock_rejects_circular_prevotes_and_survives_an_unsigned_new_round() {
+    let spec = spec();
+    let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
+    let first = data(0, [1; 32], FinalityVotePhase::Precommit);
+    let locked = quorum_for(&spec, first.clone());
+    engine
+        .sign_vote_durable(&key(0), first, vec![[3; 32]], Some(locked.clone()))
+        .unwrap();
+    let mut target = data(1, [2; 32], FinalityVotePhase::Prevote);
+    assert!(
+        engine
+            .sign_vote_durable(&key(0), target.clone(), vec![], None)
+            .is_err()
+    );
+    let justification = quorum_for(&spec, target.clone());
+    assert!(
+        engine
+            .sign_vote_durable(&key(0), target.clone(), vec![], Some(justification.clone()))
+            .is_err()
+    );
+    target.round = 2;
+    let signed = engine
+        .sign_vote_durable(&key(0), target.clone(), vec![], Some(justification.clone()))
+        .unwrap();
+    assert_eq!(
+        signed.attestations[0].unlock_quorum,
+        Some(justification.clone())
+    );
+    let mut restored = Engine::open(spec, engine.store().db().clone()).unwrap();
+    assert_eq!(
+        restored.reserved_signing_lock(&key(0), 0).unwrap(),
+        Some(locked)
+    );
+    assert_eq!(
+        restored
+            .sign_vote_durable(&key(0), target.clone(), vec![], Some(justification))
+            .unwrap(),
+        signed
+    );
+    assert!(
+        restored
+            .sign_vote_durable(&key(0), target, vec![], None)
+            .is_err()
+    );
 }

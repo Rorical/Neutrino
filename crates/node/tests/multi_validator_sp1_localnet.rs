@@ -15,19 +15,22 @@
 //!
 //! Convergence assertion: all 16 validators reach
 //! `finalized_chunk_id == Some(0)` within the test window — the
-//! M7-new headline criterion over real SP1 envelopes.
+//! M7-new headline criterion over real SP1 envelopes. The final validator's
+//! incoming precommit and Chunk-proof gossip is deliberately omitted, so its
+//! production `SyncDriver` must recover complete finality through `ChunkProofById` RPC.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProposerKey};
-use neutrino_consensus_types::{Block, BlockProof, ChunkProof, FinalityVote};
-use neutrino_network::Topic;
+use neutrino_consensus_types::{FinalityVote, FinalityVotePhase};
 use neutrino_network::libp2p::gossipsub::MessageAcceptance;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
 use neutrino_network::{Multiaddr, PeerId};
+use neutrino_network::{Topic, rpc::RpcRequest};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BlockHash, BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams,
@@ -38,7 +41,7 @@ pub mod native_chunk;
 use native_chunk::NativeChunkTestSystem;
 use neutrino_runtime_host::WasmExecutor;
 use neutrino_storage::MemoryDatabase;
-use neutrino_sync::SyncBackend;
+use neutrino_sync::{SyncBackend, SyncDriver, SyncDriverConfig};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -110,6 +113,7 @@ fn chain_spec(count: u8) -> ChainSpec {
 type NodeBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
 struct NodeHandle {
+    peer_id: PeerId,
     cmd_tx: mpsc::Sender<NetworkCommand>,
     event_rx: Option<mpsc::Receiver<NetworkEvent>>,
     backend: Arc<NodeBackend>,
@@ -118,6 +122,7 @@ struct NodeHandle {
 
 fn build_node(validator_index: u8) -> (NodeHandle, NetworkService) {
     let key = Keypair::generate_ed25519();
+    let peer_id = PeerId::from(key.public());
     // Bounded event queues keep the 16-validator burst within capacity; the
     // mesh isn't backpressure-bottlenecked.
     let (cmd_tx, cmd_rx) = mpsc::channel(1024);
@@ -132,6 +137,7 @@ fn build_node(validator_index: u8) -> (NodeHandle, NetworkService) {
     backend.set_network_publisher(cmd_tx.clone());
     (
         NodeHandle {
+            peer_id,
             cmd_tx,
             event_rx: Some(event_rx),
             backend,
@@ -179,6 +185,7 @@ fn all_bft_topics() -> Vec<Topic> {
         Topic::Blocks,
         Topic::BlockProofs,
         Topic::ChunkProofs,
+        Topic::BftCandidates,
         Topic::FinalityVotesPrevote,
         Topic::FinalityVotesPrecommit,
     ];
@@ -199,133 +206,87 @@ async fn subscribe_all(handle: &NodeHandle, topics: &[Topic]) {
     }
 }
 
-/// Permanent gossip driver task. Buffers `BlockProof`s that race
-/// their `Block` (gossipsub may deliver either first) and retries
-/// them after every block import.
-fn spawn_handle_driver(
-    backend: Arc<NodeBackend>,
-    cmd_tx: mpsc::Sender<NetworkCommand>,
-    mut event_rx: mpsc::Receiver<NetworkEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut pending_proofs: Vec<BlockProof> = Vec::new();
-        while let Some(event) = event_rx.recv().await {
-            let NetworkEvent::GossipMessage {
-                propagation_source,
-                topic,
-                data,
-                message_id,
-            } = event
-            else {
-                continue;
-            };
-            let acceptance = match topic {
-                Topic::Blocks => {
-                    if let Ok(block) = borsh::from_slice::<Block>(&data) {
-                        let _ = backend.verify_and_import_gossip_block(block).await;
-                        // A fresh block import may have unblocked a
-                        // buffered proof. Retry every buffered
-                        // entry; the ones that still fail stay
-                        // buffered.
-                        let drained: Vec<BlockProof> = std::mem::take(&mut pending_proofs);
-                        for proof in drained {
-                            let height = proof.height;
-                            match import_proof_blocking(&backend, height, proof.clone()).await {
-                                Ok(()) => {}
-                                Err(_) => pending_proofs.push(proof),
-                            }
-                        }
-                        MessageAcceptance::Accept
-                    } else {
-                        MessageAcceptance::Reject
-                    }
-                }
-                Topic::BlockProofs => {
-                    if let Ok(proof) = borsh::from_slice::<BlockProof>(&data) {
-                        let height = proof.height;
-                        match import_proof_blocking(&backend, height, proof.clone()).await {
-                            Ok(()) => MessageAcceptance::Accept,
-                            Err(true) => {
-                                // ChainBehind — buffer for retry
-                                // after the matching block lands.
-                                pending_proofs.push(proof);
-                                MessageAcceptance::Ignore
-                            }
-                            Err(false) => MessageAcceptance::Reject,
-                        }
-                    } else {
-                        MessageAcceptance::Reject
-                    }
-                }
-                Topic::FinalityVotesPrevote | Topic::FinalityVotesPrecommit => {
-                    if let Ok(vote) = borsh::from_slice::<FinalityVote>(&data) {
-                        backend.ingest_finality_vote(vote).await;
-                        MessageAcceptance::Accept
-                    } else {
-                        MessageAcceptance::Reject
-                    }
-                }
-                Topic::AggregateFinalityVotes(subnet) => {
-                    if let Ok(vote) = borsh::from_slice::<FinalityVote>(&data) {
-                        backend.ingest_aggregate_finality_vote(subnet, vote).await;
-                        MessageAcceptance::Accept
-                    } else {
-                        MessageAcceptance::Reject
-                    }
-                }
-                Topic::ChunkProofs => {
-                    if let Ok(proof) = borsh::from_slice::<ChunkProof>(&data) {
-                        let _ = backend.verify_and_import_chunk_proof(proof).await;
-                        MessageAcceptance::Accept
-                    } else {
-                        MessageAcceptance::Reject
-                    }
-                }
-                _ => MessageAcceptance::Ignore,
-            };
-            let _ = cmd_tx
-                .send(NetworkCommand::ReportGossipValidation {
+fn omit_finality_gossip(event: &NetworkEvent) -> bool {
+    match event {
+        NetworkEvent::GossipMessage {
+            topic: Topic::ChunkProofs | Topic::FinalityVotesPrecommit,
+            ..
+        } => true,
+        NetworkEvent::GossipMessage {
+            topic: Topic::AggregateFinalityVotes(_),
+            data,
+            ..
+        } => borsh::from_slice::<FinalityVote>(data)
+            .is_ok_and(|vote| vote.data.phase == FinalityVotePhase::Precommit),
+        _ => false,
+    }
+}
+
+/// Replay consumed connection notices, then pass the actual network stream to
+/// the production driver, including status and complete-proof RPC handling.
+async fn spawn_handle_driver(
+    handle: &mut NodeHandle,
+    peers: Vec<PeerId>,
+    backfill_peer: PeerId,
+    backfill_requests: Arc<AtomicUsize>,
+) -> [tokio::task::JoinHandle<()>; 2] {
+    let (events, event_rx) = mpsc::channel(4096);
+    for peer in peers {
+        events
+            .send(NetworkEvent::PeerConnected(peer))
+            .await
+            .expect("replay connected peer");
+    }
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::clone(&handle.backend) as Arc<dyn SyncBackend>,
+        handle
+            .backend
+            .local_progress()
+            .await
+            .expect("local progress"),
+        handle.cmd_tx.clone(),
+        event_rx,
+    );
+    let driver_task = tokio::spawn(async move { driver.run().await.expect("sync driver") });
+    let omit_gossip = handle.peer_id == backfill_peer;
+    let cmd_tx = handle.cmd_tx.clone();
+    let mut network_events = handle.event_rx.take().expect("event stream present");
+    let relay_task = tokio::spawn(async move {
+        while let Some(event) = network_events.recv().await {
+            if let NetworkEvent::RpcRequestReceived {
+                peer,
+                request: RpcRequest::ChunkProofById(_),
+                ..
+            } = &event
+                && *peer == backfill_peer
+            {
+                backfill_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            if omit_gossip && omit_finality_gossip(&event) {
+                if let NetworkEvent::GossipMessage {
                     message_id,
                     propagation_source,
-                    acceptance,
-                })
-                .await;
+                    ..
+                } = event
+                {
+                    cmd_tx
+                        .send(NetworkCommand::ReportGossipValidation {
+                            message_id,
+                            propagation_source,
+                            acceptance: MessageAcceptance::Ignore,
+                        })
+                        .await
+                        .expect("report omitted gossip");
+                }
+                continue;
+            }
+            if events.send(event).await.is_err() {
+                return;
+            }
         }
-    })
-}
-
-/// Import a block proof on a blocking thread. Returns:
-///
-/// - `Ok(())` on success
-/// - `Err(true)` if rejected with `ChainBehind` (proof outran its block)
-/// - `Err(false)` for any other rejection
-async fn import_proof_blocking(
-    backend: &Arc<NodeBackend>,
-    height: neutrino_primitives::Height,
-    proof: BlockProof,
-) -> Result<(), bool> {
-    let backend = Arc::clone(backend);
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("inner runtime");
-        rt.block_on(backend.verify_and_import_block_proofs(height, vec![proof]))
-    })
-    .await
-    .expect("spawn_blocking proof import")
-    .map(|_| ())
-    .map_err(|err| matches!(err, neutrino_sync::SyncBackendError::ChainBehind(_)))
-}
-
-async fn finalized_index(handle: &NodeHandle) -> neutrino_primitives::CheckpointIndex {
-    handle
-        .backend
-        .local_status()
-        .await
-        .unwrap()
-        .finalized_chunk_id
-        .map_or(0, |id| id + 1)
+    });
+    [driver_task, relay_task]
 }
 
 /// Producer (v0) drives the real production path: WASM dry-run →
@@ -385,27 +346,40 @@ async fn wait_for_all_finalised(
 ) -> Vec<neutrino_primitives::CheckpointIndex> {
     loop {
         let mut indices = Vec::with_capacity(handles.len());
+        let mut progress = Vec::with_capacity(handles.len());
         for h in handles {
-            h.backend.tick_bft_round_timeouts(0).await;
-            indices.push(finalized_index(h).await);
+            let snapshot = h.backend.local_progress().await.expect("local progress");
+            indices.push(snapshot.finalized_chunk_id.map_or(0, |id| id + 1));
+            progress.push((
+                snapshot.head_height,
+                snapshot.proven_height,
+                snapshot.body_height,
+            ));
         }
         if indices.iter().all(|i| *i >= 1) {
             return indices;
         }
         if tokio::time::Instant::now() >= deadline {
-            let mut head_heights = Vec::with_capacity(handles.len());
-            let mut proven_heights = Vec::with_capacity(handles.len());
-            let mut next_chunks = Vec::with_capacity(handles.len());
-            for h in handles {
-                let progress = h.backend.local_progress().await.unwrap();
-                head_heights.push(progress.head_height);
-                proven_heights.push(progress.proven_height);
-                next_chunks.push(h.backend.next_chunk_to_close());
-            }
+            let sessions: Vec<_> = handles
+                .iter()
+                .map(|handle| {
+                    handle.backend.with_engine_mut_for_test(|engine| {
+                        engine.bft_session(0).map(|session| {
+                            (
+                                session.round(),
+                                session.local_prevoted(),
+                                session.local_precommitted(),
+                                session.prevote_quorum_observed(),
+                                session.precommit_quorum_observed(),
+                            )
+                        })
+                    })
+                })
+                .collect();
             panic!(
-                "M7-new 16-validator SP1 BFT did not finalize chunk 0 within the test budget. \
-                 Latest finalized indices = {indices:?}; head heights = {head_heights:?}; \
-                 proven heights = {proven_heights:?}; next chunks = {next_chunks:?}"
+                "16-validator BFT did not finalize chunk 0 within the test budget. \
+                 Finalized indices = {indices:?}; (head, proven, body) = {progress:?}; \
+                 (round, own prevote, own precommit, prevote quorum, precommit quorum) = {sessions:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -417,7 +391,12 @@ async fn wait_for_all_finalised(
 // 16-node libp2p + BFT + SP1 pipeline;
 // splitting it would dilute the assertion.
 async fn sixteen_validators_finalise_chunk_zero_over_real_sp1_envelopes() {
-    let _ = tracing_subscriber::fmt::try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
 
     // Build all N_VALIDATORS nodes. `build_node` calls Sp1ProofSystem
     // and wasmtime which both spin up internal runtimes; spawn_blocking
@@ -439,15 +418,25 @@ async fn sixteen_validators_finalise_chunk_zero_over_real_sp1_envelopes() {
         services.push(s);
     }
 
+    let completion_handles: Vec<_> = handles
+        .iter()
+        .map(|handle| tokio::spawn(Arc::clone(&handle.backend).run_consensus_proof_notifications()))
+        .collect();
+    let bft_clock_handles: Vec<_> = handles
+        .iter()
+        .map(|handle| tokio::spawn(Arc::clone(&handle.backend).run_bft_round_timeouts()))
+        .collect();
+
     // Every node listens on its own port for full-mesh dial topology
     // (avoids the star-via-v0 bottleneck on gossipsub mesh formation).
     for svc in &mut services {
         svc.listen_on("/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
             .expect("listen");
     }
-    for svc in services {
-        tokio::spawn(svc.run());
-    }
+    let network_handles: Vec<_> = services
+        .into_iter()
+        .map(|service| tokio::spawn(service.run()))
+        .collect();
 
     // Capture each node's listen address.
     for h in &mut handles {
@@ -472,6 +461,7 @@ async fn sixteen_validators_finalise_chunk_zero_over_real_sp1_envelopes() {
         }
     }
 
+    let mut connected_peers = Vec::with_capacity(handles.len());
     for h in &mut handles {
         let rx = h.event_rx.as_mut().expect("event_rx still attached");
         let peers = wait_for_peer_count(rx, usize::from(N_VALIDATORS - 1)).await;
@@ -480,16 +470,18 @@ async fn sixteen_validators_finalise_chunk_zero_over_real_sp1_envelopes() {
             usize::from(N_VALIDATORS - 1),
             "node did not connect to the full localnet peer mesh"
         );
+        connected_peers.push(peers);
     }
 
-    // Spawn permanent gossip drivers per node.
-    for h in &mut handles {
-        let rx = h.event_rx.take().expect("event_rx still present");
-        drop(spawn_handle_driver(
-            Arc::clone(&h.backend),
-            h.cmd_tx.clone(),
-            rx,
-        ));
+    // The last validator cannot receive a gossip precommit quorum or complete
+    // Chunk proof. Its real driver must recover finality through ChunkProofById.
+    let backfill_peer = handles.last().expect("validators present").peer_id;
+    let backfill_requests = Arc::new(AtomicUsize::new(0));
+    let mut driver_tasks = Vec::with_capacity(handles.len() * 2);
+    for (handle, peers) in handles.iter_mut().zip(connected_peers) {
+        driver_tasks.extend(
+            spawn_handle_driver(handle, peers, backfill_peer, Arc::clone(&backfill_requests)).await,
+        );
     }
 
     // Subscribe to BFT topics after the mesh is established.
@@ -517,5 +509,25 @@ async fn sixteen_validators_finalise_chunk_zero_over_real_sp1_envelopes() {
             "validator {i} did not finalize chunk 0 over real SP1 envelopes \
              (finalized_index = {idx})"
         );
+    }
+    assert!(
+        backfill_requests.load(Ordering::Relaxed) > 0,
+        "the gossip-isolated validator must request a complete Chunk proof over RPC"
+    );
+    for handle in driver_tasks
+        .iter()
+        .chain(&completion_handles)
+        .chain(&bft_clock_handles)
+        .chain(&network_handles)
+    {
+        handle.abort();
+    }
+    for handle in driver_tasks
+        .into_iter()
+        .chain(completion_handles)
+        .chain(bft_clock_handles)
+        .chain(network_handles)
+    {
+        let _ = handle.await;
     }
 }

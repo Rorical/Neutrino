@@ -276,12 +276,9 @@ async fn invalid_proof_signing_detector_emits_evidence_on_precommit() {
     let mut bad_vote = partial_vote(0, FinalityVotePhase::Precommit, &v1, active_set_len);
     let mut hashes = vec![[0; 32]; usize::try_from(spec(2).consensus.chunk_size).unwrap()];
     hashes[0] = neutrino_primitives::blake3_256(&borsh::to_vec(&bad_proof).unwrap());
-    bad_vote.attestations.push(v1.attest_precommit(
-        TEST_CHAIN_ID,
-        bad_vote.data.clone(),
-        hashes,
-        None,
-    ));
+    bad_vote
+        .attestations
+        .push(v1.attest_vote(TEST_CHAIN_ID, bad_vote.data.clone(), hashes, None));
     backend.ingest_finality_vote(bad_vote.clone()).await;
 
     assert_eq!(
@@ -379,7 +376,7 @@ async fn ingest_rejects_invalid_proof_signing_evidence_whose_proof_verifies() {
     };
     let dishonest_evidence = SlashingEvidence::InvalidProofSigning {
         validator_index: v1.validator_index(),
-        attestation: v1.attest_precommit(
+        attestation: v1.attest_vote(
             TEST_CHAIN_ID,
             indexed.data.clone(),
             vec![
@@ -447,7 +444,7 @@ async fn aggregate_only_proof_acceptance_attributes_every_signer() {
     let signatures: Vec<_> = (0..2)
         .map(|index| {
             let voter = proposer(index);
-            aggregate.attestations.push(voter.attest_precommit(
+            aggregate.attestations.push(voter.attest_vote(
                 TEST_CHAIN_ID,
                 aggregate.data.clone(),
                 vec![neutrino_primitives::blake3_256(
@@ -482,4 +479,135 @@ async fn aggregate_only_proof_acceptance_attributes_every_signer() {
         .collect();
     signers.sort_unstable();
     assert_eq!(signers, vec![0, 1]);
+}
+
+fn proof_acceptance_vote(proof: &BlockProof, signer: &ProposerKey) -> FinalityVote {
+    let mut vote = partial_vote(0, FinalityVotePhase::Precommit, signer, 2);
+    vote.attestations.push(signer.attest_vote(
+        TEST_CHAIN_ID,
+        vote.data.clone(),
+        vec![neutrino_primitives::blake3_256(
+            &borsh::to_vec(proof).unwrap(),
+        )],
+        None,
+    ));
+    vote
+}
+
+fn assert_objective_invalid_acceptance(
+    offences: &[SlashingEvidence],
+    invalid: &BlockProof,
+    signer_index: u32,
+    expected_reason: ProofRejectionReason,
+) {
+    use neutrino_proof_system::ProofSystem;
+    let [
+        SlashingEvidence::InvalidProofSigning {
+            validator_index,
+            vote,
+            attestation,
+            rejected_proof,
+            reason,
+        },
+    ] = offences
+    else {
+        panic!("expected one objectively attributable invalid-proof offence, got {offences:?}")
+    };
+    assert_eq!(*validator_index, signer_index);
+    assert_eq!(
+        rejected_proof, invalid,
+        "later valid bytes do not change the old exact-byte verdict"
+    );
+    assert_eq!(*reason, expected_reason);
+    neutrino_consensus_engine::slashing::verify_proof_signing_attribution(
+        *validator_index,
+        vote,
+        attestation,
+        rejected_proof,
+        &validators(2),
+        TEST_CHAIN_ID,
+        1,
+    )
+    .unwrap();
+    let rejected =
+        borsh::from_slice::<MockBlockProof>(&rejected_proof.proof_bytes).map_or(true, |decoded| {
+            MockProofSystem::new()
+                .verify_block(&decoded, &rejected_proof.public_inputs)
+                .is_err()
+        });
+    assert!(
+        rejected,
+        "the carried exact bytes are independently rejected"
+    );
+}
+
+#[tokio::test]
+async fn valid_replacement_preserves_accountability_for_later_signed_invalid_bytes() {
+    for malformed in [false, true] {
+        let backend = fresh_backend();
+        let signer = proposer(1);
+        let genesis = backend.local_status().await.unwrap().head_block_hash;
+        let block = signed_block(1, genesis, 1, &proposer(0));
+        let hash = block.hash();
+        backend
+            .verify_and_import_gossip_block(block.clone())
+            .await
+            .unwrap();
+        let mut invalid = bad_mock_proof(&block);
+        let expected_reason = if malformed {
+            invalid.proof_bytes = vec![0x99];
+            ProofRejectionReason::MalformedProof
+        } else {
+            ProofRejectionReason::PublicInputsMismatch
+        };
+        assert!(
+            backend
+                .verify_and_import_block_proofs(1, vec![invalid.clone()])
+                .await
+                .is_err()
+        );
+        let valid = good_mock_proof(&block);
+        backend
+            .verify_and_import_block_proofs(1, vec![valid.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.block_state(&hash),
+            Some(neutrino_consensus_engine::BlockState::Proven)
+        );
+        assert_eq!(
+            backend.block_proofs_by_hash(&[hash]).await.unwrap().proofs,
+            vec![valid.clone()]
+        );
+
+        let valid_vote = proof_acceptance_vote(&valid, &signer);
+        backend.ingest_finality_vote(valid_vote.clone()).await;
+        assert_eq!(
+            backend.slashing_pool_len(),
+            0,
+            "accepting valid bytes cannot inherit an older rejection"
+        );
+        backend
+            .ingest_finality_vote(proof_acceptance_vote(&invalid, &signer))
+            .await;
+        let offences = backend.drain_slashing_pool(8);
+        assert_objective_invalid_acceptance(
+            &offences,
+            &invalid,
+            signer.validator_index(),
+            expected_reason,
+        );
+
+        // The objective evidence affects neither proof storage nor the block FSM.
+        assert_eq!(
+            backend.block_state(&hash),
+            Some(neutrino_consensus_engine::BlockState::Proven)
+        );
+        assert_eq!(
+            backend.block_proofs_by_hash(&[hash]).await.unwrap().proofs,
+            vec![valid]
+        );
+        backend.ingest_finality_vote(valid_vote).await;
+        assert_eq!(backend.slashing_pool_len(), 0);
+    }
 }

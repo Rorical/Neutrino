@@ -2,9 +2,10 @@
 
 use crate::rpc::{
     BlockProofByHashBehaviour, BlockProofByHeightBehaviour, BlocksByRangeBehaviour,
-    BlocksByRootBehaviour, CheckpointLatestBehaviour, ChunkProofByIdBehaviour,
-    FinalityCertByChunkBehaviour, HistoryProofByRangeBehaviour, MetadataBehaviour, PingBehaviour,
-    StateByRootBehaviour, StatusBehaviour, WitnessByBlockBehaviour,
+    BlocksByRootBehaviour, CandidateByChunkBehaviour, CheckpointLatestBehaviour,
+    ChunkProofByIdBehaviour, FinalityCertByChunkBehaviour, HistoryProofByRangeBehaviour,
+    MetadataBehaviour, PingBehaviour, StateByRootBehaviour, StatusBehaviour,
+    WitnessByBlockBehaviour,
 };
 use libp2p::{
     connection_limits, gossipsub, identify,
@@ -21,7 +22,7 @@ use libp2p::{
 /// - [`identify::Behaviour`] — protocol negotiation and listen-addr exchange.
 /// - [`ping::Behaviour`] — keepalive and RTT estimation.
 /// - [`connection_limits::Behaviour`] — DoS resistance via hard caps.
-/// - Eleven `request_response::Behaviour` instances, one per RPC: the six
+/// - Independent `request_response::Behaviour` instances, one per RPC: the six
 ///   core protocols (`status`, `metadata`, `ping` reply, `blocks_by_range`,
 ///   `blocks_by_root`, `state_by_root`) plus proof retrieval endpoints for
 ///   block, chunk, and recursive proofs.
@@ -63,4 +64,6 @@ pub struct NeutrinoBehaviour {
     pub rpc_finality_cert_by_chunk: FinalityCertByChunkBehaviour,
     /// `/neutrino/req/witness_by_block` request/response.
     pub rpc_witness_by_block: WitnessByBlockBehaviour,
+    /// Proven next-chunk candidate discovery.
+    pub rpc_candidate_by_chunk: CandidateByChunkBehaviour,
 }

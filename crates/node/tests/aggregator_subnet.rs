@@ -343,6 +343,10 @@ async fn passive_follower_finalises_via_aggregate_subnet_topic() {
 
     let (mut handle_a, mut svc_a) = build_node(0).await;
     let (mut handle_b, svc_b) = build_node(1).await;
+    let completion_a =
+        tokio::spawn(Arc::clone(&handle_a.backend).run_consensus_proof_notifications());
+    let completion_b =
+        tokio::spawn(Arc::clone(&handle_b.backend).run_consensus_proof_notifications());
 
     svc_a
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr"))
@@ -399,4 +403,8 @@ async fn passive_follower_finalises_via_aggregate_subnet_topic() {
         "passive validator B did not finalize chunk 0 — the aggregator \
          subnet emission path is broken"
     );
+    completion_a.abort();
+    completion_b.abort();
+    let _ = completion_a.await;
+    let _ = completion_b.await;
 }

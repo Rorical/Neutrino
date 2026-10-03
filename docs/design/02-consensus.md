@@ -1,16 +1,18 @@
 # Consensus
 
 The authenticated active validator set defines proposer eligibility and BFT
-weights. BLS-VRF binds chain ID, finalized seed and slot. Headers carry a proposer
+weights. Both configured quorum fractions must be at least 2/3. BLS-VRF binds
+chain ID, finalized seed and slot. Headers carry a proposer
 signature; native validation and the chunk Guest verify signatures and eligibility.
 Fork choice tracks proven branches and finality anchors. Branch materialization
 replays the selected branch through the runtime executor.
 
 Chunk BFT has prevote and precommit phases, round progression, locks and unlock
 quorums. Quorum checks use authenticated stake and signer bitmaps. Every accepted
-precommit signer must supply a signed attestation binding its individual vote,
-the exact ordered block-proof envelope hashes and its unlock declaration.
-Finality certificates retain complete attestation coverage. Omissions, duplicates,
+prevote and precommit signer supplies a signed attestation binding its individual
+vote and unlock declaration. Precommits also bind exact ordered block-proof
+envelope hashes; prevotes carry no proof hashes. Finality certificates retain
+complete coverage for both phases. Omissions, duplicates,
 foreign signers and incomplete proof lists invalidate votes/certificates.
 
 Vote and attestation signing synchronizes a durable journal before producing
@@ -30,8 +32,16 @@ rebroadcast original messages without resetting their round or unlock claim.
 Recovery verifies the saved candidate's original block branch under the current
 proof backend, rather than substituting the current fork-choice head. A verified
 certificate/proof for that saved target can materialize and finalize its branch.
-Sessions currently remain bound to that target across rounds; a higher-round
-candidate replacement protocol is separate work.
+Higher-round candidate replacement separately authenticates the new branch and
+preserves the existing lock. A conflicting prevote requires a valid target quorum
+strictly after the lock round and strictly before the new round. The candidate
+transition commits before signing and survives restart. Candidate hints do not
+reset locks or let unsigned messages force an early round. See
+[candidate replacement](22-bft-candidate-replacement.md) for the exact rules and
+the remaining leader/pacemaker liveness boundary.
+A current-target, current-round quorum keeps its pending precommit phase until
+the local timeout; advertisements cannot skip that phase. Round deadlines use an
+independent validator clock, and proof completion uses notifications.
 Finalized journal entries are reclaimed only behind durable finality; proposer
 slot watermarks remain. RocksDB synchronizes the WAL and permits one database
 writer. Separate databases using the same key require an external coordinator.

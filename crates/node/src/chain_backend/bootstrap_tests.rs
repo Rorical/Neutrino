@@ -14,7 +14,7 @@ use crate::config::BootstrapConfig;
 use neutrino_consensus_engine::{Engine, RetentionPolicy};
 use neutrino_consensus_types::{
     AggregatedVote, Block, BlockProofPublicInputs, Body, FinalityCert, FinalityVoteData,
-    FinalityVotePhase, Header, PrecommitAttestation,
+    FinalityVotePhase, Header, VoteAttestation,
     history::{HistoryFrontier, HistoryPath},
     history_proof::{
         ChainBinding, Checkpoint, ExecutionPrograms, HistoryProof, HistoryStatement, ProofDomain,
@@ -151,9 +151,10 @@ impl Fixture {
             active_validator_set_root: chunk.active_validator_set_root,
             prevote: aggregate(FinalityVotePhase::Prevote),
             precommit: aggregate(FinalityVotePhase::Precommit),
-            attestations: vec![],
+            prevote_attestations: vec![],
+            precommit_attestations: vec![],
         };
-        let mut claim = PrecommitAttestation {
+        let mut claim = VoteAttestation {
             validator_index: 0,
             vote: cert.precommit_vote().data,
             vote_signature: cert.precommit.signature,
@@ -164,7 +165,15 @@ impl Fixture {
         claim.signature = key
             .sign(&claim.signing_message(witness.chain_spec.chain_id))
             .to_bytes();
-        cert.attestations.push(claim);
+        cert.precommit_attestations.push(claim);
+        let mut prevote_claim = cert.precommit_attestations[0].clone();
+        prevote_claim.vote = cert.prevote_vote().data;
+        prevote_claim.vote_signature = cert.prevote.signature;
+        prevote_claim.proof_hashes.clear();
+        prevote_claim.signature = key
+            .sign(&prevote_claim.signing_message(witness.chain_spec.chain_id))
+            .to_bytes();
+        cert.prevote_attestations.push(prevote_claim);
         witness.finality_cert = cert;
         let validated = validate_consensus_with_context(&witness).unwrap();
         let record = HistoricalChunk {
@@ -478,7 +487,7 @@ async fn invalid_receipt_context_history_or_certificate_never_publishes_bootstra
                 if mutation == 4 {
                     opening.path.siblings[63][0] ^= 1;
                 } else {
-                    opening.record.finality.attestations[0].signature[0] ^= 1;
+                    opening.record.finality.precommit_attestations[0].signature[0] ^= 1;
                 }
                 manifest.recent = neutrino_consensus_types::bootstrap::BootstrapHistory::new(vec![
                     BoundedBytes::new(borsh::to_vec(&opening).unwrap()).unwrap(),

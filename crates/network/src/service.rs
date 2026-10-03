@@ -26,11 +26,12 @@ use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::rpc::{
     self, BlockProofByHashCodec, BlockProofByHashResponse, BlockProofByHeightCodec,
     BlockProofByHeightResponse, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec,
-    BlocksByRootResponse, CheckpointLatestCodec, CheckpointLatestResponse, ChunkProofByIdCodec,
-    ChunkProofByIdResponse, FinalityCertByChunkCodec, FinalityCertByChunkResponse,
-    HistoryProofByRangeCodec, HistoryProofByRangeResponse, MetadataCodec, PingCodec, RpcError,
-    RpcInboundId, RpcProtocol, RpcRequest, RpcResponse, StateByRootCodec, StateByRootResponse,
-    StatusCodec, WitnessByBlockCodec, WitnessByBlockResponse,
+    BlocksByRootResponse, CandidateByChunkCodec, CandidateByChunkResponse, CheckpointLatestCodec,
+    CheckpointLatestResponse, ChunkProofByIdCodec, ChunkProofByIdResponse,
+    FinalityCertByChunkCodec, FinalityCertByChunkResponse, HistoryProofByRangeCodec,
+    HistoryProofByRangeResponse, MetadataCodec, PingCodec, RpcError, RpcInboundId, RpcProtocol,
+    RpcRequest, RpcResponse, StateByRootCodec, StateByRootResponse, StatusCodec,
+    WitnessByBlockCodec, WitnessByBlockResponse,
 };
 use crate::topic::Topic;
 use futures::StreamExt;
@@ -258,6 +259,8 @@ struct RpcDispatch {
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_witness_by_block:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_candidate_by_chunk:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
 
     inbound_status: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Status>>>,
     inbound_metadata: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Metadata>>>,
@@ -278,6 +281,8 @@ struct RpcDispatch {
     inbound_finality_cert_by_chunk:
         HashMap<u64, ResponseChannel<rpc::RpcResult<FinalityCertByChunkResponse>>>,
     inbound_witness_by_block: HashMap<u64, ResponseChannel<rpc::RpcResult<WitnessByBlockResponse>>>,
+    inbound_candidate_by_chunk:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<CandidateByChunkResponse>>>,
 }
 
 impl RpcDispatch {
@@ -307,6 +312,7 @@ impl RpcDispatch {
             RpcProtocol::HistoryProofByRange => self.pending_history_proof_by_range.insert(id, tx),
             RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.insert(id, tx),
             RpcProtocol::WitnessByBlock => self.pending_witness_by_block.insert(id, tx),
+            RpcProtocol::CandidateByChunk => self.pending_candidate_by_chunk.insert(id, tx),
         };
     }
 
@@ -329,6 +335,7 @@ impl RpcDispatch {
             RpcProtocol::HistoryProofByRange => self.pending_history_proof_by_range.remove(&id),
             RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.remove(&id),
             RpcProtocol::WitnessByBlock => self.pending_witness_by_block.remove(&id),
+            RpcProtocol::CandidateByChunk => self.pending_candidate_by_chunk.remove(&id),
         }
     }
 }
@@ -541,6 +548,9 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcWitnessByBlock(ev)) => {
                 self.handle_rpc_witness_by_block(ev).await;
             }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcCandidateByChunk(ev)) => {
+                self.handle_rpc_candidate_by_chunk(ev).await;
+            }
             _ => {}
         }
     }
@@ -650,6 +660,9 @@ impl NetworkService {
                 .send_request(&peer, req),
             RpcRequest::WitnessByBlock(req) => {
                 behaviour.rpc_witness_by_block.send_request(&peer, req)
+            }
+            RpcRequest::CandidateByChunk(req) => {
+                behaviour.rpc_candidate_by_chunk.send_request(&peer, req)
             }
         };
         self.rpc.record_outbound(protocol, id, response_tx);
@@ -793,6 +806,16 @@ impl NetworkService {
                         .send_response(chan, Ok(payload))
                         .is_ok()
                 }),
+            (RpcProtocol::CandidateByChunk, RpcResponse::CandidateByChunk(payload)) => self
+                .rpc
+                .inbound_candidate_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_candidate_by_chunk
+                        .send_response(chan, Ok(*payload))
+                        .is_ok()
+                }),
             (RpcProtocol::Status, RpcResponse::Error { error, .. }) => self
                 .rpc
                 .inbound_status
@@ -910,6 +933,16 @@ impl NetworkService {
                 .is_some_and(|chan| {
                     behaviour
                         .rpc_witness_by_block
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::CandidateByChunk, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_candidate_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_candidate_by_chunk
                         .send_response(chan, Err(error))
                         .is_ok()
                 }),
@@ -1648,6 +1681,64 @@ impl NetworkService {
         }
     }
 
+    async fn handle_rpc_candidate_by_chunk(
+        &mut self,
+        ev: request_response::Event<
+            rpc::CandidateByChunkRequest,
+            rpc::RpcResult<CandidateByChunkResponse>,
+        >,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::CandidateByChunk);
+                self.rpc
+                    .inbound_candidate_by_chunk
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::CandidateByChunk(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::CandidateByChunk, request_id)
+                {
+                    let _ = tx.send(
+                        response
+                            .map(|payload| RpcResponse::CandidateByChunk(Box::new(payload)))
+                            .map_err(RpcError::Remote),
+                    );
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::CandidateByChunk, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on CandidateByChunk RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn complete_outbound_failure(
         &mut self,
         protocol: RpcProtocol,
@@ -1705,6 +1796,7 @@ fn build_behaviour(
         rpc_history_proof_by_range: build_rpc_history_proof_by_range(),
         rpc_finality_cert_by_chunk: build_rpc_finality_cert_by_chunk(),
         rpc_witness_by_block: build_rpc_witness_by_block(),
+        rpc_candidate_by_chunk: build_rpc_candidate_by_chunk(),
     })
 }
 
@@ -1991,6 +2083,17 @@ fn build_rpc_witness_by_block() -> rpc::WitnessByBlockBehaviour {
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
+    )
+}
+
+fn build_rpc_candidate_by_chunk() -> rpc::CandidateByChunkBehaviour {
+    request_response::Behaviour::with_codec(
+        CandidateByChunkCodec::default(),
+        [(
+            RpcProtocol::CandidateByChunk.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
     )
 }
 

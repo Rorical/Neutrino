@@ -278,8 +278,10 @@ async fn run_with_prover<P: ProgramProver + 'static>(
         }
     }
 
-    // Spawn the network service.
-    let network_handle = tokio::spawn(svc.run());
+    // Own every runner task from its first spawn. Dropping the set aborts
+    // them on startup errors, signal errors or cancellation of this future.
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(svc.run());
 
     // Dial bootnodes if any.
     for addr in &config.bootnodes {
@@ -299,7 +301,7 @@ async fn run_with_prover<P: ProgramProver + 'static>(
             if config.role == NodeRole::LightClient {
                 vec![Topic::Checkpoints]
             } else {
-                Topic::STATIC.to_vec()
+                Topic::all_default().collect()
             }
         },
         |names| {
@@ -335,6 +337,10 @@ async fn run_with_prover<P: ProgramProver + 'static>(
         .resume_bft_sessions()
         .await
         .map_err(NodeError::Engine)?;
+    tasks.spawn(Arc::clone(&concrete_backend).run_consensus_proof_notifications());
+    if concrete_backend.local_voter().is_some() {
+        tasks.spawn(Arc::clone(&concrete_backend).run_bft_round_timeouts());
+    }
     let producer_job = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = concrete_backend;
@@ -354,14 +360,18 @@ async fn run_with_prover<P: ProgramProver + 'static>(
         cmd_tx.clone(),
         event_rx,
     );
-    let driver_handle = tokio::spawn(driver.run());
-    let producer_handle = producer_job.map(|(backend, production_config)| {
-        tokio::spawn(run_block_producer(
+    tasks.spawn(async move {
+        if let Err(error) = driver.run().await {
+            warn!(%error, "sync driver stopped with an error");
+        }
+    });
+    if let Some((backend, production_config)) = producer_job {
+        tasks.spawn(run_block_producer(
             backend,
             cmd_tx.clone(),
             production_config,
-        ))
-    });
+        ));
+    }
     // Optional JSON-RPC server. Started after the engine is open so
     // the very first request observes a consistent head.
     let rpc_handle = if let Some(rpc_cfg) = config.rpc.as_ref() {
@@ -382,15 +392,16 @@ async fn run_with_prover<P: ProgramProver + 'static>(
     // Suppress the "unused" warning for nodes that never request RPC.
     let _ = &rpc_backend;
 
-    // Wait for shutdown signal.
-    wait_for_shutdown().await?;
-    info!("shutdown signal received");
-
-    // Closing the command channel triggers the network service to stop;
-    // dropping the channels propagates to the driver loop.
-    if let Some(handle) = producer_handle.as_ref() {
-        handle.abort();
+    // Clean up even when installing a signal handler fails. ServerHandle's
+    // final drop also stops RPC if the caller cancels this whole future.
+    let shutdown = wait_for_shutdown().await;
+    if shutdown.is_ok() {
+        info!("shutdown signal received");
     }
+
+    // Abort the driver too: it owns command senders and backend/DB references,
+    // so dropping only our sender cannot shut down the network task.
+    tasks.abort_all();
     if let Some(handle) = rpc_handle.as_ref() {
         let _ = handle.stop();
     }
@@ -398,11 +409,7 @@ async fn run_with_prover<P: ProgramProver + 'static>(
 
     // Give tasks a brief grace period to flush logs.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        let _ = network_handle.await;
-        let _ = driver_handle.await;
-        if let Some(handle) = producer_handle {
-            let _ = handle.await;
-        }
+        tasks.shutdown().await;
         if let Some(handle) = rpc_handle {
             handle.stopped().await;
         }
@@ -410,14 +417,12 @@ async fn run_with_prover<P: ProgramProver + 'static>(
     .await;
 
     info!("node stopped");
+    shutdown?;
     Ok(())
 }
 
 fn topic_from_name(name: &str) -> Option<Topic> {
-    Topic::STATIC
-        .iter()
-        .copied()
-        .find(|t| t.protocol_string() == name)
+    Topic::all_default().find(|t| t.protocol_string() == name)
 }
 
 fn open_node_db(config: &NodeConfig) -> Result<NodeDb, NodeError> {
@@ -517,5 +522,27 @@ async fn wait_for_shutdown() -> Result<(), std::io::Error> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Topic, topic_from_name};
+
+    #[test]
+    fn configured_topics_include_valid_aggregate_subnets() {
+        assert_eq!(
+            topic_from_name("/neutrino/aggregate_finality_votes_0/borsh"),
+            Some(Topic::AggregateFinalityVotes(0))
+        );
+        assert_eq!(
+            topic_from_name("/neutrino/aggregate_finality_votes_15/borsh"),
+            Some(Topic::AggregateFinalityVotes(15))
+        );
+        assert_eq!(
+            topic_from_name("/neutrino/aggregate_finality_votes_16/borsh"),
+            None
+        );
+        assert_eq!(topic_from_name("/unknown/topic"), None);
     }
 }

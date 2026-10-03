@@ -53,16 +53,16 @@ impl fmt::Display for ProposerKeyError {
 impl std::error::Error for ProposerKeyError {}
 
 impl ProposerKey {
-    /// Sign explicit proof acceptance and the exact unlock claim for a precommit.
+    /// Sign explicit vote, proof acceptance and the exact optional unlock claim.
     #[must_use]
-    pub fn attest_precommit(
+    pub fn attest_vote(
         &self,
         chain_id: ChainId,
         vote: FinalityVoteData,
         proof_hashes: Vec<Hash>,
         unlock_quorum: Option<neutrino_consensus_types::QuorumCertificate>,
-    ) -> neutrino_consensus_types::PrecommitAttestation {
-        let mut attestation = neutrino_consensus_types::PrecommitAttestation {
+    ) -> neutrino_consensus_types::VoteAttestation {
+        let mut attestation = neutrino_consensus_types::VoteAttestation {
             validator_index: self.validator_index,
             vote_signature: self.sign_finality_vote(chain_id, &vote),
             vote,

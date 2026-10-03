@@ -1,7 +1,8 @@
 # 20 — Evidence proofs and mandatory sanctions
 
-Status: implemented. Current-program workspace and CUDA-client checks passed on
-2026-10-03; see the [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
+Status: implemented. The current higher-round BFT format passed workspace checks
+and CUDA-enabled node compilation checks on 2026-10-03. See the
+[acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
 Real compressed composition acceptance remains pending as a separate gate.
 History recursion composes completed Chunk statements; it never rechecks evidence offences.
 
@@ -67,9 +68,9 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
 - [x] Chunk consumes proven sanctions without evidence verification.
 - [x] Node generation, persistent pool, gossip, import and restart paths.
 - [x] Adversarial, lifecycle, queue and native/WASM/Guest parity tests.
-- [x] Current-program workspace build, tests (819 passed), strict Clippy and
-  workspace/Guest formatting passed on 2026-10-03. CUDA-client tests and strict
-  Clippy passed; final retention/reconnect fixes also passed sync-driver regressions.
+- [x] Locked workspace build and tests, strict Clippy, CUDA-enabled node Clippy
+  and workspace/Guest formatting for the current higher-round BFT format; see the
+  [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
 - [ ] Real SP1 EvidenceProof → block → chunk → History composition gate: local acceptance
   was cancelled. The upgraded programs require a fresh run on a suitable prover.
   An opt-in CUDA gate uses the same fixture with independent local verification;
@@ -127,6 +128,18 @@ rejection verifier for that offence; Evidence Guest authenticates the verdict, a
 original signed misconduct evidence. Separating the resulting EvidenceProof
 witness changes neither guilt nor the mandatory sanctions and withdrawal holds.
 The chunk consumes block-proven effects without verifying evidence again.
+
+Both BFT phases now retain mandatory `VoteAttestation` signer coverage. A prevote
+signs its exact optional unlock declaration and has an empty proof-hash list;
+a precommit also signs the ordered proof envelopes it accepted. `LockViolation`
+can prove an earlier signed precommit and its lock quorum followed by a conflicting
+prevote with no valid independent higher-round justification. For a later prevote,
+the unlock quorum must be strictly between the old lock round and the later round.
+A later precommit may use its current prevote quorum. This closes the circular
+case in which illegal conflicting prevotes produce the quorum subsequently used
+to excuse their precommits. Certificate validity authenticates the declarations
+and carried quorums; proving a violation still requires the earlier signed lock
+evidence. A certificate does not establish that no hidden historical offence exists.
 
 The host's exact-receipt verifier decodes bounded envelopes once and passes the
 proof directly to the SDK's typed verifier. Circuit, successful exit, program

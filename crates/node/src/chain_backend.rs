@@ -24,6 +24,8 @@
 //! Verified history compaction runs independently of Chunk finality.
 
 mod bootstrap;
+mod candidates;
+mod consensus_jobs;
 mod evidence;
 mod facts;
 mod history;
@@ -39,8 +41,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use neutrino_consensus_engine::{
-    BftAction, Engine, FinalizeError, FinalizeOutcome, ImportError, ProductionConfig,
-    ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
+    BftAction, BftQuorumIdentity, Engine, FinalizeError, FinalizeOutcome, ImportError,
+    ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
     vrf_rejection_reason,
 };
 use neutrino_consensus_types::{
@@ -103,6 +105,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     proof_system: Arc<P>,
     proving_budget: Arc<crate::proving_budget::ProvingBudget>,
     consensus_proof_task: Mutex<Option<ConsensusProofTask<P>>>,
+    consensus_proof_notify: Arc<tokio::sync::Notify>,
+    last_candidate_notice: Mutex<Option<Hash>>,
     mempool: Mutex<Mempool>,
     /// Channel used to publish gossip messages produced by the BFT
     /// loop (prevotes, precommits, chunk proofs, recursive proofs).
@@ -125,8 +129,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
 }
 
 type ConsensusProofTask<P> = (
-    ChunkId,
-    tokio::task::JoinHandle<
+    BftQuorumIdentity,
+    tokio::sync::oneshot::Receiver<
         Result<
             (
                 neutrino_prover_chunk::consensus::ConsensusWitness,
@@ -284,6 +288,8 @@ where
             proof_system: Arc::new(proof_system),
             proving_budget: Arc::new(crate::proving_budget::ProvingBudget::new(2)),
             consensus_proof_task: Mutex::new(None),
+            consensus_proof_notify: Arc::new(tokio::sync::Notify::new()),
+            last_candidate_notice: Mutex::new(None),
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
@@ -1250,6 +1256,20 @@ where
             .map_err(|error| SyncBackendError::Rejected(error.to_string()))
     }
 
+    // Apply this only after objective attribution. A delayed or conflicting
+    // signed vote can establish an offence without contributing to this session.
+    fn vote_matches_bft_session(&self, vote: &FinalityVote) -> bool {
+        self.with_engine(|engine| {
+            vote.data.chunk_id == engine.finalized_next_chunk_id()
+                && engine
+                    .bft_session(vote.data.chunk_id)
+                    .is_some_and(|session| {
+                        session.round() == vote.data.round
+                            && session.chunk_hash() == vote.data.chunk_hash
+                    })
+        })
+    }
+
     /// Authenticate restored signing work and rebroadcast its original messages.
     /// Call after installing the publisher and the local validator identity.
     pub async fn resume_bft_sessions(&self) -> Result<(), String> {
@@ -1286,11 +1306,12 @@ where
                     self.publish_finality_vote(Topic::AggregateFinalityVotes(subnet), &vote)
                         .await;
                 }
-                BftAction::QuorumReached(chunk_id) => {
-                    self.handle_quorum_reached(chunk_id).await;
+                BftAction::QuorumReached(identity) => {
+                    self.handle_quorum_reached(identity);
                 }
             }
         }
+        self.publish_bft_candidate().await;
     }
 
     async fn publish_finality_vote(&self, topic: Topic, vote: &FinalityVote) {
@@ -1324,33 +1345,20 @@ where
     /// budget has elapsed. Re-published prevotes go out on the
     /// matching gossip topic so peers see the new round's vote.
     ///
-    /// Production callers (e.g. the producer's slot loop) invoke
-    /// this every slot tick so a stalled chunk advances within one
-    /// timeout window. Tests pass a deterministic `now_secs` to
-    /// drive scenarios.
+    /// The validator's independent BFT clock invokes this once per second,
+    /// so production slots and prover completion cannot suppress deadlines.
+    /// Tests can pass a deterministic `now_secs` to drive scenarios.
     pub async fn tick_bft_round_timeouts(&self, now_secs: u64) {
         if self.bootstrap_pending() {
             return;
         }
-        self.poll_consensus_proof().await;
-        if self.proof_system.consensus_block_key().is_some() {
-            let ready = self.with_engine(|engine| {
-                let next = engine
-                    .latest_finalized_chunk_id()
-                    .map_or(0, |id| id.saturating_add(1));
-                engine
-                    .bft_session(next)
-                    .filter(|session| session.precommit_quorum_observed())
-                    .map(|_| next)
-            });
-            if let Some(chunk_id) = ready {
-                self.handle_quorum_reached(chunk_id).await;
-            }
+        if let Some(identity) = self.ready_consensus_quorum() {
+            self.handle_quorum_reached(identity);
         }
         let actions = match self.with_live_engine_mut(|engine| {
             self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
             engine
-                .tick_bft_round_timeouts(now_secs)
+                .tick_bft_round_timeouts_with_proof_system(now_secs, self.proof_system.as_ref())
                 .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         }) {
             Ok(actions) => actions,
@@ -1361,116 +1369,6 @@ where
         };
         if !actions.is_empty() {
             self.handle_bft_actions(actions).await;
-        }
-    }
-
-    /// Start complete proving after BFT without blocking the network task.
-    #[allow(clippy::unused_async)]
-    async fn handle_quorum_reached(&self, chunk_id: ChunkId) {
-        let Some(voter) = self.local_voter() else {
-            return;
-        };
-        self.start_consensus_proof(chunk_id, &voter);
-    }
-
-    /// Proving runs on a blocking worker with no engine mutex held. Rechecking
-    /// the incoming anchor during commit rejects a stale or competing result.
-    fn start_consensus_proof(&self, chunk_id: ChunkId, voter: &ProposerKey) {
-        let mut running = self
-            .consensus_proof_task
-            .lock()
-            .expect("proof task mutex poisoned");
-        if running.is_some() {
-            return;
-        }
-        let prepared = self.with_live_engine_mut(|engine| {
-            let mut prepared = engine
-                .prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
-            engine
-                .certify_consensus_chunk(&mut prepared, voter)
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
-            Ok(prepared)
-        });
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                warn!(chunk_id, %error, "complete chunk preparation failed");
-                return;
-            }
-        };
-        let prover = Arc::clone(&self.proof_system);
-        let budget = Arc::clone(&self.proving_budget);
-        let task = tokio::task::spawn_blocking(move || {
-            let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Critical);
-            let proof = prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
-            Ok::<_, neutrino_proof_system::ProofError>((prepared.witness, proof))
-        });
-        *running = Some((chunk_id, task));
-    }
-
-    /// Collect only finished work; proof failures leave the BFT session for retry.
-    async fn poll_consensus_proof(&self) {
-        let completed = {
-            let mut running = self
-                .consensus_proof_task
-                .lock()
-                .expect("proof task mutex poisoned");
-            if running.as_ref().is_some_and(|(_, task)| task.is_finished()) {
-                running.take()
-            } else {
-                None
-            }
-        };
-        let Some((chunk_id, task)) = completed else {
-            return;
-        };
-        let (witness, proof) = match task.await {
-            Ok(Ok(result)) => result,
-            other => {
-                warn!(
-                    chunk_id,
-                    ?other,
-                    "complete chunk proving failed; finality not persisted"
-                );
-                return;
-            }
-        };
-        let executor = self.block_executor_snapshot();
-        let outcome = self.with_live_engine_mut(|engine| {
-            engine
-                .commit_bft_consensus_chunk(
-                    &witness,
-                    &proof,
-                    self.proof_system.as_ref(),
-                    executor.as_deref(),
-                )
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-        });
-        match outcome {
-            Ok(outcome) => {
-                self.start_evidence_jobs();
-                self.start_history_jobs();
-                let publisher = self
-                    .network_publisher
-                    .lock()
-                    .expect("publisher mutex poisoned")
-                    .clone();
-                if let Some(publisher) = publisher {
-                    match borsh::to_vec(&outcome.chunk_proof) {
-                        Ok(data) => {
-                            let _ = publisher
-                                .send(NetworkCommand::Publish {
-                                    topic: Topic::ChunkProofs,
-                                    data,
-                                })
-                                .await;
-                        }
-                        Err(error) => warn!(chunk_id, %error, "chunk proof encoding failed"),
-                    }
-                }
-            }
-            Err(error) => warn!(chunk_id, %error, "complete chunk commit rejected"),
         }
     }
 
@@ -1523,7 +1421,6 @@ where
         if self.light_checkpoint().is_some() {
             return Ok(None);
         }
-        self.poll_consensus_proof().await;
         if self.proof_system.consensus_block_key().is_none() {
             return Ok(None);
         }
@@ -1545,6 +1442,36 @@ where
             }))
         })
     }
+    fn supports_bft_candidate_sync(&self) -> bool {
+        self.light_checkpoint().is_none() && self.proof_system.consensus_block_key().is_some()
+    }
+
+    async fn bft_candidate(
+        &self,
+        chunk_id: ChunkId,
+        hash: Option<Hash>,
+    ) -> Result<neutrino_network::rpc::CandidateByChunkResponse, SyncBackendError> {
+        self.p2p_bft_candidate(chunk_id, hash)
+    }
+
+    async fn validate_bft_candidate_hint(
+        &self,
+        candidate: &neutrino_consensus_types::BftCandidate,
+    ) -> bool {
+        self.authenticated_bft_candidate_hint(candidate)
+    }
+
+    async fn bft_vote_needs_candidate(&self, vote: &FinalityVote) -> bool {
+        self.authenticated_missing_bft_candidate(vote)
+    }
+
+    async fn consider_bft_candidate(
+        &self,
+        candidate: neutrino_consensus_types::BftCandidate,
+    ) -> Result<(), SyncBackendError> {
+        self.consider_downloaded_bft_candidate(&candidate).await
+    }
+
     async fn local_status(&self) -> Result<Status, SyncBackendError> {
         self.p2p_local_status()
     }
@@ -1974,6 +1901,8 @@ where
             .map_err(Self::map_import_err)
         })?;
         if self.proof_system.consensus_block_key().is_some() {
+            self.queue_vote_facts(&proof.finality_cert.prevote_vote());
+            self.queue_vote_facts(&proof.finality_cert.precommit_vote());
             self.start_evidence_jobs();
             self.start_history_jobs();
         }
@@ -1994,11 +1923,12 @@ where
         }
         if self.with_engine(|engine| {
             let count = engine.finalized_next_chunk_id();
-            vote.data.chunk_id < count
-                && !neutrino_consensus_types::history::is_recent_history_index(
-                    vote.data.chunk_id,
-                    count,
-                )
+            vote.data.chunk_id > count
+                || (vote.data.chunk_id < count
+                    && !neutrino_consensus_types::history::is_recent_history_index(
+                        vote.data.chunk_id,
+                        count,
+                    ))
         }) {
             return;
         }
@@ -2025,6 +1955,9 @@ where
         for evidence in invalid_proof_evidence {
             self.pool_and_gossip_slashing(evidence).await;
         }
+        if !self.vote_matches_bft_session(&vote) {
+            return;
+        }
         let actions = match self.with_live_engine_mut(|engine| {
             self.validate_bft_signing_candidate(engine, vote.data.chunk_id)?;
             engine
@@ -2047,11 +1980,12 @@ where
         }
         if self.with_engine(|engine| {
             let count = engine.finalized_next_chunk_id();
-            vote.data.chunk_id < count
-                && !neutrino_consensus_types::history::is_recent_history_index(
-                    vote.data.chunk_id,
-                    count,
-                )
+            vote.data.chunk_id > count
+                || (vote.data.chunk_id < count
+                    && !neutrino_consensus_types::history::is_recent_history_index(
+                        vote.data.chunk_id,
+                        count,
+                    ))
         }) {
             return;
         }
@@ -2076,6 +2010,9 @@ where
             .unwrap_or_default();
         for evidence in invalid_proof_evidence {
             self.pool_and_gossip_slashing(evidence).await;
+        }
+        if !self.vote_matches_bft_session(&vote) {
+            return;
         }
         let actions = match self.with_live_engine_mut(|engine| {
             self.validate_bft_signing_candidate(engine, vote.data.chunk_id)?;

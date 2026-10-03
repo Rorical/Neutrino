@@ -30,12 +30,18 @@ Validator signing journals and unfinalized BFT session recovery protect restart
 signing. Full/validator checkpoint bootstrap authenticates consensus metadata and
 downloads execution state in resumable content-addressed fragments before one
 durable installation; archive mode continues source replay.
+Safe higher-round candidate replacement retains locks independently of the active
+target, authenticates earlier unlock quorums before conflicting prevotes, preserves
+both phases' signed attestations and resumes the exact persisted transition.
+Candidate gossip/RPC backfills fixed branches, and proof-task commit checks bind
+the exact candidate, round and certificate identity.
 
 Outstanding work:
 
-- Define safe higher-round BFT candidate replacement. Current sessions retain their
-  original target and lock across rounds and restarts; they never use restart as
-  permission to sign another candidate.
+- Complete the round-leader, nil-vote and pacemaker protocol if guaranteed eventual
+  convergence under adversarial competing proposals is required. Candidate
+  replacement now enforces safety and allows convergence after nodes share a
+  proven fork choice; it does not claim that stronger liveness guarantee.
 
 - Measure and bound real proving cost, including statement recursion, objective
   block-proof rejection, larger validator sets and sustained multi-chunk operation.

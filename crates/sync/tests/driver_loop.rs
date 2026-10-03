@@ -41,6 +41,8 @@ use tokio::time::timeout;
 #[derive(Default)]
 struct MockState {
     full_chunk_size: Option<u64>,
+    candidate_sync: bool,
+    candidate_replacements: Vec<neutrino_consensus_types::BftCandidate>,
     bootstrap_origin: Option<Checkpoint>,
     bootstrap_pending: Option<(StateRoot, Vec<StateItem>)>,
     bootstrap_endpoint: Option<Checkpoint>,
@@ -74,6 +76,7 @@ struct MockState {
 
 #[derive(Clone, Default)]
 struct MockBackend {
+    candidate_notified: Arc<tokio::sync::Notify>,
     inner: Arc<Mutex<MockState>>,
 }
 
@@ -121,6 +124,34 @@ impl MockBackend {
 
 #[async_trait]
 impl SyncBackend for MockBackend {
+    fn supports_bft_candidate_sync(&self) -> bool {
+        self.inner.lock().unwrap().candidate_sync
+    }
+    async fn validate_bft_candidate_hint(
+        &self,
+        candidate: &neutrino_consensus_types::BftCandidate,
+    ) -> bool {
+        candidate.round <= 16
+            && candidate
+                .justification
+                .as_ref()
+                .is_none_or(|qc| qc.aggregate.signature[0] == 77)
+    }
+    async fn bft_vote_needs_candidate(&self, _vote: &FinalityVote) -> bool {
+        self.inner.lock().unwrap().candidate_sync
+    }
+    async fn consider_bft_candidate(
+        &self,
+        candidate: neutrino_consensus_types::BftCandidate,
+    ) -> Result<(), SyncBackendError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .candidate_replacements
+            .push(candidate);
+        self.candidate_notified.notify_one();
+        Ok(())
+    }
     async fn consensus_sync_target(
         &self,
     ) -> Result<Option<neutrino_sync::backend::ConsensusSyncTarget>, SyncBackendError> {
@@ -910,7 +941,8 @@ fn sample_chunk_proof(chunk_id: ChunkId, end_height: Height) -> ChunkProof {
     use neutrino_primitives::ZERO_HASH;
     ChunkProof {
         finality_cert: neutrino_consensus_types::FinalityCert {
-            attestations: Vec::new(),
+            prevote_attestations: Vec::new(),
+            precommit_attestations: Vec::new(),
             chunk_id,
             round: 0,
             chunk_hash: [0xCC; 32],
@@ -1088,25 +1120,6 @@ async fn next_full_sync_request(
     }
 }
 
-async fn assert_no_full_sync_request(commands: &mut mpsc::Receiver<NetworkCommand>) {
-    // These regressions pause Tokio time. Advance past two retry intervals to
-    // prove that an obsolete response cannot make the active request slot idle.
-    let request = timeout(Duration::from_secs(11), async {
-        loop {
-            match commands.recv().await.expect("driver command channel") {
-                NetworkCommand::SendRpcRequest { request, .. } => return request,
-                NetworkCommand::Subscribe(_) => {}
-                other => panic!("unexpected full-sync command {other:?}"),
-            }
-        }
-    })
-    .await;
-    assert!(
-        request.is_err(),
-        "obsolete response released active request: {request:?}"
-    );
-}
-
 fn linked_full_sync_blocks() -> Vec<Block> {
     let first = sample_block(1, 1, 0);
     let mut second = sample_block(2, 2, 0);
@@ -1252,7 +1265,7 @@ async fn stale_pruned_response_cannot_poison_a_reconnected_providers_availabilit
     let (request, response) = next_full_sync_request(&mut received).await;
     assert!(matches!(request, RpcRequest::Status(_)));
     response.send(Ok(RpcResponse::Status(status))).unwrap();
-    let (request, current_response) = next_full_sync_request(&mut received).await;
+    let (request, current_response) = next_full_sync_payload_request(&mut received, status).await;
     assert!(matches!(request, RpcRequest::BlocksByRange(range) if range.start_height == 1));
     old_response
         .send(Err(neutrino_network::rpc::RpcError::Remote(
@@ -1262,13 +1275,13 @@ async fn stale_pruned_response_cannot_poison_a_reconnected_providers_availabilit
             },
         )))
         .unwrap();
-    assert_no_full_sync_request(&mut received).await;
+    assert_no_full_sync_payload_request(&mut received, status).await;
     current_response
         .send(Ok(RpcResponse::BlocksByRange(BlocksByRangeResponse {
             blocks: linked_full_sync_blocks(),
         })))
         .unwrap();
-    let (request, _response) = next_full_sync_request(&mut received).await;
+    let (request, _response) = next_full_sync_payload_request(&mut received, status).await;
     assert!(matches!(request, RpcRequest::BlockProofByHeight(range) if range.start_height == 1));
     drop(events);
     run.await.unwrap().unwrap();
@@ -2869,3 +2882,6 @@ async fn bootstrap_success_preserves_nonce_against_an_older_disconnected_respons
     assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 2);
     pending.stop().await;
 }
+
+#[path = "driver_loop/bft_candidate_backfill.rs"]
+mod bft_candidate_backfill;

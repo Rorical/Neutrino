@@ -1022,7 +1022,11 @@ impl LightClientParams {
 }
 
 fn validate_quorum(numerator: u64, denominator: u64) -> Result<(), ChainSpecError> {
-    if denominator == 0 || numerator == 0 || numerator > denominator {
+    if denominator == 0
+        || numerator == 0
+        || numerator > denominator
+        || u128::from(numerator) * 3 < u128::from(denominator) * 2
+    {
         return Err(ChainSpecError::InvalidQuorum);
     }
 
@@ -1189,6 +1193,44 @@ mod tests {
         let spec = test_chain_spec();
         assert_eq!(spec.validate(), Ok(()));
         assert_ne!(spec.hash(), ZERO_HASH);
+    }
+
+    #[test]
+    fn both_bft_quorums_require_at_least_two_thirds_without_overflow() {
+        for (numerator, denominator, valid) in [
+            (0, 3, false),
+            (1, 0, false),
+            (1, 3, false),
+            (1, 2, false),
+            (3, 5, false),
+            (2, 3, true),
+            (4, 6, true),
+            (3, 4, true),
+            (1, 1, true),
+            (4, 3, false),
+            (u64::MAX / 3, u64::MAX, false),
+            (u64::MAX - 1, u64::MAX, true),
+        ] {
+            for precommit in [false, true] {
+                let mut spec = test_chain_spec();
+                if precommit {
+                    spec.consensus.bft_precommit_quorum_numerator = numerator;
+                    spec.consensus.bft_precommit_quorum_denominator = denominator;
+                } else {
+                    spec.consensus.bft_prevote_quorum_numerator = numerator;
+                    spec.consensus.bft_prevote_quorum_denominator = denominator;
+                }
+                assert_eq!(
+                    spec.validate(),
+                    if valid {
+                        Ok(())
+                    } else {
+                        Err(ChainSpecError::InvalidQuorum)
+                    },
+                    "quorum {numerator}/{denominator}, precommit={precommit}",
+                );
+            }
+        }
     }
 
     #[test]

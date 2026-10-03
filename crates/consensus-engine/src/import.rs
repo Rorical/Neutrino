@@ -1171,15 +1171,24 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
-        let backend_proof: PS::BlockProof =
-            borsh::from_slice(&proof.proof_bytes).map_err(ImportError::Codec)?;
+        let backend_proof: PS::BlockProof = match borsh::from_slice(&proof.proof_bytes) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.record_rejected_proof(
+                    canonical_hash,
+                    proof.clone(),
+                    neutrino_consensus_types::ProofRejectionReason::MalformedProof,
+                );
+                return Err(ImportError::Codec(error));
+            }
+        };
         if let Err(err) = proof_system.verify_block(&backend_proof, &proof.public_inputs) {
             // Cache the rejected proof envelope so the
             // `InvalidProofSigning` detector can surface evidence
             // when a peer precommit later arrives for a chunk
-            // covering this block. The cache is opt-out: legitimate
-            // peers re-publish corrected proofs and the cache entry
-            // is cleared on the next successful import (above).
+            // covering this block. A later valid receipt cannot change the
+            // verdict of these exact rejected bytes, which a delayed signed
+            // attestation may still reference.
             let reason = match err {
                 neutrino_proof_system::ProofError::MalformedProof => {
                     neutrino_consensus_types::ProofRejectionReason::MalformedProof
@@ -1190,21 +1199,16 @@ impl<DB: Database> Engine<DB> {
                 _ => neutrino_consensus_types::ProofRejectionReason::VerifierRejected,
             };
             self.record_rejected_proof(canonical_hash, proof.clone(), reason);
-            // Notify the fork-choice DAG so the block (and every
-            // descendant) is excluded from `head()` candidates. The
-            // helper silently no-ops when the block hasn't been
-            // registered (e.g. unit tests that never called
-            // `import_block`).
-            let _ = self
-                .fork_choice
-                .on_block_proof(canonical_hash, ProofStatus::Invalid);
-            // Pending-fix #12: if our local materialised head was
-            // on the now-Invalid branch, the materialise step
-            // moves it off. Swallow materialise errors here so the
-            // caller sees the more important `InvalidBlockProof`
-            // error (the proof was bad; the materialise failure is
-            // a secondary symptom and the next import will retry).
-            let _ = self.materialise_to_fork_choice_head(executor);
+            // A rejected alternative receipt cannot invalidate a block already
+            // established by a retained, verified receipt. The exact rejected
+            // bytes remain available for attributable proof-signing evidence.
+            if self.store().get_block_proof(&canonical_hash)?.is_none() {
+                let _ = self
+                    .fork_choice
+                    .on_block_proof(canonical_hash, ProofStatus::Invalid);
+                // Preserve the proof rejection if branch replay also fails.
+                let _ = self.materialise_to_fork_choice_head(executor);
+            }
             return Err(ImportError::InvalidBlockProof(err));
         }
         if self.evidence_programs.is_some() {
@@ -1222,19 +1226,14 @@ impl<DB: Database> Engine<DB> {
                 ));
             }
         }
-        // Successful import — clear any stale rejected-proof entry
-        // for this block (a peer's earlier corrupted gossip should
-        // not slash any future signer once an honest proof lands).
-        self.clear_rejected_proof(&canonical_hash);
-
-        self.store_mut().put_block_proof(&canonical_hash, proof)?;
         match self.store().get_block_state(&canonical_hash)? {
             Some(BlockState::BlockProduced | BlockState::PendingProof | BlockState::Proven)
             | None => {
-                self.store_mut()
-                    .put_block_state(&canonical_hash, BlockState::Proven)?;
+                self.store_mut().put_proven_block(&canonical_hash, proof)?;
             }
-            Some(BlockState::Finalized) => {}
+            Some(BlockState::Finalized) => {
+                self.store_mut().put_block_proof(&canonical_hash, proof)?;
+            }
         }
         // Promote the block from `PendingProof` to `Proven` in the
         // fork-choice DAG. Branches built on top of unproven blocks
@@ -1540,6 +1539,94 @@ mod tests {
         let outcome = engine.import_block(&block2).expect("second extends first");
         assert_eq!(outcome.new_head_height, 2);
         assert_eq!(engine.head_hash(), block2.hash());
+    }
+
+    /// Isolated mock receipts allow distinct encodings of the same statement;
+    /// this fixture does not implement chunk proving or finalization.
+    struct AlternateMockBlockProofSystem;
+
+    impl ProofSystem for AlternateMockBlockProofSystem {
+        type BlockProof = (neutrino_proof_system::MockBlockProof, u8);
+        type ChunkProof = Vec<u8>;
+
+        fn prove_block(
+            &self,
+            witness: &[u8],
+            inputs: &BlockProofPublicInputs,
+        ) -> Result<Self::BlockProof, ProofError> {
+            neutrino_proof_system::MockProofSystem
+                .prove_block(witness, inputs)
+                .map(|proof| (proof, 0))
+        }
+
+        fn verify_block(
+            &self,
+            proof: &Self::BlockProof,
+            inputs: &BlockProofPublicInputs,
+        ) -> Result<(), ProofError> {
+            neutrino_proof_system::MockProofSystem.verify_block(&proof.0, inputs)
+        }
+    }
+
+    #[test]
+    fn alternate_receipts_cannot_replace_signed_bytes_or_invalidate_proven_branch() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let block = block(1, 1, engine.head_hash(), [5; 32]);
+        engine.import_block(&block).unwrap();
+        let hash = block.hash();
+        let inputs = engine.block_proof_public_inputs(&block.header, ZERO_HASH, hash);
+        let backend = AlternateMockBlockProofSystem;
+        let mut decoded = backend.prove_block(&[], &inputs).unwrap();
+        let receipt = BlockProof {
+            height: 1,
+            block_hash: hash,
+            public_inputs: inputs,
+            proof_bytes: borsh::to_vec(&decoded).unwrap(),
+        };
+        engine.import_block_proof(&receipt, &backend).unwrap();
+
+        decoded.1 = 1;
+        let mut alternate = receipt.clone();
+        alternate.proof_bytes = borsh::to_vec(&decoded).unwrap();
+        assert_ne!(alternate.proof_bytes, receipt.proof_bytes);
+        engine.import_block_proof(&alternate, &backend).unwrap();
+        assert_eq!(
+            engine.store().get_block_proof(&hash).unwrap(),
+            Some(receipt.clone())
+        );
+
+        decoded.0.commitment[0] ^= 1;
+        alternate.proof_bytes = borsh::to_vec(&decoded).unwrap();
+        assert!(matches!(
+            engine.import_block_proof(&alternate, &backend),
+            Err(ImportError::InvalidBlockProof(_))
+        ));
+        alternate.proof_bytes.clear();
+        assert!(matches!(
+            engine.import_block_proof(&alternate, &backend),
+            Err(ImportError::Codec(_))
+        ));
+        assert_eq!(
+            engine.rejected_proofs.get(&hash),
+            Some(&(
+                alternate,
+                neutrino_consensus_types::ProofRejectionReason::MalformedProof
+            ))
+        );
+        engine.import_block_proof(&receipt, &backend).unwrap();
+        assert_eq!(engine.rejected_proof_cache_len(), 1);
+        assert_eq!(
+            engine.store().get_block_proof(&hash).unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(
+            engine.store().get_block_state(&hash).unwrap(),
+            Some(BlockState::Proven)
+        );
+        assert_eq!(engine.fork_choice_head(), hash);
+        assert_eq!(engine.head_hash(), hash);
+        let reopened = Engine::open(spec(), engine.store().db().clone()).unwrap();
+        assert_eq!(reopened.fork_choice_head(), hash);
     }
 
     #[test]

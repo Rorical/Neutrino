@@ -215,7 +215,8 @@ pub fn fixture_with_live(
         }
     };
     let mut cert = FinalityCert {
-        attestations: Vec::new(),
+        prevote_attestations: Vec::new(),
+        precommit_attestations: Vec::new(),
         chunk_id: 0,
         round: 0,
         chunk_hash: chunk.hash(),
@@ -223,7 +224,7 @@ pub fn fixture_with_live(
         precommit: aggregate(FinalityVotePhase::Precommit),
         active_validator_set_root: root,
     };
-    let mut claim = neutrino_consensus_types::PrecommitAttestation {
+    let mut claim = neutrino_consensus_types::VoteAttestation {
         validator_index: 0,
         vote: cert.precommit_vote().data,
         vote_signature: cert.precommit.signature,
@@ -232,7 +233,17 @@ pub fn fixture_with_live(
         signature: [0; 96],
     };
     claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
-    cert.attestations.push(claim);
+    cert.precommit_attestations.push(claim);
+    let mut claim = neutrino_consensus_types::VoteAttestation {
+        validator_index: 0,
+        vote: cert.prevote_vote().data,
+        vote_signature: cert.prevote.signature,
+        proof_hashes: Vec::new(),
+        unlock_quorum: None,
+        signature: [0; 96],
+    };
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    cert.prevote_attestations.push(claim);
     (
         ConsensusWitness {
             fact_guest_vk_digest: [3; 8],

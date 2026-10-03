@@ -327,8 +327,13 @@ impl<DB: Database> Engine<DB> {
         Ok(prepared)
     }
 
+    /// Prepare a complete candidate on an explicitly selected branch. Every
+    /// receipt and consensus field is authenticated under the current backend.
+    ///
+    /// # Errors
+    /// Returns unavailable ancestry, invalid receipts or consensus bindings.
     #[allow(clippy::too_many_lines)] // Snapshot all authenticated inputs before leaving the engine lock.
-    pub(crate) fn prepare_consensus_chunk_on_branch<P: ProofSystem>(
+    pub fn prepare_consensus_chunk_on_branch<P: ProofSystem>(
         &self,
         chunk_id: ChunkId,
         end_hash: Hash,
@@ -425,7 +430,8 @@ impl<DB: Database> Engine<DB> {
             post_state,
             history,
             finality_cert: FinalityCert {
-                attestations: Vec::new(),
+                prevote_attestations: Vec::new(),
+                precommit_attestations: Vec::new(),
                 chunk_id,
                 round: 0,
                 chunk_hash: [0; 32],
@@ -521,6 +527,13 @@ impl<DB: Database> Engine<DB> {
             .ok_or(FinalizeError::FinalizationStalled)?;
         let candidate = validate_candidate(witness).map_err(|_| ProofError::InvalidWitness)?;
         if as_chunk(&candidate.execution.chunk).hash() != session.chunk_hash() {
+            return Err(ProofError::PublicInputMismatch.into());
+        }
+        if self.bft_quorum_identity(witness.context.chunk_id)
+            != Some(crate::BftQuorumIdentity::from_certificate(
+                &witness.finality_cert,
+            ))
+        {
             return Err(ProofError::PublicInputMismatch.into());
         }
         self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor)

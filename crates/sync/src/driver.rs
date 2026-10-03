@@ -34,6 +34,7 @@ use crate::backend::{HeadersImported, SyncBackend, SyncBackendError};
 use crate::error::SyncDriverError;
 
 mod bootstrap;
+mod candidates;
 mod full_chunk;
 
 /// Construction-time options for [`SyncDriver`].
@@ -70,6 +71,7 @@ const HISTORY_PROVIDER_ATTEMPT_LIMIT: usize = 256;
 pub struct SyncDriver {
     full_chunks: full_chunk::FullChunkSync,
     bootstrap: bootstrap::BootstrapSync,
+    candidates: candidates::CandidateSync,
     fsm: SyncMachine,
     backend: Arc<dyn SyncBackend>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -117,6 +119,7 @@ impl SyncDriver {
         Self {
             full_chunks: full_chunk::FullChunkSync::default(),
             bootstrap: bootstrap::BootstrapSync::default(),
+            candidates: candidates::CandidateSync::default(),
             fsm,
             backend,
             cmd_tx,
@@ -184,6 +187,7 @@ impl SyncDriver {
                 if self.connected_peers.insert(peer) {
                     full_chunk::on_connect(self, peer);
                     bootstrap::on_connect(self, peer);
+                    candidates::on_connect(self, peer);
                 }
                 let cmds = self.fsm.on_event(SyncEvent::PeerConnected(peer));
                 self.dispatch_sync_commands(cmds).await;
@@ -199,6 +203,7 @@ impl SyncDriver {
                 }
                 self.deferred_history_status.remove(&peer);
                 full_chunk::on_disconnect(self, peer);
+                candidates::on_disconnect(self, peer).await;
                 bootstrap::on_disconnect(self, peer).await;
                 let cmds = self.fsm.on_event(SyncEvent::PeerDisconnected(peer));
                 self.dispatch_sync_commands(cmds).await;
@@ -305,6 +310,17 @@ impl SyncDriver {
                 Err(_) => MessageAcceptance::Ignore,
             };
         }
+        if topic == Topic::BftCandidates {
+            let Ok(candidate) = borsh::from_slice::<neutrino_consensus_types::BftCandidate>(&data)
+            else {
+                return MessageAcceptance::Reject;
+            };
+            return if candidates::on_hint(self, source, candidate).await {
+                MessageAcceptance::Accept
+            } else {
+                MessageAcceptance::Ignore
+            };
+        }
         if topic == Topic::Checkpoints {
             return self.handle_checkpoint_announcement(&data, source).await;
         }
@@ -313,11 +329,11 @@ impl SyncDriver {
             return MessageAcceptance::Accept;
         }
         if topic == Topic::FinalityVotesPrevote || topic == Topic::FinalityVotesPrecommit {
-            return self.handle_finality_vote_gossip(data).await;
+            return self.handle_finality_vote_gossip(data, source).await;
         }
         if let Topic::AggregateFinalityVotes(subnet) = topic {
             return self
-                .handle_aggregate_finality_vote_gossip(subnet, data)
+                .handle_aggregate_finality_vote_gossip(subnet, data, source)
                 .await;
         }
         if topic == Topic::EvidenceProofs {
@@ -346,6 +362,15 @@ impl SyncDriver {
             );
             return MessageAcceptance::Ignore;
         }
+        self.handle_block_gossip(data, source).await
+    }
+
+    async fn handle_block_gossip(
+        &mut self,
+        data: Vec<u8>,
+        source: neutrino_network::PeerId,
+    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
+        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
         let block = match borsh::from_slice::<neutrino_consensus_types::Block>(&data) {
             Ok(b) => b,
             Err(err) => {
@@ -482,8 +507,9 @@ impl SyncDriver {
     }
 
     async fn handle_finality_vote_gossip(
-        &self,
+        &mut self,
         data: Vec<u8>,
+        source: neutrino_network::PeerId,
     ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
         use neutrino_network::libp2p::gossipsub::MessageAcceptance;
         let vote = match borsh::from_slice::<neutrino_consensus_types::FinalityVote>(&data) {
@@ -496,14 +522,16 @@ impl SyncDriver {
         // M6 lands the transport; M7 wires this into the chunk-BFT
         // state machine. Backends override the default no-op trait
         // method when they have a BFT loop to feed.
+        candidates::on_vote(self, source, None, &vote).await;
         self.backend.ingest_finality_vote(vote).await;
         MessageAcceptance::Accept
     }
 
     async fn handle_aggregate_finality_vote_gossip(
-        &self,
+        &mut self,
         subnet: u8,
         data: Vec<u8>,
+        source: neutrino_network::PeerId,
     ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
         use neutrino_network::libp2p::gossipsub::MessageAcceptance;
         let vote = match borsh::from_slice::<neutrino_consensus_types::FinalityVote>(&data) {
@@ -516,6 +544,7 @@ impl SyncDriver {
                 return MessageAcceptance::Reject;
             }
         };
+        candidates::on_vote(self, source, Some(subnet), &vote).await;
         self.backend
             .ingest_aggregate_finality_vote(subnet, vote)
             .await;
@@ -643,6 +672,13 @@ impl SyncDriver {
                 RpcProtocol::FinalityCertByChunk,
                 self.backend.finality_certs_by_chunk(&req.chunk_ids).await,
                 RpcResponse::FinalityCertByChunk,
+            ),
+            RpcRequest::CandidateByChunk(req) => rpc_reply(
+                RpcProtocol::CandidateByChunk,
+                self.backend
+                    .bft_candidate(req.chunk_id, req.chunk_hash)
+                    .await,
+                |payload| RpcResponse::CandidateByChunk(Box::new(payload)),
             ),
             RpcRequest::WitnessByBlock(req) => rpc_reply(
                 RpcProtocol::WitnessByBlock,
@@ -890,6 +926,9 @@ impl SyncDriver {
 
     async fn handle_outbound_outcome(&mut self, outcome: OutboundOutcome) {
         match outcome {
+            OutboundOutcome::Candidate { request, response } => {
+                candidates::on_response(self, request, response).await;
+            }
             OutboundOutcome::Bootstrap {
                 peer,
                 nonce,
@@ -1004,6 +1043,7 @@ impl SyncDriver {
                 if bootstrap::on_status(self, peer, status).await {
                     return;
                 }
+                candidates::on_status(self, peer, status).await;
                 if full_chunk::on_status(self, peer, status).await {
                     return;
                 }
@@ -1306,6 +1346,10 @@ impl SyncDriver {
 /// into the main driver loop.
 #[derive(Debug)]
 enum OutboundOutcome {
+    Candidate {
+        request: candidates::Request,
+        response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
+    },
     Bootstrap {
         peer: neutrino_network::PeerId,
         nonce: u64,

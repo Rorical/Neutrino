@@ -2,6 +2,7 @@
 #[path = "../../prover-chunk/tests/support/mod.rs"]
 pub mod support;
 
+use neutrino_crypto::bls::SecretKey;
 use neutrino_proof_system::ProofSystem;
 use neutrino_prover_chunk::consensus::validate_consensus;
 use neutrino_runtime_host::Sp1ProofSystem;
@@ -21,7 +22,6 @@ fn two_block_fixture(
     )>,
 ) {
     use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
-    use neutrino_crypto::bls::SecretKey;
     use neutrino_primitives::{DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG};
     use neutrino_prover_chunk::consensus::{as_chunk, validate_candidate};
     // Ordinary transactions are present in the block proofs but absent from
@@ -97,15 +97,27 @@ fn two_block_fixture(
         message.extend_from_slice(&borsh::to_vec(&vote).unwrap());
         aggregate.signature = key.sign(&message).to_bytes();
     }
-    let data = witness.finality_cert.precommit_vote().data;
-    let signature = witness.finality_cert.precommit.signature;
     let count = usize::try_from(witness.context.chunk_size).unwrap();
-    let claim = &mut witness.finality_cert.attestations[0];
-    claim.vote = data;
-    claim.vote_signature = signature;
-    claim.proof_hashes = vec![[1; 32]; count];
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    sign_fixture_attestations(&mut witness.finality_cert, &key, count);
     (witness, vec![(input, state.clone()), (second_input, state)])
+}
+
+fn sign_fixture_attestations(
+    certificate: &mut neutrino_consensus_types::FinalityCert,
+    key: &SecretKey,
+    block_count: usize,
+) {
+    let prevote = certificate.prevote_vote();
+    let claim = &mut certificate.prevote_attestations[0];
+    claim.vote = prevote.data;
+    claim.vote_signature = prevote.signature;
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    let precommit = certificate.precommit_vote();
+    let claim = &mut certificate.precommit_attestations[0];
+    claim.vote = precommit.data;
+    claim.vote_signature = precommit.signature;
+    claim.proof_hashes = vec![[1; 32]; block_count];
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
 }
 
 #[allow(clippy::too_many_lines)] // Explicit end-to-end proving stages and their negative assertions.
@@ -147,7 +159,7 @@ fn pipeline<P: neutrino_runtime_host::ProgramProver>(prover: P, real: bool) {
             })
         })
         .collect();
-    let claim = &mut witness.finality_cert.attestations[0];
+    let claim = &mut witness.finality_cert.precommit_attestations[0];
     claim.proof_hashes = hashes;
     claim.signature = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[])
         .unwrap()
@@ -241,15 +253,33 @@ fn check_guest_rejections<P: Prover>(
     identity_vote.finality_cert.precommit.signature = [0; 96];
     identity_vote.finality_cert.precommit.signature[0] = 0xc0;
     let mut missing_attestation = witness.clone();
-    missing_attestation.finality_cert.attestations.clear();
+    missing_attestation
+        .finality_cert
+        .precommit_attestations
+        .clear();
+    let mut missing_prevote = witness.clone();
+    missing_prevote.finality_cert.prevote_attestations.clear();
+    let mut circular_unlock = witness.clone();
+    let certificate = &mut circular_unlock.finality_cert;
+    let claim = &mut certificate.prevote_attestations[0];
+    claim.unlock_quorum = Some(neutrino_consensus_types::QuorumCertificate {
+        data: claim.vote.clone(),
+        aggregate: certificate.prevote.clone(),
+    });
+    let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    claim.signature = key
+        .sign(&claim.signing_message(witness.chain_spec.chain_id))
+        .to_bytes();
     let mut bad_individual = witness.clone();
-    bad_individual.finality_cert.attestations[0].vote_signature[0] ^= 1;
+    bad_individual.finality_cert.precommit_attestations[0].vote_signature[0] ^= 1;
     let mut incomplete_proofs = witness.clone();
-    incomplete_proofs.finality_cert.attestations[0]
+    incomplete_proofs.finality_cert.precommit_attestations[0]
         .proof_hashes
         .pop();
     for invalid in [
         missing_attestation,
+        missing_prevote,
+        circular_unlock,
         bad_individual,
         incomplete_proofs,
         wrong_signature,

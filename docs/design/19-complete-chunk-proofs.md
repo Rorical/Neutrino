@@ -21,9 +21,13 @@ use canonical ordered block, public-input, VRF and DA leaves. DA commitment does
 not prove physical availability.
 
 The Guest verifies both BFT quorum certificates, stake weights, signer membership,
-domain/chain/round/chunk binding and mandatory precommit attestation coverage.
-Attestations retain individually signed votes, exact ordered proof-envelope hashes
-and signed unlock claims. It derives validator activation/exit/stake changes from
+domain/chain/round/chunk binding and mandatory attestation coverage for both phases.
+Attestations retain individually signed votes and signed unlock claims; precommits
+add exact ordered proof-envelope hashes. Carried quorums are independently checked
+against the authenticated active set and configured threshold. A prevote cannot
+carry its current round's quorum as an unlock; a precommit may carry that quorum.
+Earlier local locks are proven by objective evidence rather than inferred from
+missing observations. It derives validator activation/exit/stake changes from
 authenticated runtime state, verifies registrations, consumes block-proven sanctions,
 and commits the next validator root, seed and history root in a compact boundary.
 The full next context is retained by the node. Sanction replay protection is owned

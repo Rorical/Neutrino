@@ -146,7 +146,7 @@ impl<DB: Database> Engine<DB> {
         self.rejected_proofs_order
             .retain(|hash| self.rejected_proofs.contains_key(hash));
         self.slashing_monitor
-            .retain_history_window(floor, info.first_retained_height);
+            .retain_history_window(count.saturating_sub(HISTORY_RETENTION_CHUNKS));
         Ok(info)
     }
 }

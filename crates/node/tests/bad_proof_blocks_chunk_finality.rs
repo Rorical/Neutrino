@@ -316,6 +316,11 @@ async fn injected_bad_proof_prevents_chunk_finality() {
     let _ = peer_id_0;
     let _ = peer_id_1;
 
+    let completion_handles: Vec<_> = [&handle_0, &handle_1]
+        .into_iter()
+        .map(|handle| tokio::spawn(Arc::clone(&handle.backend).run_consensus_proof_notifications()))
+        .collect();
+
     // Wire gossip drivers.
     for h in [&mut handle_0, &mut handle_1] {
         let rx = h.event_rx.take().expect("event_rx present");
@@ -421,4 +426,10 @@ async fn injected_bad_proof_prevents_chunk_finality() {
         progress_1.head_height, 1,
         "v1 still accepts the legitimately-signed block on Topic::Blocks",
     );
+    for handle in &completion_handles {
+        handle.abort();
+    }
+    for handle in completion_handles {
+        let _ = handle.await;
+    }
 }

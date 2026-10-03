@@ -9,21 +9,19 @@ use neutrino_primitives::{ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Val
 use crate::execution::commitment;
 
 /// Authenticate an embedded vote without requiring that this one envelope
-/// already reaches quorum. Every precommit signer must carry a complete,
+/// already reaches quorum. Every signer must carry a complete,
 /// cryptographically authenticated attestation.
 pub fn verify_vote(
     chain_id: u64,
     validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
-    max_round: u32,
-    block_count: u64,
+    params: &ConsensusParams,
 ) -> Result<(), FinalityError> {
     verify_vote_using(
         chain_id,
         validators,
         vote,
-        max_round,
-        block_count,
+        params,
         &mut crate::bls::DirectVerifier::default(),
     )
 }
@@ -33,16 +31,55 @@ pub fn verify_vote_using(
     chain_id: u64,
     validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
-    max_round: u32,
-    block_count: u64,
+    params: &ConsensusParams,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), FinalityError> {
+    verify_vote_signatures_using(chain_id, validators, vote, params, verifier)?;
+    verify_unlock_claims_using(
+        chain_id,
+        validators,
+        &vote.data,
+        &vote.attestations,
+        params,
+        verifier,
+    )
+}
+
+/// Authenticate a signed vote envelope for objective attribution.
+///
+/// This checks complete signer coverage and all vote/attestation signatures, but
+/// does not validate a signer's declared unlock quorum. An invalid signed unlock
+/// can itself establish an offence; consensus admission must use [`verify_vote`].
+pub fn verify_vote_signatures(
+    chain_id: u64,
+    validators: &[Validator],
+    vote: &neutrino_consensus_types::FinalityVote,
+    params: &ConsensusParams,
+) -> Result<(), FinalityError> {
+    verify_vote_signatures_using(
+        chain_id,
+        validators,
+        vote,
+        params,
+        &mut crate::bls::DirectVerifier::default(),
+    )
+}
+
+/// Authenticate signed vote artifacts with a shared key cache or fact source.
+/// Declared unlock semantics remain separate from this attribution check.
+pub fn verify_vote_signatures_using(
+    chain_id: u64,
+    validators: &[Validator],
+    vote: &neutrino_consensus_types::FinalityVote,
+    params: &ConsensusParams,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
     if !neutrino_consensus_types::attestation_coverage_valid(
         &vote.data,
         &vote.aggregation_bits,
         &vote.attestations,
-        block_count,
-    ) || vote.data.round > max_round
+        params.chunk_size,
+    ) || vote.data.round > params.bft_max_round
         || usize::try_from(vote.aggregation_bits.bit_len()).ok() != Some(validators.len())
     {
         return Err(FinalityError::Membership);
@@ -67,7 +104,7 @@ pub fn verify_vote_using(
     if keys.is_empty() || !verifier.aggregate(&keys, &message, &vote.signature) {
         return Err(FinalityError::Signature);
     }
-    verify_claims_using(
+    verify_claim_signatures_using(
         chain_id,
         validators,
         &vote.data,
@@ -81,7 +118,19 @@ fn verify_claims_using(
     chain_id: u64,
     validators: &[Validator],
     data: &FinalityVoteData,
-    claims: &[neutrino_consensus_types::PrecommitAttestation],
+    claims: &[neutrino_consensus_types::VoteAttestation],
+    params: &ConsensusParams,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), FinalityError> {
+    verify_claim_signatures_using(chain_id, validators, data, claims, verifier)?;
+    verify_unlock_claims_using(chain_id, validators, data, claims, params, verifier)
+}
+
+fn verify_claim_signatures_using(
+    chain_id: u64,
+    validators: &[Validator],
+    data: &FinalityVoteData,
+    claims: &[neutrino_consensus_types::VoteAttestation],
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
     for claim in claims {
@@ -94,6 +143,33 @@ fn verify_claims_using(
             verifier,
         )
         .map_err(|_| FinalityError::Signature)?;
+    }
+    Ok(())
+}
+
+fn verify_unlock_claims_using(
+    chain_id: u64,
+    validators: &[Validator],
+    data: &FinalityVoteData,
+    claims: &[neutrino_consensus_types::VoteAttestation],
+    params: &ConsensusParams,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), FinalityError> {
+    for claim in claims {
+        if let Some(unlock) = &claim.unlock_quorum {
+            crate::slashing::verify_unlock_using(
+                chain_id,
+                validators,
+                data,
+                unlock,
+                (
+                    params.bft_prevote_quorum_numerator,
+                    params.bft_prevote_quorum_denominator,
+                ),
+                verifier,
+            )
+            .map_err(|_| FinalityError::Target)?;
+        }
     }
     Ok(())
 }
@@ -150,27 +226,6 @@ pub fn verify_finality_using(
     {
         return Err(FinalityError::Target);
     }
-    let data = FinalityVoteData {
-        chunk_id: certificate.chunk_id,
-        round: certificate.round,
-        chunk_hash: certificate.chunk_hash,
-        phase: FinalityVotePhase::Precommit,
-    };
-    if !neutrino_consensus_types::attestation_coverage_valid(
-        &data,
-        &certificate.precommit.aggregation_bits,
-        &certificate.attestations,
-        params.chunk_size,
-    ) {
-        return Err(FinalityError::Membership);
-    }
-    verify_claims_using(
-        chain_id,
-        validators,
-        &data,
-        &certificate.attestations,
-        verifier,
-    )?;
     let total = validators
         .iter()
         .try_fold(0_u64, |total, validator| {
@@ -196,6 +251,25 @@ pub fn verify_finality_using(
             params.bft_precommit_quorum_denominator,
         ),
     ] {
+        let data = FinalityVoteData {
+            chunk_id: certificate.chunk_id,
+            round: certificate.round,
+            chunk_hash: certificate.chunk_hash,
+            phase,
+        };
+        let claims = match phase {
+            FinalityVotePhase::Prevote => &certificate.prevote_attestations,
+            FinalityVotePhase::Precommit => &certificate.precommit_attestations,
+        };
+        if !neutrino_consensus_types::attestation_coverage_valid(
+            &data,
+            &vote.aggregation_bits,
+            claims,
+            params.chunk_size,
+        ) {
+            return Err(FinalityError::Membership);
+        }
+        verify_claims_using(chain_id, validators, &data, claims, params, verifier)?;
         verify_phase_using(
             chain_id,
             validators,
@@ -221,6 +295,7 @@ fn verify_phase_using(
     if numerator == 0
         || denominator == 0
         || numerator > denominator
+        || u128::from(numerator) * 3 < u128::from(denominator) * 2
         || usize::try_from(vote.aggregation_bits.bit_len()).ok() != Some(validators.len())
     {
         return Err(FinalityError::Membership);

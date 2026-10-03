@@ -246,8 +246,13 @@ fn empty_successor(
         message.extend_from_slice(&borsh::to_vec(&data).unwrap());
         aggregate.signature = key.sign(&message).to_bytes();
     }
+    let prevote = next.finality_cert.prevote_vote();
+    let claim = &mut next.finality_cert.prevote_attestations[0];
+    claim.vote = prevote.data;
+    claim.vote_signature = prevote.signature;
+    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
     let vote = next.finality_cert.precommit_vote();
-    let claim = &mut next.finality_cert.attestations[0];
+    let claim = &mut next.finality_cert.precommit_attestations[0];
     claim.vote = vote.data;
     claim.vote_signature = vote.signature;
     claim.proof_hashes = vec![[1; 32]];
@@ -316,7 +321,7 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
             |proof| verifier.verify_block(proof, inputs),
             || system.prove_block(&block_input, inputs),
         );
-        let claim = &mut witness.finality_cert.attestations[0];
+        let claim = &mut witness.finality_cert.precommit_attestations[0];
         claim.proof_hashes = vec![neutrino_prover_chunk::execution::commitment(
             &neutrino_consensus_types::BlockProof {
                 height: inputs.height,

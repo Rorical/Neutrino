@@ -107,6 +107,24 @@ impl Database for RocksDbDatabase {
         self.db.write(write_batch).map_err(Into::into)
     }
 
+    fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
+        let mut write_batch = WriteBatch::default();
+        for op in batch.into_operations() {
+            match op {
+                BatchOp::Put { column, key, value } => {
+                    write_batch.put_cf(&self.cf(column)?, key, value);
+                }
+                BatchOp::Delete { column, key } => {
+                    write_batch.delete_cf(&self.cf(column)?, key);
+                }
+            }
+        }
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        options.disable_wal(false);
+        self.db.write_opt(write_batch, &options).map_err(Into::into)
+    }
+
     fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
         let cf = self.cf(column)?;
         let mut out = Vec::new();
@@ -212,6 +230,47 @@ mod tests {
             assert_eq!(get(&db, Column::Headers, b"h"), Some(b"header".to_vec()));
         }
         fs::remove_dir_all(&path).expect("remove temp rocksdb");
+    }
+
+    #[test]
+    fn durable_signing_batch_preserves_prior_finality_after_abrupt_exit() {
+        const CHILD_PATH: &str = "NEUTRINO_DURABILITY_CHILD_DB";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let mut db = RocksDbDatabase::open(path).expect("open child database");
+            let mut finality = Batch::new();
+            finality.put(Column::Finalized, b"latest_chunk_id", 9_u64.to_be_bytes());
+            db.write_batch(finality).expect("ordinary finality write");
+            let mut signing = Batch::new();
+            signing.put(Column::SigningJournal, b"identity", b"reserved-message");
+            signing.put(Column::BftSessions, b"chunk", b"saved-session");
+            db.write_batch_durable(signing)
+                .expect("synchronize signing and prior WAL");
+            // Skip database destructors and their normal shutdown flush.
+            std::process::exit(0);
+        }
+        let path = temp_db_path("durable-abrupt-exit");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("rocks::tests::durable_signing_batch_preserves_prior_finality_after_abrupt_exit")
+            .env(CHILD_PATH, &path)
+            .status()
+            .expect("run crash child");
+        assert!(status.success());
+        let db = RocksDbDatabase::open(&path).expect("recover child WAL");
+        assert_eq!(
+            get(&db, Column::Finalized, b"latest_chunk_id"),
+            Some(9_u64.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            get(&db, Column::SigningJournal, b"identity"),
+            Some(b"reserved-message".to_vec())
+        );
+        assert_eq!(
+            get(&db, Column::BftSessions, b"chunk"),
+            Some(b"saved-session".to_vec())
+        );
+        drop(db);
+        fs::remove_dir_all(&path).expect("remove crash child database");
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! columns use stable ASCII names (`tip`, `finalized_head`,
 //! `latest_chunk_id`, ...).
 
+mod bootstrap;
 mod canonical;
 mod chain_store;
 mod error;
@@ -17,6 +18,7 @@ mod history;
 pub mod keys;
 pub mod pointers;
 mod retention;
+mod snapshot;
 
 pub use chain_store::{ChainStore, ContentAddressedEntries, ValidatorSetSnapshot};
 pub use error::StoreError;

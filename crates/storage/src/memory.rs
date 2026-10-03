@@ -95,6 +95,10 @@ impl Database for MemoryDatabase {
             values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         }))
     }
+
+    fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
+        self.write_batch(batch)
+    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 use crate::backend::{HeadersImported, SyncBackend, SyncBackendError};
 use crate::error::SyncDriverError;
 
+mod bootstrap;
 mod full_chunk;
 
 /// Construction-time options for [`SyncDriver`].
@@ -68,6 +69,7 @@ const HISTORY_PROVIDER_ATTEMPT_LIMIT: usize = 256;
 /// network service and the sync state machine.
 pub struct SyncDriver {
     full_chunks: full_chunk::FullChunkSync,
+    bootstrap: bootstrap::BootstrapSync,
     fsm: SyncMachine,
     backend: Arc<dyn SyncBackend>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -114,6 +116,7 @@ impl SyncDriver {
         let fsm = SyncMachine::new(config.mode, local_progress);
         Self {
             full_chunks: full_chunk::FullChunkSync::default(),
+            bootstrap: bootstrap::BootstrapSync::default(),
             fsm,
             backend,
             cmd_tx,
@@ -180,6 +183,7 @@ impl SyncDriver {
                 debug!(%peer, "peer connected, dispatching FSM event");
                 if self.connected_peers.insert(peer) {
                     full_chunk::on_connect(self, peer);
+                    bootstrap::on_connect(self, peer);
                 }
                 let cmds = self.fsm.on_event(SyncEvent::PeerConnected(peer));
                 self.dispatch_sync_commands(cmds).await;
@@ -195,6 +199,7 @@ impl SyncDriver {
                 }
                 self.deferred_history_status.remove(&peer);
                 full_chunk::on_disconnect(self, peer);
+                bootstrap::on_disconnect(self, peer).await;
                 let cmds = self.fsm.on_event(SyncEvent::PeerDisconnected(peer));
                 self.dispatch_sync_commands(cmds).await;
                 if interrupted_history {
@@ -265,6 +270,7 @@ impl SyncDriver {
             .map_or(1, |(generation, _)| generation.wrapping_add(1));
         self.history_announcement = Some((generation, source));
         self.history_attempts.clear();
+        bootstrap::on_notice(self);
         debug!(range_id = ?announcement.range_id, "history range became available");
         self.dispatch_one(SyncCommand::RequestStatus(source)).await;
         MessageAcceptance::Accept
@@ -538,6 +544,38 @@ impl SyncDriver {
         MessageAcceptance::Accept
     }
 
+    async fn history_rpc_reply(
+        &self,
+        request: HistoryProofByRangeRequest,
+    ) -> Result<neutrino_network::rpc::HistoryProofByRangeResponse, SyncBackendError> {
+        let response = if request.bootstrap
+            && request.start_checkpoint_hash == request.end_checkpoint_hash
+        {
+            let data = self
+                .backend
+                .bootstrap_data(request.end_checkpoint_hash)
+                .await?;
+            neutrino_network::rpc::HistoryProofByRangeResponse {
+                proof: data.genesis_prefix.clone(),
+                bootstrap: Some(data),
+            }
+        } else {
+            let mut response = self
+                .backend
+                .history_proof_by_range(request.start_checkpoint_hash, request.end_checkpoint_hash)
+                .await?;
+            if request.bootstrap {
+                response.bootstrap = Some(
+                    self.backend
+                        .bootstrap_data(request.end_checkpoint_hash)
+                        .await?,
+                );
+            }
+            response
+        };
+        bounded_history_reply(response)
+    }
+
     async fn handle_inbound_rpc(
         &self,
         peer: neutrino_network::PeerId,
@@ -571,7 +609,7 @@ impl SyncDriver {
             ),
             RpcRequest::StateByRoot(req) => rpc_reply(
                 RpcProtocol::StateByRoot,
-                self.backend.state_nodes(req.state_root, &req.paths).await,
+                self.backend.state_nodes(req.state_root, &req.items).await,
                 RpcResponse::StateByRoot,
             ),
             RpcRequest::BlockProofByHash(req) => rpc_reply(
@@ -598,9 +636,7 @@ impl SyncDriver {
             ),
             RpcRequest::HistoryProofByRange(req) => rpc_reply(
                 RpcProtocol::HistoryProofByRange,
-                self.backend
-                    .history_proof_by_range(req.start_checkpoint_hash, req.end_checkpoint_hash)
-                    .await,
+                self.history_rpc_reply(req).await,
                 |payload| RpcResponse::HistoryProofByRange(Box::new(payload)),
             ),
             RpcRequest::FinalityCertByChunk(req) => rpc_reply(
@@ -681,6 +717,7 @@ impl SyncDriver {
                 RpcRequest::HistoryProofByRange(HistoryProofByRangeRequest {
                     start_checkpoint_hash,
                     end_checkpoint_hash,
+                    bootstrap: false,
                 }),
                 move |_, response| OutboundOutcome::HistoryProof { request, response },
             )
@@ -741,16 +778,20 @@ impl SyncDriver {
             SyncCommand::RequestStateNodes {
                 peer,
                 state_root,
-                paths,
+                items,
             } => {
-                let paths_for_callback = paths.clone();
+                let items_for_callback = items.clone();
                 self.send_rpc(
                     peer,
-                    RpcRequest::StateByRoot(StateByRootRequest { state_root, paths }),
+                    RpcRequest::StateByRoot(StateByRootRequest {
+                        state_root,
+                        items: neutrino_consensus_types::bootstrap::StateItems::new(items)
+                            .expect("bounded sync request"),
+                    }),
                     move |peer, response| OutboundOutcome::StateNodes {
                         peer,
                         state_root,
-                        paths: paths_for_callback,
+                        items: items_for_callback,
                         response,
                     },
                 )
@@ -849,6 +890,12 @@ impl SyncDriver {
 
     async fn handle_outbound_outcome(&mut self, outcome: OutboundOutcome) {
         match outcome {
+            OutboundOutcome::Bootstrap {
+                peer,
+                nonce,
+                request,
+                response,
+            } => bootstrap::on_response(self, peer, nonce, request, response).await,
             OutboundOutcome::Consensus {
                 peer,
                 connection,
@@ -893,16 +940,15 @@ impl SyncDriver {
             OutboundOutcome::StateNodes {
                 peer,
                 state_root,
-                paths,
+                items,
                 response,
             } => match response {
                 Ok(RpcResponse::StateByRoot(payload)) => {
                     self.handle_state_nodes_response(
                         peer,
                         state_root,
-                        paths,
-                        payload.nodes,
-                        payload.values,
+                        items,
+                        payload.entries.to_vec(),
                     )
                     .await;
                 }
@@ -953,6 +999,9 @@ impl SyncDriver {
                     {
                         self.deferred_history_status.insert(peer, status);
                     }
+                    return;
+                }
+                if bootstrap::on_status(self, peer, status).await {
                     return;
                 }
                 if full_chunk::on_status(self, peer, status).await {
@@ -1179,13 +1228,12 @@ impl SyncDriver {
         &mut self,
         peer: neutrino_network::PeerId,
         state_root: StateRoot,
-        paths: Vec<Vec<u8>>,
-        nodes: Vec<Vec<u8>>,
-        values: Vec<Vec<u8>>,
+        items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
+        entries: Vec<neutrino_consensus_types::bootstrap::StateEntry>,
     ) {
         match self
             .backend
-            .import_state_nodes(state_root, paths, nodes, values)
+            .import_state_nodes(state_root, items, entries)
             .await
         {
             Ok(progress) => {
@@ -1194,7 +1242,7 @@ impl SyncDriver {
                         .fsm
                         .on_event(SyncEvent::StateRootReconstructed(state_root));
                     self.dispatch_sync_commands(cmds).await;
-                } else if !progress.next_paths.is_empty() {
+                } else if !progress.next_items.is_empty() {
                     // Continue the trie walk.
                     let _ = self
                         .cmd_tx
@@ -1202,12 +1250,15 @@ impl SyncDriver {
                             peer,
                             request: RpcRequest::StateByRoot(StateByRootRequest {
                                 state_root,
-                                paths: progress.next_paths.clone(),
+                                items: neutrino_consensus_types::bootstrap::StateItems::new(
+                                    progress.next_items.clone(),
+                                )
+                                .expect("bounded state continuation"),
                             }),
                             response_tx: {
                                 let (tx, rx) = oneshot::channel();
                                 let outbound_tx = self.outbound_tx.clone();
-                                let next_paths = progress.next_paths;
+                                let next_items = progress.next_items;
                                 tokio::spawn(async move {
                                     let result = match tokio::time::timeout(
                                         Duration::from_secs(30),
@@ -1227,7 +1278,7 @@ impl SyncDriver {
                                         .send(OutboundOutcome::StateNodes {
                                             peer,
                                             state_root,
-                                            paths: next_paths,
+                                            items: next_items,
                                             response: result,
                                         })
                                         .await;
@@ -1255,6 +1306,12 @@ impl SyncDriver {
 /// into the main driver loop.
 #[derive(Debug)]
 enum OutboundOutcome {
+    Bootstrap {
+        peer: neutrino_network::PeerId,
+        nonce: u64,
+        request: bootstrap::Request,
+        response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
+    },
     Consensus {
         peer: neutrino_network::PeerId,
         connection: Option<u64>,
@@ -1276,7 +1333,7 @@ enum OutboundOutcome {
     StateNodes {
         peer: neutrino_network::PeerId,
         state_root: StateRoot,
-        paths: Vec<Vec<u8>>,
+        items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
         response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
     },
     BlockProofs {
@@ -1304,6 +1361,21 @@ fn hex_short(bytes: &[u8; 32]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+fn bounded_history_reply(
+    payload: neutrino_network::rpc::HistoryProofByRangeResponse,
+) -> Result<neutrino_network::rpc::HistoryProofByRangeResponse, SyncBackendError> {
+    let size = borsh::to_vec(&payload)
+        .map_err(|error| SyncBackendError::Storage(error.to_string()))?
+        .len();
+    // Reserve the RpcResult discriminant in the framed response.
+    if u64::try_from(size).unwrap_or(u64::MAX) >= neutrino_network::rpc::DEFAULT_MAX_RESPONSE_SIZE {
+        return Err(SyncBackendError::NotAvailable(
+            "bootstrap manifest exceeds the wire limit".into(),
+        ));
+    }
+    Ok(payload)
 }
 
 fn rpc_reply<T>(

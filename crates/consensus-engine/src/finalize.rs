@@ -8,14 +8,12 @@ use crate::proposer::ProposerKey;
 use crate::store::StoreError;
 use alloc::vec::Vec;
 use core::fmt;
-use neutrino_consensus_chunk_bft::{BftError, ChunkBft, FinalizationStatus};
+use neutrino_consensus_chunk_bft::BftError;
 use neutrino_consensus_types::{
     BlockProof as WireBlockProof, Chunk, ChunkProof as WireChunkProof, ChunkProofPublicInputs,
-    FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase, Header,
+    FinalityCert, Header,
 };
-use neutrino_primitives::{
-    BitVec, BlockHash, ChunkHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH,
-};
+use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
@@ -80,7 +78,7 @@ pub enum FinalizeError<E> {
     EmptyActiveSet,
     /// Backend chunk-proof generation failed.
     Backend(ProofError),
-    /// Chunk-BFT bookkeeping rejected the synthesized vote.
+    /// Chunk-BFT bookkeeping rejected a signed vote.
     Bft(BftError),
     /// The BFT layer accepted votes but still reports `Pending`. Only
     /// possible when the available valid votes do not form a quorum.
@@ -189,13 +187,16 @@ pub struct FinalizeOutcome {
 
 impl<DB: Database> Engine<DB> {
     /// Prove and finalize complete execution and consensus for a chunk.
+    /// This convenience path commits an already-materialized canonical branch.
+    /// A saved BFT target on another branch requires
+    /// [`Self::commit_bft_consensus_chunk`] with a configured replay executor.
     pub fn finalize_chunk<PS: ProofSystem>(
         &mut self,
         chunk_id: ChunkId,
         proof_system: &PS,
         voter: &ProposerKey,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        let mut prepared = self.prepare_consensus_chunk(chunk_id, proof_system)?;
+        let mut prepared = self.prepare_bft_consensus_chunk(chunk_id, proof_system)?;
         self.certify_consensus_chunk(&mut prepared, voter)?;
         let proof = proof_system.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
         self.commit_consensus_chunk(&prepared.witness, &proof, proof_system)
@@ -241,85 +242,37 @@ impl<DB: Database> Engine<DB> {
     /// consuming a live BFT session or obtaining a local certificate when
     /// the local signer alone meets the configured quorum.
     pub(crate) fn run_chunk_bft(
-        &self,
+        &mut self,
         chunk: &Chunk,
         chunk_hash: ChunkHash,
         voter: &ProposerKey,
         active_validator_set_root: Hash,
     ) -> Result<FinalityCert, FinalizeError<DB::Error>> {
-        if let Some(session) = self.bft_sessions.get(&chunk.chunk_id) {
-            return finalize_from_session(session, chunk_hash, active_validator_set_root);
+        if self
+            .local_voter
+            .as_ref()
+            .is_some_and(|local| local.public_key_bytes() != voter.public_key_bytes())
+        {
+            return Err(EngineError::Signing(crate::signing::SigningViolation::Conflict).into());
         }
-
-        let active_set = self.active_validator_set().to_vec();
-        if active_set.is_empty() {
-            return Err(FinalizeError::EmptyActiveSet);
-        }
-
-        let mut bft = ChunkBft::with_quorum(
-            self.chain_spec().chain_id,
-            chunk.clone(),
-            0,
-            active_set.clone(),
-            active_validator_set_root,
-            (
-                self.chain_spec().consensus.bft_prevote_quorum_numerator,
-                self.chain_spec().consensus.bft_prevote_quorum_denominator,
-            ),
-            (
-                self.chain_spec().consensus.bft_precommit_quorum_numerator,
-                self.chain_spec().consensus.bft_precommit_quorum_denominator,
-            ),
-        )?;
-
-        let prevote = build_single_validator_vote(
-            chunk.chunk_id,
-            chunk_hash,
-            0,
-            FinalityVotePhase::Prevote,
-            self.chain_spec().chain_id,
-            voter,
-            active_set.len(),
-        );
-        let mut precommit = build_single_validator_vote(
-            chunk.chunk_id,
-            chunk_hash,
-            0,
-            FinalityVotePhase::Precommit,
-            self.chain_spec().chain_id,
-            voter,
-            active_set.len(),
-        );
-
-        let mut proof_hashes = Vec::new();
-        for height in chunk.start_height..=chunk.end_height {
-            let hash = self
-                .store()
-                .get_block_hash_by_height(height)?
-                .ok_or(FinalizeError::FinalizationStalled)?;
-            let proof = self
-                .store()
-                .get_block_proof(&hash)?
-                .ok_or(FinalizeError::FinalizationStalled)?;
-            proof_hashes.push(neutrino_prover_chunk::execution::commitment(&proof));
-        }
-        precommit.attestations.push(voter.attest_precommit(
-            self.chain_spec().chain_id,
-            precommit.data.clone(),
-            proof_hashes,
-            None,
-        ));
-        bft.add_prevote(prevote)?;
-        bft.add_precommit(precommit)?;
-
-        let status = bft.finalization_status(true, active_validator_set_root)?;
-        if status != FinalizationStatus::Finalized {
-            return Err(FinalizeError::FinalizationStalled);
-        }
-        let cert = bft
-            .try_finalize(true, active_validator_set_root)?
+        let previous = self.local_voter.clone();
+        self.set_local_voter(voter.clone());
+        let driven = if self.bft_sessions.contains_key(&chunk.chunk_id) {
+            self.resume_bft_session(chunk.chunk_id)
+        } else {
+            self.open_bft_session(chunk.clone())
+        };
+        self.local_voter = previous;
+        driven.map_err(|error| match error {
+            crate::BftLoopError::Bft(error) => FinalizeError::Bft(error),
+            crate::BftLoopError::Engine(error) => FinalizeError::Engine(error),
+            _ => FinalizeError::FinalizationStalled,
+        })?;
+        let session = self
+            .bft_sessions
+            .get(&chunk.chunk_id)
             .ok_or(FinalizeError::FinalizationStalled)?;
-        Ok(cert)
+        finalize_from_session(session, chunk_hash, active_validator_set_root)
     }
 
     /// Attempt to assemble the canonical [`Chunk`] for `chunk_id` from
@@ -459,36 +412,4 @@ fn chunk_range<E>(
 fn wire_proof_leaf_bytes(wire_proof: &WireBlockProof) -> Vec<u8> {
     borsh::to_vec(&wire_proof.public_inputs)
         .expect("borsh encode of BlockProofPublicInputs is infallible")
-}
-
-fn build_single_validator_vote(
-    chunk_id: ChunkId,
-    chunk_hash: ChunkHash,
-    round: u32,
-    phase: FinalityVotePhase,
-    chain_id: u64,
-    voter: &ProposerKey,
-    active_set_len: usize,
-) -> FinalityVote {
-    let data = FinalityVoteData {
-        chunk_id,
-        round,
-        chunk_hash,
-        phase,
-    };
-    let signature = voter.sign_finality_vote(chain_id, &data);
-
-    let mut bits = BitVec::default();
-    let voter_index = voter.validator_index();
-    let voter_position = usize::try_from(voter_index).expect("u32 fits usize on supported targets");
-    for position in 0..active_set_len {
-        bits.push(position == voter_position);
-    }
-
-    FinalityVote {
-        attestations: Vec::new(),
-        aggregation_bits: bits,
-        data,
-        signature,
-    }
 }

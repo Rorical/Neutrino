@@ -1,45 +1,44 @@
-//! M6-new exit criterion 2: a follower catches up by fetching
-//! headers and block proofs through the [`SyncBackend`] RPC surface.
-//!
-//! This test sidesteps libp2p and the [`SyncDriver`] FSM and exercises
-//! the data plane directly:
-//!
-//! 1. Producer (node 0) builds a 3-block chain through the real
-//!    production path — `try_produce_block` + `prove_block` on
-//!    `Sp1ProofSystem<MockProver>` + `WasmExecutor`.
-//! 2. Follower (node 1) boots empty.
-//! 3. Follower pulls headers via [`SyncBackend::blocks_by_range`] on
-//!    the producer's `ChainBackend` (same handler the libp2p
-//!    request-response path serves) and imports them via
-//!    [`SyncBackend::verify_and_import_headers`].
-//! 4. Follower pulls block proofs via
-//!    [`SyncBackend::block_proofs_by_height`] and imports them via
-//!    [`SyncBackend::verify_and_import_block_proofs`].
-//! 5. Assert: both nodes agree on `head_height`, head hash, and
-//!    `proven_height`.
-//!
-//! End-to-end coverage including [`SyncDriver`] FSM transitions over
-//! libp2p remains a follow-on item; that requires wiring the driver
-//! against a real backend, which no existing test does. The data
-//! path itself is exercised here against real SP1 proof envelopes,
-//! mirroring what the driver would request and ingest.
+//! A follower imports execution headers and block proofs, then reconstructs the
+//! exact head state through the same bounded typed-fragment RPC handlers served
+//! by libp2p. Mock SP1 envelopes exercise adapter plumbing, not the real STARK gate.
 
 use std::sync::Arc;
 
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProposerKey};
+use neutrino_consensus_types::BlockProof;
+use neutrino_consensus_types::bootstrap::StateItem;
+use neutrino_default_runtime_core::{Account, account_key, encode_account};
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BlockHash, BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams,
-    RuntimeInfo, RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    RuntimeInfo, RuntimeParams, StateParams, StateRoot, Validator, ZERO_HASH,
+    fixed_u128_from_integer,
 };
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
-use neutrino_storage::MemoryDatabase;
+use neutrino_storage::{Column, Database, MemoryDatabase};
 use neutrino_sync::SyncBackend;
+use neutrino_trie::Trie;
 use sp1_sdk::blocking::MockProver;
 
 const CHAIN_ID: u64 = 7_777_777;
 const GENESIS_SEED: [u8; 32] = [0xBE; 32];
+const FUNDED_ACCOUNT: [u8; 32] = [0xAC; 32];
+
+fn funded_account_bytes() -> Vec<u8> {
+    encode_account(&Account {
+        nonce: 0,
+        balance: 1_000_000,
+    })
+}
+
+fn genesis_state() -> Trie {
+    let mut state = Trie::new();
+    state
+        .insert(&account_key(&FUNDED_ACCOUNT), funded_account_bytes())
+        .expect("insert genesis account");
+    state
+}
 
 fn proposer() -> ProposerKey {
     ProposerKey::from_ikm(&[0xC3; 32], 0).expect("derive proposer")
@@ -70,14 +69,14 @@ fn chain_spec() -> ChainSpec {
         ..ConsensusParams::default()
     };
     ChainSpec {
-        name: BoundedBytes::new(b"m6-new-snap-sync".to_vec()).expect("name fits"),
+        name: BoundedBytes::new(b"typed-state-snapshot".to_vec()).expect("name fits"),
         chain_id: CHAIN_ID,
         genesis_time: 1_700_000_000,
         genesis_gas_limit: 30_000_000,
         runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [0xDD; 32],
         genesis_seed: GENESIS_SEED,
-        genesis_state_root: ZERO_HASH,
+        genesis_state_root: genesis_state().root(),
         genesis_block_hash,
         genesis_validator_set_root: vs_root,
         consensus,
@@ -95,7 +94,15 @@ type NodeBackend = ChainBackend<MemoryDatabase, Sp1ProofSystem<MockProver>>;
 fn build_backend() -> Arc<NodeBackend> {
     let engine = Engine::genesis(chain_spec(), MemoryDatabase::new()).expect("genesis");
     let proof_system = Sp1ProofSystem::mock().expect("mock SP1 adapter");
-    let backend = Arc::new(ChainBackend::new(engine, proof_system));
+    Arc::new(ChainBackend::new(engine, proof_system))
+}
+
+fn build_producer() -> Arc<NodeBackend> {
+    let backend = build_backend();
+    backend.with_engine_mut_for_test(|engine| {
+        engine.replace_state_with_reconstructed(genesis_state());
+        engine.flush_trie_to_store().expect("persist genesis state");
+    });
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
     backend.set_block_executor(executor);
     backend
@@ -115,11 +122,51 @@ where
         .expect("spawn_blocking joined")
 }
 
+/// Reconstruct a committed state root through the production fragment handlers.
+async fn import_state_from_rpc(
+    producer: &NodeBackend,
+    follower: &NodeBackend,
+    root: StateRoot,
+) -> usize {
+    let mut items = vec![StateItem::node(root)];
+    let mut fragments = 0;
+    loop {
+        let response = producer
+            .state_nodes(root, &items)
+            .await
+            .expect("serve fragments");
+        fragments += response.entries.len();
+        let progress = follower
+            .import_state_nodes(root, items, response.entries.to_vec())
+            .await
+            .expect("authenticate and import fragments");
+        if progress.root_complete {
+            return fragments;
+        }
+        items = progress.next_items;
+    }
+}
+
+/// Import SDK proof envelopes off the async worker and return proven progress.
+async fn import_proofs(follower: Arc<NodeBackend>, proofs: Vec<BlockProof>) -> u64 {
+    run_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("inner runtime");
+        runtime
+            .block_on(follower.verify_and_import_block_proofs(1, proofs))
+            .expect("follower imports proofs")
+            .new_proven_height
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
+async fn follower_reconstructs_nonempty_state_then_imports_mock_sp1_adapter_proofs() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let producer = run_blocking(build_backend).await;
+    let producer = run_blocking(build_producer).await;
     let follower = run_blocking(build_backend).await;
 
     // Producer builds a 3-block chain. Each slot: produce → prove.
@@ -144,6 +191,17 @@ async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
     // Follower starts at genesis with no proofs.
     assert_eq!(follower.head_height(), 0);
     assert_eq!(follower.local_progress().await.unwrap().proven_height, 0);
+    assert_eq!(
+        follower.with_engine_mut_for_test(|engine| {
+            engine
+                .store()
+                .db()
+                .iter_column(Column::TrieNodes)
+                .unwrap()
+                .len()
+        }),
+        0
+    );
 
     // Step 1: header backfill via the producer's RPC handler. The
     // sync FSM's `HeaderBackfill` state issues exactly this kind of
@@ -170,8 +228,24 @@ async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
     assert_eq!(follower.head_height(), 3);
     // Proofs still unimported, so proven_height is still 0.
     assert_eq!(follower.local_progress().await.unwrap().proven_height, 0);
+    assert!(!follower.engine_state_invariant_holds());
 
-    // Step 2: proof backfill via the producer's RPC handler. The
+    // Step 2: Snap sync reconstructs state before proof backfill can prepare
+    // BFT's authenticated rotation witness. Header import installed no trie data.
+    let root = blocks_response.blocks.last().unwrap().header.state_root;
+    assert_ne!(root, ZERO_HASH);
+    let fragments = import_state_from_rpc(&producer, &follower, root).await;
+    assert!(fragments > 0);
+    assert!(follower.engine_state_invariant_holds());
+    assert_eq!(
+        follower.with_engine_mut_for_test(|engine| {
+            engine.state().get(&account_key(&FUNDED_ACCOUNT))
+        }),
+        Some(funded_account_bytes())
+    );
+    assert_eq!(follower.local_progress().await.unwrap().proven_height, 0);
+
+    // Step 3: proof backfill via the producer's RPC handler. The
     // sync FSM's `ProofBackfill` state issues exactly this kind of
     // `BlockProofByHeight` request and pipes the result into
     // `verify_and_import_block_proofs`.
@@ -189,18 +263,10 @@ async fn follower_snap_syncs_three_block_chain_with_sp1_proofs() {
         "producer must return all 3 proofs",
     );
 
-    let follower_clone = Arc::clone(&follower);
-    let proofs = proofs_response.proofs;
-    let imported_proofs = run_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("inner runtime");
-        rt.block_on(follower_clone.verify_and_import_block_proofs(1, proofs))
-            .expect("follower imports proofs")
-    })
-    .await;
-    assert_eq!(imported_proofs.new_proven_height, 3);
+    assert_eq!(
+        import_proofs(Arc::clone(&follower), proofs_response.proofs).await,
+        3
+    );
 
     // Convergence: same head, same hash, same proven height.
     assert_eq!(

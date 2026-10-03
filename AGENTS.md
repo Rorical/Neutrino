@@ -50,6 +50,11 @@ have passed.
   chunks. Full/validator nodes prune older raw data only below saved recursive
   coverage; archive nodes preserve history. Proof jobs pin receipts and boundaries,
   not old transaction bodies or execution state. Current sanctions remain live state.
+- Full/validator snapshot bootstrap verifies a genesis History prefix and an exact
+  bridge from local trust, then authenticates validators, recent history and the
+  complete execution state before durable atomic installation. Archive nodes replay
+  sources. BFT/proposer signing journals must be synchronized before signing; never
+  bypass journal reservations or discard unfinalized locks during bootstrap.
 - There is one current protocol format with unversioned types, fields and paths.
   Incompatible development upgrades replace formats directly. Do not introduce
   deprecated variants, compatibility shims, fake recursive proofs or empty-proof

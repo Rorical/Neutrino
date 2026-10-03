@@ -26,20 +26,23 @@ at 624 bytes; raw archival data and live application state remain separate.
 Historical consensus references use an eight-chunk window. Full/validator nodes
 prune sources only below persisted recursive coverage and expose the actual
 retention watermark; `role = "archive"` preserves full history voluntarily.
+Validator signing journals and unfinalized BFT session recovery protect restart
+signing. Full/validator checkpoint bootstrap authenticates consensus metadata and
+downloads execution state in resumable content-addressed fragments before one
+durable installation; archive mode continues source replay.
 
 Outstanding work:
+
+- Define safe higher-round BFT candidate replacement. Current sessions retain their
+  original target and lock across rounds and restarts; they never use restart as
+  permission to sign another candidate.
 
 - Measure and bound real proving cost, including statement recursion, objective
   block-proof rejection, larger validator sets and sustained multi-chunk operation.
 - Strengthen signed-artifact publication/retrieval, archival and late-arrival detection.
-- Persist validator round/lock/local-vote state for restart signing safety; current
-  BFT sessions are reconstructed in memory, independently of proof validity.
 - Define erasure-coded DA and sampling if availability guarantees are required.
 - Complete operator tooling, key management, metrics, RPC resource controls,
-  snapshot publishing and runtime-upgrade coordination.
-- Implement full/validator bootstrap from a recursive checkpoint and an
-  authenticated state snapshot; current synchronization replays source blocks
-  from genesis and needs an archive when recent providers have pruned them.
+  managed snapshot export/distribution and runtime-upgrade coordination.
 - Add strict local disk/backlog admission limits for stalled provers if an
   unconditional storage cap is required; proof lag delays raw-history pruning.
 - Implement prover-market/bounty behavior and other currently unsupported interfaces.

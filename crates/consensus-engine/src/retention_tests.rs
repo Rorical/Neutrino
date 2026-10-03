@@ -1,5 +1,14 @@
 //! Storage fixtures model already verified finalizations; no cryptographic receipts are generated.
 
+#[path = "bootstrap_storage_tests.rs"]
+mod bootstrap_storage_tests;
+
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;
+
+#[path = "bootstrap_checkpoint_retention_tests.rs"]
+mod bootstrap_checkpoint_retention_tests;
+
 use super::*;
 use crate::full_chunk::ConsensusState;
 use crate::test_db::{FaultDb, header};
@@ -165,7 +174,7 @@ where
     next_context.parent_slot = end.slot;
     next_context.history_root = end.history_root;
     let state = ConsensusState {
-        statement: statement.clone(),
+        boundary: statement.end,
         next_context,
         next_seed: end.seed,
         frontier,

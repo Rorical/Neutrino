@@ -111,6 +111,17 @@ impl ProposerKey {
         self.validator_index
     }
 
+    /// Keep this BLS identity while binding it to its authenticated active-set
+    /// position. Consensus rotation can change the position without changing
+    /// either the secret key or its durable anti-equivocation identity.
+    #[must_use]
+    pub fn with_validator_index(&self, validator_index: ValidatorIndex) -> Self {
+        Self {
+            validator_index,
+            ..self.clone()
+        }
+    }
+
     /// Canonical 48-byte BLS public-key bytes.
     #[must_use]
     pub const fn public_key_bytes(&self) -> &BlsPublicKey {

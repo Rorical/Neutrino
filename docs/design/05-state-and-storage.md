@@ -22,12 +22,18 @@ prune sources older than the eight-chunk window only after a persisted recursive
 prefix covers them; archive nodes retain complete history. See
 [the exact retention boundary](21-recursive-checkpoint-proofs.md#eight-chunk-retention-and-archive-mode).
 Current state, recent evidence openings and admitted withdrawal obligations survive
-pruning. Full/validator synchronization currently replays source blocks from genesis;
-importing a recursive checkpoint together with an authenticated execution-state
-snapshot is not implemented. A fresh node, or a node behind the available retained
-window, therefore requires an archive or another source retaining its missing data.
-A light client's recursive proof verification does not install execution state and
-does not provide full-node bootstrap.
+pruning. Full/validator nodes can bootstrap from a recursive checkpoint and an
+authenticated execution-state snapshot. Endpoint header, active validators,
+append frontier and the preceding eight historical records bind to the proven
+boundary. Bounded state fragments and progress persist separately until complete
+root authentication. Installation publishes state, canonical anchor, consensus
+context and recursive prefix in one durable batch. Archive nodes replay sources.
+
+A bootstrapped node advertises its raw-data watermark at the installed endpoint.
+It retains the preceding eight consensus records and paths, without claiming their
+transaction bodies. New chunks rebuild the recent raw window. The source floor
+never regresses; historical consensus records have their own eight-chunk floor.
+Installation preserves signing intents and refuses to erase unfinalized locks.
 
 Header archival never selects a branch. The materialized tip, canonical height
 index and trie deltas commit in one batch; reorgs replace changed ancestry and

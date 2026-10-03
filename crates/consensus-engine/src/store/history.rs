@@ -665,6 +665,9 @@ mod tests {
         fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error> {
             self.inner.write_batch(batch)
         }
+        fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
+            self.inner.write_batch_durable(batch)
+        }
         fn iter_column(&self, _: Column) -> Result<ColumnSnapshot, Self::Error> {
             panic!("history append/open must not enumerate archived records")
         }

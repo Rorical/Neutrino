@@ -3,15 +3,76 @@
 #[path = "../../prover-chunk/tests/support/mod.rs"]
 pub mod support;
 
-use neutrino_consensus_engine::{BlockState, Engine, ProposerKey};
-use neutrino_consensus_types::{BlockProof, BlockProofPublicInputs};
-use neutrino_default_runtime_core::StfPublicOutput;
-use neutrino_proof_system::{ProofError, ProofSystem};
+use neutrino_consensus_engine::{BftAction, BlockState, Engine, ProposerKey};
+use neutrino_consensus_types::{BlockProof, BlockProofPublicInputs, Body};
+use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block};
+use neutrino_proof_system::{
+    BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome, ProofError, ProofSystem,
+};
 use neutrino_prover_chunk::consensus::{ConsensusStatement, ConsensusWitness, validate_consensus};
+use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
+use neutrino_runtime_core::host::{LiveTrie, TracingState};
 use neutrino_storage::MemoryDatabase;
+use neutrino_trie::{Poseidon2Hasher, Trie};
 
 struct NativeConsensusBackend {
     reject: bool,
+}
+
+/// Execute the actual shared STF when materializing a proof-selected branch.
+struct NativeReplayExecutor;
+
+impl ErasedBlockExecutor for NativeReplayExecutor {
+    fn execute_block(
+        &self,
+        context: &BlockExecutionContext,
+        body: &Body,
+        state: &mut Trie<Poseidon2Hasher>,
+    ) -> Result<ExecutionOutcome, String> {
+        let input = StfInput {
+            evidence_anchor: context.evidence_anchor,
+            chain_id: context.chain_id,
+            block_height: context.block_height,
+            block_gas_limit: context.gas_limit,
+            gas_price: context.gas_price,
+            proposer_address: context.proposer_address,
+            transactions: body
+                .transactions
+                .iter()
+                .map(|bytes| borsh::from_slice(bytes))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?,
+        };
+        let live = LiveTrie::from_trie(state.clone());
+        let mut tracing = TracingState::new(&live);
+        let output = apply_block(&input, &mut tracing);
+        let (post_state, witness) = tracing.into_committed_and_witness();
+        *state = post_state;
+        Ok(ExecutionOutcome {
+            state_root_after: output.post_state_root,
+            runtime_extra: output.validator_set_root,
+            receipts_root: output.receipts_root,
+            gas_used: output.gas_used,
+            witness_bytes: borsh::to_vec(&(input, witness)).map_err(|error| error.to_string())?,
+        })
+    }
+
+    fn query(&self, _: &QueryRequest, _: &Trie<Poseidon2Hasher>) -> Result<QueryResponse, String> {
+        Err(String::from("query is outside this replay regression"))
+    }
+
+    fn validate_tx(
+        &self,
+        _: &[u8],
+        _: u64,
+        _: u64,
+        _: u128,
+        _: &Trie<Poseidon2Hasher>,
+    ) -> Result<TxValidity, String> {
+        Err(String::from(
+            "transaction admission is outside this replay regression",
+        ))
+    }
 }
 
 impl ProofSystem for NativeConsensusBackend {
@@ -20,10 +81,16 @@ impl ProofSystem for NativeConsensusBackend {
 
     fn prove_block(
         &self,
-        _: &[u8],
-        _: &BlockProofPublicInputs,
+        bytes: &[u8],
+        pi: &BlockProofPublicInputs,
     ) -> Result<Self::BlockProof, ProofError> {
-        Err(ProofError::Unsupported)
+        let (input, witness): (StfInput, neutrino_runtime_abi::StateWitness) =
+            borsh::from_slice(bytes).map_err(|_| ProofError::InvalidWitness)?;
+        let mut state = neutrino_runtime_core::WitnessState::new(&witness)
+            .map_err(|_| ProofError::InvalidWitness)?;
+        let output = apply_block(&input, &mut state);
+        self.verify_block(&output, pi)?;
+        Ok(output)
     }
 
     fn verify_block(
@@ -149,7 +216,7 @@ fn complete_finalization_persists_boundary_and_peer_import_checks_certificate() 
     assert_ne!(outcome.chunk_proof.proof_bytes, [] as [u8; 0]);
     assert_eq!(outcome.chunk_proof.finality_cert, outcome.finality_cert);
     let state = producer.store().get_consensus_state().unwrap().unwrap();
-    assert_eq!(state.statement, validate_consensus(&input).unwrap());
+    assert_eq!(state.boundary, validate_consensus(&input).unwrap().end);
     assert_eq!(
         producer.active_validator_set(),
         state.next_context.active_validators
@@ -238,7 +305,7 @@ fn successor_bft_uses_the_proven_validator_root_without_a_recursive_checkpoint()
     successor.start_height = 2;
     successor.end_height = 2;
     successor.active_validator_set_root = root;
-    engine.set_local_voter(voter);
+    engine.set_local_voter(voter.clone());
     let mut header = engine.store().get_header_by_height(1).unwrap().unwrap();
     let mut proof = engine
         .store()
@@ -248,7 +315,10 @@ fn successor_bft_uses_the_proven_validator_root_without_a_recursive_checkpoint()
     header.parent_hash = header.hash();
     header.height = 2;
     header.slot = 2;
+    header.signature = voter.sign_proposer_message(engine.chain_spec().chain_id, &header.hash());
     let hash = engine.store_mut().put_header(&header).unwrap();
+    successor.start_block_hash = hash;
+    successor.end_block_hash = hash;
     proof.height = 2;
     proof.block_hash = hash;
     proof.public_inputs.height = 2;
@@ -364,6 +434,319 @@ fn chunk_preparation_uses_the_materialized_branch_after_sibling_archival() {
         .unwrap();
     assert_eq!(prepared.witness.blocks, witness.blocks);
     assert_ne!(prepared.witness.blocks[0].header.hash(), sibling.hash());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Follow the fixed signed target across branch change, restart and finality.
+fn restored_bft_finalizes_its_signed_branch_after_the_canonical_head_changes() {
+    let (mut engine, input) = engine();
+    let backend = NativeConsensusBackend { reject: false };
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let mut original = engine.prepare_bft_consensus_chunk(0, &backend).unwrap();
+    engine
+        .certify_consensus_chunk(&mut original, &voter)
+        .unwrap();
+    let signed_hash = original.witness.finality_cert.chunk_hash;
+    let original_header = &input.blocks[0].header;
+    let signed_end = original_header.hash();
+    let original_certificate = original.witness.finality_cert.clone();
+
+    // A valid sibling has its own proposer signature and slot-bound BLS VRF.
+    // Its STF transition is identical because neither block has transactions.
+    let mut sibling = original_header.clone();
+    sibling.slot = 2;
+    sibling.timestamp = 2 * input.chain_spec.consensus.slot_duration_secs;
+    let secret = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    sibling.vrf_proof = secret
+        .sign(&neutrino_vrf::vrf_message(
+            input.chain_spec.chain_id,
+            &input.chain_spec.genesis_seed,
+            sibling.slot,
+        ))
+        .to_bytes();
+    sibling.signature = voter.sign_proposer_message(input.chain_spec.chain_id, &sibling.hash());
+    engine
+        .import_block(&neutrino_consensus_types::Block {
+            header: sibling.clone(),
+            body: Body::default(),
+        })
+        .unwrap();
+    let sibling_hash = sibling.hash();
+    let mut sibling_proof = engine
+        .store()
+        .get_block_proof(&signed_end)
+        .unwrap()
+        .unwrap();
+    sibling_proof.block_hash = sibling_hash;
+    sibling_proof.public_inputs.block_hash = sibling_hash;
+    engine
+        .store_mut()
+        .put_block_state(&sibling_hash, BlockState::Proven)
+        .unwrap();
+    engine
+        .store_mut()
+        .put_block_proof(&sibling_hash, &sibling_proof)
+        .unwrap();
+    // Publish a competing materialized head, just as ordinary fork-choice
+    // replay does. Both branches have the same genuine native STF state.
+    engine
+        .store_mut()
+        .commit_tip(
+            sibling_hash,
+            input.chain_spec.genesis_block_hash,
+            neutrino_storage::Batch::new(),
+        )
+        .unwrap();
+    let database = engine.store().db().clone();
+    drop(engine);
+
+    let mut restored = Engine::open(input.chain_spec.clone(), database).unwrap();
+    restored.set_evidence_programs([1; 8], [2; 8], [3; 8]);
+    restored.set_local_voter(voter.clone());
+    assert_eq!(restored.head_hash(), sibling_hash);
+    assert_eq!(restored.bft_session(0).unwrap().chunk_hash(), signed_hash);
+    let mut canonical = restored.prepare_consensus_chunk(0, &backend).unwrap();
+    assert_eq!(canonical.witness.blocks[0].header.hash(), sibling_hash);
+    // A restart never permits a local vote or proof to retarget the session.
+    assert!(
+        restored
+            .certify_consensus_chunk(&mut canonical, &voter)
+            .is_err()
+    );
+
+    let mut prepared = restored.prepare_bft_consensus_chunk(0, &backend).unwrap();
+    assert_eq!(prepared.witness.blocks[0].header.hash(), signed_end);
+    let resumed = restored.resume_bft_actions().unwrap();
+    assert!(
+        resumed
+            .iter()
+            .any(|action| matches!(action, BftAction::QuorumReached(0)))
+    );
+    restored
+        .certify_consensus_chunk(&mut prepared, &voter)
+        .unwrap();
+    assert_eq!(prepared.witness.finality_cert, original_certificate);
+    let statement = backend
+        .prove_consensus_chunk(&prepared.proofs, &prepared.witness)
+        .unwrap();
+    let chunk = neutrino_prover_chunk::consensus::as_chunk(&statement.chunk);
+    neutrino_prover_chunk::finality::verify_finality(
+        input.chain_spec.chain_id,
+        &input.chain_spec.consensus,
+        &prepared.witness.context.active_validators,
+        &chunk,
+        &prepared.witness.finality_cert,
+    )
+    .unwrap();
+    // Rejected proofs and a missing replay executor leave head/finality intact.
+    assert!(
+        restored
+            .commit_bft_consensus_chunk(
+                &prepared.witness,
+                &statement,
+                &NativeConsensusBackend { reject: true },
+                Some(&NativeReplayExecutor),
+            )
+            .is_err()
+    );
+    assert!(
+        restored
+            .commit_bft_consensus_chunk(&prepared.witness, &statement, &backend, None)
+            .is_err()
+    );
+    assert_eq!(restored.head_hash(), sibling_hash);
+    assert_eq!(restored.latest_finalized_chunk_id(), None);
+    let outcome = restored
+        .commit_bft_consensus_chunk(
+            &prepared.witness,
+            &statement,
+            &backend,
+            Some(&NativeReplayExecutor),
+        )
+        .unwrap();
+    assert_eq!(outcome.chunk_hash, signed_hash);
+    assert_eq!(restored.head_hash(), signed_end);
+    assert_eq!(restored.fork_choice_finalized(), signed_end);
+    assert_eq!(restored.latest_finalized_chunk_id(), Some(0));
+    assert!(restored.bft_session(0).is_none());
+    let restarted = Engine::open(input.chain_spec, restored.store().db().clone()).unwrap();
+    assert_eq!(restarted.head_hash(), signed_end);
+    assert_eq!(restarted.latest_finalized_chunk_id(), Some(0));
+    assert!(restarted.bft_session(0).is_none());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Authenticate registration, transition identity, produce and restart.
+fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_hint() {
+    use neutrino_default_runtime_core::{
+        VALIDATOR_REGISTRATIONS_KEY, VALIDATOR_SET_KEY, ValidatorRegistration,
+        ValidatorRegistrations, ValidatorSet,
+    };
+    let newcomer = ProposerKey::from_ikm(&[43; 32], 99).unwrap();
+    let address = [12; 32];
+    let mut runtime_validators = ValidatorSet::default();
+    runtime_validators.upsert(address, 100);
+    let registrations = ValidatorRegistrations {
+        entries: vec![ValidatorRegistration {
+            address,
+            bls_pubkey: *newcomer.public_key_bytes(),
+            pop_signature: newcomer.prove_possession().to_bytes(),
+        }],
+    };
+    let mut live = LiveTrie::default();
+    live.insert(
+        VALIDATOR_SET_KEY,
+        borsh::to_vec(&runtime_validators).unwrap(),
+    );
+    live.insert(
+        VALIDATOR_REGISTRATIONS_KEY,
+        borsh::to_vec(&registrations).unwrap(),
+    );
+    let (mut witness, mut input, _) =
+        support::fixture_with_live([1; 8], [4; 32], Vec::new(), 30_000_000, &live);
+    // Registration seats an inactive key at epoch 1, then the next verified
+    // chunk activates it at epoch 2 under a valid positive protocol delay.
+    witness.chain_spec.consensus.epoch_length_in_chunks = 1;
+    witness.chain_spec.consensus.activation_delay_epochs = 1;
+    input.evidence_anchor.chain_spec_hash = witness.chain_spec.hash();
+    let mut state = TracingState::new(&live);
+    witness.blocks[0].output = apply_block(&input, &mut state);
+    let backend = NativeConsensusBackend { reject: false };
+    let mut producer = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    for engine in [&mut producer, &mut follower] {
+        engine.set_evidence_programs([1; 8], [2; 8], [3; 8]);
+        engine.replace_state_with_reconstructed(live.trie().clone());
+        engine.flush_trie_to_store().unwrap();
+        let block = &witness.blocks[0];
+        let hash = block.header.hash();
+        engine
+            .import_block(&neutrino_consensus_types::Block {
+                header: block.header.clone(),
+                body: Body::default(),
+            })
+            .unwrap();
+        engine
+            .store_mut()
+            .put_block_state(&hash, BlockState::Proven)
+            .unwrap();
+        engine
+            .store_mut()
+            .put_block_proof(
+                &hash,
+                &BlockProof {
+                    height: 1,
+                    block_hash: hash,
+                    public_inputs: block.public_inputs.clone(),
+                    proof_bytes: borsh::to_vec(&block.output).unwrap(),
+                },
+            )
+            .unwrap();
+    }
+    follower.set_local_voter(newcomer.clone());
+    assert!(
+        follower
+            .try_produce_block(
+                2,
+                neutrino_consensus_engine::ProductionConfig {
+                    proposer: &newcomer,
+                },
+                Body::default(),
+                witness.chain_spec.genesis_gas_limit,
+                &NativeReplayExecutor,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        neutrino_storage::Database::iter_column(
+            follower.store().db(),
+            neutrino_storage::Column::SigningJournal,
+        )
+        .unwrap()
+        .len(),
+        0
+    );
+    // Both the producer's stale index and the newcomer are resolved by key.
+    let original = ProposerKey::from_ikm(&[42; 32], 77).unwrap();
+    let finalized = producer.finalize_chunk(0, &backend, &original).unwrap();
+    follower
+        .import_chunk_proof(&finalized.chunk_proof, &backend)
+        .unwrap();
+    assert_eq!(follower.active_validator_set().len(), 2);
+    assert_eq!(follower.active_validator_set()[1].activation_epoch, 2);
+    assert_eq!(follower.active_validator_set()[1].effective_stake, 0);
+    assert!(
+        follower
+            .try_produce_block(
+                2,
+                neutrino_consensus_engine::ProductionConfig {
+                    proposer: &newcomer,
+                },
+                Body::default(),
+                witness.chain_spec.genesis_gas_limit,
+                &NativeReplayExecutor,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let next_block = producer
+        .try_produce_block(
+            2,
+            neutrino_consensus_engine::ProductionConfig {
+                proposer: &original,
+            },
+            Body::default(),
+            witness.chain_spec.genesis_gas_limit,
+            &NativeReplayExecutor,
+        )
+        .unwrap()
+        .unwrap();
+    let receipt = producer
+        .prove_block(&next_block.block_hash, &backend)
+        .unwrap();
+    follower.import_block(&next_block.block).unwrap();
+    follower
+        .import_block_proof(&receipt.block_proof, &backend)
+        .unwrap();
+    let finalized = producer.finalize_chunk(1, &backend, &original).unwrap();
+    follower
+        .import_chunk_proof(&finalized.chunk_proof, &backend)
+        .unwrap();
+    assert_eq!(follower.local_voter().unwrap().validator_index(), 1);
+    assert_eq!(follower.active_validator_set()[1].effective_stake, 100);
+    let outcome = follower
+        .try_produce_block(
+            3,
+            neutrino_consensus_engine::ProductionConfig {
+                proposer: &newcomer,
+            },
+            Body::default(),
+            witness.chain_spec.genesis_gas_limit,
+            &NativeReplayExecutor,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.block.header.proposer_index, 1);
+    assert_eq!(
+        follower
+            .observe_header_for_slashing(&outcome.block.header)
+            .unwrap(),
+        None
+    );
+    let bytes = follower
+        .store()
+        .get_witness(&outcome.block_hash)
+        .unwrap()
+        .unwrap();
+    let (executed, _): (StfInput, neutrino_runtime_abi::StateWitness) =
+        borsh::from_slice(&bytes).unwrap();
+    assert_eq!(executed.proposer_address, address);
+    let mut restarted = Engine::open(witness.chain_spec, follower.store().db().clone()).unwrap();
+    restarted.set_local_voter(newcomer.with_validator_index(0));
+    assert_eq!(restarted.local_voter().unwrap().validator_index(), 1);
+    assert_eq!(restarted.head_hash(), outcome.block_hash);
+    assert_eq!(restarted.latest_finalized_chunk_id(), Some(1));
 }
 
 #[test]

@@ -17,6 +17,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use neutrino_consensus_types::{
     Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
+    bootstrap::{BootstrapData, StateEntries, StateItem},
+    history_proof::Checkpoint,
 };
 use neutrino_network::PeerId;
 use neutrino_network::libp2p::identity::Keypair;
@@ -39,6 +41,12 @@ use tokio::time::timeout;
 #[derive(Default)]
 struct MockState {
     full_chunk_size: Option<u64>,
+    bootstrap_origin: Option<Checkpoint>,
+    bootstrap_pending: Option<(StateRoot, Vec<StateItem>)>,
+    bootstrap_endpoint: Option<Checkpoint>,
+    bootstrap_imports: usize,
+    bootstrap_fetching: bool,
+    state_fragments: Vec<StateItem>,
     proven_height: u64,
     status: Status,
     rpc_calls: Vec<String>,
@@ -118,7 +126,11 @@ impl SyncBackend for MockBackend {
     ) -> Result<Option<neutrino_sync::backend::ConsensusSyncTarget>, SyncBackendError> {
         let state = self.inner.lock().unwrap();
         Ok(state.full_chunk_size.map(|size| {
-            let chunk_id = u64::try_from(state.chunk_proof_imports.len()).unwrap();
+            let base = state
+                .bootstrap_endpoint
+                .filter(|_| state.bootstrap_origin.is_none())
+                .map_or(0, |endpoint| endpoint.boundary.next_chunk_id);
+            let chunk_id = base + u64::try_from(state.chunk_proof_imports.len()).unwrap();
             neutrino_sync::backend::ConsensusSyncTarget {
                 chunk_id,
                 start_height: chunk_id * size + 1,
@@ -132,7 +144,33 @@ impl SyncBackend for MockBackend {
 
     async fn local_progress(&self) -> Result<LocalProgress, SyncBackendError> {
         Ok({
-            let status = self.inner.lock().unwrap().status;
+            let (status, endpoint) = {
+                let state = self.inner.lock().unwrap();
+                (
+                    state.status,
+                    state
+                        .bootstrap_endpoint
+                        .filter(|_| state.bootstrap_origin.is_none()),
+                )
+            };
+            if let Some(endpoint) = endpoint {
+                return Ok(LocalProgress {
+                    chain_id: status.chain_id,
+                    chain_spec_hash: status.chain_spec_hash,
+                    finalized_chunk_id: status.finalized_chunk_id,
+                    finalized_chunk_hash: status.finalized_chunk_hash,
+                    recursive_covered_chunks: status.recursive_covered_chunks,
+                    checkpoint_hash: status.checkpoint_hash,
+                    finalized_state_root: endpoint.boundary.state_root,
+                    finalized_block_hash: endpoint.boundary.block_hash,
+                    finalized_height: endpoint.boundary.height,
+                    head_height: status.head_height,
+                    head_block_hash: status.head_block_hash,
+                    head_slot: status.head_slot,
+                    proven_height: status.head_height,
+                    body_height: status.head_height,
+                });
+            }
             LocalProgress {
                 chain_id: status.chain_id,
                 chain_spec_hash: status.chain_spec_hash,
@@ -140,6 +178,48 @@ impl SyncBackend for MockBackend {
                 finalized_chunk_hash: [0; 32],
                 ..LocalProgress::default()
             }
+        })
+    }
+
+    async fn bootstrap_origin(&self) -> Option<Checkpoint> {
+        self.inner.lock().unwrap().bootstrap_origin
+    }
+
+    async fn bootstrap_fetch(&self, active: bool) {
+        self.inner.lock().unwrap().bootstrap_fetching = active;
+    }
+
+    async fn bootstrap_state(
+        &self,
+    ) -> Result<Option<(StateRoot, Vec<StateItem>)>, SyncBackendError> {
+        Ok(self.inner.lock().unwrap().bootstrap_pending.clone())
+    }
+
+    // Driver tests validate RPC sequencing. The real backend's cryptographic,
+    // consensus-context and state authentication are tested in the node crate.
+    async fn begin_bootstrap(
+        &self,
+        bridge: Option<HistoryProof>,
+        data: BootstrapData,
+    ) -> Result<StateProgress, SyncBackendError> {
+        let endpoint = data.genesis_prefix.statement.end_checkpoint();
+        let items = vec![StateItem::node(endpoint.boundary.state_root)];
+        {
+            let mut state = self.inner.lock().unwrap();
+            let origin = state.bootstrap_origin.expect("bootstrap test origin");
+            if bridge.as_ref().is_some_and(|proof| {
+                proof.statement.start_checkpoint() != origin
+                    || proof.statement.end_checkpoint() != endpoint
+            }) {
+                return Err(SyncBackendError::Rejected("wrong test bridge".into()));
+            }
+            state.bootstrap_imports += 1;
+            state.bootstrap_endpoint = Some(endpoint);
+            state.bootstrap_pending = Some((endpoint.boundary.state_root, items.clone()));
+        }
+        Ok(StateProgress {
+            root_complete: false,
+            next_items: items,
         })
     }
 
@@ -198,7 +278,7 @@ impl SyncBackend for MockBackend {
     async fn state_nodes(
         &self,
         _root: StateRoot,
-        _paths: &[Vec<u8>],
+        _items: &[neutrino_consensus_types::bootstrap::StateItem],
     ) -> Result<StateByRootResponse, SyncBackendError> {
         Ok(StateByRootResponse::default())
     }
@@ -285,14 +365,29 @@ impl SyncBackend for MockBackend {
 
     async fn import_state_nodes(
         &self,
-        _root: StateRoot,
-        _paths: Vec<Vec<u8>>,
-        _nodes: Vec<Vec<u8>>,
-        _values: Vec<Vec<u8>>,
+        root: StateRoot,
+        items: Vec<StateItem>,
+        _entries: Vec<neutrino_consensus_types::bootstrap::StateEntry>,
     ) -> Result<StateProgress, SyncBackendError> {
+        {
+            let mut state = self.inner.lock().unwrap();
+            if let Some((expected, _)) = &state.bootstrap_pending {
+                assert_eq!(root, *expected);
+                state.state_fragments.extend(items);
+                state.bootstrap_pending = None;
+                state.bootstrap_origin = None;
+                state.bootstrap_fetching = false;
+                let endpoint = state.bootstrap_endpoint.expect("bootstrap endpoint");
+                state.status.finalized_chunk_id = endpoint.boundary.next_chunk_id.checked_sub(1);
+                state.status.head_height = endpoint.boundary.height;
+                state.status.head_block_hash = endpoint.boundary.block_hash;
+                state.status.recursive_covered_chunks = endpoint.boundary.next_chunk_id;
+                state.status.checkpoint_hash = endpoint.hash();
+            }
+        }
         Ok(StateProgress {
             root_complete: true,
-            next_paths: vec![],
+            next_items: vec![],
         })
     }
 
@@ -1802,6 +1897,7 @@ async fn light_relay_miss_tries_a_connected_full_provider_for_the_same_range() {
     response
         .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
             HistoryProofByRangeResponse {
+                bootstrap: None,
                 proof: pending.proof.clone(),
             },
         ))))
@@ -1847,6 +1943,7 @@ async fn pruned_history_provider_never_changes_the_clients_trusted_anchor() {
     response
         .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
             HistoryProofByRangeResponse {
+                bootstrap: None,
                 proof: pending.proof.clone(),
             },
         ))))
@@ -1932,6 +2029,7 @@ async fn assert_disconnected_history_outcome_is_ignored(stale_success: bool) {
             .unwrap()
             .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
                 HistoryProofByRangeResponse {
+                    bootstrap: None,
                     proof: pending.proof.clone(),
                 },
             ))))
@@ -1952,6 +2050,7 @@ async fn assert_disconnected_history_outcome_is_ignored(stale_success: bool) {
     current_response
         .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
             HistoryProofByRangeResponse {
+                bootstrap: None,
                 proof: pending.proof.clone(),
             },
         ))))
@@ -2000,6 +2099,7 @@ async fn higher_status_during_history_request_is_deferred_until_current_success(
         .unwrap()
         .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
             HistoryProofByRangeResponse {
+                bootstrap: None,
                 proof: pending.proof.clone(),
             },
         ))))
@@ -2121,6 +2221,7 @@ async fn old_response_from_same_peer_and_range_cannot_replace_a_new_request() {
     old_response
         .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
             HistoryProofByRangeResponse {
+                bootstrap: None,
                 proof: pending.proof.clone(),
             },
         ))))
@@ -2166,6 +2267,7 @@ async fn disconnecting_highest_deferred_peer_preserves_other_progress_notificati
         .unwrap()
         .send(Ok(RpcResponse::HistoryProofByRange(Box::new(
             HistoryProofByRangeResponse {
+                bootstrap: None,
                 proof: pending.proof.clone(),
             },
         ))))
@@ -2233,5 +2335,537 @@ async fn exhausted_deferred_hint_cannot_block_another_available_range() {
     assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
         if range.start_checkpoint_hash == pending.proof.statement.start_checkpoint().hash()
             && range.end_checkpoint_hash == [3; 32]));
+    pending.stop().await;
+}
+
+// These fixtures are transport-only: opaque receipts are never accepted by a
+// production verifier. Node tests exercise authenticated checkpoint installation.
+struct PendingBootstrap {
+    backend: MockBackend,
+    proof: HistoryProof,
+    events: mpsc::Sender<NetworkEvent>,
+    commands: mpsc::Receiver<NetworkCommand>,
+    runner: tokio::task::JoinHandle<Result<(), neutrino_sync::SyncDriverError>>,
+    peer: PeerId,
+    status: Status,
+}
+
+impl PendingBootstrap {
+    async fn new(resume: bool) -> Self {
+        Self::with_origin(resume, false).await
+    }
+
+    async fn with_origin(resume: bool, genesis: bool) -> Self {
+        let backend = MockBackend::default();
+        let mut proof = sample_history_proof();
+        if genesis {
+            proof.statement.start.next_chunk_id = 0;
+            proof.statement.start.height = 0;
+        }
+        {
+            let mut state = backend.inner.lock().unwrap();
+            state.status.chain_id = 1;
+            state.bootstrap_origin = Some(proof.statement.start_checkpoint());
+            if resume {
+                let mut item = StateItem::value([9; 32]);
+                item.offset = 65_536;
+                state.bootstrap_endpoint = Some(proof.statement.end_checkpoint());
+                state.bootstrap_pending = Some((proof.statement.end.state_root, vec![item]));
+            }
+        }
+        let local = LocalProgress {
+            chain_id: 1,
+            ..LocalProgress::default()
+        };
+        let (cmd_tx, commands) = mpsc::channel(32);
+        let (events, event_rx) = mpsc::channel(32);
+        let driver = SyncDriver::new(
+            SyncDriverConfig::default(),
+            Arc::new(backend.clone()),
+            local,
+            cmd_tx,
+            event_rx,
+        );
+        let mut pending = Self {
+            backend,
+            peer: random_peer(),
+            status: Status {
+                chain_id: 1,
+                finalized_chunk_id: Some(4),
+                recursive_covered_chunks: 5,
+                checkpoint_hash: proof.statement.end_checkpoint().hash(),
+                head_block_hash: proof.statement.end.block_hash,
+                head_height: 10,
+                head_slot: 10,
+                ..Status::default()
+            },
+            proof,
+            events,
+            commands,
+            runner: tokio::spawn(driver.run()),
+        };
+        pending.connect(pending.peer).await;
+        pending
+    }
+
+    async fn next(&mut self) -> (PeerId, RpcRequest, HistoryReply) {
+        loop {
+            match timeout(Duration::from_secs(1), self.commands.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                NetworkCommand::SendRpcRequest {
+                    peer,
+                    request,
+                    response_tx,
+                } => return (peer, request, response_tx),
+                NetworkCommand::Subscribe(_) => {}
+                command => panic!("unexpected bootstrap command {command:?}"),
+            }
+        }
+    }
+
+    async fn connect(&mut self, peer: PeerId) {
+        self.events
+            .send(NetworkEvent::PeerConnected(peer))
+            .await
+            .unwrap();
+        let (owner, request, response) = self.next().await;
+        assert_eq!(owner, peer);
+        assert!(matches!(request, RpcRequest::Status(_)));
+        response.send(Ok(RpcResponse::Status(self.status))).unwrap();
+    }
+
+    fn manifest(&self) -> RpcResponse {
+        let mut prefix = self.proof.clone();
+        prefix.statement.start.next_chunk_id = 0;
+        prefix.statement.start.height = 0;
+        let data = BootstrapData::new(
+            prefix,
+            sample_block(10, 10, 0).header,
+            vec![],
+            neutrino_consensus_types::history::HistoryFrontier::empty(),
+            vec![],
+        )
+        .unwrap();
+        RpcResponse::HistoryProofByRange(Box::new(HistoryProofByRangeResponse {
+            proof: self.proof.clone(),
+            bootstrap: Some(data),
+        }))
+    }
+
+    async fn history(&mut self) -> HistoryReply {
+        let (_, request, response) = self.next().await;
+        assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+            if range.bootstrap
+                && range.start_checkpoint_hash == self.proof.statement.start_checkpoint().hash()
+                && range.end_checkpoint_hash == self.status.checkpoint_hash));
+        response
+    }
+
+    async fn state(&mut self) -> (PeerId, Vec<StateItem>, HistoryReply) {
+        let (peer, request, response) = self.next().await;
+        let RpcRequest::StateByRoot(request) = request else {
+            panic!("expected fragments, got {request:?}")
+        };
+        assert_eq!(request.state_root, self.proof.statement.end.state_root);
+        (peer, request.items.to_vec(), response)
+    }
+
+    async fn quiet(&mut self) {
+        assert!(
+            timeout(Duration::from_secs(1), self.commands.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn stop(self) {
+        drop(self.events);
+        self.runner.await.unwrap().unwrap();
+    }
+}
+
+fn bootstrap_unavailable(reply: HistoryReply) {
+    reply
+        .send(Err(neutrino_network::rpc::RpcError::Remote(
+            neutrino_network::rpc::RpcFailure::Unavailable("snapshot unavailable".into()),
+        )))
+        .unwrap();
+}
+
+fn latest_anchor_bootstrap(resume: bool) -> (PendingBootstrap, PeerId) {
+    let backend = MockBackend::default();
+    let proof = sample_history_proof();
+    let anchor = proof.statement.end_checkpoint();
+    {
+        let mut state = backend.inner.lock().unwrap();
+        state.status.chain_id = 1;
+        state.bootstrap_origin = Some(anchor);
+        if resume {
+            state.bootstrap_endpoint = Some(anchor);
+            state.bootstrap_pending = Some((
+                anchor.boundary.state_root,
+                vec![StateItem::node(anchor.boundary.state_root)],
+            ));
+        }
+    }
+    let (cmd_tx, commands) = mpsc::channel(32);
+    let (events, event_rx) = mpsc::channel(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend.clone()),
+        LocalProgress {
+            chain_id: 1,
+            ..LocalProgress::default()
+        },
+        cmd_tx,
+        event_rx,
+    );
+    // Equal-count ranking chooses the later key. Give that key to the peer whose
+    // advertised checkpoint disagrees with the independently trusted endpoint.
+    let mut peers = [random_peer(), random_peer()];
+    peers.sort_unstable();
+    (
+        PendingBootstrap {
+            backend,
+            proof,
+            events,
+            commands,
+            runner: tokio::spawn(driver.run()),
+            peer: peers[1],
+            status: Status {
+                chain_id: 1,
+                recursive_covered_chunks: anchor.boundary.next_chunk_id,
+                checkpoint_hash: anchor.hash(),
+                ..Status::default()
+            },
+        },
+        peers[0],
+    )
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_manifest_ranking_skips_a_same_count_wrong_checkpoint() {
+    let (mut pending, matching) = latest_anchor_bootstrap(false);
+    pending.status.checkpoint_hash = [99; 32];
+    pending.connect(pending.peer).await;
+    pending.quiet().await;
+    let anchor = pending.proof.statement.end_checkpoint().hash();
+    pending.status.checkpoint_hash = anchor;
+    pending.connect(matching).await;
+    let (owner, request, _reply) = pending.next().await;
+    assert_eq!(owner, matching);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.bootstrap && range.start_checkpoint_hash == anchor && range.end_checkpoint_hash == anchor));
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_manifest_fallback_filters_endpoints_without_filtering_state_providers() {
+    let (mut pending, matching) = latest_anchor_bootstrap(true);
+    pending.status.checkpoint_hash = [99; 32];
+    pending.connect(pending.peer).await;
+    // An existing authenticated root can be served despite an unrelated advertised
+    // checkpoint. The eligibility restriction applies only to new manifests.
+    let (owner, items, first) = pending.state().await;
+    assert_eq!(owner, pending.peer);
+    let anchor = pending.proof.statement.end_checkpoint().hash();
+    pending.status.checkpoint_hash = anchor;
+    pending.connect(matching).await;
+    bootstrap_unavailable(first);
+    let (owner, next_items, second) = pending.state().await;
+    assert_eq!(owner, matching);
+    assert_eq!(next_items, items);
+    bootstrap_unavailable(second);
+    // Both state providers failed, so request an eligible replacement manifest.
+    let (owner, request, _reply) = pending.next().await;
+    assert_eq!(owner, matching);
+    assert!(matches!(request, RpcRequest::HistoryProofByRange(range)
+        if range.bootstrap && range.start_checkpoint_hash == anchor && range.end_checkpoint_hash == anchor));
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_requests_recursive_context_then_fragments_before_raw_blocks() {
+    let mut pending = PendingBootstrap::new(false).await;
+    pending
+        .history()
+        .await
+        .send(Ok(pending.manifest()))
+        .unwrap();
+    let (_, items, reply) = pending.state().await;
+    assert_eq!(
+        items,
+        vec![StateItem::node(pending.proof.statement.end.state_root)]
+    );
+    assert!(pending.backend.inner.lock().unwrap().bootstrap_fetching);
+    reply
+        .send(Ok(RpcResponse::StateByRoot(StateByRootResponse {
+            entries: StateEntries::default(),
+        })))
+        .unwrap();
+    let (_, request, _reply) = pending.next().await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    {
+        let state = pending.backend.inner.lock().unwrap();
+        assert_eq!(state.bootstrap_imports, 1);
+        assert_eq!(state.state_fragments, items);
+        assert_eq!(state.status.head_height, 10);
+        assert!(!state.bootstrap_fetching);
+        drop(state);
+    }
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_rejects_wrong_endpoint_before_backend_installation() {
+    let mut pending = PendingBootstrap::new(false).await;
+    let reply = pending.history().await;
+    let RpcResponse::HistoryProofByRange(mut response) = pending.manifest() else {
+        unreachable!()
+    };
+    response.proof.statement.end.block_hash = [99; 32];
+    reply
+        .send(Ok(RpcResponse::HistoryProofByRange(response)))
+        .unwrap();
+    pending.quiet().await;
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    assert_eq!(pending.backend.inner.lock().unwrap().status.head_height, 0);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_restart_requests_the_durable_fragment_offset() {
+    let mut pending = PendingBootstrap::new(true).await;
+    let (_, items, _reply) = pending.state().await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].offset, 65_536);
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_disconnected_response_cannot_release_replacement_request() {
+    let mut pending = PendingBootstrap::new(false).await;
+    let stale = pending.history().await;
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    pending.connect(pending.peer).await;
+    let current = pending.history().await;
+    stale.send(Ok(pending.manifest())).unwrap();
+    pending.quiet().await;
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    current.send(Ok(pending.manifest())).unwrap();
+    let (_, _, _reply) = pending.state().await;
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 1);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_failed_fragment_provider_fails_over_without_restarting_manifest() {
+    let mut pending = PendingBootstrap::new(false).await;
+    pending
+        .history()
+        .await
+        .send(Ok(pending.manifest()))
+        .unwrap();
+    let (first, items, reply) = pending.state().await;
+    let second = random_peer();
+    pending.connect(second).await;
+    bootstrap_unavailable(reply);
+    let (replacement, replacement_items, failed) = pending.state().await;
+    assert_eq!(replacement, second);
+    assert_ne!(replacement, first);
+    assert_eq!(replacement_items, items);
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 1);
+    bootstrap_unavailable(failed);
+    // A second provider may supply a manifest once after both copies of the old
+    // root fail. It cannot endlessly repeat a failed endpoint.
+    let manifest = pending.history().await;
+    bootstrap_unavailable(manifest);
+    pending.quiet().await;
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_unavailable_at_genesis_resumes_source_replay_without_polling() {
+    let mut pending = PendingBootstrap::with_origin(false, true).await;
+    bootstrap_unavailable(pending.history().await);
+    let (_, request, _reply) = pending.next().await;
+    assert!(matches!(request, RpcRequest::BlocksByRange(_)));
+    assert!(!pending.backend.inner.lock().unwrap().bootstrap_fetching);
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_manifest_disconnect_at_genesis_releases_fetching_and_resumes_raw_sync() {
+    let mut pending = PendingBootstrap::with_origin(false, true).await;
+    let _in_flight = pending.history().await;
+    assert!(pending.backend.inner.lock().unwrap().bootstrap_fetching);
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    pending.quiet().await;
+    assert!(!pending.backend.inner.lock().unwrap().bootstrap_fetching);
+
+    // A no-prefix status independently releases a leftover genesis-only fetch
+    // barrier, so ordinary source replay can start without a bootstrap provider.
+    pending.backend.inner.lock().unwrap().bootstrap_fetching = true;
+    pending.status.recursive_covered_chunks = 0;
+    pending.status.checkpoint_hash = [0; 32];
+    let source = random_peer();
+    pending.connect(source).await;
+    let (owner, request, _reply) = pending.next().await;
+    assert_eq!(owner, source);
+    assert!(matches!(request, RpcRequest::BlocksByRange(_)));
+    assert!(!pending.backend.inner.lock().unwrap().bootstrap_fetching);
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_manifest_disconnect_preserves_a_nonzero_trusted_anchor_barrier() {
+    let mut pending = PendingBootstrap::new(false).await;
+    let _in_flight = pending.history().await;
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    pending.quiet().await;
+    assert!(pending.backend.inner.lock().unwrap().bootstrap_fetching);
+
+    pending.status.recursive_covered_chunks = 0;
+    pending.status.checkpoint_hash = [0; 32];
+    pending.connect(random_peer()).await;
+    pending.quiet().await;
+    assert!(pending.backend.inner.lock().unwrap().bootstrap_fetching);
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_restores_connection_generations_and_finalizes_the_next_chunk() {
+    let mut pending = PendingBootstrap::new(false).await;
+    pending
+        .history()
+        .await
+        .send(Ok(pending.manifest()))
+        .unwrap();
+    let (_, _, state_reply) = pending.state().await;
+    pending.backend.inner.lock().unwrap().full_chunk_size = Some(2);
+    state_reply
+        .send(Ok(RpcResponse::StateByRoot(StateByRootResponse::default())))
+        .unwrap();
+    let (_, request, status_reply) = pending.next().await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    let mut first = sample_block(11, 11, 0);
+    first.header.parent_hash = pending.proof.statement.end.block_hash;
+    let mut second = sample_block(12, 12, 0);
+    second.header.parent_hash = first.hash();
+    let blocks = vec![first, second];
+    let mut status = pending.status;
+    status.head_height = 12;
+    status.head_block_hash = blocks[1].hash();
+    status.finalized_chunk_id = Some(5);
+    status.finalized_chunk_hash = [0xCC; 32];
+    status_reply.send(Ok(RpcResponse::Status(status))).unwrap();
+    let (request, block_reply) =
+        next_full_sync_payload_request(&mut pending.commands, status).await;
+    assert!(
+        matches!(request, RpcRequest::BlocksByRange(range) if range.start_height == 11 && range.count == 2)
+    );
+    let proofs = blocks
+        .iter()
+        .map(|block| {
+            let mut proof = sample_block_proof(block.header.height);
+            proof.block_hash = block.hash();
+            proof.public_inputs.block_hash = block.hash();
+            proof.public_inputs.parent_block_hash = block.header.parent_hash;
+            proof
+        })
+        .collect();
+    block_reply
+        .send(Ok(RpcResponse::BlocksByRange(BlocksByRangeResponse {
+            blocks: blocks.clone(),
+        })))
+        .unwrap();
+    let (request, proof_reply) =
+        next_full_sync_payload_request(&mut pending.commands, status).await;
+    assert!(
+        matches!(request, RpcRequest::BlockProofByHeight(range) if range.start_height == 11 && range.count == 2)
+    );
+    proof_reply
+        .send(Ok(RpcResponse::BlockProofByHeight(
+            BlockProofByHeightResponse { proofs },
+        )))
+        .unwrap();
+    let (request, chunk_reply) =
+        next_full_sync_payload_request(&mut pending.commands, status).await;
+    assert!(matches!(request, RpcRequest::ChunkProofById(range) if range.chunk_ids == vec![5]));
+    let mut chunk = sample_chunk_proof(5, 12);
+    chunk.public_inputs.end_block_hash = blocks[1].hash();
+    chunk_reply
+        .send(Ok(RpcResponse::ChunkProofById(ChunkProofByIdResponse {
+            proofs: vec![chunk],
+        })))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(pending.backend.chunk_proof_imports(), vec![5]);
+    assert_eq!(pending.backend.inner.lock().unwrap().status.head_height, 12);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_success_preserves_nonce_against_an_older_disconnected_response() {
+    let mut pending = PendingBootstrap::new(false).await;
+    let old = pending.history().await;
+    let old_payload = pending.manifest();
+    pending
+        .events
+        .send(NetworkEvent::PeerDisconnected(pending.peer))
+        .await
+        .unwrap();
+    pending.connect(pending.peer).await;
+    pending
+        .history()
+        .await
+        .send(Ok(pending.manifest()))
+        .unwrap();
+    let (_, _, reply) = pending.state().await;
+    reply
+        .send(Ok(RpcResponse::StateByRoot(StateByRootResponse::default())))
+        .unwrap();
+    let (_, request, status_reply) = pending.next().await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    pending.proof.statement.end.next_chunk_id = 6;
+    pending.proof.statement.end.height = 12;
+    pending.proof.statement.end.slot = 12;
+    pending.proof.statement.end.block_hash = [11; 32];
+    pending.proof.statement.end.state_root = [10; 32];
+    pending.status.recursive_covered_chunks = 6;
+    pending.status.checkpoint_hash = pending.proof.statement.end_checkpoint().hash();
+    pending.status.finalized_chunk_id = Some(5);
+    pending.status.head_height = 12;
+    pending.backend.inner.lock().unwrap().bootstrap_origin =
+        Some(pending.proof.statement.start_checkpoint());
+    status_reply
+        .send(Ok(RpcResponse::Status(pending.status)))
+        .unwrap();
+    let current = pending.history().await;
+    old.send(Ok(old_payload)).unwrap();
+    pending.quiet().await;
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 1);
+    current.send(Ok(pending.manifest())).unwrap();
+    let (_, _, _reply) = pending.state().await;
+    assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 2);
     pending.stop().await;
 }

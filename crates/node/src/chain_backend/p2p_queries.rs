@@ -338,20 +338,82 @@ where
     pub(super) fn p2p_state_nodes(
         &self,
         root: StateRoot,
-        paths: &[Vec<u8>],
+        items: &[neutrino_consensus_types::bootstrap::StateItem],
     ) -> Result<StateByRootResponse, SyncBackendError> {
-        check_count(paths.len(), rpc::MAX_STATE_PATHS_PER_REQUEST)?;
-        if paths.iter().any(|path| !path.is_empty()) {
-            return Err(SyncBackendError::InvalidRequest(
-                "only a bounded full-root state snapshot is supported".to_owned(),
-            ));
-        }
-        self.with_engine(|engine| {
-            let data = rpc_queries::read_state_data(engine, root).map_err(query_error)?;
-            bounded(StateByRootResponse {
-                nodes: data.nodes.into_values().collect(),
-                values: data.values.into_values().collect(),
-            })
+        use neutrino_consensus_types::bootstrap::{
+            MAX_STATE_FRAGMENT_BYTES, MAX_STATE_ITEMS, StateEntries, StateEntry, StateItemKind,
+        };
+        use neutrino_storage::Column;
+        use neutrino_trie::{Hasher, Node, Poseidon2Hasher};
+        check_count(
+            items.len(),
+            u64::try_from(MAX_STATE_ITEMS).expect("bounded item count"),
+        )?;
+        self.with_engine_mut(|engine| {
+            // The retained root must exist and authenticate its own node. Object
+            // reachability is established by the receiver while following child
+            // hashes; serving each fragment does not traverse the complete tree.
+            if root != ZERO_HASH {
+                let bytes = engine
+                    .store()
+                    .db()
+                    .get(Column::TrieNodes, &root)
+                    .map_err(storage_error)?
+                    .ok_or_else(|| missing("requested state root is unavailable"))?;
+                if Poseidon2Hasher::hash_node(&bytes) != root {
+                    return Err(storage_error("persisted state root content hash mismatch"));
+                }
+                Node::decode(&bytes).map_err(storage_error)?;
+            }
+            let entries = items
+                .iter()
+                .map(|item| {
+                    let column = match item.kind {
+                        StateItemKind::Node => Column::TrieNodes,
+                        StateItemKind::Value => Column::StateValues,
+                    };
+                    let bytes = engine
+                        .store()
+                        .db()
+                        .get(column, &item.hash)
+                        .map_err(storage_error)?
+                        .ok_or_else(|| missing("state object unavailable"))?;
+                    let hash = match item.kind {
+                        StateItemKind::Node => Poseidon2Hasher::hash_node(&bytes),
+                        StateItemKind::Value => Poseidon2Hasher::hash_value(&bytes),
+                    };
+                    if hash != item.hash {
+                        return Err(storage_error("persisted state content hash mismatch"));
+                    }
+                    let offset = usize::try_from(item.offset).map_err(storage_error)?;
+                    if offset > bytes.len() || (offset == bytes.len() && offset != 0) {
+                        return Err(SyncBackendError::InvalidRequest(
+                            "state offset exceeds object".into(),
+                        ));
+                    }
+                    let end = offset
+                        .saturating_add(MAX_STATE_FRAGMENT_BYTES)
+                        .min(bytes.len());
+                    Ok(StateEntry {
+                        item: *item,
+                        total_len: u64::try_from(bytes.len()).map_err(storage_error)?,
+                        bytes: neutrino_primitives::BoundedBytes::new(bytes[offset..end].to_vec())
+                            .map_err(storage_error)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, SyncBackendError>>()?;
+            let response = bounded(StateByRootResponse {
+                entries: StateEntries::new(entries).map_err(storage_error)?,
+            })?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(storage_error)?
+                .as_secs();
+            engine
+                .store_mut()
+                .refresh_state_snapshot(root, now)
+                .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+            Ok(response)
         })
     }
 
@@ -471,13 +533,19 @@ where
                 .ok_or_else(|| {
                     SyncBackendError::NotAvailable("history range not retained".into())
                 })?;
-            return Ok(HistoryProofByRangeResponse { proof });
+            return Ok(HistoryProofByRangeResponse {
+                proof,
+                bootstrap: None,
+            });
         }
         let proof = self
             .with_engine(|engine| rpc_queries::read_history_proof(engine, start, end))
             .map_err(query_error)?;
         if let Some(proof) = proof {
-            return bounded(HistoryProofByRangeResponse { proof });
+            return bounded(HistoryProofByRangeResponse {
+                proof,
+                bootstrap: None,
+            });
         }
         self.request_history(start, end).map_err(query_error)?;
         Err(missing(

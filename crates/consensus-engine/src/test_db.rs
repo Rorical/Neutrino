@@ -13,6 +13,8 @@ pub(crate) struct FaultDb {
     inner: MemoryDatabase,
     /// Reject the next batch while preserving persisted data.
     pub fail_batch: bool,
+    /// Fail the durable operation after this many successful durable writes.
+    pub fail_durable_after: Option<usize>,
 }
 
 impl Database for FaultDb {
@@ -37,6 +39,16 @@ impl Database for FaultDb {
     }
     fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
         Ok(self.inner.iter_column(column).unwrap())
+    }
+
+    fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
+        if let Some(remaining) = &mut self.fail_durable_after {
+            if *remaining == 0 {
+                return Err(std::io::Error::other("injected durable failure"));
+            }
+            *remaining -= 1;
+        }
+        self.write_batch(batch)
     }
 }
 

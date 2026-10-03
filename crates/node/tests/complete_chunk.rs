@@ -599,42 +599,14 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
         backend.blocks_by_range(1, 1, 1, [99; 32]).await,
         Err(neutrino_sync::SyncBackendError::NotAvailable(_))
     ));
-    let old_state = backend
-        .state_nodes(finalized.state_root, &[vec![]])
-        .await
-        .unwrap();
-    assert!(old_state.values.contains(&encode_account(&initial)));
-    assert!(!old_state.values.contains(&encode_account(&paid)));
-    let head_state = backend
-        .state_nodes(second.header.state_root, &[vec![]])
-        .await
-        .unwrap();
-    assert!(head_state.values.contains(&encode_account(&paid)));
-    assert!(!head_state.values.contains(&encode_account(&initial)));
     let snapshot_client = ChainBackend::new(
         Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap(),
         ready_prover(),
     );
-    assert!(
-        snapshot_client
-            .import_state_nodes(
-                finalized.state_root,
-                vec![vec![]],
-                old_state.nodes.clone(),
-                vec![]
-            )
-            .await
-            .is_err()
-    );
-    snapshot_client
-        .import_state_nodes(
-            finalized.state_root,
-            vec![vec![]],
-            old_state.nodes.clone(),
-            old_state.values.clone(),
-        )
-        .await
-        .unwrap();
+    let old_values =
+        transfer_snapshot(backend.as_ref(), &snapshot_client, finalized.state_root).await;
+    assert!(old_values.contains(&encode_account(&initial)));
+    assert!(!old_values.contains(&encode_account(&paid)));
     assert_eq!(
         snapshot_client
             .storage_at(&account_key(&sender), &BlockId::Latest)
@@ -642,15 +614,10 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
             .unwrap(),
         Some(encode_account(&initial))
     );
-    snapshot_client
-        .import_state_nodes(
-            second.header.state_root,
-            vec![vec![]],
-            head_state.nodes.clone(),
-            head_state.values.clone(),
-        )
-        .await
-        .unwrap();
+    let head_values =
+        transfer_snapshot(backend.as_ref(), &snapshot_client, second.header.state_root).await;
+    assert!(head_values.contains(&encode_account(&paid)));
+    assert!(!head_values.contains(&encode_account(&initial)));
     assert!(snapshot_client.engine_state_invariant_holds());
     assert_eq!(
         snapshot_client
@@ -659,21 +626,17 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
             .unwrap(),
         Some(encode_account(&initial))
     );
-    assert!(
-        snapshot_client
-            .import_state_nodes(ZERO_HASH, vec![], vec![], vec![vec![1]])
-            .await
-            .is_err()
-    );
-
+    let bad_item = neutrino_consensus_types::bootstrap::StateItem::node([99; 32]);
     assert!(matches!(
-        backend.state_nodes(finalized.state_root, &[vec![1]]).await,
-        Err(neutrino_sync::SyncBackendError::InvalidRequest(_))
-    ));
-    assert!(matches!(
-        backend.state_nodes([99; 32], &[vec![]]).await,
+        backend.state_nodes([99; 32], &[bad_item]).await,
         Err(neutrino_sync::SyncBackendError::NotAvailable(_))
     ));
+    let too_many = vec![bad_item; 129];
+    assert!(matches!(
+        backend.state_nodes(finalized.state_root, &too_many).await,
+        Err(neutrino_sync::SyncBackendError::InvalidRequest(_))
+    ));
+
     assert!(matches!(
         backend.blocks_by_root(&[second.hash(); 17]).await,
         Err(neutrino_sync::SyncBackendError::InvalidRequest(_))
@@ -750,7 +713,12 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
     ));
     assert!(matches!(
         reopened
-            .state_nodes(second.header.state_root, &[vec![]])
+            .state_nodes(
+                second.header.state_root,
+                &[neutrino_consensus_types::bootstrap::StateItem::value(
+                    Poseidon2Hasher::hash_value(&encode_account(&paid))
+                )]
+            )
             .await,
         Err(neutrino_sync::SyncBackendError::NotAvailable(_))
     ));
@@ -912,4 +880,36 @@ async fn imported_finality_selects_a_proven_archived_fork_and_survives_restart()
         restarted.finalized().await.unwrap().block_hash,
         remote.hash()
     );
+}
+
+async fn transfer_snapshot(
+    source: &impl neutrino_sync::SyncBackend,
+    target: &impl neutrino_sync::SyncBackend,
+    root: neutrino_primitives::Hash,
+) -> Vec<Vec<u8>> {
+    use neutrino_consensus_types::bootstrap::{StateItem, StateItemKind};
+    let mut items = if root == neutrino_primitives::ZERO_HASH {
+        Vec::new()
+    } else {
+        vec![StateItem::node(root)]
+    };
+    let mut values = Vec::new();
+    loop {
+        let response = source.state_nodes(root, &items).await.unwrap();
+        for entry in response
+            .entries
+            .iter()
+            .filter(|entry| entry.item.kind == StateItemKind::Value)
+        {
+            values.push(entry.bytes.as_slice().to_vec());
+        }
+        let progress = target
+            .import_state_nodes(root, items, response.entries.to_vec())
+            .await
+            .unwrap();
+        if progress.root_complete {
+            return values;
+        }
+        items = progress.next_items;
+    }
 }

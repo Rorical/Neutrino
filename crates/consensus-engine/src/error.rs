@@ -29,6 +29,8 @@ pub enum EngineError<E> {
     AlreadyInitialised,
     /// Underlying chain-store error.
     Store(StoreError<E>),
+    /// The local anti-equivocation journal refused the requested signature.
+    Signing(crate::signing::SigningViolation),
 }
 
 impl<E: fmt::Display> fmt::Display for EngineError<E> {
@@ -42,6 +44,7 @@ impl<E: fmt::Display> fmt::Display for EngineError<E> {
             Self::NotInitialised => f.write_str("database has no genesis metadata"),
             Self::AlreadyInitialised => f.write_str("database is already initialised"),
             Self::Store(err) => write!(f, "store error: {err}"),
+            Self::Signing(err) => write!(f, "signing safety: {err}"),
         }
     }
 }

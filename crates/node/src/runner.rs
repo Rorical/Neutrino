@@ -247,6 +247,15 @@ async fn run_with_prover<P: ProgramProver + 'static>(
         let block_executor = WasmExecutor::default_runtime()
             .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
         concrete_backend.set_block_executor(block_executor);
+        if config.role == NodeRole::Archive {
+            concrete_backend
+                .discard_bootstrap_download()
+                .map_err(NodeError::ProofSystem)?;
+        } else {
+            concrete_backend
+                .initialize_bootstrap(&config.bootstrap)
+                .map_err(NodeError::ProofSystem)?;
+        }
     }
     let local_key = Keypair::generate_ed25519();
     let local_peer_id = neutrino_network::PeerId::from(local_key.public());
@@ -322,6 +331,10 @@ async fn run_with_prover<P: ProgramProver + 'static>(
     if let Some(cfg) = production_config.as_ref() {
         concrete_backend.set_local_voter(cfg.proposer.clone());
     }
+    concrete_backend
+        .resume_bft_sessions()
+        .await
+        .map_err(NodeError::Engine)?;
     let producer_job = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = concrete_backend;
@@ -468,18 +481,8 @@ fn build_block_producer_config(
     let proposer = ProposerKey::from_ikm(&ikm, proposer_index)
         .map_err(|err| NodeError::ProposerKey(err.to_string()))?;
 
-    let index = usize::try_from(proposer_index).expect("u32 fits usize on supported targets");
-    let validator = chain_spec.initial_validators.get(index).ok_or_else(|| {
-        NodeError::ChainSpec(ChainSpecError::Validation(format!(
-            "proposer_index {proposer_index} is outside initial validator set"
-        )))
-    })?;
-    if validator.pubkey != *proposer.public_key_bytes() {
-        return Err(NodeError::ChainSpec(ChainSpecError::Validation(format!(
-            "proposer key does not match validator pubkey at index {proposer_index}"
-        ))));
-    }
-
+    // The configured position is a hint. Engine signing resolves the key's
+    // position in the authenticated live set after replay or checkpoint bootstrap.
     Ok(Some(BlockProducerConfig {
         proving: config.proving,
         proposer,

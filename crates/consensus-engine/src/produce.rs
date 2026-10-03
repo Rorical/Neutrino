@@ -45,23 +45,11 @@ pub enum ProductionError<E> {
     Engine(EngineError<E>),
     /// Validator key cannot propose: missing index, slashed, etc.
     NotEligible(VrfError),
-    /// Local validator index is not present in the active set.
-    UnknownProposer {
-        /// Validator index the proposer key declared.
-        index: u32,
-        /// Length of the active set.
-        active_set_len: usize,
-    },
     /// Block height counter would overflow `u64`.
     HeightOverflow,
     /// The dynamic runtime ([`BlockExecutor`]) failed during the
     /// dry-run path.
     Executor(String),
-    /// The proposer key does not match the validator pubkey at its declared index.
-    ProposerKeyMismatch {
-        /// Validator index the proposer key declared.
-        index: u32,
-    },
     /// The requested slot does not advance past the current head slot.
     NonMonotonicSlot {
         /// Slot of the current head block, or genesis slot 0.
@@ -76,18 +64,8 @@ impl<E: fmt::Display + fmt::Debug> fmt::Display for ProductionError<E> {
         match self {
             Self::Engine(e) => write!(f, "engine error: {e}"),
             Self::NotEligible(e) => write!(f, "validator cannot propose: {e}"),
-            Self::UnknownProposer {
-                index,
-                active_set_len,
-            } => write!(
-                f,
-                "proposer index {index} is outside active set of length {active_set_len}"
-            ),
             Self::HeightOverflow => f.write_str("block height counter overflowed"),
             Self::Executor(msg) => write!(f, "block executor failed: {msg}"),
-            Self::ProposerKeyMismatch { index } => {
-                write!(f, "proposer key does not match validator at index {index}")
-            }
             Self::NonMonotonicSlot {
                 parent_slot,
                 requested,
@@ -117,7 +95,7 @@ impl<E> From<StoreError<E>> for ProductionError<E> {
 /// Runtime + proposer binding for [`Engine::try_produce_block`].
 #[derive(Clone, Copy, Debug)]
 pub struct ProductionConfig<'a> {
-    /// Proposer secret-key wrapper.
+    /// Proposer BLS identity. Its index is resolved from the current active set.
     pub proposer: &'a ProposerKey,
 }
 
@@ -147,7 +125,8 @@ impl<DB: Database> Engine<DB> {
     ///    local head (cheap, no eligibility cost on stale slots).
     /// 2. Evaluate VRF eligibility against the active validator set
     ///    and the finalized seed. Returns `Ok(None)` if the local
-    ///    validator is not eligible for this slot.
+    ///    validator is inactive or not eligible for this slot. The configured
+    ///    index never overrides the authenticated BLS identity's position.
     /// 3. Snapshot the engine's authoritative state trie, flush
     ///    pending nodes/values to RocksDB so the snapshot is
     ///    drain-complete, then hand the snapshot + body to the
@@ -170,10 +149,7 @@ impl<DB: Database> Engine<DB> {
     ///
     /// - [`ProductionError::NonMonotonicSlot`] if `slot` does not
     ///   strictly advance the local head's slot.
-    /// - [`ProductionError::UnknownProposer`] /
-    ///   [`ProductionError::ProposerKeyMismatch`] /
-    ///   [`ProductionError::NotEligible`] for proposer eligibility
-    ///   failures.
+    /// - [`ProductionError::NotEligible`] for VRF eligibility failures.
     /// - [`ProductionError::HeightOverflow`] if the block height
     ///   counter would overflow `u64`.
     /// - [`ProductionError::Executor`] if the dynamic runtime fails.
@@ -195,7 +171,10 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
-        let Some(eligibility) = self.evaluate_eligibility(slot, cfg.proposer)? else {
+        let Some(proposer) = self.bind_active_proposer(cfg.proposer) else {
+            return Ok(None);
+        };
+        let Some(eligibility) = self.evaluate_eligibility(slot, &proposer)? else {
             return Ok(None);
         };
 
@@ -229,7 +208,7 @@ impl<DB: Database> Engine<DB> {
         // We source it from the active validator set rather than from
         // the chain spec's initial set so on-chain validator changes
         // (deposits, exits) propagate to fee routing automatically.
-        let proposer_index = cfg.proposer.validator_index();
+        let proposer_index = proposer.validator_index();
         let proposer_position = usize::try_from(proposer_index)
             .expect("u32 validator index fits usize on supported targets");
         let proposer_address = self
@@ -276,7 +255,7 @@ impl<DB: Database> Engine<DB> {
             height,
             slot,
             parent_hash,
-            proposer_index: cfg.proposer.validator_index(),
+            proposer_index,
             vrf_proof: eligibility.vrf_proof,
             state_root: state_root_after,
             transactions_root: ZERO_HASH,
@@ -299,9 +278,7 @@ impl<DB: Database> Engine<DB> {
 
         // Sign and seal.
         let header_hash = header.hash();
-        header.signature = cfg
-            .proposer
-            .sign_proposer_message(chain_spec.chain_id, &header_hash);
+        header.signature = self.sign_proposal_durable(&proposer, slot, header_hash)?;
         let block_hash = header.hash();
         let block = Block { header, body };
 
@@ -338,17 +315,15 @@ impl<DB: Database> Engine<DB> {
         let position = usize::try_from(index).expect("u32 fits usize on supported targets");
         let validator = active_set
             .get(position)
-            .ok_or(ProductionError::UnknownProposer {
-                index,
-                active_set_len: active_set.len(),
-            })?;
-        if validator.slashed {
-            return Err(ProductionError::NotEligible(VrfError::SlashedValidator));
-        }
+            .filter(|validator| {
+                validator.pubkey == *proposer.public_key_bytes()
+                    && !validator.slashed
+                    && validator.effective_stake > 0
+            })
+            .ok_or(EngineError::Signing(
+                crate::signing::SigningViolation::KeyNotActive,
+            ))?;
         let total_stake = total_active_stake(active_set).map_err(ProductionError::NotEligible)?;
-        if validator.pubkey != *proposer.public_key_bytes() {
-            return Err(ProductionError::ProposerKeyMismatch { index });
-        }
 
         let seed = self.finalized_seed();
         let chain_id = self.chain_spec().chain_id;

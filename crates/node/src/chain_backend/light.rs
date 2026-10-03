@@ -502,6 +502,10 @@ mod tests {
             self.successful_batches += 1;
             Ok(())
         }
+        fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
+            self.write_batch(batch)
+        }
+
         fn iter_column(
             &self,
             column: Column,

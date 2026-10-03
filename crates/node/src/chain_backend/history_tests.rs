@@ -374,6 +374,7 @@ fn missing_progress_artifact_fails_without_proving_or_advancing_coverage() {
         &engine,
         &MockProofSystem::new(),
         &Arc::new(ProvingBudget::new(1)),
+        &super::HistoryRuntime::default(),
         queued,
     )
     .unwrap_err();
@@ -407,6 +408,7 @@ fn mismatched_progress_anchor_is_rejected_before_receipt_verification() {
         &Mutex::new(engine),
         &MockProofSystem::new(),
         &Arc::new(ProvingBudget::new(1)),
+        &super::HistoryRuntime::default(),
         queued,
     )
     .unwrap_err();
@@ -427,6 +429,7 @@ fn progress_already_at_target_still_requires_a_real_verified_receipt() {
             &engine,
             &MockProofSystem::new(),
             &Arc::new(ProvingBudget::new(1)),
+            &super::HistoryRuntime::default(),
             queued,
         )
         .is_err()
@@ -490,4 +493,90 @@ fn archived_ranges_split_on_reusable_aligned_boundaries_without_overflow() {
     assert!(range_split(3, 4).is_err());
     assert!(range_split(4, 4).is_err());
     assert!(range_split(4, 3).is_err());
+}
+
+#[tokio::test]
+async fn bootstrap_pause_cancels_dormant_jobs_and_releases_their_pins() {
+    let mut engine = engine();
+    let queued = job(0, 4);
+    engine.set_history_domain(queued.range.domain).unwrap();
+    let mut interrupted = job(4, 8);
+    interrupted.state = 1;
+    save(&mut engine, &queued).unwrap();
+    save(&mut engine, &interrupted).unwrap();
+    let backend = ChainBackend::new(engine, MockProofSystem::new());
+    backend
+        .history
+        .initialized
+        .store(true, std::sync::atomic::Ordering::Release);
+    backend.pause_history_jobs().await.unwrap();
+    backend.with_engine(|engine| {
+        assert!(jobs(engine).unwrap().iter().all(|job| job.state == 4));
+        assert!(!engine.store().history_range_is_pinned(0, 8).unwrap());
+    });
+    backend.start_history_jobs();
+    assert!(
+        !backend
+            .history
+            .started
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_pause_waits_for_running_worker_before_releasing_dependencies() {
+    let mut engine = engine();
+    let mut running = job(0, 4);
+    running.state = 1;
+    save(&mut engine, &running).unwrap();
+    let backend = Arc::new(ChainBackend::new(engine, MockProofSystem::new()));
+    backend
+        .history
+        .running
+        .store(true, std::sync::atomic::Ordering::Release);
+    let waiting = Arc::clone(&backend);
+    let mut pause = tokio::spawn(async move { waiting.pause_history_jobs().await });
+    tokio::task::yield_now().await;
+    assert!(
+        backend
+            .history
+            .paused
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(!pause.is_finished());
+    backend.with_engine(|engine| assert!(engine.store().history_range_is_pinned(0, 4).unwrap()));
+    // Model the actual synchronous worker returning. No caller erases an active
+    // worker's pins; quiescence is signaled only after it has ceased using them.
+    backend
+        .history
+        .running
+        .store(false, std::sync::atomic::Ordering::Release);
+    backend.history.idle.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(1), &mut pause)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    backend.with_engine(|engine| assert!(!engine.store().history_range_is_pinned(0, 4).unwrap()));
+}
+
+#[test]
+fn paused_history_worker_does_not_enter_proving_or_verify_saved_progress() {
+    let mut engine = engine();
+    let mut queued = job(0, 4);
+    queued.progress = Some([99; 32]);
+    save(&mut engine, &queued).unwrap();
+    let runtime = super::HistoryRuntime::default();
+    runtime
+        .paused
+        .store(true, std::sync::atomic::Ordering::Release);
+    let error = run_job(
+        &Mutex::new(engine),
+        &MockProofSystem::new(),
+        &Arc::new(ProvingBudget::new(1)),
+        &runtime,
+        queued,
+    )
+    .unwrap_err();
+    assert_eq!(error, "history job paused for checkpoint bootstrap");
 }

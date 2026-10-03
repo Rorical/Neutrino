@@ -11,8 +11,8 @@ use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::{
     body::ConsensusBody,
     consensus::{
-        ConsensusStatement, ConsensusWitness, as_chunk, context_boundary, genesis_context,
-        validate_candidate, validate_consensus, validate_consensus_with_context,
+        ConsensusWitness, as_chunk, context_boundary, genesis_context, validate_candidate,
+        validate_consensus, validate_consensus_with_context,
     },
     execution::{ExecutionContext, ProvenBlock, commitment},
     history::{HistoricalChunk, HistoryWitness},
@@ -26,8 +26,8 @@ use crate::{BlockState, Engine, FinalizeError, FinalizeOutcome, ProposerKey};
 /// Durable context for the next chunk; committed atomically with finalization.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ConsensusState {
-    /// Last verified complete statement.
-    pub statement: ConsensusStatement,
+    /// Authenticated outgoing boundary, established by a Chunk or History receipt.
+    pub boundary: neutrino_consensus_types::history_proof::ConsensusBoundary,
     /// Full context retained for ordinary execution, checked against the compact output.
     pub next_context: ExecutionContext,
     /// Randomness for the following chunk.
@@ -270,8 +270,8 @@ impl<DB: Database> Engine<DB> {
         if previous.next_context.chunk_id != chunk_id
             || context_boundary(&previous.next_context, previous.next_seed)
                 .map_err(|_| ProofError::InvalidWitness)?
-                != previous.statement.end
-            || previous.frontier.root() != Some(previous.statement.end.history_root)
+                != previous.boundary
+            || previous.frontier.root() != Some(previous.boundary.history_root)
         {
             return Err(ProofError::PublicInputMismatch.into());
         }
@@ -301,6 +301,30 @@ impl<DB: Database> Engine<DB> {
             .get_block_hash_by_height(end)?
             .ok_or(FinalizeError::MissingBlock { height: end })?;
         self.prepare_consensus_chunk_on_branch(chunk_id, end_hash, proof_system)
+    }
+
+    /// Prepare the fixed, previously signed BFT branch under the current proof
+    /// backend, even if fork choice currently selects a competing branch.
+    /// Without a session, prepare the current canonical candidate.
+    pub fn prepare_bft_consensus_chunk<P: ProofSystem>(
+        &self,
+        chunk_id: ChunkId,
+        proof_system: &P,
+    ) -> Result<PreparedConsensusChunk<P>, FinalizeError<DB::Error>> {
+        let Some(session) = self.bft_session(chunk_id) else {
+            return self.prepare_consensus_chunk(chunk_id, proof_system);
+        };
+        let prepared = self.prepare_consensus_chunk_on_branch(
+            chunk_id,
+            session.end_block_hash(),
+            proof_system,
+        )?;
+        let candidate =
+            validate_candidate(&prepared.witness).map_err(|_| ProofError::InvalidWitness)?;
+        if as_chunk(&candidate.execution.chunk).hash() != session.chunk_hash() {
+            return Err(ProofError::PublicInputMismatch.into());
+        }
+        Ok(prepared)
     }
 
     #[allow(clippy::too_many_lines)] // Snapshot all authenticated inputs before leaving the engine lock.
@@ -448,7 +472,7 @@ impl<DB: Database> Engine<DB> {
     /// Obtain the finality certificate before asking a prover to attest to it.
     /// A failed proof attempt leaves the BFT session available for retry.
     pub fn certify_consensus_chunk<P: ProofSystem>(
-        &self,
+        &mut self,
         prepared: &mut PreparedConsensusChunk<P>,
         voter: &ProposerKey,
     ) -> Result<(), FinalizeError<DB::Error>> {
@@ -479,6 +503,26 @@ impl<DB: Database> Engine<DB> {
         proof_system: &P,
         executor: Option<&dyn neutrino_proof_system::ErasedBlockExecutor>,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
+        self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor)
+    }
+
+    /// Commit complete consensus for the saved BFT target. When that target
+    /// differs from fork choice, replay its already-proven branch with the
+    /// installed executor before atomically publishing finality and live state.
+    pub fn commit_bft_consensus_chunk<P: ProofSystem>(
+        &mut self,
+        witness: &ConsensusWitness,
+        proof: &P::ChunkProof,
+        proof_system: &P,
+        executor: Option<&dyn neutrino_proof_system::ErasedBlockExecutor>,
+    ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
+        let session = self
+            .bft_session(witness.context.chunk_id)
+            .ok_or(FinalizeError::FinalizationStalled)?;
+        let candidate = validate_candidate(witness).map_err(|_| ProofError::InvalidWitness)?;
+        if as_chunk(&candidate.execution.chunk).hash() != session.chunk_hash() {
+            return Err(ProofError::PublicInputMismatch.into());
+        }
         self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor)
     }
 
@@ -539,14 +583,14 @@ impl<DB: Database> Engine<DB> {
         }
         let next_seed = statement.end.seed;
         let state = ConsensusState {
-            statement,
+            boundary: statement.end,
             next_context: validated.next_context,
             next_seed,
             frontier,
         };
         let batch = self
             .store()
-            .consensus_finalization_batch(witness, &wire, &state)?;
+            .consensus_finalization_batch(witness, &wire, &statement, &state)?;
         if self.store().get_block_hash_by_height(chunk.end_height)? == Some(chunk.end_block_hash) {
             self.store_mut()
                 .db_mut()
@@ -577,7 +621,7 @@ impl<DB: Database> Engine<DB> {
             chunk_hash: chunk.hash(),
             chunk,
             chunk_proof: wire,
-            public_inputs: state.statement.chunk,
+            public_inputs: statement.chunk,
             finality_cert: witness.finality_cert.clone(),
         })
     }

@@ -64,8 +64,8 @@ pub const PROTOCOL_WITNESS_BY_BLOCK: &str = "/neutrino/req/witness_by_block";
 
 /// Default maximum request payload size in bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
-/// Default maximum response payload size in bytes (16 MiB).
-pub const DEFAULT_MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
+/// Default maximum response payload size in bytes (32 MiB).
+pub const DEFAULT_MAX_RESPONSE_SIZE: u64 = 32 * 1024 * 1024;
 
 /// Maximum number of blocks returned in a single `BlocksByRange` response.
 ///
@@ -73,8 +73,6 @@ pub const DEFAULT_MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
 /// [`DEFAULT_MAX_RESPONSE_SIZE`] even when blocks carry full bodies and
 /// proofs.
 pub const MAX_BLOCKS_PER_RESPONSE: u64 = 16;
-/// Maximum number of paths queried in a single `StateByRoot` request.
-pub const MAX_STATE_PATHS_PER_REQUEST: u64 = 256;
 /// Maximum number of block proofs returned in one response.
 pub const MAX_BLOCK_PROOFS_PER_RESPONSE: u64 = 8;
 /// Maximum number of chunk proofs returned in one response.
@@ -267,31 +265,20 @@ pub struct BlocksByRootResponse {
     pub blocks: Vec<Block>,
 }
 
-/// `StateByRoot` request: fetch trie nodes covering specified paths.
+/// Request bounded content-addressed fragments under one authenticated state root.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
 pub struct StateByRootRequest {
-    /// State trie root the paths address.
+    /// Immutable target state root.
     pub state_root: StateRoot,
-    /// Raw trie keys (or sub-paths) being requested.
-    pub paths: Vec<Vec<u8>>,
+    /// Exact typed node/value hashes and byte offsets.
+    pub items: neutrino_consensus_types::bootstrap::StateItems,
 }
 
-/// `StateByRoot` response carrying trie node payloads and any state
-/// values referenced by leaf nodes covered by the response.
-///
-/// M6 nodes serve a one-shot dump of the entire local state when the
-/// requested `state_root` matches their head; the receiver rebuilds
-/// the trie locally and re-derives the root. Real path-based walking
-/// arrives with the M12 snap-sync slice.
+/// Bounded state fragments, in exact request order.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateByRootResponse {
-    /// Trie node bytes. Each entry is the canonical encoding of one
-    /// `neutrino_trie::Node`; the hash of the bytes equals the
-    /// content-addressed key the local engine stores them under.
-    pub nodes: Vec<Vec<u8>>,
-    /// State value bytes referenced by `value_hash` fields inside
-    /// leaf nodes of `nodes`.
-    pub values: Vec<Vec<u8>>,
+    /// Each fragment is independently framed; hashes are checked after assembly.
+    pub entries: neutrino_consensus_types::bootstrap::StateEntries,
 }
 
 /// `BlockProofByHash` request: fetch specific block proofs by block hash.
@@ -361,6 +348,8 @@ pub struct HistoryProofByRangeRequest {
     pub start_checkpoint_hash: Hash,
     /// Exact requested target endpoint.
     pub end_checkpoint_hash: Hash,
+    /// Include authenticated full-node bootstrap context and a genesis prefix.
+    pub bootstrap: bool,
 }
 
 /// A single authenticated range, or an explicit unavailable RPC error.
@@ -368,6 +357,8 @@ pub struct HistoryProofByRangeRequest {
 pub struct HistoryProofByRangeResponse {
     /// Exact requested conditional range and bounded compressed receipt.
     pub proof: HistoryProof,
+    /// Full-node context for this same endpoint, requested explicitly.
+    pub bootstrap: Option<neutrino_consensus_types::bootstrap::BootstrapData>,
 }
 
 /// Lightweight availability announcement; never accepted as a proof or trust anchor.
@@ -890,7 +881,7 @@ mod tests {
             (
                 RpcRequest::StateByRoot(StateByRootRequest {
                     state_root: [0; 32],
-                    paths: vec![],
+                    items: neutrino_consensus_types::bootstrap::StateItems::default(),
                 }),
                 RpcProtocol::StateByRoot,
             ),
@@ -918,6 +909,7 @@ mod tests {
                 RpcRequest::HistoryProofByRange(HistoryProofByRangeRequest {
                     start_checkpoint_hash: [1; 32],
                     end_checkpoint_hash: [2; 32],
+                    bootstrap: false,
                 }),
                 RpcProtocol::HistoryProofByRange,
             ),
@@ -932,9 +924,10 @@ mod tests {
         let request = HistoryProofByRangeRequest {
             start_checkpoint_hash: [1; 32],
             end_checkpoint_hash: [2; 32],
+            bootstrap: false,
         };
         let bytes = to_vec(&request).unwrap();
-        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), 65);
         assert_eq!(
             from_slice::<HistoryProofByRangeRequest>(&bytes).unwrap(),
             request
@@ -957,6 +950,7 @@ mod tests {
         encoded.truncate(HISTORY_STATEMENT_BYTES);
         encoded.extend_from_slice(&1_u32.to_le_bytes());
         encoded.push(7);
+        encoded.push(0); // No bootstrap context.
         let response = from_slice::<HistoryProofByRangeResponse>(&encoded).unwrap();
         assert_eq!(to_vec(&response).unwrap(), encoded);
         encoded.push(8);
@@ -1063,7 +1057,12 @@ mod tests {
         // Build a State request whose borsh size exceeds 100 bytes.
         let req = StateByRootRequest {
             state_root: [0; 32],
-            paths: (0..16).map(|_| vec![0_u8; 64]).collect(),
+            items: neutrino_consensus_types::bootstrap::StateItems::new(
+                (0..16)
+                    .map(|_| neutrino_consensus_types::bootstrap::StateItem::node([0; 32]))
+                    .collect(),
+            )
+            .unwrap(),
         };
         let mut codec = StateByRootCodec::default().with_request_size_maximum(100);
         let protocol = RpcProtocol::StateByRoot.stream_protocol();

@@ -30,5 +30,12 @@ pub const LATEST_VALIDATOR_SET_INDEX: &[u8] = b"latest_vs_idx";
 /// BLAKE3 hash of the borsh-encoded chain spec.
 pub const CHAIN_SPEC_HASH: &[u8] = b"chain_spec_hash";
 
-/// Last complete consensus statement with authenticated history openings.
+/// Authenticated consensus boundary and the full next execution context.
 pub const CONSENSUS_STATE: &[u8] = b"full_consensus_state";
+
+/// Authenticated manifest and trust origin of an unfinished snapshot bootstrap.
+pub const BOOTSTRAP_PENDING: &[u8] = b"bootstrap_pending";
+/// Durable frontier of a content-addressed execution-state download.
+pub const STATE_DOWNLOAD: &[u8] = b"state_download";
+/// Prefix for partial and completed objects in the download staging area.
+pub const STATE_DOWNLOAD_ENTRY_PREFIX: &[u8] = b"state_download_entry/";

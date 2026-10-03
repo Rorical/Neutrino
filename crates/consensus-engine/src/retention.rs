@@ -64,7 +64,8 @@ impl<DB: Database> Engine<DB> {
         let count = self.finalized_next_chunk_id();
         let floor = self
             .recursive_covered_chunks()
-            .min(count.saturating_sub(HISTORY_RETENTION_CHUNKS));
+            .min(count.saturating_sub(HISTORY_RETENTION_CHUNKS))
+            .max(self.store().bootstrap_source_floor()?);
         if floor < info.pruned_before_chunk {
             return Err(StoreError::Corrupt(
                 "recursive coverage or finality regressed after pruning",
@@ -75,7 +76,12 @@ impl<DB: Database> Engine<DB> {
             .checked_mul(self.chain_spec().consensus.chunk_size)
             .and_then(|height| height.checked_add(1))
             .ok_or(StoreError::Corrupt("retention height overflow"))?;
-        let (mut batch, roots) = self.store().retention_batch(self.chain_spec(), info)?;
+        let (mut batch, mut roots) = self.store().retention_batch(self.chain_spec(), info)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| StoreError::Corrupt("snapshot retention clock is invalid"))?
+            .as_secs();
+        roots.extend(self.store().snapshot_retention(&mut batch, now)?);
         // Some sync/header-only nodes have never materialized historical state roots.
         // If even one retained root is unavailable, preserve all state entries. This
         // is conservative and cannot erase a partially downloaded or corrupt state.

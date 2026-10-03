@@ -33,6 +33,11 @@ Neutrino separates the chain into two cleanly decoupled layers:
   window once a persisted recursive prefix covers older data. `role = "archive"`
   keeps complete source history voluntarily. Old transactions may become globally
   unavailable when no archive retains them; proof lag delays deletion.
+- **Authenticated snapshot bootstrap.** Full/validator nodes verify a recursive
+  checkpoint and its locally trusted bridge, download bounded state fragments,
+  and atomically install execution and consensus state before resuming sync.
+- **Durable validator signing.** Vote/attestation and proposer reservations are
+  synchronized before signing. Round, lock and local votes survive restart.
 - **Proof-authorized sanctions.** An independent fact Guest compresses signed artifacts; a batch evidence Guest proves offences.
   Blocks recursively authenticate evidence statements and execute mandatory sanctions;
   chunks consume those proven effects without rechecking the evidence. See

@@ -110,8 +110,8 @@ pub struct HeadersImported {
 pub struct StateProgress {
     /// `true` once the target state root is fully reconstructed locally.
     pub root_complete: bool,
-    /// Additional paths the driver should fetch next (driver-controlled trie walk).
-    pub next_paths: Vec<Vec<u8>>,
+    /// Exact pending node/value hashes and offsets discovered from verified nodes.
+    pub next_items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
 }
 
 /// Result of importing a batch of block proofs.
@@ -172,6 +172,42 @@ pub trait SyncBackend: Send + Sync + 'static {
         end: Hash,
     ) -> Result<HistoryProofByRangeResponse, SyncBackendError>;
 
+    /// Full-node bootstrap trust origin selected from local configuration or finality.
+    async fn bootstrap_origin(&self) -> Option<neutrino_consensus_types::Checkpoint> {
+        None
+    }
+    /// Freeze local execution while an authenticated bootstrap target is fetched.
+    async fn bootstrap_fetch(&self, _active: bool) {}
+    /// Resume durable authenticated state reconstruction, if active.
+    async fn bootstrap_state(
+        &self,
+    ) -> Result<
+        Option<(
+            StateRoot,
+            Vec<neutrino_consensus_types::bootstrap::StateItem>,
+        )>,
+        SyncBackendError,
+    > {
+        Ok(None)
+    }
+    /// Serve the exact genesis-prefix context corresponding to an endpoint.
+    async fn bootstrap_data(
+        &self,
+        _end: Hash,
+    ) -> Result<neutrino_consensus_types::bootstrap::BootstrapData, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "bootstrap context unavailable".into(),
+        ))
+    }
+    /// Verify trust, both real receipts and context before starting a state download.
+    async fn begin_bootstrap(
+        &self,
+        _bridge: Option<HistoryProof>,
+        _data: neutrino_consensus_types::bootstrap::BootstrapData,
+    ) -> Result<StateProgress, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable("bootstrap disabled".into()))
+    }
+
     /// Build a response to `/neutrino/req/blocks_by_range`.
     async fn blocks_by_range(
         &self,
@@ -191,7 +227,7 @@ pub trait SyncBackend: Send + Sync + 'static {
     async fn state_nodes(
         &self,
         root: StateRoot,
-        paths: &[Vec<u8>],
+        items: &[neutrino_consensus_types::bootstrap::StateItem],
     ) -> Result<StateByRootResponse, SyncBackendError>;
 
     /// Build a response to `/neutrino/req/block_proof_by_hash`.
@@ -256,21 +292,12 @@ pub trait SyncBackend: Send + Sync + 'static {
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError>;
 
-    /// Persist the supplied trie nodes (and the state values their
-    /// leaves reference) under `root`, then report which child paths
-    /// the driver should fetch next (driver-controlled trie walk).
-    ///
-    /// `values` carries the contents of every leaf node in `nodes`;
-    /// the M6 backend rebuilds the trie locally from this combined
-    /// payload and rejects the import when the reconstructed root
-    /// differs from `root`. M12 will replace this single-shot call
-    /// with a per-path streaming variant.
+    /// Persist exact bounded fragments and discover authenticated child hashes.
     async fn import_state_nodes(
         &self,
         root: StateRoot,
-        paths: Vec<Vec<u8>>,
-        nodes: Vec<Vec<u8>>,
-        values: Vec<Vec<u8>>,
+        items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
+        entries: Vec<neutrino_consensus_types::bootstrap::StateEntry>,
     ) -> Result<StateProgress, SyncBackendError>;
 
     /// Verify each block proof, then persist all accepted proofs.

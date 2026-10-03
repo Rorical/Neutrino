@@ -249,10 +249,13 @@ impl<DB: Database> Engine<DB> {
                 consensus.next_seed,
             )
             .map_err(|_| StoreError::Corrupt("stored consensus context is invalid"))?;
-            if boundary != consensus.statement.end
-                || consensus.statement.chain
-                    != neutrino_consensus_types::history_proof::ChainBinding::from_spec(&chain_spec)
-                || latest_finalized_chunk_id != Some(consensus.statement.chunk.chunk_id)
+            if boundary != consensus.boundary
+                || consensus.next_context.chain_id != chain_spec.chain_id
+                || consensus.next_context.chain_spec_hash != chain_spec.hash()
+                || consensus.next_context.chunk_size != chain_spec.consensus.chunk_size
+                || consensus.next_context.vm_code_hash != chain_spec.runtime_code_hash
+                || consensus.next_context.gas_price != chain_spec.runtime.gas_price
+                || latest_finalized_chunk_id != boundary.next_chunk_id.checked_sub(1)
                 || finalized_head != boundary.block_hash
                 || finalized_seed != boundary.seed
                 || active_validator_set != consensus.next_context.active_validators
@@ -276,7 +279,7 @@ impl<DB: Database> Engine<DB> {
 
         let fork_choice = Self::restore_fork_choice(&store, finalized_head, head_hash)?;
 
-        Ok(Self {
+        let mut engine = Self {
             chain_spec,
             store,
             clock,
@@ -295,7 +298,9 @@ impl<DB: Database> Engine<DB> {
             rejected_proofs: BTreeMap::new(),
             rejected_proofs_order: VecDeque::new(),
             fork_choice,
-        })
+        };
+        engine.restore_bft_sessions()?;
+        Ok(engine)
     }
 
     fn validate_history_coverage(
@@ -312,10 +317,15 @@ impl<DB: Database> Engine<DB> {
             .transpose()?
             .unwrap_or(0);
         let floor = store.retention_info()?.pruned_before_chunk;
+        let bootstrap_floor = store.bootstrap_source_floor()?;
         if floor > recursive_covered_chunks
             || floor
                 > finalized_count
                     .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS)
+                    .max(bootstrap_floor)
+            || bootstrap_floor > floor
+            || bootstrap_floor > recursive_covered_chunks
+            || bootstrap_floor > finalized_count
         {
             return Err(StoreError::Corrupt(
                 "retention exceeds proven finalized history",
@@ -679,6 +689,7 @@ impl<DB: Database> Engine<DB> {
             .put_validator_set_snapshot(effective_at, &new_set)?;
         self.store.put_latest_validator_set_index(effective_at)?;
         self.active_validator_set = new_set;
+        self.rebind_local_voter();
         Ok(())
     }
 
@@ -726,10 +737,30 @@ impl<DB: Database> Engine<DB> {
 
     /// Install only after the complete finalization batch has committed.
     pub(crate) fn install_consensus_state(&mut self, state: &crate::full_chunk::ConsensusState) {
-        self.latest_finalized_chunk_id = Some(state.statement.chunk.chunk_id);
+        self.latest_finalized_chunk_id = state.boundary.next_chunk_id.checked_sub(1);
         self.finalized_seed = state.next_seed;
         self.active_validator_set
             .clone_from(&state.next_context.active_validators);
+        self.rebind_local_voter();
+    }
+
+    /// Publish a bootstrap only after its state and every canonical pointer are durable.
+    pub(crate) fn publish_bootstrap_state(
+        &mut self,
+        consensus: &crate::full_chunk::ConsensusState,
+        state: Trie,
+    ) {
+        self.install_consensus_state(consensus);
+        self.recursive_covered_chunks = consensus.boundary.next_chunk_id;
+        self.head_height = consensus.boundary.height;
+        self.head_hash = consensus.boundary.block_hash;
+        self.head_state_root = consensus.boundary.state_root;
+        self.state = state;
+        self.fork_choice = ForkChoice::new(consensus.boundary.block_hash);
+        self.bft_sessions.clear();
+        self.slashing_monitor = SlashingMonitor::new();
+        self.rejected_proofs.clear();
+        self.rejected_proofs_order.clear();
     }
 
     /// Update prefix coverage after verification and atomic artifact persistence.
@@ -859,7 +890,7 @@ impl<DB: Database> Engine<DB> {
     /// or when the local validator's index is not selected.
     #[must_use]
     pub fn local_is_aggregator_for(&self, chunk_id: ChunkId, round: u32) -> bool {
-        let Some(voter) = self.local_voter.as_ref() else {
+        let Some(voter) = self.active_local_voter() else {
             return false;
         };
         let local_idx = voter.validator_index();

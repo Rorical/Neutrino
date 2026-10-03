@@ -68,10 +68,14 @@ pub enum Column {
     FinalizedOffences,
     /// Reusable objective-evidence receipts keyed by offence ID.
     EvidenceProofs,
+    /// Durable local signing intents and monotonic signing watermarks.
+    SigningJournal,
+    /// Unfinalized BFT sessions, including local votes and quorum certificates.
+    BftSessions,
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 30] = [
+pub const ALL_COLUMNS: [Column; 32] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -102,6 +106,8 @@ pub const ALL_COLUMNS: [Column; 30] = [
     Column::HistoryPins,
     Column::FinalizedOffences,
     Column::EvidenceProofs,
+    Column::SigningJournal,
+    Column::BftSessions,
 ];
 
 impl Column {
@@ -139,6 +145,8 @@ impl Column {
             Self::HistoryPins => "history_pins",
             Self::FinalizedOffences => "finalized_offences",
             Self::EvidenceProofs => "evidence_proofs",
+            Self::SigningJournal => "signing_journal",
+            Self::BftSessions => "bft_sessions",
         }
     }
 }
@@ -149,7 +157,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 30);
+        assert_eq!(ALL_COLUMNS.len(), 32);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -159,7 +167,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 30] = [
+        let names: [&str; 32] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -190,6 +198,8 @@ mod tests {
             "history_pins",
             "finalized_offences",
             "evidence_proofs",
+            "signing_journal",
+            "bft_sessions",
         ];
         for (column, expected) in ALL_COLUMNS.iter().zip(names) {
             assert_eq!(column.name(), expected);

@@ -58,6 +58,9 @@ pub struct NodeConfig {
     /// Explicit local trust anchor and time policy for proof-only operation.
     #[serde(default)]
     pub light_client: LightClientConfig,
+    /// Full/validator checkpoint bootstrap and local weak-subjectivity policy.
+    #[serde(default)]
+    pub bootstrap: BootstrapConfig,
     /// Bind addresses (multiaddr) the libp2p listener attaches to.
     ///
     /// Defaults to `/ip4/0.0.0.0/tcp/0` if empty.
@@ -79,7 +82,7 @@ pub struct NodeConfig {
     /// proposer key for validator block production.
     #[serde(default)]
     pub proposer_ikm_hex: Option<String>,
-    /// Validator index paired with [`Self::proposer_ikm_hex`].
+    /// Initial position hint; signing resolves the public key in the authenticated active set.
     #[serde(default)]
     pub proposer_index: Option<u32>,
     /// Gossip topics to subscribe to on startup. Defaults to all canonical
@@ -110,6 +113,30 @@ pub struct LightClientConfig {
 impl Default for LightClientConfig {
     fn default() -> Self {
         Self {
+            trusted_checkpoint_path: None,
+            trusted_at: None,
+            max_future_drift_secs: 30,
+        }
+    }
+}
+
+/// Full-node state bootstrap. Archive nodes always replay complete source history.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BootstrapConfig {
+    /// Enable proof-backed state bootstrap when the local finalized anchor is behind.
+    pub enabled: bool,
+    /// Optional independently trusted checkpoint file, never selected by peers.
+    pub trusted_checkpoint_path: Option<std::path::PathBuf>,
+    /// Original local trust time, required with the checkpoint file.
+    pub trusted_at: Option<u64>,
+    /// Maximum accepted future endpoint timestamp.
+    pub max_future_drift_secs: u64,
+}
+impl Default for BootstrapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
             trusted_checkpoint_path: None,
             trusted_at: None,
             max_future_drift_secs: 30,

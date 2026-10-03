@@ -23,12 +23,16 @@
 //! block proofs, and authenticate the full consensus boundary before proceeding.
 //! Verified history compaction runs independently of Chunk finality.
 
+mod bootstrap;
 mod evidence;
 mod facts;
 mod history;
 mod light;
 mod p2p_queries;
 mod rpc_queries;
+mod state_sync;
+#[cfg(test)]
+mod state_sync_tests;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -55,7 +59,7 @@ use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot, blake3_256};
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
 use neutrino_runtime_abi::{TxValidationCode, TxValidity};
-use neutrino_storage::Database;
+use neutrino_storage::{Column, Database};
 use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
     SyncBackend, SyncBackendError,
@@ -93,6 +97,7 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     fact_jobs: Mutex<Option<mpsc::Sender<Vec<neutrino_prover_chunk::facts::FactRequest>>>>,
     history: Arc<history::HistoryRuntime>,
     light: Mutex<Option<light::LightRuntime>>,
+    bootstrap: Mutex<Option<bootstrap::BootstrapRuntime>>,
     evidence_job_running: Arc<std::sync::atomic::AtomicBool>,
     evidence_job_cursor: std::sync::atomic::AtomicUsize,
     proof_system: Arc<P>,
@@ -273,6 +278,7 @@ where
             fact_jobs: Mutex::new(None),
             history: Arc::new(history::HistoryRuntime::default()),
             light: Mutex::new(None),
+            bootstrap: Mutex::new(None),
             evidence_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             evidence_job_cursor: std::sync::atomic::AtomicUsize::new(0),
             proof_system: Arc::new(proof_system),
@@ -342,8 +348,10 @@ where
     /// mismatch, attempt to reorg past finalised history).
     pub fn try_materialise_to_fork_choice_head(&self) -> Result<bool, SyncBackendError> {
         let executor = self.block_executor_snapshot();
-        self.with_engine_mut(|e| e.materialise_to_fork_choice_head(executor.as_deref()))
-            .map_err(Self::map_import_err)
+        self.with_live_engine_mut(|e| {
+            e.materialise_to_fork_choice_head(executor.as_deref())
+                .map_err(Self::map_import_err)
+        })
     }
 
     /// Re-run the configured `ProofSystem::verify_block` against a
@@ -581,6 +589,9 @@ where
         slot: Slot,
         proposer: &ProposerKey,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
+        if self.bootstrap_pending() {
+            return Ok(None);
+        }
         self.start_evidence_jobs();
         self.start_history_jobs();
         if self.proof_system.consensus_block_key().is_some()
@@ -609,6 +620,9 @@ where
             },
             |executor| {
                 self.with_engine_mut(|e| {
+                    if self.bootstrap_pending() {
+                        return Ok(None);
+                    }
                     if let Some(key) = self.proof_system.consensus_block_key() {
                         let height = e.head_height().checked_add(1).ok_or_else(|| {
                             ProductionError::Executor("height overflow".to_owned())
@@ -797,13 +811,27 @@ where
         &self,
         block_hash: &BlockHash,
     ) -> Result<ProveOutcome, ProveError<DB::Error>> {
-        let job = self.with_engine_mut(|e| e.prepare_block_proof(block_hash))?;
+        let job = self.with_engine_mut(|e| {
+            if self.bootstrap_pending() {
+                return Err(ProveError::Backend(
+                    neutrino_proof_system::ProofError::BackendRejected,
+                ));
+            }
+            e.prepare_block_proof(block_hash)
+        })?;
         let permit = self
             .proving_budget
             .acquire(crate::proving_budget::ProvingPriority::Critical);
         let completed = job.prove(self.proof_system.as_ref())?;
         drop(permit);
-        self.with_engine_mut(|e| e.commit_block_proof(completed))
+        self.with_engine_mut(|e| {
+            if self.bootstrap_pending() {
+                return Err(ProveError::Backend(
+                    neutrino_proof_system::ProofError::BackendRejected,
+                ));
+            }
+            e.commit_block_proof(completed)
+        })
     }
 
     /// Configure the shared proving limit before starting background workers.
@@ -905,8 +933,14 @@ where
         chunk_id: u64,
         voter: &ProposerKey,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        let outcome = self
-            .with_engine_mut(|e| e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter))?;
+        let outcome = self.with_engine_mut(|e| {
+            if self.bootstrap_pending() {
+                return Err(FinalizeError::Backend(
+                    neutrino_proof_system::ProofError::BackendRejected,
+                ));
+            }
+            e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter)
+        })?;
         self.start_history_jobs();
         Ok(outcome)
     }
@@ -1078,76 +1112,29 @@ where
         Ok(height)
     }
 
-    /// Persist a full state dump received during snap-sync. Verifies
-    /// the reconstructed trie root before persisting the bytes, so a
-    /// malicious peer cannot poison the local state column with
-    /// uncorrelated entries.
-    fn import_full_state_dump(
+    /// Publish an already reconstructed and root-authenticated state snapshot.
+    fn commit_reconstructed_state(
         &self,
-        root: StateRoot,
-        nodes: Vec<Vec<u8>>,
-        values: Vec<Vec<u8>>,
-    ) -> Result<StateProgress, SyncBackendError> {
-        use neutrino_trie::{Hasher, Poseidon2Hasher};
-        let node_count = nodes.len();
-        let value_count = values.len();
-        let nodes: std::collections::BTreeMap<_, _> = nodes
-            .into_iter()
-            .map(|bytes| (Poseidon2Hasher::hash_node(&bytes), bytes))
-            .collect();
-        let values: std::collections::BTreeMap<_, _> = values
-            .into_iter()
-            .map(|bytes| (Poseidon2Hasher::hash_value(&bytes), bytes))
-            .collect();
-        let authenticated = rpc_queries::authenticate_state(
-            root,
-            |hash| {
-                nodes
-                    .get(&hash)
-                    .cloned()
-                    .ok_or(neutrino_rpc::QueryError::StateUnavailable)
-            },
-            |hash| {
-                values
-                    .get(&hash)
-                    .cloned()
-                    .ok_or(neutrino_rpc::QueryError::StateUnavailable)
-            },
-        )
-        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
-        if authenticated.nodes.len() != node_count || authenticated.values.len() != value_count {
-            return Err(SyncBackendError::Rejected(
-                "snapshot contains duplicate or unreachable entries".to_owned(),
-            ));
-        }
-        let reconstructed = neutrino_trie::Trie::from_persisted(
-            root,
-            authenticated.nodes.clone(),
-            authenticated.values.clone(),
-        );
-        self.with_engine_mut(|engine| {
+        state: neutrino_trie::Trie,
+    ) -> Result<(), SyncBackendError> {
+        self.with_live_engine_mut(|engine| {
+            let root = state.root();
             let mut batch = neutrino_storage::Batch::new();
-            for (hash, bytes) in authenticated.nodes {
-                batch.put(neutrino_storage::Column::TrieNodes, hash, bytes);
+            for (hash, bytes) in state.node_entries() {
+                batch.put(Column::TrieNodes, hash, bytes);
             }
-            for (hash, bytes) in authenticated.values {
-                batch.put(neutrino_storage::Column::StateValues, hash, bytes);
+            for (hash, bytes) in state.value_entries() {
+                batch.put(Column::StateValues, hash, bytes);
             }
             engine
                 .store_mut()
                 .db_mut()
-                .write_batch(batch)
+                .write_batch_durable(batch)
                 .map_err(p2p_queries::storage_error)?;
-            // Historical snapshots are retained without replacing live head state.
             if engine.head_state_root() == root {
-                engine.replace_state_with_reconstructed(reconstructed);
+                engine.replace_state_with_reconstructed(state);
             }
-            Ok::<_, SyncBackendError>(())
-        })?;
-
-        Ok(StateProgress {
-            root_complete: true,
-            next_paths: vec![],
+            Ok(())
         })
     }
 
@@ -1161,6 +1148,22 @@ where
         f(&mut guard)
     }
 
+    /// The engine lock also orders bootstrap admission, so the optimistic checks
+    /// at async entry points cannot authorize mutations after fetching begins.
+    fn with_live_engine_mut<R>(
+        &self,
+        f: impl FnOnce(&mut Engine<DB>) -> Result<R, SyncBackendError>,
+    ) -> Result<R, SyncBackendError> {
+        self.with_engine_mut(|engine| {
+            if self.bootstrap_pending() {
+                return Err(SyncBackendError::NotAvailable(
+                    "checkpoint state is downloading".into(),
+                ));
+            }
+            f(engine)
+        })
+    }
+
     /// If the chunk containing `height` now has every block proof in place, open a BFT
     /// session for it and broadcast any resulting actions.
     ///
@@ -1168,6 +1171,9 @@ where
     /// proof (local production, gossip imports, RPC batches). Cheap
     /// for incomplete chunks. Proofs may finish in any order.
     pub async fn maybe_open_bft_session_for_height(&self, height: Height) {
+        if self.bootstrap_pending() {
+            return;
+        }
         let chunk_size = self.chunk_size().max(1);
         if height == 0 {
             return;
@@ -1185,7 +1191,8 @@ where
         }
         let assembled = if self.proof_system.consensus_block_key().is_some() {
             self.with_engine(|e| {
-                let prepared = e.prepare_consensus_chunk(chunk_id, self.proof_system.as_ref())?;
+                let prepared =
+                    e.prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())?;
                 let candidate =
                     neutrino_prover_chunk::consensus::validate_candidate(&prepared.witness)
                         .map_err(|_| {
@@ -1211,7 +1218,10 @@ where
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let actions = match self.with_engine_mut(|e| e.open_bft_session_at(chunk, now_secs)) {
+        let actions = match self.with_live_engine_mut(|e| {
+            e.open_bft_session_at(chunk, now_secs)
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+        }) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(chunk_id, ?err, "open_bft_session failed");
@@ -1219,6 +1229,43 @@ where
             }
         };
         self.handle_bft_actions(actions).await;
+    }
+
+    // Restored FSM flags cannot authorize new signatures under the current program.
+    // Receipt verification reuses the host's exact-byte/program-key cache.
+    fn validate_bft_signing_candidate(
+        &self,
+        engine: &Engine<DB>,
+        chunk_id: ChunkId,
+    ) -> Result<(), SyncBackendError> {
+        if engine.local_voter().is_none() || self.proof_system.consensus_block_key().is_none() {
+            return Ok(());
+        }
+        if engine.bft_session(chunk_id).is_none() {
+            return Ok(());
+        }
+        engine
+            .prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())
+            .map(|_| ())
+            .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+    }
+
+    /// Authenticate restored signing work and rebroadcast its original messages.
+    /// Call after installing the publisher and the local validator identity.
+    pub async fn resume_bft_sessions(&self) -> Result<(), String> {
+        if self.bootstrap_pending() {
+            return Ok(());
+        }
+        let actions = self
+            .with_live_engine_mut(|engine| {
+                self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
+                engine
+                    .resume_bft_actions()
+                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+            })
+            .map_err(|error| error.to_string())?;
+        self.handle_bft_actions(actions).await;
+        Ok(())
     }
 
     /// Drain a batch of [`BftAction`]s into network publishes and
@@ -1282,6 +1329,9 @@ where
     /// timeout window. Tests pass a deterministic `now_secs` to
     /// drive scenarios.
     pub async fn tick_bft_round_timeouts(&self, now_secs: u64) {
+        if self.bootstrap_pending() {
+            return;
+        }
         self.poll_consensus_proof().await;
         if self.proof_system.consensus_block_key().is_some() {
             let ready = self.with_engine(|engine| {
@@ -1297,7 +1347,12 @@ where
                 self.handle_quorum_reached(chunk_id).await;
             }
         }
-        let actions = match self.with_engine_mut(|e| e.tick_bft_round_timeouts(now_secs)) {
+        let actions = match self.with_live_engine_mut(|engine| {
+            self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
+            engine
+                .tick_bft_round_timeouts(now_secs)
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+        }) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(?err, "tick_bft_round_timeouts failed");
@@ -1328,11 +1383,14 @@ where
         if running.is_some() {
             return;
         }
-        let prepared = self.with_engine_mut(|engine| {
-            let mut prepared =
-                engine.prepare_consensus_chunk(chunk_id, self.proof_system.as_ref())?;
-            engine.certify_consensus_chunk(&mut prepared, voter)?;
-            Ok::<_, neutrino_consensus_engine::FinalizeError<DB::Error>>(prepared)
+        let prepared = self.with_live_engine_mut(|engine| {
+            let mut prepared = engine
+                .prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+            engine
+                .certify_consensus_chunk(&mut prepared, voter)
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+            Ok(prepared)
         });
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -1378,8 +1436,16 @@ where
                 return;
             }
         };
-        let outcome = self.with_engine_mut(|engine| {
-            engine.commit_consensus_chunk(&witness, &proof, self.proof_system.as_ref())
+        let executor = self.block_executor_snapshot();
+        let outcome = self.with_live_engine_mut(|engine| {
+            engine
+                .commit_bft_consensus_chunk(
+                    &witness,
+                    &proof,
+                    self.proof_system.as_ref(),
+                    executor.as_deref(),
+                )
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         });
         match outcome {
             Ok(outcome) => {
@@ -1539,9 +1605,41 @@ where
     async fn state_nodes(
         &self,
         root: StateRoot,
-        paths: &[Vec<u8>],
+        items: &[neutrino_consensus_types::bootstrap::StateItem],
     ) -> Result<StateByRootResponse, SyncBackendError> {
-        self.p2p_state_nodes(root, paths)
+        self.p2p_state_nodes(root, items)
+    }
+
+    async fn bootstrap_origin(&self) -> Option<neutrino_consensus_types::Checkpoint> {
+        Self::bootstrap_origin(self)
+    }
+    async fn bootstrap_fetch(&self, active: bool) {
+        Self::bootstrap_fetch(self, active).await;
+    }
+
+    async fn bootstrap_state(
+        &self,
+    ) -> Result<
+        Option<(
+            StateRoot,
+            Vec<neutrino_consensus_types::bootstrap::StateItem>,
+        )>,
+        SyncBackendError,
+    > {
+        Self::bootstrap_state(self)
+    }
+    async fn bootstrap_data(
+        &self,
+        end: Hash,
+    ) -> Result<neutrino_consensus_types::bootstrap::BootstrapData, SyncBackendError> {
+        self.serve_bootstrap(end)
+    }
+    async fn begin_bootstrap(
+        &self,
+        bridge: Option<HistoryProof>,
+        data: neutrino_consensus_types::bootstrap::BootstrapData,
+    ) -> Result<neutrino_sync::StateProgress, SyncBackendError> {
+        Self::begin_bootstrap(self, bridge, data).await
     }
 
     async fn block_proofs_by_hash(
@@ -1597,8 +1695,11 @@ where
         .await
         .map_err(|error| SyncBackendError::Rejected(error.to_string()))?
         .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
-        self.with_engine_mut(|engine| engine.commit_verified_history(verified))
-            .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+        self.with_live_engine_mut(|engine| {
+            engine
+                .commit_verified_history(verified)
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+        })?;
         self.start_history_jobs();
         Ok(CheckpointsImported {
             new_finalized_index: statement.end.next_chunk_id,
@@ -1613,6 +1714,11 @@ where
         &self,
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError> {
+        if self.bootstrap_pending() {
+            return Err(SyncBackendError::NotAvailable(
+                "checkpoint state is downloading".into(),
+            ));
+        }
         if self.light_checkpoint().is_some() {
             return Err(SyncBackendError::NotAvailable("proof-only node".into()));
         }
@@ -1628,15 +1734,13 @@ where
         for block in blocks {
             self.authorize_incoming_consensus_body(&block)?;
             let block_ref = &block;
-            let import_result = executor.as_ref().map_or_else(
-                || self.with_engine_mut(|e| e.import_block(block_ref)),
-                |executor| {
-                    self.with_engine_mut(|e| {
-                        e.import_block_with_dry_run(block_ref, executor.as_ref())
-                    })
-                },
-            );
-            let outcome = import_result.map_err(Self::map_import_err)?;
+            let outcome = self.with_live_engine_mut(|e| {
+                match executor.as_ref() {
+                    Some(executor) => e.import_block_with_dry_run(block_ref, executor.as_ref()),
+                    None => e.import_block(block_ref),
+                }
+                .map_err(Self::map_import_err)
+            })?;
             self.queue_header_facts(&block.header);
             self.forget_mined_transactions(&block.body.transactions);
             last = Some(HeadersImported {
@@ -1651,19 +1755,32 @@ where
     async fn import_state_nodes(
         &self,
         root: StateRoot,
-        paths: Vec<Vec<u8>>,
-        nodes: Vec<Vec<u8>>,
-        values: Vec<Vec<u8>>,
+        items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
+        entries: Vec<neutrino_consensus_types::bootstrap::StateEntry>,
     ) -> Result<StateProgress, SyncBackendError> {
         if self.light_checkpoint().is_some() {
             return Err(SyncBackendError::NotAvailable("proof-only node".into()));
         }
-        if paths.iter().any(|path| !path.is_empty()) {
-            return Err(SyncBackendError::InvalidRequest(
-                "subtree state import is unsupported".to_owned(),
+        let pending = self.bootstrap_state()?;
+        if pending
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected != root)
+        {
+            return Err(SyncBackendError::Rejected(
+                "state response targets another bootstrap".into(),
             ));
         }
-        self.import_full_state_dump(root, nodes, values)
+        let progress = self.receive_state_entries(root, &items, &entries)?;
+        if progress.root_complete {
+            if pending.is_some() {
+                self.finish_bootstrap().await?;
+            } else {
+                let trie = self.reconstructed_state(root)?;
+                self.commit_reconstructed_state(trie)?;
+                self.clear_state_download(root)?;
+            }
+        }
+        Ok(progress)
     }
 
     async fn verify_and_import_block_proofs(
@@ -1691,23 +1808,18 @@ where
             // trie to the new fork-choice head. Executor-less
             // backends keep the prior behaviour.
             let proof_ref = &proof;
-            let import_result = self.block_executor_snapshot().map_or_else(
-                || {
-                    self.with_engine_mut(|e| {
-                        e.import_block_proof(proof_ref, self.proof_system.as_ref())
-                    })
-                },
-                |executor| {
-                    self.with_engine_mut(|e| {
-                        e.import_block_proof_with_dry_run(
-                            proof_ref,
-                            self.proof_system.as_ref(),
-                            executor.as_ref(),
-                        )
-                    })
-                },
-            );
-            let outcome = import_result.map_err(Self::map_import_err)?;
+            let executor = self.block_executor_snapshot();
+            let outcome = self.with_live_engine_mut(|e| {
+                match executor.as_ref() {
+                    Some(executor) => e.import_block_proof_with_dry_run(
+                        proof_ref,
+                        self.proof_system.as_ref(),
+                        executor.as_ref(),
+                    ),
+                    None => e.import_block_proof(proof_ref, self.proof_system.as_ref()),
+                }
+                .map_err(Self::map_import_err)
+            })?;
             last_height = Some(outcome.height);
             imported_heights.push(outcome.height);
             expected_height = expected_height.saturating_add(1);
@@ -1729,6 +1841,11 @@ where
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
+        if self.bootstrap_pending() {
+            return Err(SyncBackendError::NotAvailable(
+                "checkpoint state is downloading".into(),
+            ));
+        }
         if self.light_checkpoint().is_some() {
             return Err(SyncBackendError::NotAvailable("proof-only node".into()));
         }
@@ -1754,12 +1871,13 @@ where
         // cross-checked against a local re-execution against the
         // parent state. Tests / RPC-only nodes that leave the
         // executor unset fall back to the no-dry-run path.
-        let import_result = self.block_executor_snapshot().map_or_else(
-            || self.with_engine_mut(|e| e.import_block(&block)),
-            |executor| {
-                self.with_engine_mut(|e| e.import_block_with_dry_run(&block, executor.as_ref()))
-            },
-        );
+        let executor = self.block_executor_snapshot();
+        let import_result = self.with_live_engine_mut(|e| {
+            Ok(match executor.as_ref() {
+                Some(executor) => e.import_block_with_dry_run(&block, executor.as_ref()),
+                None => e.import_block(&block),
+            })
+        })?;
         let outcome = match import_result {
             Ok(outcome) => outcome,
             Err(ImportError::HeaderVrf(vrf_err)) => {
@@ -1844,16 +1962,17 @@ where
         }
         let chunk_id = proof.chunk_id;
         let executor = self.block_executor_snapshot();
-        let outcome = self
-            .with_engine_mut(|engine| match executor.as_ref() {
+        let outcome = self.with_live_engine_mut(|engine| {
+            match executor.as_ref() {
                 Some(executor) => engine.import_chunk_proof_with_dry_run(
                     &proof,
                     self.proof_system.as_ref(),
                     executor.as_ref(),
                 ),
                 None => engine.import_chunk_proof(&proof, self.proof_system.as_ref()),
-            })
-            .map_err(Self::map_import_err)?;
+            }
+            .map_err(Self::map_import_err)
+        })?;
         if self.proof_system.consensus_block_key().is_some() {
             self.start_evidence_jobs();
             self.start_history_jobs();
@@ -1870,7 +1989,7 @@ where
     }
 
     async fn ingest_finality_vote(&self, vote: FinalityVote) {
-        if self.light_checkpoint().is_some() {
+        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
             return;
         }
         if self.with_engine(|engine| {
@@ -1906,7 +2025,12 @@ where
         for evidence in invalid_proof_evidence {
             self.pool_and_gossip_slashing(evidence).await;
         }
-        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote.clone())) {
+        let actions = match self.with_live_engine_mut(|engine| {
+            self.validate_bft_signing_candidate(engine, vote.data.chunk_id)?;
+            engine
+                .observe_finality_vote(vote.clone())
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+        }) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(?err, "engine rejected finality vote");
@@ -1918,7 +2042,7 @@ where
     }
 
     async fn ingest_aggregate_finality_vote(&self, subnet: u8, vote: FinalityVote) {
-        if self.light_checkpoint().is_some() {
+        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
             return;
         }
         if self.with_engine(|engine| {
@@ -1953,7 +2077,12 @@ where
         for evidence in invalid_proof_evidence {
             self.pool_and_gossip_slashing(evidence).await;
         }
-        let actions = match self.with_engine_mut(|e| e.observe_finality_vote(vote.clone())) {
+        let actions = match self.with_live_engine_mut(|engine| {
+            self.validate_bft_signing_candidate(engine, vote.data.chunk_id)?;
+            engine
+                .observe_finality_vote(vote.clone())
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+        }) {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(?err, "engine rejected aggregate finality vote");

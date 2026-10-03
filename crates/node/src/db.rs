@@ -85,6 +85,17 @@ impl Database for NodeDb {
         }
     }
 
+    fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
+        match self {
+            Self::Memory(db) => {
+                db.write_batch_durable(batch)
+                    .expect("memory durable batch is infallible");
+                Ok(())
+            }
+            Self::Rocks(db) => db.write_batch_durable(batch).map_err(NodeDbError::from),
+        }
+    }
+
     fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
         match self {
             Self::Memory(db) => Ok(db

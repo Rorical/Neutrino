@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod bootstrap;
 pub mod evidence;
 pub mod history;
 pub mod history_proof;

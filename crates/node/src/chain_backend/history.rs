@@ -61,6 +61,9 @@ impl Job {
 pub(super) struct HistoryRuntime {
     initialized: AtomicBool,
     started: AtomicBool,
+    pub(super) paused: AtomicBool,
+    running: AtomicBool,
+    idle: Notify,
     wake: Notify,
     watchers: Mutex<BTreeMap<Hash, watch::Sender<HistoryJobInfo>>>,
 }
@@ -291,7 +294,11 @@ where
     }
 
     pub(super) fn start_history_jobs(&self) {
-        if self.light_checkpoint().is_some() || !self.history.initialized.load(Ordering::Acquire) {
+        if self.light_checkpoint().is_some()
+            || self.bootstrap_pending()
+            || self.history.paused.load(Ordering::Acquire)
+            || !self.history.initialized.load(Ordering::Acquire)
+        {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -317,6 +324,31 @@ where
         runtime.spawn(actor.run());
     }
 
+    /// Stop admission and drain a running proof before releasing its dependencies.
+    /// The prover itself is synchronous; only its worker may release running pins.
+    pub(super) async fn pause_history_jobs(&self) -> Result<(), String> {
+        loop {
+            let idle = self.history.idle.notified();
+            let (cancelled, running) = self.with_engine_mut(|engine| {
+                self.history.paused.store(true, Ordering::Release);
+                let running = self.history.running.load(Ordering::Acquire);
+                cancel_bootstrap_jobs(engine, !running).map(|jobs| (jobs, running))
+            })?;
+            for job in cancelled {
+                self.history.publish(&job);
+            }
+            if !running {
+                return Ok(());
+            }
+            idle.await;
+        }
+    }
+
+    pub(super) fn resume_history_jobs(&self) {
+        self.history.paused.store(false, Ordering::Release);
+        self.start_history_jobs();
+    }
+
     pub(super) fn request_history(
         &self,
         start: Hash,
@@ -326,6 +358,9 @@ where
             return Err(QueryError::StateUnavailable);
         }
         let job = self.with_engine_mut(|engine| {
+            if self.history.paused.load(Ordering::Acquire) || self.bootstrap_pending() {
+                return Err(QueryError::HistoryUnavailable);
+            }
             super::rpc_queries::ensure_history_endpoints(engine, start, end)?;
             let (start, end) = engine.history_endpoints(start, end).map_err(query_error)?;
             let range = HistoryStatement {
@@ -416,7 +451,14 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     async fn run(self) {
-        let recovered = recover_jobs(&mut self.engine.lock().expect("engine"));
+        let recovered = {
+            let mut engine = self.engine.lock().expect("engine");
+            if self.state.paused.load(Ordering::Acquire) {
+                cancel_bootstrap_jobs(&mut engine, true)
+            } else {
+                recover_jobs(&mut engine)
+            }
+        };
         match recovered {
             Ok(records) => {
                 for job in records {
@@ -437,6 +479,9 @@ where
 
     fn claim(&self) -> Option<Job> {
         let mut engine = self.engine.lock().expect("engine");
+        if self.state.paused.load(Ordering::Acquire) {
+            return None;
+        }
         // Expiry is enforced on every wake, not only after a restart. Release
         // leases even when no later request would otherwise touch the job.
         let expired = match expire_jobs(&mut engine) {
@@ -452,6 +497,9 @@ where
                 self.state.publish(&job);
             }
             engine = self.engine.lock().expect("engine");
+        }
+        if self.state.paused.load(Ordering::Acquire) {
+            return None;
         }
         if let Err(error) = engine.prune_history_covered() {
             tracing::warn!(%error, "history pruning deferred");
@@ -473,6 +521,9 @@ where
         job.state = 1;
         job.attempts = job.attempts.saturating_add(1);
         let saved = save(&mut engine, &job);
+        if saved.is_ok() {
+            self.state.running.store(true, Ordering::Release);
+        }
         drop(engine);
         match saved {
             Ok(()) => Some(job),
@@ -532,10 +583,14 @@ where
         let prover = Arc::clone(&self.prover);
         let budget = Arc::clone(&self.budget);
         let work = job.clone();
-        let result =
-            tokio::task::spawn_blocking(move || run_job(&engine, prover.as_ref(), &budget, work))
-                .await;
+        let state = Arc::clone(&self.state);
+        let result = tokio::task::spawn_blocking(move || {
+            run_job(&engine, prover.as_ref(), &budget, &state, work)
+        })
+        .await;
         let completed = self.finish(job, result);
+        self.state.running.store(false, Ordering::Release);
+        self.state.idle.notify_waiters();
         self.state.publish(&completed);
         self.announce(&completed).await;
     }
@@ -570,7 +625,10 @@ where
                 job.error = Some(bounded_error(&error.to_string()));
             }
         }
-        if job.state == 3 && now().saturating_sub(job.created) > JOB_LIFETIME_SECS {
+        if job.state == 3
+            && (self.state.paused.load(Ordering::Acquire)
+                || now().saturating_sub(job.created) > JOB_LIFETIME_SECS)
+        {
             job.state = 4;
         } else if job.state == 3 && job.attempts < 3 {
             job.state = 0;
@@ -612,12 +670,14 @@ struct HistoryWorker<'a, DB: Database, P> {
     spec: neutrino_primitives::ChainSpec,
     range: HistoryStatement,
     created: u64,
+    paused: &'a AtomicBool,
 }
 
 fn run_job<DB, P>(
     engine: &Mutex<Engine<DB>>,
     prover: &P,
     budget: &Arc<crate::proving_budget::ProvingBudget>,
+    state: &HistoryRuntime,
     mut job: Job,
 ) -> Result<Job, String>
 where
@@ -632,7 +692,9 @@ where
         budget,
         range: job.range,
         created: job.created,
+        paused: &state.paused,
     };
+    worker.check_pause()?;
     let previous = worker.restore_progress(job.progress)?;
     worker.validate_range()?;
     // Archived requests can reuse a balanced forest. Sequential live prefix
@@ -664,6 +726,14 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display,
     P: ProofSystem + Sync,
 {
+    fn check_pause(&self) -> Result<(), String> {
+        if self.paused.load(Ordering::Acquire) {
+            Err("history job paused for checkpoint bootstrap".into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn verify(&self, proof: HistoryProof) -> Result<VerifiedHistory, String> {
         verify_history_proof(self.prover, &self.spec, proof).map_err(|error| error.to_string())
     }
@@ -751,6 +821,7 @@ where
         let _permit = self
             .budget
             .acquire(crate::proving_budget::ProvingPriority::Background);
+        self.check_pause()?;
         self.prover
             .prove_history_fold(&self.spec, previous, &chunks)
             .map_err(|error| error.to_string())
@@ -762,6 +833,7 @@ where
         mut previous: Option<HistoryProof>,
     ) -> Result<Job, String> {
         loop {
+            self.check_pause()?;
             if now().saturating_sub(job.created) > JOB_LIFETIME_SECS {
                 return Err("history job expired".into());
             }
@@ -835,6 +907,7 @@ where
     P: ProofSystem + Sync,
 {
     fn prove_range(&self, start: u64, end: u64, parallel: bool) -> Result<HistoryProof, String> {
+        self.check_pause()?;
         if now().saturating_sub(self.created) > JOB_LIFETIME_SECS {
             return Err("history job expired".into());
         }
@@ -851,6 +924,7 @@ where
             let _permit = self
                 .budget
                 .acquire(crate::proving_budget::ProvingPriority::Background);
+            self.check_pause()?;
             self.prover
                 .prove_history_merge(&self.spec, &left, &right)
                 .map_err(|error| error.to_string())?
@@ -899,6 +973,25 @@ where
 
 fn bounded_error(message: &str) -> String {
     message.chars().take(1024).collect()
+}
+
+fn cancel_bootstrap_jobs<DB: Database>(
+    engine: &mut Engine<DB>,
+    include_running: bool,
+) -> Result<Vec<Job>, String>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    let mut cancelled = Vec::new();
+    for mut job in jobs(engine)? {
+        if job.state == 0 || (include_running && job.state == 1) {
+            job.state = 4;
+            job.error = Some("history job paused for checkpoint bootstrap".into());
+            save(engine, &job)?;
+            cancelled.push(job);
+        }
+    }
+    Ok(cancelled)
 }
 
 fn expire_jobs<DB: Database>(engine: &mut Engine<DB>) -> Result<Vec<Job>, String>

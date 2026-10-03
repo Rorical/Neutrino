@@ -251,7 +251,7 @@ pub enum SyncCommand {
         /// Number of blocks to fetch.
         count: u64,
     },
-    /// Fetch state trie nodes at the given paths under `state_root`.
+    /// Fetch bounded content-addressed state fragments under `state_root`.
     ///
     /// The FSM emits this with the *root* path; the driver walks the trie
     /// and may issue additional `RequestStateNodes` commands on its own.
@@ -260,8 +260,8 @@ pub enum SyncCommand {
         peer: PeerId,
         /// Target state root.
         state_root: StateRoot,
-        /// Initial set of paths to fetch.
-        paths: Vec<Vec<u8>>,
+        /// Initial node/value hash and byte-offset requests.
+        items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
     },
     /// Fetch a batch of block proofs from the peer.
     RequestBlockProofs {
@@ -357,6 +357,11 @@ impl SyncMachine {
     #[must_use]
     pub const fn progress(&self) -> &LocalProgress {
         &self.progress
+    }
+
+    /// Refresh canonical cursors only after a backend atomically installs a checkpoint.
+    pub const fn refresh_local_progress(&mut self, progress: LocalProgress) {
+        self.progress = progress;
     }
 
     /// Selected sync peer, if any.
@@ -708,9 +713,10 @@ impl SyncMachine {
         vec![SyncCommand::RequestStateNodes {
             peer: sync_peer.peer,
             state_root: target_state_root,
-            // Seed the driver with the empty path so it can request the root
-            // node and walk children from there.
-            paths: vec![Vec::new()],
+            // Seed with the authenticated root hash; verified nodes reveal child hashes.
+            items: vec![neutrino_consensus_types::bootstrap::StateItem::node(
+                target_state_root,
+            )],
         }]
     }
 
@@ -901,7 +907,9 @@ impl SyncMachine {
                 vec![SyncCommand::RequestStateNodes {
                     peer,
                     state_root: target_state_root,
-                    paths: vec![Vec::new()],
+                    items: vec![neutrino_consensus_types::bootstrap::StateItem::node(
+                        target_state_root,
+                    )],
                 }]
             }
             (
@@ -1422,7 +1430,9 @@ mod tests {
             vec![SyncCommand::RequestStateNodes {
                 peer,
                 state_root: [9; 32],
-                paths: vec![Vec::new()],
+                items: vec![neutrino_consensus_types::bootstrap::StateItem::node(
+                    [9; 32]
+                )],
             }]
         );
     }

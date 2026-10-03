@@ -50,6 +50,19 @@ pub(super) enum Step {
     Finality(u64),
 }
 
+/// Invalidate every old request while preserving monotonic connection generations.
+pub(super) fn reset_after_bootstrap(driver: &mut SyncDriver) {
+    let next_connection = driver.full_chunks.next_connection;
+    driver.full_chunks = FullChunkSync {
+        next_connection,
+        ..FullChunkSync::default()
+    };
+    let peers: Vec<_> = driver.connected_peers.iter().copied().collect();
+    for peer in peers {
+        on_connect(driver, peer);
+    }
+}
+
 pub(super) fn on_connect(driver: &mut SyncDriver, peer: PeerId) {
     if let Some(connection) = driver.full_chunks.next_connection.checked_add(1) {
         driver.full_chunks.next_connection = connection;

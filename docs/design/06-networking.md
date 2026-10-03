@@ -28,9 +28,14 @@ Every RPC response is a Borsh `Result<Payload, RpcFailure>`: `Unavailable`,
 `Pruned`, `Storage` or `InvalidRequest` failures reach the requester explicitly. Missing
 bodies are never manufactured, and hash-list requests do not silently omit
 missing entries. Range responses may contain a bounded contiguous prefix; clients
-paginate from its last height. State RPC serves only authenticated nodes and values
-reachable from the requested retained root. Full-root snapshots are bounded by the
-wire size limit; nonempty subtree paths are rejected until streaming is implemented.
+paginate from its last height. State RPC requires an available, hash-checked root
+node (or the canonical empty root) and serves content-addressed objects from the
+retained node/value store. Requests name typed hashes and fragment offsets. The
+provider checks object hashes without traversing the whole tree for each fragment;
+it does not assert that each requested object is reachable from that root. The
+receiver authenticates reachability by starting at the requested root and following
+verified child hashes. A final complete-root check rejects missing, corrupt or
+unreachable entries before installation. Partial bytes and progress survive restart.
 
 Status advertises `finalized_chunk_id: Option<ChunkId>` and its chunk hash separately
 from `recursive_covered_chunks` and `checkpoint_hash`. Chunk 0 is `Some(0)`, genesis
@@ -44,7 +49,12 @@ unavailable uncached ranges queue bounded background work. A fixed 72-byte
 range. It is not itself trusted progress. The gossipsub transport cap includes
 framing and is larger than the strictly decoded payload.
 
-Full/archive sync establishes block and Chunk finality first. Light-client sync
+Full/validator bootstrap authenticates an exact trusted-start/end bridge and a
+genesis prefix with the same endpoint. Its manifest carries header, validators,
+append frontier and eight recent historical openings. An explicitly trusted
+checkpoint already at the endpoint needs no empty proof, but still checks expiry,
+freshness and future slots. Installation resumes sequential sync at that height.
+Archive sync establishes source block and Chunk finality first. Light-client sync
 instead requests an anchored suffix and advances without downloading block history.
 Unavailable or pruned responses try each connected provider at most once for the
 same range and availability event, then wait for a new event. Stale responses never
@@ -73,5 +83,4 @@ with the retained boundaries in `data`; unavailable history endpoints/ranges use
 has been deleted. Full sync remembers an explicit provider pruning floor and
 stops requesting unavailable old data from that provider during that connection.
 
-Prover-market/bounty handling, erasure-coded DA sampling and authenticated state
-snapshot installation for full-node checkpoint jumps remain separate work.
+Prover-market/bounty handling and erasure-coded DA sampling remain separate work.

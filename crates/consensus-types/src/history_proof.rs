@@ -210,6 +210,11 @@ impl Checkpoint {
 /// Vector whose declared length is checked before allocating or decoding elements.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize)]
 pub struct BoundedVec<T, const N: usize>(Vec<T>);
+impl<T, const N: usize> Default for BoundedVec<T, N> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
 impl<T, const N: usize> BoundedVec<T, N> {
     /// Reject values exceeding the protocol bound.
     pub fn new(values: Vec<T>) -> Result<Self, neutrino_primitives::BoundsError> {

@@ -220,13 +220,77 @@ A light client whose anchor predates retained range sources may require an archi
 bridge or a newly and independently trusted checkpoint. An unrelated genesis-prefix
 proof never authorizes silently replacing its established trust anchor.
 
-Full/validator synchronization currently replays source blocks from genesis.
-Importing a recursive checkpoint together with an authenticated execution-state
-snapshot is not implemented. A fresh full/validator node, or a node behind the
-available retained window, needs an archive or another source retaining its missing
-blocks and receipts. If those sources no longer exist, the recursive proof alone
-cannot make full synchronization possible. Light clients can verify recursive
-history without execution state; that path does not bootstrap a full node.
+Full/validator nodes can install a recursive checkpoint with an authenticated
+execution-state snapshot and continue source replay from its endpoint. Bootstrap
+verifies the real genesis prefix, plus an exact bridge from local trust when that
+trust is a different boundary. Both receipts must end at the same checkpoint.
+The node applies the same weak-subjectivity, freshness and future-slot policy as
+the light client; a peer cannot supply or refresh `trusted_at`. An explicitly
+trusted endpoint needs no empty-range proof but still undergoes those time checks.
+
+Bootstrap is enabled by default for full/validator roles. Without an explicit
+checkpoint, the existing finalized local boundary is the trust origin; its original
+block timestamp is used rather than the process restart time. For a new node whose
+genesis trust has expired, configure an independently obtained Borsh-encoded
+`Checkpoint` and the Unix timestamp when it was trusted:
+
+```toml
+[bootstrap]
+enabled = true
+trusted_checkpoint_path = "/path/to/trusted-checkpoint.borsh"
+trusted_at = 1790985600
+max_future_drift_secs = 30
+```
+
+The checkpoint and timestamp must be supplied together. Peer advertisements never
+choose this trust origin. Setting `enabled = false` keeps ordinary source replay;
+archive nodes always use source replay and preserve complete history.
+Validator signing resolves the configured BLS public key in the authenticated
+active set. A genesis position is not authority to sign after rotation; inactive,
+slashed or zero-stake keys wait without signing until an eligible identity appears.
+
+Transport and download budgets are local service policy: at most 65,536 validators,
+eight recent history openings totaling 8 MiB, and a 32 MiB assembled RPC response.
+State requests contain at most 128 content-addressed entries, each returned in
+64 KiB fragments. Reconstruction permits up to 64 MiB per object, two million
+objects and 64 GiB total data. Hashes and the final root authenticate every byte;
+these limits do not certify state validity or impose new consensus limits. A
+provider exceeding the manifest service budget reports unavailable; source replay
+or another suitably capable provider is required.
+
+The snapshot manifest binds the endpoint header, ordered active validators,
+history frontier and exactly the preceding `min(F, 8)` historical records and
+64-level openings to the proven boundary at count `F`. Each record certificate
+and the endpoint proposer signature are checked independently. Historical paths
+and the frontier's right spine restore future indexed reads and appends without
+older records or a full-tree download. Durable consensus state stores the boundary
+directly; an unauthenticated last Chunk statement is never installed as finality.
+
+Execution state downloads use typed content hashes and offsets, with bounded
+fragments and durable progress. Hash checks authorize following children; complete
+root authentication rejects missing, corrupt and unreachable entries. No live
+state, finality or coverage pointer changes before one durable installation batch.
+The batch preserves signing journals and refuses active history leases, a newer
+local head, or unfinalized BFT locks beyond the proposed endpoint. Restart handles
+interrupted downloads and completed installations whose staging cleanup was interrupted.
+Bootstrap pauses History admission and waits for running workers to release their
+leases through completion notifications before installing state. It never deletes
+the dependencies of an active prover. Ordinary signing and imports pause during
+manifest selection and download, and resume after installation or source fallback.
+Providers lease at most four execution-state roots for snapshot service. Five idle
+minutes expire a lease; valid state requests renew it within a 24-hour lifetime.
+These bounded state leases do not retain transaction bodies or change history-job
+dependencies and prevent ordinary pruning from deleting an active download root.
+
+The raw source watermark begins at `F`: earlier transaction bodies are absent.
+Historical consensus records independently retain `[F.saturating_sub(8), F)`.
+A durable bootstrap provenance prevents the raw watermark from regressing while
+new chunks rebuild the recent source window. Providers also retain the eight
+consensus records before their latest recursive endpoint while that endpoint lags
+finality, so its manifest remains reconstructible. These compact records do not
+pin old raw blocks or extend the reference window for current consensus.
+Archive nodes continue genesis source
+replay and cannot advertise a checkpoint-bootstrapped database as complete history.
 
 ## Transport, RPC and light clients
 
@@ -265,13 +329,17 @@ not authenticate an attacker-supplied replacement for the client's entire databa
 
 ## Acceptance and boundaries
 
-Local checks passed on 2026-10-03 after the eight-chunk retention changes: locked
-workspace build and tests (819 passed, six ignored), focused sync-driver regressions
-(29 passed), CUDA-client integration tests (182 passed, eight ignored), and final
-CUDA-enabled library regressions (49 passed). Strict workspace/CUDA Clippy and
-workspace/Guest formatting passed. These counts overlap; the real compressed
-composition gates remained ignored and no GPU proving was run. Local logs are
-retained under `target/verification/` rather than the reboot-cleared temporary directory.
+Local checks passed on 2026-10-03 after durable BFT signing and authenticated
+full/validator bootstrap: locked workspace build and tests (889 passed, six
+ignored), strict workspace Clippy, CUDA-enabled node Clippy across all targets,
+and workspace/Guest formatting checks.
+The tests cover durable-write failure, abrupt RocksDB process exit, interrupted
+snapshot download and installation, saved-branch recovery, validator activation,
+bootstrap/signing races, checkpoint lag and stale provider responses. Native and
+mock-adapter fixtures are separate from real compressed composition acceptance;
+those expensive gates remained ignored and no GPU proving was run. Local logs
+are retained under `target/verification/` rather than the reboot-cleared temporary
+directory.
 
 Native/Guest tests cover boundary and program mutations, empty/overflowed ranges,
 branch mismatch, grouping-invariant endpoint identities, bounded decoding, tree
@@ -292,5 +360,5 @@ invalidate earlier acceptance results.
 
 This provides constant-size history verification state, not lossless archival
 compression. Raw-data availability, live application state, misconduct discovery,
-evidence publication/inclusion, authenticated query proofs, state snapshot
-installation, runtime upgrades and PoS weak subjectivity remain separate concerns.
+evidence publication/inclusion, authenticated query proofs, snapshot data
+availability, runtime upgrades and PoS weak subjectivity remain separate concerns.

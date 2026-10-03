@@ -163,10 +163,11 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
         proof: &ChunkProof,
+        statement: &neutrino_consensus_types::history_proof::ConsensusStatement,
         state: &crate::full_chunk::ConsensusState,
     ) -> Result<neutrino_storage::Batch, StoreError<DB::Error>> {
         let mut batch = neutrino_storage::Batch::new();
-        let chunk = neutrino_prover_chunk::consensus::as_chunk(&state.statement.chunk);
+        let chunk = neutrino_prover_chunk::consensus::as_chunk(&statement.chunk);
         let key = keys::chunk_id_key(chunk.chunk_id);
         batch.put(Column::Chunks, key, borsh::to_vec(&chunk)?);
         batch.put(Column::ChunkProofs, key, borsh::to_vec(proof)?);
@@ -199,7 +200,7 @@ impl<DB: Database> ChainStore<DB> {
             keys::checkpoint_index_key(next.chunk_id),
         );
         if let Some(domain) = self.history_domain()? {
-            for boundary in [state.statement.start, state.statement.end] {
+            for boundary in [statement.start, statement.end] {
                 let checkpoint = Checkpoint { domain, boundary };
                 batch.put(
                     Column::Checkpoints,
@@ -213,20 +214,16 @@ impl<DB: Database> ChainStore<DB> {
                 );
             }
         }
+        batch.put(Column::ChunkStatements, key, borsh::to_vec(statement)?);
         batch.put(
-            Column::ChunkStatements,
-            key,
-            borsh::to_vec(&state.statement)?,
+            Column::ConsensusBoundaries,
+            keys::chunk_id_key(statement.start.next_chunk_id),
+            borsh::to_vec(&statement.start)?,
         );
         batch.put(
             Column::ConsensusBoundaries,
-            keys::chunk_id_key(state.statement.start.next_chunk_id),
-            borsh::to_vec(&state.statement.start)?,
-        );
-        batch.put(
-            Column::ConsensusBoundaries,
-            keys::chunk_id_key(state.statement.end.next_chunk_id),
-            borsh::to_vec(&state.statement.end)?,
+            keys::chunk_id_key(statement.end.next_chunk_id),
+            borsh::to_vec(&statement.end)?,
         );
         let record = neutrino_prover_chunk::history::HistoricalChunk {
             chunk,
@@ -235,7 +232,7 @@ impl<DB: Database> ChainStore<DB> {
             finality: witness.finality_cert.clone(),
         };
         let frontier = self.append_history_batch(&mut batch, &record)?;
-        if frontier != state.frontier || frontier.root() != Some(state.statement.end.history_root) {
+        if frontier != state.frontier || frontier.root() != Some(state.boundary.history_root) {
             return Err(StoreError::Corrupt(
                 "proven history append differs from archive",
             ));

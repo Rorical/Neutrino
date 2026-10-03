@@ -55,6 +55,14 @@ pub trait Database {
     /// implement this trait.
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error>;
 
+    /// Atomically commit a batch and make it durable before returning success.
+    ///
+    /// Persistent backends must synchronize their write-ahead log to stable
+    /// storage. An error has uncertain durability, so callers must not sign or
+    /// publish an artifact authorized by a failed operation. In-memory backends
+    /// provide atomicity for their lifetime; they are not persistent validators.
+    fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error>;
+
     /// Snapshot every `(key, value)` pair currently stored in `column`.
     ///
     /// Ordering is implementation-defined; callers wanting numeric

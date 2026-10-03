@@ -9,6 +9,7 @@
 pub mod bft_loop;
 pub mod block_state;
 pub mod body;
+pub mod bootstrap;
 pub mod clock;
 pub mod engine;
 pub mod error;
@@ -22,6 +23,7 @@ pub mod proposer;
 pub mod prove;
 pub mod retention;
 pub mod signature;
+pub mod signing;
 pub mod slashing;
 pub mod store;
 #[cfg(test)]

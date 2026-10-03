@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{ChainStore, StoreError};
 use crate::{RetentionInfo, RetentionPolicy};
 
-const RETENTION_KEY: &[u8] = b"history_retention";
+pub(super) const RETENTION_KEY: &[u8] = b"history_retention";
 
 #[derive(BorshSerialize, BorshDeserialize)]
 #[allow(
@@ -118,7 +118,17 @@ impl<DB: Database> ChainStore<DB> {
         self.prune_count_columns(&mut batch, info.pruned_before_chunk, &boundaries)?;
         self.prune_history_nodes(&mut batch, info.pruned_before_chunk)?;
         let roots = self.prune_blocks(&mut batch, info)?;
-        self.prune_evidence(&mut batch, spec, info.pruned_before_chunk)?;
+        let finalized_count = self
+            .get_latest_finalized_chunk_id()?
+            .map_or(0, |id| id.saturating_add(1));
+        self.prune_evidence(
+            &mut batch,
+            spec,
+            info.pruned_before_chunk.min(
+                finalized_count
+                    .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS),
+            ),
+        )?;
         batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
         Ok((batch, roots))
     }
@@ -178,6 +188,13 @@ impl<DB: Database> ChainStore<DB> {
         boundaries: &BTreeSet<u64>,
     ) -> Result<(), StoreError<DB::Error>> {
         let pins = self.history_dependencies()?;
+        let record_floor = self.get_latest_finalized_chunk_id()?.map_or(0, |id| {
+            id.saturating_add(1)
+                .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS)
+        });
+        let checkpoint_count = self.get_recursive_covered_chunks()?.unwrap_or(0);
+        let checkpoint_floor = checkpoint_count
+            .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
         for column in [
             Column::Chunks,
             Column::ChunkProofs,
@@ -197,7 +214,10 @@ impl<DB: Database> ChainStore<DB> {
                         || pins
                             .iter()
                             .any(|pin| pin.start <= count && count <= pin.end));
-                if count < floor && !proof_source && !boundary {
+                let recent_record = column == Column::HistoricalChunks
+                    && (count >= record_floor
+                        || (checkpoint_floor <= count && count < checkpoint_count));
+                if count < floor && !proof_source && !boundary && !recent_record {
                     batch.delete(column, key);
                 }
             }
@@ -247,7 +267,10 @@ impl<DB: Database> ChainStore<DB> {
             }
             // Keep paths to each recent record and to the next append location. Old
             // subtrees remain opaque sibling hashes; their internal nodes are dispensable.
-            self.retain_history_paths(root, floor, count, &mut retained)?;
+            let record_floor = floor.min(
+                count.saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS),
+            );
+            self.retain_history_paths(root, record_floor, count, &mut retained)?;
         }
         for (key, _) in self
             .db

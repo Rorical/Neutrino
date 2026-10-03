@@ -2431,7 +2431,7 @@ mod tests {
             (
                 RpcRequest::StateByRoot(rpc::StateByRootRequest {
                     state_root: [6; 32],
-                    paths: vec![],
+                    items: neutrino_consensus_types::bootstrap::StateItems::default(),
                 }),
                 rpc::RpcFailure::Storage("invalid trie node".to_owned()),
             ),

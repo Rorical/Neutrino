@@ -90,6 +90,20 @@ impl<H: Hasher> Trie<H> {
         self.values.len()
     }
 
+    /// Iterate content-addressed nodes without copying the trie.
+    pub fn node_entries(&self) -> impl Iterator<Item = (Hash, &[u8])> {
+        self.nodes
+            .iter()
+            .map(|(hash, bytes)| (*hash, bytes.as_slice()))
+    }
+
+    /// Iterate content-addressed values without copying the trie.
+    pub fn value_entries(&self) -> impl Iterator<Item = (Hash, &[u8])> {
+        self.values
+            .iter()
+            .map(|(hash, bytes)| (*hash, bytes.as_slice()))
+    }
+
     /// Remove entries unreachable from the current root and the supplied roots.
     ///
     /// Every retained node and value is checked before any mutation. Missing or

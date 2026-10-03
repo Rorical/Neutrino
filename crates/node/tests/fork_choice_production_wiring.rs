@@ -1,29 +1,6 @@
-//! the production
-//! `ChainBackend` paths feed fork-choice the two pieces of state
-//! that previously stayed test-only.
-//!
-//! 1. `Engine::finalize_chunk` advances
-//!    `ForkChoice::add_finalized_chunk` so the DAG's `self.finalized`
-//!    anchor tracks the engine's. Before #13, the DAG anchor stuck
-//!    at the chain-spec genesis block hash for the whole live
-//!    session — meaning fork-choice could not gate out a head
-//!    candidate sitting below the finalised line.
-//!
-//! 2. `Engine::observe_finality_vote` feeds `ForkChoice::add_vote`
-//!    for every signer of every accepted vote. Before #13, the
-//!    DAG's vote map stayed empty in production — meaning
-//!    vote-weighted head selection only ever fired in unit tests
-//!    that poked the DAG via `fork_choice_mut_for_test()`.
-//!
-//! The test exercises the single-validator complete proof finalisation
-//! path (which uses a synthesised certificate rather than peer
-//! votes) for assertion #1; assertion #2 is covered by the
-//! engine-side unit test in `bft_loop.rs::observe_finality_vote_feeds_fork_choice`,
-//! which exercises a real `observe_finality_vote` call end-to-end.
-//!
-//! Together these document the two wire-ups #13 lands: chunk
-//! finalisation advances the DAG anchor, and finality-vote
-//! ingestion populates the DAG vote map.
+//! Production finalization advances the fork-choice anchor and records the
+//! local validator's real BFT votes. Even a single-validator chain runs the
+//! durable signing/session path and requires a proof-bound precommit attestation.
 
 use std::sync::Arc;
 
@@ -31,7 +8,7 @@ use neutrino_consensus_engine::{BlockState, Engine, ProposerKey, validator_set_r
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
-    RuntimeParams, StateParams, Validator, ZERO_HASH, fixed_u128_from_integer,
+    RuntimeParams, StateParams, Validator, ZERO_HASH, blake3_256, fixed_u128_from_integer,
 };
 #[path = "support/native_chunk.rs"]
 pub mod native_chunk;
@@ -137,8 +114,7 @@ fn chunk_finalisation_advances_fork_choice_finalized_anchor() {
         .expect("prove_block");
     assert_eq!(proven.state, BlockState::Proven);
 
-    // Finalize chunk 0 via the single-validator complete proof path
-    // (no BFT session open → synthesised certificate).
+    // Finalize chunk 0 through a real BFT session whose local signer meets quorum.
     let finalize_outcome = backend
         .finalize_chunk(0, &proposer)
         .expect("finalize chunk 0");
@@ -181,15 +157,10 @@ fn chunk_finalisation_advances_fork_choice_finalized_anchor() {
     );
 }
 
-/// Sanity check: in the single-validator fallback path, no peer
-/// votes flow through `observe_finality_vote`, so the
-/// `add_vote` half of pending-fix #13 is exercised only by the
-/// unit test in `bft_loop.rs::observe_finality_vote_feeds_fork_choice`.
-/// What we can assert here is that the single-validator
-/// finalisation does NOT spuriously populate the fork-choice
-/// vote map (synthesised certs bypass `observe_finality_vote`).
+/// A single validator meets quorum with its own journaled votes, which feed
+/// fork choice and bind the exact block proof in the mandatory attestation.
 #[test]
-fn single_validator_finalisation_does_not_populate_fork_choice_votes() {
+fn single_validator_finalisation_records_real_bft_votes_and_attestation() {
     let backend = fresh_backend();
     let proposer = proposer();
 
@@ -204,12 +175,40 @@ fn single_validator_finalisation_does_not_populate_fork_choice_votes() {
         .expect("produce")
         .expect("eligible");
     backend.prove_block(&outcome.block_hash).expect("prove");
-    backend.finalize_chunk(0, &proposer).expect("finalize");
+    let block_proof = backend.with_engine_mut_for_test(|engine| {
+        engine
+            .store()
+            .get_block_proof(&outcome.block_hash)
+            .expect("read proven block")
+            .expect("proof present")
+    });
+    let finalized = backend.finalize_chunk(0, &proposer).expect("finalize");
 
     assert_eq!(
         backend.fork_choice_vote_count(),
-        0,
-        "single-validator complete proof finalisation must not populate fork-choice's vote map \
-         (the synthesised cert bypasses observe_finality_vote)",
+        1,
+        "the local validator's real prevote and precommit feed fork choice",
     );
+    let cert = &finalized.finality_cert;
+    assert_eq!(cert.chunk_hash, finalized.chunk_hash);
+    assert_eq!(cert.attestations.len(), 1);
+    let attestation = &cert.attestations[0];
+    assert_eq!(attestation.validator_index, 0);
+    assert_eq!(attestation.vote, cert.precommit_vote().data);
+    assert_eq!(
+        attestation.proof_hashes,
+        vec![blake3_256(
+            &borsh::to_vec(&block_proof).expect("encode block proof")
+        )]
+    );
+    assert!(attestation.unlock_quorum.is_some());
+    let spec = chain_spec();
+    neutrino_prover_chunk::finality::verify_finality(
+        spec.chain_id,
+        &spec.consensus,
+        &spec.initial_validators,
+        &finalized.chunk,
+        cert,
+    )
+    .expect("real signed BFT certificate and mandatory attestation verify");
 }

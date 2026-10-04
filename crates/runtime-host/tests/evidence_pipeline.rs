@@ -498,10 +498,62 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
                 verifier.verify_consensus_chunk(&proof, &expected)
             },
             || {
-                let proof = system.prove_consensus_chunk(&[proof], &next)?;
+                let proof = system.prove_consensus_chunk(std::slice::from_ref(&proof), &next)?;
                 borsh::to_vec(&proof).map_err(|_| ProofError::MalformedProof)
             },
         )
+        .unwrap();
+    // Same chunk with every signature check answered by Fact receipts: the
+    // early worker's path. Receipts are proven first, then the chunk guest
+    // only verifies them recursively. The committed statement must not change.
+    eprintln!("evidence gate: prove the same chunk with fact-covered signature checks");
+    let mut recorder = neutrino_prover_chunk::facts::FactRecorder::default();
+    neutrino_prover_chunk::consensus::validate_consensus_using(&next, &mut recorder).unwrap();
+    let requests: Vec<_> = recorder
+        .finish()
+        .unwrap()
+        .into_iter()
+        .map(|(request, _)| request)
+        .collect();
+    let covered_identity = StageIdentity::new(
+        "chunk-facts",
+        &neutrino_runtime_host::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF,
+        &borsh::to_vec(&(&next, &proof_bytes, requests.len())).unwrap(),
+        &borsh::to_vec(&expected).unwrap(),
+    );
+    let covered_bytes = cache
+        .prove_or_resume(
+            &covered_identity,
+            |bytes| {
+                let proof: Sp1ChunkProof =
+                    borsh::from_slice(bytes).map_err(|_| ProofError::MalformedProof)?;
+                verifier.verify_consensus_chunk(&proof, &expected)
+            },
+            || {
+                let started = std::time::Instant::now();
+                system.preprove_facts(&requests)?;
+                eprintln!(
+                    "evidence gate: {} fact requests proven in {:?}",
+                    requests.len(),
+                    started.elapsed()
+                );
+                let started = std::time::Instant::now();
+                let proof = system.prove_consensus_chunk(std::slice::from_ref(&proof), &next)?;
+                let (covered, total) = system.last_chunk_fact_coverage().unwrap_or((0, 0));
+                eprintln!(
+                    "evidence gate: fact-covered chunk proved in {:?}; coverage {covered}/{total}",
+                    started.elapsed()
+                );
+                if covered != total || total == 0 {
+                    return Err(ProofError::InvalidWitness);
+                }
+                borsh::to_vec(&proof).map_err(|_| ProofError::MalformedProof)
+            },
+        )
+        .unwrap();
+    let covered: Sp1ChunkProof = borsh::from_slice(&covered_bytes).unwrap();
+    verifier
+        .verify_consensus_chunk(&covered, &expected)
         .unwrap();
     // The accepted offence and mandatory deduction survive one further recursive
     // STARK layer. This range starts at the explicitly trusted first boundary.

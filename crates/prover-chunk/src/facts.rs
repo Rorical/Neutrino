@@ -461,6 +461,91 @@ pub fn vote_requests(
     requests
 }
 
+/// Aggregate check for a quorum certificate over `validators`.
+fn quorum_request(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[neutrino_primitives::Validator],
+    quorum: &neutrino_consensus_types::QuorumCertificate,
+) -> FactRequest {
+    let keys = validators
+        .iter()
+        .enumerate()
+        .filter_map(|(index, validator)| {
+            (quorum
+                .aggregate
+                .aggregation_bits
+                .get(u32::try_from(index).ok()?)
+                == Some(true))
+            .then_some(validator.pubkey)
+        })
+        .collect();
+    FactRequest::Aggregate {
+        keys,
+        message: crate::slashing::vote_message(domain, &quorum.data),
+        signature: quorum.aggregate.signature,
+    }
+}
+
+/// Leader proposal signature plus every signature inside its round-change
+/// certificate, so a chunk's proposal checks can be answered from facts.
+pub fn proposal_requests(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[neutrino_primitives::Validator],
+    proposal: &neutrino_consensus_types::BftProposal,
+) -> Vec<FactRequest> {
+    let mut requests = Vec::new();
+    if let Some(validator) = validators.get(proposal.proposer_index as usize) {
+        requests.push(FactRequest::Signature {
+            key: validator.pubkey,
+            message: proposal.signing_message(domain),
+            signature: proposal.signature,
+            possession: false,
+        });
+    }
+    if let Some(certificate) = &proposal.round_change_certificate {
+        requests.extend(round_change_certificate_requests(
+            domain,
+            validators,
+            certificate,
+        ));
+    }
+    requests
+}
+
+/// Round-change report signature and its carried highest quorum, if any.
+pub fn round_change_requests(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[neutrino_primitives::Validator],
+    report: &neutrino_consensus_types::RoundChange,
+) -> Vec<FactRequest> {
+    let mut requests = Vec::new();
+    if let Some(validator) = validators.get(report.validator_index as usize) {
+        requests.push(FactRequest::Signature {
+            key: validator.pubkey,
+            message: report.signing_message(domain),
+            signature: report.signature,
+            possession: false,
+        });
+    }
+    if let Some(quorum) = &report.highest_quorum {
+        requests.push(quorum_request(domain, validators, quorum));
+    }
+    requests
+}
+
+/// Every signature a round-change certificate carries.
+pub fn round_change_certificate_requests(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[neutrino_primitives::Validator],
+    certificate: &neutrino_consensus_types::RoundChangeCertificate,
+) -> Vec<FactRequest> {
+    certificate
+        .reports
+        .iter()
+        .flat_map(|report| round_change_requests(domain, validators, report))
+        .collect()
+}
+
 /// Exact nil signatures available for early cryptographic fact compression.
 pub fn nil_vote_requests(
     domain: neutrino_primitives::ConsensusDomain,

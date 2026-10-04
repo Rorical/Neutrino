@@ -98,6 +98,7 @@ where
                         "invalid BFT leader proposal".into(),
                     ));
                 }
+                self.queue_proposal_facts(&proposal);
                 self.with_live_engine_mut(|engine| {
                     engine
                         .observe_bft_proposal(*proposal, now, self.proof_system.as_ref())
@@ -122,12 +123,16 @@ where
                         .observe_nil_vote(vote, now)
                         .map_err(|error| SyncBackendError::Rejected(error.to_string()))
                 })?,
-            BftMessage::RoundChange(report) => self.with_live_engine_mut(|engine| {
-                engine
-                    .observe_round_change(report, now)
-                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-            })?,
+            BftMessage::RoundChange(report) => {
+                self.queue_round_change_facts(&report);
+                self.with_live_engine_mut(|engine| {
+                    engine
+                        .observe_round_change(report, now)
+                        .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                })?
+            }
             BftMessage::RoundChangeCertificate(certificate) => {
+                self.queue_round_change_certificate_facts(&certificate);
                 self.with_live_engine_mut(|engine| {
                     engine
                         .observe_round_change_certificate(certificate, now)

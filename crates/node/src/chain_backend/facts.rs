@@ -62,6 +62,74 @@ where
         }
     }
 
+    /// Validators that signed material for `chunk_id`: the historical record
+    /// when the chunk is finalized and recent, otherwise the active set.
+    fn fact_validators_for_chunk(
+        &self,
+        chunk_id: u64,
+    ) -> Option<(
+        neutrino_primitives::ConsensusDomain,
+        Vec<neutrino_primitives::Validator>,
+    )> {
+        self.with_engine(|engine| {
+            let next = engine.finalized_next_chunk_id();
+            if chunk_id < next
+                && !neutrino_consensus_types::history::is_recent_history_index(chunk_id, next)
+            {
+                return None;
+            }
+            let validators = engine
+                .store()
+                .historical_chunk(chunk_id)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || engine.active_validator_set().to_vec(),
+                    |record| record.validators,
+                );
+            Some((engine.chain_spec().consensus_domain(), validators))
+        })
+    }
+
+    /// Pre-prove a leader proposal's signature and round-change certificate.
+    pub(super) fn queue_proposal_facts(&self, proposal: &neutrino_consensus_types::BftProposal) {
+        if let Some((domain, validators)) = self.fact_validators_for_chunk(proposal.chunk.chunk_id)
+        {
+            self.queue_facts(&neutrino_prover_chunk::facts::proposal_requests(
+                domain,
+                &validators,
+                proposal,
+            ));
+        }
+    }
+
+    /// Pre-prove a round-change report and its carried quorum.
+    pub(super) fn queue_round_change_facts(&self, report: &neutrino_consensus_types::RoundChange) {
+        if let Some((domain, validators)) = self.fact_validators_for_chunk(report.chunk_id) {
+            self.queue_facts(&neutrino_prover_chunk::facts::round_change_requests(
+                domain,
+                &validators,
+                report,
+            ));
+        }
+    }
+
+    /// Pre-prove every report inside a round-change certificate.
+    pub(super) fn queue_round_change_certificate_facts(
+        &self,
+        certificate: &neutrino_consensus_types::RoundChangeCertificate,
+    ) {
+        if let Some((domain, validators)) = self.fact_validators_for_chunk(certificate.chunk_id) {
+            self.queue_facts(
+                &neutrino_prover_chunk::facts::round_change_certificate_requests(
+                    domain,
+                    &validators,
+                    certificate,
+                ),
+            );
+        }
+    }
+
     pub(super) fn queue_vote_facts(&self, vote: &neutrino_consensus_types::FinalityVote) {
         let requests = self.with_engine(|engine| {
             let next = engine.finalized_next_chunk_id();

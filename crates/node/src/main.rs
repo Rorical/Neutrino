@@ -17,10 +17,24 @@ use neutrino_node::NodeConfig;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     init_tracing();
-    match run().await {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to start tokio runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = runtime.block_on(run());
+    // A CPU proof in flight on the blocking pool can take many minutes.
+    // Operators expect SIGTERM to stop the process promptly; the proof job
+    // is resumable from persisted inputs, so abandon it after a short grace.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "neutrino-node failed");
@@ -70,8 +84,9 @@ fn print_usage() {
     eprintln!("    bootnodes        = [\"<multiaddr>\"]");
     eprintln!("    data_dir         = \"/path/to/data\"");
     eprintln!("    chain_spec_path  = \"/path/to/chain-spec.toml\"");
-    eprintln!("    proposer_ikm_hex = \"<64 hex chars>\"     # validator only");
+    eprintln!("    proposer_ikm_path = \"/path/to/validator.ikm\"  # validator only, mode 0600");
     eprintln!("    proposer_index   = 0                    # validator only");
+    eprintln!("    # or export NEUTRINO_PROPOSER_IKM_HEX=<64 hex chars> (takes precedence)");
     eprintln!("    subscribe_topics = [\"/neutrino/blocks/borsh\", ...]");
     eprintln!();
     eprintln!("    [proving]");
@@ -81,6 +96,17 @@ fn print_usage() {
     eprintln!("    concurrency      = 2");
     eprintln!("    capacity         = 16");
     eprintln!("    # cuda_device    = 0                    # CUDA only");
+    eprintln!();
+    eprintln!("    [rpc]");
+    eprintln!("    listen           = \"127.0.0.1:9933\"");
+    eprintln!("    max_concurrent_requests = 64");
+    eprintln!("    requests_per_second_per_connection = 50");
+    eprintln!("    runtime_call_timeout_ms = 2000");
+    eprintln!();
+    eprintln!("    [execution]                              # WASM fuel/memory caps");
+    eprintln!("    query_fuel       = 50000000");
+    eprintln!();
+    eprintln!("Generate keys, genesis roots and configs with the neutrino-cli binary.");
 }
 
 fn init_tracing() {

@@ -129,9 +129,9 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_with_prover<P: ProgramProver + 'static>(
+async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
     config: NodeConfig,
-    build_prover: impl FnOnce() -> Result<P, Sp1HostError>,
+    build_prover: impl FnOnce() -> Result<P, Sp1HostError> + Send + 'static,
 ) -> Result<(), NodeError> {
     // Every node requires a `chain_spec_path`. Misconfigured deployments
     // must fail loudly instead of silently running an unreachable chain.
@@ -174,10 +174,16 @@ async fn run_with_prover<P: ProgramProver + 'static>(
     }
     let production_config = build_block_producer_config(&config, &chain_spec)?;
     let db = open_node_db(&config)?;
-    let engine = open_or_initialise_engine(db, chain_spec)?;
-    let prover = build_prover().map_err(|error| NodeError::ProofSystem(error.to_string()))?;
-    let proof_system =
-        Sp1ProofSystem::new(prover).map_err(|error| NodeError::ProofSystem(error.to_string()))?;
+    let engine = open_or_initialise_engine(db, chain_spec, &spec_file)?;
+    // SP1's blocking prover clients drive their own runtime while they
+    // initialise, which must not happen on an async worker thread.
+    let proof_system = tokio::task::spawn_blocking(move || {
+        let prover = build_prover()?;
+        Sp1ProofSystem::new(prover)
+    })
+    .await
+    .map_err(|error| NodeError::ProofSystem(format!("prover setup task failed: {error}")))?
+    .map_err(|error| NodeError::ProofSystem(error.to_string()))?;
     info!(backend = ?config.proving.backend, cuda_device = ?config.proving.cuda_device,
         concurrency = config.proving.concurrency, "SP1 proving backend initialized");
     info!(
@@ -242,8 +248,9 @@ async fn run_with_prover<P: ProgramProver + 'static>(
         // runtime master cdylib is the only runtime today; on-chain
         // upgrades will install a different `WasmExecutor` per
         // activation epoch.
-        let block_executor = WasmExecutor::default_runtime()
-            .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
+        let block_executor =
+            WasmExecutor::default_runtime_with_limits(config.execution.to_wasm_limits())
+                .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
         concrete_backend.set_block_executor(block_executor);
         if config.role == NodeRole::Archive {
             concrete_backend
@@ -444,6 +451,7 @@ fn open_node_db(config: &NodeConfig) -> Result<NodeDb, NodeError> {
 fn open_or_initialise_engine(
     db: NodeDb,
     chain_spec: ChainSpec,
+    spec_file: &ChainSpecFile,
 ) -> Result<Engine<NodeDb>, NodeError> {
     let already_initialised = db
         .get(
@@ -462,9 +470,19 @@ fn open_or_initialise_engine(
         );
         Ok(engine)
     } else {
-        let engine =
+        let mut engine =
             Engine::genesis(chain_spec, db).map_err(|err| NodeError::Engine(err.to_string()))?;
-        info!("engine initialised at genesis");
+        // Every node derives the same allocation from the same spec file;
+        // the chain spec hash already binds its root.
+        let genesis = crate::genesis::build_genesis_state(spec_file)?;
+        engine
+            .install_genesis_state(genesis.trie)
+            .map_err(|err| NodeError::Engine(err.to_string()))?;
+        info!(
+            accounts = genesis.accounts,
+            staked_validators = genesis.staked_validators,
+            "engine initialised at genesis"
+        );
         Ok(engine)
     }
 }
@@ -476,13 +494,27 @@ fn build_block_producer_config(
     if config.role != NodeRole::Validator {
         return Ok(None);
     }
-    let Some(ikm_hex) = &config.proposer_ikm_hex else {
-        warn!("validator role configured without proposer_ikm_hex; block production disabled");
+    let Some((ikm_hex, source)) = config
+        .resolve_proposer_ikm_hex()
+        .map_err(|err| NodeError::ProposerKey(err.to_string()))?
+    else {
+        warn!(
+            "validator role configured without a proposer key ({} / proposer_ikm_path); \
+             block production disabled",
+            crate::config::PROPOSER_IKM_ENV
+        );
         return Ok(None);
     };
+    match source {
+        crate::config::ProposerIkmSource::Inline => warn!(
+            "proposer key read inline from the config file; prefer {} or proposer_ikm_path",
+            crate::config::PROPOSER_IKM_ENV
+        ),
+        other => info!(source = ?other, "proposer key loaded"),
+    }
 
     let proposer_index = config.proposer_index.unwrap_or(0);
-    let ikm = decode_hex_exact::<32>(ikm_hex, "proposer_ikm_hex")?;
+    let ikm = decode_hex_exact::<32>(&ikm_hex, "proposer key")?;
     let proposer = ProposerKey::from_ikm(&ikm, proposer_index)
         .map_err(|err| NodeError::ProposerKey(err.to_string()))?;
 

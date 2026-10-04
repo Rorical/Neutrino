@@ -57,6 +57,23 @@ The development protocol has one current format without version numbers.
 Upgrades are incompatible; deprecated formats and migration paths are not
 maintained.
 
+## Bringing up a network
+
+```text
+neutrino-cli keygen --out keys --name v0          # BLS proposer IKM + Ed25519 account key (mode 0600)
+# paste the printed [[validators]] / [[accounts]] entries into chain-spec.toml
+neutrino-cli genesis --spec chain-spec.toml --write   # derive and pin genesis_state_root_hex
+neutrino-cli node-config --spec chain-spec.toml --out config.toml \
+    --data-dir data --ikm-path keys/v0.ikm --listen /ip4/0.0.0.0/tcp/30303 --rpc 127.0.0.1:9933
+neutrino-node --config config.toml
+```
+
+Every node derives the genesis runtime state from the chain-spec allocation, so only
+the spec file is distributed. The validator key is read from `NEUTRINO_PROPOSER_IKM_HEX`
+or an owner-only key file, never from the config. The RPC server caps concurrent
+requests, per-connection request rate, batch size and `runtime_call` wall time, and
+WASM queries run under fuel and memory budgets (`[rpc]` and `[execution]` in the config).
+
 ## Design Documents
 
 | Document | Topic |

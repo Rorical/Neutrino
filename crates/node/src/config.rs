@@ -2,6 +2,12 @@
 
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Environment variable that supplies the validator's BLS IKM as hex.
+/// Takes precedence over `proposer_ikm_path` and `proposer_ikm_hex`.
+pub const PROPOSER_IKM_ENV: &str = "NEUTRINO_PROPOSER_IKM_HEX";
 
 /// Self-declared role for the node.
 ///
@@ -78,10 +84,18 @@ pub struct NodeConfig {
     /// test containers).
     #[serde(default)]
     pub data_dir: Option<std::path::PathBuf>,
-    /// Optional hex-encoded BLS IKM (32 bytes) used to derive the local
-    /// proposer key for validator block production.
+    /// Inline hex-encoded BLS IKM (32 bytes). Convenient for tests only:
+    /// the runner warns when a validator key is read from the config
+    /// file itself. Prefer [`PROPOSER_IKM_ENV`] or `proposer_ikm_path`.
     #[serde(default)]
     pub proposer_ikm_hex: Option<String>,
+    /// File holding the hex-encoded BLS IKM. On Unix the file must not be
+    /// readable by group or others; the runner refuses looser modes.
+    #[serde(default)]
+    pub proposer_ikm_path: Option<PathBuf>,
+    /// Fuel and memory budgets for WASM queries and admission checks.
+    #[serde(default)]
+    pub execution: ExecutionLimitsConfig,
     /// Initial position hint; signing resolves the public key in the authenticated active set.
     #[serde(default)]
     pub proposer_index: Option<u32>,
@@ -144,6 +158,149 @@ impl Default for BootstrapConfig {
     }
 }
 
+/// Where the validator IKM was read from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposerIkmSource {
+    /// [`PROPOSER_IKM_ENV`].
+    Environment,
+    /// `proposer_ikm_path`.
+    File,
+    /// `proposer_ikm_hex` inline in the config file.
+    Inline,
+}
+
+/// Failure to obtain the validator IKM from the configured sources.
+#[derive(Debug, thiserror::Error)]
+pub enum ProposerIkmError {
+    /// The key file could not be read.
+    #[error("failed to read proposer_ikm_path `{path}`: {source}")]
+    Read {
+        /// Configured path.
+        path: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The key file is readable by group or others.
+    #[error("proposer_ikm_path `{path}` has mode {mode:o}; it must not be group or world readable")]
+    Permissions {
+        /// Configured path.
+        path: String,
+        /// Observed permission bits.
+        mode: u32,
+    },
+    /// The environment variable is set but not valid UTF-8.
+    #[error("{PROPOSER_IKM_ENV} is not valid UTF-8")]
+    Environment,
+}
+
+impl NodeConfig {
+    /// Resolve the validator IKM hex: environment, then key file, then inline.
+    ///
+    /// Returns `Ok(None)` when no source is configured.
+    ///
+    /// # Errors
+    /// Returns [`ProposerIkmError`] when a configured source is unreadable
+    /// or the key file is too permissive.
+    pub fn resolve_proposer_ikm_hex(
+        &self,
+    ) -> Result<Option<(String, ProposerIkmSource)>, ProposerIkmError> {
+        match std::env::var(PROPOSER_IKM_ENV) {
+            Ok(value) if !value.trim().is_empty() => {
+                return Ok(Some((
+                    value.trim().to_owned(),
+                    ProposerIkmSource::Environment,
+                )));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => return Err(ProposerIkmError::Environment),
+            _ => {}
+        }
+        if let Some(path) = &self.proposer_ikm_path {
+            let hex = read_secret_file(path)?;
+            return Ok(Some((hex, ProposerIkmSource::File)));
+        }
+        Ok(self
+            .proposer_ikm_hex
+            .as_ref()
+            .map(|hex| (hex.trim().to_owned(), ProposerIkmSource::Inline)))
+    }
+}
+
+/// Read a single-line hex secret, refusing files other users can read.
+fn read_secret_file(path: &Path) -> Result<String, ProposerIkmError> {
+    let display = path.display().to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|source| ProposerIkmError::Read {
+                path: display.clone(),
+                source,
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(ProposerIkmError::Permissions {
+                path: display,
+                mode,
+            });
+        }
+    }
+    let raw = std::fs::read_to_string(path).map_err(|source| ProposerIkmError::Read {
+        path: display,
+        source,
+    })?;
+    Ok(raw.trim().to_owned())
+}
+
+/// Fuel and linear-memory budgets for untrusted WASM entrypoints.
+///
+/// Mirrors [`neutrino_runtime_host::wasm::WasmLimits`]; see there for the
+/// semantics. Block execution keeps unlimited fuel because the header gas
+/// limit already bounds it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecutionLimitsConfig {
+    /// Fuel for one RPC `runtime_call` query.
+    pub query_fuel: u64,
+    /// Memory cap in bytes for one RPC query.
+    pub query_memory_bytes: usize,
+    /// Fuel for one mempool admission check.
+    pub validate_tx_fuel: u64,
+    /// Memory cap in bytes for one admission check.
+    pub validate_tx_memory_bytes: usize,
+    /// Memory cap in bytes for one block dry run.
+    pub block_memory_bytes: usize,
+}
+
+impl Default for ExecutionLimitsConfig {
+    fn default() -> Self {
+        let limits = neutrino_runtime_host::wasm::WasmLimits::default();
+        Self {
+            query_fuel: limits.query_fuel,
+            query_memory_bytes: limits.query_memory_bytes,
+            validate_tx_fuel: limits.validate_tx_fuel,
+            validate_tx_memory_bytes: limits.validate_tx_memory_bytes,
+            block_memory_bytes: limits.block_memory_bytes,
+        }
+    }
+}
+
+impl ExecutionLimitsConfig {
+    /// Convert into the runtime-host limit set.
+    #[must_use]
+    pub const fn to_wasm_limits(self) -> neutrino_runtime_host::wasm::WasmLimits {
+        neutrino_runtime_host::wasm::WasmLimits {
+            query_fuel: self.query_fuel,
+            query_memory_bytes: self.query_memory_bytes,
+            validate_tx_fuel: self.validate_tx_fuel,
+            validate_tx_memory_bytes: self.validate_tx_memory_bytes,
+            block_memory_bytes: self.block_memory_bytes,
+        }
+    }
+}
+
 /// TOML-deserialisable mirror of [`neutrino_rpc::RpcConfig`].
 #[derive(Clone, Debug, Deserialize)]
 pub struct RpcConfigToml {
@@ -161,6 +318,20 @@ pub struct RpcConfigToml {
     /// 15 MiB.
     #[serde(default = "default_max_response_body_size")]
     pub max_response_body_size: u32,
+    /// Requests executing at once across all connections. Defaults to 64.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: u32,
+    /// Sustained per-connection request rate; burst is twice this.
+    /// Defaults to 50.
+    #[serde(default = "default_requests_per_second")]
+    pub requests_per_second_per_connection: u32,
+    /// Maximum entries per JSON-RPC batch. Defaults to 16.
+    #[serde(default = "default_max_batch_requests")]
+    pub max_batch_requests: u32,
+    /// Wall-clock budget for one `runtime_call`, in milliseconds.
+    /// Defaults to 2000.
+    #[serde(default = "default_runtime_call_timeout_ms")]
+    pub runtime_call_timeout_ms: u64,
 }
 
 const fn default_max_connections() -> u32 {
@@ -171,6 +342,18 @@ const fn default_max_request_body_size() -> u32 {
 }
 const fn default_max_response_body_size() -> u32 {
     15 * 1024 * 1024
+}
+const fn default_max_concurrent_requests() -> u32 {
+    64
+}
+const fn default_requests_per_second() -> u32 {
+    50
+}
+const fn default_max_batch_requests() -> u32 {
+    16
+}
+const fn default_runtime_call_timeout_ms() -> u64 {
+    2000
 }
 
 impl RpcConfigToml {
@@ -183,6 +366,10 @@ impl RpcConfigToml {
             max_connections: self.max_connections,
             max_request_body_size: self.max_request_body_size,
             max_response_body_size: self.max_response_body_size,
+            max_concurrent_requests: self.max_concurrent_requests,
+            requests_per_second_per_connection: self.requests_per_second_per_connection,
+            max_batch_requests: self.max_batch_requests,
+            runtime_call_timeout: Duration::from_millis(self.runtime_call_timeout_ms),
         })
     }
 }
@@ -246,6 +433,85 @@ max_connections = 64
         let runtime_cfg = rpc.to_runtime_config().expect("listen parses");
         assert_eq!(runtime_cfg.listen.port(), 9933);
         assert_eq!(runtime_cfg.max_connections, 64);
+    }
+
+    #[test]
+    fn rpc_limits_default_and_parse() {
+        let cfg: NodeConfig = toml::from_str(
+            r#"
+chain_id = 1
+[rpc]
+listen = "127.0.0.1:9933"
+max_concurrent_requests = 8
+runtime_call_timeout_ms = 250
+[execution]
+query_fuel = 1000000
+"#,
+        )
+        .unwrap();
+        let rpc = cfg.rpc.unwrap().to_runtime_config().unwrap();
+        assert_eq!(rpc.max_concurrent_requests, 8);
+        assert_eq!(rpc.requests_per_second_per_connection, 50);
+        assert_eq!(rpc.max_batch_requests, 16);
+        assert_eq!(rpc.runtime_call_timeout, Duration::from_millis(250));
+        let limits = cfg.execution.to_wasm_limits();
+        assert_eq!(limits.query_fuel, 1_000_000);
+        assert_eq!(
+            limits.validate_tx_fuel,
+            neutrino_runtime_host::wasm::WasmLimits::default().validate_tx_fuel
+        );
+    }
+
+    #[test]
+    fn proposer_ikm_prefers_file_over_inline_and_checks_permissions() {
+        let dir = std::env::temp_dir().join(format!("neutrino-ikm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("validator.ikm");
+        std::fs::write(&path, "  aa".repeat(16) + "\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let cfg = NodeConfig {
+                chain_id: 1,
+                proposer_ikm_path: Some(path.clone()),
+                ..NodeConfig::default()
+            };
+            assert!(matches!(
+                cfg.resolve_proposer_ikm_hex(),
+                Err(ProposerIkmError::Permissions { .. })
+            ));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
+        let cfg = NodeConfig {
+            chain_id: 1,
+            proposer_ikm_path: Some(path),
+            proposer_ikm_hex: Some("cd".repeat(32)),
+            ..NodeConfig::default()
+        };
+        let (hex, source) = cfg.resolve_proposer_ikm_hex().unwrap().unwrap();
+        assert_eq!(source, ProposerIkmSource::File);
+        assert_eq!(hex, "ab".repeat(32));
+        let inline = NodeConfig {
+            chain_id: 1,
+            proposer_ikm_hex: Some("cd".repeat(32)),
+            ..NodeConfig::default()
+        };
+        assert_eq!(
+            inline.resolve_proposer_ikm_hex().unwrap().unwrap().1,
+            ProposerIkmSource::Inline
+        );
+        assert!(
+            NodeConfig {
+                chain_id: 1,
+                ..NodeConfig::default()
+            }
+            .resolve_proposer_ikm_hex()
+            .unwrap()
+            .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

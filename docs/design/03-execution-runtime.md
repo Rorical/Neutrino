@@ -22,6 +22,12 @@ longer collide with. Pending sanctions hold withdrawal collateral. Each block
 executes the mandatory FIFO prefix before ordinary transactions, reserving gas.
 Deductions are internal operations, not unsigned user transaction variants.
 
+Genesis runtime state is derived by every node from the chain-spec file: each
+`[[accounts]]` entry seeds a balance and each validator with non-zero withdrawal
+credentials seeds a runtime stake record and validator-set entry. The derived root is
+the spec's `genesis_state_root`, so the chain-spec hash binds the allocation; a declared
+`genesis_state_root_hex` must match it. `neutrino-cli genesis` prints the root.
+
 `StfInput` binds execution context, transactions and incoming evidence anchor.
 `StfPublicOutput` commits state roots, transaction/receipt commitments, gas,
 validator runtime state, transaction count and accountability effects. The block

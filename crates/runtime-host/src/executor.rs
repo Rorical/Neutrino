@@ -63,6 +63,18 @@ impl WasmExecutor {
         Ok(Self::new(WasmRuntime::default_runtime()?))
     }
 
+    /// Build with the embedded default-runtime master cdylib and explicit
+    /// per-call fuel and memory budgets.
+    ///
+    /// # Errors
+    /// Surfaces [`WasmError`] if wasmtime fails to compile the embedded
+    /// module or `limits` are invalid.
+    pub fn default_runtime_with_limits(limits: crate::wasm::WasmLimits) -> Result<Self, WasmError> {
+        Ok(Self::new(
+            WasmRuntime::default_runtime()?.with_limits(limits)?,
+        ))
+    }
+
     /// Borrow the underlying [`WasmRuntime`] (mostly for tests).
     #[must_use]
     pub const fn wasm(&self) -> &WasmRuntime {

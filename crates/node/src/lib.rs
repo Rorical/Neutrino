@@ -17,13 +17,18 @@ pub mod chain_backend;
 pub mod chain_spec;
 pub mod config;
 pub mod db;
+pub mod genesis;
 pub(crate) mod producer;
 pub mod runner;
 
 pub use chain_backend::ChainBackend;
-pub use chain_spec::{ChainSpecError, ChainSpecFile, ValidatorEntry};
-pub use config::{NodeConfig, NodeRole};
+pub use chain_spec::{AccountEntry, ChainSpecError, ChainSpecFile, ValidatorEntry};
+pub use config::{
+    ExecutionLimitsConfig, NodeConfig, NodeRole, PROPOSER_IKM_ENV, ProposerIkmError,
+    ProposerIkmSource,
+};
 pub use db::{NodeDb, NodeDbError};
+pub use genesis::{GenesisState, build_genesis_state};
 pub use runner::{NodeError, run};
 
 mod proof_queue;

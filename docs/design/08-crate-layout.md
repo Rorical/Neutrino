@@ -16,7 +16,8 @@
 | `prover-chunk` | Shared consensus, evidence statements and exact signed-proof rejection |
 | `prover-checkpoint` | no_std compact-boundary and Fold/Merge validation |
 | `light-client` | Explicit anchor, extension and freshness policy with durable snapshots |
-| `network`, `sync`, `mempool`, `rpc`, `node`, `cli` | Transport, full sync, admission, query and node/operator interfaces |
+| `network`, `sync`, `mempool`, `rpc`, `node` | Transport, full sync, admission, rate-limited query API and the node binary |
+| `cli` | Operator tooling: `keygen`, `genesis` (derives and pins the genesis state root) and `node-config` |
 
 Guest packages are outside the root workspace. `runtime-host/build.rs` builds
 five SP1 ELFs with the succinct toolchain and the master WASM with the pinned

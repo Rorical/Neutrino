@@ -76,6 +76,15 @@ pub struct ValidatorEntry {
     pub effective_stake: u64,
 }
 
+/// One funded account in the genesis allocation.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AccountEntry {
+    /// Hex-encoded 32-byte runtime address (the Ed25519 public key).
+    pub address_hex: String,
+    /// Spendable balance at genesis, in the runtime's base unit.
+    pub balance: u128,
+}
+
 /// TOML-deserializable chain spec file.
 ///
 /// Fields not exposed here fall back to canonical [`ConsensusParams`],
@@ -93,8 +102,11 @@ pub struct ChainSpecFile {
     /// Optional hex-encoded genesis seed (32 bytes). Defaults to all-zero.
     #[serde(default)]
     pub genesis_seed_hex: Option<String>,
-    /// Optional hex-encoded genesis state root (32 bytes). Defaults to
-    /// all-zero.
+    /// Optional hex-encoded genesis state root (32 bytes). The root is
+    /// always derived from `accounts` and the validators' runtime records
+    /// (see [`crate::genesis::build_genesis_state`]); when this field is
+    /// present it must equal the derived value, which lets operators pin
+    /// the allocation they reviewed. `neutrino-cli genesis` prints it.
     #[serde(default)]
     pub genesis_state_root_hex: Option<String>,
     /// Optional hex-encoded genesis block hash (32 bytes). Defaults to
@@ -152,6 +164,9 @@ pub struct ChainSpecFile {
     pub metadata: Option<String>,
     /// Initial validator set (must be non-empty).
     pub validators: Vec<ValidatorEntry>,
+    /// Genesis account balances. Defaults to none.
+    #[serde(default)]
+    pub accounts: Vec<AccountEntry>,
 }
 
 impl ChainSpecFile {
@@ -201,10 +216,18 @@ impl ChainSpecFile {
 
         let genesis_seed: Hash =
             decode_hash_or_zero(self.genesis_seed_hex.as_deref(), "genesis_seed_hex")?;
-        let genesis_state_root: Hash = decode_hash_or_zero(
-            self.genesis_state_root_hex.as_deref(),
-            "genesis_state_root_hex",
-        )?;
+        let genesis_state_root = crate::genesis::build_genesis_state(self)?.root;
+        if let Some(declared) = self.genesis_state_root_hex.as_deref() {
+            let declared = decode_hex_exact::<32>(declared, "genesis_state_root_hex")?;
+            if declared != genesis_state_root {
+                return Err(ChainSpecError::Validation(format!(
+                    "genesis_state_root_hex {} does not match the root derived from the \
+                     genesis allocation {}",
+                    hex::encode(declared),
+                    hex::encode(genesis_state_root)
+                )));
+            }
+        }
         let genesis_block_hash: Hash = decode_hash_or_zero(
             self.genesis_block_hash_hex.as_deref(),
             "genesis_block_hash_hex",

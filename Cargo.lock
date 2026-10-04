@@ -4132,6 +4132,16 @@ dependencies = [
 [[package]]
 name = "neutrino-cli"
 version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hex",
+ "neutrino-consensus-engine",
+ "neutrino-crypto",
+ "neutrino-node",
+ "neutrino-runtime-host",
+ "rand_core 0.10.1",
+ "toml",
+]
 
 [[package]]
 name = "neutrino-codec"
@@ -4286,6 +4296,7 @@ dependencies = [
  "async-trait",
  "borsh",
  "ed25519-dalek",
+ "hex",
  "neutrino-consensus-engine",
  "neutrino-consensus-fork-choice",
  "neutrino-consensus-types",

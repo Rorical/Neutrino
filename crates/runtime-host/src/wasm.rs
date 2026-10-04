@@ -31,7 +31,10 @@ use neutrino_runtime_abi::{
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Poseidon2Hasher, Trie};
-use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{
+    Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    TypedFunc,
+};
 
 use crate::{DryRun, Sp1HostError};
 
@@ -52,12 +55,17 @@ pub enum WasmError {
     /// runtime ABI skew.
     #[error("invalid TxValidity from runtime: {0:?}")]
     InvalidTxValidity(TxValidityDecodeError),
+    /// The call exhausted its fuel or memory budget from [`WasmLimits`].
+    #[error("wasm resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }
 
 impl From<WasmError> for Sp1HostError {
     fn from(err: WasmError) -> Self {
         match err {
-            WasmError::Wasmtime(msg) | WasmError::Codec(msg) => Self::Codec(msg),
+            WasmError::Wasmtime(msg) | WasmError::Codec(msg) | WasmError::ResourceLimit(msg) => {
+                Self::Codec(msg)
+            }
             WasmError::InvalidTxValidity(decode_err) => Self::Codec(format!("{decode_err:?}")),
         }
     }
@@ -65,6 +73,76 @@ impl From<WasmError> for Sp1HostError {
 
 fn wt_err<E: std::fmt::Display>(err: E) -> WasmError {
     WasmError::Wasmtime(err.to_string())
+}
+
+/// Classify a trap raised while running a guest entrypoint.
+fn trap_err(err: wasmtime::Error) -> WasmError {
+    match err.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => WasmError::ResourceLimit("fuel exhausted".to_owned()),
+        Some(Trap::MemoryOutOfBounds | Trap::UnreachableCodeReached) => {
+            WasmError::ResourceLimit(format!("guest trapped: {err}"))
+        }
+        _ => wt_err(err),
+    }
+}
+
+/// Fuel and linear-memory budgets applied to every guest call.
+///
+/// Fuel counts executed wasm instructions, so the bound is deterministic
+/// and independent of host speed. Block execution is already bounded by
+/// the header gas limit and keeps unlimited fuel; queries and admission
+/// checks run on behalf of untrusted callers and get the configured caps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WasmLimits {
+    /// Fuel budget for one `query` call.
+    pub query_fuel: u64,
+    /// Linear-memory cap in bytes for one `query` call.
+    pub query_memory_bytes: usize,
+    /// Fuel budget for one `validate_tx` call.
+    pub validate_tx_fuel: u64,
+    /// Linear-memory cap in bytes for one `validate_tx` call.
+    pub validate_tx_memory_bytes: usize,
+    /// Linear-memory cap in bytes for one `apply_block` dry run.
+    pub block_memory_bytes: usize,
+}
+
+impl Default for WasmLimits {
+    fn default() -> Self {
+        Self {
+            query_fuel: 50_000_000,
+            query_memory_bytes: 64 * 1024 * 1024,
+            validate_tx_fuel: 20_000_000,
+            validate_tx_memory_bytes: 64 * 1024 * 1024,
+            block_memory_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+impl WasmLimits {
+    /// Reject budgets that would make every call fail.
+    ///
+    /// # Errors
+    /// Returns a static description of the offending field.
+    pub const fn validate(self) -> Result<(), &'static str> {
+        if self.query_fuel == 0 || self.validate_tx_fuel == 0 {
+            return Err("wasm fuel budgets must be positive");
+        }
+        if self.query_memory_bytes < 1024 * 1024
+            || self.validate_tx_memory_bytes < 1024 * 1024
+            || self.block_memory_bytes < 1024 * 1024
+        {
+            return Err("wasm memory caps must be at least 1 MiB");
+        }
+        Ok(())
+    }
+}
+
+fn store_limits(memory_bytes: usize) -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(memory_bytes)
+        .memories(1)
+        .tables(1)
+        .build()
 }
 
 fn codec_err<E: std::fmt::Display>(err: E) -> WasmError {
@@ -77,6 +155,7 @@ fn codec_err<E: std::fmt::Display>(err: E) -> WasmError {
 pub struct WasmRuntime {
     engine: Engine,
     module: Module,
+    limits: WasmLimits,
 }
 
 impl WasmRuntime {
@@ -88,9 +167,42 @@ impl WasmRuntime {
     /// Returns [`WasmError::Wasmtime`] if wasmtime cannot compile the
     /// module.
     pub fn new(wasm: &[u8]) -> Result<Self, WasmError> {
-        let engine = Engine::default();
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).map_err(wt_err)?;
         let module = Module::new(&engine, wasm).map_err(wt_err)?;
-        Ok(Self { engine, module })
+        Ok(Self {
+            engine,
+            module,
+            limits: WasmLimits::default(),
+        })
+    }
+
+    /// Replace the per-call fuel and memory budgets.
+    ///
+    /// # Errors
+    /// Returns [`WasmError::Codec`] when `limits` fails
+    /// [`WasmLimits::validate`].
+    pub fn with_limits(mut self, limits: WasmLimits) -> Result<Self, WasmError> {
+        limits
+            .validate()
+            .map_err(|reason| WasmError::Codec(reason.to_owned()))?;
+        self.limits = limits;
+        Ok(self)
+    }
+
+    /// Budgets applied to every call.
+    #[must_use]
+    pub const fn limits(&self) -> WasmLimits {
+        self.limits
+    }
+
+    /// Create a store whose guest memory and fuel are capped.
+    fn store_with(&self, host: HostState, fuel: u64) -> Result<Store<Mutex<HostState>>, WasmError> {
+        let mut store = Store::new(&self.engine, Mutex::new(host));
+        store.limiter(|data| &mut data.get_mut().expect("HostState mutex").limits);
+        store.set_fuel(fuel).map_err(wt_err)?;
+        Ok(store)
     }
 
     /// Compile the embedded default-runtime master.
@@ -133,8 +245,9 @@ impl WasmRuntime {
             pending_read_value: None,
             read_only: false,
             write_attempted: false,
+            limits: store_limits(self.limits.block_memory_bytes),
         };
-        let mut store = Store::new(&self.engine, Mutex::new(host));
+        let mut store = self.store_with(host, u64::MAX)?;
 
         let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
         register_host_imports(&mut linker)?;
@@ -155,7 +268,7 @@ impl WasmRuntime {
             .map_err(wt_err)?;
         let input_ptr = allocate
             .call(&mut store, input_bytes.len() as u32)
-            .map_err(wt_err)?;
+            .map_err(trap_err)?;
         memory
             .write(&mut store, input_ptr as usize, &input_bytes)
             .map_err(wt_err)?;
@@ -165,7 +278,7 @@ impl WasmRuntime {
             .map_err(wt_err)?;
         let packed = apply_block
             .call(&mut store, (input_ptr, input_bytes.len() as u32))
-            .map_err(wt_err)?;
+            .map_err(trap_err)?;
         let output_ptr = (packed >> 32) as u32;
         let output_len = (packed & 0xFFFF_FFFF) as u32;
 
@@ -224,8 +337,9 @@ impl WasmRuntime {
             pending_read_value: None,
             read_only: true,
             write_attempted: false,
+            limits: store_limits(self.limits.query_memory_bytes),
         };
-        let mut store = Store::new(&self.engine, Mutex::new(host));
+        let mut store = self.store_with(host, self.limits.query_fuel)?;
 
         let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
         register_host_imports(&mut linker)?;
@@ -246,7 +360,7 @@ impl WasmRuntime {
             .map_err(wt_err)?;
         let req_ptr = allocate
             .call(&mut store, req_bytes.len() as u32)
-            .map_err(wt_err)?;
+            .map_err(trap_err)?;
         memory
             .write(&mut store, req_ptr as usize, &req_bytes)
             .map_err(wt_err)?;
@@ -256,7 +370,7 @@ impl WasmRuntime {
             .map_err(wt_err)?;
         let packed = query_fn
             .call(&mut store, (req_ptr, req_bytes.len() as u32))
-            .map_err(wt_err)?;
+            .map_err(trap_err)?;
         let resp_ptr = (packed >> 32) as u32;
         let resp_len = (packed & 0xFFFF_FFFF) as u32;
 
@@ -321,8 +435,9 @@ impl WasmRuntime {
             pending_read_value: None,
             read_only: true,
             write_attempted: false,
+            limits: store_limits(self.limits.validate_tx_memory_bytes),
         };
-        let mut store = Store::new(&self.engine, Mutex::new(host));
+        let mut store = self.store_with(host, self.limits.validate_tx_fuel)?;
 
         let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
         register_host_imports(&mut linker)?;
@@ -356,7 +471,7 @@ impl WasmRuntime {
             .map_err(wt_err)?;
         let in_ptr = allocate
             .call(&mut store, input_bytes.len() as u32)
-            .map_err(wt_err)?;
+            .map_err(trap_err)?;
         memory
             .write(&mut store, in_ptr as usize, &input_bytes)
             .map_err(wt_err)?;
@@ -366,7 +481,7 @@ impl WasmRuntime {
             .map_err(wt_err)?;
         let packed = validate_fn
             .call(&mut store, (in_ptr, input_bytes.len() as u32))
-            .map_err(wt_err)?;
+            .map_err(trap_err)?;
         let out_ptr = (packed >> 32) as u32;
         let out_len = (packed & 0xFFFF_FFFF) as u32;
 
@@ -427,6 +542,8 @@ struct HostState {
     /// [`neutrino_runtime_abi::QueryStatus::PermissionDenied`] for the
     /// runtime's response when this flag is set.
     write_attempted: bool,
+    /// Linear-memory cap enforced by wasmtime's resource limiter.
+    limits: StoreLimits,
 }
 
 impl HostState {

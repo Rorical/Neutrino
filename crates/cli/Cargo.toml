@@ -9,10 +9,23 @@ repository    = { workspace = true }
 homepage      = { workspace = true }
 documentation = { workspace = true }
 publish       = { workspace = true }
+description   = "Operator tooling: key generation, genesis roots and node configs."
 
-[features]
-default = ["std"]
-std = []
+[[bin]]
+name = "neutrino-cli"
+path = "src/main.rs"
+
+[dependencies]
+getrandom                   = { workspace = true }
+hex                         = { workspace = true }
+neutrino-consensus-engine   = { workspace = true }
+neutrino-crypto             = { workspace = true }
+neutrino-node               = { workspace = true }
+neutrino-runtime-host       = { workspace = true }
+rand_core                   = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+toml = "1.1.6"

@@ -7,9 +7,9 @@
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -322,24 +322,65 @@ pub async fn bind(listen: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(listen).await
 }
 
+/// Connections served at once; further connections are closed unanswered.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// Minimum interval between two state samples. Scrapes inside the window
+/// reuse the previous exposition so a flood cannot hammer the engine lock.
+pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shared scrape state: the source plus the last rendered exposition.
+struct Scraper {
+    source: Arc<dyn MetricsSource>,
+    cached: Mutex<Option<(Instant, Arc<String>)>>,
+}
+
+impl Scraper {
+    fn exposition(&self) -> Arc<String> {
+        let mut cached = self.cached.lock().expect("metrics cache poisoned");
+        if let Some((at, body)) = cached.as_ref()
+            && at.elapsed() < SNAPSHOT_INTERVAL
+        {
+            return Arc::clone(body);
+        }
+        let snapshot = self.source.snapshot();
+        let body = Arc::new(render(self.source.metrics(), &snapshot));
+        *cached = Some((Instant::now(), Arc::clone(&body)));
+        body
+    }
+}
+
 /// Serve `GET /metrics` until the listener fails.
 ///
 /// Each connection handles one request and is closed; a 5 second deadline
-/// bounds slow or idle clients. Bodies and other paths are ignored.
+/// bounds slow or idle clients, at most [`MAX_CONNECTIONS`] are served at
+/// once, and state is sampled at most once per [`SNAPSHOT_INTERVAL`]. Bodies
+/// and other paths are ignored.
 pub async fn serve(listener: TcpListener, source: Arc<dyn MetricsSource>) {
+    let scraper = Arc::new(Scraper {
+        source,
+        cached: Mutex::new(None),
+    });
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        let source = Arc::clone(&source);
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            // Over capacity: close immediately rather than queue work.
+            drop(stream);
+            continue;
+        };
+        let scraper = Arc::clone(&scraper);
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(Duration::from_secs(5), respond(stream, source)).await;
+            let _permit = permit;
+            let _ = tokio::time::timeout(Duration::from_secs(5), respond(stream, scraper)).await;
         });
     }
 }
 
-async fn respond(mut stream: TcpStream, source: Arc<dyn MetricsSource>) -> std::io::Result<()> {
+async fn respond(mut stream: TcpStream, scraper: Arc<Scraper>) -> std::io::Result<()> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 512];
     loop {
@@ -360,14 +401,14 @@ async fn respond(mut stream: TcpStream, source: Arc<dyn MetricsSource>) -> std::
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
-    let (status, body) = if method == "GET" && (path == "/metrics" || path == "/") {
-        let snapshot = source.snapshot();
-        ("200 OK", render(source.metrics(), &snapshot))
-    } else if method == "GET" && path == "/health" {
-        ("200 OK", "ok\n".to_owned())
-    } else {
-        ("404 Not Found", "not found\n".to_owned())
-    };
+    let (status, body): (&str, Arc<String>) =
+        if method == "GET" && (path == "/metrics" || path == "/") {
+            ("200 OK", scraper.exposition())
+        } else if method == "GET" && path == "/health" {
+            ("200 OK", Arc::new("ok\n".to_owned()))
+        } else {
+            ("404 Not Found", Arc::new("not found\n".to_owned()))
+        };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -381,15 +422,67 @@ async fn respond(mut stream: TcpStream, source: Arc<dyn MetricsSource>) -> std::
 mod tests {
     use super::*;
 
-    struct Stub(NodeMetrics, MetricsSnapshot);
+    struct Stub(NodeMetrics, MetricsSnapshot, AtomicU64);
+
+    impl Stub {
+        fn new(snapshot: MetricsSnapshot) -> Self {
+            Self(NodeMetrics::default(), snapshot, AtomicU64::new(0))
+        }
+    }
 
     impl MetricsSource for Stub {
         fn metrics(&self) -> &NodeMetrics {
             &self.0
         }
         fn snapshot(&self) -> MetricsSnapshot {
+            self.2.fetch_add(1, Ordering::Relaxed);
             self.1.clone()
         }
+    }
+
+    #[test]
+    fn scrapes_inside_the_interval_reuse_one_snapshot() {
+        let stub = Arc::new(Stub::new(MetricsSnapshot::default()));
+        let scraper = Scraper {
+            source: Arc::clone(&stub) as Arc<dyn MetricsSource>,
+            cached: Mutex::new(None),
+        };
+        let first = scraper.exposition();
+        let second = scraper.exposition();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(stub.2.load(Ordering::Relaxed), 1);
+        // Expire the cache and the source is sampled again.
+        scraper.cached.lock().unwrap().as_mut().unwrap().0 -= SNAPSHOT_INTERVAL * 2;
+        let third = scraper.exposition();
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(stub.2.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn idle_connections_beyond_the_cap_are_closed_unanswered() {
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let source: Arc<dyn MetricsSource> = Arc::new(Stub::new(MetricsSnapshot::default()));
+        tokio::spawn(serve(listener, source));
+        // Fill every slot with connections that never send a request.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The next connection is accepted and closed without a response.
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let _ = extra
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await;
+        let mut response = String::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(2), extra.read_to_string(&mut response))
+                .await
+                .expect("connection must be closed promptly");
+        assert!(read.is_ok() || read.is_err());
+        assert!(response.is_empty(), "{response}");
+        drop(idle);
     }
 
     #[test]
@@ -441,13 +534,10 @@ mod tests {
     async fn http_endpoint_serves_metrics_and_rejects_other_paths() {
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let source: Arc<dyn MetricsSource> = Arc::new(Stub(
-            NodeMetrics::default(),
-            MetricsSnapshot {
-                head_height: 9,
-                ..MetricsSnapshot::default()
-            },
-        ));
+        let source: Arc<dyn MetricsSource> = Arc::new(Stub::new(MetricsSnapshot {
+            head_height: 9,
+            ..MetricsSnapshot::default()
+        }));
         tokio::spawn(serve(listener, source));
         for (path, expect_status, expect_body) in [
             ("/metrics", "200 OK", "neutrino_head_height 9"),

@@ -1,10 +1,3 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/png/neutrino-logo-dark.png">
-    <img alt="Neutrino" src="docs/brand/png/neutrino-logo-light.png" width="420">
-  </picture>
-</p>
-
 # Neutrino
 
 Shared WASM/SP1 execution, complete chunk consensus proofs, EvidenceProof

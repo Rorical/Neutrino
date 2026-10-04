@@ -37,7 +37,9 @@ echo "== system packages =="
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq build-essential clang cmake curl git libclang-dev libssl-dev pkg-config protobuf-compiler >/dev/null
+  # libprotobuf-dev carries protoc's standard includes (google/protobuf/*.proto),
+  # which sp1-prover-types needs; it is only a recommended package of protobuf-compiler.
+  apt-get install -y -qq build-essential clang cmake curl git libclang-dev libprotobuf-dev libssl-dev pkg-config protobuf-compiler >/dev/null
 fi
 
 echo "== rust toolchain =="

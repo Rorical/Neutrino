@@ -56,8 +56,14 @@ fi
 cargo prove --version
 
 echo "== build (cuda feature) =="
-# Reuse the target directory across sessions when it lives on Drive.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$OUT_DIR/target}"
+# The build directory must be on local disk: Google Drive is mounted without
+# execute permission, so build scripts and test binaries there cannot run.
+# Only SP1 stage caches and logs go to OUT_DIR. A disconnect therefore costs a
+# rebuild, but never a lost proving stage.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_DIR/target}"
+case "$CARGO_TARGET_DIR" in
+  /content/drive/*) echo "CARGO_TARGET_DIR must not be on Drive (noexec): $CARGO_TARGET_DIR"; exit 1 ;;
+esac
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}"
 export SP1_PROVER=cuda
 cargo build --locked --release -p neutrino-node -p neutrino-runtime-host --features neutrino-node/cuda

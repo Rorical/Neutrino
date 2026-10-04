@@ -97,7 +97,7 @@ fi
 
 echo "== cuda evidence/block/chunk/history gate =="
 START=$(date +%s)
-"${MEASURE[@]}" cargo test --locked --release -p neutrino-runtime-host --features neutrino-node/cuda \
+"${MEASURE[@]}" cargo test --locked --release -p neutrino-runtime-host --features cuda \
   --test evidence_pipeline evidence_block_chunk_cuda_compressed_recursion -- --ignored --exact --nocapture \
   2>&1 | tee "$OUT_DIR/cuda-evidence-gate.log"
 echo "cuda gate wall seconds: $(( $(date +%s) - START ))" | tee -a "$OUT_DIR/cuda-evidence-gate.log"

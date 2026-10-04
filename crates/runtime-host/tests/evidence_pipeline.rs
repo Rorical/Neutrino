@@ -604,7 +604,10 @@ fn successor_fixture(
     let (post, _) = state.into_committed_and_witness();
     let post = LiveTrie::from_trie(post);
     let mut trace = TracingState::new(&post);
-    for key in neutrino_prover_chunk::rotation::witness_keys(&next.context.active_validators) {
+    for key in neutrino_prover_chunk::rotation::witness_keys_from(
+        &mut trace,
+        &next.context.active_validators,
+    ) {
         let _ = trace.read(&key);
     }
     next.post_state = trace.into_witness();

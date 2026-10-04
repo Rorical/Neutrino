@@ -479,7 +479,11 @@ impl<DB: Database> Engine<DB> {
             self.store().iter_trie_nodes()?,
             self.store().iter_state_values()?,
         );
-        let keys = neutrino_prover_chunk::rotation::witness_keys(validators);
+        let index: neutrino_default_runtime_core::ValidatorRegistrations = trie
+            .get(neutrino_default_runtime_core::VALIDATOR_REGISTRATIONS_KEY)
+            .and_then(|bytes| borsh::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let keys = neutrino_prover_chunk::rotation::witness_keys(validators, &index);
         let mut nodes = BTreeMap::new();
         let mut values = BTreeMap::new();
         for key in &keys {

@@ -154,14 +154,19 @@ pub const VALIDATOR_KEY_PREFIX: &[u8; 4] = b"val:";
 pub const WITHDRAWAL_KEY_PREFIX: &[u8; 4] = b"wdr:";
 /// Canonical key holding the [`ValidatorSet`] summary.
 pub const VALIDATOR_SET_KEY: &[u8] = b"validator_set";
-/// Canonical key holding the [`ValidatorRegistrations`] summary.
+/// Canonical key holding the [`ValidatorRegistrations`] index.
 ///
-/// Each row carries a registered validator's BLS pubkey and
-/// proof-of-possession signature. Populated by
-/// [`Transaction::RegisterValidator`]; authenticated by the complete chunk
-/// validator transition to derive consensus-side
+/// The index lists the addresses that currently hold a registration
+/// record under [`REGISTRATION_KEY_PREFIX`]. Populated by
+/// [`Transaction::RegisterValidator`] and shrunk again when a validator
+/// fully withdraws; authenticated by the complete chunk validator
+/// transition to discover new consensus-side
 /// [`neutrino_primitives::Validator`] entries.
 pub const VALIDATOR_REGISTRATIONS_KEY: &[u8] = b"validator_registrations";
+/// Prefix used to derive state keys for per-validator registration
+/// records: `registration_key(addr) = REGISTRATION_KEY_PREFIX || addr`.
+/// Each key holds a borsh-encoded [`ValidatorRegistration`].
+pub const REGISTRATION_KEY_PREFIX: &[u8; 4] = b"reg:";
 
 /// Length of the canonical signed payload for a transfer:
 /// `16B domain || 8B chain_id || 32B from || 32B to || 16B amount || 8B nonce`.
@@ -237,6 +242,15 @@ pub struct Validator {
 pub fn validator_key(addr: &Address) -> Vec<u8> {
     let mut key = Vec::with_capacity(VALIDATOR_KEY_PREFIX.len() + 32);
     key.extend_from_slice(VALIDATOR_KEY_PREFIX);
+    key.extend_from_slice(addr);
+    key
+}
+
+/// Build the registration-record state key for `addr`.
+#[must_use]
+pub fn registration_key(addr: &Address) -> Vec<u8> {
+    let mut key = Vec::with_capacity(REGISTRATION_KEY_PREFIX.len() + 32);
+    key.extend_from_slice(REGISTRATION_KEY_PREFIX);
     key.extend_from_slice(addr);
     key
 }
@@ -385,8 +399,10 @@ pub enum Transaction {
     /// Register a brand-new validator identity. Creates a runtime
     /// validator entry funded by `deposit_amount` from the depositor,
     /// records the BLS pubkey + proof-of-possession under
-    /// [`VALIDATOR_REGISTRATIONS_KEY`], and upserts the validator's
-    /// stake into the canonical [`ValidatorSet`].
+    /// [`registration_key`], lists the address in the
+    /// [`VALIDATOR_REGISTRATIONS_KEY`] index, and upserts the validator's
+    /// stake into the canonical [`ValidatorSet`]. A later full withdrawal
+    /// removes the record, the index entry and the runtime validator entry.
     ///
     /// The STF stores the proof-of-possession; complete chunk validation
     /// verifies it before admitting the corresponding consensus-side
@@ -580,9 +596,10 @@ impl WithdrawalQueue {
     }
 }
 
-/// One row of [`ValidatorRegistrations`]. Recorded by
-/// [`Transaction::RegisterValidator`] and consumed by the host-side
-/// chunk validator transition.
+/// Per-validator registration record stored under [`registration_key`].
+///
+/// Recorded by [`Transaction::RegisterValidator`], consumed by the chunk
+/// validator transition and deleted once the validator has fully withdrawn.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatorRegistration {
     /// Runtime address of the registered validator. Doubles as the
@@ -599,40 +616,44 @@ pub struct ValidatorRegistration {
     pub pop_signature: neutrino_primitives::BlsSignature,
 }
 
-/// Canonical store of every runtime-side validator registration
-/// produced by [`Transaction::RegisterValidator`]. Entries are kept
-/// sorted by `address` ascending so the bridge sees a stable order.
+/// Index of addresses that currently hold a [`ValidatorRegistration`] record.
+///
+/// Entries are kept sorted ascending so the bridge sees a stable order. The
+/// index is bounded by live registrations: a fully withdrawn validator is
+/// removed together with its record.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ValidatorRegistrations {
-    /// Registrations sorted by `address` ascending. Append-only —
-    /// once a validator is registered they remain in the set even
-    /// if their stake later drops to zero (exit is handled by the
-    /// host-side activation FSM, not by removing the registration).
-    pub entries: Vec<ValidatorRegistration>,
+    /// Registered addresses sorted ascending.
+    pub addresses: Vec<Address>,
 }
 
 impl ValidatorRegistrations {
-    /// `true` when `addr` already has a registration row.
+    /// `true` when `addr` currently has a registration record.
     #[must_use]
     pub fn contains(&self, addr: &Address) -> bool {
-        self.entries
-            .binary_search_by(|e| e.address.cmp(addr))
-            .is_ok()
+        self.addresses.binary_search(addr).is_ok()
     }
 
-    /// Insert a new row. Returns `false` (and leaves `self`
-    /// unchanged) if `addr` is already registered — the runtime
-    /// uses this as the duplicate-registration gate.
-    pub fn insert(&mut self, registration: ValidatorRegistration) -> bool {
-        match self
-            .entries
-            .binary_search_by(|e| e.address.cmp(&registration.address))
-        {
+    /// Add `addr`. Returns `false` (and leaves `self` unchanged) if it is
+    /// already present — the runtime uses this as the duplicate gate.
+    pub fn insert(&mut self, addr: Address) -> bool {
+        match self.addresses.binary_search(&addr) {
             Ok(_) => false,
             Err(idx) => {
-                self.entries.insert(idx, registration);
+                self.addresses.insert(idx, addr);
                 true
             }
+        }
+    }
+
+    /// Remove `addr`. Returns `true` when the index actually changed.
+    pub fn remove(&mut self, addr: &Address) -> bool {
+        match self.addresses.binary_search(addr) {
+            Ok(idx) => {
+                self.addresses.remove(idx);
+                true
+            }
+            Err(_) => false,
         }
     }
 }
@@ -645,10 +666,49 @@ fn load_validator_registrations<B: StateBackend>(state: &mut B) -> ValidatorRegi
 }
 
 fn store_validator_registrations<B: StateBackend>(state: &mut B, set: &ValidatorRegistrations) {
+    if set.addresses.is_empty() {
+        state.delete(VALIDATOR_REGISTRATIONS_KEY);
+    } else {
+        state.write(
+            VALIDATOR_REGISTRATIONS_KEY,
+            borsh::to_vec(set).expect("borsh encode ValidatorRegistrations never fails"),
+        );
+    }
+}
+
+/// Read `addr`'s registration record, if one is stored.
+pub fn load_validator_registration<B: StateBackend>(
+    state: &mut B,
+    addr: &Address,
+) -> Option<ValidatorRegistration> {
+    state
+        .read(&registration_key(addr))
+        .and_then(|bytes| ValidatorRegistration::try_from_slice(&bytes).ok())
+}
+
+fn store_validator_registration<B: StateBackend>(
+    state: &mut B,
+    registration: &ValidatorRegistration,
+) {
     state.write(
-        VALIDATOR_REGISTRATIONS_KEY,
-        borsh::to_vec(set).expect("borsh encode ValidatorRegistrations never fails"),
+        &registration_key(&registration.address),
+        borsh::to_vec(registration).expect("borsh encode ValidatorRegistration never fails"),
     );
+}
+
+/// Drop every runtime record of a validator whose stake and withdrawal
+/// queue are both empty. The caller has already verified that no sanction
+/// is pending against `addr`. Consensus observed the zero stake at a chunk
+/// boundary before this point because the unbonding delay exceeds the
+/// chunk size, so the deleted record cannot resurrect stake.
+fn retire_validator<B: StateBackend>(state: &mut B, addr: &Address) {
+    state.delete(&validator_key(addr));
+    state.delete(&withdrawal_key(addr));
+    let mut registrations = load_validator_registrations(state);
+    if registrations.remove(addr) {
+        state.delete(&registration_key(addr));
+        store_validator_registrations(state, &registrations);
+    }
 }
 
 /// Per-transaction receipt status code.
@@ -1810,10 +1870,17 @@ fn apply_withdraw<B: StateBackend>(
     // emits the sibling node at every on-path Branch, so the SP1
     // guest's `Trie::remove` has the data it needs to call
     // `absorb_into_parent` (the trie's collapse path).
-    if queue.entries.is_empty() {
-        state.delete(&withdrawal_key(&tx.validator));
-    } else {
+    if !queue.entries.is_empty() {
         store_withdrawal_queue(state, &tx.validator, &queue);
+        return Ok(());
+    }
+    // Nothing is queued any more. A validator with no stake left has
+    // served its full unbonding delay, so every record can go.
+    let validator = load_validator(state, &tx.validator);
+    if validator.stake == 0 && !validator.active {
+        retire_validator(state, &tx.validator);
+    } else {
+        state.delete(&withdrawal_key(&tx.validator));
     }
     Ok(())
 }
@@ -1868,11 +1935,15 @@ fn apply_register_validator<B: StateBackend>(
     // Append to the registrations index. The bridge will verify the
     // POP before lifting this entry into the consensus active set;
     // an invalid POP burns gas here but never enters consensus.
-    registrations.insert(ValidatorRegistration {
-        address: tx.validator,
-        bls_pubkey: tx.bls_pubkey,
-        pop_signature: tx.pop_signature,
-    });
+    registrations.insert(tx.validator);
+    store_validator_registration(
+        state,
+        &ValidatorRegistration {
+            address: tx.validator,
+            bls_pubkey: tx.bls_pubkey,
+            pop_signature: tx.pop_signature,
+        },
+    );
 
     // Self-registration (`depositor == validator`) is allowed; the
     // depositor's account fields cover the validator's account
@@ -2034,10 +2105,11 @@ pub const QUERY_METHOD_PENDING_WITHDRAWALS: &str = "pending_withdrawals";
 /// snapshot recorded by [`Transaction::RegisterValidator`].
 ///
 /// Args wire format: empty (no payload expected).
-/// Payload wire format: `borsh(ValidatorRegistrations)` — empty
-/// registries are returned as `ValidatorRegistrations::default()`
-/// (empty entries vector). Complete chunk validation authenticates
-/// the registry directly against the block-proven state root.
+/// Payload wire format: `borsh(Vec<ValidatorRegistration>)` — every
+/// record listed in the [`VALIDATOR_REGISTRATIONS_KEY`] index, in
+/// address order; an empty registry is an empty vector. Complete chunk
+/// validation authenticates the index and records directly against the
+/// block-proven state root.
 pub const QUERY_METHOD_VALIDATOR_REGISTRATIONS: &str = "validator_registrations";
 
 /// Dispatch a [`neutrino_runtime_abi::QueryRequest`] against `state`.
@@ -2134,9 +2206,14 @@ fn query_pending_withdrawals<B: neutrino_runtime_core::StateBackend>(
 fn query_validator_registrations<B: neutrino_runtime_core::StateBackend>(
     state: &mut B,
 ) -> neutrino_runtime_abi::QueryResponse {
-    let registrations = load_validator_registrations(state);
+    let index = load_validator_registrations(state);
+    let records: Vec<ValidatorRegistration> = index
+        .addresses
+        .iter()
+        .filter_map(|addr| load_validator_registration(state, addr))
+        .collect();
     let payload =
-        borsh::to_vec(&registrations).expect("borsh encode ValidatorRegistrations never fails");
+        borsh::to_vec(&records).expect("borsh encode Vec<ValidatorRegistration> never fails");
     neutrino_runtime_abi::QueryResponse::ok(payload)
 }
 
@@ -3717,6 +3794,85 @@ mod tests {
         let (_, live4) = apply_against(&live3, &mature);
         assert_eq!(read_account(&live4, &addr).balance, 100);
         assert_eq!(read_withdrawal_queue(&live4, &addr).total(), 0);
+        // Nothing staked or queued remains, so the validator record is gone.
+        assert!(live4.get(&validator_key(&addr)).is_none());
+        assert!(live4.get(&withdrawal_key(&addr)).is_none());
+    }
+
+    #[test]
+    fn full_withdrawal_retires_registration_and_validator_records() {
+        let alice = signing_key(50);
+        let addr = address_of(&alice);
+        let mut live = live_with_account(
+            addr,
+            Account {
+                nonce: 0,
+                balance: 0,
+            },
+        );
+        let mut index = ValidatorRegistrations::default();
+        index.insert(addr);
+        index.insert([0xEE; 32]);
+        live.insert(VALIDATOR_REGISTRATIONS_KEY, borsh::to_vec(&index).unwrap());
+        let registration = ValidatorRegistration {
+            address: addr,
+            bls_pubkey: [1; 48],
+            pop_signature: [2; 96],
+        };
+        live.insert(
+            &registration_key(&addr),
+            borsh::to_vec(&registration).unwrap(),
+        );
+        live.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake: 0,
+                active: false,
+            }),
+        );
+        live.insert(
+            &withdrawal_key(&addr),
+            borsh::to_vec(&WithdrawalQueue {
+                entries: alloc::vec![Withdrawal {
+                    amount: 40,
+                    mature_at_height: 10,
+                }],
+            })
+            .unwrap(),
+        );
+        let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
+            chain_id: CHAIN_ID,
+            block_height: 10,
+            block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+            gas_price: 0,
+            proposer_address: [0u8; 32],
+            transactions: alloc::vec![Transaction::Withdraw(signed_withdraw(&alice, 0, CHAIN_ID))],
+        };
+        let (output, post) = apply_against(&live, &input);
+        assert_eq!(output.applied, 1);
+        assert_eq!(read_account(&post, &addr).balance, 40);
+        assert!(post.get(&validator_key(&addr)).is_none());
+        assert!(post.get(&withdrawal_key(&addr)).is_none());
+        assert!(post.get(&registration_key(&addr)).is_none());
+        let remaining: ValidatorRegistrations =
+            borsh::from_slice(&post.get(VALIDATOR_REGISTRATIONS_KEY).unwrap()).unwrap();
+        assert_eq!(remaining.addresses, alloc::vec![[0xEE; 32]]);
+        // A validator that still stakes keeps every record after a withdrawal.
+        let mut staked = live.clone();
+        staked.insert(
+            &validator_key(&addr),
+            encode_validator(&Validator {
+                stake: 5,
+                active: true,
+            }),
+        );
+        let (_, post) = apply_against(&staked, &input);
+        assert_eq!(read_validator(&post, &addr).stake, 5);
+        assert!(post.get(&registration_key(&addr)).is_some());
+        let kept: ValidatorRegistrations =
+            borsh::from_slice(&post.get(VALIDATOR_REGISTRATIONS_KEY).unwrap()).unwrap();
+        assert!(kept.contains(&addr));
     }
 
     // -----------------------------------------------------------------

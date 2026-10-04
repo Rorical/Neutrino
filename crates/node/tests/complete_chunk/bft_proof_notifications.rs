@@ -102,7 +102,7 @@ fn three_validator_fixture() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     input.evidence_anchor.chain_spec_hash = witness.chain_spec.hash();
     let live = LiveTrie::default();
     let mut traced = TracingState::new(&live);
-    for key in neutrino_prover_chunk::rotation::witness_keys(&validators) {
+    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut traced, &validators) {
         let _ = traced.read(&key);
     }
     witness.blocks[0].output = neutrino_default_runtime_core::apply_block(&input, &mut traced);

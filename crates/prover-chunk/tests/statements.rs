@@ -15,7 +15,7 @@ use neutrino_prover_chunk::{
     execution::{ExecutionContext, ProvenBlock, commitment, validate_execution},
     finality::{FinalityError, verify_finality},
     proposer::{ProposerError, verify_proposer},
-    rotation::derive_next_validators,
+    rotation::{derive_next_validators, retirement_delay_chunks},
 };
 
 fn test_domain() -> neutrino_primitives::ConsensusDomain {
@@ -398,9 +398,9 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
         bls_pubkey: key.public_key().to_bytes(),
         pop_signature: key.prove_possession().to_bytes(),
     };
-    let registrations = ValidatorRegistrations {
-        entries: vec![registration],
-    };
+    let mut index = ValidatorRegistrations::default();
+    index.insert([12; 32]);
+    let records = vec![registration];
     let mut set = ValidatorSet::default();
     set.upsert([12; 32], 300);
     let params = ConsensusParams {
@@ -409,21 +409,58 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
         exit_delay_epochs: 2,
         ..ConsensusParams::default()
     };
+    let unbonding = params.chunk_size * 2;
     let initial = vec![validator()];
-    let next = derive_next_validators(&initial, &set, &registrations, &params, 0).unwrap();
+    let next =
+        derive_next_validators(&initial, &set, &index, &records, &params, unbonding, 0).unwrap();
     assert_eq!(next.len(), 2);
     assert_eq!(next[1].activation_epoch, 3);
     assert_eq!(next[1].effective_stake, 0);
-    let active = derive_next_validators(&next, &set, &registrations, &params, 2).unwrap();
+    // Seated identities are not registered again on later chunks.
+    let active =
+        derive_next_validators(&next, &set, &index, &records, &params, unbonding, 2).unwrap();
+    assert_eq!(active.len(), 2);
     assert_eq!(active[1].effective_stake, 300);
     set.remove(&[12; 32]);
-    let exited = derive_next_validators(&active, &set, &registrations, &params, 3).unwrap();
+    let exited = derive_next_validators(&active, &set, &index, &[], &params, unbonding, 3).unwrap();
     assert_eq!(exited[1].effective_stake, 0);
     assert_eq!(exited[1].exit_epoch, 6);
-    let mut bad = registrations;
-    bad.entries[0].pop_signature = [0; 96];
+    // While the runtime still lists the registration the entry stays seated,
+    // however long ago it exited.
+    let far = 6 + retirement_delay_chunks(&params, unbonding).unwrap() + 10;
+    let kept = derive_next_validators(&exited, &set, &index, &[], &params, unbonding, far).unwrap();
+    assert_eq!(kept.len(), 2);
+    // Once the runtime has withdrawn it, the exited entry is dropped after the
+    // retirement delay but not before.
+    let empty = ValidatorRegistrations::default();
+    // `next_chunk` is `chunk_id + 1`; one chunk short of the delay keeps it.
+    let early =
+        derive_next_validators(&exited, &set, &empty, &[], &params, unbonding, far - 12).unwrap();
+    assert_eq!(early.len(), 2);
+    let retired =
+        derive_next_validators(&exited, &set, &empty, &[], &params, unbonding, far).unwrap();
+    assert_eq!(retired.len(), 1);
     assert_eq!(
-        derive_next_validators(&initial, &set, &bad, &params, 0)
+        retired[0].withdrawal_credentials,
+        initial[0].withdrawal_credentials
+    );
+    // A slashed identity is never retired and blocks re-registration of its key.
+    let mut slashed = exited;
+    slashed[1].slashed = true;
+    let kept =
+        derive_next_validators(&slashed, &set, &empty, &[], &params, unbonding, far).unwrap();
+    assert_eq!(kept.len(), 2);
+    let reseat =
+        derive_next_validators(&kept[..1], &set, &index, &records, &params, unbonding, far)
+            .unwrap();
+    assert_eq!(reseat.len(), 2, "unslashed key may register again");
+    let blocked =
+        derive_next_validators(&kept, &set, &index, &records, &params, unbonding, far).unwrap();
+    assert_eq!(blocked.len(), 2, "slashed key cannot be seated twice");
+    let mut bad = records;
+    bad[0].pop_signature = [0; 96];
+    assert_eq!(
+        derive_next_validators(&initial, &set, &index, &bad, &params, unbonding, 0)
             .unwrap()
             .len(),
         1
@@ -893,7 +930,7 @@ fn unlock_quorum_crypto_obeys_the_same_batched_and_direct_decision() {
 #[test]
 fn exhausted_genesis_account_cannot_recover_declared_genesis_stake() {
     use neutrino_default_runtime_core::{Validator as RuntimeValidator, validator_key};
-    use neutrino_prover_chunk::rotation::{rotate_from_witness, witness_keys};
+    use neutrino_prover_chunk::rotation::{rotate_from_witness, witness_keys_from};
     use neutrino_runtime_core::{
         StateBackend,
         host::{LiveTrie, TracingState},
@@ -909,13 +946,14 @@ fn exhausted_genesis_account_cannot_recover_declared_genesis_stake() {
         .unwrap(),
     );
     let mut state = TracingState::new(&live);
-    for key in witness_keys(&previous) {
+    for key in witness_keys_from(&mut state, &previous) {
         let _ = state.read(&key);
     }
     let witness = state.into_witness();
     let next = rotate_from_witness(
         &previous,
         &ConsensusParams::default(),
+        ConsensusParams::default().chunk_size,
         0,
         witness.pre_state_root,
         &witness,
@@ -927,13 +965,8 @@ fn exhausted_genesis_account_cannot_recover_declared_genesis_stake() {
 #[test]
 fn epoch_zero_registration_exits_even_with_zero_activation_delay() {
     let registered = validator();
-    let registrations = ValidatorRegistrations {
-        entries: vec![ValidatorRegistration {
-            address: registered.withdrawal_credentials,
-            bls_pubkey: registered.pubkey,
-            pop_signature: key().prove_possession().to_bytes(),
-        }],
-    };
+    let mut index = ValidatorRegistrations::default();
+    index.insert(registered.withdrawal_credentials);
     let params = ConsensusParams {
         epoch_length_in_chunks: 10,
         activation_delay_epochs: 0,
@@ -942,8 +975,10 @@ fn epoch_zero_registration_exits_even_with_zero_activation_delay() {
     let next = derive_next_validators(
         &[registered],
         &ValidatorSet::default(),
-        &registrations,
+        &index,
+        &[],
         &params,
+        params.chunk_size,
         0,
     )
     .unwrap();

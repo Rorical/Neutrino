@@ -56,11 +56,57 @@ pub struct AccountabilityOutput {
     pub queue_after: Hash,
 }
 
-/// Status key, retained permanently to reject duplicate/re-encoded offences.
+/// Status key rejecting duplicate or re-encoded offences while admissible.
+///
+/// It is swept through the [`expiry_key`] bucket of its admitting height
+/// once that height's admission window has closed.
 pub fn offence_key(id: &Hash) -> Vec<u8> {
     let mut key = Vec::from(&b"accountability:event:v1:"[..]);
     key.extend_from_slice(id);
     key
+}
+
+/// Bucket listing the offence IDs admitted at `height`. The block at
+/// `height + evidence_max_age_blocks + 1` deletes the bucket and every
+/// listed status key; by then no claim with those IDs can bind.
+pub fn expiry_key(height: u64) -> Vec<u8> {
+    let mut key = Vec::from(&b"accountability:expiry:v1:"[..]);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+/// Delete the markers admitted at the height whose window closed this block.
+///
+/// Markers older than the window can no longer collide with a bindable
+/// claim. The sweep is bounded by that block's admission cap and is
+/// mandatory, so it carries no gas.
+fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, max_age: u64) {
+    let Some(expired) = height
+        .checked_sub(max_age)
+        .and_then(|height| height.checked_sub(1))
+    else {
+        return;
+    };
+    let Some(bytes) = state.read(&expiry_key(expired)) else {
+        return;
+    };
+    let ids: Vec<Hash> = borsh::from_slice(&bytes).expect("canonical expiry bucket");
+    for id in &ids {
+        state.delete(&offence_key(id));
+    }
+    state.delete(&expiry_key(expired));
+}
+
+/// Remember which markers this block created so a later block can sweep them.
+fn record_expiry_bucket<B: StateBackend>(state: &mut B, height: u64, admitted: &[Sanction]) {
+    if admitted.is_empty() {
+        return;
+    }
+    let ids: Vec<Hash> = admitted.iter().map(|s| s.offence_id).collect();
+    state.write(
+        &expiry_key(height),
+        borsh::to_vec(&ids).expect("canonical expiry bucket"),
+    );
 }
 
 /// Read the bounded queue. Malformed authenticated state fails closed.
@@ -142,6 +188,7 @@ pub(crate) fn apply<B: StateBackend>(
         "queue bound"
     );
     let before = commitment(&queue);
+    sweep_expired_markers(state, input.block_height, policy.evidence_max_age_blocks);
     let mut admitted = Vec::new();
     // Validate every admission and its replay key before mutating any state.
     for tx in &input.transactions {
@@ -195,6 +242,7 @@ pub(crate) fn apply<B: StateBackend>(
             amount,
         });
     }
+    record_expiry_bucket(state, input.block_height, &admitted);
     let mut executed = Vec::with_capacity(execution_count);
     let mut receipts = Vec::with_capacity(execution_count);
     for item in queue.drain(..execution_count) {
@@ -370,6 +418,52 @@ pub(crate) mod tests {
         assert_eq!(load_queue(&mut next), [] as [PendingSanction; 0]);
         assert_eq!(crate::load_validator(&mut next, &[2; 32]).stake, 70);
         assert_eq!(next.read(&offence_key(&[2; 32])), Some(vec![1]));
+    }
+
+    #[test]
+    fn offence_marker_is_swept_once_its_admission_window_closes() {
+        let mut input = input();
+        input.evidence_anchor.policy.evidence_max_age_blocks = 5;
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
+        let mut live = LiveTrie::default();
+        live.insert(
+            &crate::validator_key(&[1; 32]),
+            crate::encode_validator(&crate::Validator {
+                stake: 100,
+                active: true,
+            }),
+        );
+        let mut state = TracingState::new(&live);
+        let output = crate::apply_block(&input, &mut state);
+        assert_eq!(output.accountability.executed.len(), 1);
+        assert_eq!(state.read(&offence_key(&[1; 32])), Some(vec![1]));
+        let bucket: Vec<Hash> =
+            borsh::from_slice(&state.read(&expiry_key(input.block_height)).unwrap()).unwrap();
+        assert_eq!(bucket, vec![[1; 32]]);
+        let admitted_at = input.block_height;
+        let (post, _) = state.into_committed_and_witness();
+        // The last block inside the window keeps the marker.
+        let live = LiveTrie::from_trie(post);
+        let mut state = TracingState::new(&live);
+        input.transactions.clear();
+        input.block_height = admitted_at + 5;
+        crate::apply_block(&input, &mut state);
+        assert!(state.read(&offence_key(&[1; 32])).is_some());
+        assert!(state.read(&expiry_key(admitted_at)).is_some());
+        let (post, _) = state.into_committed_and_witness();
+        // The first block past the window sweeps the bucket and its markers,
+        // and the Guest replays the same deletions from the witness.
+        let live = LiveTrie::from_trie(post);
+        let mut state = TracingState::new(&live);
+        input.block_height = admitted_at + 6;
+        let output = crate::apply_block(&input, &mut state);
+        assert!(state.read(&offence_key(&[1; 32])).is_none());
+        assert!(state.read(&expiry_key(admitted_at)).is_none());
+        let (_, witness) = state.into_committed_and_witness();
+        let mut guest = WitnessState::new(&witness).unwrap();
+        let checked = validate_input(&input);
+        assert_eq!(crate::apply_block_validated(&checked, &mut guest), output);
+        assert_eq!(guest.post_state_root(), output.post_state_root);
     }
 
     #[test]

@@ -45,10 +45,12 @@ missing observations. Explicit nil votes advance unsuccessful live phases but
 cannot finalize a chunk or erase a value lock. Nil/value equivocation and conflicting
 leader-proposal evidence is proven through the separate Evidence Guest path. The Chunk Guest
 derives validator activation/exit/stake changes from
-authenticated runtime state, verifies registrations, consumes block-proven sanctions,
+authenticated runtime state, verifies new registrations, retires fully withdrawn
+exited identities after the retirement delay, consumes block-proven sanctions,
 and commits the next validator root, seed and history root in a compact boundary.
-The full next context is retained by the node. Sanction replay protection is owned
-by permanent Block STF offence markers; Chunk has no duplicate penalty ledger.
+Slashed identities stay seated so their key cannot re-register. The full next
+context is retained by the node. Sanction replay protection is owned by Block STF
+offence markers that live for the admission window; Chunk has no duplicate penalty ledger.
 
 Historical commitments exclude certificate signer subsets; alternative valid quorum
 certificates cannot produce different history roots. The block-proof root commits

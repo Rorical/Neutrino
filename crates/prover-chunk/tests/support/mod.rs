@@ -111,7 +111,7 @@ pub fn fixture_with_live(
         transactions,
     };
     let mut state = TracingState::new(live);
-    for key in neutrino_prover_chunk::rotation::witness_keys(&validators) {
+    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut state, &validators) {
         let _ = state.read(&key);
     }
     let output = apply_block(&input, &mut state);
@@ -192,6 +192,7 @@ pub fn fixture_with_live(
         &rotate_from_witness(
             &validators,
             &spec.consensus,
+            spec.runtime.unbonding_delay_blocks,
             0,
             statement.chunk.end_state_root,
             &witness,

@@ -713,19 +713,19 @@ fn restored_bft_finalizes_its_signed_branch_after_the_canonical_head_changes() {
 fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_hint() {
     use neutrino_default_runtime_core::{
         VALIDATOR_REGISTRATIONS_KEY, VALIDATOR_SET_KEY, ValidatorRegistration,
-        ValidatorRegistrations, ValidatorSet,
+        ValidatorRegistrations, ValidatorSet, registration_key,
     };
     let newcomer = ProposerKey::from_ikm(&[43; 32], 99).unwrap();
     let address = [12; 32];
     let mut runtime_validators = ValidatorSet::default();
     runtime_validators.upsert(address, 100);
-    let registrations = ValidatorRegistrations {
-        entries: vec![ValidatorRegistration {
-            address,
-            bls_pubkey: *newcomer.public_key_bytes(),
-            pop_signature: newcomer.prove_possession().to_bytes(),
-        }],
+    let registration = ValidatorRegistration {
+        address,
+        bls_pubkey: *newcomer.public_key_bytes(),
+        pop_signature: newcomer.prove_possession().to_bytes(),
     };
+    let mut registrations = ValidatorRegistrations::default();
+    registrations.insert(address);
     let mut live = LiveTrie::default();
     live.insert(
         VALIDATOR_SET_KEY,
@@ -734,6 +734,10 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     live.insert(
         VALIDATOR_REGISTRATIONS_KEY,
         borsh::to_vec(&registrations).unwrap(),
+    );
+    live.insert(
+        &registration_key(&address),
+        borsh::to_vec(&registration).unwrap(),
     );
     let (mut witness, mut input, _) =
         support::fixture_with_live([1; 8], [4; 32], Vec::new(), 30_000_000, &live);

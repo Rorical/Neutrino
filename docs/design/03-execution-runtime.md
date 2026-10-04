@@ -10,11 +10,15 @@ The runtime supports transfer, stake, unstake, deposit, voluntary exit, withdraw
 BLS validator registration and proof-backed evidence admission. User transactions
 check signatures, nonces, balances and ownership. Runtime parameters determine gas,
 fees, evidence windows, queue capacity and unbonding delays. Validator registration
-and consensus rotation verify possession of registered BLS keys.
+and consensus rotation verify possession of registered BLS keys. Registration records
+are keyed per address behind a compact index of live registrations; a validator that
+has fully withdrawn loses its record, index entry and runtime validator entry, and the
+consensus vector drops the exited identity after the retirement delay.
 
 `SubmitEvidence` is admitted through the verified evidence path rather than ordinary
-mempool precheck. The STF authenticates historical openings and permanently records
-admitted offence IDs. Pending sanctions hold withdrawal collateral. Each block
+mempool precheck. The STF authenticates historical openings and records admitted
+offence IDs for the admission window; each block sweeps the markers its height can no
+longer collide with. Pending sanctions hold withdrawal collateral. Each block
 executes the mandatory FIFO prefix before ordinary transactions, reserving gas.
 Deductions are internal operations, not unsigned user transaction variants.
 

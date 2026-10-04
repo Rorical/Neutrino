@@ -311,6 +311,7 @@ fn validate_candidate_using(
     let next_validators = rotate_from_witness(
         &previous_validators,
         &spec.consensus,
+        spec.runtime.unbonding_delay_blocks,
         context.chunk_id,
         execution.chunk.end_state_root,
         &input.post_state,

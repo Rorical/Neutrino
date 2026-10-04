@@ -108,8 +108,10 @@ impl Fixture {
         witness.context.chain_spec_hash = spec_hash;
         input.evidence_anchor.chain_spec_hash = spec_hash;
         let mut traced = TracingState::new(&live);
-        for key in neutrino_prover_chunk::rotation::witness_keys(&witness.context.active_validators)
-        {
+        for key in neutrino_prover_chunk::rotation::witness_keys_from(
+            &mut traced,
+            &witness.context.active_validators,
+        ) {
             let _ = traced.read(&key);
         }
         witness.blocks[0].output = apply_block(&input, &mut traced);

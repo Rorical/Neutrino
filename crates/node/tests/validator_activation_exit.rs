@@ -32,7 +32,7 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, RegisterValidatorTx, Transaction, UnstakeTx, ValidatorRegistrations,
+    Account, Address, RegisterValidatorTx, Transaction, UnstakeTx, ValidatorRegistration,
     ValidatorSet, account_key, encode_account, register_validator_sig_message, unstake_sig_message,
 };
 use neutrino_node::ChainBackend;
@@ -184,7 +184,7 @@ fn query_validator_set(backend: &ActivationBackend) -> ValidatorSet {
     borsh::from_slice(&resp.payload).expect("decode ValidatorSet")
 }
 
-fn query_validator_registrations(backend: &ActivationBackend) -> ValidatorRegistrations {
+fn query_validator_registrations(backend: &ActivationBackend) -> Vec<ValidatorRegistration> {
     let resp = rt().block_on(async {
         backend
             .runtime_call(
@@ -195,7 +195,7 @@ fn query_validator_registrations(backend: &ActivationBackend) -> ValidatorRegist
             .await
             .expect("runtime_call validator_registrations")
     });
-    borsh::from_slice(&resp.payload).expect("decode ValidatorRegistrations")
+    borsh::from_slice(&resp.payload).expect("decode Vec<ValidatorRegistration>")
 }
 
 /// Build a signed `RegisterValidator` tx funded by `depositor`,
@@ -357,11 +357,8 @@ fn register_validator_activates_after_delay() {
         "runtime validator_set must contain the new validator at the deposited stake",
     );
     let registrations = query_validator_registrations(&backend);
-    assert_eq!(registrations.entries.len(), 1);
-    assert_eq!(
-        registrations.entries[0].bls_pubkey,
-        *new_bls.public_key_bytes()
-    );
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].bls_pubkey, *new_bls.public_key_bytes());
 
     // Bridge ran. Current epoch after chunk 0 = (0+1)/1 = 1.
     // New validator: activation_epoch = 1 + 2 = 3, effective_stake = 0.
@@ -518,7 +515,7 @@ fn register_validator_with_invalid_pop_is_filtered_at_bridge() {
     // The runtime stored the registration:
     let registrations = query_validator_registrations(&backend);
     assert_eq!(
-        registrations.entries.len(),
+        registrations.len(),
         1,
         "runtime accepts the registration regardless of POP validity"
     );

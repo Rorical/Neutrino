@@ -39,7 +39,7 @@ if command -v apt-get >/dev/null; then
   apt-get update -qq
   # libprotobuf-dev carries protoc's standard includes (google/protobuf/*.proto),
   # which sp1-prover-types needs; it is only a recommended package of protobuf-compiler.
-  apt-get install -y -qq build-essential clang cmake curl git libclang-dev libprotobuf-dev libssl-dev pkg-config protobuf-compiler >/dev/null
+  apt-get install -y -qq build-essential clang cmake curl git libclang-dev libprotobuf-dev libssl-dev pkg-config protobuf-compiler time >/dev/null
 fi
 
 echo "== rust toolchain =="
@@ -70,6 +70,14 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}"
 export SP1_PROVER=cuda
 cargo build --locked --release -p neutrino-node -p neutrino-runtime-host --features neutrino-node/cuda
 
+# GNU time reports peak resident memory; degrade gracefully without it.
+if [ -x /usr/bin/time ]; then
+  MEASURE=(/usr/bin/time -v)
+else
+  echo "GNU time not installed; peak memory will not be reported"
+  MEASURE=()
+fi
+
 echo "== gate configuration =="
 # Shared memory-conscious worker settings, then CUDA-specific cache dirs that
 # must never alias CPU caches.
@@ -83,13 +91,13 @@ env | grep -E '^(SP1_|SHARD_|RAYON_|NEUTRINO_|CARGO_TARGET)' | sort
 
 if [ "${SKIP_CPU:-1}" != "1" ]; then
   echo "== cpu consensus gate (upper bound) =="
-  /usr/bin/time -v cargo test --locked --release --workspace --test consensus_chunk \
+  "${MEASURE[@]}" cargo test --locked --release --workspace --test consensus_chunk \
     consensus_guest_real_compressed_recursion -- --ignored --nocapture 2>&1 | tee "$OUT_DIR/cpu-consensus-gate.log"
 fi
 
 echo "== cuda evidence/block/chunk/history gate =="
 START=$(date +%s)
-/usr/bin/time -v cargo test --locked --release -p neutrino-runtime-host --features neutrino-node/cuda \
+"${MEASURE[@]}" cargo test --locked --release -p neutrino-runtime-host --features neutrino-node/cuda \
   --test evidence_pipeline evidence_block_chunk_cuda_compressed_recursion -- --ignored --exact --nocapture \
   2>&1 | tee "$OUT_DIR/cuda-evidence-gate.log"
 echo "cuda gate wall seconds: $(( $(date +%s) - START ))" | tee -a "$OUT_DIR/cuda-evidence-gate.log"

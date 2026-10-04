@@ -464,6 +464,7 @@ impl<DB: Database> Engine<DB> {
                 active_validator_set_root: [0; 32],
             },
             block_guest_vk_digest: key,
+            facts: Vec::new(),
         };
         validate_candidate(&witness).map_err(|_| ProofError::InvalidWitness)?;
         Ok(PreparedConsensusChunk { witness, proofs })

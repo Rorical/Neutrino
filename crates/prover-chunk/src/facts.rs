@@ -307,6 +307,64 @@ signature_verifier!(FactRecorder, |this: &mut FactRecorder, request| this
     .check(request));
 signature_verifier!(FactReader, |this: &mut FactReader, request| this
     .check(&request));
+signature_verifier!(HybridVerifier, |this: &mut HybridVerifier, request| this
+    .check(&request));
+
+/// Answers from recursively authenticated fact statements first and falls
+/// back to in-circuit BLS for anything they do not cover.
+///
+/// This lets a consensus chunk consume signature work that fact proofs
+/// already did ahead of time without making chunk proving wait for them:
+/// uncovered checks still run through the batched pairing path.
+pub struct HybridVerifier {
+    facts: BTreeMap<Hash, bool>,
+    direct: bls::BatchVerifier,
+    hits: usize,
+    misses: usize,
+}
+
+impl HybridVerifier {
+    /// Construct after every statement's receipt has been verified against
+    /// the pinned fact program. Conflicting verdicts for one request are
+    /// rejected as in [`FactReader::new`].
+    pub fn new(statements: &[FactStatement]) -> Result<Self, HistoryError> {
+        let reader = FactReader::new(statements)?;
+        Ok(Self {
+            facts: reader.facts,
+            direct: bls::BatchVerifier::default(),
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    fn check(&mut self, request: &FactRequest) -> bool {
+        if let Some(valid) = self.facts.get(&request.id()) {
+            self.hits += 1;
+            return *valid;
+        }
+        self.misses += 1;
+        request.verify(&mut self.direct).unwrap_or(false)
+    }
+
+    /// Checks answered by fact statements.
+    #[must_use]
+    pub const fn hits(&self) -> usize {
+        self.hits
+    }
+
+    /// Checks that fell back to in-circuit verification.
+    #[must_use]
+    pub const fn misses(&self) -> usize {
+        self.misses
+    }
+
+    /// Settle the batched fallback equations. Must be called before trusting
+    /// any positive answer that came from the fallback path.
+    #[must_use]
+    pub fn finish(self) -> bool {
+        self.direct.finish()
+    }
+}
 impl EvidenceVerifier for FactRecorder {
     fn rejects_block(&mut self, proof: &BlockProof, key: &[u32; 8]) -> Result<bool, HistoryError> {
         let valid = self.check(FactRequest::Block {

@@ -52,6 +52,22 @@ Slashed identities stay seated so their key cannot re-register. The full next
 context is retained by the node. Sanction replay protection is owned by Block STF
 offence markers that live for the admission window; Chunk has no duplicate penalty ledger.
 
+The Chunk witness may carry recursively authenticated Fact statements. The guest
+verifies each receipt under the pinned Fact program and answers covered signature
+checks from them; uncovered checks fall back to the batched in-circuit path, so chunk
+proving never waits for the early fact worker and the committed statement is identical
+either way. The host selects receipts from its verified cache after recording the exact
+requests a chunk performs.
+
+Measured with the opt-in `proof_work_profile` test on 2026-10-04 (single-validator
+fixture, one block, nine signature checks, mock execution, instruction counts not
+proving time): the block guest executes about 67 k instructions for an empty block,
+1.3 M for 128 transfers and 9.9 M for 1,024 transfers; the chunk guest executes about
+30.3 M instructions with in-circuit BLS and about 3.9 M when one Fact statement covers
+all nine checks. Precompile syscalls count as single instructions here, and deferred
+receipt verification is paid in the recursion stage, so these ratios bound the RISC-V
+side only. Real proving time remains unmeasured.
+
 Historical commitments exclude certificate signer subsets; alternative valid quorum
 certificates cannot produce different history roots. The block-proof root commits
 canonical public inputs, not receipt bytes; different valid receipt encodings

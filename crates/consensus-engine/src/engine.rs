@@ -650,6 +650,34 @@ impl<DB: Database> Engine<DB> {
         self.state = reconstructed;
     }
 
+    /// Install and persist the runtime state a fresh genesis engine starts
+    /// from.
+    ///
+    /// The engine is created with an empty trie and the chain spec's
+    /// `genesis_state_root`; callers derive the genesis allocation from the
+    /// same spec and hand it over here so every node materialises identical
+    /// state. Nodes reopening an existing database reload the persisted
+    /// nodes instead.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Corrupt`] when the engine is past genesis or
+    /// `state` does not hash to the committed genesis state root.
+    pub fn install_genesis_state(&mut self, state: Trie) -> Result<(), StoreError<DB::Error>> {
+        if self.head_height != 0 || self.head_hash != self.chain_spec.genesis_block_hash {
+            return Err(StoreError::Corrupt(
+                "genesis state can only be installed at genesis",
+            ));
+        }
+        if state.root() != self.head_state_root {
+            return Err(StoreError::Corrupt(
+                "genesis state does not match the chain spec genesis_state_root",
+            ));
+        }
+        let genesis_hash = self.chain_spec.genesis_block_hash;
+        let root = self.head_state_root;
+        self.commit_materialized_head_with_batch(0, genesis_hash, root, Some(state), Batch::new())
+    }
+
     /// Replace the in-memory active validator set with `new_set` and
     /// persist a snapshot indexed at `effective_at`.
     ///

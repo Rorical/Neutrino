@@ -117,6 +117,8 @@ pub struct Sp1ProofSystem<P: Prover> {
     pub(super) fact_pk: P::ProvingKey,
     pub(super) fact_vk: SP1VerifyingKey,
     pub(super) facts: Mutex<super::fact_cache::FactCache>,
+    /// Signature checks of the most recent chunk answered by fact receipts.
+    pub(super) last_fact_coverage: std::sync::atomic::AtomicU64,
     /// Serializes cache misses across early and evidence workers. Never an engine lock.
     pub(super) fact_proving: Mutex<()>,
     /// Independent evidence guest; no runtime deduction logic is trusted here.
@@ -154,6 +156,7 @@ where
             fact_pk: fact_proving_key,
             fact_vk,
             facts: Mutex::new(facts),
+            last_fact_coverage: std::sync::atomic::AtomicU64::new(0),
             fact_proving: Mutex::new(()),
             ctx,
             evidence_pk: evidence_proving_key,
@@ -555,6 +558,65 @@ where
         Ok(())
     }
 
+    /// Signature checks of the most recently proven chunk that were answered
+    /// by early fact receipts instead of in-circuit BLS.
+    #[must_use]
+    pub fn last_chunk_fact_coverage(&self) -> u64 {
+        self.last_fact_coverage
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Select cached fact receipts covering this chunk's signature checks.
+    ///
+    /// Runs the consensus checks once with a recording verifier (verifying
+    /// natively as it goes), asks the fact cache for receipts covering the
+    /// recorded requests, and returns the witness with those statements
+    /// attached in receipt order. Missing facts are never proven here: the
+    /// guest falls back to in-circuit verification for them, so chunk
+    /// proving never waits on the fact worker.
+    fn attach_fact_receipts(
+        &self,
+        witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
+    ) -> Result<
+        (
+            neutrino_prover_chunk::consensus::ConsensusWitness,
+            Vec<Arc<super::fact_cache::FactReceipt>>,
+        ),
+        ProofError,
+    > {
+        let known = self
+            .facts
+            .lock()
+            .map_err(|_| ProofError::BackendRejected)?
+            .verified();
+        let mut recorder = neutrino_prover_chunk::facts::FactRecorder::with_verified(known);
+        neutrino_prover_chunk::consensus::validate_consensus_using(witness, &mut recorder)
+            .map_err(|_| ProofError::InvalidWitness)?;
+        let requests = recorder.finish().map_err(|_| ProofError::InvalidWitness)?;
+        if requests.iter().any(|(_, valid)| !valid) {
+            return Err(ProofError::InvalidWitness);
+        }
+        let mut wanted: std::collections::BTreeSet<_> =
+            requests.iter().map(|(request, _)| request.id()).collect();
+        let total = wanted.len();
+        let mut receipts = self
+            .facts
+            .lock()
+            .map_err(|_| ProofError::BackendRejected)?
+            .covering(&mut wanted);
+        receipts.truncate(neutrino_prover_chunk::consensus::MAX_CONSENSUS_FACT_STATEMENTS);
+        self.last_fact_coverage.store(
+            u64::try_from(total.saturating_sub(wanted.len())).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut attached = witness.clone();
+        attached.facts = receipts
+            .iter()
+            .map(|receipt| receipt.statement.clone())
+            .collect();
+        Ok((attached, receipts))
+    }
+
     /// Prove the stronger consensus chunk statement with explicit witnesses.
     ///
     /// The node supplies authenticated history and runtime witnesses and both
@@ -572,6 +634,15 @@ where
         {
             return Err(ProofError::PublicInputMismatch);
         }
+        if !witness.facts.is_empty() {
+            // The host owns receipt selection; callers hand over bare witnesses.
+            return Err(ProofError::InvalidWitness);
+        }
+        // Learn which signature checks this chunk performs, then cover as many
+        // as possible with receipts the early fact worker already produced.
+        // Anything uncovered is verified in-circuit by the hybrid verifier.
+        let (witness, fact_receipts) = self.attach_fact_receipts(witness)?;
+        let witness = &witness;
         let expected = neutrino_prover_chunk::consensus::validate_consensus(witness)
             .map_err(|_| ProofError::InvalidWitness)?;
         let mut stdin = SP1Stdin::new();
@@ -585,6 +656,12 @@ where
                 return Err(ProofError::MalformedProof);
             };
             stdin.write_proof(*inner.clone(), self.ctx.vk.vk.clone());
+        }
+        for receipt in &fact_receipts {
+            let SP1Proof::Compressed(inner) = &receipt.bundle.proof else {
+                return Err(ProofError::MalformedProof);
+            };
+            stdin.write_proof(*inner.clone(), self.fact_vk.vk.clone());
         }
         let pk = self
             .chunk_proving_key()

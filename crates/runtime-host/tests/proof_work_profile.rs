@@ -65,10 +65,49 @@ fn transaction_commitment_profile() {
         assert_eq!(chunk_output.as_slice(), borsh::to_vec(
             &neutrino_prover_chunk::consensus::validate_consensus(&witness).unwrap(),
         ).unwrap());
+        // Same chunk with every signature check answered by fact statements:
+        // the guest then only verifies fact receipts recursively.
+        let mut recorder = neutrino_prover_chunk::facts::FactRecorder::default();
+        neutrino_prover_chunk::consensus::validate_consensus_using(&witness, &mut recorder)
+            .unwrap();
+        let requests = recorder.finish().unwrap();
+        let mut covered = witness.clone();
+        covered.facts = requests
+            .chunks(neutrino_prover_chunk::facts::MAX_FACTS)
+            .map(|group| neutrino_prover_chunk::facts::FactStatement {
+                facts: group
+                    .iter()
+                    .map(
+                        |(request, valid)| neutrino_prover_chunk::facts::ProvenFact {
+                            id: request.id(),
+                            valid: *valid,
+                        },
+                    )
+                    .collect(),
+            })
+            .collect();
+        let (hits, misses) = neutrino_prover_chunk::consensus::fact_coverage(&covered).unwrap();
+        assert_eq!(misses, 0);
+        let mut covered_stdin = SP1Stdin::new();
+        covered_stdin.write_vec(borsh::to_vec(&covered).unwrap());
+        let (covered_output, covered_report) = client
+            .execute(
+                neutrino_runtime_host::DEFAULT_CONSENSUS_CHUNK_GUEST_ELF.clone(),
+                covered_stdin,
+            )
+            .deferred_proof_verification(false)
+            .run()
+            .unwrap();
+        assert_eq!(covered_report.exit_code, 0);
+        assert_eq!(covered_output.as_slice(), chunk_output.as_slice());
         eprintln!(
-            "PROFILE transactions={count} witness_bytes={witness_bytes} block_instructions={} chunk_instructions={}",
+            "PROFILE transactions={count} witness_bytes={witness_bytes} block_instructions={} \
+             chunk_instructions_in_circuit_bls={} chunk_instructions_fact_covered={} \
+             signature_checks={hits} fact_statements={}",
             block_report.total_instruction_count(),
-            chunk_report.total_instruction_count()
+            chunk_report.total_instruction_count(),
+            covered_report.total_instruction_count(),
+            covered.facts.len()
         );
     }
 }

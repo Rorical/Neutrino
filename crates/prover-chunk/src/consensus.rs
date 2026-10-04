@@ -48,6 +48,10 @@ pub struct ConsensusWitness {
     pub finality_cert: neutrino_consensus_types::FinalityCert,
     /// Block-program key that each recursive verification must use.
     pub block_guest_vk_digest: [u32; 8],
+    /// Recursively authenticated fact statements covering some or all of the
+    /// signature checks below. The guest verifies each receipt under
+    /// `fact_guest_vk_digest`; uncovered checks fall back to in-circuit BLS.
+    pub facts: Vec<crate::facts::FactStatement>,
 }
 
 /// Native result retaining the full context outside the compact public statement.
@@ -131,15 +135,60 @@ pub fn validate_consensus(input: &ConsensusWitness) -> Result<ConsensusStatement
     Ok(validate_consensus_with_context(input)?.statement)
 }
 
+/// Upper bound on fact statements a chunk witness may carry.
+pub const MAX_CONSENSUS_FACT_STATEMENTS: usize = 64;
+
+/// Build the fact-first verifier for `input`; malformed statements fail closed.
+fn hybrid_verifier(
+    input: &ConsensusWitness,
+) -> Result<crate::facts::HybridVerifier, ConsensusError> {
+    if input.facts.len() > MAX_CONSENSUS_FACT_STATEMENTS {
+        return Err(ConsensusError::History(HistoryError::Evidence));
+    }
+    crate::facts::HybridVerifier::new(&input.facts).map_err(ConsensusError::History)
+}
+
 /// Verify consensus once and retain the ordinary-execution context for the host.
+///
+/// Signature checks covered by `input.facts` are answered from those
+/// statements; the rest are batched in-circuit. The result is identical
+/// either way, so the host may prepare a witness with any subset of facts.
 pub fn validate_consensus_with_context(
     input: &ConsensusWitness,
 ) -> Result<ValidatedConsensus, ConsensusError> {
-    let mut verifier = crate::bls::BatchVerifier::default();
+    let mut verifier = hybrid_verifier(input)?;
+    let validated = validate_consensus_using(input, &mut verifier)?;
+    if !verifier.finish() {
+        return Err(ConsensusError::Finality);
+    }
+    Ok(validated)
+}
+
+/// Fact-coverage report for a witness: how many checks facts answered and
+/// how many still ran in-circuit. Useful for sizing the early fact worker.
+pub fn fact_coverage(input: &ConsensusWitness) -> Result<(usize, usize), ConsensusError> {
+    let mut verifier = hybrid_verifier(input)?;
+    validate_consensus_using(input, &mut verifier)?;
+    let (hits, misses) = (verifier.hits(), verifier.misses());
+    if !verifier.finish() {
+        return Err(ConsensusError::Finality);
+    }
+    Ok((hits, misses))
+}
+
+/// Run every consensus check through `verifier` without settling it.
+///
+/// Callers must settle the verifier afterwards (for batched verifiers) or
+/// otherwise confirm every answer it gave. The host uses this with a
+/// recording verifier to learn which fact requests a chunk needs.
+pub fn validate_consensus_using(
+    input: &ConsensusWitness,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<ValidatedConsensus, ConsensusError> {
     let ValidatedCandidate {
         execution,
         next_validators,
-    } = validate_candidate_using(input, &mut verifier)?;
+    } = validate_candidate_using(input, verifier)?;
     let context = &input.context;
     let spec = &input.chain_spec;
     let chunk = as_chunk(&execution.chunk);
@@ -149,12 +198,9 @@ pub fn validate_consensus_with_context(
         &context.active_validators,
         &chunk,
         &input.finality_cert,
-        &mut verifier,
+        verifier,
     )
     .map_err(|_| ConsensusError::Finality)?;
-    if !verifier.finish() {
-        return Err(ConsensusError::Finality);
-    }
     let vrfs: Vec<_> = input
         .blocks
         .iter()
@@ -232,7 +278,7 @@ pub struct ValidatedCandidate {
 /// Validate a candidate before voting. Finality is checked only by
 /// [`validate_consensus`], which is the guest's entry point.
 pub fn validate_candidate(input: &ConsensusWitness) -> Result<ValidatedCandidate, ConsensusError> {
-    let mut verifier = crate::bls::BatchVerifier::default();
+    let mut verifier = hybrid_verifier(input)?;
     let candidate = validate_candidate_using(input, &mut verifier)?;
     if !verifier.finish() {
         return Err(ConsensusError::Proposer);

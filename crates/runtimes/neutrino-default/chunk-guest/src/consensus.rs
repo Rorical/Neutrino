@@ -24,6 +24,13 @@ fn main() {
         let digest: [u8; 32] = Sha256::digest(&public_values).into();
         sp1_zkvm::lib::verify::verify_sp1_proof(&input.block_guest_vk_digest, &digest);
     }
+    // Fact statements answered signature checks above; authenticate each one
+    // under the pinned fact program in the same order the host attached them.
+    for fact in &input.facts {
+        let public_values = borsh::to_vec(fact).expect("canonical fact statement");
+        let digest: [u8; 32] = Sha256::digest(&public_values).into();
+        sp1_zkvm::lib::verify::verify_sp1_proof(&input.fact_guest_vk_digest, &digest);
+    }
     let output = borsh::to_vec(&statement).expect("canonical consensus statement");
     sp1_zkvm::io::commit_slice(&output);
 }

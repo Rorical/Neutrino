@@ -272,6 +272,7 @@ pub fn fixture_with_live(
             history: neutrino_prover_chunk::history::HistoryWitness::default(),
             finality_cert: cert,
             block_guest_vk_digest: key_digest,
+            facts: Vec::new(),
         },
         input,
         witness,

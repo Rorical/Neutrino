@@ -79,6 +79,11 @@ cargo test --locked --release -p neutrino-runtime-host --features cuda \
   -- --ignored --exact --nocapture
 ```
 
+Before measuring, note the only numbers recorded so far are guest instruction counts
+from `cargo test -p neutrino-runtime-host --test proof_work_profile -- --ignored --nocapture`
+(see design 19): roughly 30 M chunk-guest instructions with in-circuit BLS versus
+4 M when Fact receipts cover the chunk's signature checks. Measure both variants.
+
 Keep those directories to resume an interrupted GPU run; use new directories to
 measure fresh proving latency. The CUDA hardware gate and speed measurements
 remain pending: development here is on a Mac without an NVIDIA GPU. Compilation,

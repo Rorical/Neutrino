@@ -200,3 +200,53 @@ fn finality_requires_complete_authentic_accountability() {
         assert_eq!(validate_consensus(&invalid), Err(ConsensusError::Finality));
     }
 }
+
+#[test]
+fn fact_statements_replace_in_circuit_signature_checks() {
+    use neutrino_prover_chunk::consensus::{fact_coverage, validate_consensus_using};
+    use neutrino_prover_chunk::facts::{FactRecorder, FactStatement, ProvenFact};
+    let (input, _, _) = support::fixture([1; 8], [4; 32]);
+    // Without facts every check runs in-circuit.
+    let (hits, misses) = fact_coverage(&input).unwrap();
+    assert_eq!(hits, 0);
+    assert!(misses > 0, "fixture performs signature checks");
+    // Record the exact requests the chunk performs, as the host does.
+    let mut recorder = FactRecorder::default();
+    validate_consensus_using(&input, &mut recorder).unwrap();
+    let requests = recorder.finish().unwrap();
+    assert!(requests.iter().all(|(_, valid)| *valid));
+    let statement = FactStatement {
+        facts: requests
+            .iter()
+            .map(|(request, valid)| ProvenFact {
+                id: request.id(),
+                valid: *valid,
+            })
+            .collect(),
+    };
+    let mut covered = input.clone();
+    covered.facts = vec![statement.clone()];
+    // Full coverage: no BLS work remains and the statement is unchanged.
+    let (hits, misses) = fact_coverage(&covered).unwrap();
+    assert_eq!(misses, 0);
+    assert_eq!(hits, requests.len());
+    assert_eq!(validate_consensus(&covered), validate_consensus(&input));
+    // Partial coverage still succeeds with the remainder in-circuit.
+    let mut partial = input.clone();
+    partial.facts = vec![FactStatement {
+        facts: statement.facts[..1].to_vec(),
+    }];
+    let (hits, misses) = fact_coverage(&partial).unwrap();
+    assert_eq!(hits, 1);
+    assert_eq!(misses, requests.len() - 1);
+    // A proven negative verdict for a needed check fails the chunk.
+    let mut negative = covered.clone();
+    negative.facts[0].facts[0].valid = false;
+    assert!(validate_consensus(&negative).is_err());
+    // Conflicting verdicts across statements are rejected outright.
+    let mut conflicting = covered;
+    let mut flipped = statement;
+    flipped.facts[0].valid = false;
+    conflicting.facts.push(flipped);
+    assert!(validate_consensus(&conflicting).is_err());
+}

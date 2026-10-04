@@ -424,6 +424,14 @@ where
         Self::mempool_len(self)
     }
 
+    fn peer_count(&self) -> u64 {
+        self.sync_status().map_or(0, |status| status.peer_count())
+    }
+
+    fn is_syncing(&self) -> bool {
+        self.sync_status().is_some_and(|status| status.is_syncing())
+    }
+
     async fn head(&self) -> Result<HeadInfo, QueryError> {
         if let Some(checkpoint) = self.light_checkpoint() {
             let boundary = checkpoint.boundary;

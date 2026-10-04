@@ -1,8 +1,9 @@
 //! Single-node consensus engine state and lifecycle.
 //!
-//! [`Engine`] is the per-node orchestration object. M5 covers
-//! bootstrap (this file) and per-slot block production (later phases
-//! reuse this struct via additional `impl` blocks).
+//! [`Engine`] is the per-node orchestration object. This file covers
+//! bootstrap and read accessors; block production, import, BFT,
+//! finalization and recursion extend the struct through additional
+//! `impl` blocks in sibling modules.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use core::cell::RefCell;
@@ -36,7 +37,7 @@ extern crate alloc;
 /// The engine owns the [`ChainStore`] and exposes typed accessors for
 /// every value consumers might want. Mutating operations (block
 /// production, chunk finalization, checkpoint recursion) live in
-/// follow-on phases of M5.
+/// sibling modules.
 #[derive(Debug)]
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
@@ -51,13 +52,13 @@ pub struct Engine<DB: Database> {
     latest_finalized_chunk_id: Option<ChunkId>,
     recursive_covered_chunks: CheckpointIndex,
     active_validator_set: Vec<Validator>,
-    /// Live chunk-BFT sessions keyed by chunk id, used by the M7
+    /// Live chunk-BFT sessions keyed by chunk id, used by the
     /// multi-validator finality loop. See [`crate::bft_loop`].
     pub(crate) bft_sessions: BTreeMap<ChunkId, BftSession>,
     /// Local validator key used by the BFT loop to sign prevotes and
     /// precommits. Unset on non-voting nodes.
     pub(crate) local_voter: Option<ProposerKey>,
-    /// Equivocation detector for the M7-B slashing pipeline. See
+    /// Equivocation detector for the slashing pipeline. See
     /// [`crate::slashing`].
     pub(crate) slashing_monitor: SlashingMonitor,
     /// Bounded cache of exact native BLS equations, never consensus decisions.
@@ -794,7 +795,7 @@ impl<DB: Database> Engine<DB> {
         Ok(self.slashing_monitor.record_header(source_chunk, header))
     }
 
-    /// Subnet index used by the M7-C aggregator role to route the
+    /// Subnet index used by the aggregator role to route the
     /// aggregated vote for `chunk_id` onto a single
     /// [`neutrino_network::Topic::AggregateFinalityVotes`] subnet.
     ///

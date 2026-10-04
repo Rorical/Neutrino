@@ -1068,9 +1068,10 @@ pub struct StfPublicOutput {
 ///   mutation; the running total is not advanced. Subsequent
 ///   transactions in the same block are still attempted (they may
 ///   have a smaller cost and still fit).
-/// - Failed transactions consume no gas. There is no fee mechanism
-///   yet; charging failures would require debiting an explicit fee
-///   payer, which the wire format does not yet carry.
+/// - Failed transactions consume no gas and pay no fee. Successful
+///   fee-bearing transactions (see [`tx_charges_fee`]) debit
+///   `tx_gas(tx) * input.gas_price` from the sender and credit the
+///   block's fee recipient; `gas_price == 0` disables fees.
 ///
 /// Receipts:
 ///
@@ -2464,7 +2465,7 @@ mod tests {
 
     #[test]
     fn unstake_after_stake_queues_withdrawal_and_empties_validator_set() {
-        // Post-M8: unstake no longer credits balance immediately; it
+        // Unstake does not credit balance immediately; it
         // queues a withdrawal. The validator set still empties at the
         // moment of unstake because the validator's stake drops to
         // zero.

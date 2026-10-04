@@ -1424,7 +1424,7 @@ mod tests {
     const TEST_GENESIS_SEED: [u8; 32] = [0xDD; 32];
     const TEST_IKM: [u8; 32] = [0xAA; 32];
     /// Anchor for the in-test slot clock. Test fixtures use this to
-    /// build header timestamps the post-M5-new import validator
+    /// build header timestamps the import validator
     /// accepts (`abs(header.ts - clock.timestamp_for(slot)) <= 60s`).
     const TEST_GENESIS_TIME: u64 = 1_700_000_000;
 

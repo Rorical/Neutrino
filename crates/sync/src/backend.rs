@@ -410,14 +410,14 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// `/neutrino/finality_votes_prevote/borsh` or
     /// `/neutrino/finality_votes_precommit/borsh`.
     ///
-    /// Default impl drops the vote. M7 BFT backends override this
+    /// Default impl drops the vote. BFT backends override this
     /// to route the vote into the chunk-BFT state machine.
     async fn ingest_finality_vote(&self, _vote: FinalityVote) {}
 
     /// Ingest an aggregate finality vote received via
     /// `/neutrino/aggregate_finality_votes_<subnet>/borsh`.
     ///
-    /// Default impl drops the aggregate. M7 BFT backends override
+    /// Default impl drops the aggregate. BFT backends override
     /// this to merge the aggregate into the per-chunk vote
     /// accumulator.
     async fn ingest_aggregate_finality_vote(&self, _subnet: u8, _vote: FinalityVote) {}
@@ -425,7 +425,7 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Ingest a slashing evidence record received via
     /// `/neutrino/slashing_evidence/borsh`.
     ///
-    /// Default impl drops the evidence. M7 slashing backends
+    /// Default impl drops the evidence. Slashing backends
     /// override this to buffer evidence for runtime application.
     async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {}
 

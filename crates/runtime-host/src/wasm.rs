@@ -123,9 +123,9 @@ impl WasmRuntime {
         evidence_proofs: &[neutrino_consensus_types::evidence::EvidenceArtifact],
     ) -> Result<DryRun, WasmError> {
         crate::evidence::verify_input_receipts(input, evidence_proofs).map_err(codec_err)?;
-        // Cloning the trie is a BTreeMap clone — fine for tests; M5-new
-        // can switch this to a reference-counted snapshot when blocks
-        // grow large.
+        // Cloning the trie is a BTreeMap clone — fine for tests; this
+        // can switch to a reference-counted snapshot when blocks grow
+        // large.
         let host = HostState {
             live: live.clone(),
             scratch: live.trie().clone(),

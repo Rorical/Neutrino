@@ -196,7 +196,7 @@ impl Mempool {
     /// Remove and return the transaction with `hash`, if present.
     ///
     /// Removal is `O(n)` because the pool keeps priority order in a
-    /// contiguous queue; M5 removal volume (one block per slot) is
+    /// contiguous queue; removal volume (one block per slot) is
     /// small enough that linear scans are not worth optimising away.
     pub fn remove(&mut self, hash: &Hash) -> Option<MempoolEntry> {
         if !self.by_hash.remove(hash) {

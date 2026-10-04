@@ -236,9 +236,9 @@ impl From<FinalizedInfo> for FinalizedInfoJson {
 /// JSON shape returned by `system_health`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HealthJson {
-    /// Active libp2p peer count (stub: always 0 today).
+    /// Number of currently connected libp2p peers.
     pub peers: u64,
-    /// `true` if sync FSM is still trailing the network.
+    /// `true` while the sync driver has not reached the live-following state.
     pub is_syncing: bool,
     /// `true` if a WASM runtime is attached and queries are usable.
     pub runtime_available: bool,

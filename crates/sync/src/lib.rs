@@ -23,7 +23,7 @@ pub use backend::{
     CheckpointsImported, ChunkProofImported, EvidenceProofAcceptance, HeadersImported,
     ProofsImported, StateProgress, SyncBackend, SyncBackendError,
 };
-pub use driver::{SyncDriver, SyncDriverConfig};
+pub use driver::{SyncDriver, SyncDriverConfig, SyncStatus};
 pub use error::SyncDriverError;
 
 // Re-export the FSM types so callers do not need to depend on

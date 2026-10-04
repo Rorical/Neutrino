@@ -2209,12 +2209,12 @@ fn build_peer_score_config() -> (gossipsub::PeerScoreParams, gossipsub::PeerScor
 ///
 /// Zeroes out the positive components from libp2p's defaults
 /// (`time_in_mesh`, `first_message_deliveries`,
-/// `mesh_message_deliveries`) because M6 does not yet have meaningful
+/// `mesh_message_deliveries`) because the mesh has no meaningful
 /// signal to reward — every node forwards every message. Negative
 /// components stay active: a single confirmed `Reject` verdict on
 /// `invalid_message_deliveries` is enough to drop the source peer
-/// below `graylist_threshold`. M7 will reintroduce the positive
-/// components once the validator surface gives them real meaning.
+/// below `graylist_threshold`. Positive components can return once
+/// the validator surface gives them real meaning.
 const fn build_topic_score_params() -> gossipsub::TopicScoreParams {
     gossipsub::TopicScoreParams {
         topic_weight: 1.0,

@@ -329,7 +329,7 @@ impl ChunkBft {
     }
 
     /// The currently-accumulated aggregate vote for `phase`, if any
-    /// partial votes have been recorded. Used by the M7-C aggregator
+    /// partial votes have been recorded. Used by the aggregator
     /// role to publish the union-aggregated vote on a subnet topic.
     #[must_use]
     pub fn current_aggregate(&self, phase: FinalityVotePhase) -> Option<AggregatedVote> {

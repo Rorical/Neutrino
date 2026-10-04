@@ -37,67 +37,62 @@ use std::{
 use crate::executor::decode_witness_bundle;
 use crate::{ProgramProver, ProverCtx, Sp1HostError};
 
-/// Wire form of an SP1 block proof.
+/// Largest chunk-proof envelope accepted off the wire.
+const CHUNK_PROOF_WIRE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Declare a borsh wire wrapper around a bincode-serialized
+/// [`SP1ProofWithPublicValues`].
 ///
-/// Borsh-encodes a bincode-serialized [`SP1ProofWithPublicValues`] so
-/// the existing `ProofSystem::BlockProof` trait bound (which requires
-/// borsh) is satisfied while preserving SP1's native serde format on
-/// the inside.
-#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
-pub struct Sp1BlockProof {
-    /// `receipt_codec::encode(&SP1ProofWithPublicValues)` bytes.
-    pub bytes: Vec<u8>,
-}
-
-impl Sp1BlockProof {
-    /// Serialize an SP1 proof bundle for storage on the wire.
-    pub fn from_sp1(proof: &SP1ProofWithPublicValues) -> Result<Self, Sp1HostError> {
-        let bytes =
-            receipt_codec::encode(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
-        Ok(Self { bytes })
-    }
-
-    /// Decode the inner SP1 proof bundle.
-    pub fn to_sp1(&self) -> Result<SP1ProofWithPublicValues, Sp1HostError> {
-        let limit = neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES - 4;
-        if self.bytes.len() > limit {
-            return Err(Sp1HostError::Codec(
-                "block proof exceeds wire limit".to_owned(),
-            ));
+/// Borsh on the outside satisfies the `ProofSystem` associated-type bounds
+/// while the inside keeps SP1's native serde format. `$wire_limit` bounds
+/// the envelope before decoding and `$decode_limit` bounds the decoder.
+macro_rules! sp1_wire_proof {
+    ($(#[$meta:meta])* $name:ident, wire = $wire_limit:expr, decode = $decode_limit:expr $(,)?) => {
+        $(#[$meta])*
+        #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+        pub struct $name {
+            /// `receipt_codec::encode(&SP1ProofWithPublicValues)` bytes.
+            pub bytes: Vec<u8>,
         }
-        receipt_codec::decode::<
-            SP1ProofWithPublicValues,
-            { neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES },
-        >(&self.bytes)
-        .map_err(|err| Sp1HostError::Codec(err.to_string()))
-    }
+
+        impl $name {
+            /// Serialize an SP1 proof bundle for storage on the wire.
+            pub fn from_sp1(proof: &SP1ProofWithPublicValues) -> Result<Self, Sp1HostError> {
+                let bytes = receipt_codec::encode(proof)
+                    .map_err(|err| Sp1HostError::Codec(err.to_string()))?;
+                Ok(Self { bytes })
+            }
+
+            /// Decode the inner SP1 proof bundle, rejecting oversized envelopes.
+            pub fn to_sp1(&self) -> Result<SP1ProofWithPublicValues, Sp1HostError> {
+                if self.bytes.len() > $wire_limit {
+                    return Err(Sp1HostError::Codec(concat!(
+                        stringify!($name),
+                        " exceeds wire limit"
+                    )
+                    .to_owned()));
+                }
+                receipt_codec::decode::<SP1ProofWithPublicValues, { $decode_limit }>(&self.bytes)
+                    .map_err(|err| Sp1HostError::Codec(err.to_string()))
+            }
+        }
+    };
 }
 
-/// Wire form of an SP1 chunk-aggregator proof.
-///
-/// Parallel to [`Sp1BlockProof`] but produced by the
-/// complete consensus chunk guest. Public values
-/// are a borsh-encoded
-/// [`neutrino_prover_chunk::consensus::ConsensusStatement`].
-#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
-pub struct Sp1ChunkProof {
-    /// `receipt_codec::encode(&SP1ProofWithPublicValues)` bytes.
-    pub bytes: Vec<u8>,
+sp1_wire_proof! {
+    /// Wire form of an SP1 block proof produced by the default-runtime guest.
+    /// Public values are a borsh-encoded [`StfPublicOutput`].
+    Sp1BlockProof,
+    wire = neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES - 4,
+    decode = neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES,
 }
 
-impl Sp1ChunkProof {
-    /// Serialize an SP1 chunk-aggregator proof bundle for the wire.
-    pub fn from_sp1(proof: &SP1ProofWithPublicValues) -> Result<Self, Sp1HostError> {
-        let bytes =
-            receipt_codec::encode(proof).map_err(|err| Sp1HostError::Codec(err.to_string()))?;
-        Ok(Self { bytes })
-    }
-
-    /// Decode the inner SP1 proof bundle.
-    pub fn to_sp1(&self) -> Result<SP1ProofWithPublicValues, Sp1HostError> {
-        receipt_codec::decode::<SP1ProofWithPublicValues, { 8 * 1024 * 1024 }>(&self.bytes)
-            .map_err(|err| Sp1HostError::Codec(err.to_string()))
-    }
+sp1_wire_proof! {
+    /// Wire form of an SP1 complete consensus chunk proof. Public values are a
+    /// borsh-encoded [`neutrino_prover_chunk::consensus::ConsensusStatement`].
+    Sp1ChunkProof,
+    wire = CHUNK_PROOF_WIRE_LIMIT,
+    decode = CHUNK_PROOF_WIRE_LIMIT,
 }
 
 #[derive(Clone)]

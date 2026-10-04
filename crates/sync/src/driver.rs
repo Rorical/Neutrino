@@ -17,6 +17,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use neutrino_network::rpc::{
@@ -24,7 +25,7 @@ use neutrino_network::rpc::{
     RpcProtocol, RpcRequest, RpcResponse, StateByRootRequest,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
-use neutrino_network::sync::{SyncCommand, SyncEvent, SyncMachine, SyncMode};
+use neutrino_network::sync::{SyncCommand, SyncEvent, SyncMachine, SyncMode, SyncState};
 use neutrino_network::topic::Topic;
 use neutrino_primitives::StateRoot;
 use tokio::sync::{mpsc, oneshot};
@@ -68,6 +69,53 @@ const PENDING_PROOF_BUFFER_LIMIT: usize = 256;
 /// while bounding memory even if distinct peers continuously churn.
 const HISTORY_PROVIDER_ATTEMPT_LIMIT: usize = 256;
 
+/// Live sync summary shared with observers outside the driver task, such as
+/// the `system_health` RPC. Cloning shares the same underlying counters.
+#[derive(Clone, Debug)]
+pub struct SyncStatus(Arc<SyncStatusInner>);
+
+#[derive(Debug)]
+struct SyncStatusInner {
+    peers: AtomicU64,
+    syncing: AtomicBool,
+}
+
+impl Default for SyncStatus {
+    /// Before the driver publishes anything the node has no peers and has
+    /// not reached [`SyncState::Following`], so it reports as syncing.
+    fn default() -> Self {
+        Self(Arc::new(SyncStatusInner {
+            peers: AtomicU64::new(0),
+            syncing: AtomicBool::new(true),
+        }))
+    }
+}
+
+impl SyncStatus {
+    /// Number of currently connected libp2p peers.
+    #[must_use]
+    pub fn peer_count(&self) -> u64 {
+        self.0.peers.load(Ordering::Relaxed)
+    }
+
+    /// `true` until the sync FSM reaches [`SyncState::Following`]; a
+    /// [`SyncState::Stalled`] driver also reports `true` because it is not
+    /// tracking the live head.
+    #[must_use]
+    pub fn is_syncing(&self) -> bool {
+        self.0.syncing.load(Ordering::Relaxed)
+    }
+
+    fn publish(&self, peers: usize, state: &SyncState) {
+        self.0
+            .peers
+            .store(u64::try_from(peers).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.0
+            .syncing
+            .store(!matches!(state, SyncState::Following), Ordering::Relaxed);
+    }
+}
+
 /// Stage 5 sync driver — the engine-side bridge between the libp2p
 /// network service and the sync state machine.
 pub struct SyncDriver {
@@ -77,6 +125,8 @@ pub struct SyncDriver {
     bft: bft::BftSync,
     availability: availability::AvailabilitySync,
     fsm: SyncMachine,
+    /// Observer-facing summary refreshed on every loop iteration.
+    status: SyncStatus,
     backend: Arc<dyn SyncBackend>,
     cmd_tx: mpsc::Sender<NetworkCommand>,
     event_rx: mpsc::Receiver<NetworkEvent>,
@@ -127,6 +177,7 @@ impl SyncDriver {
             bft: bft::BftSync::default(),
             availability: availability::AvailabilitySync::default(),
             fsm,
+            status: SyncStatus::default(),
             backend,
             cmd_tx,
             event_rx,
@@ -150,10 +201,24 @@ impl SyncDriver {
         &self.fsm
     }
 
+    /// Shared handle reporting peer count and sync progress. Remains valid
+    /// after the driver is moved into its task.
+    #[must_use]
+    pub fn status(&self) -> SyncStatus {
+        self.status.clone()
+    }
+
+    fn publish_status(&self) {
+        self.status
+            .publish(self.connected_peers.len(), self.fsm.state());
+    }
+
     /// Drive the loop until the network event channel closes.
     pub async fn run(mut self) -> Result<(), SyncDriverError> {
         let mut retry = tokio::time::interval(Duration::from_secs(5));
         loop {
+            // Reflect the state left by the previous iteration before blocking.
+            self.publish_status();
             tokio::select! {
                 _ = retry.tick() => {
                     availability::on_retry(&mut self).await;
@@ -1553,5 +1618,30 @@ fn rpc_reply<T>(
             };
             RpcResponse::Error { protocol, error }
         }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn default_status_reports_no_peers_and_syncing() {
+        let status = SyncStatus::default();
+        assert_eq!(status.peer_count(), 0);
+        assert!(status.is_syncing());
+    }
+
+    #[test]
+    fn publish_shares_state_across_clones() {
+        let status = SyncStatus::default();
+        let observer = status.clone();
+        status.publish(3, &SyncState::Following);
+        assert_eq!(observer.peer_count(), 3);
+        assert!(!observer.is_syncing());
+
+        status.publish(0, &SyncState::Init);
+        assert_eq!(observer.peer_count(), 0);
+        assert!(observer.is_syncing());
     }
 }

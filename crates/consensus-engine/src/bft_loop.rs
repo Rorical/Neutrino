@@ -1204,7 +1204,7 @@ mod tests {
         let vs_root = validator_set_root(&validators);
         let genesis_block_hash: BlockHash = [0xAA; 32];
 
-        // M7-C: keep the foundational session tests deterministic by
+        // Keep the foundational session tests deterministic by
         // pinning `expected_aggregators_per_round` to a value so
         // small that no validator clears the VRF threshold. Tests
         // that want aggregator behaviour build their own spec via

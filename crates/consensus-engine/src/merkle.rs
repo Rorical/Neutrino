@@ -1,7 +1,7 @@
 //! Binary Merkle root over BLAKE3 used for header and chunk
 //! commitments.
 //!
-//! M5 uses a simple unbalanced binary tree: leaves are 32-byte
+//! Commitments use a simple unbalanced binary tree: leaves are 32-byte
 //! BLAKE3 digests, internal nodes are `BLAKE3(left || right)`, and an
 //! odd leaf at any level is promoted unchanged to the next level. The
 //! commitment for an empty list is [`EMPTY_MERKLE_ROOT`].

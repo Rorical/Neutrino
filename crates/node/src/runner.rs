@@ -133,10 +133,8 @@ async fn run_with_prover<P: ProgramProver + 'static>(
     config: NodeConfig,
     build_prover: impl FnOnce() -> Result<P, Sp1HostError>,
 ) -> Result<(), NodeError> {
-    // Every node now requires a `chain_spec_path`; the stub fallback
-    // from earlier M6 bring-up was removed once the persistent
-    // ChainBackend stabilised. Misconfigured deployments must fail
-    // loudly instead of silently running an unreachable chain.
+    // Every node requires a `chain_spec_path`. Misconfigured deployments
+    // must fail loudly instead of silently running an unreachable chain.
     let Some(chain_spec_path) = config.chain_spec_path.clone() else {
         return Err(NodeError::ChainSpec(ChainSpecError::Validation(
             "chain_spec_path is required; the stub backend was removed".to_owned(),
@@ -343,7 +341,7 @@ async fn run_with_prover<P: ProgramProver + 'static>(
     }
     let producer_job = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
-    let backend: Arc<dyn SyncBackend> = concrete_backend;
+    let backend: Arc<dyn SyncBackend> = Arc::clone(&concrete_backend) as Arc<dyn SyncBackend>;
 
     let local_progress = backend
         .local_progress()
@@ -360,6 +358,8 @@ async fn run_with_prover<P: ProgramProver + 'static>(
         cmd_tx.clone(),
         event_rx,
     );
+    concrete_backend.set_sync_status(driver.status());
+    drop(concrete_backend);
     tasks.spawn(async move {
         if let Err(error) = driver.run().await {
             warn!(%error, "sync driver stopped with an error");

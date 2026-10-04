@@ -25,6 +25,10 @@ pub(super) struct Harness {
     pub(super) events: mpsc::Sender<NetworkEvent>,
     commands: mpsc::Receiver<NetworkCommand>,
     deferred: std::collections::VecDeque<(PeerId, RpcRequest, Reply)>,
+    /// Per-peer `Status` the harness advertises. Every reply path reads the
+    /// same entry so a refreshed peer never flaps back to the default status,
+    /// which would reset the driver's canonical cursor.
+    statuses: std::collections::BTreeMap<PeerId, Status>,
     runner: tokio::task::JoinHandle<Result<(), neutrino_sync::SyncDriverError>>,
     blocks: Vec<Block>,
     pub(super) candidate: BftCandidate,
@@ -103,6 +107,7 @@ impl Harness {
             events,
             commands,
             deferred: std::collections::VecDeque::new(),
+            statuses: std::collections::BTreeMap::new(),
             runner: tokio::spawn(driver.run()),
             blocks,
             candidate,
@@ -130,15 +135,19 @@ impl Harness {
         }
     }
 
+    fn status_for(&self, peer: &PeerId) -> Status {
+        self.statuses.get(peer).copied().unwrap_or_else(|| Status {
+            chain_id: 1,
+            ..Status::default()
+        })
+    }
+
     pub(super) async fn request(&mut self) -> (PeerId, RpcRequest, Reply) {
         loop {
             let (peer, request, reply) = self.raw_request().await;
             if matches!(request, RpcRequest::Status(_)) {
                 reply
-                    .send(Ok(RpcResponse::Status(Status {
-                        chain_id: 1,
-                        ..Status::default()
-                    })))
+                    .send(Ok(RpcResponse::Status(self.status_for(&peer))))
                     .unwrap();
             } else {
                 return (peer, request, reply);
@@ -156,10 +165,7 @@ impl Harness {
         assert!(matches!(request, RpcRequest::Status(_)));
         // No ordinary canonical backfill is needed. The candidate is a different availability path.
         reply
-            .send(Ok(RpcResponse::Status(Status {
-                chain_id: 1,
-                ..Status::default()
-            })))
+            .send(Ok(RpcResponse::Status(self.status_for(&peer))))
             .unwrap();
     }
 
@@ -188,12 +194,8 @@ impl Harness {
                     request: RpcRequest::Status(_),
                     response_tx,
                 } => {
-                    let _ = peer;
                     response_tx
-                        .send(Ok(RpcResponse::Status(Status {
-                            chain_id: 1,
-                            ..Status::default()
-                        })))
+                        .send(Ok(RpcResponse::Status(self.status_for(&peer))))
                         .unwrap();
                 }
                 NetworkCommand::SendRpcRequest {
@@ -207,6 +209,8 @@ impl Harness {
     }
 
     async fn refresh_candidate_status(&mut self, peer: PeerId) {
+        let refreshed = self.backend.inner.lock().unwrap().status;
+        self.statuses.insert(peer, refreshed);
         let announcement = neutrino_network::rpc::CheckpointAnnouncement {
             covered_chunks: 0,
             checkpoint_hash: [0; 32],
@@ -238,13 +242,14 @@ impl Harness {
                     request: RpcRequest::Status(_),
                     response_tx,
                 } => {
-                    assert_eq!(owner, peer);
+                    // Other peers may be re-handshaked concurrently; answer them
+                    // consistently and keep waiting for the refreshed peer.
                     response_tx
-                        .send(Ok(RpcResponse::Status(
-                            self.backend.inner.lock().unwrap().status,
-                        )))
+                        .send(Ok(RpcResponse::Status(self.status_for(&owner))))
                         .unwrap();
-                    answered = true;
+                    if owner == peer {
+                        answered = true;
+                    }
                 }
                 NetworkCommand::SendRpcRequest {
                     peer,

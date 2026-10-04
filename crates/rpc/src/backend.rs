@@ -209,14 +209,14 @@ pub trait RpcBackend: Send + Sync + 'static {
     /// Number of transactions currently buffered in the mempool.
     fn mempool_len(&self) -> usize;
 
-    /// Local peer count. Stubbed to 0 until the network service grows
-    /// a peer-info channel.
+    /// Number of currently connected peers. Backends without a network
+    /// service report `0`.
     fn peer_count(&self) -> u64 {
         0
     }
 
-    /// Whether the sync FSM still trails the network. Stubbed to
-    /// `false` for the M6 single-node setup.
+    /// Whether the sync driver still trails the network. Backends without
+    /// a sync driver report `false`.
     fn is_syncing(&self) -> bool {
         false
     }

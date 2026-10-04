@@ -558,7 +558,7 @@ pub fn verify_proof_signing_attribution(
 /// set), unsigned (no bits set), or carries an aggregation-bit
 /// vector whose length disagrees with the active validator set.
 ///
-/// Used by the M7-B detector to recover an [`IndexedVote`] from a
+/// Used by the equivocation detector to recover an [`IndexedVote`] from a
 /// gossiped partial vote so equivocation can be attributed to a
 /// specific validator.
 #[must_use]

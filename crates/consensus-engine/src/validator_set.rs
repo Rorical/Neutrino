@@ -2,7 +2,7 @@
 //! computations.
 //!
 //! The doc-level definition is "Merkle root of `(pubkey, stake, status)`
-//! records over the active set". For M5 we commit to the canonical
+//! records over the active set". The engine commits to the canonical
 //! borsh encoding of the full validator vector via BLAKE3, which is
 //! collision-equivalent to a Merkle tree over its leaves for the
 //! single-list use case and trivial to recompute deterministically.

@@ -64,6 +64,7 @@ use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, State
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
 use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 use neutrino_storage::{Column, Database};
+use neutrino_sync::SyncStatus;
 use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
     SyncBackend, SyncBackendError,
@@ -117,6 +118,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// `None` disables the BFT loop's broadcast side; the backend
     /// still ingests peer votes into the engine but emits no traffic.
     network_publisher: Mutex<Option<mpsc::Sender<NetworkCommand>>>,
+    /// Live peer/sync summary published by the running [`neutrino_sync::SyncDriver`].
+    sync_status: Mutex<Option<SyncStatus>>,
     /// Local validator key used to sign BFT votes and act as the
     /// `voter` argument to [`Engine::finalize_chunk`]. Wrapped in an
     /// [`Arc`] so async tasks can hold a snapshot without re-locking.
@@ -298,6 +301,7 @@ where
             deferred_bft_votes: Mutex::new(Vec::new()),
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
+            sync_status: Mutex::new(None),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(slashing_pool),
             block_executor: Mutex::new(None),
@@ -389,6 +393,24 @@ where
         self.block_executor
             .lock()
             .expect("ChainBackend block_executor poisoned")
+            .clone()
+    }
+
+    /// Install the sync driver's status handle so RPC health reflects the
+    /// live peer count and sync progress.
+    pub fn set_sync_status(&self, status: SyncStatus) {
+        *self
+            .sync_status
+            .lock()
+            .expect("ChainBackend sync_status poisoned") = Some(status);
+    }
+
+    /// Installed sync status handle, if a driver has published one.
+    #[must_use]
+    pub fn sync_status(&self) -> Option<SyncStatus> {
+        self.sync_status
+            .lock()
+            .expect("ChainBackend sync_status poisoned")
             .clone()
     }
 
@@ -1022,7 +1044,7 @@ where
 
     /// FSM state of the block at `hash`, if it has been observed.
     ///
-    /// Used by the M5-new production integration test and by
+    /// Used by production integration tests and by
     /// debugging tooling that wants to know whether a block has
     /// progressed past [`BlockState::BlockProduced`].
     pub fn block_state(&self, hash: &BlockHash) -> Option<neutrino_consensus_engine::BlockState> {
@@ -1046,7 +1068,7 @@ where
     }
 
     /// Subnet routing for `chunk_id`'s aggregate finality votes.
-    /// Exposed for the M7-C test harness; production callers stay
+    /// Exposed for the aggregator test harness; production callers stay
     /// inside [`Engine::subnet_for_chunk`].
     pub fn subnet_for_chunk(&self, chunk_id: ChunkId) -> u8 {
         self.with_engine(|e| e.subnet_for_chunk(chunk_id))
@@ -2216,7 +2238,7 @@ where
         // pooling it: a forged claim must not poison the pool that
         // the producer will later include in a block body. The
         // ingest path does *not* re-gossip — gossipsub handles
-        // mesh-wide propagation and the M7-B detector already
+        // mesh-wide propagation and the equivocation detector already
         // gossipped locally-detected items via
         // `pool_and_gossip_slashing`.
         let accepted = self.with_engine(|engine| {

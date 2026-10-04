@@ -202,6 +202,7 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
     );
     let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
     concrete_backend.set_proving_concurrency(config.proving.concurrency);
+    concrete_backend.set_backlog_policy(config.proving.backlog_policy());
     if config.role == NodeRole::LightClient {
         let (spec, domain) = concrete_backend
             .history_profile()

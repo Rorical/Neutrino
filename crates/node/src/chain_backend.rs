@@ -123,6 +123,10 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     sync_status: Mutex<Option<SyncStatus>>,
     /// Proving counters and latencies exported by the metrics endpoint.
     metrics: Arc<crate::metrics::NodeMetrics>,
+    /// Stalled-prover backpressure policy from `[proving]`.
+    backlog_policy: Mutex<crate::config::BacklogPolicy>,
+    /// Whether the last check found the history lag over its limit.
+    history_lag_exceeded: std::sync::atomic::AtomicBool,
     /// Local validator key used to sign BFT votes and act as the
     /// `voter` argument to [`Engine::finalize_chunk`]. Wrapped in an
     /// [`Arc`] so async tasks can hold a snapshot without re-locking.
@@ -306,6 +310,8 @@ where
             network_publisher: Mutex::new(None),
             sync_status: Mutex::new(None),
             metrics: Arc::new(crate::metrics::NodeMetrics::default()),
+            backlog_policy: Mutex::new(crate::config::BacklogPolicy::default()),
+            history_lag_exceeded: std::sync::atomic::AtomicBool::new(false),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(slashing_pool),
             block_executor: Mutex::new(None),
@@ -413,6 +419,52 @@ where
     #[must_use]
     pub const fn metrics(&self) -> &Arc<crate::metrics::NodeMetrics> {
         &self.metrics
+    }
+
+    /// Install the stalled-prover backpressure policy.
+    pub fn set_backlog_policy(&self, policy: crate::config::BacklogPolicy) {
+        *self
+            .backlog_policy
+            .lock()
+            .expect("ChainBackend backlog_policy poisoned") = policy;
+    }
+
+    /// Current backpressure policy.
+    #[must_use]
+    pub fn backlog_policy(&self) -> crate::config::BacklogPolicy {
+        *self
+            .backlog_policy
+            .lock()
+            .expect("ChainBackend backlog_policy poisoned")
+    }
+
+    /// Finalized chunks the recursive history prefix trails beyond the
+    /// configured limit, if any. Logs once each time the state flips so a
+    /// stalled prover is visible without flooding the log.
+    #[must_use]
+    pub fn history_lag_exceeded(&self) -> Option<u64> {
+        let policy = self.backlog_policy();
+        let (finalized, covered) = self.with_engine(|engine| {
+            (
+                engine.finalized_next_chunk_id(),
+                engine.recursive_covered_chunks(),
+            )
+        });
+        let exceeded = policy.exceeded(finalized, covered);
+        let was = self
+            .history_lag_exceeded
+            .swap(exceeded.is_some(), std::sync::atomic::Ordering::Relaxed);
+        match (was, exceeded) {
+            (false, Some(lag)) => tracing::warn!(
+                lag,
+                limit = ?policy.max_history_lag_chunks,
+                pause_production = policy.pause_production,
+                "recursive history prover is behind; raw history cannot be pruned"
+            ),
+            (true, None) => tracing::info!("recursive history prover caught up"),
+            _ => {}
+        }
+        exceeded
     }
 
     /// Installed sync status handle, if a driver has published one.
@@ -643,6 +695,9 @@ where
         }
         self.start_evidence_jobs();
         self.start_history_jobs();
+        if self.history_lag_exceeded().is_some() && self.backlog_policy().pause_production {
+            return Ok(None);
+        }
         if self.proof_system.consensus_block_key().is_some()
             && !self.with_engine(|e| {
                 let next_chunk = e

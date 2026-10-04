@@ -150,6 +150,10 @@ pub struct MetricsSnapshot {
     pub mempool: u64,
     /// Live BFT sessions.
     pub bft_sessions: Vec<BftSessionGauge>,
+    /// Configured history lag limit in chunks, if any.
+    pub history_lag_limit: Option<u64>,
+    /// History lag currently exceeds the configured limit.
+    pub history_lag_exceeded: bool,
 }
 
 /// Anything that can be scraped: the chain backend in production, a stub in tests.
@@ -214,6 +218,18 @@ fn render_chain_gauges(out: &mut String, snapshot: &MetricsSnapshot) {
         snapshot
             .finalized_chunks
             .saturating_sub(snapshot.recursive_covered_chunks),
+    );
+    gauge(
+        out,
+        "neutrino_history_lag_limit_chunks",
+        "Configured history lag limit in chunks; 0 when unset.",
+        snapshot.history_lag_limit.unwrap_or(0),
+    );
+    gauge(
+        out,
+        "neutrino_history_lag_exceeded",
+        "1 while the recursive history prover trails beyond its limit.",
+        u8::from(snapshot.history_lag_exceeded),
     );
     gauge(
         out,

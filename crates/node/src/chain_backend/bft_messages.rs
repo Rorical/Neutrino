@@ -98,8 +98,10 @@ where
                         "invalid BFT leader proposal".into(),
                     ));
                 }
-                self.queue_proposal_facts(&proposal);
-                self.with_live_engine_mut(|engine| {
+                // Fact proving is expensive; only authenticated proposals that
+                // the engine accepted may schedule it.
+                let accepted = proposal.clone();
+                let actions = self.with_live_engine_mut(|engine| {
                     engine
                         .observe_bft_proposal(*proposal, now, self.proof_system.as_ref())
                         .map_err(|error| match error {
@@ -115,7 +117,9 @@ where
                             ) => SyncBackendError::NotAvailable(error.to_string()),
                             other => SyncBackendError::Rejected(other.to_string()),
                         })
-                })?
+                })?;
+                self.queue_proposal_facts(&accepted);
+                actions
             }
             BftMessage::Vote(neutrino_consensus_types::BftVote::Nil(vote)) => self
                 .with_live_engine_mut(|engine| {
@@ -124,20 +128,24 @@ where
                         .map_err(|error| SyncBackendError::Rejected(error.to_string()))
                 })?,
             BftMessage::RoundChange(report) => {
-                self.queue_round_change_facts(&report);
-                self.with_live_engine_mut(|engine| {
+                let accepted = report.clone();
+                let actions = self.with_live_engine_mut(|engine| {
                     engine
                         .observe_round_change(report, now)
                         .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-                })?
+                })?;
+                self.queue_round_change_facts(&accepted);
+                actions
             }
             BftMessage::RoundChangeCertificate(certificate) => {
-                self.queue_round_change_certificate_facts(&certificate);
-                self.with_live_engine_mut(|engine| {
+                let accepted = certificate.clone();
+                let actions = self.with_live_engine_mut(|engine| {
                     engine
                         .observe_round_change_certificate(certificate, now)
                         .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-                })?
+                })?;
+                self.queue_round_change_certificate_facts(&accepted);
+                actions
             }
         };
         self.handle_bft_actions(actions).await;

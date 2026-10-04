@@ -54,8 +54,9 @@ Outstanding work:
 - Define erasure-coded DA and sampling if availability guarantees are required.
 - Complete operator tooling, key management, metrics, RPC resource controls,
   managed snapshot export/distribution and runtime-upgrade coordination.
-- Add strict local disk/backlog admission limits for stalled provers if an
-  unconditional storage cap is required; proof lag delays raw-history pruning.
+- `[proving] max_history_lag_chunks` warns and exports `neutrino_history_lag_exceeded`
+  when the recursive history prover stalls, and can pause local block production.
+  An unconditional disk quota still does not exist; proof lag delays raw-history pruning.
 - Implement prover-market/bounty behavior and other currently unsupported interfaces.
 
 This is a development protocol. Wire/database upgrades are incompatible, and the

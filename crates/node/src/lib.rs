@@ -25,7 +25,7 @@ pub mod runner;
 pub use chain_backend::ChainBackend;
 pub use chain_spec::{AccountEntry, ChainSpecError, ChainSpecFile, ValidatorEntry};
 pub use config::{
-    ExecutionLimitsConfig, NodeConfig, NodeRole, PROPOSER_IKM_ENV, ProposerIkmError,
+    BacklogPolicy, ExecutionLimitsConfig, NodeConfig, NodeRole, PROPOSER_IKM_ENV, ProposerIkmError,
     ProposerIkmSource,
 };
 pub use db::{NodeDb, NodeDbError};

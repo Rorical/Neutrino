@@ -20,6 +20,8 @@ where
             (status.peer_count(), status.is_syncing())
         });
         let mempool = u64::try_from(self.mempool_len()).unwrap_or(u64::MAX);
+        let policy = self.backlog_policy();
+        let history_lag_exceeded = self.history_lag_exceeded().is_some();
         self.with_engine(|engine| MetricsSnapshot {
             head_height: engine.head_height(),
             finalized_chunks: engine.finalized_next_chunk_id(),
@@ -44,6 +46,8 @@ where
                     precommit_quorum: session.precommit_quorum,
                 })
                 .collect(),
+            history_lag_limit: policy.max_history_lag_chunks,
+            history_lag_exceeded,
         })
     }
 }

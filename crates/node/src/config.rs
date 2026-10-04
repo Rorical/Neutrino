@@ -526,6 +526,24 @@ query_fuel = 1000000
     }
 
     #[test]
+    fn backlog_policy_parses_validates_and_detects_excess_lag() {
+        let cfg: NodeConfig = toml::from_str(
+            "chain_id = 1\n[proving]\nmax_history_lag_chunks = 4\npause_production_on_history_lag = true\n",
+        )
+        .unwrap();
+        assert!(cfg.proving.validate().is_ok());
+        let policy = cfg.proving.backlog_policy();
+        assert_eq!(policy.exceeded(10, 6), None);
+        assert_eq!(policy.exceeded(11, 6), Some(5));
+        assert!(policy.pause_production);
+        assert_eq!(BacklogPolicy::default().exceeded(1_000, 0), None);
+        let bad: NodeConfig =
+            toml::from_str("chain_id = 1\n[proving]\npause_production_on_history_lag = true\n")
+                .unwrap();
+        assert!(bad.proving.validate().is_err());
+    }
+
+    #[test]
     fn metrics_section_parses_and_defaults_off() {
         let cfg: NodeConfig =
             toml::from_str("chain_id = 1\n[metrics]\nlisten = \"127.0.0.1:9615\"\n").unwrap();
@@ -641,6 +659,16 @@ pub struct ProvingConfig {
     pub concurrency: usize,
     /// Maximum queued plus running blocks, including restart recovery.
     pub capacity: usize,
+    /// Finalized chunks the recursive history prefix may trail before the
+    /// node reports a stalled prover. Raw history is only pruned below the
+    /// recursive prefix, so this lag is what grows disk when provers stall.
+    /// `None` disables the check.
+    pub max_history_lag_chunks: Option<u64>,
+    /// Stop proposing blocks while the history lag exceeds the limit. Off by
+    /// default: a validator that stops proposing hurts liveness, so this is
+    /// an explicit operator choice; the limit alone still warns and exports
+    /// `neutrino_history_lag_exceeded`.
+    pub pause_production_on_history_lag: bool,
 }
 
 impl Default for ProvingConfig {
@@ -650,11 +678,47 @@ impl Default for ProvingConfig {
             cuda_device: None,
             concurrency: 2,
             capacity: 16,
+            max_history_lag_chunks: None,
+            pause_production_on_history_lag: false,
+        }
+    }
+}
+
+/// Backpressure policy for a stalled recursive history prover.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BacklogPolicy {
+    /// Allowed lag in finalized chunks, if any.
+    pub max_history_lag_chunks: Option<u64>,
+    /// Whether exceeding the lag pauses local block production.
+    pub pause_production: bool,
+}
+
+impl BacklogPolicy {
+    /// Lag beyond the limit, if a limit is set and exceeded.
+    #[must_use]
+    pub const fn exceeded(
+        self,
+        finalized_chunks: u64,
+        recursive_covered_chunks: u64,
+    ) -> Option<u64> {
+        let lag = finalized_chunks.saturating_sub(recursive_covered_chunks);
+        match self.max_history_lag_chunks {
+            Some(limit) if lag > limit => Some(lag),
+            _ => None,
         }
     }
 }
 
 impl ProvingConfig {
+    /// The stalled-prover backpressure policy this configuration selects.
+    #[must_use]
+    pub const fn backlog_policy(self) -> BacklogPolicy {
+        BacklogPolicy {
+            max_history_lag_chunks: self.max_history_lag_chunks,
+            pause_production: self.pause_production_on_history_lag,
+        }
+    }
+
     /// Validate budgets and backend support before starting node services.
     ///
     /// # Errors
@@ -666,6 +730,9 @@ impl ProvingConfig {
             || self.capacity > 1024
         {
             return Err("proving requires 1..=64 workers and workers <= capacity <= 1024");
+        }
+        if self.pause_production_on_history_lag && self.max_history_lag_chunks.is_none() {
+            return Err("proving.pause_production_on_history_lag requires max_history_lag_chunks");
         }
         match self.backend {
             ProvingBackend::Cpu if self.cuda_device.is_some() => {

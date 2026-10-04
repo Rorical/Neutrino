@@ -96,6 +96,8 @@ fn print_usage() {
     eprintln!("    concurrency      = 2");
     eprintln!("    capacity         = 16");
     eprintln!("    # cuda_device    = 0                    # CUDA only");
+    eprintln!("    # max_history_lag_chunks = 64          # warn when the history prover stalls");
+    eprintln!("    # pause_production_on_history_lag = false");
     eprintln!();
     eprintln!("    [rpc]");
     eprintln!("    listen           = \"127.0.0.1:9933\"");

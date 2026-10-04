@@ -134,6 +134,22 @@ impl Database for RocksDbDatabase {
         }
         Ok(out)
     }
+
+    fn iter_prefix(&self, column: Column, prefix: &[u8]) -> Result<ColumnSnapshot, Self::Error> {
+        let cf = self.cf(column)?;
+        let mut out = Vec::new();
+        for entry in self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
+            let (key, value) = entry?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push((key.into_vec(), value.into_vec()));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

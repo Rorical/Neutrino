@@ -145,7 +145,8 @@ fn tamper_state_root(mut block: Block, signer: &ProposerKey) -> Block {
     block.header.state_root = [0xFF; 32];
     block.header.signature = [0; 96];
     let header_hash = block.header.hash();
-    block.header.signature = signer.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    block.header.signature =
+        signer.sign_proposer_message(chain_spec(2).consensus_domain(), &header_hash);
     block
 }
 
@@ -156,7 +157,8 @@ fn tamper_gas_used(mut block: Block, signer: &ProposerKey) -> Block {
     block.header.gas_used = block.header.gas_used.wrapping_add(0xDEAD_BEEF);
     block.header.signature = [0; 96];
     let header_hash = block.header.hash();
-    block.header.signature = signer.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    block.header.signature =
+        signer.sign_proposer_message(chain_spec(2).consensus_domain(), &header_hash);
     block
 }
 

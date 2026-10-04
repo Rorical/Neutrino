@@ -582,6 +582,7 @@ where
                     trie,
                 )
                 .map_err(rejected)?;
+            self.reset_block_verdicts();
             *self.bootstrap.lock().expect("bootstrap runtime") = None;
             Ok(())
         })?;

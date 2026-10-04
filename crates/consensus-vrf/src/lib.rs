@@ -18,8 +18,8 @@ use core::fmt;
 use neutrino_consensus_types::Header;
 use neutrino_crypto::{bls::PublicKey, bls::Signature, sha256};
 use neutrino_primitives::{
-    BlsPublicKey, BlsSignature, ChunkId, DOMAIN_AGG_PROOF, FixedU128, Hash, Seed, Slot, Validator,
-    ValidatorIndex,
+    BlsPublicKey, BlsSignature, ChunkId, ConsensusDomain, DOMAIN_AGG_PROOF, FixedU128, Hash, Seed,
+    Slot, Validator, ValidatorIndex,
 };
 use neutrino_vrf::{VrfOutput, is_eligible, verify};
 
@@ -53,8 +53,8 @@ pub struct ProposerClaim<'a> {
     pub stake: u64,
     /// Total active stake for the validator set.
     pub total_stake: u64,
-    /// Chain identifier bound into the VRF message.
-    pub chain_id: u64,
+    /// Complete chain-spec signing domain bound into the VRF message.
+    pub domain: ConsensusDomain,
     /// Latest finalized public seed.
     pub finalized_seed: &'a Seed,
     /// Slot being proposed for.
@@ -156,7 +156,7 @@ pub fn verify_proposer(claim: ProposerClaim<'_>) -> Result<VrfOutput, VrfError> 
     let proof = parse_proof(claim.vrf_proof)?;
     let output = verify(
         &public_key,
-        claim.chain_id,
+        claim.domain,
         claim.finalized_seed,
         claim.slot,
         &proof,
@@ -179,7 +179,7 @@ pub fn verify_proposer(claim: ProposerClaim<'_>) -> Result<VrfOutput, VrfError> 
 pub fn verify_header_proposer(
     header: &Header,
     active_set: &[Validator],
-    chain_id: u64,
+    domain: ConsensusDomain,
     finalized_seed: &Seed,
     expected_proposers_per_slot: FixedU128,
 ) -> Result<ProposerEligibility, VrfError> {
@@ -193,7 +193,7 @@ pub fn verify_header_proposer(
         public_key: &validator.pubkey,
         stake: validator.effective_stake,
         total_stake,
-        chain_id,
+        domain,
         finalized_seed,
         slot: header.slot,
         vrf_proof: &header.vrf_proof,
@@ -367,7 +367,10 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
-    const CHAIN_ID: u64 = 7;
+    const DOMAIN: ConsensusDomain = ConsensusDomain {
+        chain_id: 7,
+        chain_spec_hash: [1; 32],
+    };
     const SEED: Seed = [0x42; 32];
     const SLOT: Slot = 11;
 
@@ -412,14 +415,14 @@ mod tests {
     fn verify_header_accepts_valid_proposer() {
         let sk = secret_key(1);
         let pk = sk.public_key().to_bytes();
-        let (proof, expected_output) = neutrino_vrf::eval(&sk, CHAIN_ID, &SEED, SLOT);
+        let (proof, expected_output) = neutrino_vrf::eval(&sk, DOMAIN, &SEED, SLOT);
         let active_set = [validator(pk, 100)];
         let header = header(0, proof.to_bytes());
 
         let eligibility = verify_header_proposer(
             &header,
             &active_set,
-            CHAIN_ID,
+            DOMAIN,
             &SEED,
             DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
         )
@@ -433,7 +436,7 @@ mod tests {
     fn verify_header_rejects_wrong_seed() {
         let sk = secret_key(2);
         let pk = sk.public_key().to_bytes();
-        let (proof, _) = neutrino_vrf::eval(&sk, CHAIN_ID, &SEED, SLOT);
+        let (proof, _) = neutrino_vrf::eval(&sk, DOMAIN, &SEED, SLOT);
         let mut wrong_seed = SEED;
         wrong_seed[0] ^= 0x01;
         let active_set = [validator(pk, 100)];
@@ -443,7 +446,7 @@ mod tests {
             verify_header_proposer(
                 &header,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 &wrong_seed,
                 DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
             ),
@@ -455,12 +458,12 @@ mod tests {
     fn verify_header_rejects_ineligible_output() {
         let sk = secret_key(3);
         let pk = sk.public_key().to_bytes();
-        let (proof, _) = neutrino_vrf::eval(&sk, CHAIN_ID, &SEED, SLOT);
+        let (proof, _) = neutrino_vrf::eval(&sk, DOMAIN, &SEED, SLOT);
         let active_set = [validator(pk, 100)];
         let header = header(0, proof.to_bytes());
 
         assert_eq!(
-            verify_header_proposer(&header, &active_set, CHAIN_ID, &SEED, 0),
+            verify_header_proposer(&header, &active_set, DOMAIN, &SEED, 0),
             Err(VrfError::NotEligible)
         );
     }
@@ -469,7 +472,7 @@ mod tests {
     fn verify_header_rejects_slashed_or_missing_validator() {
         let sk = secret_key(4);
         let pk = sk.public_key().to_bytes();
-        let (proof, _) = neutrino_vrf::eval(&sk, CHAIN_ID, &SEED, SLOT);
+        let (proof, _) = neutrino_vrf::eval(&sk, DOMAIN, &SEED, SLOT);
         let mut slashed = validator(pk, 100);
         slashed.slashed = true;
 
@@ -477,7 +480,7 @@ mod tests {
             verify_header_proposer(
                 &header(0, proof.to_bytes()),
                 &[slashed],
-                CHAIN_ID,
+                DOMAIN,
                 &SEED,
                 DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
             ),
@@ -487,7 +490,7 @@ mod tests {
             verify_header_proposer(
                 &header(1, proof.to_bytes()),
                 &[validator(pk, 100)],
-                CHAIN_ID,
+                DOMAIN,
                 &SEED,
                 DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
             ),
@@ -499,8 +502,8 @@ mod tests {
     fn seed_fold_from_headers_matches_proof_order() {
         let sk_a = secret_key(5);
         let sk_b = secret_key(6);
-        let (proof_a, _) = neutrino_vrf::eval(&sk_a, CHAIN_ID, &SEED, SLOT);
-        let (proof_b, _) = neutrino_vrf::eval(&sk_b, CHAIN_ID, &SEED, SLOT + 1);
+        let (proof_a, _) = neutrino_vrf::eval(&sk_a, DOMAIN, &SEED, SLOT);
+        let (proof_b, _) = neutrino_vrf::eval(&sk_b, DOMAIN, &SEED, SLOT + 1);
         let header_a = header(0, proof_a.to_bytes());
         let header_b = header(1, proof_b.to_bytes());
 
@@ -577,7 +580,7 @@ mod tests {
     #[test]
     fn verify_proposer_rejects_zero_stake_and_bad_key() {
         let sk = secret_key(9);
-        let (proof, _) = neutrino_vrf::eval(&sk, CHAIN_ID, &SEED, SLOT);
+        let (proof, _) = neutrino_vrf::eval(&sk, DOMAIN, &SEED, SLOT);
         let bad_key: BlsPublicKey = [0x00; 48];
 
         assert_eq!(
@@ -585,7 +588,7 @@ mod tests {
                 public_key: &sk.public_key().to_bytes(),
                 stake: 0,
                 total_stake: 100,
-                chain_id: CHAIN_ID,
+                domain: DOMAIN,
                 finalized_seed: &SEED,
                 slot: SLOT,
                 vrf_proof: &proof.to_bytes(),
@@ -598,7 +601,7 @@ mod tests {
                 public_key: &bad_key,
                 stake: 100,
                 total_stake: 100,
-                chain_id: CHAIN_ID,
+                domain: DOMAIN,
                 finalized_seed: &SEED,
                 slot: SLOT,
                 vrf_proof: &proof.to_bytes(),

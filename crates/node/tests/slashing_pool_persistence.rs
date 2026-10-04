@@ -101,7 +101,7 @@ fn signed_block(
 ) -> Block {
     let body = Body::default();
     let roots = compute_body_roots(&body);
-    let vrf_proof = signer.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
+    let vrf_proof = signer.vrf_eval(spec(2).consensus_domain(), &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
         height,
@@ -121,7 +121,7 @@ fn signed_block(
         signature: [0; 96],
     };
     let header_hash = header.hash();
-    header.signature = signer.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    header.signature = signer.sign_proposer_message(spec(2).consensus_domain(), &header_hash);
     Block { header, body }
 }
 

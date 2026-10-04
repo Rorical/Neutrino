@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::{collections::BTreeMap, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::history::is_recent_history_index;
-use neutrino_consensus_types::{AggregatedVote, ChunkProof, FinalityCert};
+use neutrino_consensus_types::{AggregatedVote, Chunk, ChunkProof, FinalityCert};
 use neutrino_primitives::{ChunkId, Hash};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::{
@@ -430,6 +430,30 @@ impl<DB: Database> Engine<DB> {
             post_state,
             history,
             finality_cert: FinalityCert {
+                // Candidate validation does not inspect finality. The prepared
+                // input receives the authenticated live certificate before proving.
+                proposal: neutrino_consensus_types::BftProposal {
+                    chunk: Chunk {
+                        chunk_id,
+                        start_height: 0,
+                        end_height: 0,
+                        start_state_root: [0; 32],
+                        end_state_root: [0; 32],
+                        start_block_hash: [0; 32],
+                        end_block_hash: [0; 32],
+                        block_hash_root: [0; 32],
+                        block_proof_root: [0; 32],
+                        vrf_proof_root: [0; 32],
+                        active_validator_set_root: [0; 32],
+                        next_validator_set_root: [0; 32],
+                        da_root: [0; 32],
+                    },
+                    round: 0,
+                    proposer_index: 0,
+                    valid_quorum: None,
+                    round_change_certificate: None,
+                    signature: [0; 96],
+                },
                 prevote_attestations: Vec::new(),
                 precommit_attestations: Vec::new(),
                 chunk_id,

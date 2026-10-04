@@ -41,11 +41,17 @@ have passed.
 - Fact Guest compresses exact cryptographic verdicts; batch Evidence Guest proves objective offences. Blocks recursively verify evidence statements using separate proof attachments,
   admit sanctions and execute the mandatory FIFO. Chunks consume proven effects
   and verify complete consensus without repeating STF/evidence work.
-- Complete chunk proofs are the only finalization path. Certificates retain mandatory
-  prevote and precommit attestations. Conflicting prevotes require a separately
+- Complete chunk proofs are the only finalization path. Certificates retain the
+  exact signed round-leader proposal and mandatory prevote/precommit attestations.
+  Nonzero proposals require an authenticated round-change certificate and cannot
+  downgrade its highest QC. Fair leaders, explicit nil phases and growing deadlines
+  drive the live protocol; timeout alone cannot authorize higher-round entry, and
+  nil votes cannot clear a retained value lock. Conflicting prevotes require a separately
   verified quorum strictly between the retained lock round and the new round;
   the current round cannot authorize its own prevotes. Read
-  `docs/design/22-bft-candidate-replacement.md` before changing BFT target selection.
+  `docs/design/22-bft-candidate-replacement.md` before changing BFT leadership,
+  pacing, target selection or recovery. BFT has no configurable round cutoff;
+  checked integer exhaustion cannot reset signing history.
   A separate checkpoint Guest folds Chunk
   receipts and merges adjacent History ranges using Compressed STARK recursion.
   History coverage never gates chunk finality. Read `docs/design/21-recursive-checkpoint-proofs.md`
@@ -59,6 +65,10 @@ have passed.
   complete execution state before durable atomic installation. Archive nodes replay
   sources. BFT/proposer signing journals must be synchronized before signing; never
   bypass journal reservations or discard unfinalized locks during bootstrap.
+- Signed consensus artifacts are authenticated, indexed and exchanged within the
+  current plus eight-chunk evidence window. Read
+  `docs/design/23-evidence-availability.md` before changing evidence retention,
+  discovery or retrieval. Archive retention does not extend admissible consensus history.
 - There is one current protocol format with unversioned types, fields and paths.
   Incompatible development upgrades replace formats directly. Do not introduce
   deprecated variants, compatibility shims, fake recursive proofs or empty-proof
@@ -114,6 +124,10 @@ have passed.
 - Canonical wire codec is `borsh`, not SCALE.
 - Canonical chain hash is BLAKE3 (`primitives::blake3_256`). SHA-256 and
   Keccak-256 exist for compatibility surfaces only.
+- Consensus BLS/VRF signatures derive `ConsensusDomain` from the complete locally
+  authenticated ChainSpec and sign `tag || chain_id LE8 || ChainSpecHash32 || payload`.
+  Equal numeric chain IDs do not authorize cross-spec replay. Signing journals
+  decode the current 56-byte prefix; there is no older-domain fallback.
 - BLS scheme is min-pk POP.
 - Domain tags are prepended by callers, not by the crypto crate. The 16-byte
   `DOMAIN_*` constants live in `crates/primitives/src/lib.rs`.

@@ -84,7 +84,7 @@ fn signed_block_for_slot(slot: u64, parent: BlockHash, height: Height) -> Block 
     let key = proposer();
     let body = Body::default();
     let roots = compute_body_roots(&body);
-    let vrf_proof = key.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
+    let vrf_proof = key.vrf_eval(spec().consensus_domain(), &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
         height,
@@ -104,7 +104,7 @@ fn signed_block_for_slot(slot: u64, parent: BlockHash, height: Height) -> Block 
         signature: [0; 96],
     };
     let header_hash = header.hash();
-    header.signature = key.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    header.signature = key.sign_proposer_message(spec().consensus_domain(), &header_hash);
     Block { header, body }
 }
 

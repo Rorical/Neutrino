@@ -16,14 +16,22 @@ use neutrino_prover_chunk::{
     history::HistoricalChunk,
 };
 
+fn test_domain() -> neutrino_primitives::ConsensusDomain {
+    support::fixture([1; 8], [4; 32])
+        .0
+        .chain_spec
+        .consensus_domain()
+}
+
 fn bad_vrf() -> EvidenceWitness {
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let chunk = as_chunk(&validate_consensus(&input).unwrap().chunk);
     let mut header = input.blocks[0].header.clone();
     header.vrf_proof = [0; 96];
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&input.chain_spec.chain_id.to_le_bytes());
-    message.extend_from_slice(&header.hash());
+    let message = input
+        .chain_spec
+        .consensus_domain()
+        .signing_message(DOMAIN_PROPOSER_SIG, &header.hash());
     header.signature = SecretKey::key_gen(&[42; 32], &[])
         .unwrap()
         .sign(&message)
@@ -122,7 +130,7 @@ fn locked_prevote() -> EvidenceWitness {
         AggregatedVote, FinalityVoteData, FinalityVotePhase, IndexedVote, LockEvidence,
         QuorumCertificate, VoteAttestation,
     };
-    use neutrino_primitives::{BitVec, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE};
+    use neutrino_primitives::BitVec;
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     let signed = |phase, round, hash| {
         let data = FinalityVoteData {
@@ -131,14 +139,7 @@ fn locked_prevote() -> EvidenceWitness {
             round,
             chunk_hash: [hash; 32],
         };
-        let domain = if phase == FinalityVotePhase::Prevote {
-            DOMAIN_PREVOTE
-        } else {
-            DOMAIN_PRECOMMIT
-        };
-        let mut message = Vec::from(domain);
-        message.extend_from_slice(&7_u64.to_le_bytes());
-        message.extend_from_slice(&borsh::to_vec(&data).unwrap());
+        let message = data.signing_message(test_domain());
         IndexedVote {
             data,
             signature: key.sign(&message).to_bytes(),
@@ -155,7 +156,7 @@ fn locked_prevote() -> EvidenceWitness {
         unlock_quorum: None,
         signature: [0; 96],
     };
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key.sign(&claim.signing_message(test_domain())).to_bytes();
     let mut witness = bad_vrf();
     witness.claim = EvidenceClaim::Slash(SlashingEvidence::LockViolation {
         validator_index: 0,
@@ -217,12 +218,74 @@ fn locked_prevote_produces_an_authenticated_batch_statement() {
     assert!(validate_evidence_batch(&batch_input).is_err());
 }
 
+#[test]
+fn equal_chain_ids_do_not_replay_lock_evidence_or_its_authenticated_facts() {
+    let witness = locked_prevote();
+    let mut recorder = FactRecorder::default();
+    let expected = validate_evidence_using(&witness, &mut recorder).unwrap();
+    let checks = recorder.finish().unwrap();
+    let facts = FactWitness {
+        requests: checks.iter().map(|(request, _)| request.clone()).collect(),
+        statement: FactStatement {
+            facts: checks
+                .iter()
+                .map(|(request, valid)| ProvenFact {
+                    id: request.id(),
+                    valid: *valid,
+                })
+                .collect(),
+        },
+    };
+    validate_facts(&facts).unwrap();
+    let mut batch = EvidenceBatchWitness {
+        witnesses: vec![witness],
+        facts: vec![facts.statement],
+        fact_guest_vk_digest: [3; 8],
+    };
+    assert_eq!(validate_evidence_batch(&batch).unwrap().1, vec![expected]);
+    let original = batch.witnesses[0].chain_spec.consensus_domain();
+    batch.witnesses[0]
+        .chain_spec
+        .consensus
+        .bft_round_timeout_base_secs += 1;
+    batch.witnesses[0].chain_spec.validate().unwrap();
+    let other = batch.witnesses[0].chain_spec.consensus_domain();
+    assert_eq!(original.chain_id, other.chain_id);
+    assert_ne!(original.chain_spec_hash, other.chain_spec_hash);
+    assert!(neutrino_prover_chunk::evidence::validate_evidence(&batch.witnesses[0]).is_err());
+    // Exact source-domain equations remain valid facts, but cannot answer any
+    // signature request derived by the Evidence Guest from the other spec.
+    assert!(validate_evidence_batch(&batch).is_err());
+}
+
+fn resign_source_certificate(
+    source: &HistoricalChunk,
+    keys: &[SecretKey],
+) -> neutrino_consensus_types::FinalityCert {
+    let mut certificate = source.finality.clone();
+    certificate.chunk_hash = source.chunk.hash();
+    certificate.active_validator_set_root = source.chunk.active_validator_set_root;
+    certificate.proposal.chunk = source.chunk.clone();
+    let leader = neutrino_consensus_types::bft_leader(
+        7,
+        source.chunk.chunk_id,
+        certificate.round,
+        &source.validators,
+    )
+    .unwrap();
+    certificate.proposal.proposer_index = leader;
+    certificate.proposal.signature = keys[leader as usize]
+        .sign(&certificate.proposal.signing_message(test_domain()))
+        .to_bytes();
+    certificate
+}
+
 fn inactivity_claims() -> [EvidenceWitness; 2] {
     use neutrino_consensus_types::{
         AggregatedVote, FinalityVoteData, FinalityVotePhase, VoteAttestation,
     };
     use neutrino_crypto::bls::aggregate_signatures;
-    use neutrino_primitives::{BitVec, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE};
+    use neutrino_primitives::BitVec;
     use neutrino_prover_chunk::execution::commitment;
     let mut first = bad_vrf();
     let keys: Vec<_> = (20..26)
@@ -240,9 +303,7 @@ fn inactivity_claims() -> [EvidenceWitness; 2] {
         })
         .collect();
     first.source.chunk.active_validator_set_root = commitment(&first.source.validators);
-    let mut certificate = first.source.finality.clone();
-    certificate.chunk_hash = first.source.chunk.hash();
-    certificate.active_validator_set_root = first.source.chunk.active_validator_set_root;
+    let mut certificate = resign_source_certificate(&first.source, &keys);
     let data = |phase| FinalityVoteData {
         chunk_id: 0,
         round: certificate.round,
@@ -250,14 +311,7 @@ fn inactivity_claims() -> [EvidenceWitness; 2] {
         phase,
     };
     let sign = |key: &SecretKey, phase| {
-        let domain = if phase == FinalityVotePhase::Prevote {
-            DOMAIN_PREVOTE
-        } else {
-            DOMAIN_PRECOMMIT
-        };
-        let mut message = Vec::from(domain);
-        message.extend_from_slice(&7_u64.to_le_bytes());
-        message.extend_from_slice(&borsh::to_vec(&data(phase)).unwrap());
+        let message = data(phase).signing_message(test_domain());
         key.sign(&message)
     };
     let aggregate = |phase| {
@@ -289,7 +343,7 @@ fn inactivity_claims() -> [EvidenceWitness; 2] {
                     unlock_quorum: None,
                     signature: [0; 96],
                 };
-                claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+                claim.signature = key.sign(&claim.signing_message(test_domain())).to_bytes();
                 claim
             })
             .collect()

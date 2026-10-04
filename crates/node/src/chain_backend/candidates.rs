@@ -46,6 +46,34 @@ where
                     .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
                 return Ok(candidate);
             }
+            if let Some(cached) = hash.and_then(|hash| {
+                engine
+                    .bft_session(id)
+                    .and_then(|session| session.candidate_by_hash(&hash))
+                    .cloned()
+            }) {
+                let prepared = engine
+                    .prepare_consensus_chunk_on_branch(
+                        id,
+                        cached.end_block_hash,
+                        self.proof_system.as_ref(),
+                    )
+                    .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                let validated =
+                    neutrino_prover_chunk::consensus::validate_candidate(&prepared.witness)
+                        .map_err(|error| SyncBackendError::Rejected(format!("{error:?}")))?;
+                if neutrino_prover_chunk::consensus::as_chunk(&validated.execution.chunk) != cached
+                {
+                    return Err(SyncBackendError::Rejected(
+                        "cached candidate changed".into(),
+                    ));
+                }
+                return Ok(BftCandidate {
+                    chunk: cached,
+                    round: 0,
+                    justification: None,
+                });
+            }
             let prepared = engine
                 .prepare_consensus_chunk(id, self.proof_system.as_ref())
                 .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
@@ -104,8 +132,7 @@ where
                 .chunk_id
                 .checked_add(1)
                 .and_then(|id| id.checked_mul(params.chunk_size));
-            if candidate.round > params.bft_max_round
-                || start != Some(candidate.chunk.start_height)
+            if start != Some(candidate.chunk.start_height)
                 || end != Some(candidate.chunk.end_height)
                 || candidate.chunk.start_state_root != context.pre_state_root
                 || candidate.chunk.active_validator_set_root
@@ -121,7 +148,7 @@ where
             };
             candidate.justification.as_ref().is_none_or(|qc| {
                 neutrino_prover_chunk::slashing::verify_unlock_quorum(
-                    engine.chain_spec().chain_id,
+                    engine.chain_spec().consensus_domain(),
                     &context.active_validators,
                     &vote,
                     qc,
@@ -143,7 +170,6 @@ where
             let validators = engine.active_validator_set();
             let params = &engine.chain_spec().consensus;
             if vote.data.chunk_id != engine.finalized_next_chunk_id()
-                || vote.data.round > params.bft_max_round
                 || usize::try_from(vote.aggregation_bits.bit_len()).ok() != Some(validators.len())
                 || engine
                     .bft_session(vote.data.chunk_id)
@@ -158,7 +184,7 @@ where
                 return false;
             }
             neutrino_prover_chunk::finality::verify_vote(
-                engine.chain_spec().chain_id,
+                engine.chain_spec().consensus_domain(),
                 validators,
                 vote,
                 params,
@@ -184,56 +210,22 @@ where
                 "candidate hint is not bound to the current context".into(),
             ));
         }
-        let actions = self.apply_bft_candidate(candidate, now)?;
+        let actions = self.offer_ready_bft_candidate(candidate, now)?;
         self.handle_bft_actions(actions).await;
+        self.retry_deferred_bft_votes().await;
         Ok(())
     }
 
-    fn apply_bft_candidate(
+    fn offer_ready_bft_candidate(
         &self,
         candidate: &BftCandidate,
         now: u64,
     ) -> Result<Vec<neutrino_consensus_engine::BftAction>, SyncBackendError> {
         self.with_live_engine_mut(|engine| {
-            self.validate_bft_signing_candidate(engine, candidate.chunk.chunk_id)?;
-            let mut effective = candidate.clone();
-            let Some(session) = engine.bft_session(candidate.chunk.chunk_id) else {
-                // Only the authenticated QC or this node's initial round
-                // chooses a fresh session; the remote clock is advisory.
-                effective.round = candidate
-                    .justification
-                    .as_ref()
-                    .map_or(Some(0), |qc| qc.data.round.checked_add(1))
-                    .ok_or_else(|| SyncBackendError::Rejected("candidate round overflow".into()))?;
-                return engine
-                    .retarget_bft_session(&effective, now, self.proof_system.as_ref())
-                    .map_err(|error| SyncBackendError::Rejected(error.to_string()));
-            };
-            let current_round = session.round();
-            if session.precommit_quorum_observed()
-                || (session.chunk_hash() == candidate.chunk.hash()
-                    && candidate
-                        .justification
-                        .as_ref()
-                        .is_none_or(|qc| qc.data.round <= current_round))
-            {
-                // A current-target quorum belongs to the session that is
-                // collecting its precommits. Its advertisement cannot make
-                // peers discard that round before their own timeout.
-                return Ok(Vec::new());
-            }
-            effective.round = if let Some(qc) = &candidate.justification
-                && qc.data.round >= current_round
-            {
-                qc.data.round.checked_add(1)
-            } else {
-                current_round.checked_add(1)
-            }
-            .ok_or_else(|| SyncBackendError::Rejected("candidate round overflow".into()))?;
-            // Engine authenticates the branch and QC again, preserves its lock,
-            // and accepts a bare hint only at this node's own due timeout.
+            // Backfill authenticates and caches an available branch. Only a
+            // signed leader proposal or pacemaker quorum authorizes progression.
             engine
-                .retarget_bft_session(&effective, now, self.proof_system.as_ref())
+                .offer_bft_candidate(candidate, now, self.proof_system.as_ref())
                 .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         })
     }
@@ -243,6 +235,23 @@ where
             return;
         };
         let id = self.with_engine(neutrino_consensus_engine::Engine::finalized_next_chunk_id);
+        // The first publication authenticates the branch. Avoid preparing the
+        // same immutable candidate again for every subsequent vote action.
+        let known_hash = self.with_engine(|engine| {
+            engine
+                .bft_candidate(id)
+                .and_then(|candidate| borsh::to_vec(&candidate).ok())
+                .map(|data| blake3_256(&data))
+        });
+        if known_hash.is_some()
+            && known_hash
+                == *self
+                    .last_candidate_notice
+                    .lock()
+                    .expect("candidate notice mutex")
+        {
+            return;
+        }
         let Ok(response) = self.p2p_bft_candidate(id, None) else {
             return;
         };

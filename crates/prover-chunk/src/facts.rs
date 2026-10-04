@@ -337,12 +337,12 @@ impl EvidenceVerifier for FactReader {
 /// Cryptographic requests available as soon as a BFT vote is observed.
 /// This extraction does not assert membership, quorum, validity or guilt.
 pub fn vote_requests(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[neutrino_primitives::Validator],
     vote: &neutrino_consensus_types::FinalityVote,
 ) -> Vec<FactRequest> {
     let mut requests = Vec::new();
-    let message = crate::slashing::vote_message(chain_id, &vote.data);
+    let message = crate::slashing::vote_message(domain, &vote.data);
     let keys: Vec<_> = validators
         .iter()
         .enumerate()
@@ -370,13 +370,13 @@ pub fn vote_requests(
         };
         requests.push(FactRequest::Signature {
             key: validator.pubkey,
-            message: crate::slashing::vote_message(chain_id, &claim.vote),
+            message: crate::slashing::vote_message(domain, &claim.vote),
             signature: claim.vote_signature,
             possession: false,
         });
         requests.push(FactRequest::Signature {
             key: validator.pubkey,
-            message: claim.signing_message(chain_id),
+            message: claim.signing_message(domain),
             signature: claim.signature,
             possession: false,
         });
@@ -395,7 +395,7 @@ pub fn vote_requests(
                 .collect();
             requests.push(FactRequest::Aggregate {
                 keys,
-                message: crate::slashing::vote_message(chain_id, &quorum.data),
+                message: crate::slashing::vote_message(domain, &quorum.data),
                 signature: quorum.aggregate.signature,
             });
         }
@@ -403,9 +403,50 @@ pub fn vote_requests(
     requests
 }
 
+/// Exact nil signatures available for early cryptographic fact compression.
+pub fn nil_vote_requests(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[neutrino_primitives::Validator],
+    vote: &neutrino_consensus_types::NilVote,
+) -> Vec<FactRequest> {
+    let mut requests = Vec::new();
+    let message = vote.data.signing_message(domain);
+    let keys: Vec<_> = validators
+        .iter()
+        .enumerate()
+        .filter_map(|(index, validator)| {
+            (vote.aggregation_bits.get(u32::try_from(index).ok()?) == Some(true))
+                .then_some(validator.pubkey)
+        })
+        .collect();
+    requests.push(FactRequest::Aggregate {
+        keys,
+        message: message.clone(),
+        signature: vote.signature,
+    });
+    for claim in &vote.attestations {
+        let Some(validator) = validators.get(claim.validator_index as usize) else {
+            continue;
+        };
+        requests.push(FactRequest::Signature {
+            key: validator.pubkey,
+            message: message.clone(),
+            signature: claim.vote_signature,
+            possession: false,
+        });
+        requests.push(FactRequest::Signature {
+            key: validator.pubkey,
+            message: claim.signing_message(domain),
+            signature: claim.signature,
+            possession: false,
+        });
+    }
+    requests
+}
+
 /// Header authentication and VRF facts can be compressed before finality.
 pub fn header_requests(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[neutrino_primitives::Validator],
     seed: &Hash,
     header: &neutrino_consensus_types::Header,
@@ -413,9 +454,7 @@ pub fn header_requests(
     let Some(validator) = validators.get(header.proposer_index as usize) else {
         return Vec::new();
     };
-    let mut message = Vec::from(neutrino_primitives::DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(&header.hash());
+    let message = domain.signing_message(neutrino_primitives::DOMAIN_PROPOSER_SIG, &header.hash());
     alloc::vec![
         FactRequest::Signature {
             key: validator.pubkey,
@@ -425,7 +464,7 @@ pub fn header_requests(
         },
         FactRequest::Signature {
             key: validator.pubkey,
-            message: neutrino_vrf::vrf_message(chain_id, seed, header.slot),
+            message: neutrino_vrf::vrf_message(domain, seed, header.slot),
             signature: header.vrf_proof,
             possession: false
         },

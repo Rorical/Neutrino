@@ -39,9 +39,14 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent transport/fault switches in the fixture.
 struct MockState {
     full_chunk_size: Option<u64>,
     candidate_sync: bool,
+    bft_sync: bool,
+    bft_round: u32,
+    bft_branch_ready: bool,
+    bft_messages: Vec<neutrino_consensus_types::BftMessage>,
     candidate_replacements: Vec<neutrino_consensus_types::BftCandidate>,
     bootstrap_origin: Option<Checkpoint>,
     bootstrap_pending: Option<(StateRoot, Vec<StateItem>)>,
@@ -51,6 +56,8 @@ struct MockState {
     state_fragments: Vec<StateItem>,
     proven_height: u64,
     status: Status,
+    /// Explicit ordinary-head fixture, independent of candidate availability.
+    local_progress_override: Option<LocalProgress>,
     rpc_calls: Vec<String>,
     advance_to_index: CheckpointIndex,
     advance_to_height: Height,
@@ -58,6 +65,10 @@ struct MockState {
     finality_vote_count: u32,
     aggregate_finality_vote_count: u32,
     slashing_evidence_count: u32,
+    availability_enabled: bool,
+    availability_deferred: bool,
+    availability_sources: Vec<neutrino_consensus_types::signed_artifacts::SignedArtifact>,
+    availability_missing: Vec<neutrino_consensus_types::signed_artifacts::SignedArtifactRef>,
     /// Heights for which a block has been imported via
     /// `verify_and_import_gossip_block`. Consulted by
     /// `verify_and_import_block_proofs` when `simulate_block_proof_race`
@@ -77,6 +88,9 @@ struct MockState {
 #[derive(Clone, Default)]
 struct MockBackend {
     candidate_notified: Arc<tokio::sync::Notify>,
+    proofs_notified: Arc<tokio::sync::Notify>,
+    bft_notified: Arc<tokio::sync::Notify>,
+    availability_notified: Arc<tokio::sync::Notify>,
     inner: Arc<Mutex<MockState>>,
 }
 
@@ -149,7 +163,44 @@ impl SyncBackend for MockBackend {
             .unwrap()
             .candidate_replacements
             .push(candidate);
+        self.inner.lock().unwrap().bft_branch_ready = true;
         self.candidate_notified.notify_one();
+        Ok(())
+    }
+    fn supports_bft_message_sync(&self) -> bool {
+        self.inner.lock().unwrap().bft_sync
+    }
+    async fn current_bft_round(&self) -> Option<(ChunkId, u32)> {
+        let state = self.inner.lock().unwrap();
+        state.bft_sync.then_some((0, state.bft_round))
+    }
+    async fn validate_bft_proposal_hint(
+        &self,
+        proposal: &neutrino_consensus_types::BftProposal,
+    ) -> bool {
+        // Transport-only marker. Engine and Guest tests verify actual BLS.
+        proposal.signature[0] == 88 && proposal.chunk.chunk_id == 0
+    }
+    async fn ingest_bft_message(
+        &self,
+        message: neutrino_consensus_types::BftMessage,
+    ) -> Result<(), SyncBackendError> {
+        let mut state = self.inner.lock().unwrap();
+        match &message {
+            neutrino_consensus_types::BftMessage::Proposal(proposal) => {
+                if !state.bft_branch_ready {
+                    return Err(SyncBackendError::NotAvailable("candidate branch".into()));
+                }
+                state.bft_round = proposal.round;
+            }
+            neutrino_consensus_types::BftMessage::RoundChangeCertificate(certificate) => {
+                state.bft_round = certificate.round;
+            }
+            _ => {}
+        }
+        state.bft_messages.push(message);
+        drop(state);
+        self.bft_notified.notify_one();
         Ok(())
     }
     async fn consensus_sync_target(
@@ -177,6 +228,9 @@ impl SyncBackend for MockBackend {
         Ok({
             let (status, endpoint) = {
                 let state = self.inner.lock().unwrap();
+                if let Some(progress) = state.local_progress_override {
+                    return Ok(progress);
+                }
                 (
                     state.status,
                     state
@@ -454,6 +508,7 @@ impl SyncBackend for MockBackend {
         }
         self.inner.lock().unwrap().proofs_imported_count += 1;
         self.inner.lock().unwrap().proven_height = last.height;
+        self.proofs_notified.notify_one();
         Ok(ProofsImported {
             new_proven_height: last.height,
         })
@@ -502,6 +557,76 @@ impl SyncBackend for MockBackend {
 
     async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {
         self.inner.lock().unwrap().slashing_evidence_count += 1;
+    }
+
+    fn supports_signed_artifact_sync(&self) -> bool {
+        self.inner.lock().unwrap().availability_enabled
+    }
+    async fn signed_artifact_source_known(&self, chunk: ChunkId) -> bool {
+        self.inner.lock().unwrap().availability_enabled && chunk == 0
+    }
+    async fn signed_artifact_matches_source(
+        &self,
+        artifact: &neutrino_consensus_types::signed_artifacts::SignedArtifact,
+        chunk: ChunkId,
+    ) -> bool {
+        artifact.chunk_id(1) == Some(chunk)
+    }
+    async fn signed_artifact_by_id(
+        &self,
+        id: Hash,
+    ) -> Result<neutrino_network::rpc::SignedArtifactByIdResponse, SyncBackendError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .availability_sources
+            .iter()
+            .find(|source| source.id() == id)
+            .cloned()
+            .map(|artifact| neutrino_network::rpc::SignedArtifactByIdResponse { artifact })
+            .ok_or_else(|| SyncBackendError::NotAvailable("mock source unavailable".into()))
+    }
+    async fn signed_artifact_inventory(
+        &self,
+        chunk: ChunkId,
+        after: Option<Hash>,
+    ) -> Result<neutrino_network::rpc::SignedArtifactInventoryByChunkResponse, SyncBackendError>
+    {
+        let mut entries: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .availability_sources
+            .iter()
+            .map(neutrino_consensus_types::signed_artifacts::SignedArtifact::reference)
+            .filter(|item| after.is_none_or(|cursor| item.id > cursor))
+            .collect();
+        entries.sort_by_key(|item| item.id);
+        entries.truncate(32);
+        Ok(
+            neutrino_consensus_types::signed_artifacts::SignedArtifactInventory {
+                chunk_id: chunk,
+                entries,
+                next: None,
+            },
+        )
+    }
+    async fn ingest_signed_artifact(
+        &self,
+        source: neutrino_consensus_types::signed_artifacts::SignedArtifact,
+    ) -> neutrino_sync::EvidenceProofAcceptance {
+        if self.inner.lock().unwrap().availability_deferred {
+            return neutrino_sync::EvidenceProofAcceptance::Deferred;
+        }
+        self.inner.lock().unwrap().availability_sources.push(source);
+        self.availability_notified.notify_one();
+        neutrino_sync::EvidenceProofAcceptance::Accepted
+    }
+    async fn missing_vote_artifacts(
+        &self,
+        _vote: &FinalityVote,
+    ) -> Vec<neutrino_consensus_types::signed_artifacts::SignedArtifactRef> {
+        self.inner.lock().unwrap().availability_missing.clone()
     }
 }
 
@@ -941,6 +1066,28 @@ fn sample_chunk_proof(chunk_id: ChunkId, end_height: Height) -> ChunkProof {
     use neutrino_primitives::ZERO_HASH;
     ChunkProof {
         finality_cert: neutrino_consensus_types::FinalityCert {
+            proposal: neutrino_consensus_types::BftProposal {
+                chunk: neutrino_consensus_types::Chunk {
+                    chunk_id,
+                    start_height: 0,
+                    end_height,
+                    start_state_root: ZERO_HASH,
+                    end_state_root: ZERO_HASH,
+                    start_block_hash: ZERO_HASH,
+                    end_block_hash: ZERO_HASH,
+                    block_hash_root: ZERO_HASH,
+                    block_proof_root: ZERO_HASH,
+                    vrf_proof_root: ZERO_HASH,
+                    active_validator_set_root: ZERO_HASH,
+                    next_validator_set_root: ZERO_HASH,
+                    da_root: ZERO_HASH,
+                },
+                round: 0,
+                proposer_index: 0,
+                valid_quorum: None,
+                round_change_certificate: None,
+                signature: [0; 96],
+            },
             prevote_attestations: Vec::new(),
             precommit_attestations: Vec::new(),
             chunk_id,
@@ -1473,7 +1620,7 @@ async fn gossipped_finality_vote_is_routed_to_backend() {
     let handle = tokio::spawn(driver.run());
 
     let vote = sample_finality_vote(7);
-    let encoded = borsh::to_vec(&vote).unwrap();
+    let encoded = borsh::to_vec(&neutrino_consensus_types::BftVote::Value(vote.clone())).unwrap();
     event_tx
         .send(NetworkEvent::GossipMessage {
             propagation_source: random_peer(),
@@ -1521,7 +1668,7 @@ async fn gossipped_aggregate_finality_vote_is_routed_to_backend() {
         .send(NetworkEvent::GossipMessage {
             propagation_source: random_peer(),
             topic: neutrino_network::Topic::AggregateFinalityVotes(3),
-            data: borsh::to_vec(&vote).unwrap(),
+            data: borsh::to_vec(&neutrino_consensus_types::BftVote::Value(vote.clone())).unwrap(),
             message_id: neutrino_network::libp2p::gossipsub::MessageId::from(b"agg".to_vec()),
         })
         .await
@@ -2885,3 +3032,9 @@ async fn bootstrap_success_preserves_nonce_against_an_older_disconnected_respons
 
 #[path = "driver_loop/bft_candidate_backfill.rs"]
 mod bft_candidate_backfill;
+
+#[path = "driver_loop/bft_round_recovery.rs"]
+mod bft_round_recovery;
+
+#[path = "driver_loop/signed_artifact_backfill.rs"]
+mod signed_artifact_backfill;

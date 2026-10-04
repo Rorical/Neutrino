@@ -139,6 +139,22 @@ fn enqueue_query(driver: &mut SyncDriver, peer: PeerId, query: CandidateByChunkR
     driver.candidates.queries.push((peer, query));
 }
 
+pub(super) async fn request_quorum(
+    driver: &mut SyncDriver,
+    peer: PeerId,
+    quorum: &neutrino_consensus_types::QuorumCertificate,
+) {
+    enqueue_query(
+        driver,
+        peer,
+        CandidateByChunkRequest {
+            chunk_id: quorum.data.chunk_id,
+            chunk_hash: Some(quorum.data.chunk_hash),
+        },
+    );
+    drive(driver).await;
+}
+
 pub(super) async fn on_vote(
     driver: &mut SyncDriver,
     peer: PeerId,
@@ -297,6 +313,18 @@ async fn drive(driver: &mut SyncDriver) {
         // Keep advancing a known branch even if availability hints keep the
         // discovery queue continuously nonempty.
         driver.candidates.query_turn = true;
+        // Repeated availability from an unsuccessful provider cannot hold the
+        // first target indefinitely ahead of an obtainable quorum dependency.
+        if let Step::Blocks { hash, .. } | Step::Proofs { hash, .. } = step
+            && let Some(index) = driver
+                .candidates
+                .targets
+                .iter()
+                .position(|target| target.candidate.chunk.hash() == hash)
+        {
+            let attempted = driver.candidates.targets.remove(index);
+            driver.candidates.targets.push(attempted);
+        }
         send(driver, peer, step, rpc).await;
     }
 }
@@ -427,6 +455,7 @@ async fn finish_ready(driver: &mut SyncDriver) {
             .map(|(_, vote)| borsh::object_length(vote).unwrap_or(MAX_VOTE_BYTES))
             .sum();
     }
+    super::bft::retry_pending(driver).await;
 }
 
 pub(super) async fn on_response(

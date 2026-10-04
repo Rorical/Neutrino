@@ -37,7 +37,7 @@ fn successor(
 ) -> neutrino_prover_chunk::consensus::ConsensusWitness {
     use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
     use neutrino_crypto::bls::SecretKey;
-    use neutrino_primitives::{DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG};
+    use neutrino_primitives::DOMAIN_PROPOSER_SIG;
     use neutrino_prover_chunk::{
         consensus::{as_chunk, validate_candidate},
         history::HistoricalChunk,
@@ -67,11 +67,16 @@ fn successor(
     block.header.parent_hash = next.context.parent_block_hash;
     block.header.timestamp = next.chain_spec.consensus.slot_duration_secs * 2;
     block.header.vrf_proof = key
-        .sign(&neutrino_vrf::vrf_message(7, &next.seed, 2))
+        .sign(&neutrino_vrf::vrf_message(
+            next.chain_spec.consensus_domain(),
+            &next.seed,
+            2,
+        ))
         .to_bytes();
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&7_u64.to_le_bytes());
-    message.extend_from_slice(&block.header.hash());
+    let message = next
+        .chain_spec
+        .consensus_domain()
+        .signing_message(DOMAIN_PROPOSER_SIG, &block.header.hash());
     block.header.signature = key.sign(&message).to_bytes();
     block.public_inputs.height = 2;
     block.public_inputs.parent_block_hash = block.header.parent_hash;
@@ -83,15 +88,19 @@ fn successor(
     next.finality_cert.chunk_id = 1;
     next.finality_cert.chunk_hash = chunk.hash();
     next.finality_cert.active_validator_set_root = chunk.active_validator_set_root;
-    for (phase, domain, aggregate) in [
-        (
-            FinalityVotePhase::Prevote,
-            DOMAIN_PREVOTE,
-            &mut next.finality_cert.prevote,
-        ),
+    next.finality_cert.proposal.chunk = chunk.clone();
+    next.finality_cert.proposal.signature = key
+        .sign(
+            &next
+                .finality_cert
+                .proposal
+                .signing_message(next.chain_spec.consensus_domain()),
+        )
+        .to_bytes();
+    for (phase, aggregate) in [
+        (FinalityVotePhase::Prevote, &mut next.finality_cert.prevote),
         (
             FinalityVotePhase::Precommit,
-            DOMAIN_PRECOMMIT,
             &mut next.finality_cert.precommit,
         ),
     ] {
@@ -101,21 +110,23 @@ fn successor(
             chunk_hash: chunk.hash(),
             phase,
         };
-        let mut message = Vec::from(domain);
-        message.extend_from_slice(&7_u64.to_le_bytes());
-        message.extend_from_slice(&borsh::to_vec(&data).unwrap());
+        let message = data.signing_message(next.chain_spec.consensus_domain());
         aggregate.signature = key.sign(&message).to_bytes();
     }
     let prevote = next.finality_cert.prevote_vote();
     let claim = &mut next.finality_cert.prevote_attestations[0];
     claim.vote = prevote.data;
     claim.vote_signature = prevote.signature;
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key
+        .sign(&claim.signing_message(next.chain_spec.consensus_domain()))
+        .to_bytes();
     let data = next.finality_cert.precommit_vote().data;
     let claim = &mut next.finality_cert.precommit_attestations[0];
     claim.vote = data;
     claim.vote_signature = next.finality_cert.precommit.signature;
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key
+        .sign(&claim.signing_message(next.chain_spec.consensus_domain()))
+        .to_bytes();
     next
 }
 

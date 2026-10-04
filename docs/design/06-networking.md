@@ -27,9 +27,86 @@ branch selects its replayed state, canonical index and finality in one atomic ba
 Bounded `BftCandidate` gossip and `CandidateByChunk` RPC advertise available
 unfinalized targets. The driver retains the vote's propagation source, fetches
 unknown candidates and backfills their fixed endpoint through ordinary block/proof
-requests. Advertised rounds are advisory; complete candidate validation and local
-timeout or authenticated quorum rules govern signing. See
+requests. Exact-hash candidate queries can also serve a retained proven branch
+named by an earlier quorum, after validating its complete branch and semantic
+candidate equality. Backfill rotates among bounded targets so repeated Status
+announcements cannot starve the highest-valid-quorum branch. Advertised rounds are
+advisory; only an authenticated designated-leader proposal authorizes value voting.
+Local phase timeouts produce explicit nil votes and signed round-change reports;
+entry into a later round requires a verified round-change certificate. See
 [candidate replacement](22-bft-candidate-replacement.md).
+
+Prevote, precommit and all 16 aggregate-vote subnet topics carry the same
+`BftVote` envelope: `Value(FinalityVote)` or `Nil(NilVote)`. Nil is a separate
+signed position with mandatory individual attestations, never a zero target hash.
+Value and nil share the durable phase reservation. Value votes retain mandatory
+individual attestations, exact block-proof hashes on precommits and any carried
+unlock quorum. Aggregate votes retain complete individual coverage.
+`BftMessages` carries signed leader proposals, either vote form, individual
+round-change reports and round-change certificates. Nonzero-round proposals bind
+their exact certificate and highest-valid quorum; receiving one can authenticate
+catchup even when standalone round-change gossip was lost.
+
+| Gossip payload | Topic | Transmission cap |
+| --- | --- | --- |
+| `BftVote` | `finality_votes_prevote`, `finality_votes_precommit`, `aggregate_finality_votes_<subnet>` | 8 MiB |
+| `BftMessage` | `bft_messages` | 8 MiB |
+| `BftCandidate` | `bft_candidates` | 16 KiB |
+| `SignedArtifactInventory` | `signed_artifacts` | 2 KiB |
+
+The node authenticates value votes before deferring them until their proposal or
+branch arrives. The deferred queue admits at most 128 votes and 8 MiB. Proposal
+backfill retains at most eight authenticated pending proposals; unknown branch
+votes and targets have independent bounded queues. Imported blocks, proofs,
+accepted proposals, startup recovery and authenticated catchup trigger replay.
+
+`BftRoundByChunk` returns the provider's current signed proposal and available
+round-change certificate for the requested unfinalized chunk. A response is an
+availability hint: signatures, designated leader, source chunk, quorum stake,
+highest-valid selection and complete candidate proofs are checked independently.
+Round recovery allows four concurrent requests and tracks at most 256 providers.
+Status events and the five-second network retry timer retry eligible providers
+after a five-second per-provider cooldown, preferring providers tried least
+recently. Empty or unavailable early replies therefore cannot permanently strand
+an older round after a partition heals. A local chunk/round change clears attempt
+cooldowns. Connection generation, monotonic request nonce and exact active request
+identity fence callbacks; an old response cannot release a replacement request.
+
+Signed-source discovery uses `SignedArtifactInventoryByChunk(chunk_id, after)`
+and the `SignedArtifacts` gossip notice. A page contains at most 32 increasing
+content-hash references and an exclusive cursor equal to its last returned hash
+when another page exists. Discovery and accountability admission require the
+authenticated current chunk or one of the preceding eight finalized chunks.
+`SignedArtifactById` fetches the exact immutable source: value/nil votes, quorums,
+proposals, round-change reports/certificates or original block-proof envelopes.
+The ID commits to the entire canonical source bytes, so alternative proof bytes
+are retrieved by their exact ID even when they share the same block and public
+inputs. Returned category, ID, source boundary, signatures and header/proof-input
+bindings are verified before retention and accountability replay. An inventory
+announcement itself proves neither source validity nor an offence.
+
+Exact-source retrieval has at most 128 jobs, 32 jobs per provider, four providers
+per job and four concurrent requests. Each provider gets at most three attempts
+per job; completed responses and transport failures impose a five-second retry
+delay. Connection
+generations, monotonic nonces and exact query tokens fence stale callbacks.
+New local-head availability resets attempt budgets; expired exhausted hints leave
+the queue, and later Status or inventory events can announce availability again.
+Authenticated delayed quorums, votes and original proof bytes revisit dependent
+observations; restart replays durable sources before signing resumes. Optional
+remote retention quotas do not block otherwise valid live BFT admission. Local
+publication requires durable retention of its protected signed sources.
+
+All three RPCs use 64-byte request caps and 15-second transport timeouts.
+`BftRoundByChunk` responses have an 8 MiB cap;
+`SignedArtifactInventoryByChunk` responses have a 2 KiB cap;
+`SignedArtifactById` allows 8 MiB of canonical source bytes plus 16 bytes of response
+framing. BFT and inventory Borsh readers reject excessive counts and lengths before
+allocating collections; signed-source decoding also enforces its total byte cap.
+Full/validator retention compacts superseded unfinalized sources and
+prunes expired historical sources under recursive coverage; archive policy keeps
+the originals. Detection still requires an available copy of the relevant signed
+sources within the offence's admission window.
 
 Every RPC response is a Borsh `Result<Payload, RpcFailure>`: `Unavailable`,
 `Pruned`, `Storage` or `InvalidRequest` failures reach the requester explicitly. Missing
@@ -63,9 +140,10 @@ checkpoint already at the endpoint needs no empty proof, but still checks expiry
 freshness and future slots. Installation resumes sequential sync at that height.
 Archive sync establishes source block and Chunk finality first. Light-client sync
 instead requests an anchored suffix and advances without downloading block history.
-Unavailable or pruned responses try each connected provider at most once for the
-same range and availability event, then wait for a new event. Stale responses never
-release or replace the current request. JSON-RPC clients can subscribe to history-job
+History range recovery tries each connected provider at most once after an
+unavailable or pruned response for the same range and availability event, then
+waits for a new event. Stale responses never release or replace the current request.
+JSON-RPC clients can subscribe to history-job
 completion, including already completed jobs, and reconnect using persisted status.
 
 Metadata advertises `retained_from_chunk` and `retained_from_height` from the

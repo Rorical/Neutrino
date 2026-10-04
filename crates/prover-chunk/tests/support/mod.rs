@@ -6,9 +6,9 @@ use neutrino_consensus_types::{
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::{StfInput, apply_block};
 use neutrino_primitives::{
-    BitVec, BoundedBytes, ChainSpec, ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE,
-    DOMAIN_PROPOSER_SIG, Hash, LightClientParams, ProofParams, RuntimeInfo, RuntimeParams,
-    StateParams, Validator, fixed_u128_from_integer, merkle_root_of_hashes,
+    BitVec, BoundedBytes, ChainSpec, ConsensusParams, DOMAIN_PROPOSER_SIG, Hash, LightClientParams,
+    ProofParams, RuntimeInfo, RuntimeParams, StateParams, Validator, fixed_u128_from_integer,
+    merkle_root_of_hashes,
 };
 use neutrino_prover_chunk::{
     consensus::{ConsensusWitness, as_chunk},
@@ -131,7 +131,11 @@ pub fn fixture_with_live(
         parent_hash: spec.genesis_block_hash,
         proposer_index: 0,
         vrf_proof: key
-            .sign(&neutrino_vrf::vrf_message(7, &spec.genesis_seed, 1))
+            .sign(&neutrino_vrf::vrf_message(
+                spec.consensus_domain(),
+                &spec.genesis_seed,
+                1,
+            ))
             .to_bytes(),
         state_root: output.post_state_root,
         transactions_root: output.transactions_root,
@@ -144,9 +148,9 @@ pub fn fixture_with_live(
         timestamp: spec.consensus.slot_duration_secs,
         signature: [0; 96],
     };
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&7_u64.to_le_bytes());
-    message.extend_from_slice(&header.hash());
+    let message = spec
+        .consensus_domain()
+        .signing_message(DOMAIN_PROPOSER_SIG, &header.hash());
     header.signature = key.sign(&message).to_bytes();
     let pi = BlockProofPublicInputs {
         chain_id: 7,
@@ -202,19 +206,25 @@ pub fn fixture_with_live(
             chunk_hash: chunk.hash(),
             phase,
         };
-        let mut msg = Vec::from(if phase == FinalityVotePhase::Prevote {
-            DOMAIN_PREVOTE
-        } else {
-            DOMAIN_PRECOMMIT
-        });
-        msg.extend_from_slice(&7_u64.to_le_bytes());
-        msg.extend_from_slice(&borsh::to_vec(&data).unwrap());
+        let msg = data.signing_message(spec.consensus_domain());
         AggregatedVote {
             aggregation_bits: BitVec::from_bytes(1, vec![1]).unwrap(),
             signature: key.sign(&msg).to_bytes(),
         }
     };
+    let mut proposal = neutrino_consensus_types::BftProposal {
+        chunk: chunk.clone(),
+        round: 0,
+        proposer_index: 0,
+        valid_quorum: None,
+        round_change_certificate: None,
+        signature: [0; 96],
+    };
+    proposal.signature = key
+        .sign(&proposal.signing_message(spec.consensus_domain()))
+        .to_bytes();
     let mut cert = FinalityCert {
+        proposal,
         prevote_attestations: Vec::new(),
         precommit_attestations: Vec::new(),
         chunk_id: 0,
@@ -232,7 +242,9 @@ pub fn fixture_with_live(
         unlock_quorum: None,
         signature: [0; 96],
     };
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key
+        .sign(&claim.signing_message(spec.consensus_domain()))
+        .to_bytes();
     cert.precommit_attestations.push(claim);
     let mut claim = neutrino_consensus_types::VoteAttestation {
         validator_index: 0,
@@ -242,7 +254,9 @@ pub fn fixture_with_live(
         unlock_quorum: None,
         signature: [0; 96],
     };
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key
+        .sign(&claim.signing_message(spec.consensus_domain()))
+        .to_bytes();
     cert.prevote_attestations.push(claim);
     (
         ConsensusWitness {

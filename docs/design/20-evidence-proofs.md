@@ -1,7 +1,8 @@
 # 20 — Evidence proofs and mandatory sanctions
 
-Status: implemented. The current higher-round BFT format passed workspace checks
-and CUDA-enabled node compilation checks on 2026-10-03. See the
+Status: implemented. Workspace checks for the current nil-vote, authenticated
+round-entry, full ChainSpec signing domain and signed-source availability format
+passed on 2026-10-04. See the
 [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
 Real compressed composition acceptance remains pending as a separate gate.
 History recursion composes completed Chunk statements; it never rechecks evidence offences.
@@ -11,6 +12,11 @@ History recursion composes completed Chunk statements; it never rechecks evidenc
 An independent SP1 fact Guest first compresses exact cryptographic checks. The
 batch evidence Guest recursively verifies these facts and proves objective offences
 using historical membership, signed-artifact bindings and explicit verdicts.
+Consensus BLS signatures and VRFs use `ConsensusDomain` derived from that
+witness's complete authenticated ChainSpec: `tag || chain_id LE8 ||
+chain_spec_hash || payload`. Fact requests include these exact bytes; a verdict
+or signed source from another specification cannot establish a local offence,
+even if both specifications reuse the numeric chain ID and validator keys.
 Its statement binds chain ID and complete chain-spec hash, the historical context, stable offender
 identity and the existing evidence-independent penalty ID. The runtime block
 guest recursively verifies this proof and authenticates the historical opening
@@ -69,7 +75,9 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
 - [x] Node generation, persistent pool, gossip, import and restart paths.
 - [x] Adversarial, lifecycle, queue and native/WASM/Guest parity tests.
 - [x] Locked workspace build and tests, strict Clippy, CUDA-enabled node Clippy
-  and workspace/Guest formatting for the current higher-round BFT format; see the
+  and workspace/Guest formatting for the current nil-vote, authenticated round-entry
+  and signed-source availability format: 1,010 tests passed, six real-proving
+  gates remained ignored; see the
   [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
 - [ ] Real SP1 EvidenceProof → block → chunk → History composition gate: local acceptance
   was cancelled. The upgraded programs require a fresh run on a suitable prover.
@@ -141,6 +149,17 @@ to excuse their precommits. Certificate validity authenticates the declarations
 and carried quorums; proving a violation still requires the earlier signed lock
 evidence. A certificate does not establish that no hidden historical offence exists.
 
+Original signed sources now have durable content-addressed availability. Gossip
+announces bounded inventories; exact RPC retrieval follows proof-envelope
+references and historical lock dependencies. A proof identity remains the exact
+BLAKE3 hash of its canonical signed envelope. Accepted receipts resolve through
+their existing immutable block-proof storage; rejected alternative bytes remain
+available under their distinct identities. Delayed arrival of the earlier lock
+quorum or rejected proof re-evaluates only the related signed votes, including
+after an authenticated restart replay. See
+[signed-source availability](23-evidence-availability.md) for the storage,
+transport and resource contract.
+
 The host's exact-receipt verifier decodes bounded envelopes once and passes the
 proof directly to the SDK's typed verifier. Circuit, successful exit, program
 identity, exact public values and trailing-byte rejection remain mandatory.
@@ -167,6 +186,19 @@ The eighth preceding chunk is admissible; the ninth is rejected even with a vali
 membership proof and signatures. This rule also bounds ordinary embedded votes.
 Pruning never expires an admitted FIFO obligation or removes its current-state
 withdrawal hold or offence replay marker.
+
+Signed-source storage observes the current chunk and those eight preceding
+authenticated chunks. Full/validator retention follows recursive coverage;
+archives can serve older sources without extending evidence admission. The
+bounded forensic cache reserves durable local publication capacity and protects
+actual locks. Live admission counts only the current and preceding-eight chunk
+window; older rows waiting for recursive coverage do not gate BFT publication.
+Total disk use can grow while recursive proving falls behind, and pruning keeps
+the saved-coverage guard. Superseded uninvolved messages from indefinitely unfinalized rounds
+may expire under the explicit local rolling policy. Peer cache deferral does not
+prevent live BFT admission. Availability therefore improves discovery of
+published, retained offences without claiming recovery of hidden signatures or
+unlimited round history on finite storage.
 
 Historical context commits the chunk, membership and seed, independently of a
 certificate's signer subset. Different valid certificates must produce the same

@@ -111,7 +111,7 @@ fn signed_block(
 ) -> Block {
     let body = Body::default();
     let roots = compute_body_roots(&body);
-    let vrf_proof = signer.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
+    let vrf_proof = signer.vrf_eval(spec(2).consensus_domain(), &TEST_GENESIS_SEED, slot);
 
     let mut header = Header {
         height,
@@ -131,7 +131,7 @@ fn signed_block(
         signature: [0; 96],
     };
     let header_hash = header.hash();
-    header.signature = signer.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    header.signature = signer.sign_proposer_message(spec(2).consensus_domain(), &header_hash);
     Block { header, body }
 }
 
@@ -151,7 +151,7 @@ fn partial_vote(
         chunk_hash: [chunk_hash_byte; 32],
         phase,
     };
-    let signature = signer.sign_finality_vote(TEST_CHAIN_ID, &data);
+    let signature = signer.sign_finality_vote(spec(2).consensus_domain(), &data);
     let voter_position = usize::try_from(signer.validator_index()).expect("u32 fits usize");
     let mut bits = BitVec::default();
     for position in 0..active_set_len {
@@ -159,7 +159,7 @@ fn partial_vote(
     }
     FinalityVote {
         attestations: vec![signer.attest_vote(
-            TEST_CHAIN_ID,
+            spec(2).consensus_domain(),
             data.clone(),
             if phase == FinalityVotePhase::Prevote {
                 vec![]
@@ -278,7 +278,32 @@ async fn stale_and_wrong_target_votes_preserve_raw_and_aggregate_attribution() {
             let target_hash = chunk.hash();
             backend.with_engine_mut_for_test(|engine| {
                 engine.open_bft_session_at(chunk, 100).unwrap();
-                engine.tick_bft_round_timeouts(108).unwrap();
+                let reports = (0..2)
+                    .map(|index| {
+                        let signer = proposer(index);
+                        let mut report = neutrino_consensus_types::RoundChange {
+                            chunk_id: 0,
+                            round: 1,
+                            validator_index: u32::from(index),
+                            highest_quorum: None,
+                            signature: [0; 96],
+                        };
+                        report.signature = signer
+                            .sign_raw(&report.signing_message(spec(2).consensus_domain()))
+                            .to_bytes();
+                        report
+                    })
+                    .collect();
+                engine
+                    .observe_round_change_certificate(
+                        neutrino_consensus_types::RoundChangeCertificate {
+                            chunk_id: 0,
+                            round: 1,
+                            reports,
+                        },
+                        108,
+                    )
+                    .unwrap();
                 assert_eq!(engine.bft_session(0).unwrap().round(), 1);
             });
 
@@ -533,9 +558,13 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     let v0 = proposer(0);
     let mut v0_prevote = partial_vote(0, 0, FinalityVotePhase::Prevote, 0xCC, &v0, 3);
     v0_prevote.data.chunk_hash = chunk_hash;
-    v0_prevote.signature = v0.sign_finality_vote(TEST_CHAIN_ID, &v0_prevote.data);
-    v0_prevote.attestations =
-        vec![v0.attest_vote(TEST_CHAIN_ID, v0_prevote.data.clone(), vec![], None)];
+    v0_prevote.signature = v0.sign_finality_vote(spec(3).consensus_domain(), &v0_prevote.data);
+    v0_prevote.attestations = vec![v0.attest_vote(
+        spec(3).consensus_domain(),
+        v0_prevote.data.clone(),
+        vec![],
+        None,
+    )];
     backend.ingest_finality_vote(v0_prevote).await;
 
     // Step 2: v1's prevote crosses 2/3 stake.
@@ -546,9 +575,13 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     // expects. Rebuild with the real chunk_hash.
     let mut v1_prevote = v1_prevote;
     v1_prevote.data.chunk_hash = chunk_hash;
-    v1_prevote.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_prevote.data);
-    v1_prevote.attestations =
-        vec![v1.attest_vote(TEST_CHAIN_ID, v1_prevote.data.clone(), vec![], None)];
+    v1_prevote.signature = v1.sign_finality_vote(spec(3).consensus_domain(), &v1_prevote.data);
+    v1_prevote.attestations = vec![v1.attest_vote(
+        spec(3).consensus_domain(),
+        v1_prevote.data.clone(),
+        vec![],
+        None,
+    )];
 
     backend.ingest_finality_vote(v1_prevote).await;
 
@@ -558,9 +591,10 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     // No slashing should fire here.
     let mut v1_precommit_r0 = partial_vote(0, 0, FinalityVotePhase::Precommit, 0xCC, &v1, 3);
     v1_precommit_r0.data.chunk_hash = chunk_hash;
-    v1_precommit_r0.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r0.data);
+    v1_precommit_r0.signature =
+        v1.sign_finality_vote(spec(3).consensus_domain(), &v1_precommit_r0.data);
     v1_precommit_r0.attestations = vec![v1.attest_vote(
-        TEST_CHAIN_ID,
+        spec(3).consensus_domain(),
         v1_precommit_r0.data.clone(),
         vec![[0x44; 32]],
         None,
@@ -578,9 +612,10 @@ async fn lock_violation_is_synthesised_when_quorum_observed_via_bft_loop() {
     conflicting_hash[0] ^= 0xFF;
     let mut v1_precommit_r1 = partial_vote(0, 1, FinalityVotePhase::Precommit, 0xDD, &v1, 3);
     v1_precommit_r1.data.chunk_hash = conflicting_hash;
-    v1_precommit_r1.signature = v1.sign_finality_vote(TEST_CHAIN_ID, &v1_precommit_r1.data);
+    v1_precommit_r1.signature =
+        v1.sign_finality_vote(spec(3).consensus_domain(), &v1_precommit_r1.data);
     v1_precommit_r1.attestations = vec![v1.attest_vote(
-        TEST_CHAIN_ID,
+        spec(3).consensus_domain(),
         v1_precommit_r1.data.clone(),
         vec![[0x55; 32]],
         None,
@@ -641,6 +676,14 @@ fn historical_record_fixture(
         signature: [0; 96],
     };
     let finality = neutrino_consensus_types::FinalityCert {
+        proposal: neutrino_consensus_types::BftProposal {
+            chunk: chunk.clone(),
+            round: 0,
+            proposer_index: 0,
+            valid_quorum: None,
+            round_change_certificate: None,
+            signature: [0; 96],
+        },
         prevote_attestations: Vec::new(),
         precommit_attestations: Vec::new(),
         chunk_id: chunk.chunk_id,
@@ -673,11 +716,11 @@ fn long_range_evidence_fixture(canonical_hash: BlockHash) -> SlashingEvidence {
     SlashingEvidence::LongRangeForkParticipation {
         validator_index: 0,
         vote: IndexedVote {
-            signature: signer.sign_finality_vote(TEST_CHAIN_ID, &vote_data),
+            signature: signer.sign_finality_vote(spec(2).consensus_domain(), &vote_data),
             data: vote_data,
         },
         canonical_vote: IndexedVote {
-            signature: signer.sign_finality_vote(TEST_CHAIN_ID, &canonical_data),
+            signature: signer.sign_finality_vote(spec(2).consensus_domain(), &canonical_data),
             data: canonical_data,
         },
     }
@@ -783,7 +826,7 @@ async fn invalid_vrf_evidence_construction_round_trips() {
     let mut block = signed_block(99, genesis_hash, 1, 0x77, &v0);
     block.header.vrf_proof = [0; 96];
     let hash = block.header.hash();
-    block.header.signature = v0.sign_proposer_message(TEST_CHAIN_ID, &hash);
+    block.header.signature = v0.sign_proposer_message(spec(2).consensus_domain(), &hash);
 
     let evidence = SlashingEvidence::InvalidVrfClaim {
         proposer_index: 0,
@@ -832,7 +875,7 @@ async fn future_signed_votes_and_candidates_cannot_evict_current_accountability(
     };
     let claims: Vec<_> = [&v0, &v1]
         .into_iter()
-        .map(|signer| signer.attest_vote(TEST_CHAIN_ID, data.clone(), vec![], None))
+        .map(|signer| signer.attest_vote(spec(2).consensus_domain(), data.clone(), vec![], None))
         .collect();
     let signatures: Vec<_> = claims
         .iter()
@@ -852,8 +895,13 @@ async fn future_signed_votes_and_candidates_cannot_evict_current_accountability(
     };
     // These are real signatures under the local active keys, not malformed
     // input. Their future consensus context has not been authenticated.
-    neutrino_prover_chunk::slashing::verify_quorum(TEST_CHAIN_ID, &validators(2), &quorum, (2, 3))
-        .unwrap();
+    neutrino_prover_chunk::slashing::verify_quorum(
+        spec(2).consensus_domain(),
+        &validators(2),
+        &quorum,
+        (2, 3),
+    )
+    .unwrap();
     let future = FinalityVote {
         data,
         aggregation_bits: aggregate.aggregation_bits,

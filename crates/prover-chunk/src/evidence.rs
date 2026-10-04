@@ -78,7 +78,7 @@ pub fn validate_evidence_using(
             certificate,
         } => {
             crate::finality::verify_finality_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &spec.consensus,
                 &source.validators,
                 &source.chunk,

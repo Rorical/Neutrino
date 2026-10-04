@@ -1,130 +1,230 @@
-# Higher-round BFT candidates
+# Round leaders, nil votes and certified BFT recovery
 
-This development format has one `VoteAttestation` type for both phases and separate
-`prevote_attestations` and `precommit_attestations` in `FinalityCert`. There is no
-old-format decoder or compatibility mode. The current format passed workspace
-checks; see the [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
-Real compressed composition acceptance for the changed programs remains pending.
+The live protocol runs propose, prevote and precommit phases for each chunk.
+A designated leader selects a proven candidate, explicit nil votes complete
+unsuccessful phases, and signed round-change certificates synchronize later
+rounds. The complete Chunk Guest authenticates the proposal, certified round
+entry and both accountable value quorums. Only a verified complete Chunk proof
+finalizes the chunk. Real compressed composition remains a separate acceptance
+gate; see the [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
 
-## Candidate and lock rules
+There is one current format. `BftVote` distinguishes `Value(FinalityVote)` and
+`Nil(NilVote)`; there is no sentinel chunk hash or old vote decoder. Every
+`FinalityCert` includes the exact signed `BftProposal` selected for its round.
 
-The session keeps its current proven candidate separately from its highest retained
-prevote quorum. A timeout, candidate advertisement or restart cannot erase that
-lock. The incoming finalized context, validator set, seed and program identities
-remain fixed for the chunk. A replacement branch must independently pass complete
-candidate validation under the current backend before a local vote is reserved.
+## Leadership and phase progression
 
-Replacing an active target requires a strictly newer round, bounded by the chain
-specification's maximum. A bare candidate advertisement is an availability hint:
-it cannot make the node advance before its own timeout. A cryptographically valid
-target prevote quorum may justify advancing beyond that quorum's round. Regressing
-rounds, finalized targets and already finalizable sessions cannot be retargeted.
-With no existing session, a verified target quorum opens directly at
-`quorum.round + 1`; the node does not first sign a throwaway round-zero vote.
+The leader selector derives an offset from the chain ID, chunk ID and complete
+authenticated validator-set root, then rotates through positive-stake, unslashed
+validator indices. Every eligible validator receives a turn within one complete
+cycle. A large balance cannot monopolize successive rounds; stake determines
+quorum weights. The current chunk's incoming finalized context, active set,
+seed and program identities remain fixed throughout all its rounds.
 
-A quorum for the current target and current round does not advance an active
-session before its local timeout. It has just enabled precommits, which must
-remain available to finish that round. A strictly higher target quorum can still
-justify catching up, and a legal quorum for a different target can authorize
-replacement under the retained-lock rule below.
+A `BftProposal` signs the complete compact chunk, round, leader index, optional
+earlier valid prevote QC and optional round-change certificate. Nodes verify the
+designated leader and signature before allocating branch downloads. They then
+validate the exact branch, block receipts and candidate consensus under the
+current backend before selecting a local value vote. Opening a session or
+receiving an unsigned `BftCandidate` does not authorize a follower's prevote.
 
-A locked validator may prevote the same target. For a different target, it needs
-an independently verified prevote quorum for that target with
+The persistent pacemaker has `Propose`, `Prevote`, `Precommit` and `AwaitRound`
+steps. Each phase has an independent deadline of
+`base_timeout + round * timeout_step`; both parameters must be positive. Entering
+a new phase resets its deadline. A timely compatible leader proposal selects a
+value prevote. A missing, invalid, unavailable or lock-incompatible proposal
+results in a nil prevote. A valid current value prevote QC selects a value
+precommit and retains its lock. A nil prevote QC or a prevote deadline without a
+usable value QC selects a nil precommit. Nil votes never erase a retained value
+lock and cannot finalize a chunk.
+
+After an unsuccessful precommit phase, the validator signs a report for the
+next round. A nil precommit quorum can trigger this report immediately, first
+persisting `AwaitRound` so a later proposal or QC cannot cause another old-round
+value vote. Duplicate nil quorum observations do not postpone the retransmission
+deadline. Once
+signed, the exact report is retransmitted on its deadline; a lost first gossip
+publication cannot leave the session waiting forever. Local timeout alone never
+enters a higher round. A current value precommit quorum pauses round advancement
+while its complete proof is prepared, verified and committed.
+
+## Certified round entry and valid values
+
+A `RoundChange` signs the chunk, requested new round, validator index and the
+exact optional highest known value prevote QC. Each carried QC independently
+binds this chunk, authenticated members, stake, phase, target and an earlier
+round. A `RoundChangeCertificate` contains unique signed reports for one exact
+chunk and new round, weighted under the configured prevote quorum fraction.
+A bare report cannot advance the session; a verified certificate can catch up
+directly to its later round.
+
+Round zero has no entry certificate. Every nonzero leader proposal must carry
+an independently valid certificate for that exact chunk and round, and its
+signature binds the certificate bytes. If the certificate contains a highest
+QC, the proposal's valid QC cannot be lower. Equal QC rounds must name the same
+target. The proposed valid QC itself must authenticate this candidate and
+strictly predate the new round. These checks run in both native admission and
+the Chunk Guest, so host-only round synchronization cannot authorize an
+otherwise unproven certificate.
+
+The driver stores its highest observed valid value separately from the candidate
+selected for the current round and its retained signing lock. When becoming
+leader, it proposes the highest known valid value and its QC. If a round-change
+certificate refers to a higher QC whose candidate is not available locally, it
+fetches that exact branch before proposing. A signed higher-round proposal can
+carry its own certified entry when a node has missed previous rounds; accepting
+it does not first sign a throwaway round-zero vote.
+
+A locked validator may prevote its lock target. For a different target, it needs
+an independently verified QC with
 
 ```text
 retained_lock.round < justification.round < new_prevote.round
 ```
 
-The justification must bind this chunk, the replacement hash, the authenticated
-active set, the configured stake threshold and the chain's vote signature domain.
-Both phase thresholds are at least 2/3. Using the current round's quorum to excuse
-its own conflicting prevotes is rejected. This strict earlier-round rule matches
-the locking condition in the [Tendermint consensus specification](https://github.com/tendermint/spec/blob/master/spec/consensus/consensus.md).
+Precommit still requires the current target's current-round prevote quorum and
+may declare that quorum as its unlock. Receiving a QC cannot overwrite the old
+lock before signing authorization is checked. Current-round prevotes cannot
+justify the conflicting prevotes that created them. The strict earlier-round
+rule follows the [Tendermint lock-change specification](https://github.com/tendermint/spec/blob/master/spec/consensus/consensus.md).
 
-Precommit still requires a quorum of prevotes for the current target and round.
-It can declare that current quorum because it does not help create those prevotes.
-A received quorum cannot overwrite the earlier lock before signing authorization
-is checked. Candidate selection and vote aggregation do not manufacture finality:
-only a verified complete Chunk receipt commits it.
+## Signatures and objective accountability
 
-## Signed declarations and objective evidence
+Both value vote phases retain complete unique `VoteAttestation` coverage.
+A prevote attestation signs its exact individual vote and optional unlock QC,
+including an explicit `None`, with an empty proof list. A precommit additionally
+signs the exact ordered Borsh block-proof envelope hashes it accepted. Nil votes
+use a separate consensus domain, including phase, and retain complete
+`NilVoteAttestation` coverage with individual vote signatures.
 
-Every accepted signer in either phase supplies a separately signed attestation
-covering its exact individual vote signature and optional unlock quorum, including
-an explicit `None`. Prevote proof hashes must be empty; precommits bind the exact
-ordered block-proof envelopes accepted by that signer. Each aggregate and finality
-certificate preserves complete, unique signer coverage for the corresponding phase.
+Vote accumulation unions verified individual signers even when incoming
+aggregate bitmaps overlap. Each validator contributes stake and its vote
+signature once; the first accepted signed attestation is retained unchanged.
+The resulting aggregate is recomputed from those unique individual signatures,
+so replacing or ignoring a smaller overlapping aggregate cannot lose progress.
+Identical unlock QCs carried by several claims share one native aggregate
+signature check per validation call; every claim still receives its individual
+signature, policy, membership and stake checks.
 
-The Guest checks signatures, target bindings and the contents of every carried
-unlock quorum. `LockViolation` also supports an earlier signed precommit and its
-locking quorum followed by a conflicting later prevote. A carried unlock is honest
-only if it is above that earlier lock and strictly below the later prevote's round.
-The later-precommit case allows its current prevote quorum. Invalid claims can be
-proved by Evidence Guest and admitted through the existing mandatory sanction FIFO.
+`ConflictingNilVote` authenticates a value and nil vote from the same validator,
+chunk, round and phase. It uses the existing double-prevote or double-precommit
+penalty identity, so presenting both forms cannot duplicate a deduction.
+`DoubleBftProposal` authenticates two distinct target proposals from the
+same designated chunk-round leader. Attaching an invalid QC or entry certificate
+does not excuse an independently signed conflicting proposal. This offence has
+its own chunk/round identity and the existing slash sanction semantics.
 
-A quorum contains an aggregate signature, not recursively nested attestations.
-This keeps certificates and witnesses bounded. Votes and finality certificates
-retain the individual signed declarations needed for attributable offences.
-Certificate verification does not prove the absence of every hidden historical
-lock or discover unpublished signatures. Safety relies on the usual active-stake
-fault assumption together with honest validators enforcing the signing rules;
-objective attribution additionally needs the earlier signed evidence.
+`LockViolation` proves an earlier signed value precommit and its locking QC,
+followed by a conflicting value prevote or precommit with an invalid signed
+unlock declaration. A later prevote needs a QC strictly between the old lock and
+new round; a later precommit may use its current-round QC. Fact and Evidence
+Guests establish these exact signed facts, while block execution admits and
+executes the existing mandatory sanction FIFO.
 
-## Persistence and receipt identity
+Certificates do not prove that a signer never saw an unpublished QC or held an
+undisclosed historical lock. The phrase "highest known" is a local honest-node
+rule, not an objective claim about missing messages. Evidence still requires
+the actual signed offence and authenticated source context. See
+[evidence proofs](20-evidence-proofs.md) and
+[signed artifact availability](23-evidence-availability.md).
 
-The unsigned candidate/round transition, retained lock and exact justification are
-synchronized before reserving the replacement prevote. Its signing reservation is
-then synchronized before BLS signing, and the completed session before publication.
-A crash in either gap can resume that same candidate and vote. It cannot restore
-from the current fork-choice head, forget the old lock or sign a conflicting retry.
+## Durable recovery and proof identity
 
-Each node retains its first verified block-proof envelope. Receiving another valid
-encoding of that block statement cannot replace bytes already bound by its local
-attestation. Different validators can accept different valid encodings; the chunk
-hash commits the semantic block statements, not one globally chosen proof encoding.
-A rejected alternate receipt cannot demote a block established by a valid receipt.
-A valid alternate also cannot erase cached invalid bytes referenced by a delayed
-signed attestation. The rejection cache still retains one bounded observation per
-block; it does not promise to preserve every invalid encoding ever received.
+Candidate, phase, deadlines, retained lock, valid value, report collection and
+certified round entry are synchronized before signing new messages. The signing
+journal binds the chain specification, validator public key and exact proposal,
+value/nil vote or round report before BLS signing. Every consensus signature
+cryptographically binds `tag || chain_id LE8 || ChainSpecHash32 || payload`,
+including proposer/VRF, value/nil votes and declarations, DA commitments, leader
+proposals and round reports. Engine derives this strong domain from its complete
+authenticated specification; equal numeric chain IDs cannot authorize signatures
+or offence evidence from a different specification. The current journal decoder
+requires the exact 56-byte domain prefix; there is no numeric-ID-only fallback.
+Completed session state is
+synchronized before publication. Identical retries reproduce the original
+message; a conflicting value/nil reservation, changed proposal or regressing
+round is refused. Validator index rotation does not reset a public key's history.
 
-Accountability observations accept the current source chunk or its preceding eight
-authenticated chunks. Historical headers use the source validator set and seed.
-Cache pruning follows authenticated finalized boundaries rather than a peer's
-declared future chunk or header slot.
+Journal retention is bounded per identity and chunk. An atomic reservation keeps
+current value/nil intents and the original precommit establishing the retained
+lock, while monotonic proposal/report watermarks replace superseded message
+positions, including skipped rounds that never produced a vote. Compaction and
+the new reservation synchronize together; failed persistence cannot authorize a
+signature or erase the prior lock. Old positions stay forbidden after their raw
+intent has been removed.
 
-Host attribution uses immediate native BLS verification and retains at most 4096
-exact signature equations in an Engine-local FIFO cache. Each cache key binds the
-operation, cipher suite, complete ordered public-key list, message and signature.
-Membership, stake, signer coverage, quorum thresholds, target/round and historical
-admission are checked again on every call. Old-round or wrong-target votes still
-pass through accountability detection before skipping current-candidate checks.
-This host optimization does not alter the Guest or its proof obligations.
+Restart reauthenticates saved reports, proposal/certificates, vote declarations
+and the original candidate branch under the current backend. A journal entry
+cannot manufacture an absent durable higher-round entry. It cannot substitute
+the current fork-choice head or erase an unfinalized lock. Different valid
+round-certificate signer subsets are allowed: accepting an independently
+verified leader proposal retains its exact entry certificate for durable
+proposal binding without discarding a higher valid value or signing lock.
 
-Chunk proof work is fenced by the exact chunk/hash/round/certificate identity at
-preparation, launch and commit. A stale completion cannot commit a new session or
-clear another task's state. The next ready quorum can run when obsolete work exits;
-waiting uses completion notifications rather than repeated prover polling.
-An independent BFT clock advances expired round deadlines even when the block
-producer has no work. It does not poll proof completion or depend on slot cadence.
+The node retains its first verified block receipt. Another valid encoding of the
+same statement cannot replace bytes already signed locally. A rejected alternate
+cannot demote a proven block or remove an invalid envelope needed for later
+accountability. Different validators can accept different valid encodings; the
+chunk commits block statements rather than one globally chosen proof encoding.
 
-## Availability and liveness boundary
+The first complete authenticated proposal plus both value quorums freezes its
+exact certificate. Later signed sources remain available to objective
+accountability, but cannot alter the in-flight proof identity. The quorum-ready
+clock retries failed proof work under that identity; restart authenticates and
+restores the frozen certificate.
 
-`BftCandidate` advertises the full compact chunk, provider round and optional target
-quorum. Gossip and `CandidateByChunk` RPC are bounded availability mechanisms. An
-unknown vote can trigger retrieval from its source. Block and proof backfill pins
-the candidate's endpoint rather than following a moving peer head. Ordinary
-signature, execution, proof and finalized-context checks still apply to every
-downloaded branch before candidate admission.
-Discovery queries and candidate payload pages alternate when both are pending,
-so a stream of additional hints cannot starve a known branch's backfill.
+Proof work is fenced by exact chunk/hash/round/certificate identity at preparation,
+launch and commit. A stale completion cannot commit a new session or clear
+another task's state. Completion notifications release the next ready quorum.
+The independent BFT clock runs even when the producer has no work; it does not
+poll proof completion.
 
-Without a valid justification, timeout selection uses an independently validated
-local candidate only when compatible with the retained lock. When nodes learn a
-common proven fork-choice branch, unlocked sessions can leave their initial split
-targets. A locked session continues its lock target unless a higher quorum legally
-permits replacement. Peer hints themselves provide no signing authority.
+## Transport and liveness assumptions
 
-This closes safe candidate replacement, restart and branch-retrieval paths. It does
-not implement a complete round-leader, nil-vote and pacemaker protocol or establish
-unconditional eventual convergence under adversarial competing proposals. Those
-are separate liveness work; raising rounds or relaxing lock checks is not a substitute.
+`BftMessages` transports proposals, nil votes, round reports and certificates.
+The existing value-vote topics use the current `BftVote` envelope. `BftRoundByChunk`
+RPC returns the current proposal and certified entry when gossip was missed.
+An empty or unsuccessful response remains eligible for bounded retries after a
+network cooldown, even if the local round has not advanced. Thus a lagging node
+can recover the entry certificate after peers have progressed beyond the round
+for which its isolated reports are useful. Ordinary report collection keeps only
+the nearest two future rounds; complete certificates independently authorize
+catchup to any later round, without a minority-report advancement rule.
+`BftCandidate`, candidate inventory and `CandidateByChunk` remain availability
+hints. `Engine::offer_bft_candidate` fully authenticates the offered branch but
+never treats its advertised round or QC as signing authority. Payload retrieval
+pins an exact branch endpoint; moving peer heads do not redirect that backfill.
+Exact-hash candidate RPC also serves retained noncurrent proven branches after
+reauthenticating their receipts and complete candidate. An immutable signed report
+can still reference an older QC target after its holder's highest value or canonical
+head changes; that target must remain retrievable from the bounded candidate cache.
+Eviction protects the current target, highest valid value, retained lock, current
+entry certificate's highest QC and local immutable next-round report's highest QC.
+These are at most five distinct pins within the eight-candidate bound.
+
+Transport decoders bound bitmap sizes, signer/report counts, proof-hash counts
+and encoded messages before allocation. Those are local transport/resource
+limits, not a substitute for canonical core proof validation. Report collection,
+candidate discovery and fixed-branch payload queues are bounded and scheduled
+fairly. Payload scheduling rotates targets after each attempt, so one failing
+target cannot starve an obtainable highest-QC candidate through repeated compatible
+Status refreshes. Progress requires the active validator set, certificates and proven
+candidate to fit the supported resource budgets and remain obtainable.
+
+Under eventual synchrony, bounded honest clocks, an obtainable valid candidate
+and responsive stake sufficient for both configured quorum fractions, growing
+phase deadlines permit a complete round to communicate. Fair leadership ensures
+an honest proposer receives a turn. Proposing the highest known valid value
+allows validators with older conflicting locks to follow its independently
+verified QC; nil phases and certified reports continue through missing or
+malicious leaders. With the default 2/3 thresholds, fewer than 1/3 faulty or
+unresponsive active stake satisfies the quorum assumption. Higher configured
+thresholds require correspondingly more responsive stake. This protocol does
+not promise progress through a permanent partition, failed proof backend,
+unavailable candidate, exhausted storage or arbitrary denial of service.
+
+There is no configurable operator cutoff for BFT rounds. Checked `u32` exhaustion
+is an explicit representation failure, never a wraparound or permission to reset
+signing history. Consensus safety still depends on the active-stake fault
+assumption and honest signing rules; tests and workspace checks do not constitute
+a formal machine-checked liveness proof or real compressed-proving acceptance.

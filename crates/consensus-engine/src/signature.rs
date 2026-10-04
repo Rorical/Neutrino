@@ -6,11 +6,11 @@
 //! looked up in the active validator set.
 //!
 //! The message bound by the signature is
-//! `DOMAIN_PROPOSER_SIG || chain_id (u64 LE) || header_hash (32)`.
+//! `DOMAIN_PROPOSER_SIG || chain_id (u64 LE) || chain_spec_hash (32) || header_hash (32)`.
 
 use neutrino_consensus_types::Header;
 use neutrino_crypto::bls::{PublicKey, Signature};
-use neutrino_primitives::{BlsPublicKey, ChainId, DOMAIN_PROPOSER_SIG, Hash, Validator};
+use neutrino_primitives::{BlsPublicKey, ConsensusDomain, DOMAIN_PROPOSER_SIG, Hash, Validator};
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -64,12 +64,8 @@ impl std::error::Error for SignatureError {}
 /// underlying BLS signing operation. Followers reconstruct the same
 /// bytes to verify.
 #[must_use]
-pub fn proposer_signed_message(chain_id: ChainId, header_hash: &Hash) -> Vec<u8> {
-    let mut message = Vec::with_capacity(DOMAIN_PROPOSER_SIG.len() + 8 + 32);
-    message.extend_from_slice(&DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(header_hash);
-    message
+pub fn proposer_signed_message(domain: ConsensusDomain, header_hash: &Hash) -> Vec<u8> {
+    domain.signing_message(DOMAIN_PROPOSER_SIG, header_hash)
 }
 
 /// Verify the proposer signature carried by `header` against the
@@ -86,7 +82,7 @@ pub fn proposer_signed_message(chain_id: ChainId, header_hash: &Hash) -> Vec<u8>
 pub fn verify_header_signature<'a>(
     header: &Header,
     active_set: &'a [Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
 ) -> Result<&'a Validator, SignatureError> {
     let index = header.proposer_index;
     let position = usize::try_from(index).expect("u32 fits usize on supported targets");
@@ -101,7 +97,7 @@ pub fn verify_header_signature<'a>(
     let signature = Signature::from_bytes(&header.signature)
         .map_err(|_| SignatureError::InvalidSignatureBytes)?;
     let header_hash = header.hash();
-    let message = proposer_signed_message(chain_id, &header_hash);
+    let message = proposer_signed_message(domain, &header_hash);
     public_key
         .verify(&message, &signature)
         .map_err(|_| SignatureError::BadSignature)?;
@@ -117,6 +113,13 @@ mod tests {
     use super::*;
     use crate::ProposerKey;
     use neutrino_primitives::Validator;
+
+    const fn test_domain(chain_id: u64) -> ConsensusDomain {
+        ConsensusDomain {
+            chain_id,
+            chain_spec_hash: [9; 32],
+        }
+    }
 
     fn validator_with_pubkey(pubkey: BlsPublicKey, stake: u64) -> Validator {
         Validator {
@@ -158,9 +161,10 @@ mod tests {
         // Build a header, hash it without the signature, sign, write back.
         let mut header = sample_header(0, [0; 96]);
         let header_hash = header.hash();
-        header.signature = proposer.sign_proposer_message(7, &header_hash);
+        header.signature = proposer.sign_proposer_message(test_domain(7), &header_hash);
 
-        let validator = verify_header_signature(&header, &active_set, 7).expect("verifies");
+        let validator =
+            verify_header_signature(&header, &active_set, test_domain(7)).expect("verifies");
         assert_eq!(validator.pubkey, *proposer.public_key_bytes());
     }
 
@@ -169,7 +173,7 @@ mod tests {
         let active_set = [validator_with_pubkey([0; 48], 100)];
         let header = sample_header(7, [0; 96]);
         assert_eq!(
-            verify_header_signature(&header, &active_set, 1),
+            verify_header_signature(&header, &active_set, test_domain(1)),
             Err(SignatureError::ValidatorIndexOutOfBounds { index: 7, len: 1 })
         );
     }
@@ -180,10 +184,28 @@ mod tests {
         let active_set = [validator_with_pubkey(*proposer.public_key_bytes(), 100)];
         let mut header = sample_header(0, [0; 96]);
         let header_hash = header.hash();
-        header.signature = proposer.sign_proposer_message(7, &header_hash);
+        header.signature = proposer.sign_proposer_message(test_domain(7), &header_hash);
 
         assert_eq!(
-            verify_header_signature(&header, &active_set, 99),
+            verify_header_signature(&header, &active_set, test_domain(99)),
+            Err(SignatureError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_signature_under_another_spec_with_the_same_chain_id() {
+        let proposer = ProposerKey::from_ikm(&[0xBB; 32], 0).expect("derive");
+        let active_set = [validator_with_pubkey(*proposer.public_key_bytes(), 100)];
+        let mut header = sample_header(0, [0; 96]);
+        let domain = test_domain(7);
+        header.signature = proposer.sign_proposer_message(domain, &header.hash());
+        verify_header_signature(&header, &active_set, domain).unwrap();
+        let other_domain = ConsensusDomain {
+            chain_spec_hash: [10; 32],
+            ..domain
+        };
+        assert_eq!(
+            verify_header_signature(&header, &active_set, other_domain),
             Err(SignatureError::BadSignature)
         );
     }
@@ -194,11 +216,11 @@ mod tests {
         let active_set = [validator_with_pubkey(*proposer.public_key_bytes(), 100)];
         let mut header = sample_header(0, [0; 96]);
         let header_hash = header.hash();
-        header.signature = proposer.sign_proposer_message(7, &header_hash);
+        header.signature = proposer.sign_proposer_message(test_domain(7), &header_hash);
         // Flip a bit in the signature.
         header.signature[0] ^= 0x80;
 
-        match verify_header_signature(&header, &active_set, 7) {
+        match verify_header_signature(&header, &active_set, test_domain(7)) {
             // blst typically reports "BadSignature" for tampered
             // signatures; bytes that fail group-membership decoding
             // become InvalidSignatureBytes. Both indicate the same
@@ -214,9 +236,9 @@ mod tests {
         let active_set = [validator_with_pubkey([0xFF; 48], 100)];
         let mut header = sample_header(0, [0; 96]);
         let header_hash = header.hash();
-        header.signature = proposer.sign_proposer_message(7, &header_hash);
+        header.signature = proposer.sign_proposer_message(test_domain(7), &header_hash);
 
-        match verify_header_signature(&header, &active_set, 7) {
+        match verify_header_signature(&header, &active_set, test_domain(7)) {
             Err(SignatureError::InvalidPublicKey { index: 0 }) => {}
             other => panic!("expected InvalidPublicKey, got {other:?}"),
         }

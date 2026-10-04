@@ -48,19 +48,22 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use neutrino_consensus_types::{
-    FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedVote, LockEvidence,
-    QuorumCertificate, SlashingEvidence, VoteAttestation, VrfRejectionReason,
+    BftProposal, FinalityVote, FinalityVoteData, FinalityVotePhase, Header, IndexedNilVote,
+    IndexedVote, LockEvidence, NilVote, QuorumCertificate, SlashingEvidence, VoteAttestation,
+    VrfRejectionReason,
 };
 use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
 use neutrino_crypto::bls::{PublicKey, Signature};
 use neutrino_primitives::{
-    ChainId, ChunkHash, ChunkId, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DomainTag, FixedU128, Seed,
-    Slot, Validator, ValidatorIndex,
+    ChunkHash, ChunkId, ConsensusDomain, FixedU128, Seed, Slot, Validator, ValidatorIndex,
 };
 
 use crate::signature::{SignatureError, verify_header_signature};
 
 extern crate alloc;
+
+const MAX_MONITOR_ENTRIES: usize = 4096;
+const MAX_MONITOR_BYTES: usize = 64 * 1024 * 1024;
 
 /// Indices of headers and votes already observed by this node.
 ///
@@ -81,6 +84,11 @@ pub struct SlashingMonitor {
     /// to `PrevoteQuorumObserved`. Consumed by the cross-round
     /// `LockViolation` synthesiser in
     /// [`Self::record_indexed_vote`].
+    seen_nil_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedNilVote>,
+    seen_bft_proposals: BTreeMap<(ChunkId, u32, ValidatorIndex), BftProposal>,
+    proposal_bytes: usize,
+    attestation_bytes: usize,
+    quorum_bytes: usize,
     observed_prevote_quorums: BTreeMap<(ChunkId, u32, ChunkHash), QuorumCertificate>,
     /// Explicit authenticated claims; local absence of a QC is not slashable.
     attestations:
@@ -100,6 +108,11 @@ impl SlashingMonitor {
         Self {
             seen_headers: BTreeMap::new(),
             seen_votes: BTreeMap::new(),
+            seen_nil_votes: BTreeMap::new(),
+            seen_bft_proposals: BTreeMap::new(),
+            proposal_bytes: 0,
+            attestation_bytes: 0,
+            quorum_bytes: 0,
             observed_prevote_quorums: BTreeMap::new(),
             attestations: BTreeMap::new(),
         }
@@ -114,10 +127,29 @@ impl SlashingMonitor {
             .retain(|(chunk, _, _), _| *chunk >= first_chunk);
         self.seen_votes
             .retain(|(_, chunk, _, _), _| *chunk >= first_chunk);
+        self.seen_nil_votes
+            .retain(|(_, chunk, _, _), _| *chunk >= first_chunk);
+        self.seen_bft_proposals
+            .retain(|(chunk, _, _), _| *chunk >= first_chunk);
         self.observed_prevote_quorums
             .retain(|(chunk, _, _), _| *chunk >= first_chunk);
         self.attestations
             .retain(|(_, chunk, _, _, _), _| *chunk >= first_chunk);
+        self.proposal_bytes = self
+            .seen_bft_proposals
+            .values()
+            .filter_map(|item| borsh::object_length(item).ok())
+            .sum();
+        self.attestation_bytes = self
+            .attestations
+            .values()
+            .filter_map(|item| borsh::object_length(item).ok())
+            .sum();
+        self.quorum_bytes = self
+            .observed_prevote_quorums
+            .values()
+            .filter_map(|item| borsh::object_length(item).ok())
+            .sum();
     }
 
     /// Number of header entries currently retained. Exposed for
@@ -158,6 +190,9 @@ impl SlashingMonitor {
             }
             Some(_) => None,
             None => {
+                if self.seen_headers.len() >= MAX_MONITOR_ENTRIES {
+                    return None;
+                }
                 self.seen_headers.insert(key, header.clone());
                 None
             }
@@ -195,6 +230,13 @@ impl SlashingMonitor {
             vote.data.round,
             vote.data.phase,
         );
+        if let Some(nil_vote) = self.seen_nil_votes.get(&key) {
+            return Some(SlashingEvidence::ConflictingNilVote {
+                validator_index,
+                value_vote: vote.clone(),
+                nil_vote: nil_vote.clone(),
+            });
+        }
         // Rule 1: same-round equivocation. Caught before any insert
         // / cross-round work because the existing entry at the same
         // key always takes precedence.
@@ -219,10 +261,73 @@ impl SlashingMonitor {
             // as a duplicate with no new attribution information.
             return self.try_synthesize_lock_violation(validator_index, vote);
         }
+        if self.seen_votes.len() >= MAX_MONITOR_ENTRIES {
+            return None;
+        }
         self.seen_votes.insert(key, vote.clone());
 
         // A prior locked precommit constrains both later vote phases.
         self.try_synthesize_lock_violation(validator_index, vote)
+    }
+
+    /// Record individually authenticated nil declarations, including delayed arrivals.
+    pub fn record_nil_vote(&mut self, vote: &NilVote) -> Vec<SlashingEvidence> {
+        let mut evidence = Vec::new();
+        for claim in &vote.attestations {
+            let key = (
+                claim.validator_index,
+                vote.data.chunk_id,
+                vote.data.round,
+                vote.data.phase,
+            );
+            let nil_vote = IndexedNilVote {
+                data: vote.data.clone(),
+                signature: claim.vote_signature,
+            };
+            if let Some(value_vote) = self.seen_votes.get(&key) {
+                evidence.push(SlashingEvidence::ConflictingNilVote {
+                    validator_index: claim.validator_index,
+                    value_vote: value_vote.clone(),
+                    nil_vote: nil_vote.clone(),
+                });
+            }
+            if self.seen_nil_votes.len() < MAX_MONITOR_ENTRIES
+                || self.seen_nil_votes.contains_key(&key)
+            {
+                self.seen_nil_votes.entry(key).or_insert(nil_vote);
+            }
+        }
+        evidence
+    }
+
+    /// Preserve independently signed conflicting leader targets for the same round.
+    pub fn record_bft_proposal(&mut self, proposal: &BftProposal) -> Option<SlashingEvidence> {
+        let key = (
+            proposal.chunk.chunk_id,
+            proposal.round,
+            proposal.proposer_index,
+        );
+        match self.seen_bft_proposals.get(&key) {
+            Some(prior) if prior.chunk.hash() != proposal.chunk.hash() => {
+                Some(SlashingEvidence::DoubleBftProposal {
+                    proposer_index: proposal.proposer_index,
+                    proposal_a: prior.clone(),
+                    proposal_b: proposal.clone(),
+                })
+            }
+            Some(_) => None,
+            None => {
+                let size = borsh::object_length(proposal).unwrap_or(usize::MAX);
+                if self.seen_bft_proposals.len() >= MAX_MONITOR_ENTRIES
+                    || size > MAX_MONITOR_BYTES.saturating_sub(self.proposal_bytes)
+                {
+                    return None;
+                }
+                self.proposal_bytes += size;
+                self.seen_bft_proposals.insert(key, proposal.clone());
+                None
+            }
+        }
     }
 
     /// Record an observed 2/3 prevote quorum so the
@@ -243,22 +348,54 @@ impl SlashingMonitor {
             quorum.data.round,
             quorum.data.chunk_hash,
         );
-        self.observed_prevote_quorums.entry(key).or_insert(quorum);
+        if self.observed_prevote_quorums.contains_key(&key) {
+            return;
+        }
+        let size = borsh::object_length(&quorum).unwrap_or(usize::MAX);
+        if self.observed_prevote_quorums.len() >= MAX_MONITOR_ENTRIES
+            || size > MAX_MONITOR_BYTES.saturating_sub(self.quorum_bytes)
+        {
+            return;
+        }
+        self.quorum_bytes += size;
+        self.observed_prevote_quorums.insert(key, quorum);
+    }
+
+    pub(crate) fn prevote_quorum_is_observed(&self, quorum: &QuorumCertificate) -> bool {
+        self.observed_prevote_quorums.contains_key(&(
+            quorum.data.chunk_id,
+            quorum.data.round,
+            quorum.data.chunk_hash,
+        ))
     }
 
     /// Record a claim after verifying its signature against the chunk's set.
     pub fn record_attestation(&mut self, attestation: VoteAttestation) {
         let data = &attestation.vote;
-        self.attestations.insert(
-            (
-                attestation.validator_index,
-                data.chunk_id,
-                data.round,
-                data.chunk_hash,
-                data.phase,
-            ),
-            attestation,
+        let key = (
+            attestation.validator_index,
+            data.chunk_id,
+            data.round,
+            data.chunk_hash,
+            data.phase,
         );
+        let old_size = self
+            .attestations
+            .get(&key)
+            .and_then(|item| borsh::object_length(item).ok())
+            .unwrap_or(0);
+        let Some(size) = borsh::object_length(&attestation).ok() else {
+            return;
+        };
+        let retained_size = self.attestation_bytes.saturating_sub(old_size);
+        if size > MAX_MONITOR_BYTES.saturating_sub(retained_size)
+            || (self.attestations.len() >= MAX_MONITOR_ENTRIES
+                && !self.attestations.contains_key(&key))
+        {
+            return;
+        }
+        self.attestation_bytes = retained_size + size;
+        self.attestations.insert(key, attestation);
     }
 
     /// Look for a prior precommit by `validator_index` for the same
@@ -347,17 +484,8 @@ impl SlashingMonitor {
 /// signature, mirroring
 /// [`crate::ProposerKey::sign_finality_vote`].
 #[must_use]
-pub fn finality_vote_signed_message(chain_id: ChainId, data: &FinalityVoteData) -> Vec<u8> {
-    let domain: DomainTag = match data.phase {
-        FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
-        FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
-    };
-    let data_bytes = borsh::to_vec(data).expect("borsh encode of FinalityVoteData is infallible");
-    let mut message = Vec::with_capacity(domain.len() + 8 + data_bytes.len());
-    message.extend_from_slice(&domain);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(&data_bytes);
-    message
+pub fn finality_vote_signed_message(domain: ConsensusDomain, data: &FinalityVoteData) -> Vec<u8> {
+    data.signing_message(domain)
 }
 
 /// Authenticate the offender's explicit proof/unlock claim, including `None`.
@@ -366,14 +494,14 @@ pub fn verify_vote_attestation(
     validator_index: ValidatorIndex,
     vote: &FinalityVoteData,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
 ) -> Result<(), SlashingError> {
     verify_vote_attestation_using(
         attestation,
         validator_index,
         vote,
         active_set,
-        chain_id,
+        domain,
         &mut crate::bls_verdicts::NativeBlsVerifier::default(),
     )
 }
@@ -383,12 +511,12 @@ pub(crate) fn verify_vote_attestation_using(
     validator_index: ValidatorIndex,
     vote: &FinalityVoteData,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
     verifier: &mut impl neutrino_prover_chunk::bls::Verifier,
 ) -> Result<(), SlashingError> {
     let _ = active_vote_validator(validator_index, active_set)?;
     neutrino_prover_chunk::slashing::verify_attestation_using(
-        chain_id,
+        domain,
         active_set,
         validator_index,
         vote,
@@ -416,17 +544,11 @@ pub fn verify_proof_signing_attribution(
     attestation: &VoteAttestation,
     proof: &neutrino_consensus_types::BlockProof,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
     chunk_size: u64,
 ) -> Result<(), SlashingError> {
-    verify_indexed_vote_signature(validator_index, vote, active_set, chain_id)?;
-    verify_vote_attestation(
-        attestation,
-        validator_index,
-        &vote.data,
-        active_set,
-        chain_id,
-    )?;
+    verify_indexed_vote_signature(validator_index, vote, active_set, domain)?;
+    verify_vote_attestation(attestation, validator_index, &vote.data, active_set, domain)?;
     verify_proof_acceptance(attestation, proof, chunk_size)
 }
 
@@ -585,7 +707,7 @@ pub fn verify_double_proposal_evidence(
     header_a: &Header,
     header_b: &Header,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
 ) -> Result<(), SlashingError> {
     if header_a.proposer_index != proposer_index || header_b.proposer_index != proposer_index {
         return Err(SlashingError::EvidenceFieldsInconsistent);
@@ -596,8 +718,8 @@ pub fn verify_double_proposal_evidence(
     if header_a.hash() == header_b.hash() {
         return Err(SlashingError::NotEquivocating);
     }
-    verify_header_signature(header_a, active_set, chain_id).map_err(map_signature_error)?;
-    verify_header_signature(header_b, active_set, chain_id).map_err(map_signature_error)?;
+    verify_header_signature(header_a, active_set, domain).map_err(map_signature_error)?;
+    verify_header_signature(header_b, active_set, domain).map_err(map_signature_error)?;
     Ok(())
 }
 
@@ -623,14 +745,14 @@ pub fn verify_lock_violation_evidence(
     vote_b: &IndexedVote,
     lock_evidence: &LockEvidence,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
     prevote_quorum: (u64, u64),
 ) -> Result<(), SlashingError> {
     if vote_a.data.chunk_hash == vote_b.data.chunk_hash {
         return Err(SlashingError::NotEquivocating);
     }
     neutrino_prover_chunk::slashing::verify_lock_violation(
-        chain_id,
+        domain,
         active_set,
         validator_index,
         (vote_a, vote_b),
@@ -663,7 +785,7 @@ pub fn verify_long_range_fork_participation_evidence(
     canonical_vote: &IndexedVote,
     local_chunk: Option<&neutrino_consensus_types::Chunk>,
     historical_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
 ) -> Result<(), SlashingError> {
     let chunk = local_chunk.ok_or(SlashingError::NotYetFinalizedLocally)?;
     if vote.data.chunk_id != chunk.chunk_id || canonical_vote.data.chunk_hash != chunk.hash() {
@@ -675,7 +797,7 @@ pub fn verify_long_range_fork_participation_evidence(
         vote,
         canonical_vote,
         historical_set,
-        chain_id,
+        domain,
     )
 }
 
@@ -696,7 +818,7 @@ pub fn verify_double_vote_evidence(
     vote_a: &IndexedVote,
     vote_b: &IndexedVote,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
 ) -> Result<(), SlashingError> {
     if vote_a.data.phase != expected_phase || vote_b.data.phase != expected_phase {
         return Err(SlashingError::EvidenceFieldsInconsistent);
@@ -707,8 +829,8 @@ pub fn verify_double_vote_evidence(
     if vote_a.data.chunk_hash == vote_b.data.chunk_hash {
         return Err(SlashingError::NotEquivocating);
     }
-    verify_indexed_vote_signature(validator_index, vote_a, active_set, chain_id)?;
-    verify_indexed_vote_signature(validator_index, vote_b, active_set, chain_id)?;
+    verify_indexed_vote_signature(validator_index, vote_a, active_set, domain)?;
+    verify_indexed_vote_signature(validator_index, vote_b, active_set, domain)?;
     Ok(())
 }
 
@@ -726,18 +848,18 @@ pub fn verify_invalid_vrf_claim_evidence(
     header: &Header,
     expected_reason: VrfRejectionReason,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
     finalized_seed: &Seed,
     expected_proposers_per_slot: FixedU128,
 ) -> Result<(), SlashingError> {
     if header.proposer_index != proposer_index {
         return Err(SlashingError::EvidenceFieldsInconsistent);
     }
-    verify_header_signature(header, active_set, chain_id).map_err(map_signature_error)?;
+    verify_header_signature(header, active_set, domain).map_err(map_signature_error)?;
     match consensus_vrf::verify_header_proposer(
         header,
         active_set,
-        chain_id,
+        domain,
         finalized_seed,
         expected_proposers_per_slot,
     ) {
@@ -764,7 +886,7 @@ pub fn verify_indexed_vote_signature(
     validator_index: ValidatorIndex,
     vote: &IndexedVote,
     active_set: &[Validator],
-    chain_id: ChainId,
+    domain: ConsensusDomain,
 ) -> Result<(), SlashingError> {
     let validator = active_vote_validator(validator_index, active_set)?;
     let pk =
@@ -773,7 +895,7 @@ pub fn verify_indexed_vote_signature(
         })?;
     let sig =
         Signature::from_bytes(&vote.signature).map_err(|_| SlashingError::InvalidSignatureBytes)?;
-    let message = finality_vote_signed_message(chain_id, &vote.data);
+    let message = finality_vote_signed_message(domain, &vote.data);
     pk.verify(&message, &sig)
         .map_err(|_| SlashingError::BadSignature)?;
     Ok(())
@@ -815,7 +937,10 @@ mod tests {
     use neutrino_crypto::bls::{Signature, aggregate_signatures};
     use neutrino_primitives::{BitVec, BlsSignature, ZERO_HASH};
 
-    const CHAIN_ID: ChainId = 7;
+    const DOMAIN: ConsensusDomain = ConsensusDomain {
+        chain_id: 7,
+        chain_spec_hash: [9; 32],
+    };
 
     fn proposer(seed: u8) -> ProposerKey {
         ProposerKey::from_ikm(&[seed; 32], u32::from(seed)).expect("derive proposer")
@@ -859,7 +984,7 @@ mod tests {
             signature: [0; 96],
         };
         let hash = header.hash();
-        header.signature = signer.sign_proposer_message(CHAIN_ID, &hash);
+        header.signature = signer.sign_proposer_message(DOMAIN, &hash);
         header
     }
 
@@ -876,7 +1001,7 @@ mod tests {
             chunk_hash: [chunk_hash_byte; 32],
             phase,
         };
-        let signature: BlsSignature = signer.sign_finality_vote(CHAIN_ID, &data);
+        let signature: BlsSignature = signer.sign_finality_vote(DOMAIN, &data);
         IndexedVote { data, signature }
     }
 
@@ -884,7 +1009,7 @@ mod tests {
         let signatures: Vec<Signature> = signers
             .iter()
             .map(|signer| {
-                let sig = proposer(*signer).sign_finality_vote(CHAIN_ID, &data);
+                let sig = proposer(*signer).sign_finality_vote(DOMAIN, &data);
                 Signature::from_bytes(&sig).expect("test signature decodes")
             })
             .collect();
@@ -919,7 +1044,7 @@ mod tests {
     fn lock_evidence_for(vote: &IndexedVote, later: &IndexedVote, signers: &[u8]) -> LockEvidence {
         LockEvidence {
             locked_prevote_quorum: quorum_certificate_for(vote, signers),
-            attestation: proposer(1).attest_vote(CHAIN_ID, later.data.clone(), Vec::new(), None),
+            attestation: proposer(1).attest_vote(DOMAIN, later.data.clone(), Vec::new(), None),
         }
     }
 
@@ -969,7 +1094,7 @@ mod tests {
             let vote = signed_indexed_vote(source, 0, FinalityVotePhase::Precommit, 0xAA, &signer);
             monitor.record_prevote_quorum(quorum_for_prevote_data(source, 0, 0xAA, &[0, 1]));
             monitor.record_attestation(signer.attest_vote(
-                CHAIN_ID,
+                DOMAIN,
                 vote.data.clone(),
                 Vec::new(),
                 None,
@@ -985,7 +1110,7 @@ mod tests {
         assert_eq!(monitor.attestations.len(), 1);
         let later = signed_indexed_vote(1, 2, FinalityVotePhase::Prevote, 0xBB, &signer);
         monitor.record_attestation(signer.attest_vote(
-            CHAIN_ID,
+            DOMAIN,
             later.data.clone(),
             Vec::new(),
             None,
@@ -1103,7 +1228,7 @@ mod tests {
         bits.push(false);
         bits.push(false);
         bits.push(true);
-        let signature = v2.sign_finality_vote(CHAIN_ID, &data);
+        let signature = v2.sign_finality_vote(DOMAIN, &data);
         let vote = FinalityVote {
             attestations: Vec::new(),
             aggregation_bits: bits,
@@ -1121,7 +1246,7 @@ mod tests {
         let active_set = validators_with_keys(2);
         let header_a = signed_header(0, 5, 0x11, &v0);
         let header_b = signed_header(0, 5, 0x22, &v0);
-        verify_double_proposal_evidence(0, &header_a, &header_b, &active_set, CHAIN_ID)
+        verify_double_proposal_evidence(0, &header_a, &header_b, &active_set, DOMAIN)
             .expect("genuine equivocation verifies");
     }
 
@@ -1131,7 +1256,7 @@ mod tests {
         let active_set = validators_with_keys(2);
         let header = signed_header(0, 5, 0x11, &v0);
         assert_eq!(
-            verify_double_proposal_evidence(0, &header, &header, &active_set, CHAIN_ID),
+            verify_double_proposal_evidence(0, &header, &header, &active_set, DOMAIN),
             Err(SlashingError::NotEquivocating)
         );
     }
@@ -1143,7 +1268,7 @@ mod tests {
         let header_a = signed_header(0, 5, 0x11, &v0);
         let header_b = signed_header(0, 5, 0x22, &v0);
         assert_eq!(
-            verify_double_proposal_evidence(1, &header_a, &header_b, &active_set, CHAIN_ID),
+            verify_double_proposal_evidence(1, &header_a, &header_b, &active_set, DOMAIN),
             Err(SlashingError::EvidenceFieldsInconsistent)
         );
     }
@@ -1155,7 +1280,7 @@ mod tests {
         let header_a = signed_header(0, 5, 0x11, &v0);
         let mut header_b = signed_header(0, 5, 0x22, &v0);
         header_b.signature[0] ^= 0x80;
-        match verify_double_proposal_evidence(0, &header_a, &header_b, &active_set, CHAIN_ID) {
+        match verify_double_proposal_evidence(0, &header_a, &header_b, &active_set, DOMAIN) {
             Err(SlashingError::BadSignature | SlashingError::InvalidSignatureBytes) => {}
             other => panic!("expected signature failure, got {other:?}"),
         }
@@ -1173,7 +1298,7 @@ mod tests {
             &vote_a,
             &vote_b,
             &active_set,
-            CHAIN_ID,
+            DOMAIN,
         )
         .expect("genuine equivocation verifies");
     }
@@ -1191,7 +1316,7 @@ mod tests {
                 &prevote,
                 &precommit,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
             ),
             Err(SlashingError::EvidenceFieldsInconsistent)
         );
@@ -1209,7 +1334,7 @@ mod tests {
                 &vote,
                 &vote,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
             ),
             Err(SlashingError::NotEquivocating)
         );
@@ -1231,7 +1356,7 @@ mod tests {
                 &vote_a,
                 &vote_b,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
             ),
             Err(SlashingError::BadSignature),
         );
@@ -1307,7 +1432,7 @@ mod tests {
             &violation,
             &evidence,
             &active_set,
-            CHAIN_ID,
+            DOMAIN,
             (2, 3),
         )
         .expect("genuine cross-round lock violation verifies");
@@ -1322,7 +1447,7 @@ mod tests {
         let wrong_message = signed_indexed_vote(7, 0, FinalityVotePhase::Precommit, 0xCC, &v1);
         let mut evidence = LockEvidence {
             locked_prevote_quorum: quorum_certificate_for(&wrong_message, &[0, 1]),
-            attestation: v1.attest_vote(CHAIN_ID, violation.data.clone(), Vec::new(), None),
+            attestation: v1.attest_vote(DOMAIN, violation.data.clone(), Vec::new(), None),
         };
         evidence.locked_prevote_quorum.data = FinalityVoteData {
             phase: FinalityVotePhase::Prevote,
@@ -1336,7 +1461,7 @@ mod tests {
                 &violation,
                 &evidence,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 (2, 3)
             ),
             Err(SlashingError::BadSignature)
@@ -1360,7 +1485,7 @@ mod tests {
         );
         let mut evidence = lock_evidence_for(&lock, &violation, &[0, 1]);
         evidence.attestation =
-            v1.attest_vote(CHAIN_ID, violation.data.clone(), Vec::new(), Some(unlock));
+            v1.attest_vote(DOMAIN, violation.data.clone(), Vec::new(), Some(unlock));
 
         assert_eq!(
             verify_lock_violation_evidence(
@@ -1369,7 +1494,7 @@ mod tests {
                 &violation,
                 &evidence,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 (2, 3)
             ),
             Err(SlashingError::EvidenceFieldsInconsistent)
@@ -1390,7 +1515,7 @@ mod tests {
                 &b_same_round,
                 &evidence,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 (2, 3)
             ),
             Err(SlashingError::EvidenceFieldsInconsistent),
@@ -1404,7 +1529,7 @@ mod tests {
                 &b_same_hash,
                 &evidence,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 (2, 3)
             ),
             Err(SlashingError::NotEquivocating)
@@ -1425,7 +1550,7 @@ mod tests {
                 &precommit,
                 &evidence,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 (2, 3)
             ),
             Err(SlashingError::EvidenceFieldsInconsistent),
@@ -1449,7 +1574,7 @@ mod tests {
                 &violation,
                 &evidence,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 (2, 3)
             ),
             Err(SlashingError::BadSignature)
@@ -1480,14 +1605,14 @@ mod tests {
         // tries to decode them as a BLS G2 signature.
         header.vrf_proof = [0; 96];
         let hash = header.hash();
-        header.signature = v0.sign_proposer_message(CHAIN_ID, &hash);
+        header.signature = v0.sign_proposer_message(DOMAIN, &hash);
 
         verify_invalid_vrf_claim_evidence(
             0,
             &header,
             VrfRejectionReason::BadSignature,
             &active_set,
-            CHAIN_ID,
+            DOMAIN,
             &ZERO_HASH,
             neutrino_primitives::DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
         )
@@ -1500,7 +1625,7 @@ mod tests {
                 &header,
                 VrfRejectionReason::ThresholdNotMet,
                 &active_set,
-                CHAIN_ID,
+                DOMAIN,
                 &ZERO_HASH,
                 neutrino_primitives::DEFAULT_EXPECTED_PROPOSERS_PER_SLOT,
             ),
@@ -1544,7 +1669,7 @@ mod tests {
 
         let conflicting = signed_indexed_vote(7, 1, FinalityVotePhase::Precommit, 0xBB, &v1);
         monitor.record_attestation(v1.attest_vote(
-            CHAIN_ID,
+            DOMAIN,
             conflicting.data.clone(),
             Vec::new(),
             None,
@@ -1585,7 +1710,7 @@ mod tests {
 
         assert!(monitor.record_indexed_vote(1, &lock_precommit).is_none());
         monitor.record_attestation(v1.attest_vote(
-            CHAIN_ID,
+            DOMAIN,
             conflicting.data.clone(),
             Vec::new(),
             None,
@@ -1656,7 +1781,7 @@ mod tests {
 
         monitor.record_indexed_vote(1, &lock_precommit);
         monitor.record_attestation(v1.attest_vote(
-            CHAIN_ID,
+            DOMAIN,
             conflicting.data.clone(),
             Vec::new(),
             None,
@@ -1679,7 +1804,7 @@ mod tests {
             &vote_b,
             &lock_evidence,
             &active_set,
-            CHAIN_ID,
+            DOMAIN,
             (2, 3),
         )
         .expect("synthesised LockViolation evidence passes verifier");
@@ -1741,7 +1866,7 @@ mod tests {
             chunk_hash: hash,
             phase: FinalityVotePhase::Precommit,
         };
-        let signature = key.sign_finality_vote(CHAIN_ID, &data);
+        let signature = key.sign_finality_vote(DOMAIN, &data);
         IndexedVote { data, signature }
     }
 
@@ -1759,7 +1884,7 @@ mod tests {
                 &canonical,
                 Some(&chunk),
                 &validators,
-                CHAIN_ID
+                DOMAIN
             ),
             Ok(())
         );
@@ -1770,7 +1895,7 @@ mod tests {
                 &canonical,
                 None,
                 &validators,
-                CHAIN_ID
+                DOMAIN
             ),
             Err(SlashingError::NotYetFinalizedLocally)
         );
@@ -1781,7 +1906,7 @@ mod tests {
                 &canonical,
                 Some(&chunk),
                 &validators,
-                CHAIN_ID
+                DOMAIN
             ),
             Err(SlashingError::NotEquivocating)
         );
@@ -1793,7 +1918,7 @@ mod tests {
                 &wrong_canonical,
                 Some(&chunk),
                 &validators,
-                CHAIN_ID
+                DOMAIN
             ),
             Err(SlashingError::EvidenceFieldsInconsistent)
         );
@@ -1805,7 +1930,7 @@ mod tests {
                 &canonical,
                 Some(&chunk),
                 &validators,
-                CHAIN_ID
+                DOMAIN
             ),
             Err(SlashingError::EvidenceFieldsInconsistent)
         );
@@ -1817,7 +1942,7 @@ mod tests {
                 &canonical,
                 Some(&chunk),
                 &validators,
-                CHAIN_ID
+                DOMAIN
             ),
             Err(SlashingError::BadSignature)
         );

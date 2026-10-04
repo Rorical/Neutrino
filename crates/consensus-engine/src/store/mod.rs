@@ -10,6 +10,7 @@
 //! columns use stable ASCII names (`tip`, `finalized_head`,
 //! `latest_chunk_id`, ...).
 
+mod availability;
 mod bootstrap;
 mod canonical;
 mod chain_store;
@@ -20,5 +21,6 @@ pub mod pointers;
 mod retention;
 mod snapshot;
 
+pub use availability::SignedArtifactMetadata;
 pub use chain_store::{ChainStore, ContentAddressedEntries, ValidatorSetSnapshot};
 pub use error::StoreError;

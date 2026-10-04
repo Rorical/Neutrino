@@ -306,6 +306,8 @@ pub(super) async fn on_response(
             };
             super::full_chunk::reset_after_bootstrap(driver);
             super::candidates::reset_after_bootstrap(driver);
+            super::bft::reset_after_bootstrap(driver);
+            super::availability::reset_after_bootstrap(driver);
             // Refresh canonical cursors only after the engine's atomic installation.
             if let Ok(progress) = driver.backend.local_progress().await {
                 driver.fsm.refresh_local_progress(progress);

@@ -144,7 +144,7 @@ pub fn validate_consensus_with_context(
     let spec = &input.chain_spec;
     let chunk = as_chunk(&execution.chunk);
     verify_finality_using(
-        spec.chain_id,
+        spec.consensus_domain(),
         &spec.consensus,
         &context.active_validators,
         &chunk,
@@ -266,7 +266,7 @@ fn validate_candidate_using(
         }
         verify_proposer_using(
             &block.header,
-            spec.chain_id,
+            spec.consensus_domain(),
             &context.active_validators,
             &input.seed,
             spec.consensus.expected_proposers_per_slot,

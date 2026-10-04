@@ -97,7 +97,7 @@ fn fresh_backend() -> Arc<ChainBackend<MemoryDatabase, MockProofSystem>> {
 fn signed_block(slot: u64, parent: BlockHash, height: Height, signer: &ProposerKey) -> Block {
     let body = Body::default();
     let roots = compute_body_roots(&body);
-    let vrf_proof = signer.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
+    let vrf_proof = signer.vrf_eval(spec(2).consensus_domain(), &TEST_GENESIS_SEED, slot);
     let mut header = Header {
         height,
         slot,
@@ -116,7 +116,7 @@ fn signed_block(slot: u64, parent: BlockHash, height: Height, signer: &ProposerK
         signature: [0; 96],
     };
     let header_hash = header.hash();
-    header.signature = signer.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    header.signature = signer.sign_proposer_message(spec(2).consensus_domain(), &header_hash);
     Block { header, body }
 }
 
@@ -227,7 +227,7 @@ fn partial_vote(
         chunk_hash: [0x77; 32],
         phase,
     };
-    let signature = signer.sign_finality_vote(TEST_CHAIN_ID, &data);
+    let signature = signer.sign_finality_vote(spec(2).consensus_domain(), &data);
     let voter_position = usize::try_from(signer.validator_index()).expect("u32 fits usize");
     let mut bits = BitVec::default();
     for position in 0..active_set_len {
@@ -276,9 +276,12 @@ async fn invalid_proof_signing_detector_emits_evidence_on_precommit() {
     let mut bad_vote = partial_vote(0, FinalityVotePhase::Precommit, &v1, active_set_len);
     let mut hashes = vec![[0; 32]; usize::try_from(spec(2).consensus.chunk_size).unwrap()];
     hashes[0] = neutrino_primitives::blake3_256(&borsh::to_vec(&bad_proof).unwrap());
-    bad_vote
-        .attestations
-        .push(v1.attest_vote(TEST_CHAIN_ID, bad_vote.data.clone(), hashes, None));
+    bad_vote.attestations.push(v1.attest_vote(
+        spec(2).consensus_domain(),
+        bad_vote.data.clone(),
+        hashes,
+        None,
+    ));
     backend.ingest_finality_vote(bad_vote.clone()).await;
 
     assert_eq!(
@@ -377,7 +380,7 @@ async fn ingest_rejects_invalid_proof_signing_evidence_whose_proof_verifies() {
     let dishonest_evidence = SlashingEvidence::InvalidProofSigning {
         validator_index: v1.validator_index(),
         attestation: v1.attest_vote(
-            TEST_CHAIN_ID,
+            spec(2).consensus_domain(),
             indexed.data.clone(),
             vec![
                 neutrino_primitives::blake3_256(&borsh::to_vec(&valid_proof).unwrap());
@@ -445,7 +448,7 @@ async fn aggregate_only_proof_acceptance_attributes_every_signer() {
         .map(|index| {
             let voter = proposer(index);
             aggregate.attestations.push(voter.attest_vote(
-                TEST_CHAIN_ID,
+                spec(2).consensus_domain(),
                 aggregate.data.clone(),
                 vec![neutrino_primitives::blake3_256(
                     &borsh::to_vec(&rejected).unwrap(),
@@ -453,7 +456,7 @@ async fn aggregate_only_proof_acceptance_attributes_every_signer() {
                 None,
             ));
             neutrino_crypto::bls::Signature::from_bytes(
-                &voter.sign_finality_vote(TEST_CHAIN_ID, &aggregate.data),
+                &voter.sign_finality_vote(spec(2).consensus_domain(), &aggregate.data),
             )
             .unwrap()
         })
@@ -484,7 +487,7 @@ async fn aggregate_only_proof_acceptance_attributes_every_signer() {
 fn proof_acceptance_vote(proof: &BlockProof, signer: &ProposerKey) -> FinalityVote {
     let mut vote = partial_vote(0, FinalityVotePhase::Precommit, signer, 2);
     vote.attestations.push(signer.attest_vote(
-        TEST_CHAIN_ID,
+        spec(2).consensus_domain(),
         vote.data.clone(),
         vec![neutrino_primitives::blake3_256(
             &borsh::to_vec(proof).unwrap(),
@@ -525,7 +528,7 @@ fn assert_objective_invalid_acceptance(
         attestation,
         rejected_proof,
         &validators(2),
-        TEST_CHAIN_ID,
+        spec(2).consensus_domain(),
         1,
     )
     .unwrap();
@@ -610,4 +613,353 @@ async fn valid_replacement_preserves_accountability_for_later_signed_invalid_byt
         backend.ingest_finality_vote(valid_vote).await;
         assert_eq!(backend.slashing_pool_len(), 0);
     }
+}
+
+#[tokio::test]
+async fn exact_fetched_rejected_proof_arriving_after_attestation_detects_offence() {
+    use neutrino_consensus_types::signed_artifacts::SignedArtifact;
+    let backend = fresh_backend();
+    let block = signed_block(1, spec(2).genesis_block_hash, 1, &proposer(0));
+    backend
+        .verify_and_import_gossip_block(block.clone())
+        .await
+        .unwrap();
+    let proof = bad_mock_proof(&block);
+    let source = SignedArtifact::BlockProof(proof.clone());
+    let mut vote = partial_vote(0, FinalityVotePhase::Precommit, &proposer(1), 2);
+    vote.attestations.push(proposer(1).attest_vote(
+        spec(2).consensus_domain(),
+        vote.data.clone(),
+        vec![source.id()],
+        None,
+    ));
+    backend.ingest_finality_vote(vote.clone()).await;
+    assert_eq!(backend.slashing_pool_len(), 0);
+    assert_eq!(backend.missing_vote_artifacts(&vote).await.len(), 1);
+    assert_eq!(
+        backend.ingest_signed_artifact(source.clone()).await,
+        neutrino_sync::EvidenceProofAcceptance::Accepted
+    );
+    assert_eq!(backend.slashing_pool_len(), 1);
+    assert_eq!(
+        backend
+            .signed_artifact_by_id(source.id())
+            .await
+            .unwrap()
+            .artifact,
+        source
+    );
+    assert_eq!(
+        backend.missing_vote_artifacts(&vote).await,
+        Vec::<neutrino_consensus_types::signed_artifacts::SignedArtifactRef>::new()
+    );
+}
+
+#[tokio::test]
+async fn exact_artifacts_preserve_distinct_rejected_encodings_of_one_block() {
+    use neutrino_consensus_types::signed_artifacts::SignedArtifact;
+    let backend = fresh_backend();
+    let block = signed_block(1, spec(2).genesis_block_hash, 1, &proposer(0));
+    backend
+        .verify_and_import_gossip_block(block.clone())
+        .await
+        .unwrap();
+    let first = bad_mock_proof(&block);
+    let mut second = first.clone();
+    second.proof_bytes = borsh::to_vec(&MockBlockProof {
+        commitment: [0xDD; 32],
+    })
+    .unwrap();
+    let first = SignedArtifact::BlockProof(first);
+    let second = SignedArtifact::BlockProof(second);
+    assert_ne!(first.id(), second.id());
+    assert_eq!(
+        backend.ingest_signed_artifact(first.clone()).await,
+        neutrino_sync::EvidenceProofAcceptance::Accepted
+    );
+    assert_eq!(
+        backend.ingest_signed_artifact(second.clone()).await,
+        neutrino_sync::EvidenceProofAcceptance::Accepted
+    );
+    assert_eq!(
+        backend
+            .signed_artifact_by_id(first.id())
+            .await
+            .unwrap()
+            .artifact,
+        first
+    );
+    assert_eq!(
+        backend
+            .signed_artifact_by_id(second.id())
+            .await
+            .unwrap()
+            .artifact,
+        second
+    );
+    let inventory = backend.signed_artifact_inventory(0, None).await.unwrap();
+    assert_eq!(inventory.entries.len(), 2);
+}
+
+#[tokio::test]
+async fn forged_and_future_source_artifacts_never_enter_durable_inventory() {
+    use neutrino_consensus_types::signed_artifacts::SignedArtifact;
+    let backend = fresh_backend();
+    let mut vote = partial_vote(0, FinalityVotePhase::Prevote, &proposer(1), 2);
+    vote.attestations.push(proposer(1).attest_vote(
+        spec(2).consensus_domain(),
+        vote.data.clone(),
+        Vec::new(),
+        None,
+    ));
+    vote.signature[0] ^= 1;
+    assert_eq!(
+        backend
+            .ingest_signed_artifact(SignedArtifact::Vote(vote))
+            .await,
+        neutrino_sync::EvidenceProofAcceptance::Rejected
+    );
+    let mut future = partial_vote(u64::MAX, FinalityVotePhase::Prevote, &proposer(1), 2);
+    future.attestations.push(proposer(1).attest_vote(
+        spec(2).consensus_domain(),
+        future.data.clone(),
+        Vec::new(),
+        None,
+    ));
+    assert_eq!(
+        backend
+            .ingest_signed_artifact(SignedArtifact::Vote(future))
+            .await,
+        neutrino_sync::EvidenceProofAcceptance::Deferred
+    );
+    assert_eq!(
+        backend
+            .signed_artifact_inventory(0, None)
+            .await
+            .unwrap()
+            .entries,
+        Vec::<neutrino_consensus_types::signed_artifacts::SignedArtifactRef>::new()
+    );
+}
+
+#[tokio::test]
+async fn accepted_source_rpc_uses_existing_immutable_receipt_bytes() {
+    use neutrino_consensus_types::signed_artifacts::SignedArtifact;
+    use neutrino_storage::{Column, Database};
+    let backend = fresh_backend();
+    let block = signed_block(1, spec(2).genesis_block_hash, 1, &proposer(0));
+    backend
+        .verify_and_import_gossip_block(block.clone())
+        .await
+        .unwrap();
+    let proof = good_mock_proof(&block);
+    backend
+        .verify_and_import_block_proofs(1, vec![proof.clone()])
+        .await
+        .unwrap();
+    let artifact = SignedArtifact::BlockProof(proof);
+    assert_eq!(
+        backend
+            .signed_artifact_by_id(artifact.id())
+            .await
+            .unwrap()
+            .artifact,
+        artifact
+    );
+    let stored_bytes = backend.with_engine_mut_for_test(|engine| {
+        engine
+            .store()
+            .db()
+            .get(Column::SignedArtifacts, &artifact.id())
+            .unwrap()
+            .unwrap()
+    });
+    assert!(
+        stored_bytes.len() < 64,
+        "accepted sources store an immutable receipt pointer"
+    );
+}
+
+#[tokio::test]
+async fn delayed_lock_quorum_after_restart_revisits_later_signed_prevotes() {
+    use neutrino_consensus_types::{
+        AggregatedVote, QuorumCertificate, signed_artifacts::SignedArtifact,
+    };
+    let backend = fresh_backend();
+    let mut prior = partial_vote(0, FinalityVotePhase::Precommit, &proposer(1), 2);
+    prior.data.chunk_hash = [0x41; 32];
+    prior.signature = proposer(1).sign_finality_vote(spec(2).consensus_domain(), &prior.data);
+    prior.attestations.push(proposer(1).attest_vote(
+        spec(2).consensus_domain(),
+        prior.data.clone(),
+        vec![[9; 32]],
+        None,
+    ));
+    let mut later = partial_vote(0, FinalityVotePhase::Prevote, &proposer(1), 2);
+    later.data.round = 2;
+    later.signature = proposer(1).sign_finality_vote(spec(2).consensus_domain(), &later.data);
+    later.attestations.push(proposer(1).attest_vote(
+        spec(2).consensus_domain(),
+        later.data.clone(),
+        Vec::new(),
+        None,
+    ));
+    backend.ingest_finality_vote(later).await;
+    backend.ingest_finality_vote(prior.clone()).await;
+    assert_eq!(backend.slashing_pool_len(), 0);
+    let db = backend.with_engine_mut_for_test(|engine| engine.store().db().clone());
+    let engine = Engine::open(spec(2), db).unwrap();
+    let restarted = ChainBackend::new(engine, MockProofSystem::new());
+    let mut data = prior.data;
+    data.phase = FinalityVotePhase::Prevote;
+    let signatures: Vec<_> = (0..2)
+        .map(|index| {
+            neutrino_crypto::bls::Signature::from_bytes(
+                &proposer(index).sign_finality_vote(spec(2).consensus_domain(), &data),
+            )
+            .unwrap()
+        })
+        .collect();
+    let quorum = QuorumCertificate {
+        data,
+        aggregate: AggregatedVote {
+            aggregation_bits: BitVec::from_bytes(2, vec![3]).unwrap(),
+            signature: neutrino_crypto::bls::aggregate_signatures(
+                &signatures.iter().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .to_bytes(),
+        },
+    };
+    assert_eq!(
+        restarted
+            .ingest_signed_artifact(SignedArtifact::Quorum(quorum))
+            .await,
+        neutrino_sync::EvidenceProofAcceptance::Accepted
+    );
+    assert_eq!(restarted.slashing_pool_len(), 1);
+    assert!(matches!(
+        &restarted.drain_slashing_pool(1)[0],
+        SlashingEvidence::LockViolation { .. }
+    ));
+}
+
+fn domain_value_vote(spec: &ChainSpec) -> FinalityVote {
+    let signer = proposer(1);
+    let data = FinalityVoteData {
+        chunk_id: 0,
+        round: 0,
+        phase: FinalityVotePhase::Prevote,
+        chunk_hash: [0x77; 32],
+    };
+    let domain = spec.consensus_domain();
+    FinalityVote {
+        signature: signer.sign_finality_vote(domain, &data),
+        aggregation_bits: BitVec::from_bytes(2, vec![2]).unwrap(),
+        attestations: vec![signer.attest_vote(domain, data.clone(), Vec::new(), None)],
+        data,
+    }
+}
+
+fn domain_nil_vote(spec: &ChainSpec) -> neutrino_consensus_types::NilVote {
+    use neutrino_consensus_types::{NilVote, NilVoteAttestation, NilVoteData};
+    let signer = proposer(1);
+    let domain = spec.consensus_domain();
+    let data = NilVoteData {
+        chunk_id: 0,
+        round: 0,
+        phase: FinalityVotePhase::Prevote,
+    };
+    let signature = signer.sign_raw(&data.signing_message(domain)).to_bytes();
+    let mut claim = NilVoteAttestation {
+        validator_index: 1,
+        vote: data.clone(),
+        vote_signature: signature,
+        signature: [0; 96],
+    };
+    claim.signature = signer.sign_raw(&claim.signing_message(domain)).to_bytes();
+    NilVote {
+        data,
+        aggregation_bits: BitVec::from_bytes(2, vec![2]).unwrap(),
+        signature,
+        attestations: vec![claim],
+    }
+}
+
+#[tokio::test]
+async fn late_sources_from_same_id_different_spec_cannot_synthesize_or_authorize_slashing() {
+    use neutrino_consensus_types::{IndexedNilVote, IndexedVote, signed_artifacts::SignedArtifact};
+    use neutrino_sync::EvidenceProofAcceptance::{Accepted, Rejected};
+    let first = spec(2);
+    let mut second = first.clone();
+    second.genesis_time += 1;
+    assert_eq!(first.chain_id, second.chain_id);
+    assert_eq!(first.initial_validators, second.initial_validators);
+    assert_ne!(first.hash(), second.hash());
+    let foreign = domain_nil_vote(&first);
+    let original = ChainBackend::new(
+        Engine::genesis(first.clone(), MemoryDatabase::new()).unwrap(),
+        MockProofSystem::new(),
+    );
+    assert_eq!(
+        original
+            .ingest_signed_artifact(SignedArtifact::NilVote(foreign.clone()))
+            .await,
+        Accepted
+    );
+    let backend = ChainBackend::new(
+        Engine::genesis(second.clone(), MemoryDatabase::new()).unwrap(),
+        MockProofSystem::new(),
+    );
+    let value = domain_value_vote(&second);
+    assert_eq!(
+        backend
+            .ingest_signed_artifact(SignedArtifact::Vote(value.clone()))
+            .await,
+        Accepted
+    );
+    for source in [
+        SignedArtifact::NilVote(foreign.clone()),
+        SignedArtifact::Vote(domain_value_vote(&first)),
+    ] {
+        assert_eq!(
+            backend.ingest_signed_artifact(source.clone()).await,
+            Rejected
+        );
+        assert!(backend.signed_artifact_by_id(source.id()).await.is_err());
+    }
+    let mixed = SlashingEvidence::ConflictingNilVote {
+        validator_index: 1,
+        value_vote: IndexedVote {
+            data: value.data,
+            signature: value.signature,
+        },
+        nil_vote: IndexedNilVote {
+            data: foreign.data.clone(),
+            signature: foreign.signature,
+        },
+    };
+    backend.ingest_slashing_evidence(mixed).await;
+    assert_eq!(backend.slashing_pool_len(), 0);
+    let restarted = ChainBackend::new(
+        Engine::open(second.clone(), backend.snapshot_database()).unwrap(),
+        MockProofSystem::new(),
+    );
+    assert_eq!(
+        restarted
+            .ingest_signed_artifact(SignedArtifact::NilVote(foreign))
+            .await,
+        Rejected
+    );
+    assert_eq!(restarted.slashing_pool_len(), 0);
+    assert_eq!(
+        backend
+            .ingest_signed_artifact(SignedArtifact::NilVote(domain_nil_vote(&second)))
+            .await,
+        Accepted
+    );
+    assert!(matches!(
+        backend.drain_slashing_pool(1).as_slice(),
+        [SlashingEvidence::ConflictingNilVote { .. }]
+    ));
 }

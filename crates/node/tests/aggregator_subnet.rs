@@ -209,17 +209,31 @@ async fn dispatch_gossip(handle: &mut NodeHandle, event: NetworkEvent) {
             }
         }
         Topic::FinalityVotesPrevote | Topic::FinalityVotesPrecommit => {
-            let vote: neutrino_consensus_types::FinalityVote =
+            let vote: neutrino_consensus_types::BftVote =
                 borsh::from_slice(&data).expect("decode finality vote");
-            handle.backend.ingest_finality_vote(vote).await;
+            let _ = handle
+                .backend
+                .ingest_bft_message(neutrino_consensus_types::BftMessage::Vote(vote))
+                .await;
         }
         Topic::AggregateFinalityVotes(subnet) => {
-            let vote: neutrino_consensus_types::FinalityVote =
+            let vote: neutrino_consensus_types::BftVote =
                 borsh::from_slice(&data).expect("decode aggregate vote");
-            handle
-                .backend
-                .ingest_aggregate_finality_vote(subnet, vote)
-                .await;
+            if let neutrino_consensus_types::BftVote::Value(vote) = vote {
+                handle
+                    .backend
+                    .ingest_aggregate_finality_vote(subnet, vote)
+                    .await;
+            } else {
+                let _ = handle
+                    .backend
+                    .ingest_bft_message(neutrino_consensus_types::BftMessage::Vote(vote))
+                    .await;
+            }
+        }
+        Topic::BftMessages => {
+            let message = borsh::from_slice(&data).expect("decode signed BFT message");
+            let _ = handle.backend.ingest_bft_message(message).await;
         }
         Topic::ChunkProofs => {
             let proof: neutrino_consensus_types::ChunkProof =
@@ -370,6 +384,7 @@ async fn passive_follower_finalises_via_aggregate_subnet_topic() {
     // can ingest v1's prevote/precommit, plus the aggregate subnet
     // for chunk 0 so it can receive any aggregate v1 might emit.
     let a_topics = [
+        Topic::BftMessages,
         Topic::Blocks,
         Topic::BlockProofs,
         Topic::ChunkProofs,
@@ -380,6 +395,7 @@ async fn passive_follower_finalises_via_aggregate_subnet_topic() {
     // v1 (passive) subscribes to the aggregate subnet *only*; it has
     // no path to receive v0's partial votes directly.
     let b_topics = [
+        Topic::BftMessages,
         Topic::Blocks,
         Topic::BlockProofs,
         Topic::ChunkProofs,

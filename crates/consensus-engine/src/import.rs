@@ -527,13 +527,13 @@ impl<DB: Database> Engine<DB> {
         verify_header_signature(
             &block.header,
             self.active_validator_set(),
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
         )
         .map_err(ImportError::HeaderSignature)?;
         consensus_vrf::verify_header_proposer(
             &block.header,
             self.active_validator_set(),
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
             &self.finalized_seed(),
             self.chain_spec().consensus.expected_proposers_per_slot,
         )
@@ -1369,7 +1369,7 @@ impl<DB: Database> Engine<DB> {
         Ok(parent.state_root)
     }
 
-    fn block_proof_public_inputs(
+    pub(crate) fn block_proof_public_inputs(
         &self,
         header: &neutrino_consensus_types::Header,
         state_root_before: StateRoot,
@@ -1487,7 +1487,7 @@ mod tests {
 
         let (vrf_proof, _) = neutrino_vrf::eval(
             signing_key.secret_key(),
-            TEST_CHAIN_ID,
+            spec().consensus_domain(),
             &TEST_GENESIS_SEED,
             slot,
         );
@@ -1510,7 +1510,8 @@ mod tests {
             signature: [0; 96],
         };
         let header_hash = header.hash();
-        header.signature = signing_key.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+        header.signature =
+            signing_key.sign_proposer_message(spec().consensus_domain(), &header_hash);
         Block { header, body }
     }
 
@@ -1669,12 +1670,18 @@ mod tests {
         let mut spec = spec();
         spec.consensus.chunk_size = 1;
         spec.proof.slot_budget_per_chunk = 1;
-        let mut engine = Engine::genesis(spec, MemoryDatabase::new()).unwrap();
+        let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
         for height in 1..10 {
-            let next = block(height, height, engine.head_hash(), [5; 32]);
+            let mut next = block(height, height, engine.head_hash(), [5; 32]);
+            next.header.vrf_proof =
+                proposer().vrf_eval(spec.consensus_domain(), &spec.genesis_seed, height);
+            next.header.signature =
+                proposer().sign_proposer_message(spec.consensus_domain(), &next.hash());
             engine.import_block(&next).unwrap();
         }
         let mut next = block(10, 10, engine.head_hash(), [5; 32]);
+        next.header.vrf_proof =
+            proposer().vrf_eval(spec.consensus_domain(), &spec.genesis_seed, 10);
         next.body.finality_votes.push(FinalityVote {
             data: FinalityVoteData {
                 chunk_id: 0,
@@ -1689,7 +1696,8 @@ mod tests {
         let roots = compute_body_roots(&next.body);
         next.header.votes_root = roots.votes_root;
         next.header.da_root = roots.da_root;
-        next.header.signature = proposer().sign_proposer_message(TEST_CHAIN_ID, &next.hash());
+        next.header.signature =
+            proposer().sign_proposer_message(spec.consensus_domain(), &next.hash());
         assert!(matches!(
             engine.import_block(&next),
             Err(ImportError::HistoricalVoteOutsideWindow {
@@ -1731,7 +1739,8 @@ mod tests {
         // Re-sign with the attacker key under the legitimate proposer
         // index so the signature decodes but verifies against the
         // wrong public key.
-        block.header.signature = attacker.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+        block.header.signature =
+            attacker.sign_proposer_message(spec().consensus_domain(), &header_hash);
 
         match engine.import_block(&block) {
             Err(ImportError::HeaderSignature(_)) => {}
@@ -1748,7 +1757,7 @@ mod tests {
         let attacker = ProposerKey::from_ikm(&[0xCE; 32], 0).expect("derive attacker");
         let (bogus_vrf, _) = neutrino_vrf::eval(
             attacker.secret_key(),
-            TEST_CHAIN_ID,
+            spec().consensus_domain(),
             &TEST_GENESIS_SEED,
             block.header.slot,
         );
@@ -1756,7 +1765,8 @@ mod tests {
         // Re-sign the header so the signature check passes; only the
         // VRF claim is bogus.
         let header_hash = block.header.hash();
-        block.header.signature = proposer().sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+        block.header.signature =
+            proposer().sign_proposer_message(spec().consensus_domain(), &header_hash);
 
         match engine.import_block(&block) {
             Err(ImportError::HeaderVrf(_)) => {}
@@ -1773,7 +1783,8 @@ mod tests {
         let header_hash = block.header.hash();
         // Re-sign so signature decoding does not short-circuit; the
         // missing validator lookup must be the first failure.
-        block.header.signature = proposer().sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+        block.header.signature =
+            proposer().sign_proposer_message(spec().consensus_domain(), &header_hash);
 
         match engine.import_block(&block) {
             Err(ImportError::HeaderSignature(SignatureError::ValidatorIndexOutOfBounds {

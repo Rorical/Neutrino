@@ -1,6 +1,9 @@
 # Randomness
 
-BLS-VRF signs a domain-separated chain-ID, finalized-seed and slot message.
+BLS-VRF signs `DOMAIN_VRF || chain_id LE8 || ChainSpecHash32 || finalized_seed || slot LE8`.
+The strong `ConsensusDomain` comes from the complete authenticated `ChainSpec`;
+equal numeric chain IDs and identical validator keys cannot replay another
+specification's VRF proof.
 Proposer eligibility compares its output with the authenticated stake-weighted
 threshold defined by consensus parameters. Native header validation and the chunk
 Guest verify the same identity, signature and eligibility rules.

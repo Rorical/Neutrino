@@ -1111,6 +1111,14 @@ mod tests {
 
         let cp = neutrino_consensus_types::ChunkProof {
             finality_cert: FinalityCert {
+                proposal: neutrino_consensus_types::BftProposal {
+                    chunk: c.clone(),
+                    round: 0,
+                    proposer_index: 0,
+                    valid_quorum: None,
+                    round_change_certificate: None,
+                    signature: [0; 96],
+                },
                 prevote_attestations: Vec::new(),
                 precommit_attestations: Vec::new(),
                 chunk_id: 2,
@@ -1143,6 +1151,14 @@ mod tests {
         assert_eq!(store.get_chunk_proof(2).expect("get"), Some(cp));
 
         let cert = FinalityCert {
+            proposal: neutrino_consensus_types::BftProposal {
+                chunk: c.clone(),
+                round: 0,
+                proposer_index: 0,
+                valid_quorum: None,
+                round_change_certificate: None,
+                signature: [0; 96],
+            },
             prevote_attestations: Vec::new(),
             precommit_attestations: Vec::new(),
             chunk_id: 2,

@@ -142,7 +142,7 @@ impl ProofSystem for NativeConsensusBackend {
 }
 
 fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
-    let (witness, _, _) = support::fixture([1; 8], [4; 32]);
+    let (mut witness, _, _) = support::fixture([1; 8], [4; 32]);
     let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
     let block = &witness.blocks[0];
     let hash = block.header.hash();
@@ -168,6 +168,14 @@ fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
             },
         )
         .unwrap();
+    let receipt = engine.store().get_block_proof(&hash).unwrap().unwrap();
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    witness.finality_cert.precommit_attestations = vec![voter.attest_vote(
+        witness.chain_spec.consensus_domain(),
+        witness.finality_cert.precommit_vote().data,
+        vec![neutrino_prover_chunk::execution::commitment(&receipt)],
+        None,
+    )];
     (engine, witness)
 }
 
@@ -257,6 +265,7 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
     engine.finalize_chunk(0, &prover, &voter).unwrap();
     let key = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    let domain = engine.chain_spec().consensus_domain();
     let sign = |hash| {
         let data = FinalityVoteData {
             chunk_id: 0,
@@ -264,12 +273,9 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
             chunk_hash: [hash; 32],
             phase: FinalityVotePhase::Precommit,
         };
-        let mut message = Vec::from(neutrino_primitives::DOMAIN_PRECOMMIT);
-        message.extend_from_slice(&7_u64.to_le_bytes());
-        message.extend_from_slice(&borsh::to_vec(&data).unwrap());
         IndexedVote {
+            signature: key.sign(&data.signing_message(domain)).to_bytes(),
             data,
-            signature: key.sign(&message).to_bytes(),
         }
     };
     let offence = SlashingEvidence::DoublePrecommit {
@@ -346,6 +352,209 @@ fn ready_prover() -> NativeConsensusBackend {
     }
 }
 
+fn cached_candidate_fixture() -> (
+    Engine<MemoryDatabase>,
+    neutrino_consensus_types::Chunk,
+    neutrino_consensus_types::Chunk,
+) {
+    let (mut engine, witness) = engine();
+    engine.set_evidence_programs([1; 8], [2; 8], [3; 8]);
+    let first = witness.blocks[0].header.hash();
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let mut sibling = neutrino_consensus_types::Block {
+        header: witness.blocks[0].header.clone(),
+        body: neutrino_consensus_types::Body::default(),
+    };
+    sibling.header.slot = 2;
+    sibling.header.timestamp = 2 * witness.chain_spec.consensus.slot_duration_secs;
+    sibling.header.vrf_proof = voter
+        .sign_raw(&neutrino_vrf::vrf_message(
+            witness.chain_spec.consensus_domain(),
+            &witness.seed,
+            2,
+        ))
+        .to_bytes();
+    sibling.header.signature =
+        voter.sign_proposer_message(witness.chain_spec.consensus_domain(), &sibling.hash());
+    let second = sibling.hash();
+    engine.import_block(&sibling).unwrap();
+    let mut receipt = engine.store().get_block_proof(&first).unwrap().unwrap();
+    receipt.block_hash = second;
+    receipt.public_inputs.block_hash = second;
+    engine
+        .store_mut()
+        .put_proven_block(&second, &receipt)
+        .unwrap();
+    let prover = ready_prover();
+    let [first_chunk, second_chunk] = [first, second].map(|head| {
+        let prepared = engine
+            .prepare_consensus_chunk_on_branch(0, head, &prover)
+            .unwrap();
+        neutrino_prover_chunk::consensus::as_chunk(
+            &neutrino_prover_chunk::consensus::validate_candidate(&prepared.witness)
+                .unwrap()
+                .execution
+                .chunk,
+        )
+    });
+    engine
+        .store_mut()
+        .commit_tip(
+            second,
+            witness.chain_spec.genesis_block_hash,
+            neutrino_storage::Batch::new(),
+        )
+        .unwrap();
+    let reopened = Engine::open(witness.chain_spec, engine.store().db().clone()).unwrap();
+    (reopened, first_chunk, second_chunk)
+}
+
+fn candidate_quorum(
+    domain: neutrino_primitives::ConsensusDomain,
+    voter: &ProposerKey,
+    chunk: &neutrino_consensus_types::Chunk,
+    round: u32,
+) -> neutrino_consensus_types::QuorumCertificate {
+    let data = neutrino_consensus_types::FinalityVoteData {
+        chunk_id: chunk.chunk_id,
+        chunk_hash: chunk.hash(),
+        round,
+        phase: neutrino_consensus_types::FinalityVotePhase::Prevote,
+    };
+    neutrino_consensus_types::QuorumCertificate {
+        aggregate: neutrino_consensus_types::AggregatedVote {
+            aggregation_bits: neutrino_primitives::BitVec::from_bytes(1, vec![1]).unwrap(),
+            signature: voter.sign_finality_vote(domain, &data),
+        },
+        data,
+    }
+}
+
+fn retain_report_before_changed_highest_value(
+    engine: &mut Engine<MemoryDatabase>,
+    retained: &neutrino_consensus_types::Chunk,
+    current: &neutrino_consensus_types::Chunk,
+) {
+    use neutrino_consensus_types::{
+        BftCandidate, BftProposal, RoundChange, RoundChangeCertificate,
+    };
+    let prover = ready_prover();
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let domain = engine.chain_spec().consensus_domain();
+    engine.open_bft_session_at(retained.clone(), 100).unwrap();
+    engine
+        .offer_bft_candidate(
+            &BftCandidate {
+                chunk: retained.clone(),
+                round: 1,
+                justification: Some(candidate_quorum(domain, &voter, retained, 0)),
+            },
+            100,
+            &prover,
+        )
+        .unwrap();
+    let mut report = RoundChange {
+        chunk_id: 0,
+        round: 2,
+        validator_index: 0,
+        highest_quorum: Some(candidate_quorum(domain, &voter, retained, 0)),
+        signature: [0; 96],
+    };
+    report.signature = voter.sign_raw(&report.signing_message(domain)).to_bytes();
+    engine
+        .observe_round_change_certificate(
+            RoundChangeCertificate {
+                chunk_id: 0,
+                round: 2,
+                reports: vec![report],
+            },
+            101,
+        )
+        .unwrap();
+    engine
+        .offer_bft_candidate(
+            &BftCandidate {
+                chunk: current.clone(),
+                round: 2,
+                justification: Some(candidate_quorum(domain, &voter, current, 1)),
+            },
+            102,
+            &prover,
+        )
+        .unwrap();
+    let mut proposal = BftProposal {
+        chunk: current.clone(),
+        round: 2,
+        proposer_index: 0,
+        valid_quorum: Some(candidate_quorum(domain, &voter, current, 1)),
+        round_change_certificate: engine
+            .bft_session(0)
+            .unwrap()
+            .round_change_certificate()
+            .cloned(),
+        signature: [0; 96],
+    };
+    proposal.signature = voter.sign_raw(&proposal.signing_message(domain)).to_bytes();
+    engine.observe_bft_proposal(proposal, 102, &prover).unwrap();
+}
+
+#[tokio::test]
+async fn exact_candidate_rpc_serves_retained_report_target_after_highest_value_changes() {
+    let (mut engine, retained, current) = cached_candidate_fixture();
+    retain_report_before_changed_highest_value(&mut engine, &retained, &current);
+    assert_eq!(engine.bft_candidate(0).unwrap().chunk, current);
+    assert_eq!(engine.bft_session(0).unwrap().chunk_hash(), current.hash());
+    assert_eq!(engine.head_hash(), current.end_block_hash);
+    let spec = engine.chain_spec().clone();
+    let backend = ChainBackend::new(engine, ready_prover());
+    let entry = backend
+        .bft_round_by_chunk(0)
+        .await
+        .unwrap()
+        .round_change
+        .unwrap();
+    assert_eq!(
+        entry.highest_quorum().unwrap().data.chunk_hash,
+        retained.hash()
+    );
+    assert_eq!(
+        backend
+            .bft_candidate(0, Some(retained.hash()))
+            .await
+            .unwrap()
+            .candidate
+            .chunk,
+        retained
+    );
+    let restarted = ChainBackend::new(
+        Engine::open(spec, backend.snapshot_database()).unwrap(),
+        ready_prover(),
+    );
+    assert_eq!(
+        restarted
+            .bft_candidate(0, Some(retained.hash()))
+            .await
+            .unwrap()
+            .candidate
+            .chunk,
+        retained
+    );
+    restarted.with_engine_mut_for_test(|engine| {
+        neutrino_storage::Database::delete(
+            engine.store_mut().db_mut(),
+            neutrino_storage::Column::BlockProofs,
+            &retained.end_block_hash,
+        )
+        .unwrap();
+    });
+    assert!(
+        restarted
+            .bft_candidate(0, Some(retained.hash()))
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn historical_long_range_evidence_requires_the_finalized_canonical_hash_after_restart() {
     use neutrino_consensus_types::{
@@ -356,6 +565,7 @@ async fn historical_long_range_evidence_requires_the_finalized_canonical_hash_af
     let prover = ready_prover();
     let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
     let finalized = engine.finalize_chunk(0, &prover, &voter).unwrap();
+    let domain = witness.chain_spec.consensus_domain();
     let reopened = Engine::open(witness.chain_spec, engine.store().db().clone()).unwrap();
     assert_eq!(reopened.latest_finalized_chunk_id(), Some(0));
     let backend = ChainBackend::new(reopened, prover);
@@ -367,7 +577,7 @@ async fn historical_long_range_evidence_requires_the_finalized_canonical_hash_af
             phase: FinalityVotePhase::Precommit,
         };
         IndexedVote {
-            signature: voter.sign_finality_vote(7, &data),
+            signature: voter.sign_finality_vote(domain, &data),
             data,
         }
     };
@@ -575,9 +785,9 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
     sibling.header.gas_used = 0;
     sibling.header.receipts_root = first.header.receipts_root;
     sibling.header.runtime_extra = first.header.runtime_extra;
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&spec.chain_id.to_le_bytes());
-    message.extend_from_slice(&sibling.hash());
+    let message = spec
+        .consensus_domain()
+        .signing_message(DOMAIN_PROPOSER_SIG, &sibling.hash());
     sibling.header.signature = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[])
         .unwrap()
         .sign(&message)
@@ -832,11 +1042,16 @@ async fn imported_finality_selects_a_proven_archived_fork_and_survives_restart()
     local.header.timestamp = 2 * witness.chain_spec.consensus.slot_duration_secs;
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     local.header.vrf_proof = key
-        .sign(&neutrino_vrf::vrf_message(7, &witness.seed, 2))
+        .sign(&neutrino_vrf::vrf_message(
+            witness.chain_spec.consensus_domain(),
+            &witness.seed,
+            2,
+        ))
         .to_bytes();
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&7_u64.to_le_bytes());
-    message.extend_from_slice(&local.hash());
+    let message = witness
+        .chain_spec
+        .consensus_domain()
+        .signing_message(DOMAIN_PROPOSER_SIG, &local.hash());
     local.header.signature = key.sign(&message).to_bytes();
     let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
     follower.set_evidence_programs([1; 8], [2; 8], [3; 8]);

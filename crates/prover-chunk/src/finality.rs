@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use neutrino_consensus_types::{
     AggregatedVote, Chunk, FinalityCert, FinalityVoteData, FinalityVotePhase,
 };
-use neutrino_primitives::{ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Validator};
+use neutrino_primitives::{ConsensusParams, Validator};
 
 use crate::execution::commitment;
 
@@ -12,13 +12,13 @@ use crate::execution::commitment;
 /// already reaches quorum. Every signer must carry a complete,
 /// cryptographically authenticated attestation.
 pub fn verify_vote(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
     params: &ConsensusParams,
 ) -> Result<(), FinalityError> {
     verify_vote_using(
-        chain_id,
+        domain,
         validators,
         vote,
         params,
@@ -28,15 +28,15 @@ pub fn verify_vote(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_vote_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
     params: &ConsensusParams,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
-    verify_vote_signatures_using(chain_id, validators, vote, params, verifier)?;
+    verify_vote_signatures_using(domain, validators, vote, params, verifier)?;
     verify_unlock_claims_using(
-        chain_id,
+        domain,
         validators,
         &vote.data,
         &vote.attestations,
@@ -51,13 +51,13 @@ pub fn verify_vote_using(
 /// does not validate a signer's declared unlock quorum. An invalid signed unlock
 /// can itself establish an offence; consensus admission must use [`verify_vote`].
 pub fn verify_vote_signatures(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
     params: &ConsensusParams,
 ) -> Result<(), FinalityError> {
     verify_vote_signatures_using(
-        chain_id,
+        domain,
         validators,
         vote,
         params,
@@ -68,7 +68,7 @@ pub fn verify_vote_signatures(
 /// Authenticate signed vote artifacts with a shared key cache or fact source.
 /// Declared unlock semantics remain separate from this attribution check.
 pub fn verify_vote_signatures_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
     params: &ConsensusParams,
@@ -79,8 +79,7 @@ pub fn verify_vote_signatures_using(
         &vote.aggregation_bits,
         &vote.attestations,
         params.chunk_size,
-    ) || vote.data.round > params.bft_max_round
-        || usize::try_from(vote.aggregation_bits.bit_len()).ok() != Some(validators.len())
+    ) || usize::try_from(vote.aggregation_bits.bit_len()).ok() != Some(validators.len())
     {
         return Err(FinalityError::Membership);
     }
@@ -94,40 +93,28 @@ pub fn verify_vote_signatures_using(
             keys.push(validator.pubkey);
         }
     }
-    let domain = match vote.data.phase {
-        FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
-        FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
-    };
-    let mut message = Vec::from(domain);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(&borsh::to_vec(&vote.data).expect("canonical vote encoding"));
+    let message = vote.data.signing_message(domain);
     if keys.is_empty() || !verifier.aggregate(&keys, &message, &vote.signature) {
         return Err(FinalityError::Signature);
     }
-    verify_claim_signatures_using(
-        chain_id,
-        validators,
-        &vote.data,
-        &vote.attestations,
-        verifier,
-    )?;
+    verify_claim_signatures_using(domain, validators, &vote.data, &vote.attestations, verifier)?;
     Ok(())
 }
 
 fn verify_claims_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     data: &FinalityVoteData,
     claims: &[neutrino_consensus_types::VoteAttestation],
     params: &ConsensusParams,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), FinalityError> {
-    verify_claim_signatures_using(chain_id, validators, data, claims, verifier)?;
-    verify_unlock_claims_using(chain_id, validators, data, claims, params, verifier)
+    verify_claim_signatures_using(domain, validators, data, claims, verifier)?;
+    verify_unlock_claims_using(domain, validators, data, claims, params, verifier)
 }
 
 fn verify_claim_signatures_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     data: &FinalityVoteData,
     claims: &[neutrino_consensus_types::VoteAttestation],
@@ -135,7 +122,7 @@ fn verify_claim_signatures_using(
 ) -> Result<(), FinalityError> {
     for claim in claims {
         crate::slashing::verify_attestation_using(
-            chain_id,
+            domain,
             validators,
             claim.validator_index,
             data,
@@ -148,7 +135,7 @@ fn verify_claim_signatures_using(
 }
 
 fn verify_unlock_claims_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     data: &FinalityVoteData,
     claims: &[neutrino_consensus_types::VoteAttestation],
@@ -158,7 +145,7 @@ fn verify_unlock_claims_using(
     for claim in claims {
         if let Some(unlock) = &claim.unlock_quorum {
             crate::slashing::verify_unlock_using(
-                chain_id,
+                domain,
                 validators,
                 data,
                 unlock,
@@ -192,14 +179,14 @@ pub enum FinalityError {
 /// Membership and key possession must originate at the trusted checkpoint or
 /// a proven registration transition, never an unbound host-supplied list.
 pub fn verify_finality(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     params: &ConsensusParams,
     validators: &[Validator],
     chunk: &Chunk,
     certificate: &FinalityCert,
 ) -> Result<(), FinalityError> {
     verify_finality_using(
-        chain_id,
+        domain,
         params,
         validators,
         chunk,
@@ -210,7 +197,7 @@ pub fn verify_finality(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_finality_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     params: &ConsensusParams,
     validators: &[Validator],
     chunk: &Chunk,
@@ -222,10 +209,21 @@ pub fn verify_finality_using(
         || certificate.chunk_hash != chunk.hash()
         || certificate.active_validator_set_root != root
         || chunk.active_validator_set_root != root
-        || certificate.round > params.bft_max_round
+        || certificate.proposal.chunk != *chunk
+        || certificate.proposal.round != certificate.round
     {
         return Err(FinalityError::Target);
     }
+    crate::bft::verify_proposal_using(
+        domain,
+        validators,
+        &certificate.proposal,
+        (
+            params.bft_prevote_quorum_numerator,
+            params.bft_prevote_quorum_denominator,
+        ),
+        verifier,
+    )?;
     let total = validators
         .iter()
         .try_fold(0_u64, |total, validator| {
@@ -269,9 +267,9 @@ pub fn verify_finality_using(
         ) {
             return Err(FinalityError::Membership);
         }
-        verify_claims_using(chain_id, validators, &data, claims, params, verifier)?;
+        verify_claims_using(domain, validators, &data, claims, params, verifier)?;
         verify_phase_using(
-            chain_id,
+            domain,
             validators,
             certificate,
             phase,
@@ -284,7 +282,7 @@ pub fn verify_finality_using(
 }
 
 fn verify_phase_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     certificate: &FinalityCert,
     phase: FinalityVotePhase,
@@ -323,13 +321,7 @@ fn verify_phase_using(
         chunk_hash: certificate.chunk_hash,
         phase,
     };
-    let domain = match phase {
-        FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
-        FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
-    };
-    let mut message = Vec::from(domain);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(&borsh::to_vec(&data).expect("canonical vote encoding"));
+    let message = data.signing_message(domain);
     if !verifier.aggregate(&keys, &message, &vote.signature) {
         return Err(FinalityError::Signature);
     }

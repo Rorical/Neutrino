@@ -9,11 +9,11 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
+use neutrino_consensus_types::FinalityVoteData;
 use neutrino_crypto::bls::{SecretKey, Signature};
 use neutrino_primitives::{
-    BlsPublicKey, BlsSignature, ChainId, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG,
-    DomainTag, Hash, Seed, Slot, ValidatorIndex,
+    BlsPublicKey, BlsSignature, ConsensusDomain, DOMAIN_PROPOSER_SIG, Hash, Seed, Slot,
+    ValidatorIndex,
 };
 
 extern crate alloc;
@@ -57,21 +57,21 @@ impl ProposerKey {
     #[must_use]
     pub fn attest_vote(
         &self,
-        chain_id: ChainId,
+        domain: ConsensusDomain,
         vote: FinalityVoteData,
         proof_hashes: Vec<Hash>,
         unlock_quorum: Option<neutrino_consensus_types::QuorumCertificate>,
     ) -> neutrino_consensus_types::VoteAttestation {
         let mut attestation = neutrino_consensus_types::VoteAttestation {
             validator_index: self.validator_index,
-            vote_signature: self.sign_finality_vote(chain_id, &vote),
+            vote_signature: self.sign_finality_vote(domain, &vote),
             vote,
             proof_hashes,
             unlock_quorum,
             signature: [0; 96],
         };
         attestation.signature = self
-            .sign_raw(&attestation.signing_message(chain_id))
+            .sign_raw(&attestation.signing_message(domain))
             .to_bytes();
         attestation
     }
@@ -159,7 +159,7 @@ impl ProposerKey {
         &self.secret_key
     }
 
-    /// Evaluate the proposer VRF for `(chain_id, seed, slot)` and
+    /// Evaluate the proposer VRF for `(consensus_domain, seed, slot)` and
     /// return the 96-byte BLS signature ready to be assigned to
     /// [`neutrino_consensus_types::Header::vrf_proof`].
     ///
@@ -169,8 +169,8 @@ impl ProposerKey {
     /// (e.g. for fork choice randomness) can re-derive it via
     /// [`neutrino_vrf::verify`] against the returned proof.
     #[must_use]
-    pub fn vrf_eval(&self, chain_id: ChainId, seed: &Seed, slot: Slot) -> BlsSignature {
-        let (signature, _output) = neutrino_vrf::eval(&self.secret_key, chain_id, seed, slot);
+    pub fn vrf_eval(&self, domain: ConsensusDomain, seed: &Seed, slot: Slot) -> BlsSignature {
+        let (signature, _output) = neutrino_vrf::eval(&self.secret_key, domain, seed, slot);
         signature.to_bytes()
     }
 
@@ -179,42 +179,42 @@ impl ProposerKey {
     /// Returns the 96-byte BLS signature ready to be assigned to
     /// [`neutrino_consensus_types::Header::signature`].
     #[must_use]
-    pub fn sign_proposer_message(&self, chain_id: ChainId, header_hash: &Hash) -> BlsSignature {
-        let mut message = Vec::with_capacity(DOMAIN_PROPOSER_SIG.len() + 8 + 32);
-        message.extend_from_slice(&DOMAIN_PROPOSER_SIG);
-        message.extend_from_slice(&chain_id.to_le_bytes());
-        message.extend_from_slice(header_hash);
-        self.sign_raw(&message).to_bytes()
+    pub fn sign_proposer_message(
+        &self,
+        domain: ConsensusDomain,
+        header_hash: &Hash,
+    ) -> BlsSignature {
+        self.sign_raw(&domain.signing_message(DOMAIN_PROPOSER_SIG, header_hash))
+            .to_bytes()
     }
 
     /// Sign a finality-vote payload.
     ///
-    /// Domain tag is [`DOMAIN_PREVOTE`] for prevotes and
-    /// [`DOMAIN_PRECOMMIT`] for precommits; the rest of the message is
-    /// `chain_id (LE u64) || borsh(FinalityVoteData)`.
+    /// Domain tag is [`neutrino_primitives::DOMAIN_PREVOTE`] for prevotes and
+    /// [`neutrino_primitives::DOMAIN_PRECOMMIT`] for precommits; the rest of the message is
+    /// `chain_id (LE u64) || chain_spec_hash (32) || borsh(FinalityVoteData)`.
     pub fn sign_finality_vote(
         &self,
-        chain_id: ChainId,
+        domain: ConsensusDomain,
         vote_data: &FinalityVoteData,
     ) -> BlsSignature {
-        let domain: DomainTag = match vote_data.phase {
-            FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
-            FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
-        };
-        let data_bytes =
-            borsh::to_vec(vote_data).expect("borsh encode of FinalityVoteData is infallible");
-        let mut message = Vec::with_capacity(domain.len() + 8 + data_bytes.len());
-        message.extend_from_slice(&domain);
-        message.extend_from_slice(&chain_id.to_le_bytes());
-        message.extend_from_slice(&data_bytes);
-        self.sign_raw(&message).to_bytes()
+        self.sign_raw(&vote_data.signing_message(domain)).to_bytes()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neutrino_consensus_types::FinalityVotePhase;
     use neutrino_crypto::bls::PublicKey;
+    use neutrino_primitives::DOMAIN_PREVOTE;
+
+    const fn test_domain(chain_id: u64) -> ConsensusDomain {
+        ConsensusDomain {
+            chain_id,
+            chain_spec_hash: [9; 32],
+        }
+    }
 
     #[test]
     fn from_ikm_is_deterministic_for_same_input() {
@@ -236,13 +236,14 @@ mod tests {
     fn signature_is_deterministic_and_verifies() {
         let proposer = ProposerKey::from_ikm(&[0x77; 32], 3).expect("derive");
         let header_hash: Hash = [0xAB; 32];
-        let sig1 = proposer.sign_proposer_message(7, &header_hash);
-        let sig2 = proposer.sign_proposer_message(7, &header_hash);
+        let sig1 = proposer.sign_proposer_message(test_domain(7), &header_hash);
+        let sig2 = proposer.sign_proposer_message(test_domain(7), &header_hash);
         assert_eq!(sig1, sig2);
 
         let mut message = Vec::with_capacity(56);
         message.extend_from_slice(&DOMAIN_PROPOSER_SIG);
         message.extend_from_slice(&7_u64.to_le_bytes());
+        message.extend_from_slice(&test_domain(7).chain_spec_hash);
         message.extend_from_slice(&header_hash);
 
         let pk = PublicKey::from_bytes(proposer.public_key_bytes()).expect("decode pk");
@@ -254,16 +255,16 @@ mod tests {
     fn signature_binds_chain_id() {
         let proposer = ProposerKey::from_ikm(&[0x11; 32], 0).expect("derive");
         let header_hash: Hash = [0xCD; 32];
-        let s1 = proposer.sign_proposer_message(1, &header_hash);
-        let s2 = proposer.sign_proposer_message(2, &header_hash);
+        let s1 = proposer.sign_proposer_message(test_domain(1), &header_hash);
+        let s2 = proposer.sign_proposer_message(test_domain(2), &header_hash);
         assert_ne!(s1, s2);
     }
 
     #[test]
     fn signature_binds_header_hash() {
         let proposer = ProposerKey::from_ikm(&[0x22; 32], 0).expect("derive");
-        let s1 = proposer.sign_proposer_message(1, &[0xCD; 32]);
-        let s2 = proposer.sign_proposer_message(1, &[0xCE; 32]);
+        let s1 = proposer.sign_proposer_message(test_domain(1), &[0xCD; 32]);
+        let s2 = proposer.sign_proposer_message(test_domain(1), &[0xCE; 32]);
         assert_ne!(s1, s2);
     }
 
@@ -276,11 +277,12 @@ mod tests {
             chunk_hash: [0xAB; 32],
             phase: FinalityVotePhase::Prevote,
         };
-        let sig_bytes = proposer.sign_finality_vote(1, &prevote_data);
+        let sig_bytes = proposer.sign_finality_vote(test_domain(1), &prevote_data);
 
         let mut message = Vec::with_capacity(56);
         message.extend_from_slice(&DOMAIN_PREVOTE);
         message.extend_from_slice(&1_u64.to_le_bytes());
+        message.extend_from_slice(&test_domain(1).chain_spec_hash);
         message
             .extend_from_slice(&borsh::to_vec(&prevote_data).expect("borsh encode is infallible"));
 
@@ -298,9 +300,9 @@ mod tests {
             chunk_hash: [0x99; 32],
             phase: FinalityVotePhase::Prevote,
         };
-        let prevote_sig = proposer.sign_finality_vote(1, &base);
+        let prevote_sig = proposer.sign_finality_vote(test_domain(1), &base);
         let precommit_sig = proposer.sign_finality_vote(
-            1,
+            test_domain(1),
             &FinalityVoteData {
                 phase: FinalityVotePhase::Precommit,
                 ..base
@@ -318,17 +320,18 @@ mod tests {
             chunk_hash: [0x99; 32],
             phase: FinalityVotePhase::Prevote,
         };
-        let s1 = proposer.sign_finality_vote(1, &base);
+        let s1 = proposer.sign_finality_vote(test_domain(1), &base);
         let s_chunk = proposer.sign_finality_vote(
-            1,
+            test_domain(1),
             &FinalityVoteData {
                 chunk_id: 2,
                 ..base
             },
         );
-        let s_round = proposer.sign_finality_vote(1, &FinalityVoteData { round: 1, ..base });
+        let s_round =
+            proposer.sign_finality_vote(test_domain(1), &FinalityVoteData { round: 1, ..base });
         let s_hash = proposer.sign_finality_vote(
-            1,
+            test_domain(1),
             &FinalityVoteData {
                 chunk_hash: [0x77; 32],
                 ..base

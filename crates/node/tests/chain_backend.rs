@@ -70,10 +70,20 @@ fn spec() -> ChainSpec {
 /// matching public key so the resulting block passes both header
 /// signature and VRF eligibility checks during `import_block`.
 fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> Block {
+    block_with_spec(&spec(), height, slot, parent, state_root)
+}
+
+fn block_with_spec(
+    chain: &ChainSpec,
+    height: Height,
+    slot: u64,
+    parent: BlockHash,
+    state_root: [u8; 32],
+) -> Block {
     let p = proposer();
     let body = Body::default();
     let roots = compute_body_roots(&body);
-    let vrf_proof = p.vrf_eval(TEST_CHAIN_ID, &TEST_GENESIS_SEED, slot);
+    let vrf_proof = p.vrf_eval(chain.consensus_domain(), &chain.genesis_seed, slot);
 
     let mut header = Header {
         height,
@@ -89,11 +99,11 @@ fn block(height: Height, slot: u64, parent: BlockHash, state_root: [u8; 32]) -> 
         receipts_root: ZERO_HASH,
         gas_used: 0,
         gas_limit: 1_000_000,
-        timestamp: 1_700_000_000 + slot * 4,
+        timestamp: chain.genesis_time + slot * chain.consensus.slot_duration_secs,
         signature: [0; 96],
     };
     let header_hash = header.hash();
-    header.signature = p.sign_proposer_message(TEST_CHAIN_ID, &header_hash);
+    header.signature = p.sign_proposer_message(chain.consensus_domain(), &header_hash);
     Block { header, body }
 }
 
@@ -143,10 +153,10 @@ async fn queries_distinguish_persisted_pruning_from_unknown_hashes() {
     let mut chain = spec();
     chain.consensus.chunk_size = 2;
     chain.proof.slot_budget_per_chunk = 2;
-    let engine = Engine::genesis(chain, MemoryDatabase::new()).unwrap();
+    let engine = Engine::genesis(chain.clone(), MemoryDatabase::new()).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
-    let first = block(1, 1, [0xAA; 32], [0x11; 32]);
-    let anchor = block(2, 2, first.hash(), [0x22; 32]);
+    let first = block_with_spec(&chain, 1, 1, [0xAA; 32], [0x11; 32]);
+    let anchor = block_with_spec(&chain, 2, 2, first.hash(), [0x22; 32]);
     backend
         .verify_and_import_gossip_block(first.clone())
         .await

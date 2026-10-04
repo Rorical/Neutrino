@@ -23,7 +23,8 @@ Neutrino separates the chain into two cleanly decoupled layers:
 - **Proof-aware finality.** A chunk can finalize only after every block in the
   chunk has a valid SP1 block proof, the chunk receives 2/3 prevote and
   precommit quorums, and a complete chunk proof verifies those certificates
-  and the consensus transition. Compact witnesses omit ordinary transactions.
+  with the signed leader proposal, certified round entry and consensus transition.
+  Compact witnesses omit ordinary transactions.
 - **Dynamic non-proven execution.** RPC, transaction precheck, simulation, and
   ordinary full-node execution run through WASM/wasmtime.
 - **STARK throughout.** Complete chunk aggregation and history Fold/Merge use
@@ -37,13 +38,20 @@ Neutrino separates the chain into two cleanly decoupled layers:
   checkpoint and its locally trusted bridge, download bounded state fragments,
   and atomically install execution and consensus state before resuming sync.
 - **Durable validator signing.** Vote/attestation and proposer reservations are
-  synchronized before signing. Round, lock and local votes survive restart.
-  Higher-round candidate changes preserve locks and require earlier quorum
-  justification before a conflicting prevote.
+  synchronized before signing. Round, phase, lock and local messages survive restart.
+  Fair round leaders, explicit nil phases and certified round changes drive progress
+  under eventual synchrony. Higher-round proposals preserve locks and require an
+  earlier quorum before a conflicting prevote. See the
+  [BFT protocol](docs/design/22-bft-candidate-replacement.md) for its assumptions.
 - **Proof-authorized sanctions.** An independent fact Guest compresses signed artifacts; a batch evidence Guest proves offences.
   Blocks recursively authenticate evidence statements and execute mandatory sanctions;
   chunks consume those proven effects without rechecking the evidence. See
   [design 20](docs/design/20-evidence-proofs.md).
+- **Authenticated evidence retrieval.** Nodes retain signed consensus artifacts
+  in the current and recent eight-chunk window, discover peer records and retrieve
+  exact offence inputs. Archive nodes may keep older sources; admissible evidence
+  remains bounded by the protocol window. See
+  [design 23](docs/design/23-evidence-availability.md).
 
 The development protocol has one current format without version numbers.
 Upgrades are incompatible; deprecated formats and migration paths are not
@@ -69,7 +77,8 @@ maintained.
 | [complete-chunk-proofs](docs/design/19-complete-chunk-proofs.md) | Complete chunk proofs |
 | [evidence-proofs](docs/design/20-evidence-proofs.md) | Evidence Guest, mandatory sanctions and acceptance gates |
 | [recursive-checkpoint-proofs](docs/design/21-recursive-checkpoint-proofs.md) | Fold/Merge recursion, bounded history access and anchored light-client updates |
-| [BFT candidate replacement](docs/design/22-bft-candidate-replacement.md) | Higher-round targets, signed unlock claims, recovery and proof-task fencing |
+| [BFT protocol](docs/design/22-bft-candidate-replacement.md) | Fair leaders, nil phases, certified round changes, locks and durable recovery |
+| [evidence availability](docs/design/23-evidence-availability.md) | Authenticated signed artifacts, bounded discovery, retrieval and pruning |
 
 ## Prerequisites
 

@@ -64,6 +64,12 @@ pub struct NeutrinoBehaviour {
     pub rpc_finality_cert_by_chunk: FinalityCertByChunkBehaviour,
     /// `/neutrino/req/witness_by_block` request/response.
     pub rpc_witness_by_block: WitnessByBlockBehaviour,
+    /// Bounded current SignedArtifactById RPC.
+    pub rpc_signed_artifact_by_id: crate::rpc::SignedArtifactByIdBehaviour,
+    /// Bounded current SignedArtifactInventoryByChunk RPC.
+    pub rpc_signed_artifact_inventory_by_chunk: crate::rpc::SignedArtifactInventoryByChunkBehaviour,
+    /// Bounded current BftRoundByChunk RPC.
+    pub rpc_bft_round_by_chunk: crate::rpc::BftRoundByChunkBehaviour,
     /// Proven next-chunk candidate discovery.
     pub rpc_candidate_by_chunk: CandidateByChunkBehaviour,
 }

@@ -326,10 +326,10 @@ impl<DB: Database> Engine<DB> {
         let total_stake = total_active_stake(active_set).map_err(ProductionError::NotEligible)?;
 
         let seed = self.finalized_seed();
-        let chain_id = self.chain_spec().chain_id;
+        let domain = self.chain_spec().consensus_domain();
         let expected = self.chain_spec().consensus.expected_proposers_per_slot;
 
-        let (vrf_proof, vrf_output) = eval(proposer.secret_key(), chain_id, &seed, slot);
+        let (vrf_proof, vrf_output) = eval(proposer.secret_key(), domain, &seed, slot);
         if !neutrino_vrf::is_eligible(
             &vrf_output,
             validator.effective_stake,

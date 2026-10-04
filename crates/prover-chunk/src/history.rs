@@ -262,6 +262,12 @@ pub fn evidence_chunk_id(
     evidence: &SlashingEvidence,
 ) -> Result<u64, HistoryError> {
     let height = match evidence {
+        SlashingEvidence::DoubleBftProposal { proposal_a, .. } => {
+            return Ok(proposal_a.chunk.chunk_id);
+        }
+        SlashingEvidence::ConflictingNilVote { value_vote, .. } => {
+            return Ok(value_vote.data.chunk_id);
+        }
         SlashingEvidence::DoubleProposal { header_a, .. } => header_a.height,
         SlashingEvidence::InvalidVrfClaim { header, .. }
         | SlashingEvidence::DaCommitmentFraud { header, .. } => header.height,
@@ -325,6 +331,58 @@ pub fn authorize_evidence_using<'a>(
     );
     let invalid = |_| HistoryError::Evidence;
     match evidence {
+        SlashingEvidence::DoubleBftProposal {
+            proposer_index,
+            proposal_a,
+            proposal_b,
+        } => {
+            let record = record_at(proposal_a.chunk.chunk_id)?;
+            let validator = active_validator(&record.validators, *proposer_index)?;
+            slashing::verify_double_bft_proposal_using(
+                spec.consensus_domain(),
+                &record.validators,
+                *proposer_index,
+                proposal_a,
+                proposal_b,
+                verifier,
+            )
+            .map_err(invalid)?;
+            Ok((
+                validator,
+                penalty_id(8, validator, record.chunk.chunk_id, proposal_a.round),
+            ))
+        }
+        SlashingEvidence::ConflictingNilVote {
+            validator_index,
+            value_vote,
+            nil_vote,
+        } => {
+            let record = record_at(value_vote.data.chunk_id)?;
+            let validator = active_validator(&record.validators, *validator_index)?;
+            slashing::verify_conflicting_nil_vote_using(
+                spec.consensus_domain(),
+                &record.validators,
+                *validator_index,
+                value_vote,
+                nil_vote,
+                verifier,
+            )
+            .map_err(invalid)?;
+            let kind = if value_vote.data.phase == FinalityVotePhase::Prevote {
+                2
+            } else {
+                3
+            };
+            Ok((
+                validator,
+                penalty_id(
+                    kind,
+                    validator,
+                    value_vote.data.chunk_id,
+                    value_vote.data.round,
+                ),
+            ))
+        }
         SlashingEvidence::DoubleProposal {
             proposer_index,
             header_a,
@@ -343,14 +401,14 @@ pub fn authorize_evidence_using<'a>(
             let validator = active_validator(&record.validators, *proposer_index)?;
             crate::proposer::verify_header_signature_using(
                 header_a,
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 verifier,
             )
             .map_err(|_| HistoryError::Evidence)?;
             crate::proposer::verify_header_signature_using(
                 header_b,
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 verifier,
             )
@@ -369,14 +427,14 @@ pub fn authorize_evidence_using<'a>(
             }
             crate::proposer::verify_header_signature_using(
                 header,
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 verifier,
             )
             .map_err(|_| HistoryError::Evidence)?;
             let actual = crate::proposer::verify_proposer_using(
                 header,
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 &record.seed,
                 spec.consensus.expected_proposers_per_slot,
@@ -420,7 +478,7 @@ pub fn authorize_evidence_using<'a>(
             let record = record_at(vote_a.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_indexed_vote_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 vote_a,
@@ -428,7 +486,7 @@ pub fn authorize_evidence_using<'a>(
             )
             .map_err(invalid)?;
             slashing::verify_indexed_vote_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 vote_b,
@@ -454,7 +512,7 @@ pub fn authorize_evidence_using<'a>(
             let record = record_at(vote_a.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_lock_violation_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 (vote_a, vote_b),
@@ -478,7 +536,7 @@ pub fn authorize_evidence_using<'a>(
             let record = record_at(vote.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_indexed_vote_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 vote,
@@ -486,7 +544,7 @@ pub fn authorize_evidence_using<'a>(
             )
             .map_err(invalid)?;
             slashing::verify_attestation_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 &vote.data,
@@ -525,7 +583,7 @@ pub fn authorize_evidence_using<'a>(
             }
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_indexed_vote_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 vote,
@@ -533,7 +591,7 @@ pub fn authorize_evidence_using<'a>(
             )
             .map_err(invalid)?;
             slashing::verify_indexed_vote_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 *validator_index,
                 canonical_vote,
@@ -563,7 +621,7 @@ pub fn authorize_evidence_using<'a>(
                 return Err(HistoryError::Evidence);
             }
             slashing::verify_da_fraud_using(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &record.validators,
                 header,
                 fraud_proof,
@@ -598,7 +656,7 @@ pub fn verify_embedded_vote_using(
 ) -> Result<(), HistoryError> {
     let record = history.record(vote.data.chunk_id)?;
     crate::finality::verify_vote_using(
-        spec.chain_id,
+        spec.consensus_domain(),
         &record.validators,
         vote,
         &spec.consensus,

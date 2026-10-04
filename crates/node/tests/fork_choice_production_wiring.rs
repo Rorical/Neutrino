@@ -204,7 +204,7 @@ fn single_validator_finalisation_records_real_bft_votes_and_attestation() {
     assert!(attestation.unlock_quorum.is_some());
     let spec = chain_spec();
     neutrino_prover_chunk::finality::verify_finality(
-        spec.chain_id,
+        spec.consensus_domain(),
         &spec.consensus,
         &spec.initial_validators,
         &finalized.chunk,

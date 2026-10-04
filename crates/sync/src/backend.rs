@@ -174,6 +174,41 @@ pub trait SyncBackend: Send + Sync + 'static {
         ))
     }
 
+    /// Whether the backend verifies the live leader/nil/pacemaker protocol.
+    fn supports_bft_message_sync(&self) -> bool {
+        false
+    }
+    /// The authenticated next source and local round, for bounded catchup queues.
+    async fn current_bft_round(&self) -> Option<(ChunkId, u32)> {
+        None
+    }
+    /// Fetch the current signed proposal and authenticated round-change quorum.
+    async fn bft_round_by_chunk(
+        &self,
+        _chunk_id: ChunkId,
+    ) -> Result<neutrino_network::rpc::BftRoundByChunkResponse, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "BFT round unavailable".into(),
+        ))
+    }
+    /// Verify proposal leadership, signatures and the authenticated source boundary.
+    /// The candidate's block/proof branch may still need independent backfill.
+    async fn validate_bft_proposal_hint(
+        &self,
+        _proposal: &neutrino_consensus_types::BftProposal,
+    ) -> bool {
+        false
+    }
+    /// Admit a signed live BFT message after verification and durable persistence.
+    async fn ingest_bft_message(
+        &self,
+        _message: neutrino_consensus_types::BftMessage,
+    ) -> Result<(), SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "BFT protocol unavailable".into(),
+        ))
+    }
+
     /// Build a [`Status`] payload reflecting the local chain head.
     async fn local_status(&self) -> Result<Status, SyncBackendError>;
 
@@ -400,5 +435,66 @@ pub trait SyncBackend: Send + Sync + 'static {
         _proof: neutrino_consensus_types::evidence::EvidenceArtifact,
     ) -> EvidenceProofAcceptance {
         EvidenceProofAcceptance::Deferred
+    }
+
+    /// Whether this backend serves durable original signed accountability sources.
+    fn supports_signed_artifact_sync(&self) -> bool {
+        false
+    }
+
+    /// Authenticate a source chunk against current or preceding-eight local history.
+    async fn signed_artifact_source_known(&self, _chunk_id: ChunkId) -> bool {
+        false
+    }
+
+    /// Bind returned bytes to the exact queried source, using local block-range policy.
+    async fn signed_artifact_matches_source(
+        &self,
+        artifact: &neutrino_consensus_types::signed_artifacts::SignedArtifact,
+        chunk_id: ChunkId,
+    ) -> bool {
+        use neutrino_consensus_types::signed_artifacts::SignedArtifact;
+        match artifact {
+            SignedArtifact::BlockProof(_) => false,
+            other => other.chunk_id(1) == Some(chunk_id),
+        }
+    }
+
+    /// Retrieve an exact immutable vote, quorum or proof envelope.
+    async fn signed_artifact_by_id(
+        &self,
+        _id: Hash,
+    ) -> Result<neutrino_network::rpc::SignedArtifactByIdResponse, SyncBackendError> {
+        Err(SyncBackendError::NotAvailable(
+            "signed source unavailable".into(),
+        ))
+    }
+
+    /// Retrieve a stable bounded page of original-source identities.
+    async fn signed_artifact_inventory(
+        &self,
+        _chunk_id: ChunkId,
+        _after: Option<Hash>,
+    ) -> Result<neutrino_network::rpc::SignedArtifactInventoryByChunkResponse, SyncBackendError>
+    {
+        Err(SyncBackendError::NotAvailable(
+            "signed source inventory unavailable".into(),
+        ))
+    }
+
+    /// Recheck cryptographic context and persist fetched sources before detection.
+    async fn ingest_signed_artifact(
+        &self,
+        _artifact: neutrino_consensus_types::signed_artifacts::SignedArtifact,
+    ) -> EvidenceProofAcceptance {
+        EvidenceProofAcceptance::Deferred
+    }
+
+    /// Discover exact missing proof bytes named by authenticated precommit claims.
+    async fn missing_vote_artifacts(
+        &self,
+        _vote: &FinalityVote,
+    ) -> Vec<neutrino_consensus_types::signed_artifacts::SignedArtifactRef> {
+        Vec::new()
     }
 }

@@ -23,8 +23,7 @@ use neutrino_consensus_types::{
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::apply_block;
 use neutrino_primitives::{
-    BitVec, BoundedBytes, ChainSpec, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG, Hash,
-    Validator,
+    BitVec, BoundedBytes, ChainSpec, ConsensusDomain, DOMAIN_PROPOSER_SIG, Hash, Validator,
 };
 use neutrino_proof_system::{ProofError, ProofSystem, verify_history_proof};
 use neutrino_prover_chunk::{
@@ -117,9 +116,16 @@ impl Fixture {
         witness.post_state = traced.into_witness();
         witness.blocks[0].header.timestamp =
             witness.chain_spec.genesis_time + witness.chain_spec.consensus.slot_duration_secs;
+        witness.blocks[0].header.vrf_proof = key
+            .sign(&neutrino_vrf::vrf_message(
+                witness.chain_spec.consensus_domain(),
+                &witness.seed,
+                witness.blocks[0].header.slot,
+            ))
+            .to_bytes();
         sign_header(
             &key,
-            witness.chain_spec.chain_id,
+            witness.chain_spec.consensus_domain(),
             &mut witness.blocks[0].header,
         );
         witness.blocks[0].public_inputs.block_hash = witness.blocks[0].header.hash();
@@ -132,19 +138,26 @@ impl Fixture {
                 chunk_hash: chunk.hash(),
                 phase,
             };
-            let mut message = Vec::from(if phase == FinalityVotePhase::Prevote {
-                DOMAIN_PREVOTE
-            } else {
-                DOMAIN_PRECOMMIT
-            });
-            message.extend_from_slice(&witness.chain_spec.chain_id.to_le_bytes());
-            message.extend_from_slice(&borsh::to_vec(&data).unwrap());
             AggregatedVote {
                 aggregation_bits: BitVec::from_bytes(1, vec![1]).unwrap(),
-                signature: key.sign(&message).to_bytes(),
+                signature: key
+                    .sign(&data.signing_message(witness.chain_spec.consensus_domain()))
+                    .to_bytes(),
             }
         };
+        let mut proposal = neutrino_consensus_types::BftProposal {
+            chunk: chunk.clone(),
+            round: 0,
+            proposer_index: 0,
+            valid_quorum: None,
+            round_change_certificate: None,
+            signature: [0; 96],
+        };
+        proposal.signature = key
+            .sign(&proposal.signing_message(witness.chain_spec.consensus_domain()))
+            .to_bytes();
         let mut cert = FinalityCert {
+            proposal,
             chunk_id: 0,
             round: 0,
             chunk_hash: chunk.hash(),
@@ -163,7 +176,7 @@ impl Fixture {
             signature: [0; 96],
         };
         claim.signature = key
-            .sign(&claim.signing_message(witness.chain_spec.chain_id))
+            .sign(&claim.signing_message(witness.chain_spec.consensus_domain()))
             .to_bytes();
         cert.precommit_attestations.push(claim);
         let mut prevote_claim = cert.precommit_attestations[0].clone();
@@ -171,7 +184,7 @@ impl Fixture {
         prevote_claim.vote_signature = cert.prevote.signature;
         prevote_claim.proof_hashes.clear();
         prevote_claim.signature = key
-            .sign(&prevote_claim.signing_message(witness.chain_spec.chain_id))
+            .sign(&prevote_claim.signing_message(witness.chain_spec.consensus_domain()))
             .to_bytes();
         cert.prevote_attestations.push(prevote_claim);
         witness.finality_cert = cert;
@@ -267,12 +280,12 @@ impl Fixture {
             self.spec.genesis_time + header.slot * self.spec.consensus.slot_duration_secs;
         header.vrf_proof = key
             .sign(&neutrino_vrf::vrf_message(
-                self.spec.chain_id,
+                self.spec.consensus_domain(),
                 &self.proof.statement.end.seed,
                 header.slot,
             ))
             .to_bytes();
-        sign_header(&key, self.spec.chain_id, &mut header);
+        sign_header(&key, self.spec.consensus_domain(), &mut header);
         Block {
             header,
             body: Body::default(),
@@ -280,10 +293,8 @@ impl Fixture {
     }
 }
 
-fn sign_header(key: &SecretKey, chain_id: u64, header: &mut Header) {
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(&header.hash());
+fn sign_header(key: &SecretKey, domain: ConsensusDomain, header: &mut Header) {
+    let message = domain.signing_message(DOMAIN_PROPOSER_SIG, &header.hash());
     header.signature = key.sign(&message).to_bytes();
 }
 

@@ -22,7 +22,7 @@ fn two_block_fixture(
     )>,
 ) {
     use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
-    use neutrino_primitives::{DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, DOMAIN_PROPOSER_SIG};
+    use neutrino_primitives::DOMAIN_PROPOSER_SIG;
     use neutrino_prover_chunk::consensus::{as_chunk, validate_candidate};
     // Ordinary transactions are present in the block proofs but absent from
     // the compact chunk witness. Zero gas keeps this recursion fixture focused
@@ -49,6 +49,19 @@ fn two_block_fixture(
     input.evidence_anchor.chain_spec_hash = witness.chain_spec.hash();
     witness.blocks[0].output.accountability.anchor = input.evidence_anchor;
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    let domain = witness.chain_spec.consensus_domain();
+    let first = &mut witness.blocks[0];
+    first.header.vrf_proof = key
+        .sign(&neutrino_vrf::vrf_message(
+            domain,
+            &witness.seed,
+            first.header.slot,
+        ))
+        .to_bytes();
+    first.header.signature = key
+        .sign(&domain.signing_message(DOMAIN_PROPOSER_SIG, &first.header.hash()))
+        .to_bytes();
+    first.public_inputs.block_hash = first.header.hash();
     let mut second_input = input.clone();
     second_input.block_height = 2;
     let mut second_state = neutrino_runtime_core::WitnessState::new(&state).unwrap();
@@ -59,11 +72,9 @@ fn two_block_fixture(
     second.header.timestamp = witness.chain_spec.consensus.slot_duration_secs * 2;
     second.header.parent_hash = witness.blocks[0].header.hash();
     second.header.vrf_proof = key
-        .sign(&neutrino_vrf::vrf_message(7, &witness.seed, 2))
+        .sign(&neutrino_vrf::vrf_message(domain, &witness.seed, 2))
         .to_bytes();
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&7_u64.to_le_bytes());
-    message.extend_from_slice(&second.header.hash());
+    let message = domain.signing_message(DOMAIN_PROPOSER_SIG, &second.header.hash());
     second.header.signature = key.sign(&message).to_bytes();
     second.public_inputs.height = 2;
     second.public_inputs.parent_block_hash = second.header.parent_hash;
@@ -74,15 +85,17 @@ fn two_block_fixture(
         .push(neutrino_prover_chunk::body::ConsensusBody::default());
     let chunk = as_chunk(&validate_candidate(&witness).unwrap().execution.chunk);
     witness.finality_cert.chunk_hash = chunk.hash();
-    for (phase, domain, aggregate) in [
+    witness.finality_cert.proposal.chunk = chunk.clone();
+    witness.finality_cert.proposal.signature = key
+        .sign(&witness.finality_cert.proposal.signing_message(domain))
+        .to_bytes();
+    for (phase, aggregate) in [
         (
             FinalityVotePhase::Prevote,
-            DOMAIN_PREVOTE,
             &mut witness.finality_cert.prevote,
         ),
         (
             FinalityVotePhase::Precommit,
-            DOMAIN_PRECOMMIT,
             &mut witness.finality_cert.precommit,
         ),
     ] {
@@ -92,13 +105,11 @@ fn two_block_fixture(
             chunk_hash: chunk.hash(),
             phase,
         };
-        let mut message = Vec::from(domain);
-        message.extend_from_slice(&7_u64.to_le_bytes());
-        message.extend_from_slice(&borsh::to_vec(&vote).unwrap());
+        let message = vote.signing_message(domain);
         aggregate.signature = key.sign(&message).to_bytes();
     }
     let count = usize::try_from(witness.context.chunk_size).unwrap();
-    sign_fixture_attestations(&mut witness.finality_cert, &key, count);
+    sign_fixture_attestations(&mut witness.finality_cert, &key, count, domain);
     (witness, vec![(input, state.clone()), (second_input, state)])
 }
 
@@ -106,18 +117,19 @@ fn sign_fixture_attestations(
     certificate: &mut neutrino_consensus_types::FinalityCert,
     key: &SecretKey,
     block_count: usize,
+    domain: neutrino_primitives::ConsensusDomain,
 ) {
     let prevote = certificate.prevote_vote();
     let claim = &mut certificate.prevote_attestations[0];
     claim.vote = prevote.data;
     claim.vote_signature = prevote.signature;
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key.sign(&claim.signing_message(domain)).to_bytes();
     let precommit = certificate.precommit_vote();
     let claim = &mut certificate.precommit_attestations[0];
     claim.vote = precommit.data;
     claim.vote_signature = precommit.signature;
     claim.proof_hashes = vec![[1; 32]; block_count];
-    claim.signature = key.sign(&claim.signing_message(7)).to_bytes();
+    claim.signature = key.sign(&claim.signing_message(domain)).to_bytes();
 }
 
 #[allow(clippy::too_many_lines)] // Explicit end-to-end proving stages and their negative assertions.
@@ -163,7 +175,7 @@ fn pipeline<P: neutrino_runtime_host::ProgramProver>(prover: P, real: bool) {
     claim.proof_hashes = hashes;
     claim.signature = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[])
         .unwrap()
-        .sign(&claim.signing_message(7))
+        .sign(&claim.signing_message(witness.chain_spec.consensus_domain()))
         .to_bytes();
     let expected = validate_consensus(&witness).unwrap();
     assert!(
@@ -268,7 +280,28 @@ fn check_guest_rejections<P: Prover>(
     });
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     claim.signature = key
-        .sign(&claim.signing_message(witness.chain_spec.chain_id))
+        .sign(&claim.signing_message(witness.chain_spec.consensus_domain()))
+        .to_bytes();
+    let mut other_spec = witness.chain_spec.clone();
+    other_spec.genesis_time += 1;
+    assert_eq!(other_spec.chain_id, witness.chain_spec.chain_id);
+    assert_ne!(other_spec.hash(), witness.chain_spec.hash());
+    let foreign_domain = other_spec.consensus_domain();
+    let mut foreign_proposal = witness.clone();
+    foreign_proposal.finality_cert.proposal.signature = key
+        .sign(
+            &foreign_proposal
+                .finality_cert
+                .proposal
+                .signing_message(foreign_domain),
+        )
+        .to_bytes();
+    let mut foreign_header = witness.clone();
+    foreign_header.blocks[0].header.signature = key
+        .sign(&foreign_domain.signing_message(
+            neutrino_primitives::DOMAIN_PROPOSER_SIG,
+            &foreign_header.blocks[0].header.hash(),
+        ))
         .to_bytes();
     let mut bad_individual = witness.clone();
     bad_individual.finality_cert.precommit_attestations[0].vote_signature[0] ^= 1;
@@ -277,14 +310,16 @@ fn check_guest_rejections<P: Prover>(
         .proof_hashes
         .pop();
     for invalid in [
-        missing_attestation,
-        missing_prevote,
-        circular_unlock,
-        bad_individual,
-        incomplete_proofs,
-        wrong_signature,
-        identity_vote,
-        wrong_da,
+        Box::new(missing_attestation),
+        Box::new(missing_prevote),
+        Box::new(circular_unlock),
+        Box::new(bad_individual),
+        Box::new(incomplete_proofs),
+        Box::new(wrong_signature),
+        Box::new(identity_vote),
+        Box::new(wrong_da),
+        Box::new(foreign_proposal),
+        Box::new(foreign_header),
     ] {
         assert!(validate_consensus(&invalid).is_err());
         let mut invalid_stdin = stdin.clone();

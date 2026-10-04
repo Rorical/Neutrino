@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProposerKey};
-use neutrino_consensus_types::{Block, BlockProof, FinalityVote};
+use neutrino_consensus_types::{BftMessage, BftVote, Block, BlockProof};
 use neutrino_network::Multiaddr;
 use neutrino_network::Topic;
 use neutrino_network::libp2p::gossipsub::MessageAcceptance;
@@ -154,6 +154,7 @@ fn all_bft_topics() -> Vec<Topic> {
     vec![
         Topic::Blocks,
         Topic::BlockProofs,
+        Topic::BftMessages,
         Topic::FinalityVotesPrevote,
         Topic::FinalityVotesPrecommit,
         Topic::AggregateFinalityVotes(0),
@@ -222,16 +223,24 @@ fn spawn_handle_driver(
                     }
                 }
                 Topic::FinalityVotesPrevote | Topic::FinalityVotesPrecommit => {
-                    if let Ok(vote) = borsh::from_slice::<FinalityVote>(&data) {
-                        backend.ingest_finality_vote(vote).await;
+                    if let Ok(vote) = borsh::from_slice::<BftVote>(&data) {
+                        let _ = backend.ingest_bft_message(BftMessage::Vote(vote)).await;
                         MessageAcceptance::Accept
                     } else {
                         MessageAcceptance::Reject
                     }
                 }
                 Topic::AggregateFinalityVotes(subnet) => {
-                    if let Ok(vote) = borsh::from_slice::<FinalityVote>(&data) {
+                    if let Ok(BftVote::Value(vote)) = borsh::from_slice::<BftVote>(&data) {
                         backend.ingest_aggregate_finality_vote(subnet, vote).await;
+                        MessageAcceptance::Accept
+                    } else {
+                        MessageAcceptance::Reject
+                    }
+                }
+                Topic::BftMessages => {
+                    if let Ok(message) = borsh::from_slice::<BftMessage>(&data) {
+                        let _ = backend.ingest_bft_message(message).await;
                         MessageAcceptance::Accept
                     } else {
                         MessageAcceptance::Reject

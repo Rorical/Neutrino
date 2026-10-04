@@ -130,6 +130,14 @@ where
         signature: [0; 96],
     };
     let cert = FinalityCert {
+        proposal: neutrino_consensus_types::BftProposal {
+            chunk: chunk.clone(),
+            round: 0,
+            proposer_index: 0,
+            valid_quorum: None,
+            round_change_certificate: None,
+            signature: [0; 96],
+        },
         chunk_id: id,
         round: 0,
         chunk_hash: chunk.hash(),

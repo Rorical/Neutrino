@@ -23,6 +23,8 @@
 //! block proofs, and authenticate the full consensus boundary before proceeding.
 //! Verified history compaction runs independently of Chunk finality.
 
+mod availability;
+mod bft_messages;
 mod bootstrap;
 mod candidates;
 mod consensus_jobs;
@@ -107,6 +109,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     consensus_proof_task: Mutex<Option<ConsensusProofTask<P>>>,
     consensus_proof_notify: Arc<tokio::sync::Notify>,
     last_candidate_notice: Mutex<Option<Hash>>,
+    availability_verdicts: Mutex<availability::VerdictCache>,
+    deferred_bft_votes: Mutex<Vec<FinalityVote>>,
     mempool: Mutex<Mempool>,
     /// Channel used to publish gossip messages produced by the BFT
     /// loop (prevotes, precommits, chunk proofs, recursive proofs).
@@ -290,6 +294,8 @@ where
             consensus_proof_task: Mutex::new(None),
             consensus_proof_notify: Arc::new(tokio::sync::Notify::new()),
             last_candidate_notice: Mutex::new(None),
+            availability_verdicts: Mutex::default(),
+            deferred_bft_votes: Mutex::new(Vec::new()),
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
             local_voter: Mutex::new(None),
@@ -368,10 +374,15 @@ where
     /// `InvalidProofSigning` claims. A backend error or lack of support
     /// cannot establish an objective rejection.
     fn block_proof_objectively_rejected(&self, proof: &BlockProof) -> bool {
-        matches!(
-            self.proof_system.classify_block_rejection(proof),
-            Ok(Some(_))
-        )
+        let id = blake3_256(&borsh::to_vec(proof).expect("canonical block proof envelope"));
+        let token = self.begin_block_verdict(id);
+        if let Some(verdict) = self.cached_block_verdict_at(token) {
+            return matches!(verdict, availability::ProofVerdict::Rejected(_));
+        }
+        let Ok(verdict) = self.proof_system.classify_block_rejection(proof) else {
+            return false;
+        };
+        self.remember_block_verdict(token, verdict.into()) && verdict.is_some()
     }
 
     fn block_executor_snapshot(&self) -> Option<Arc<dyn ErasedBlockExecutor>> {
@@ -1235,6 +1246,7 @@ where
             }
         };
         self.handle_bft_actions(actions).await;
+        self.retry_deferred_bft_votes().await;
     }
 
     // Restored FSM flags cannot authorize new signatures under the current program.
@@ -1254,6 +1266,23 @@ where
             .prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())
             .map(|_| ())
             .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+    }
+
+    // Once this round's local precommit is durable, incoming votes cannot cause
+    // another local signature. Recovery still reauthenticates the full branch
+    // through validate_bft_signing_candidate under the running program.
+    fn validate_live_vote_signing_candidate(
+        &self,
+        engine: &Engine<DB>,
+        chunk_id: ChunkId,
+    ) -> Result<(), SyncBackendError> {
+        if engine
+            .bft_session(chunk_id)
+            .is_some_and(neutrino_consensus_engine::BftSession::local_precommitted)
+        {
+            return Ok(());
+        }
+        self.validate_bft_signing_candidate(engine, chunk_id)
     }
 
     // Apply this only after objective attribution. A delayed or conflicting
@@ -1276,6 +1305,7 @@ where
         if self.bootstrap_pending() {
             return Ok(());
         }
+        self.replay_signed_artifact_accountability().await;
         let actions = self
             .with_live_engine_mut(|engine| {
                 self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
@@ -1285,6 +1315,7 @@ where
             })
             .map_err(|error| error.to_string())?;
         self.handle_bft_actions(actions).await;
+        self.retry_deferred_bft_votes().await;
         Ok(())
     }
 
@@ -1309,17 +1340,47 @@ where
                 BftAction::QuorumReached(identity) => {
                     self.handle_quorum_reached(identity);
                 }
+                BftAction::BroadcastProposal(proposal) => {
+                    self.publish_bft_message(&neutrino_consensus_types::BftMessage::Proposal(
+                        proposal,
+                    ))
+                    .await;
+                }
+                BftAction::BroadcastNilVote(vote) => {
+                    self.publish_bft_message(&neutrino_consensus_types::BftMessage::Vote(
+                        neutrino_consensus_types::BftVote::Nil(vote),
+                    ))
+                    .await;
+                }
+                BftAction::BroadcastRoundChange(report) => {
+                    self.publish_bft_message(&neutrino_consensus_types::BftMessage::RoundChange(
+                        report,
+                    ))
+                    .await;
+                }
+                BftAction::BroadcastRoundChangeCertificate(certificate) => {
+                    self.publish_bft_message(
+                        &neutrino_consensus_types::BftMessage::RoundChangeCertificate(certificate),
+                    )
+                    .await;
+                }
             }
         }
         self.publish_bft_candidate().await;
     }
 
     async fn publish_finality_vote(&self, topic: Topic, vote: &FinalityVote) {
+        if !self.ensure_publishable_vote_sources(vote) {
+            return;
+        }
+        if !self.retain_availability_vote(vote).await {
+            return;
+        }
         self.queue_vote_facts(vote);
         let Some(publisher) = self.publisher_snapshot() else {
             return;
         };
-        let data = match borsh::to_vec(vote) {
+        let data = match borsh::to_vec(&neutrino_consensus_types::BftVote::Value(vote.clone())) {
             Ok(bytes) => bytes,
             Err(err) => {
                 warn!(?err, ?topic, "failed to encode finality vote for gossip");
@@ -1334,16 +1395,13 @@ where
         }
     }
 
-    /// Pending-fix #4: tick every open BFT session's round timeout
-    /// and drive any resulting round advance through the gossip
-    /// path.
+    /// Tick open sessions' phase deadlines and publish resulting nil votes,
+    /// certified round-entry messages or retransmissions.
     ///
     /// `now_secs` is the current wall-clock Unix-second timestamp.
-    /// The engine compares it against each session's
-    /// `round_started_at_secs` and advances to the next round when
-    /// the chain-spec `bft_round_timeout_base_secs + round * step`
-    /// budget has elapsed. Re-published prevotes go out on the
-    /// matching gossip topic so peers see the new round's vote.
+    /// Each phase uses the chain-spec `bft_round_timeout_base_secs + round * step`
+    /// budget. A local timeout can select nil or request the next round;
+    /// entering that round requires an authenticated round-change certificate.
     ///
     /// The validator's independent BFT clock invokes this once per second,
     /// so production slots and prover completion cannot suppress deadlines.
@@ -1358,7 +1416,7 @@ where
         let actions = match self.with_live_engine_mut(|engine| {
             self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
             engine
-                .tick_bft_round_timeouts_with_proof_system(now_secs, self.proof_system.as_ref())
+                .tick_bft_round_timeouts(now_secs)
                 .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         }) {
             Ok(actions) => actions,
@@ -1369,6 +1427,7 @@ where
         };
         if !actions.is_empty() {
             self.handle_bft_actions(actions).await;
+            self.retry_deferred_bft_votes().await;
         }
     }
 
@@ -1470,6 +1529,96 @@ where
         candidate: neutrino_consensus_types::BftCandidate,
     ) -> Result<(), SyncBackendError> {
         self.consider_downloaded_bft_candidate(&candidate).await
+    }
+
+    fn supports_bft_message_sync(&self) -> bool {
+        !self.bootstrap_pending()
+            && self.light_checkpoint().is_none()
+            && self.proof_system.consensus_block_key().is_some()
+    }
+
+    async fn current_bft_round(&self) -> Option<(ChunkId, u32)> {
+        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+            return None;
+        }
+        Some(self.with_engine(|engine| {
+            let id = engine.finalized_next_chunk_id();
+            (
+                id,
+                engine
+                    .bft_session(id)
+                    .map_or(0, neutrino_consensus_engine::BftSession::round),
+            )
+        }))
+    }
+
+    async fn bft_round_by_chunk(
+        &self,
+        id: ChunkId,
+    ) -> Result<neutrino_network::rpc::BftRoundByChunkResponse, SyncBackendError> {
+        self.p2p_bft_round(id)
+    }
+
+    async fn validate_bft_proposal_hint(
+        &self,
+        proposal: &neutrino_consensus_types::BftProposal,
+    ) -> bool {
+        self.authenticated_bft_proposal_hint(proposal)
+    }
+
+    async fn ingest_bft_message(
+        &self,
+        message: neutrino_consensus_types::BftMessage,
+    ) -> Result<(), SyncBackendError> {
+        self.accept_bft_message(message).await
+    }
+
+    fn supports_signed_artifact_sync(&self) -> bool {
+        !self.bootstrap_pending() && self.light_checkpoint().is_none()
+    }
+
+    async fn signed_artifact_source_known(&self, id: ChunkId) -> bool {
+        self.light_checkpoint().is_none() && self.availability_source_known(id)
+    }
+
+    async fn signed_artifact_matches_source(
+        &self,
+        artifact: &neutrino_consensus_types::signed_artifacts::SignedArtifact,
+        id: ChunkId,
+    ) -> bool {
+        self.with_engine(|engine| {
+            artifact.chunk_id(engine.chain_spec().consensus.chunk_size) == Some(id)
+        })
+    }
+
+    async fn signed_artifact_by_id(
+        &self,
+        id: Hash,
+    ) -> Result<neutrino_network::rpc::SignedArtifactByIdResponse, SyncBackendError> {
+        self.query_signed_artifact(id)
+    }
+
+    async fn signed_artifact_inventory(
+        &self,
+        id: ChunkId,
+        after: Option<Hash>,
+    ) -> Result<neutrino_network::rpc::SignedArtifactInventoryByChunkResponse, SyncBackendError>
+    {
+        self.query_signed_inventory(id, after)
+    }
+
+    async fn ingest_signed_artifact(
+        &self,
+        artifact: neutrino_consensus_types::signed_artifacts::SignedArtifact,
+    ) -> neutrino_sync::EvidenceProofAcceptance {
+        self.accept_signed_source(artifact).await
+    }
+
+    async fn missing_vote_artifacts(
+        &self,
+        vote: &FinalityVote,
+    ) -> Vec<neutrino_consensus_types::signed_artifacts::SignedArtifactRef> {
+        self.missing_signed_artifacts(vote)
     }
 
     async fn local_status(&self) -> Result<Status, SyncBackendError> {
@@ -1735,8 +1884,11 @@ where
             // trie to the new fork-choice head. Executor-less
             // backends keep the prior behaviour.
             let proof_ref = &proof;
+            let verdict_token = self.begin_block_verdict(blake3_256(
+                &borsh::to_vec(&proof).expect("canonical block proof envelope"),
+            ));
             let executor = self.block_executor_snapshot();
-            let outcome = self.with_live_engine_mut(|e| {
+            let result = self.with_live_engine_mut(|e| {
                 match executor.as_ref() {
                     Some(executor) => e.import_block_proof_with_dry_run(
                         proof_ref,
@@ -1746,7 +1898,10 @@ where
                     None => e.import_block_proof(proof_ref, self.proof_system.as_ref()),
                 }
                 .map_err(Self::map_import_err)
-            })?;
+            });
+            self.retain_imported_proof_source(&proof, result.is_ok(), verdict_token)
+                .await;
+            let outcome = result?;
             last_height = Some(outcome.height);
             imported_heights.push(outcome.height);
             expected_height = expected_height.saturating_add(1);
@@ -1901,6 +2056,18 @@ where
             .map_err(Self::map_import_err)
         })?;
         if self.proof_system.consensus_block_key().is_some() {
+            let certificate = &proof.finality_cert;
+            self.retain_availability_vote(&certificate.prevote_vote())
+                .await;
+            self.retain_availability_vote(&certificate.precommit_vote())
+                .await;
+            self.retain_availability_bft_message(
+                &neutrino_consensus_types::BftMessage::Proposal(Box::new(
+                    certificate.proposal.clone(),
+                )),
+                false,
+            )
+            .await;
             self.queue_vote_facts(&proof.finality_cert.prevote_vote());
             self.queue_vote_facts(&proof.finality_cert.precommit_vote());
             self.start_evidence_jobs();
@@ -1938,17 +2105,17 @@ where
             ?vote.data.phase,
             "received finality vote"
         );
+        // Forensic-cache pressure cannot suppress independently verified live BFT.
+        self.retain_availability_vote(&vote).await;
         // Signed attestations preserve individual attribution through aggregation.
         if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
             for item in evidence {
                 self.pool_and_gossip_slashing(item).await;
             }
         }
-        // M7-new InvalidProofSigning detector: a peer precommit
-        // with a signed attestation accepting the exact locally-rejected
-        // proof envelope is slashable. A plain precommit is insufficient. Each detected entry carries the rejected
-        // `BlockProof` so any replayer can independently re-run
-        // `proof_system.verify_block` and confirm the rejection.
+        // The mandatory precommit attestation binds exact proof envelopes.
+        // Invalid-proof evidence retains the rejected original BlockProof so
+        // the evidence path can independently confirm the objective rejection.
         let invalid_proof_evidence = self
             .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
             .unwrap_or_default();
@@ -1956,12 +2123,13 @@ where
             self.pool_and_gossip_slashing(evidence).await;
         }
         if !self.vote_matches_bft_session(&vote) {
+            self.defer_bft_vote(vote);
             return;
         }
         let actions = match self.with_live_engine_mut(|engine| {
-            self.validate_bft_signing_candidate(engine, vote.data.chunk_id)?;
+            self.validate_live_vote_signing_candidate(engine, vote.data.chunk_id)?;
             engine
-                .observe_finality_vote(vote.clone())
+                .observe_finality_vote_at(vote.clone(), bft_messages::now_secs())
                 .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         }) {
             Ok(actions) => actions,
@@ -1989,10 +2157,8 @@ where
         }) {
             return;
         }
-        // Aggregated votes carry the same payload as raw votes; for
-        // M7-A they take the same engine ingest path. M7-C will add
-        // per-subnet routing so partial-vote aggregators on one
-        // subnet do not redo work for another.
+        // Aggregates retain the same individual attestations and use the same
+        // authenticated accumulator as partial value votes.
         trace!(
             subnet,
             chunk_id = vote.data.chunk_id,
@@ -2000,6 +2166,7 @@ where
             ?vote.data.phase,
             "received aggregate finality vote"
         );
+        self.retain_availability_vote(&vote).await;
         if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
             for item in evidence {
                 self.pool_and_gossip_slashing(item).await;
@@ -2012,12 +2179,13 @@ where
             self.pool_and_gossip_slashing(evidence).await;
         }
         if !self.vote_matches_bft_session(&vote) {
+            self.defer_bft_vote(vote);
             return;
         }
         let actions = match self.with_live_engine_mut(|engine| {
-            self.validate_bft_signing_candidate(engine, vote.data.chunk_id)?;
+            self.validate_live_vote_signing_candidate(engine, vote.data.chunk_id)?;
             engine
-                .observe_finality_vote(vote.clone())
+                .observe_finality_vote_at(vote.clone(), bft_messages::now_secs())
                 .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         }) {
             Ok(actions) => actions,

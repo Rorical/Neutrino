@@ -24,14 +24,16 @@
 
 use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::rpc::{
-    self, BlockProofByHashCodec, BlockProofByHashResponse, BlockProofByHeightCodec,
-    BlockProofByHeightResponse, BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec,
-    BlocksByRootResponse, CandidateByChunkCodec, CandidateByChunkResponse, CheckpointLatestCodec,
+    self, BftRoundByChunkCodec, BftRoundByChunkResponse, BlockProofByHashCodec,
+    BlockProofByHashResponse, BlockProofByHeightCodec, BlockProofByHeightResponse,
+    BlocksByRangeCodec, BlocksByRangeResponse, BlocksByRootCodec, BlocksByRootResponse,
+    CandidateByChunkCodec, CandidateByChunkResponse, CheckpointLatestCodec,
     CheckpointLatestResponse, ChunkProofByIdCodec, ChunkProofByIdResponse,
     FinalityCertByChunkCodec, FinalityCertByChunkResponse, HistoryProofByRangeCodec,
     HistoryProofByRangeResponse, MetadataCodec, PingCodec, RpcError, RpcInboundId, RpcProtocol,
-    RpcRequest, RpcResponse, StateByRootCodec, StateByRootResponse, StatusCodec,
-    WitnessByBlockCodec, WitnessByBlockResponse,
+    RpcRequest, RpcResponse, SignedArtifactByIdCodec, SignedArtifactByIdResponse,
+    SignedArtifactInventoryByChunkCodec, SignedArtifactInventoryByChunkResponse, StateByRootCodec,
+    StateByRootResponse, StatusCodec, WitnessByBlockCodec, WitnessByBlockResponse,
 };
 use crate::topic::Topic;
 use futures::StreamExt;
@@ -261,6 +263,12 @@ struct RpcDispatch {
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
     pending_candidate_by_chunk:
         HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_signed_artifact_by_id:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_signed_artifact_inventory_by_chunk:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_bft_round_by_chunk:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
 
     inbound_status: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Status>>>,
     inbound_metadata: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Metadata>>>,
@@ -283,6 +291,12 @@ struct RpcDispatch {
     inbound_witness_by_block: HashMap<u64, ResponseChannel<rpc::RpcResult<WitnessByBlockResponse>>>,
     inbound_candidate_by_chunk:
         HashMap<u64, ResponseChannel<rpc::RpcResult<CandidateByChunkResponse>>>,
+    inbound_signed_artifact_by_id:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<SignedArtifactByIdResponse>>>,
+    inbound_signed_artifact_inventory_by_chunk:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<SignedArtifactInventoryByChunkResponse>>>,
+    inbound_bft_round_by_chunk:
+        HashMap<u64, ResponseChannel<rpc::RpcResult<BftRoundByChunkResponse>>>,
 }
 
 impl RpcDispatch {
@@ -313,6 +327,11 @@ impl RpcDispatch {
             RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.insert(id, tx),
             RpcProtocol::WitnessByBlock => self.pending_witness_by_block.insert(id, tx),
             RpcProtocol::CandidateByChunk => self.pending_candidate_by_chunk.insert(id, tx),
+            RpcProtocol::SignedArtifactById => self.pending_signed_artifact_by_id.insert(id, tx),
+            RpcProtocol::SignedArtifactInventoryByChunk => self
+                .pending_signed_artifact_inventory_by_chunk
+                .insert(id, tx),
+            RpcProtocol::BftRoundByChunk => self.pending_bft_round_by_chunk.insert(id, tx),
         };
     }
 
@@ -336,6 +355,11 @@ impl RpcDispatch {
             RpcProtocol::FinalityCertByChunk => self.pending_finality_cert_by_chunk.remove(&id),
             RpcProtocol::WitnessByBlock => self.pending_witness_by_block.remove(&id),
             RpcProtocol::CandidateByChunk => self.pending_candidate_by_chunk.remove(&id),
+            RpcProtocol::SignedArtifactById => self.pending_signed_artifact_by_id.remove(&id),
+            RpcProtocol::SignedArtifactInventoryByChunk => {
+                self.pending_signed_artifact_inventory_by_chunk.remove(&id)
+            }
+            RpcProtocol::BftRoundByChunk => self.pending_bft_round_by_chunk.remove(&id),
         }
     }
 }
@@ -551,6 +575,18 @@ impl NetworkService {
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcCandidateByChunk(ev)) => {
                 self.handle_rpc_candidate_by_chunk(ev).await;
             }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcSignedArtifactById(ev)) => {
+                self.handle_rpc_signed_artifact_by_id(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcSignedArtifactInventoryByChunk(
+                ev,
+            )) => {
+                self.handle_rpc_signed_artifact_inventory_by_chunk(ev).await;
+            }
+            SwarmEvent::Behaviour(NeutrinoBehaviourEvent::RpcBftRoundByChunk(ev)) => {
+                self.handle_rpc_bft_round_by_chunk(ev).await;
+            }
+
             _ => {}
         }
     }
@@ -580,6 +616,9 @@ impl NetworkService {
                 let ident = topic.to_ident();
                 match self.swarm.behaviour_mut().gossipsub.publish(ident, data) {
                     Ok(msg_id) => debug!(%topic, %msg_id, "published"),
+                    Err(gossipsub::PublishError::Duplicate) => {
+                        debug!(%topic, "exact gossip content already published");
+                    }
                     Err(err) => warn!(%topic, ?err, "publish failed"),
                 }
             }
@@ -663,6 +702,15 @@ impl NetworkService {
             }
             RpcRequest::CandidateByChunk(req) => {
                 behaviour.rpc_candidate_by_chunk.send_request(&peer, req)
+            }
+            RpcRequest::SignedArtifactById(req) => {
+                behaviour.rpc_signed_artifact_by_id.send_request(&peer, req)
+            }
+            RpcRequest::SignedArtifactInventoryByChunk(req) => behaviour
+                .rpc_signed_artifact_inventory_by_chunk
+                .send_request(&peer, req),
+            RpcRequest::BftRoundByChunk(req) => {
+                behaviour.rpc_bft_round_by_chunk.send_request(&peer, req)
             }
         };
         self.rpc.record_outbound(protocol, id, response_tx);
@@ -816,6 +864,40 @@ impl NetworkService {
                         .send_response(chan, Ok(*payload))
                         .is_ok()
                 }),
+            (RpcProtocol::SignedArtifactById, RpcResponse::SignedArtifactById(payload)) => self
+                .rpc
+                .inbound_signed_artifact_by_id
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_signed_artifact_by_id
+                        .send_response(chan, Ok(*payload))
+                        .is_ok()
+                }),
+            (
+                RpcProtocol::SignedArtifactInventoryByChunk,
+                RpcResponse::SignedArtifactInventoryByChunk(payload),
+            ) => self
+                .rpc
+                .inbound_signed_artifact_inventory_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_signed_artifact_inventory_by_chunk
+                        .send_response(chan, Ok(*payload))
+                        .is_ok()
+                }),
+            (RpcProtocol::BftRoundByChunk, RpcResponse::BftRoundByChunk(payload)) => self
+                .rpc
+                .inbound_bft_round_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_bft_round_by_chunk
+                        .send_response(chan, Ok(*payload))
+                        .is_ok()
+                }),
+
             (RpcProtocol::Status, RpcResponse::Error { error, .. }) => self
                 .rpc
                 .inbound_status
@@ -946,6 +1028,37 @@ impl NetworkService {
                         .send_response(chan, Err(error))
                         .is_ok()
                 }),
+            (RpcProtocol::SignedArtifactById, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_signed_artifact_by_id
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_signed_artifact_by_id
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::SignedArtifactInventoryByChunk, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_signed_artifact_inventory_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_signed_artifact_inventory_by_chunk
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+            (RpcProtocol::BftRoundByChunk, RpcResponse::Error { error, .. }) => self
+                .rpc
+                .inbound_bft_round_by_chunk
+                .remove(&inbound_id.raw)
+                .is_some_and(|chan| {
+                    behaviour
+                        .rpc_bft_round_by_chunk
+                        .send_response(chan, Err(error))
+                        .is_ok()
+                }),
+
             _ => false,
         };
 
@@ -1739,6 +1852,193 @@ impl NetworkService {
         }
     }
 
+    async fn handle_rpc_signed_artifact_by_id(
+        &mut self,
+        ev: request_response::Event<
+            rpc::SignedArtifactByIdRequest,
+            rpc::RpcResult<SignedArtifactByIdResponse>,
+        >,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::SignedArtifactById);
+                self.rpc
+                    .inbound_signed_artifact_by_id
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::SignedArtifactById(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::SignedArtifactById, request_id)
+                {
+                    let _ = tx.send(
+                        response
+                            .map(|payload| RpcResponse::SignedArtifactById(Box::new(payload)))
+                            .map_err(RpcError::Remote),
+                    );
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                self.complete_outbound_failure(RpcProtocol::SignedArtifactById, request_id, &error);
+            }
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on SignedArtifactById RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_signed_artifact_inventory_by_chunk(
+        &mut self,
+        ev: request_response::Event<
+            rpc::SignedArtifactInventoryByChunkRequest,
+            rpc::RpcResult<SignedArtifactInventoryByChunkResponse>,
+        >,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::SignedArtifactInventoryByChunk);
+                self.rpc
+                    .inbound_signed_artifact_inventory_by_chunk
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::SignedArtifactInventoryByChunk(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::SignedArtifactInventoryByChunk, request_id)
+                {
+                    let _ = tx.send(
+                        response
+                            .map(|payload| {
+                                RpcResponse::SignedArtifactInventoryByChunk(Box::new(payload))
+                            })
+                            .map_err(RpcError::Remote),
+                    );
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(
+                RpcProtocol::SignedArtifactInventoryByChunk,
+                request_id,
+                &error,
+            ),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(
+                    ?error,
+                    "inbound failure on SignedArtifactInventoryByChunk RPC"
+                );
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    async fn handle_rpc_bft_round_by_chunk(
+        &mut self,
+        ev: request_response::Event<
+            rpc::BftRoundByChunkRequest,
+            rpc::RpcResult<BftRoundByChunkResponse>,
+        >,
+    ) {
+        match ev {
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BftRoundByChunk);
+                self.rpc
+                    .inbound_bft_round_by_chunk
+                    .insert(inbound_id.raw, channel);
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::RpcRequestReceived {
+                        peer,
+                        inbound_id,
+                        request: RpcRequest::BftRoundByChunk(request),
+                    })
+                    .await;
+            }
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(tx) = self
+                    .rpc
+                    .take_outbound(RpcProtocol::BftRoundByChunk, request_id)
+                {
+                    let _ = tx.send(
+                        response
+                            .map(|payload| RpcResponse::BftRoundByChunk(Box::new(payload)))
+                            .map_err(RpcError::Remote),
+                    );
+                }
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => self.complete_outbound_failure(RpcProtocol::BftRoundByChunk, request_id, &error),
+            request_response::Event::InboundFailure { error, .. } => {
+                warn!(?error, "inbound failure on BftRoundByChunk RPC");
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
     fn complete_outbound_failure(
         &mut self,
         protocol: RpcProtocol,
@@ -1797,6 +2097,9 @@ fn build_behaviour(
         rpc_finality_cert_by_chunk: build_rpc_finality_cert_by_chunk(),
         rpc_witness_by_block: build_rpc_witness_by_block(),
         rpc_candidate_by_chunk: build_rpc_candidate_by_chunk(),
+        rpc_signed_artifact_by_id: build_rpc_signed_artifact_by_id(),
+        rpc_signed_artifact_inventory_by_chunk: build_rpc_signed_artifact_inventory_by_chunk(),
+        rpc_bft_round_by_chunk: build_rpc_bft_round_by_chunk(),
     })
 }
 
@@ -2091,6 +2394,45 @@ fn build_rpc_candidate_by_chunk() -> rpc::CandidateByChunkBehaviour {
         CandidateByChunkCodec::default(),
         [(
             RpcProtocol::CandidateByChunk.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_signed_artifact_by_id() -> rpc::SignedArtifactByIdBehaviour {
+    request_response::Behaviour::with_codec(
+        SignedArtifactByIdCodec::default()
+            .with_request_size_maximum(64)
+            .with_response_size_maximum(8_388_624),
+        [(
+            RpcProtocol::SignedArtifactById.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_signed_artifact_inventory_by_chunk() -> rpc::SignedArtifactInventoryByChunkBehaviour {
+    request_response::Behaviour::with_codec(
+        SignedArtifactInventoryByChunkCodec::default()
+            .with_request_size_maximum(64)
+            .with_response_size_maximum(2048),
+        [(
+            RpcProtocol::SignedArtifactInventoryByChunk.stream_protocol(),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+    )
+}
+
+fn build_rpc_bft_round_by_chunk() -> rpc::BftRoundByChunkBehaviour {
+    request_response::Behaviour::with_codec(
+        BftRoundByChunkCodec::default()
+            .with_request_size_maximum(64)
+            .with_response_size_maximum(8_388_608),
+        [(
+            RpcProtocol::BftRoundByChunk.stream_protocol(),
             ProtocolSupport::Full,
         )],
         request_response::Config::default().with_request_timeout(Duration::from_secs(15)),

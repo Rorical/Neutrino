@@ -175,7 +175,7 @@ fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     let data = witness.finality_cert.precommit_vote().data;
     witness.finality_cert.precommit_attestations =
         vec![ProposerKey::from_ikm(&[42; 32], 0).unwrap().attest_vote(
-            7,
+            engine.chain_spec().consensus_domain(),
             data,
             vec![neutrino_prover_chunk::execution::commitment(&proof)],
             None,
@@ -312,7 +312,8 @@ fn successor_bft_uses_the_proven_validator_root_without_a_recursive_checkpoint()
     header.parent_hash = header.hash();
     header.height = 2;
     header.slot = 2;
-    header.signature = voter.sign_proposer_message(engine.chain_spec().chain_id, &header.hash());
+    header.signature =
+        voter.sign_proposer_message(engine.chain_spec().consensus_domain(), &header.hash());
     let hash = engine.store_mut().put_header(&header).unwrap();
     successor.start_block_hash = hash;
     successor.end_block_hash = hash;
@@ -358,12 +359,37 @@ fn persisted_certificate_restores_accountability_after_restart_and_rotation() {
     let mut certificate = outcome.finality_cert;
     certificate.round = 1;
     certificate.chunk_hash = conflicting_chunk.hash();
+    certificate.proposal.chunk = conflicting_chunk.clone();
+    certificate.proposal.round = 1;
+    let mut report = neutrino_consensus_types::RoundChange {
+        chunk_id: 0,
+        round: 1,
+        validator_index: 0,
+        highest_quorum: None,
+        signature: [0; 96],
+    };
+    report.signature = voter
+        .sign_raw(&report.signing_message(restarted.chain_spec().consensus_domain()))
+        .to_bytes();
+    certificate.proposal.round_change_certificate =
+        Some(neutrino_consensus_types::RoundChangeCertificate {
+            chunk_id: 0,
+            round: 1,
+            reports: vec![report],
+        });
+    certificate.proposal.signature = voter
+        .sign_raw(
+            &certificate
+                .proposal
+                .signing_message(restarted.chain_spec().consensus_domain()),
+        )
+        .to_bytes();
     for (phase, aggregate) in [
         (FinalityVotePhase::Prevote, &mut certificate.prevote),
         (FinalityVotePhase::Precommit, &mut certificate.precommit),
     ] {
         aggregate.signature = voter.sign_finality_vote(
-            7,
+            restarted.chain_spec().consensus_domain(),
             &FinalityVoteData {
                 chunk_id: 0,
                 round: 1,
@@ -373,13 +399,17 @@ fn persisted_certificate_restores_accountability_after_restart_and_rotation() {
         );
     }
     certificate.precommit_attestations = vec![voter.attest_vote(
-        7,
+        restarted.chain_spec().consensus_domain(),
         certificate.precommit_vote().data,
         certificate.precommit_attestations[0].proof_hashes.clone(),
         None,
     )];
-    certificate.prevote_attestations =
-        vec![voter.attest_vote(7, certificate.prevote_vote().data, Vec::new(), None)];
+    certificate.prevote_attestations = vec![voter.attest_vote(
+        restarted.chain_spec().consensus_domain(),
+        certificate.prevote_vote().data,
+        Vec::new(),
+        None,
+    )];
     let evidence = restarted
         .observe_certificate_for_slashing(&conflicting_chunk, &certificate)
         .unwrap();
@@ -441,7 +471,8 @@ fn historical_header_attribution_uses_its_authenticated_validator_set_and_seed()
     );
     let mut invalid = historical.clone();
     invalid.vrf_proof = [0; 96];
-    invalid.signature = old_signer.sign_proposer_message(7, &invalid.hash());
+    invalid.signature =
+        old_signer.sign_proposer_message(restored.chain_spec().consensus_domain(), &invalid.hash());
     restored
         .verify_slashing_evidence(&SlashingEvidence::InvalidVrfClaim {
             proposer_index: 0,
@@ -451,7 +482,8 @@ fn historical_header_attribution_uses_its_authenticated_validator_set_and_seed()
         .unwrap();
     let mut alternate = historical.clone();
     alternate.state_root[0] ^= 1;
-    alternate.signature = old_signer.sign_proposer_message(7, &alternate.hash());
+    alternate.signature = old_signer
+        .sign_proposer_message(restored.chain_spec().consensus_domain(), &alternate.hash());
     let offence = restored
         .observe_header_for_slashing(&alternate)
         .unwrap()
@@ -460,7 +492,8 @@ fn historical_header_attribution_uses_its_authenticated_validator_set_and_seed()
 
     let mut live = historical.clone();
     live.height = 2;
-    live.signature = new_signer.sign_proposer_message(7, &live.hash());
+    live.signature =
+        new_signer.sign_proposer_message(restored.chain_spec().consensus_domain(), &live.hash());
     assert!(
         restored
             .observe_header_for_slashing(&live)
@@ -477,7 +510,10 @@ fn historical_header_attribution_uses_its_authenticated_validator_set_and_seed()
     );
     let mut conflicting = live;
     conflicting.state_root[0] ^= 2;
-    conflicting.signature = new_signer.sign_proposer_message(7, &conflicting.hash());
+    conflicting.signature = new_signer.sign_proposer_message(
+        restored.chain_spec().consensus_domain(),
+        &conflicting.hash(),
+    );
     let offence = restored
         .observe_header_for_slashing(&conflicting)
         .unwrap()
@@ -557,12 +593,13 @@ fn restored_bft_finalizes_its_signed_branch_after_the_canonical_head_changes() {
     let secret = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[]).unwrap();
     sibling.vrf_proof = secret
         .sign(&neutrino_vrf::vrf_message(
-            input.chain_spec.chain_id,
+            input.chain_spec.consensus_domain(),
             &input.chain_spec.genesis_seed,
             sibling.slot,
         ))
         .to_bytes();
-    sibling.signature = voter.sign_proposer_message(input.chain_spec.chain_id, &sibling.hash());
+    sibling.signature =
+        voter.sign_proposer_message(input.chain_spec.consensus_domain(), &sibling.hash());
     engine
         .import_block(&neutrino_consensus_types::Block {
             header: sibling.clone(),
@@ -627,7 +664,7 @@ fn restored_bft_finalizes_its_signed_branch_after_the_canonical_head_changes() {
         .unwrap();
     let chunk = neutrino_prover_chunk::consensus::as_chunk(&statement.chunk);
     neutrino_prover_chunk::finality::verify_finality(
-        input.chain_spec.chain_id,
+        input.chain_spec.consensus_domain(),
         &input.chain_spec.consensus,
         &prepared.witness.context.active_validators,
         &chunk,
@@ -707,6 +744,16 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     input.evidence_anchor.chain_spec_hash = witness.chain_spec.hash();
     let mut state = TracingState::new(&live);
     witness.blocks[0].output = apply_block(&input, &mut state);
+    let signing_key = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    let domain = witness.chain_spec.consensus_domain();
+    witness.blocks[0].header.vrf_proof = signing_key.vrf_eval(
+        domain,
+        &witness.chain_spec.genesis_seed,
+        witness.blocks[0].header.slot,
+    );
+    witness.blocks[0].header.signature =
+        signing_key.sign_proposer_message(domain, &witness.blocks[0].header.hash());
+    witness.blocks[0].public_inputs.block_hash = witness.blocks[0].header.hash();
     let backend = NativeConsensusBackend { reject: false };
     let mut producer = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
     let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
@@ -1037,8 +1084,13 @@ fn retarget_vote(
         bits.push(position == index);
     }
     neutrino_consensus_types::FinalityVote {
-        signature: key.sign_finality_vote(7, &data),
-        attestations: vec![key.attest_vote(7, data.clone(), proof_hashes, None)],
+        signature: key.sign_finality_vote(retarget_spec().consensus_domain(), &data),
+        attestations: vec![key.attest_vote(
+            retarget_spec().consensus_domain(),
+            data.clone(),
+            proof_hashes,
+            None,
+        )],
         data,
         aggregation_bits: bits,
     }
@@ -1057,7 +1109,10 @@ fn retarget_quorum(
     let signatures: Vec<_> = retarget_keys()[1..]
         .iter()
         .map(|key| {
-            neutrino_crypto::bls::Signature::from_bytes(&key.sign_finality_vote(7, &data)).unwrap()
+            neutrino_crypto::bls::Signature::from_bytes(
+                &key.sign_finality_vote(retarget_spec().consensus_domain(), &data),
+            )
+            .unwrap()
         })
         .collect();
     neutrino_consensus_types::QuorumCertificate {
@@ -1073,17 +1128,9 @@ fn retarget_quorum(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "Construct actual STF outputs and BLS-authenticated competing branches under one validator context."
-)]
-fn retarget_fixture() -> (
-    Engine<RetargetDatabase>,
-    neutrino_consensus_types::Chunk,
-    neutrino_consensus_types::Chunk,
-) {
-    let (fixture, mut input, _) = support::fixture([1; 8], [4; 32]);
-    let mut spec = fixture.chain_spec.clone();
+fn retarget_spec() -> neutrino_primitives::ChainSpec {
+    let (fixture, _, _) = support::fixture([1; 8], [4; 32]);
+    let mut spec = fixture.chain_spec;
     spec.initial_validators = retarget_keys()
         .iter()
         .map(|key| neutrino_primitives::Validator {
@@ -1094,6 +1141,20 @@ fn retarget_fixture() -> (
     spec.genesis_validator_set_root =
         neutrino_prover_chunk::execution::commitment(&spec.initial_validators);
     spec.consensus.expected_proposers_per_slot = neutrino_primitives::fixed_u128_from_integer(3);
+    spec
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Construct actual STF outputs and BLS-authenticated competing branches under one validator context."
+)]
+fn retarget_fixture() -> (
+    Engine<RetargetDatabase>,
+    neutrino_consensus_types::Chunk,
+    neutrino_consensus_types::Chunk,
+) {
+    let (fixture, mut input, _) = support::fixture([1; 8], [4; 32]);
+    let spec = retarget_spec();
     input.evidence_anchor.chain_spec_hash = spec.hash();
     let live = LiveTrie::default();
     let mut state = TracingState::new(&live);
@@ -1108,12 +1169,12 @@ fn retarget_fixture() -> (
         header.timestamp = slot * spec.consensus.slot_duration_secs;
         header.vrf_proof = key
             .sign_raw(&neutrino_vrf::vrf_message(
-                spec.chain_id,
+                spec.consensus_domain(),
                 &spec.genesis_seed,
                 slot,
             ))
             .to_bytes();
-        header.signature = key.sign_proposer_message(spec.chain_id, &header.hash());
+        header.signature = key.sign_proposer_message(spec.consensus_domain(), &header.hash());
         let hash = header.hash();
         branch_hashes.push(hash);
         engine
@@ -1173,64 +1234,114 @@ fn retarget_fixture() -> (
     (engine, first, second)
 }
 
-#[test]
-fn current_target_quorum_advertisements_preserve_pending_precommits_until_finality() {
+fn retarget_proposal(
+    engine: &Engine<RetargetDatabase>,
+    chunk: &neutrino_consensus_types::Chunk,
+    round: u32,
+    valid_quorum: Option<neutrino_consensus_types::QuorumCertificate>,
+) -> neutrino_consensus_types::BftProposal {
+    let leader = neutrino_consensus_types::bft_leader(
+        7,
+        chunk.chunk_id,
+        round,
+        engine.active_validator_set(),
+    )
+    .unwrap();
+    let mut proposal = neutrino_consensus_types::BftProposal {
+        chunk: chunk.clone(),
+        round,
+        proposer_index: leader,
+        round_change_certificate: (round > 0)
+            .then(|| retarget_round_certificate(round, valid_quorum.as_ref())),
+        valid_quorum,
+        signature: [0; 96],
+    };
+    proposal.signature = retarget_keys()[leader as usize]
+        .sign_raw(&proposal.signing_message(retarget_spec().consensus_domain()))
+        .to_bytes();
+    proposal
+}
+
+fn open_retarget_session(
+    engine: &mut Engine<RetargetDatabase>,
+    chunk: &neutrino_consensus_types::Chunk,
+) {
+    engine.set_local_voter(retarget_keys()[0].clone());
+    engine.open_bft_session_at(chunk.clone(), 100).unwrap();
+    let proposal = retarget_proposal(engine, chunk, 0, None);
+    engine
+        .observe_bft_proposal(proposal, 100, &NativeConsensusBackend { reject: false })
+        .unwrap();
+}
+
+fn retarget_round_certificate(
+    round: u32,
+    highest_quorum: Option<&neutrino_consensus_types::QuorumCertificate>,
+) -> neutrino_consensus_types::RoundChangeCertificate {
+    let reports = retarget_keys()[1..]
+        .iter()
+        .map(|key| {
+            let mut report = neutrino_consensus_types::RoundChange {
+                chunk_id: 0,
+                round,
+                validator_index: key.validator_index(),
+                highest_quorum: highest_quorum.cloned(),
+                signature: [0; 96],
+            };
+            report.signature = key
+                .sign_raw(&report.signing_message(retarget_spec().consensus_domain()))
+                .to_bytes();
+            report
+        })
+        .collect();
+    neutrino_consensus_types::RoundChangeCertificate {
+        chunk_id: 0,
+        round,
+        reports,
+    }
+}
+
+fn lock_retarget_first(
+    engine: &mut Engine<RetargetDatabase>,
+    first: &neutrino_consensus_types::Chunk,
+) -> neutrino_consensus_types::QuorumCertificate {
     use neutrino_consensus_types::FinalityVotePhase;
-    use neutrino_storage::{Column, Database};
+    open_retarget_session(engine, first);
+    engine
+        .observe_finality_vote_at(
+            retarget_vote(first, 0, FinalityVotePhase::Prevote, 1, vec![]),
+            100,
+        )
+        .unwrap();
+    assert!(engine.bft_session(0).unwrap().local_precommitted());
+    engine
+        .bft_session(0)
+        .unwrap()
+        .highest_lock_quorum()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn current_target_quorum_hints_preserve_pending_precommits_until_finality() {
+    use neutrino_consensus_types::FinalityVotePhase;
     let (mut engine, first, _) = retarget_fixture();
     let backend = NativeConsensusBackend { reject: false };
-    engine.set_local_voter(retarget_keys()[0].clone());
-    engine.open_bft_session_at(first.clone(), 100).unwrap();
-    engine
-        .observe_finality_vote(retarget_vote(
-            &first,
-            0,
-            FinalityVotePhase::Prevote,
-            1,
-            vec![],
-        ))
-        .unwrap();
+    let old_lock = lock_retarget_first(&mut engine, &first);
     let advertised = engine.bft_candidate(0).unwrap();
     assert_eq!(advertised.round, 1);
-    assert_eq!(advertised.justification.as_ref().unwrap().data.round, 0);
+    assert_eq!(advertised.justification, Some(old_lock));
     let accumulated = engine.bft_session(0).unwrap().chunk_bft().clone();
-    let saved = engine
-        .store()
-        .db()
-        .iter_column(Column::BftSessions)
-        .unwrap();
-    let journal = engine
-        .store()
-        .db()
-        .iter_column(Column::SigningJournal)
-        .unwrap();
     for _ in 0..3 {
-        assert!(
-            engine
-                .retarget_bft_session(&advertised, 101, &backend)
-                .is_err()
-        );
+        let actions = engine
+            .offer_bft_candidate(&advertised, 101, &backend)
+            .unwrap();
+        assert!(actions.is_empty());
         let session = engine.bft_session(0).unwrap();
         assert_eq!(session.round(), 0);
         assert_eq!(session.chunk_bft(), &accumulated);
         assert!(session.local_precommitted());
         assert!(!session.precommit_quorum_observed());
-        assert_eq!(
-            engine
-                .store()
-                .db()
-                .iter_column(Column::BftSessions)
-                .unwrap(),
-            saved
-        );
-        assert_eq!(
-            engine
-                .store()
-                .db()
-                .iter_column(Column::SigningJournal)
-                .unwrap(),
-            journal
-        );
     }
     let receipt = engine
         .store()
@@ -1246,68 +1357,46 @@ fn current_target_quorum_advertisements_preserve_pending_precommits_until_finali
             vec![neutrino_prover_chunk::execution::commitment(&receipt)],
         ))
         .unwrap();
-    let mut prepared = engine.prepare_bft_consensus_chunk(0, &backend).unwrap();
-    engine
-        .certify_consensus_chunk(&mut prepared, &retarget_keys()[0])
-        .unwrap();
-    let proof = backend
-        .prove_consensus_chunk(&prepared.proofs, &prepared.witness)
-        .unwrap();
-    let finalized = engine
-        .commit_bft_consensus_chunk(
-            &prepared.witness,
-            &proof,
-            &backend,
-            Some(&NativeReplayExecutor),
-        )
-        .unwrap();
+    let finalized = finalize_native_retarget_session(&mut engine, &backend);
     assert_eq!(finalized.chunk_hash, first.hash());
     assert_eq!(finalized.finality_cert.round, 0);
     assert_eq!(engine.latest_finalized_chunk_id(), Some(0));
 }
 
 #[test]
-fn same_target_quorums_advance_after_timeout_or_when_genuinely_ahead() {
-    use neutrino_consensus_types::{BftCandidate, FinalityVotePhase};
-    for ahead in [false, true] {
-        let (mut engine, first, _) = retarget_fixture();
-        let backend = NativeConsensusBackend { reject: false };
-        engine.set_local_voter(retarget_keys()[0].clone());
-        engine.open_bft_session_at(first.clone(), 100).unwrap();
+fn higher_quorum_availability_hints_cannot_advance_without_signed_round_certificate() {
+    use neutrino_consensus_types::BftCandidate;
+    let (mut engine, first, second) = retarget_fixture();
+    let backend = NativeConsensusBackend { reject: false };
+    let lock = lock_retarget_first(&mut engine, &first);
+    let candidate = BftCandidate {
+        chunk: second,
+        round: 1_000,
+        justification: None,
+    };
+    engine
+        .offer_bft_candidate(&candidate, 10_000, &backend)
+        .unwrap();
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
+    assert_eq!(engine.bft_session(0).unwrap().chunk_hash(), first.hash());
+    let mut candidate = candidate;
+    candidate.justification = Some(retarget_quorum(&candidate.chunk, 1));
+    engine
+        .offer_bft_candidate(&candidate, 10_000, &backend)
+        .unwrap();
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
+    assert_eq!(
+        engine.bft_session(0).unwrap().highest_lock_quorum(),
+        Some(&lock)
+    );
+    let mut minority = retarget_round_certificate(2, candidate.justification.as_ref());
+    minority.reports.pop();
+    assert!(
         engine
-            .observe_finality_vote(retarget_vote(
-                &first,
-                0,
-                FinalityVotePhase::Prevote,
-                1,
-                vec![],
-            ))
-            .unwrap();
-        let old_lock = engine
-            .bft_session(0)
-            .unwrap()
-            .highest_lock_quorum()
-            .unwrap()
-            .clone();
-        let candidate = BftCandidate {
-            chunk: first.clone(),
-            round: if ahead { 2 } else { 1 },
-            justification: Some(retarget_quorum(&first, u32::from(ahead))),
-        };
-        let now = if ahead {
-            101
-        } else {
-            100 + engine.chain_spec().consensus.bft_round_timeout_base_secs
-        };
-        let actions = engine
-            .retarget_bft_session(&candidate, now, &backend)
-            .unwrap();
-        let session = engine.bft_session(0).unwrap();
-        assert_eq!(session.round(), candidate.round);
-        assert_eq!(session.chunk_hash(), first.hash());
-        assert_eq!(session.highest_lock_quorum(), Some(&old_lock));
-        assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == candidate.round && vote.attestations[0].unlock_quorum == candidate.justification)));
-    }
+            .observe_round_change_certificate(minority, 101)
+            .is_err()
+    );
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
 }
 
 fn finalize_native_retarget_session(
@@ -1332,63 +1421,49 @@ fn finalize_native_retarget_session(
 }
 
 #[test]
-fn a_locked_validator_switches_only_with_an_earlier_higher_quorum_and_finalizes_after_restart() {
+fn a_locked_validator_switches_only_with_a_signed_leader_and_earlier_higher_quorum_then_recovers() {
     use neutrino_consensus_types::{BftCandidate, FinalityVotePhase};
     let (mut engine, first, second) = retarget_fixture();
     let backend = NativeConsensusBackend { reject: false };
-    engine.set_local_voter(retarget_keys()[0].clone());
-    engine.open_bft_session_at(first.clone(), 100).unwrap();
-    engine
-        .observe_finality_vote(retarget_vote(
-            &first,
-            0,
-            FinalityVotePhase::Prevote,
-            1,
-            vec![],
-        ))
-        .unwrap();
-    assert!(engine.bft_session(0).unwrap().local_precommitted());
-    let old_lock = engine
-        .bft_session(0)
-        .unwrap()
-        .highest_lock_quorum()
-        .unwrap()
-        .clone();
-    let discovery = engine.bft_candidate(0).unwrap();
-    assert_eq!(discovery.round, 1);
-    assert_eq!(discovery.justification, Some(old_lock.clone()));
-    let mut candidate = BftCandidate {
+    let old_lock = lock_retarget_first(&mut engine, &first);
+    let candidate = BftCandidate {
         chunk: second.clone(),
-        round: 1,
-        justification: None,
+        round: 2,
+        justification: Some(retarget_quorum(&second, 1)),
     };
-    assert!(
-        engine
-            .retarget_bft_session(&candidate, 10_000, &backend)
-            .is_err()
-    );
-    candidate.justification = Some(retarget_quorum(&second, 1));
-    assert!(
-        engine
-            .retarget_bft_session(&candidate, 10_000, &backend)
-            .is_err()
-    );
-    candidate.round = 2;
-    let actions = engine
-        .retarget_bft_session(&candidate, 101, &backend)
+    engine
+        .offer_bft_candidate(&candidate, 101, &backend)
         .unwrap();
+    let proposal = retarget_proposal(&engine, &second, 2, candidate.justification.clone());
+    let mut unauthenticated = proposal.clone();
+    unauthenticated.round_change_certificate = None;
+    unauthenticated.signature = retarget_keys()[unauthenticated.proposer_index as usize]
+        .sign_raw(&unauthenticated.signing_message(retarget_spec().consensus_domain()))
+        .to_bytes();
+    assert!(
+        engine
+            .observe_bft_proposal(unauthenticated, 101, &backend)
+            .is_err()
+    );
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
+    let mut actions = engine
+        .observe_round_change_certificate(
+            retarget_round_certificate(2, candidate.justification.as_ref()),
+            101,
+        )
+        .unwrap();
+    actions.extend(
+        engine
+            .observe_bft_proposal(proposal, 101, &backend)
+            .unwrap(),
+    );
     assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == 2 && vote.attestations[0].unlock_quorum == candidate.justification)));
     assert_eq!(
         engine.bft_session(0).unwrap().highest_lock_quorum(),
         Some(&old_lock)
     );
-    assert!(
-        engine
-            .retarget_bft_session(&candidate, 10_000, &backend)
-            .is_err()
-    );
-    let spec = engine.chain_spec().clone();
-    let mut engine = Engine::open(spec, engine.store().db().clone()).unwrap();
+    let mut engine =
+        Engine::open(engine.chain_spec().clone(), engine.store().db().clone()).unwrap();
     engine.set_evidence_programs([1; 8], [2; 8], [3; 8]);
     engine.set_local_voter(retarget_keys()[0].clone());
     engine.resume_bft_actions().unwrap();
@@ -1427,94 +1502,95 @@ fn a_locked_validator_switches_only_with_an_earlier_higher_quorum_and_finalizes_
 }
 
 #[test]
-fn candidate_transition_crashes_resume_the_same_justified_target_without_replaying_old_votes() {
-    use neutrino_consensus_types::{BftCandidate, FinalityVotePhase};
-    for fail_after in 0..=2 {
+fn signed_candidate_transition_crashes_keep_the_retained_lock_and_exact_new_target() {
+    use neutrino_consensus_types::BftCandidate;
+    for fail_after in 0..=4 {
         let (mut engine, first, second) = retarget_fixture();
         let backend = NativeConsensusBackend { reject: false };
-        engine.set_local_voter(retarget_keys()[0].clone());
-        engine.open_bft_session_at(first.clone(), 100).unwrap();
+        let old_lock = lock_retarget_first(&mut engine, &first);
+        let quorum = retarget_quorum(&second, 1);
         engine
-            .observe_finality_vote(retarget_vote(
-                &first,
-                0,
-                FinalityVotePhase::Prevote,
-                1,
-                vec![],
-            ))
+            .offer_bft_candidate(
+                &BftCandidate {
+                    chunk: second.clone(),
+                    round: 2,
+                    justification: Some(quorum.clone()),
+                },
+                101,
+                &backend,
+            )
             .unwrap();
-        let old_lock = engine
-            .bft_session(0)
-            .unwrap()
-            .highest_lock_quorum()
-            .unwrap()
-            .clone();
-        let candidate = BftCandidate {
-            chunk: second.clone(),
-            round: 2,
-            justification: Some(retarget_quorum(&second, 1)),
-        };
+        let proposal = retarget_proposal(&engine, &second, 2, Some(quorum.clone()));
         engine.store_mut().db_mut().fail_durable_after = Some(fail_after);
-        assert!(
-            engine
-                .retarget_bft_session(&candidate, 101, &backend)
-                .is_err()
-        );
+        let result = engine
+            .observe_round_change_certificate(retarget_round_certificate(2, Some(&quorum)), 101);
+        if fail_after < 2 {
+            assert!(result.is_err());
+        }
         let mut database = engine.store().db().clone();
         database.fail_durable_after = None;
         let mut restored = Engine::open(engine.chain_spec().clone(), database).unwrap();
         restored.set_evidence_programs([1; 8], [2; 8], [3; 8]);
         restored.set_local_voter(retarget_keys()[0].clone());
-        let actions = restored.resume_bft_actions().unwrap();
+        restored.resume_bft_actions().unwrap();
         assert_eq!(
             restored.bft_session(0).unwrap().highest_lock_quorum(),
             Some(&old_lock)
         );
-        if fail_after == 0 {
-            assert_eq!(restored.bft_session(0).unwrap().chunk_hash(), first.hash());
-        } else {
+        if restored.bft_session(0).unwrap().round() == 2 {
+            restored
+                .observe_bft_proposal(proposal, 102, &backend)
+                .unwrap();
             assert_eq!(restored.bft_session(0).unwrap().chunk_hash(), second.hash());
-            assert_eq!(restored.bft_session(0).unwrap().round(), 2);
-            assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.chunk_hash == second.hash() && vote.attestations[0].unlock_quorum == candidate.justification)));
-            assert!(!actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.chunk_hash == first.hash())));
+        } else {
+            assert_eq!(restored.bft_session(0).unwrap().round(), 0);
+            assert_eq!(restored.bft_session(0).unwrap().chunk_hash(), first.hash());
         }
     }
 }
 
 #[test]
-fn an_unlocked_timeout_authenticates_and_adopts_the_common_canonical_candidate() {
-    let (mut engine, first, second) = retarget_fixture();
-    let backend = NativeConsensusBackend { reject: false };
-    engine.set_local_voter(retarget_keys()[0].clone());
-    engine.open_bft_session_at(first, 100).unwrap();
-    assert!(
-        engine
-            .tick_bft_round_timeouts_with_proof_system(101, &backend)
-            .unwrap()
-            .is_empty()
-    );
-    let due = 100 + engine.chain_spec().consensus.bft_round_timeout_base_secs;
-    let actions = engine
-        .tick_bft_round_timeouts_with_proof_system(due, &backend)
+fn a_missing_leader_emits_nil_and_requires_quorum_before_round_replacement() {
+    use neutrino_consensus_types::FinalityVotePhase;
+    let (mut engine, first, _) = retarget_fixture();
+    let leader =
+        neutrino_consensus_types::bft_leader(7, 0, 0, engine.active_validator_set()).unwrap();
+    let follower = (leader + 1) % 3;
+    engine.set_local_voter(retarget_keys()[follower as usize].clone());
+    assert!(engine.open_bft_session_at(first, 100).unwrap().is_empty());
+    let base = engine.chain_spec().consensus.bft_round_timeout_base_secs;
+    let actions = engine.tick_bft_round_timeouts(100 + base).unwrap();
+    assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastNilVote(vote) if vote.data.phase == FinalityVotePhase::Prevote)));
+    let actions = engine.tick_bft_round_timeouts(100 + base * 2).unwrap();
+    assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastNilVote(vote) if vote.data.phase == FinalityVotePhase::Precommit)));
+    let actions = engine.tick_bft_round_timeouts(100 + base * 3).unwrap();
+    assert!(actions.iter().any(
+        |action| matches!(action, BftAction::BroadcastRoundChange(report) if report.round == 1)
+    ));
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
+    engine
+        .observe_round_change_certificate(retarget_round_certificate(1, None), 100 + base * 3)
         .unwrap();
-    assert_eq!(engine.bft_session(0).unwrap().chunk_hash(), second.hash());
     assert_eq!(engine.bft_session(0).unwrap().round(), 1);
-    assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.chunk_hash == second.hash())));
+    assert_eq!(engine.bft_session(0).unwrap().highest_lock_quorum(), None);
 }
 
 #[test]
-fn initial_signing_crashes_keep_the_original_candidate_after_fork_choice_changes() {
+fn initial_proposal_signing_crashes_keep_original_branch_after_fork_choice_changes() {
     for fail_after in 1..=2 {
         let (mut engine, first, second) = retarget_fixture();
         let backend = NativeConsensusBackend { reject: false };
-        engine.set_local_voter(retarget_keys()[0].clone());
+        let leader =
+            neutrino_consensus_types::bft_leader(7, 0, 0, engine.active_validator_set()).unwrap();
+        let voter = retarget_keys()[leader as usize].clone();
+        engine.set_local_voter(voter.clone());
         engine.store_mut().db_mut().fail_durable_after = Some(fail_after);
         assert!(engine.open_bft_session_at(first.clone(), 100).is_err());
         let mut database = engine.store().db().clone();
         database.fail_durable_after = None;
         let mut restored = Engine::open(engine.chain_spec().clone(), database).unwrap();
         restored.set_evidence_programs([1; 8], [2; 8], [3; 8]);
-        restored.set_local_voter(retarget_keys()[0].clone());
+        restored.set_local_voter(voter);
         assert_eq!(restored.head_hash(), second.end_block_hash);
         let prepared = restored.prepare_bft_consensus_chunk(0, &backend).unwrap();
         assert_eq!(
@@ -1522,55 +1598,49 @@ fn initial_signing_crashes_keep_the_original_candidate_after_fork_choice_changes
             first.end_block_hash
         );
         let actions = restored.resume_bft_actions().unwrap();
-        assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.chunk_hash == first.hash())));
+        assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastProposal(proposal) if proposal.chunk.hash() == first.hash())));
+        assert!(!actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.chunk_hash == second.hash())));
     }
 }
 
 #[test]
-fn a_fresh_authenticated_quorum_opens_its_next_round_without_a_throwaway_vote() {
+fn a_fresh_higher_round_hint_opens_round_zero_then_certified_catchup_avoids_throwaway_votes() {
     use neutrino_consensus_types::BftCandidate;
-    for fail_after in [None, Some(0), Some(1), Some(2)] {
-        let (mut engine, _, second) = retarget_fixture();
-        let backend = NativeConsensusBackend { reject: false };
-        engine.set_local_voter(retarget_keys()[0].clone());
-        let candidate = BftCandidate {
-            chunk: second.clone(),
-            round: 2,
-            justification: Some(retarget_quorum(&second, 1)),
-        };
-        engine.store_mut().db_mut().fail_durable_after = fail_after;
-        let result = engine.retarget_bft_session(&candidate, 100, &backend);
-        if fail_after.is_some() {
-            assert!(result.is_err());
-        } else {
-            let actions = result.unwrap();
-            assert!(actions.iter().any(
-                |action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == 2)
-            ));
-            assert!(!actions.iter().any(
-                |action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == 0)
-            ));
-        }
-        let mut database = engine.store().db().clone();
-        database.fail_durable_after = None;
-        let mut restored = Engine::open(engine.chain_spec().clone(), database).unwrap();
-        restored.set_evidence_programs([1; 8], [2; 8], [3; 8]);
-        restored.set_local_voter(retarget_keys()[0].clone());
-        if fail_after == Some(0) {
-            assert!(restored.bft_session(0).is_none());
-            assert_eq!(
-                neutrino_storage::Database::iter_column(
-                    restored.store().db(),
-                    neutrino_storage::Column::SigningJournal,
-                )
-                .unwrap(),
-                Vec::new(),
-            );
-        } else {
-            let actions = restored.resume_bft_actions().unwrap();
-            assert_eq!(restored.bft_session(0).unwrap().round(), 2);
-            assert_eq!(restored.bft_session(0).unwrap().chunk_hash(), second.hash());
-            assert!(actions.iter().any(|action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == 2 && vote.attestations[0].unlock_quorum == candidate.justification)));
-        }
-    }
+    let (mut engine, _, second) = retarget_fixture();
+    let backend = NativeConsensusBackend { reject: false };
+    let initial_leader =
+        neutrino_consensus_types::bft_leader(7, 0, 0, engine.active_validator_set()).unwrap();
+    let follower = (initial_leader + 1) % 3;
+    engine.set_local_voter(retarget_keys()[follower as usize].clone());
+    let quorum = retarget_quorum(&second, 1);
+    let candidate = BftCandidate {
+        chunk: second.clone(),
+        round: 2,
+        justification: Some(quorum.clone()),
+    };
+    let actions = engine
+        .offer_bft_candidate(&candidate, 100, &backend)
+        .unwrap();
+    assert!(actions.is_empty());
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
+    let mut actions = engine
+        .observe_round_change_certificate(retarget_round_certificate(2, Some(&quorum)), 101)
+        .unwrap();
+    let proposal = retarget_proposal(&engine, &second, 2, Some(quorum));
+    actions.extend(
+        engine
+            .observe_bft_proposal(proposal, 101, &backend)
+            .unwrap(),
+    );
+    assert_eq!(engine.bft_session(0).unwrap().round(), 2);
+    assert!(
+        actions.iter().any(
+            |action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == 2)
+        )
+    );
+    assert!(
+        !actions.iter().any(
+            |action| matches!(action, BftAction::BroadcastPrevote(vote) if vote.data.round == 0)
+        )
+    );
 }

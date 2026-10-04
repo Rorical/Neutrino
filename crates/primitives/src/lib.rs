@@ -58,6 +58,29 @@ pub type Secp256k1Signature = [u8; 65];
 /// Consensus domain tag. All domain tags are exactly 16 bytes.
 pub type DomainTag = [u8; 16];
 
+/// Consensus signing context derived from the complete authenticated chain spec.
+/// Equal numeric chain identifiers do not make distinct specifications equivalent.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConsensusDomain {
+    /// Numeric chain identifier, encoded little-endian in every signed message.
+    pub chain_id: ChainId,
+    /// Canonical hash of the complete chain specification.
+    pub chain_spec_hash: Hash,
+}
+
+impl ConsensusDomain {
+    /// Encode `tag || chain_id LE8 || chain_spec_hash || payload` canonically.
+    #[must_use]
+    pub fn signing_message(self, tag: DomainTag, payload: &[u8]) -> Vec<u8> {
+        let mut message = Vec::with_capacity(16 + 8 + 32 + payload.len());
+        message.extend_from_slice(&tag);
+        message.extend_from_slice(&self.chain_id.to_le_bytes());
+        message.extend_from_slice(&self.chain_spec_hash);
+        message.extend_from_slice(payload);
+        message
+    }
+}
+
 /// Zero hash used for empty roots and genesis placeholders.
 pub const ZERO_HASH: Hash = [0; 32];
 /// Fractional bits in `FixedU128`.
@@ -98,10 +121,6 @@ pub const DEFAULT_BFT_ROUND_TIMEOUT_BASE_SECS: u64 = 2 * DEFAULT_SLOT_DURATION_S
 /// Default per-round linear backoff added to the BFT round timeout.
 /// Round N waits `base + N * step` seconds before timing out.
 pub const DEFAULT_BFT_ROUND_TIMEOUT_STEP_SECS: u64 = DEFAULT_SLOT_DURATION_SECS;
-/// Default maximum BFT round any session advances to before
-/// declaring the chunk stalled. Comfortably above realistic
-/// partition durations.
-pub const DEFAULT_BFT_MAX_ROUND: u32 = 32;
 /// Default epoch length in chunks.
 ///
 /// With the default `chunk_size = 128` this yields a
@@ -157,6 +176,14 @@ pub const DOMAIN_PREVOTE: DomainTag = *b"NEUTRINO_PREVOTE";
 pub const DOMAIN_PRECOMMIT: DomainTag = *b"NEUTRINO_PRECOMM";
 /// Explicit precommit proof-artifact and unlock commitments.
 pub const DOMAIN_VOTE_ATTESTATION: DomainTag = *b"NEUTRINO_VOTE___";
+/// Signed chunk-level round-leader proposals.
+pub const DOMAIN_BFT_PROPOSAL: DomainTag = *b"NEUTRINO_BFTPROP";
+/// Explicit nil votes, independently separated from value votes.
+pub const DOMAIN_BFT_NIL: DomainTag = *b"NEUTRINO_BFTNIL_";
+/// Individual accountability declarations for nil votes.
+pub const DOMAIN_BFT_NIL_ATTESTATION: DomainTag = *b"NEUTRINO_NILATT_";
+/// Signed pacemaker reports and their highest known quorum.
+pub const DOMAIN_BFT_ROUND_CHANGE: DomainTag = *b"NEUTRINO_ROUNDCH";
 /// Domain for a proposer's signed publication of exact DA bundle bytes.
 pub const DOMAIN_DA_PUBLICATION: DomainTag = *b"NEUTRINO_DA_PUB_";
 /// Validator deposit proof-of-possession domain.
@@ -610,25 +637,13 @@ pub struct ConsensusParams {
     pub vote_subnets: u16,
     /// Validator subnets assigned per chunk.
     pub validator_subnets_per_chunk: u8,
-    /// BFT round-0 timeout in seconds.
-    ///
-    /// `Engine::tick_bft_round_timeouts` advances a session to
-    /// round + 1 when `now - round_started_at_secs` exceeds
-    /// `bft_round_timeout_base_secs + round * bft_round_timeout_step_secs`.
-    /// Sized comfortably larger than two slot durations so a single
-    /// slow gossip propagation does not force a round skip.
+    /// Round-zero deadline for each propose, prevote and precommit phase.
     pub bft_round_timeout_base_secs: u64,
     /// Linear per-round backoff added to the round timeout. Round N
     /// waits `base + N * step` seconds before timing out so a
     /// pathologically partitioned network still makes progress
     /// after the partition heals.
     pub bft_round_timeout_step_secs: u64,
-    /// Maximum BFT round any session advances to before declaring
-    /// the chunk stalled. Operators see a metric / log but the
-    /// session stops emitting new prevotes; finalisation requires
-    /// a separate operator intervention (or a partition heal that
-    /// lets earlier rounds reach quorum).
-    pub bft_max_round: u32,
     /// Number of consecutive chunks that make up one epoch. Together
     /// with `chunk_size` this defines `epoch_length_blocks =
     /// chunk_size * epoch_length_in_chunks`. Used by the
@@ -677,7 +692,6 @@ impl Default for ConsensusParams {
             validator_subnets_per_chunk: DEFAULT_VALIDATOR_SUBNETS_PER_CHUNK,
             bft_round_timeout_base_secs: DEFAULT_BFT_ROUND_TIMEOUT_BASE_SECS,
             bft_round_timeout_step_secs: DEFAULT_BFT_ROUND_TIMEOUT_STEP_SECS,
-            bft_max_round: DEFAULT_BFT_MAX_ROUND,
             epoch_length_in_chunks: DEFAULT_EPOCH_LENGTH_IN_CHUNKS,
             activation_delay_epochs: DEFAULT_ACTIVATION_DELAY_EPOCHS,
             exit_delay_epochs: DEFAULT_EXIT_DELAY_EPOCHS,
@@ -874,6 +888,15 @@ pub struct ChainSpec {
 }
 
 impl ChainSpec {
+    /// Bind consensus signatures to this complete specification.
+    #[must_use]
+    pub fn consensus_domain(&self) -> ConsensusDomain {
+        ConsensusDomain {
+            chain_id: self.chain_id,
+            chain_spec_hash: self.hash(),
+        }
+    }
+
     /// Computes `BLAKE3(borsh(self))`, the canonical chain-spec hash.
     pub fn hash(&self) -> Hash {
         blake3_256(&borsh::to_vec(self).expect("borsh serialization of ChainSpec is infallible"))
@@ -945,6 +968,8 @@ impl ConsensusParams {
             || self.chunk_timeout_slots == 0
             || self.proof_window_slots == 0
             || self.finality_stall_threshold_slots == 0
+            || self.bft_round_timeout_base_secs == 0
+            || self.bft_round_timeout_step_secs == 0
         {
             return Err(ChainSpecError::ZeroConsensusParameter);
         }
@@ -1108,6 +1133,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn consensus_domain_binds_complete_spec_and_has_one_exact_prefix() {
+        let spec = test_chain_spec();
+        let domain = spec.consensus_domain();
+        assert_eq!(domain.chain_id, spec.chain_id);
+        assert_eq!(domain.chain_spec_hash, spec.hash());
+        let message = domain.signing_message(DOMAIN_PREVOTE, &[7, 9]);
+        assert_eq!(message.len(), 58);
+        assert_eq!(&message[..16], &DOMAIN_PREVOTE);
+        assert_eq!(&message[16..24], &spec.chain_id.to_le_bytes());
+        assert_eq!(&message[24..56], &spec.hash());
+        assert_eq!(&message[56..], &[7, 9]);
+        let mut other = spec;
+        other.consensus.bft_round_timeout_base_secs += 1;
+        assert_eq!(domain.chain_id, other.consensus_domain().chain_id);
+        assert_ne!(
+            domain.chain_spec_hash,
+            other.consensus_domain().chain_spec_hash
+        );
+    }
+
+    #[test]
     fn in_place_merkle_matches_reference_for_every_tree_shape() {
         // Independent level-allocating reference, including all odd promotions.
         for count in 0..130 {
@@ -1144,6 +1190,10 @@ mod tests {
             DOMAIN_PREVOTE,
             DOMAIN_PRECOMMIT,
             DOMAIN_VOTE_ATTESTATION,
+            DOMAIN_BFT_PROPOSAL,
+            DOMAIN_BFT_NIL,
+            DOMAIN_BFT_NIL_ATTESTATION,
+            DOMAIN_BFT_ROUND_CHANGE,
             DOMAIN_DA_PUBLICATION,
             DOMAIN_DEPOSIT_POP,
             DOMAIN_VOLUNTARY_EXIT,
@@ -1193,6 +1243,19 @@ mod tests {
         let spec = test_chain_spec();
         assert_eq!(spec.validate(), Ok(()));
         assert_ne!(spec.hash(), ZERO_HASH);
+    }
+
+    #[test]
+    fn bft_phase_deadlines_and_eventual_synchrony_backoff_must_be_positive() {
+        for backoff in [false, true] {
+            let mut spec = test_chain_spec();
+            if backoff {
+                spec.consensus.bft_round_timeout_step_secs = 0;
+            } else {
+                spec.consensus.bft_round_timeout_base_secs = 0;
+            }
+            assert_eq!(spec.validate(), Err(ChainSpecError::ZeroConsensusParameter));
+        }
     }
 
     #[test]

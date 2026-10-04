@@ -8,21 +8,17 @@
 //! * `SIG_DST = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"`
 //! * `POP_DST = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"`
 //!
-//! This matches the IRTF BLS draft, the Ethereum consensus layer, and the
-//! `DOMAIN_DEPOSIT_POP` tag enumerated in `docs/design/12-randomness.md`.
+//! This follows the IRTF BLS POP cipher suite.
 //! The POP scheme makes finality-vote aggregation safe against rogue-key
 //! attacks without requiring per-message augmentation, at the cost of
 //! requiring every validator to publish a one-shot proof-of-possession at
 //! deposit time.
 //!
-//! The design doc text "min-pk, augmented" (12-randomness.md §3) refers to
-//! the determinism property shared by both AUG and POP schemes; the
-//! presence of `DOMAIN_DEPOSIT_POP` pins us to POP.
-//!
 //! # Domain-tagged plaintexts
 //!
-//! Consensus-critical callers prepend a 16-byte `DOMAIN_*` tag and the
-//! chain ID to the plaintext *before* calling [`SecretKey::sign`]; the BLS
+//! Consensus callers derive `ConsensusDomain` from the authenticated chain
+//! specification and prepend a 16-byte `DOMAIN_*` tag, chain ID and complete
+//! chain-specification hash *before* calling [`SecretKey::sign`]; the BLS
 //! cipher suite DST handles only the per-curve subgroup binding. The two
 //! layers of separation cannot collide because they apply to different
 //! inputs of the hash-to-curve.

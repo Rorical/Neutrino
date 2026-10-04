@@ -72,10 +72,14 @@ pub enum Column {
     SigningJournal,
     /// Unfinalized BFT sessions, including local votes and quorum certificates.
     BftSessions,
+    /// Durable exact signed sources and proof envelopes for delayed accountability.
+    SignedArtifacts,
+    /// Bounded metadata index for exact signed sources and proof dependencies.
+    SignedArtifactIndex,
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 32] = [
+pub const ALL_COLUMNS: [Column; 34] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -108,6 +112,8 @@ pub const ALL_COLUMNS: [Column; 32] = [
     Column::EvidenceProofs,
     Column::SigningJournal,
     Column::BftSessions,
+    Column::SignedArtifacts,
+    Column::SignedArtifactIndex,
 ];
 
 impl Column {
@@ -147,6 +153,8 @@ impl Column {
             Self::EvidenceProofs => "evidence_proofs",
             Self::SigningJournal => "signing_journal",
             Self::BftSessions => "bft_sessions",
+            Self::SignedArtifacts => "signed_artifacts",
+            Self::SignedArtifactIndex => "signed_artifact_index",
         }
     }
 }
@@ -157,7 +165,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 32);
+        assert_eq!(ALL_COLUMNS.len(), 34);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -167,7 +175,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 32] = [
+        let names: [&str; 34] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -200,6 +208,8 @@ mod tests {
             "evidence_proofs",
             "signing_journal",
             "bft_sessions",
+            "signed_artifacts",
+            "signed_artifact_index",
         ];
         for (column, expected) in ALL_COLUMNS.iter().zip(names) {
             assert_eq!(column.name(), expected);

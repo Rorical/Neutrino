@@ -11,6 +11,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod bft;
 pub mod bls;
 pub mod body;
 pub mod consensus;

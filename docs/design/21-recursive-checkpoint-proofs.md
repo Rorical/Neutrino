@@ -329,10 +329,13 @@ not authenticate an attacker-supplied replacement for the client's entire databa
 
 ## Acceptance and boundaries
 
-The current higher-round BFT format passed local checks on 2026-10-03: locked
-workspace build and tests (939 passed, zero failed, six ignored), strict workspace
-Clippy, CUDA-enabled node Clippy across all targets, and workspace/Guest formatting
-checks. The tests cover durable-write failure, RocksDB recovery after SIGKILL
+On 2026-10-04, the current signed-leader, nil-vote, certified round-change and full
+ChainSpec signing-domain format passed a fresh locked workspace build and full
+test run: **1,010 passed, zero failed, six real-proving gates ignored**. Strict
+all-target workspace Clippy, CUDA-enabled node Clippy, workspace/Guest formatting
+and `git diff --check` also passed. The Guest ELFs were rebuilt before testing;
+results for prior Guest binaries were not carried forward. The tests cover
+durable-write failure, RocksDB recovery after SIGKILL
 following a synchronized write, interrupted snapshot download and installation,
 saved-branch recovery, validator activation, bootstrap/signing races, checkpoint
 lag and stale provider responses.
@@ -340,13 +343,22 @@ lag and stale provider responses.
 BFT coverage includes legal higher-round candidate replacement with retained
 locks, same-round quorum admission that preserves pending precommits, signing
 recovery across durable-write gaps, immutable block receipts and stale proof-job
-fencing. A 16-validator test uses the production SyncDriver and completes finality
+fencing. New coverage exercises an absent leader with one quarter offline stake,
+explicit nil phases, highest-valid reproposals, alternate legitimate round-change
+quorum subsets, signed proposal recovery after exact-branch backfill, and late
+forensic-source retrieval. Real BLS tests reuse the same numeric chain ID and
+validator keys across different ChainSpecs and reject foreign value/nil votes,
+proposals, round reports, certificates, lock evidence and reused Fact verdicts.
+Node tests reject late foreign sources before storage and sanction admission,
+including after restart; actual Chunk Guest execution rejects foreign-domain
+header and proposal signatures while preserving their execution bindings.
+A 16-validator test uses the production SyncDriver and completes finality
 through ChunkProofById RPC while withholding precommit and ChunkProof gossip from
 one node. Native and mock-adapter fixtures remain separate from real compressed
 composition acceptance; those expensive gates remained ignored after the user
 cancelled local proving, and no GPU proving was run. CUDA Clippy establishes
-compilation only. Local logs are retained under `target/verification/` rather than
-the reboot-cleared temporary directory.
+compilation only. Local build, test and lint logs are retained in
+`target/verification/bft-liveness-domain-{build,tests,clippy,cuda-clippy}.log`.
 
 Native/Guest tests cover boundary and program mutations, empty/overflowed ranges,
 branch mismatch, grouping-invariant endpoint identities, bounded decoding, tree

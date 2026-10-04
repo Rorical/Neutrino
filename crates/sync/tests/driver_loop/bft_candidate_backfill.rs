@@ -6,33 +6,46 @@ use neutrino_network::{Topic, rpc::CandidateByChunkResponse};
 
 type Reply = tokio::sync::oneshot::Sender<Result<RpcResponse, neutrino_network::rpc::RpcError>>;
 
-struct Harness {
-    backend: MockBackend,
-    events: mpsc::Sender<NetworkEvent>,
+fn branch_blocks(slot_offset: u64) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut parent = [0; 32];
+    for height in 1..=20 {
+        let mut block = sample_block(height, height + slot_offset, 0);
+        block.header.parent_hash = parent;
+        parent = block.hash();
+        blocks.push(block);
+    }
+    blocks
+}
+
+// Shared with sibling test modules without exporting from the test crate.
+#[allow(clippy::redundant_pub_crate)]
+pub(super) struct Harness {
+    pub(super) backend: MockBackend,
+    pub(super) events: mpsc::Sender<NetworkEvent>,
     commands: mpsc::Receiver<NetworkCommand>,
     deferred: std::collections::VecDeque<(PeerId, RpcRequest, Reply)>,
     runner: tokio::task::JoinHandle<Result<(), neutrino_sync::SyncDriverError>>,
     blocks: Vec<Block>,
-    candidate: BftCandidate,
+    pub(super) candidate: BftCandidate,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
+        Self::with_head_height(0)
+    }
+
+    fn with_head_height(head_height: u64) -> Self {
         let backend = MockBackend::default();
         {
             let mut state = backend.inner.lock().unwrap();
             state.full_chunk_size = Some(20);
             state.candidate_sync = true;
             state.status.chain_id = 1;
+            state.status.head_height = head_height;
         }
-        let mut blocks = Vec::new();
-        let mut parent = [0; 32];
-        for height in 1..=20 {
-            let mut block = sample_block(height, height, 0);
-            block.header.parent_hash = parent;
-            parent = block.hash();
-            blocks.push(block);
-        }
+        let blocks = branch_blocks(0);
+        let parent = blocks.last().unwrap().hash();
         let candidate = BftCandidate {
             round: 0,
             justification: None,
@@ -52,15 +65,36 @@ impl Harness {
                 da_root: [6; 32],
             },
         };
+        let progress = LocalProgress {
+            chain_id: 1,
+            head_height,
+            head_block_hash: if head_height == 0 {
+                [0; 32]
+            } else {
+                branch_blocks(100).last().unwrap().hash()
+            },
+            head_slot: if head_height == 0 {
+                0
+            } else {
+                head_height + 100
+            },
+            proven_height: head_height,
+            body_height: head_height,
+            ..LocalProgress::default()
+        };
+        if head_height > 0 {
+            let mut state = backend.inner.lock().unwrap();
+            state.local_progress_override = Some(progress);
+            state.status.head_block_hash = progress.head_block_hash;
+            state.status.head_slot = progress.head_slot;
+            state.proven_height = head_height;
+        }
         let (command_tx, commands) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(64);
         let driver = SyncDriver::new(
             SyncDriverConfig::default(),
             Arc::new(backend.clone()),
-            LocalProgress {
-                chain_id: 1,
-                ..LocalProgress::default()
-            },
+            progress,
             command_tx,
             event_rx,
         );
@@ -96,7 +130,7 @@ impl Harness {
         }
     }
 
-    async fn request(&mut self) -> (PeerId, RpcRequest, Reply) {
+    pub(super) async fn request(&mut self) -> (PeerId, RpcRequest, Reply) {
         loop {
             let (peer, request, reply) = self.raw_request().await;
             if matches!(request, RpcRequest::Status(_)) {
@@ -112,7 +146,7 @@ impl Harness {
         }
     }
 
-    async fn connect(&mut self, peer: PeerId) {
+    pub(super) async fn connect(&mut self, peer: PeerId) {
         self.events
             .send(NetworkEvent::PeerConnected(peer))
             .await
@@ -129,7 +163,7 @@ impl Harness {
             .unwrap();
     }
 
-    async fn gossip(&mut self, peer: PeerId, topic: Topic, data: Vec<u8>) {
+    pub(super) async fn gossip(&mut self, peer: PeerId, topic: Topic, data: Vec<u8>) {
         self.events
             .send(NetworkEvent::GossipMessage {
                 topic,
@@ -172,7 +206,114 @@ impl Harness {
         }
     }
 
-    fn blocks_reply(&self, request: &RpcRequest) -> RpcResponse {
+    async fn refresh_candidate_status(&mut self, peer: PeerId) {
+        let announcement = neutrino_network::rpc::CheckpointAnnouncement {
+            covered_chunks: 0,
+            checkpoint_hash: [0; 32],
+            range_id: [91; 32],
+        };
+        self.events
+            .send(NetworkEvent::GossipMessage {
+                topic: Topic::Checkpoints,
+                data: borsh::to_vec(&announcement).unwrap(),
+                propagation_source: peer,
+                message_id: neutrino_network::libp2p::gossipsub::MessageId::from(
+                    b"refresh-status".to_vec(),
+                ),
+            })
+            .await
+            .unwrap();
+        let mut validated = false;
+        let mut answered = false;
+        while !validated || !answered {
+            match timeout(Duration::from_secs(1), self.commands.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                NetworkCommand::ReportGossipValidation { .. } => validated = true,
+                NetworkCommand::Subscribe(_) => {}
+                NetworkCommand::SendRpcRequest {
+                    peer: owner,
+                    request: RpcRequest::Status(_),
+                    response_tx,
+                } => {
+                    assert_eq!(owner, peer);
+                    response_tx
+                        .send(Ok(RpcResponse::Status(
+                            self.backend.inner.lock().unwrap().status,
+                        )))
+                        .unwrap();
+                    answered = true;
+                }
+                NetworkCommand::SendRpcRequest {
+                    peer,
+                    request,
+                    response_tx,
+                } => self.deferred.push_back((peer, request, response_tx)),
+                other => panic!("unexpected status refresh command {other:?}"),
+            }
+        }
+    }
+
+    async fn finish_canonical_backfill(&mut self, peer: PeerId) {
+        // A complete-consensus cursor starts at the chunk boundary even when
+        // ordinary LocalProgress is caught up. Finish that independent cursor
+        // before exercising two off-canonical candidate paths.
+        let canonical = branch_blocks(100);
+        let head = canonical.last().unwrap().hash();
+        self.refresh_candidate_status(peer).await;
+        let mut pages = 0;
+        while pages < 5 {
+            let (_, request, reply) = self.request().await;
+            let response = match request {
+                RpcRequest::CandidateByChunk(_) => {
+                    reply
+                        .send(Err(neutrino_network::rpc::RpcError::Remote(
+                            neutrino_network::rpc::RpcFailure::Unavailable(
+                                "no candidate advertised yet".into(),
+                            ),
+                        )))
+                        .unwrap();
+                    continue;
+                }
+                RpcRequest::BlocksByRange(range) => {
+                    assert_eq!(range.head_block_hash, head);
+                    let start = usize::try_from(range.start_height - 1).unwrap();
+                    let count = usize::try_from(range.count).unwrap();
+                    RpcResponse::BlocksByRange(BlocksByRangeResponse {
+                        blocks: canonical[start..start + count].to_vec(),
+                    })
+                }
+                RpcRequest::BlockProofByHeight(range) => {
+                    assert_eq!(range.head_block_hash, head);
+                    let proofs = (range.start_height..range.start_height + range.count)
+                        .map(|height| {
+                            let block = &canonical[usize::try_from(height - 1).unwrap()];
+                            let mut proof = sample_block_proof(height);
+                            proof.block_hash = block.hash();
+                            proof.public_inputs.block_hash = proof.block_hash;
+                            proof.public_inputs.parent_block_hash = block.header.parent_hash;
+                            proof
+                        })
+                        .collect();
+                    RpcResponse::BlockProofByHeight(BlockProofByHeightResponse { proofs })
+                }
+                other => panic!("unexpected canonical request {other:?}"),
+            };
+            reply.send(Ok(response)).unwrap();
+            pages += 1;
+        }
+        timeout(Duration::from_secs(1), async {
+            while self.backend.proofs_imported_count() != 3 {
+                self.backend.proofs_notified.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    pub(super) fn blocks_reply(&self, request: &RpcRequest) -> RpcResponse {
         let RpcRequest::BlocksByRange(request) = request else {
             panic!("expected branch blocks")
         };
@@ -185,7 +326,7 @@ impl Harness {
         })
     }
 
-    fn proofs_reply(&self, request: &RpcRequest) -> RpcResponse {
+    pub(super) fn proofs_reply(&self, request: &RpcRequest) -> RpcResponse {
         let RpcRequest::BlockProofByHeight(request) = request else {
             panic!("expected branch proofs")
         };
@@ -201,7 +342,7 @@ impl Harness {
         RpcResponse::BlockProofByHeight(BlockProofByHeightResponse { proofs })
     }
 
-    async fn finish(&mut self) {
+    pub(super) async fn finish(&mut self) {
         for _ in 0..5 {
             let (_, request, reply) = self.request().await;
             let response = if matches!(request, RpcRequest::BlocksByRange(_)) {
@@ -239,7 +380,7 @@ impl Harness {
         .unwrap();
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         drop(self.events);
         self.runner.await.unwrap().unwrap();
     }
@@ -324,7 +465,7 @@ async fn unknown_vote_queries_source_exact_target_and_rejects_substituted_candid
         .gossip(
             peer,
             Topic::FinalityVotesPrevote,
-            borsh::to_vec(&vote).unwrap(),
+            borsh::to_vec(&neutrino_consensus_types::BftVote::Value(vote.clone())).unwrap(),
         )
         .await;
     let (source, request, reply) = harness.request().await;
@@ -508,7 +649,7 @@ async fn candidate_discovery_backlog_cannot_starve_known_branch_payload_pages() 
             .gossip(
                 peer,
                 Topic::FinalityVotesPrevote,
-                borsh::to_vec(&vote).unwrap(),
+                borsh::to_vec(&neutrino_consensus_types::BftVote::Value(vote.clone())).unwrap(),
             )
             .await;
     }
@@ -546,6 +687,96 @@ async fn candidate_discovery_backlog_cannot_starve_known_branch_payload_pages() 
     assert_eq!(
         harness.backend.inner.lock().unwrap().candidate_replacements,
         vec![harness.candidate.clone()]
+    );
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn status_refreshed_failing_candidate_cannot_starve_an_obtainable_second_target() {
+    // Canonical heads are already caught up. These are two separate candidate
+    // availability paths; ordinary header synchronization cannot finish either.
+    let mut harness = Harness::with_head_height(20);
+    let bad_provider = random_peer();
+    let honest_provider = random_peer();
+    harness.connect(bad_provider).await;
+    harness.connect(honest_provider).await;
+    harness.finish_canonical_backfill(bad_provider).await;
+    let initial_proof_imports = harness.backend.proofs_imported_count();
+    let mut unavailable = harness.candidate.clone();
+    unavailable.chunk.start_block_hash = [99; 32];
+    unavailable.chunk.end_block_hash = [98; 32];
+    harness
+        .gossip(
+            bad_provider,
+            Topic::BftCandidates,
+            borsh::to_vec(&unavailable).unwrap(),
+        )
+        .await;
+    let (_, first_page, mut reply) = harness.request().await;
+    assert!(matches!(&first_page, RpcRequest::BlocksByRange(range)
+        if range.head_block_hash == unavailable.chunk.end_block_hash));
+    harness
+        .gossip(
+            honest_provider,
+            Topic::BftCandidates,
+            borsh::to_vec(&harness.candidate).unwrap(),
+        )
+        .await;
+
+    let mut page = first_page;
+    let mut good_pages = 0;
+    for _ in 0..24 {
+        match &page {
+            RpcRequest::CandidateByChunk(_) => {
+                reply
+                    .send(Ok(RpcResponse::CandidateByChunk(Box::new(
+                        CandidateByChunkResponse {
+                            candidate: unavailable.clone(),
+                        },
+                    ))))
+                    .unwrap();
+            }
+            RpcRequest::BlocksByRange(range)
+                if range.head_block_hash == unavailable.chunk.end_block_hash =>
+            {
+                // Refresh the failed peer's compatible Status on every attempt.
+                // Its renewed eligibility must not keep this target at the front.
+                harness.refresh_candidate_status(bad_provider).await;
+                reply
+                    .send(Err(neutrino_network::rpc::RpcError::Remote(
+                        neutrino_network::rpc::RpcFailure::Unavailable(
+                            "candidate unavailable".into(),
+                        ),
+                    )))
+                    .unwrap();
+            }
+            RpcRequest::BlocksByRange(_) | RpcRequest::BlockProofByHeight(_) => {
+                let response = if matches!(page, RpcRequest::BlocksByRange(_)) {
+                    harness.blocks_reply(&page)
+                } else {
+                    harness.proofs_reply(&page)
+                };
+                reply.send(Ok(response)).unwrap();
+                good_pages += 1;
+                if good_pages == 5 {
+                    break;
+                }
+            }
+            other => panic!("unexpected candidate request {other:?}"),
+        }
+        let (_, next, response) = harness.request().await;
+        page = next;
+        reply = response;
+    }
+    assert_eq!(good_pages, 5, "failing target starved the honest branch");
+    harness.wait_completed().await;
+    assert_eq!(
+        harness.backend.inner.lock().unwrap().candidate_replacements,
+        vec![harness.candidate.clone()]
+    );
+    assert_eq!(
+        harness.backend.proofs_imported_count() - initial_proof_imports,
+        3
     );
     harness.stop().await;
 }

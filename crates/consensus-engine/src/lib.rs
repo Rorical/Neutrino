@@ -6,8 +6,9 @@
 //! The engine executes and proves blocks, collects chunk BFT certificates,
 //! and atomically installs complete consensus proof transitions.
 
+pub mod availability;
 pub mod bft_loop;
-pub mod block_state;
+mod block_state;
 mod bls_verdicts;
 pub mod body;
 pub mod bootstrap;

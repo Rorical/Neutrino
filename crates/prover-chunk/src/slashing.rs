@@ -7,9 +7,82 @@ use neutrino_consensus_types::{
     BlockProof, FinalityVoteData, FinalityVotePhase, IndexedVote, LockEvidence, QuorumCertificate,
     VoteAttestation,
 };
-use neutrino_primitives::{ConsensusParams, DOMAIN_PRECOMMIT, DOMAIN_PREVOTE, Validator};
+use neutrino_primitives::{ConsensusParams, Validator};
 
 use crate::execution::commitment;
+
+/// Authenticate exact same-round, same-phase nil/value equivocation.
+pub fn verify_conflicting_nil_vote_using(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    index: u32,
+    value: &IndexedVote,
+    nil: &neutrino_consensus_types::IndexedNilVote,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
+    if value.data.chunk_id != nil.data.chunk_id
+        || value.data.round != nil.data.round
+        || value.data.phase != nil.data.phase
+    {
+        return Err(EvidenceError::Binding);
+    }
+    let validator = validators
+        .get(index as usize)
+        .filter(|validator| !validator.slashed && validator.effective_stake > 0)
+        .ok_or(EvidenceError::Binding)?;
+    verify_indexed_vote_using(domain, validators, index, value, verifier)?;
+    if !verifier.verify(
+        &validator.pubkey,
+        &nil.data.signing_message(domain),
+        &nil.signature,
+    ) {
+        return Err(EvidenceError::Signature);
+    }
+    Ok(())
+}
+
+/// Authenticate designated-leader equivocation without assuming either carried
+/// unlock QC is valid. The signed conflicting target alone establishes guilt.
+pub fn verify_double_bft_proposal_using(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    index: u32,
+    first: &neutrino_consensus_types::BftProposal,
+    second: &neutrino_consensus_types::BftProposal,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
+    if first.chunk.chunk_id != second.chunk.chunk_id
+        || first.round != second.round
+        || first.proposer_index != index
+        || second.proposer_index != index
+        || first.chunk.hash() == second.chunk.hash()
+        || neutrino_consensus_types::bft_leader(
+            domain.chain_id,
+            first.chunk.chunk_id,
+            first.round,
+            validators,
+        ) != Some(index)
+        || first.chunk.active_validator_set_root != commitment(validators)
+        || second.chunk.active_validator_set_root != commitment(validators)
+    {
+        return Err(EvidenceError::Binding);
+    }
+    let validator = validators
+        .get(index as usize)
+        .ok_or(EvidenceError::Binding)?;
+    if !verifier.verify(
+        &validator.pubkey,
+        &first.signing_message(domain),
+        &first.signature,
+    ) || !verifier.verify(
+        &validator.pubkey,
+        &second.signing_message(domain),
+        &second.signature,
+    ) {
+        return Err(EvidenceError::Signature);
+    }
+    Ok(())
+}
 
 /// Evidence failed authentication or does not establish a violation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,14 +99,14 @@ pub enum EvidenceError {
 
 /// Verify the exact signed acceptance/unlock statement.
 pub fn verify_attestation(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     index: u32,
     vote: &FinalityVoteData,
     attestation: &VoteAttestation,
 ) -> Result<(), EvidenceError> {
     verify_attestation_using(
-        chain_id,
+        domain,
         validators,
         index,
         vote,
@@ -44,7 +117,7 @@ pub fn verify_attestation(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_attestation_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     index: u32,
     vote: &FinalityVoteData,
@@ -55,7 +128,7 @@ pub fn verify_attestation_using(
         return Err(EvidenceError::Binding);
     }
     verify_indexed_vote_using(
-        chain_id,
+        domain,
         validators,
         index,
         &attestation.indexed_vote(),
@@ -66,7 +139,7 @@ pub fn verify_attestation_using(
         .ok_or(EvidenceError::Binding)?;
     if !verifier.verify(
         &validator.pubkey,
-        &attestation.signing_message(chain_id),
+        &attestation.signing_message(domain),
         &attestation.signature,
     ) {
         return Err(EvidenceError::Signature);
@@ -100,13 +173,13 @@ pub fn verify_proof_acceptance(
 
 /// Verify an individual finality vote under its chain and phase domains.
 pub fn verify_indexed_vote(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     index: u32,
     vote: &IndexedVote,
 ) -> Result<(), EvidenceError> {
     verify_indexed_vote_using(
-        chain_id,
+        domain,
         validators,
         index,
         vote,
@@ -116,7 +189,7 @@ pub fn verify_indexed_vote(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_indexed_vote_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     index: u32,
     vote: &IndexedVote,
@@ -127,7 +200,7 @@ pub fn verify_indexed_vote_using(
         .ok_or(EvidenceError::Binding)?;
     if !verifier.verify(
         &key.pubkey,
-        &vote_message(chain_id, &vote.data),
+        &vote_message(domain, &vote.data),
         &vote.signature,
     ) {
         return Err(EvidenceError::Signature);
@@ -137,13 +210,13 @@ pub fn verify_indexed_vote_using(
 
 /// Verify a weighted prevote quorum, rejecting inactive signers and overflow.
 pub fn verify_quorum(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     quorum: &QuorumCertificate,
     fraction: (u64, u64),
 ) -> Result<(), EvidenceError> {
     verify_quorum_using(
-        chain_id,
+        domain,
         validators,
         quorum,
         fraction,
@@ -153,7 +226,7 @@ pub fn verify_quorum(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_quorum_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     quorum: &QuorumCertificate,
     fraction: (u64, u64),
@@ -201,7 +274,7 @@ pub fn verify_quorum_using(
     }
     if !verifier.aggregate(
         &keys,
-        &vote_message(chain_id, &quorum.data),
+        &vote_message(domain, &quorum.data),
         &quorum.aggregate.signature,
     ) {
         return Err(EvidenceError::Signature);
@@ -211,17 +284,14 @@ pub fn verify_quorum_using(
 
 /// Authenticate a carried prevote quorum as an unlock declaration for this vote.
 pub fn verify_unlock_quorum(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     vote: &FinalityVoteData,
     unlock: &QuorumCertificate,
     params: &ConsensusParams,
 ) -> Result<(), EvidenceError> {
-    if vote.round > params.bft_max_round {
-        return Err(EvidenceError::Binding);
-    }
     verify_unlock_using(
-        chain_id,
+        domain,
         validators,
         vote,
         unlock,
@@ -239,7 +309,7 @@ pub fn verify_unlock_quorum(
 /// authorizing the very quorum it helps create. Precommits may use their current
 /// round's prevote quorum. The caller separately enforces any earlier local lock.
 pub fn verify_unlock_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     vote: &FinalityVoteData,
     unlock: &QuorumCertificate,
@@ -255,13 +325,13 @@ pub fn verify_unlock_using(
     {
         return Err(EvidenceError::Binding);
     }
-    verify_quorum_using(chain_id, validators, unlock, quorum, verifier)
+    verify_quorum_using(domain, validators, unlock, quorum, verifier)
 }
 
 /// Prove a conflicting later vote has an explicitly signed invalid unlock.
 /// Missing network observations never enter this decision.
 pub fn verify_lock_violation(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     index: u32,
     votes: (&IndexedVote, &IndexedVote),
@@ -269,7 +339,7 @@ pub fn verify_lock_violation(
     quorum: (u64, u64),
 ) -> Result<(), EvidenceError> {
     verify_lock_violation_using(
-        chain_id,
+        domain,
         validators,
         index,
         votes,
@@ -281,7 +351,7 @@ pub fn verify_lock_violation(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_lock_violation_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     index: u32,
     votes: (&IndexedVote, &IndexedVote),
@@ -297,10 +367,10 @@ pub fn verify_lock_violation_using(
     {
         return Err(EvidenceError::Binding);
     }
-    verify_indexed_vote_using(chain_id, validators, index, first, verifier)?;
-    verify_indexed_vote_using(chain_id, validators, index, later, verifier)?;
+    verify_indexed_vote_using(domain, validators, index, first, verifier)?;
+    verify_indexed_vote_using(domain, validators, index, later, verifier)?;
     verify_attestation_using(
-        chain_id,
+        domain,
         validators,
         index,
         &later.data,
@@ -314,50 +384,44 @@ pub fn verify_lock_violation_using(
     {
         return Err(EvidenceError::Binding);
     }
-    verify_quorum_using(chain_id, validators, locked, quorum, verifier)?;
+    verify_quorum_using(domain, validators, locked, quorum, verifier)?;
     if let Some(unlock) = &evidence.attestation.unlock_quorum
         && unlock.data.round > first.data.round
-        && verify_unlock_using(chain_id, validators, &later.data, unlock, quorum, verifier).is_ok()
+        && verify_unlock_using(domain, validators, &later.data, unlock, quorum, verifier).is_ok()
     {
         return Err(EvidenceError::HonestUnlock);
     }
     Ok(())
 }
 
-pub(crate) fn vote_message(chain_id: u64, data: &FinalityVoteData) -> alloc::vec::Vec<u8> {
-    let domain = match data.phase {
-        FinalityVotePhase::Prevote => DOMAIN_PREVOTE,
-        FinalityVotePhase::Precommit => DOMAIN_PRECOMMIT,
-    };
-    let mut bytes = alloc::vec::Vec::from(domain);
-    bytes.extend_from_slice(&chain_id.to_le_bytes());
-    bytes.extend_from_slice(&borsh::to_vec(data).expect("canonical vote"));
-    bytes
+pub(crate) fn vote_message(
+    domain: neutrino_primitives::ConsensusDomain,
+    data: &FinalityVoteData,
+) -> alloc::vec::Vec<u8> {
+    data.signing_message(domain)
 }
 
 /// Message authenticating publication of an exact DA bundle for one header.
 pub fn da_publication_message(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     header_hash: &[u8; 32],
     bundle_hash: &[u8; 32],
 ) -> alloc::vec::Vec<u8> {
-    let mut bytes = alloc::vec::Vec::from(neutrino_primitives::DOMAIN_DA_PUBLICATION);
-    bytes.extend_from_slice(&chain_id.to_le_bytes());
-    bytes.extend_from_slice(header_hash);
-    bytes.extend_from_slice(bundle_hash);
-    bytes
+    let mut payload = alloc::vec::Vec::from(*header_hash);
+    payload.extend_from_slice(bundle_hash);
+    domain.signing_message(neutrino_primitives::DOMAIN_DA_PUBLICATION, &payload)
 }
 
 /// Authenticate a mismatching full-body DA publication by the header signer.
 /// This proves commitment fraud, not data availability or censorship.
 pub fn verify_da_fraud(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     header: &neutrino_consensus_types::Header,
     fraud: &neutrino_consensus_types::DaFraudProof,
 ) -> Result<(), EvidenceError> {
     verify_da_fraud_using(
-        chain_id,
+        domain,
         validators,
         header,
         fraud,
@@ -367,13 +431,13 @@ pub fn verify_da_fraud(
 
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_da_fraud_using(
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     header: &neutrino_consensus_types::Header,
     fraud: &neutrino_consensus_types::DaFraudProof,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
-    crate::proposer::verify_header_signature_using(header, chain_id, validators, verifier)
+    crate::proposer::verify_header_signature_using(header, domain, validators, verifier)
         .map_err(|_| EvidenceError::Signature)?;
     let validator = validators
         .get(header.proposer_index as usize)
@@ -384,7 +448,7 @@ pub fn verify_da_fraud_using(
     }
     if !verifier.verify(
         &validator.pubkey,
-        &da_publication_message(chain_id, &header.hash(), &hash),
+        &da_publication_message(domain, &header.hash(), &hash),
         &fraud.publication_signature,
     ) {
         return Err(EvidenceError::Signature);

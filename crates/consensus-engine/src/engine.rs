@@ -784,8 +784,12 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<Option<SlashingEvidence>, SlashingError> {
         let source_chunk = self.accountability_chunk_for_height(header.height)?;
         let (validators, _) = self.accountability_header_context(header)?;
-        crate::signature::verify_header_signature(header, &validators, self.chain_spec().chain_id)
-            .map_err(slashing_signature_to_slashing_err)?;
+        crate::signature::verify_header_signature(
+            header,
+            &validators,
+            self.chain_spec().consensus_domain(),
+        )
+        .map_err(slashing_signature_to_slashing_err)?;
         self.retain_accountability_observations();
         Ok(self.slashing_monitor.record_header(source_chunk, header))
     }
@@ -925,11 +929,8 @@ impl<DB: Database> Engine<DB> {
         quorum: &neutrino_consensus_types::QuorumCertificate,
     ) -> Result<(), neutrino_prover_chunk::slashing::EvidenceError> {
         let params = &self.chain_spec().consensus;
-        if vote.round > params.bft_max_round {
-            return Err(neutrino_prover_chunk::slashing::EvidenceError::Binding);
-        }
         neutrino_prover_chunk::slashing::verify_unlock_using(
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
             validators,
             vote,
             quorum,
@@ -941,7 +942,7 @@ impl<DB: Database> Engine<DB> {
         )
     }
 
-    fn accountability_validators(
+    pub(crate) fn accountability_validators(
         &self,
         chunk_id: ChunkId,
     ) -> Result<alloc::vec::Vec<Validator>, SlashingError> {
@@ -1007,7 +1008,7 @@ impl<DB: Database> Engine<DB> {
             return Ok(alloc::vec![vote.clone()]);
         }
         neutrino_prover_chunk::finality::verify_vote_signatures_using(
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
             &validators,
             vote,
             &self.chain_spec().consensus,
@@ -1040,7 +1041,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
         let validators = self.accountability_validators(chunk.chunk_id)?;
         neutrino_prover_chunk::finality::verify_finality_using(
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
             &self.chain_spec().consensus,
             &validators,
             chunk,
@@ -1118,7 +1119,7 @@ impl<DB: Database> Engine<DB> {
             signer,
             &indexed,
             &validators,
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
         )?;
         self.retain_accountability_observations();
         for attestation in &vote.attestations {
@@ -1127,7 +1128,7 @@ impl<DB: Database> Engine<DB> {
                 signer,
                 &indexed.data,
                 &validators,
-                self.chain_spec().chain_id,
+                self.chain_spec().consensus_domain(),
                 &mut *self.bls_verifier.borrow_mut(),
             )
             .is_ok()
@@ -1136,7 +1137,7 @@ impl<DB: Database> Engine<DB> {
                     && quorum.data.chunk_id == indexed.data.chunk_id
                     && quorum.data.round <= indexed.data.round
                     && neutrino_prover_chunk::slashing::verify_quorum_using(
-                        self.chain_spec().chain_id,
+                        self.chain_spec().consensus_domain(),
                         &validators,
                         quorum,
                         (
@@ -1202,7 +1203,7 @@ impl<DB: Database> Engine<DB> {
             signer,
             &indexed,
             &validators,
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
         )?;
 
         // Explicit proof-acceptance detection only applies to precommit phase
@@ -1245,7 +1246,7 @@ impl<DB: Database> Engine<DB> {
                         signer,
                         &indexed.data,
                         &validators,
-                        self.chain_spec().chain_id,
+                        self.chain_spec().consensus_domain(),
                         &mut *self.bls_verifier.borrow_mut(),
                     )
                     .is_ok()
@@ -1331,7 +1332,7 @@ impl<DB: Database> Engine<DB> {
                     vote_a,
                     vote_b,
                     &self.accountability_validators(vote_a.data.chunk_id)?,
-                    self.chain_spec().chain_id,
+                    self.chain_spec().consensus_domain(),
                 )
             }
             SlashingEvidence::InvalidVrfClaim {
@@ -1339,6 +1340,16 @@ impl<DB: Database> Engine<DB> {
                 header,
                 reason,
             } => self.verify_historical_invalid_vrf(*proposer_index, header, *reason),
+            SlashingEvidence::ConflictingNilVote {
+                validator_index,
+                value_vote,
+                nil_vote,
+            } => self.verify_bft_nil_conflict(*validator_index, value_vote, nil_vote),
+            SlashingEvidence::DoubleBftProposal {
+                proposer_index,
+                proposal_a,
+                proposal_b,
+            } => self.verify_bft_leader_conflict(*proposer_index, proposal_a, proposal_b),
             SlashingEvidence::LockViolation {
                 validator_index,
                 vote_a,
@@ -1350,7 +1361,7 @@ impl<DB: Database> Engine<DB> {
                 vote_b,
                 lock_evidence,
                 &self.accountability_validators(vote_a.data.chunk_id)?,
-                self.chain_spec().chain_id,
+                self.chain_spec().consensus_domain(),
                 (
                     self.chain_spec().consensus.bft_prevote_quorum_numerator,
                     self.chain_spec().consensus.bft_prevote_quorum_denominator,
@@ -1368,7 +1379,7 @@ impl<DB: Database> Engine<DB> {
                 attestation,
                 rejected_proof,
                 &self.accountability_validators(vote.data.chunk_id)?,
-                self.chain_spec().chain_id,
+                self.chain_spec().consensus_domain(),
                 self.chain_spec().consensus.chunk_size,
             ),
             SlashingEvidence::LongRangeForkParticipation {
@@ -1399,7 +1410,7 @@ impl<DB: Database> Engine<DB> {
             header_a,
             header_b,
             &self.accountability_header_context(header_a)?.0,
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
         )
     }
 
@@ -1415,7 +1426,7 @@ impl<DB: Database> Engine<DB> {
             header,
             reason,
             &validators,
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
             &seed,
             self.chain_spec().consensus.expected_proposers_per_slot,
         )
@@ -1431,7 +1442,7 @@ impl<DB: Database> Engine<DB> {
             return Err(SlashingError::EvidenceFieldsInconsistent);
         }
         neutrino_prover_chunk::slashing::verify_da_fraud(
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
             &self.accountability_header_context(header)?.0,
             header,
             fraud,
@@ -1460,7 +1471,7 @@ impl<DB: Database> Engine<DB> {
             canonical_vote,
             Some(&record.chunk),
             &record.validators,
-            self.chain_spec().chain_id,
+            self.chain_spec().consensus_domain(),
         )
     }
 }
@@ -1555,13 +1566,14 @@ mod tests {
         let signatures: Vec<_> = keys
             .iter()
             .map(|key| {
-                Signature::from_bytes(&key.sign_finality_vote(spec.chain_id, &data)).unwrap()
+                Signature::from_bytes(&key.sign_finality_vote(spec.consensus_domain(), &data))
+                    .unwrap()
             })
             .collect();
         let vote = FinalityVote {
             attestations: keys
                 .iter()
-                .map(|key| key.attest_vote(spec.chain_id, data.clone(), Vec::new(), None))
+                .map(|key| key.attest_vote(spec.consensus_domain(), data.clone(), Vec::new(), None))
                 .collect(),
             data,
             aggregation_bits: neutrino_primitives::BitVec::from_bytes(2, vec![3]).unwrap(),

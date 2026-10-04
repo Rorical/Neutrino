@@ -83,7 +83,7 @@ where
                     |record| record.validators,
                 );
             neutrino_prover_chunk::facts::vote_requests(
-                engine.chain_spec().chain_id,
+                engine.chain_spec().consensus_domain(),
                 &validators,
                 vote,
             )
@@ -112,7 +112,7 @@ where
                 )
             });
             neutrino_prover_chunk::facts::header_requests(
-                engine.chain_spec().chain_id,
+                engine.chain_spec().consensus_domain(),
                 &validators,
                 &seed,
                 header,

@@ -3,7 +3,12 @@ use neutrino_consensus_types::{
     AggregatedVote, FinalityVote, FinalityVoteData, FinalityVotePhase, QuorumCertificate,
 };
 use neutrino_crypto::bls::{SecretKey, aggregate_signatures};
-use neutrino_primitives::{BitVec, ConsensusParams, Validator};
+use neutrino_primitives::{BitVec, ConsensusDomain, ConsensusParams, Validator};
+
+const DOMAIN: ConsensusDomain = ConsensusDomain {
+    chain_id: 7,
+    chain_spec_hash: [9; 32],
+};
 
 fn secret(index: u8) -> SecretKey {
     SecretKey::key_gen(&[42 + index; 32], &[]).unwrap()
@@ -31,14 +36,18 @@ fn vote() -> FinalityVote {
         phase: FinalityVotePhase::Prevote,
     };
     let signatures: Vec<_> = (0..2)
-        .map(|index| secret(index).sign(&crate::slashing::finality_vote_signed_message(7, &data)))
+        .map(|index| {
+            secret(index).sign(&crate::slashing::finality_vote_signed_message(
+                DOMAIN, &data,
+            ))
+        })
         .collect();
     FinalityVote {
         attestations: (0..2)
             .map(|index| {
                 crate::ProposerKey::from_ikm(&[42 + index; 32], u32::from(index))
                     .unwrap()
-                    .attest_vote(7, data.clone(), Vec::new(), None)
+                    .attest_vote(DOMAIN, data.clone(), Vec::new(), None)
             })
             .collect(),
         data,
@@ -172,7 +181,7 @@ fn cached_signatures_recheck_coverage_active_membership_and_all_signed_fields() 
     let check =
         |validators: &[Validator], vote: &FinalityVote, verifier: &mut NativeBlsVerifier| {
             neutrino_prover_chunk::finality::verify_vote_signatures_using(
-                7, validators, vote, &params, verifier,
+                DOMAIN, validators, vote, &params, verifier,
             )
         };
     check(&validators, &vote, &mut verifier).unwrap();
@@ -201,7 +210,10 @@ fn cached_signatures_recheck_coverage_active_membership_and_all_signed_fields() 
     assert!(check(&validators, &altered, &mut verifier).is_err());
     assert!(
         neutrino_prover_chunk::finality::verify_vote_signatures_using(
-            8,
+            ConsensusDomain {
+                chain_id: 8,
+                ..DOMAIN
+            },
             &validators,
             &vote,
             &params,
@@ -233,31 +245,37 @@ fn cached_quorums_recheck_stake_threshold_and_strict_unlock_target_and_round() {
         },
     };
     let mut verifier = NativeBlsVerifier::default();
-    verify_quorum_using(7, &validators, &quorum, (2, 3), &mut verifier).unwrap();
+    verify_quorum_using(DOMAIN, &validators, &quorum, (2, 3), &mut verifier).unwrap();
     let mut target = quorum.data.clone();
     target.round += 1;
-    verify_unlock_using(7, &validators, &target, &quorum, (2, 3), &mut verifier).unwrap();
+    verify_unlock_using(DOMAIN, &validators, &target, &quorum, (2, 3), &mut verifier).unwrap();
     assert_eq!(verifier.checks, 1);
-    assert!(verify_quorum_using(7, &validators, &quorum, (1, 1), &mut verifier).is_err());
+    assert!(verify_quorum_using(DOMAIN, &validators, &quorum, (1, 1), &mut verifier).is_err());
     let mut heavier = validators.clone();
     heavier[2].effective_stake = 10;
-    assert!(verify_quorum_using(7, &heavier, &quorum, (2, 3), &mut verifier).is_err());
+    assert!(verify_quorum_using(DOMAIN, &heavier, &quorum, (2, 3), &mut verifier).is_err());
     for slashed in [false, true] {
         let mut inactive = validators.clone();
         inactive[0].slashed = slashed;
         if !slashed {
             inactive[0].effective_stake = 0;
         }
-        assert!(verify_quorum_using(7, &inactive, &quorum, (2, 3), &mut verifier).is_err());
+        assert!(verify_quorum_using(DOMAIN, &inactive, &quorum, (2, 3), &mut verifier).is_err());
     }
     target.round = quorum.data.round;
-    assert!(verify_unlock_using(7, &validators, &target, &quorum, (2, 3), &mut verifier).is_err());
+    assert!(
+        verify_unlock_using(DOMAIN, &validators, &target, &quorum, (2, 3), &mut verifier).is_err()
+    );
     target.round += 1;
     target.chunk_hash[0] ^= 1;
-    assert!(verify_unlock_using(7, &validators, &target, &quorum, (2, 3), &mut verifier).is_err());
+    assert!(
+        verify_unlock_using(DOMAIN, &validators, &target, &quorum, (2, 3), &mut verifier).is_err()
+    );
     target.chunk_hash = quorum.data.chunk_hash;
     target.chunk_id += 1;
-    assert!(verify_unlock_using(7, &validators, &target, &quorum, (2, 3), &mut verifier).is_err());
+    assert!(
+        verify_unlock_using(DOMAIN, &validators, &target, &quorum, (2, 3), &mut verifier).is_err()
+    );
     assert_eq!(
         verifier.checks, 1,
         "cached positive cannot bypass policy rejection"

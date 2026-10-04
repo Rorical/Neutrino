@@ -96,6 +96,16 @@ impl Database for MemoryDatabase {
         }))
     }
 
+    fn iter_prefix(&self, column: Column, prefix: &[u8]) -> Result<ColumnSnapshot, Self::Error> {
+        Ok(self.columns.get(&column).map_or_else(Vec::new, |values| {
+            values
+                .range(prefix.to_vec()..)
+                .take_while(|(key, _)| key.starts_with(prefix))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }))
+    }
+
     fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
         self.write_batch(batch)
     }

@@ -153,7 +153,7 @@ fn authenticate_history(
         .map_err(|_| ProofError::InvalidWitness)?;
     for opening in recent {
         neutrino_prover_chunk::finality::verify_finality(
-            spec.chain_id,
+            spec.consensus_domain(),
             &spec.consensus,
             &opening.record.validators,
             &opening.record.chunk,
@@ -169,7 +169,7 @@ fn authenticate_history(
     {
         return Err(ProofError::PublicInputMismatch);
     }
-    crate::verify_header_signature(header, &last.record.validators, spec.chain_id)
+    crate::verify_header_signature(header, &last.record.validators, spec.consensus_domain())
         .map_err(|_| ProofError::InvalidWitness)?;
     Ok(())
 }

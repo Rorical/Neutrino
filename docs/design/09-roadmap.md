@@ -35,17 +35,22 @@ target, authenticates earlier unlock quorums before conflicting prevotes, preser
 both phases' signed attestations and resumes the exact persisted transition.
 Candidate gossip/RPC backfills fixed branches, and proof-task commit checks bind
 the exact candidate, round and certificate identity.
+The [BFT protocol](22-bft-candidate-replacement.md) now includes fair round leaders,
+signed proposals, nil votes, phase deadlines and authenticated round-change
+quorums. Certified proposals and highest-valid targets recover through bounded
+P2P backfill. Eventual convergence assumes partial synchrony, a valid proven
+candidate, and responsive honest stake satisfying both configured quorum thresholds.
+The [signed-source availability protocol](23-evidence-availability.md) persists
+exact artifacts before local publication, retrieves inventories and exact receipt
+hashes, and replays late sources against retained prior votes and lock quorums.
+Optional forensic-cache exhaustion does not gate live consensus. These bounded
+retention rules do not establish erasure-coded DA or guarantee detection of evidence
+that no participant ever publishes.
 
 Outstanding work:
 
-- Complete the round-leader, nil-vote and pacemaker protocol if guaranteed eventual
-  convergence under adversarial competing proposals is required. Candidate
-  replacement now enforces safety and allows convergence after nodes share a
-  proven fork choice; it does not claim that stronger liveness guarantee.
-
 - Measure and bound real proving cost, including statement recursion, objective
   block-proof rejection, larger validator sets and sustained multi-chunk operation.
-- Strengthen signed-artifact publication/retrieval, archival and late-arrival detection.
 - Define erasure-coded DA and sampling if availability guarantees are required.
 - Complete operator tooling, key management, metrics, RPC resource controls,
   managed snapshot export/distribution and runtime-upgrade coordination.

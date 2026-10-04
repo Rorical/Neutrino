@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProposerKey};
-use neutrino_consensus_types::{FinalityVote, FinalityVotePhase};
+use neutrino_consensus_types::{BftVote, FinalityVotePhase};
 use neutrino_network::libp2p::gossipsub::MessageAcceptance;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
@@ -216,8 +216,10 @@ fn omit_finality_gossip(event: &NetworkEvent) -> bool {
             topic: Topic::AggregateFinalityVotes(_),
             data,
             ..
-        } => borsh::from_slice::<FinalityVote>(data)
-            .is_ok_and(|vote| vote.data.phase == FinalityVotePhase::Precommit),
+        } => borsh::from_slice::<BftVote>(data).is_ok_and(|vote| match vote {
+            BftVote::Value(vote) => vote.data.phase == FinalityVotePhase::Precommit,
+            BftVote::Nil(vote) => vote.data.phase == FinalityVotePhase::Precommit,
+        }),
         _ => false,
     }
 }

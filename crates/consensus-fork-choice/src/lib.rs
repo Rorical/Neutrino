@@ -450,6 +450,14 @@ mod tests {
 
     fn cert(chunk: &Chunk) -> FinalityCert {
         FinalityCert {
+            proposal: neutrino_consensus_types::BftProposal {
+                chunk: chunk.clone(),
+                round: 0,
+                proposer_index: 0,
+                valid_quorum: None,
+                round_change_certificate: None,
+                signature: [0; 96],
+            },
             prevote_attestations: Vec::new(),
             precommit_attestations: Vec::new(),
             chunk_id: chunk.chunk_id,

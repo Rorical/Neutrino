@@ -4,6 +4,13 @@ The consensus chunk Guest recursively verifies each compressed block proof again
 the pinned block program and exact public values, then validates the complete
 execution/consensus transition. Native and Guest paths share `prover-chunk` logic.
 
+All Guest consensus signature requests derive `ConsensusDomain` from the
+complete supplied and authenticated `ChainSpec`, using
+`tag || chain_id LE8 || ChainSpecHash32 || payload`. Native verification uses
+the identical typed domain. Recursively authenticated Fact verdicts bind these
+exact bytes, so a valid verdict from another spec cannot satisfy this Guest's
+request even when the chain ID and BLS keys are equal.
+
 The verifier supplies the trusted chain specification and incoming context:
 parent hash/state, active validators, seed and the authenticated history root.
 The proof cannot establish the canonicality of an arbitrary starting anchor.
@@ -20,21 +27,33 @@ lanes authenticate DA contents without the complete transaction body. Chunk root
 use canonical ordered block, public-input, VRF and DA leaves. DA commitment does
 not prove physical availability.
 
-The Guest verifies both BFT quorum certificates, stake weights, signer membership,
+The Guest verifies the mandatory signed round-leader proposal against the
+authenticated incoming validator set. Every nonzero proposal round carries a
+valid weighted round-change certificate bound into the leader signature; the
+proposal cannot ignore or downgrade its highest valid QC. The proposal's exact
+chunk and round must match the finality certificate. These checks are recursive
+consensus rules rather than host-only pacemaker assertions.
+
+The Guest verifies both value BFT quorum certificates, stake weights, signer membership,
 domain/chain/round/chunk binding and mandatory attestation coverage for both phases.
 Attestations retain individually signed votes and signed unlock claims; precommits
 add exact ordered proof-envelope hashes. Carried quorums are independently checked
 against the authenticated active set and configured threshold. A prevote cannot
 carry its current round's quorum as an unlock; a precommit may carry that quorum.
 Earlier local locks are proven by objective evidence rather than inferred from
-missing observations. It derives validator activation/exit/stake changes from
+missing observations. Explicit nil votes advance unsuccessful live phases but
+cannot finalize a chunk or erase a value lock. Nil/value equivocation and conflicting
+leader-proposal evidence is proven through the separate Evidence Guest path. The Chunk Guest
+derives validator activation/exit/stake changes from
 authenticated runtime state, verifies registrations, consumes block-proven sanctions,
 and commits the next validator root, seed and history root in a compact boundary.
 The full next context is retained by the node. Sanction replay protection is owned
 by permanent Block STF offence markers; Chunk has no duplicate penalty ledger.
 
 Historical commitments exclude certificate signer subsets; alternative valid quorum
-certificates cannot produce different history roots. Evidence validity is proved by
+certificates cannot produce different history roots. The block-proof root commits
+canonical public inputs, not receipt bytes; different valid receipt encodings
+cannot change the BFT candidate hash. Evidence validity is proved by
 the independent Guest and its statements are authenticated through block recursion. The chunk never
 reverifies an evidence receipt or the underlying offence.
 

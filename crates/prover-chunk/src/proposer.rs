@@ -1,6 +1,5 @@
 //! Guest-compatible proposer signature and VRF validation.
 
-use alloc::vec::Vec;
 use neutrino_consensus_types::Header;
 use neutrino_primitives::{DOMAIN_PROPOSER_SIG, FixedU128, Seed, Validator};
 use neutrino_vrf::{is_eligible, vrf_message};
@@ -22,14 +21,14 @@ pub enum ProposerError {
 /// Verify the proposer signature and the BLS-VRF claim inside a guest.
 pub fn verify_proposer(
     header: &Header,
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     seed: &Seed,
     expected_proposers: FixedU128,
 ) -> Result<(), ProposerError> {
     verify_proposer_using(
         header,
-        chain_id,
+        domain,
         validators,
         seed,
         expected_proposers,
@@ -40,13 +39,13 @@ pub fn verify_proposer(
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_proposer_using(
     header: &Header,
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     seed: &Seed,
     expected_proposers: FixedU128,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), ProposerError> {
-    verify_header_signature_using(header, chain_id, validators, verifier)?;
+    verify_header_signature_using(header, domain, validators, verifier)?;
     let validator = usize::try_from(header.proposer_index)
         .ok()
         .and_then(|index| validators.get(index))
@@ -63,7 +62,7 @@ pub fn verify_proposer_using(
         })
         .filter(|stake| *stake > 0)
         .ok_or(ProposerError::Validator)?;
-    let vrf_message = vrf_message(chain_id, seed, header.slot);
+    let vrf_message = vrf_message(domain, seed, header.slot);
     if !verifier.verify(&validator.pubkey, &vrf_message, &header.vrf_proof) {
         return Err(ProposerError::Vrf);
     }
@@ -82,12 +81,12 @@ pub fn verify_proposer_using(
 /// Authenticate a header without assuming its VRF claim is valid.
 pub fn verify_header_signature(
     header: &Header,
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
 ) -> Result<(), ProposerError> {
     verify_header_signature_using(
         header,
-        chain_id,
+        domain,
         validators,
         &mut crate::bls::DirectVerifier::default(),
     )
@@ -96,7 +95,7 @@ pub fn verify_header_signature(
 /// Verification with a shared key cache or an authenticated fact source.
 pub fn verify_header_signature_using(
     header: &Header,
-    chain_id: u64,
+    domain: neutrino_primitives::ConsensusDomain,
     validators: &[Validator],
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), ProposerError> {
@@ -104,9 +103,7 @@ pub fn verify_header_signature_using(
         .get(header.proposer_index as usize)
         .filter(|validator| !validator.slashed && validator.effective_stake > 0)
         .ok_or(ProposerError::Validator)?;
-    let mut message = Vec::from(DOMAIN_PROPOSER_SIG);
-    message.extend_from_slice(&chain_id.to_le_bytes());
-    message.extend_from_slice(&header.hash());
+    let message = domain.signing_message(DOMAIN_PROPOSER_SIG, &header.hash());
     if !verifier.verify(&validator.pubkey, &message, &header.signature) {
         return Err(ProposerError::Signature);
     }

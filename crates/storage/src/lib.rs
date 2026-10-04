@@ -71,4 +71,16 @@ pub trait Database {
     /// keeping internal iterators alive across other database
     /// operations.
     fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error>;
+
+    /// Snapshot only keys beginning with `prefix`.
+    ///
+    /// Persistent backends should seek directly to the prefix. The default is
+    /// suitable for small custom test backends; ordinary backends override it.
+    fn iter_prefix(&self, column: Column, prefix: &[u8]) -> Result<ColumnSnapshot, Self::Error> {
+        Ok(self
+            .iter_column(column)?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .collect())
+    }
 }

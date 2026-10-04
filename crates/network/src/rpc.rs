@@ -66,6 +66,13 @@ pub const PROTOCOL_WITNESS_BY_BLOCK: &str = "/neutrino/req/witness_by_block";
 
 /// Current next-chunk candidate discovery protocol.
 pub const PROTOCOL_CANDIDATE_BY_CHUNK: &str = "/neutrino/req/candidate_by_chunk";
+/// Current SignedArtifactById RPC protocol.
+pub const PROTOCOL_SIGNED_ARTIFACT_BY_ID: &str = "/neutrino/req/signed_artifact_by_id";
+/// Current SignedArtifactInventoryByChunk RPC protocol.
+pub const PROTOCOL_SIGNED_ARTIFACT_INVENTORY_BY_CHUNK: &str =
+    "/neutrino/req/signed_artifact_inventory_by_chunk";
+/// Current BftRoundByChunk RPC protocol.
+pub const PROTOCOL_BFT_ROUND_BY_CHUNK: &str = "/neutrino/req/bft_round_by_chunk";
 
 /// Default maximum request payload size in bytes (1 MiB).
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
@@ -124,6 +131,12 @@ pub enum RpcProtocol {
     WitnessByBlock,
     /// Query a fully proven next-chunk candidate.
     CandidateByChunk,
+    /// Bounded current SignedArtifactById transport.
+    SignedArtifactById,
+    /// Bounded current SignedArtifactInventoryByChunk transport.
+    SignedArtifactInventoryByChunk,
+    /// Bounded current BftRoundByChunk transport.
+    BftRoundByChunk,
 }
 
 impl RpcProtocol {
@@ -145,6 +158,9 @@ impl RpcProtocol {
             Self::FinalityCertByChunk => PROTOCOL_FINALITY_CERT_BY_CHUNK,
             Self::WitnessByBlock => PROTOCOL_WITNESS_BY_BLOCK,
             Self::CandidateByChunk => PROTOCOL_CANDIDATE_BY_CHUNK,
+            Self::SignedArtifactById => PROTOCOL_SIGNED_ARTIFACT_BY_ID,
+            Self::SignedArtifactInventoryByChunk => PROTOCOL_SIGNED_ARTIFACT_INVENTORY_BY_CHUNK,
+            Self::BftRoundByChunk => PROTOCOL_BFT_ROUND_BY_CHUNK,
         }
     }
 
@@ -435,6 +451,73 @@ pub struct CandidateByChunkResponse {
     pub candidate: BftCandidate,
 }
 
+/// Retrieve one exact immutable source, including alternative proof encodings.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignedArtifactByIdRequest {
+    /// Exact canonical source identity.
+    pub id: Hash,
+}
+/// Exact bounded original source; receivers authenticate it independently.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Eq, PartialEq)]
+pub struct SignedArtifactByIdResponse {
+    /// Exact requested vote, quorum or block-proof envelope.
+    pub artifact: neutrino_consensus_types::signed_artifacts::SignedArtifact,
+}
+/// Paginate original sources for one authenticated source chunk.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignedArtifactInventoryByChunkRequest {
+    /// Source chunk; not an assertion of finality.
+    pub chunk_id: ChunkId,
+    /// Exclusive immutable content-hash cursor.
+    pub after: Option<Hash>,
+}
+/// At most 32 source references in immutable increasing order.
+pub type SignedArtifactInventoryByChunkResponse =
+    neutrino_consensus_types::signed_artifacts::SignedArtifactInventory;
+/// Fetch current signed leader and pacemaker information for a chunk.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BftRoundByChunkRequest {
+    /// Exact unfinalized consensus height.
+    pub chunk_id: ChunkId,
+}
+/// Availability response; all declarations require independent authentication.
+#[derive(BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct BftRoundByChunkResponse {
+    /// Current signed proposal, when available.
+    pub proposal: Option<neutrino_consensus_types::BftProposal>,
+    /// Independently signed higher-round catch-up certificate.
+    pub round_change: Option<neutrino_consensus_types::RoundChangeCertificate>,
+}
+
+impl BorshDeserialize for BftRoundByChunkResponse {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let proposal = match u8::deserialize_reader(reader)? {
+            0 => None,
+            1 => Some(neutrino_consensus_types::bft::read_proposal(reader)?),
+            _ => {
+                return Err(borsh::io::Error::new(
+                    borsh::io::ErrorKind::InvalidData,
+                    "proposal option",
+                ));
+            }
+        };
+        let round_change = match u8::deserialize_reader(reader)? {
+            0 => None,
+            1 => Some(neutrino_consensus_types::bft::read_round_change_certificate(reader)?),
+            _ => {
+                return Err(borsh::io::Error::new(
+                    borsh::io::ErrorKind::InvalidData,
+                    "round certificate option",
+                ));
+            }
+        };
+        Ok(Self {
+            proposal,
+            round_change,
+        })
+    }
+}
+
 /// Host-facing umbrella request enum used by the command surface.
 ///
 /// Never serialized to the wire — each variant maps to a different
@@ -469,6 +552,12 @@ pub enum RpcRequest {
     WitnessByBlock(WitnessByBlockRequest),
     /// Discover a proven candidate branch.
     CandidateByChunk(CandidateByChunkRequest),
+    /// Current SignedArtifactById request.
+    SignedArtifactById(SignedArtifactByIdRequest),
+    /// Current SignedArtifactInventoryByChunk request.
+    SignedArtifactInventoryByChunk(SignedArtifactInventoryByChunkRequest),
+    /// Current BftRoundByChunk request.
+    BftRoundByChunk(BftRoundByChunkRequest),
 }
 
 impl RpcRequest {
@@ -490,6 +579,9 @@ impl RpcRequest {
             Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
             Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
             Self::CandidateByChunk(_) => RpcProtocol::CandidateByChunk,
+            Self::SignedArtifactById(_) => RpcProtocol::SignedArtifactById,
+            Self::SignedArtifactInventoryByChunk(_) => RpcProtocol::SignedArtifactInventoryByChunk,
+            Self::BftRoundByChunk(_) => RpcProtocol::BftRoundByChunk,
         }
     }
 }
@@ -536,6 +628,12 @@ pub enum RpcResponse {
     WitnessByBlock(WitnessByBlockResponse),
     /// Candidate availability reply.
     CandidateByChunk(Box<CandidateByChunkResponse>),
+    /// Current SignedArtifactById response.
+    SignedArtifactById(Box<SignedArtifactByIdResponse>),
+    /// Current SignedArtifactInventoryByChunk response.
+    SignedArtifactInventoryByChunk(Box<SignedArtifactInventoryByChunkResponse>),
+    /// Current BftRoundByChunk response.
+    BftRoundByChunk(Box<BftRoundByChunkResponse>),
 }
 
 impl RpcResponse {
@@ -558,6 +656,9 @@ impl RpcResponse {
             Self::FinalityCertByChunk(_) => RpcProtocol::FinalityCertByChunk,
             Self::WitnessByBlock(_) => RpcProtocol::WitnessByBlock,
             Self::CandidateByChunk(_) => RpcProtocol::CandidateByChunk,
+            Self::SignedArtifactById(_) => RpcProtocol::SignedArtifactById,
+            Self::SignedArtifactInventoryByChunk(_) => RpcProtocol::SignedArtifactInventoryByChunk,
+            Self::BftRoundByChunk(_) => RpcProtocol::BftRoundByChunk,
         }
     }
 }
@@ -799,6 +900,25 @@ pub type WitnessByBlockBehaviour = request_response::Behaviour<WitnessByBlockCod
 /// Codec for bounded candidate discovery.
 pub type CandidateByChunkCodec =
     BorshCodec<CandidateByChunkRequest, RpcResult<CandidateByChunkResponse>>;
+/// Current SignedArtifactById bounded codec.
+pub type SignedArtifactByIdCodec =
+    BorshCodec<SignedArtifactByIdRequest, RpcResult<SignedArtifactByIdResponse>>;
+/// Current SignedArtifactById request/response behaviour.
+pub type SignedArtifactByIdBehaviour = request_response::Behaviour<SignedArtifactByIdCodec>;
+/// Current SignedArtifactInventoryByChunk bounded codec.
+pub type SignedArtifactInventoryByChunkCodec = BorshCodec<
+    SignedArtifactInventoryByChunkRequest,
+    RpcResult<SignedArtifactInventoryByChunkResponse>,
+>;
+/// Current SignedArtifactInventoryByChunk request/response behaviour.
+pub type SignedArtifactInventoryByChunkBehaviour =
+    request_response::Behaviour<SignedArtifactInventoryByChunkCodec>;
+/// Current BftRoundByChunk bounded codec.
+pub type BftRoundByChunkCodec =
+    BorshCodec<BftRoundByChunkRequest, RpcResult<BftRoundByChunkResponse>>;
+/// Current BftRoundByChunk request/response behaviour.
+pub type BftRoundByChunkBehaviour = request_response::Behaviour<BftRoundByChunkCodec>;
+
 /// Candidate request/response behaviour.
 pub type CandidateByChunkBehaviour = request_response::Behaviour<CandidateByChunkCodec>;
 

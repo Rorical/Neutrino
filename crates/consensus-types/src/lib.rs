@@ -6,20 +6,26 @@
 
 extern crate alloc;
 
+pub mod bft;
 pub mod bootstrap;
+pub use bft::{
+    BftMessage, BftProposal, BftVote, IndexedNilVote, NilVote, NilVoteAttestation, NilVoteData,
+    RoundChange, RoundChangeCertificate, bft_leader,
+};
 pub mod candidate;
 pub use candidate::BftCandidate;
 pub mod evidence;
 pub mod history;
 pub mod history_proof;
+pub mod signed_artifacts;
 pub use history_proof::{Checkpoint, HistoryProof, HistoryStatement};
 
 use alloc::vec::Vec;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
-    BitVec, BlockHash, BlsSignature, ChainId, ChunkHash, ChunkId, Hash, Height, Slot, StateRoot,
-    ValidatorIndex, blake3_256,
+    BitVec, BlockHash, BlsSignature, ChainId, ChunkHash, ChunkId, ConsensusDomain, Hash, Height,
+    Slot, StateRoot, ValidatorIndex, blake3_256,
 };
 
 /// Engine-canonical block header.
@@ -159,6 +165,18 @@ pub struct FinalityVoteData {
     pub phase: FinalityVotePhase,
 }
 
+impl FinalityVoteData {
+    /// Canonical phase-specific signature bytes bound to the complete chain spec.
+    #[must_use]
+    pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
+        let tag = match self.phase {
+            FinalityVotePhase::Prevote => neutrino_primitives::DOMAIN_PREVOTE,
+            FinalityVotePhase::Precommit => neutrino_primitives::DOMAIN_PRECOMMIT,
+        };
+        domain.signing_message(tag, &borsh::to_vec(self).expect("canonical finality vote"))
+    }
+}
+
 /// Aggregated finality vote.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct FinalityVote {
@@ -192,17 +210,16 @@ pub struct VoteAttestation {
     pub proof_hashes: Vec<Hash>,
     /// The signer's claimed unlock justification, including an explicit `None`.
     pub unlock_quorum: Option<QuorumCertificate>,
-    /// Signature under `DOMAIN_VOTE_ATTESTATION` and the chain ID.
+    /// Signature binding `DOMAIN_VOTE_ATTESTATION`, chain ID and complete chain-spec hash.
     pub signature: BlsSignature,
 }
 
 impl VoteAttestation {
     /// Canonical bytes signed by the validator (excluding the signature itself).
     #[must_use]
-    pub fn signing_message(&self, chain_id: u64) -> Vec<u8> {
-        let mut bytes = Vec::from(neutrino_primitives::DOMAIN_VOTE_ATTESTATION);
-        bytes.extend_from_slice(&chain_id.to_le_bytes());
-        bytes.extend_from_slice(
+    pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
+        domain.signing_message(
+            neutrino_primitives::DOMAIN_VOTE_ATTESTATION,
             &borsh::to_vec(&(
                 self.validator_index,
                 &self.vote,
@@ -211,8 +228,7 @@ impl VoteAttestation {
                 &self.unlock_quorum,
             ))
             .expect("canonical vote attestation"),
-        );
-        bytes
+        )
     }
 }
 
@@ -337,6 +353,8 @@ pub struct QuorumCertificate {
 /// Finality certificate proving prevote and precommit quorum for one chunk.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FinalityCert {
+    /// Exact authenticated round-leader proposal selected by both vote phases.
+    pub proposal: BftProposal,
     /// Complete per-signer prevote accountability statements.
     pub prevote_attestations: Vec<VoteAttestation>,
     /// Complete per-signer precommit accountability statements.
@@ -420,6 +438,24 @@ pub struct DaFraudProof {
 #[allow(clippy::large_enum_variant)]
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub enum SlashingEvidence {
+    /// A designated round leader signed distinct proposals for one chunk/round.
+    DoubleBftProposal {
+        /// Authenticated round leader index.
+        proposer_index: ValidatorIndex,
+        /// First independently signed proposal.
+        proposal_a: BftProposal,
+        /// Conflicting independently signed proposal.
+        proposal_b: BftProposal,
+    },
+    /// A value and an explicit nil vote signed for the same phase and round.
+    ConflictingNilVote {
+        /// Accountable signer in the authenticated source set.
+        validator_index: ValidatorIndex,
+        /// Independently signed value vote.
+        value_vote: IndexedVote,
+        /// Independently signed nil vote.
+        nil_vote: IndexedNilVote,
+    },
     /// Two distinct headers signed by the same proposer at the same slot.
     DoubleProposal {
         /// Offending proposer index.
@@ -782,6 +818,14 @@ mod tests {
     #[test]
     fn finality_cert_round_trips() {
         let cert = FinalityCert {
+            proposal: BftProposal {
+                chunk: chunk(),
+                round: 42,
+                proposer_index: 0,
+                valid_quorum: None,
+                round_change_certificate: None,
+                signature: sig(47),
+            },
             prevote_attestations: Vec::new(),
             precommit_attestations: Vec::new(),
             chunk_id: 41,
@@ -947,6 +991,14 @@ mod tests {
         };
         let chunk_proof = ChunkProof {
             finality_cert: FinalityCert {
+                proposal: BftProposal {
+                    chunk: chunk(),
+                    round: 0,
+                    proposer_index: 0,
+                    valid_quorum: None,
+                    round_change_certificate: None,
+                    signature: sig(47),
+                },
                 prevote_attestations: Vec::new(),
                 precommit_attestations: Vec::new(),
                 chunk_id: 3,

@@ -33,6 +33,10 @@ pub enum Topic {
     Checkpoints,
     /// Fully proven next-chunk branch availability; rounds are advisory.
     BftCandidates,
+    /// Bounded original-source availability inventory.
+    SignedArtifacts,
+    /// Signed leader proposals, nil votes and round-change declarations.
+    BftMessages,
     /// `/neutrino/prover_bounty/borsh`: missed-deadline bounty announcements.
     ProverBounty,
     /// `/neutrino/finality_votes_prevote/borsh`: BFT prevote votes.
@@ -46,7 +50,7 @@ pub enum Topic {
 
 impl Topic {
     /// All non-subnet topics, in canonical order.
-    pub const STATIC: [Self; 11] = [
+    pub const STATIC: [Self; 13] = [
         Self::Blocks,
         Self::Transactions,
         Self::SlashingEvidence,
@@ -55,6 +59,8 @@ impl Topic {
         Self::ChunkProofs,
         Self::Checkpoints,
         Self::BftCandidates,
+        Self::SignedArtifacts,
+        Self::BftMessages,
         Self::ProverBounty,
         Self::FinalityVotesPrevote,
         Self::FinalityVotesPrecommit,
@@ -82,6 +88,7 @@ impl Topic {
         match self {
             Self::BlockProofs => 2 * 1024 * 1024,
             Self::Blocks
+            | Self::BftMessages
             | Self::ChunkProofs
             | Self::EvidenceProofs
             | Self::SlashingEvidence
@@ -89,6 +96,7 @@ impl Topic {
             | Self::FinalityVotesPrecommit
             | Self::AggregateFinalityVotes(_) => 8 * 1024 * 1024,
             Self::Checkpoints => 1024,
+            Self::SignedArtifacts => 2048,
             Self::BftCandidates => 16 * 1024,
             Self::ProverBounty => 4 * 1024,
             Self::Transactions => 128 * 1024,
@@ -107,6 +115,8 @@ impl Topic {
             Self::ChunkProofs => "/neutrino/chunk_proofs/borsh".to_owned(),
             Self::Checkpoints => "/neutrino/checkpoints/borsh".to_owned(),
             Self::BftCandidates => "/neutrino/bft_candidates/borsh".to_owned(),
+            Self::SignedArtifacts => "/neutrino/signed_artifacts/borsh".to_owned(),
+            Self::BftMessages => "/neutrino/bft_messages/borsh".to_owned(),
             Self::ProverBounty => "/neutrino/prover_bounty/borsh".to_owned(),
             Self::FinalityVotesPrevote => "/neutrino/finality_votes_prevote/borsh".to_owned(),
             Self::FinalityVotesPrecommit => "/neutrino/finality_votes_precommit/borsh".to_owned(),

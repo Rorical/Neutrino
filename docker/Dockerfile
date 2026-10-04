@@ -26,6 +26,7 @@ RUN apt-get update \
         curl \
         git \
         libclang-dev \
+        libprotobuf-dev \
         libssl-dev \
         pkg-config \
         protobuf-compiler \

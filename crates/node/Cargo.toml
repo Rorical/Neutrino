@@ -46,7 +46,7 @@ neutrino-sync.workspace           = true
 neutrino-trie.workspace           = true
 serde                             = { version = "1.0.229", features = ["derive"] }
 thiserror.workspace               = true
-tokio                             = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs"] }
+tokio                             = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs", "net", "io-util"] }
 toml                              = "1.1.6"
 tracing                           = "0.1.44"
 tracing-subscriber                = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }

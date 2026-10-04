@@ -17,6 +17,7 @@
 //! instead of embedding the secret.
 
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -72,7 +73,8 @@ fn print_usage() {
     eprintln!("  node-config --spec <chain-spec.toml> --out <config.toml>");
     eprintln!("      [--role validator|full|archive|light-client] [--data-dir <dir>]");
     eprintln!("      [--ikm-path <file>] [--proposer-index <n>] [--listen <multiaddr>]...");
-    eprintln!("      [--bootnode <multiaddr>]... [--rpc <host:port>] [--proving cpu|cuda]");
+    eprintln!("      [--bootnode <multiaddr>]... [--rpc <host:port>] [--metrics <host:port>]");
+    eprintln!("      [--proving cpu|cuda]");
     eprintln!("      Emit a node config; the proposer key stays in the referenced file.");
 }
 
@@ -182,7 +184,7 @@ fn genesis(opts: &Options) -> Result<(), String> {
     let file = ChainSpecFile::load_from_path(&spec_path).map_err(|err| err.to_string())?;
     let state = build_genesis_state(&file).map_err(|err| err.to_string())?;
     let root_hex = hex::encode(state.root);
-    let mut pinned = file.clone();
+    let mut pinned = file;
     pinned.genesis_state_root_hex = Some(root_hex.clone());
     let spec = pinned.to_chain_spec().map_err(|err| err.to_string())?;
 
@@ -256,43 +258,52 @@ fn node_config(opts: &Options) -> Result<(), String> {
         return Err(format!("unknown --proving `{proving}`"));
     }
     let mut text = String::new();
-    text.push_str(&format!("chain_id = {}\n", file.chain_id));
-    text.push_str(&format!("role = \"{role}\"\n"));
-    text.push_str(&format!("chain_spec_path = \"{}\"\n", spec_path.display()));
+    let _ = writeln!(text, "chain_id = {}", file.chain_id);
+    let _ = writeln!(text, "role = \"{role}\"");
+    let _ = writeln!(text, "chain_spec_path = \"{}\"", spec_path.display());
     if let Some(dir) = opts.get("data-dir") {
-        text.push_str(&format!("data_dir = \"{dir}\"\n"));
+        let _ = writeln!(text, "data_dir = \"{dir}\"");
     }
     let listen = opts.all("listen");
     if !listen.is_empty() {
-        text.push_str(&format!("listen = {}\n", toml_string_array(&listen)));
+        let _ = writeln!(text, "listen = {}", toml_string_array(&listen));
     }
     let bootnodes = opts.all("bootnode");
     if !bootnodes.is_empty() {
-        text.push_str(&format!("bootnodes = {}\n", toml_string_array(&bootnodes)));
+        let _ = writeln!(text, "bootnodes = {}", toml_string_array(&bootnodes));
     }
     if role == "validator" {
         match opts.get("ikm-path") {
-            Some(path) => text.push_str(&format!("proposer_ikm_path = \"{path}\"\n")),
-            None => text.push_str(&format!(
-                "# proposer_ikm_path = \"validator.ikm\"   # or export {}\n",
-                neutrino_node::PROPOSER_IKM_ENV
-            )),
+            Some(path) => {
+                let _ = writeln!(text, "proposer_ikm_path = \"{path}\"");
+            }
+            None => {
+                let _ = writeln!(
+                    text,
+                    "# proposer_ikm_path = \"validator.ikm\"   # or export {}",
+                    neutrino_node::PROPOSER_IKM_ENV
+                );
+            }
         }
         let index = opts.get("proposer-index").unwrap_or("0");
         index
             .parse::<u32>()
             .map_err(|_| format!("--proposer-index must be an integer, got `{index}`"))?;
-        text.push_str(&format!("proposer_index = {index}\n"));
+        let _ = writeln!(text, "proposer_index = {index}");
     }
     text.push_str("\n[proving]\n");
-    text.push_str(&format!("backend = \"{proving}\"\n"));
+    let _ = writeln!(text, "backend = \"{proving}\"");
     text.push_str("concurrency = 2\ncapacity = 16\n");
     if let Some(rpc) = opts.get("rpc") {
         text.push_str("\n[rpc]\n");
-        text.push_str(&format!("listen = \"{rpc}\"\n"));
+        let _ = writeln!(text, "listen = \"{rpc}\"");
         text.push_str("max_connections = 200\nmax_concurrent_requests = 64\n");
         text.push_str("requests_per_second_per_connection = 50\n");
         text.push_str("max_batch_requests = 16\nruntime_call_timeout_ms = 2000\n");
+    }
+    if let Some(metrics) = opts.get("metrics") {
+        text.push_str("\n[metrics]\n");
+        let _ = writeln!(text, "listen = \"{metrics}\"");
     }
     text.push_str("\n[execution]\n");
     text.push_str("query_fuel = 50000000\nvalidate_tx_fuel = 20000000\n");
@@ -358,6 +369,8 @@ mod tests {
             "validator.ikm",
             "--listen",
             "/ip4/0.0.0.0/tcp/30303",
+            "--metrics",
+            "127.0.0.1:9615",
         ]
         .iter()
         .map(ToString::to_string)
@@ -371,6 +384,7 @@ mod tests {
             Some(Path::new("validator.ikm"))
         );
         assert!(cfg.rpc.is_some());
+        assert_eq!(cfg.metrics.unwrap().listen, "127.0.0.1:9615");
         let _ = fs::remove_dir_all(&dir);
     }
 }

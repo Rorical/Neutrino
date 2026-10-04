@@ -117,7 +117,8 @@ pub struct Sp1ProofSystem<P: Prover> {
     pub(super) fact_pk: P::ProvingKey,
     pub(super) fact_vk: SP1VerifyingKey,
     pub(super) facts: Mutex<super::fact_cache::FactCache>,
-    /// Signature checks of the most recent chunk answered by fact receipts.
+    /// `(covered << 32) | total` signature checks of the most recent chunk;
+    /// zero until a chunk has been proven.
     pub(super) last_fact_coverage: std::sync::atomic::AtomicU64,
     /// Serializes cache misses across early and evidence workers. Never an engine lock.
     pub(super) fact_proving: Mutex<()>,
@@ -254,6 +255,9 @@ where
 
     fn fact_key(&self) -> Option<[u32; 8]> {
         Some(self.fact_vk.hash_u32())
+    }
+    fn last_chunk_fact_coverage(&self) -> Option<(u64, u64)> {
+        Self::last_chunk_fact_coverage(self)
     }
 
     fn preprove_facts(
@@ -558,12 +562,15 @@ where
         Ok(())
     }
 
-    /// Signature checks of the most recently proven chunk that were answered
-    /// by early fact receipts instead of in-circuit BLS.
+    /// `(covered, total)` signature checks of the most recently proven chunk,
+    /// where `covered` were answered by early fact receipts instead of
+    /// in-circuit BLS. `None` before the first chunk proof.
     #[must_use]
-    pub fn last_chunk_fact_coverage(&self) -> u64 {
-        self.last_fact_coverage
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub fn last_chunk_fact_coverage(&self) -> Option<(u64, u64)> {
+        let packed = self
+            .last_fact_coverage
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (packed != 0).then_some((packed >> 32, packed & 0xFFFF_FFFF))
     }
 
     /// Select cached fact receipts covering this chunk's signature checks.
@@ -584,6 +591,8 @@ where
         ),
         ProofError,
     > {
+        /// Coverage counters are packed into one atomic as two 32-bit halves.
+        const CAP: u64 = 0xFFFF_FFFF;
         let known = self
             .facts
             .lock()
@@ -605,8 +614,12 @@ where
             .map_err(|_| ProofError::BackendRejected)?
             .covering(&mut wanted);
         receipts.truncate(neutrino_prover_chunk::consensus::MAX_CONSENSUS_FACT_STATEMENTS);
+        let covered = u64::try_from(total.saturating_sub(wanted.len()))
+            .unwrap_or(CAP)
+            .min(CAP);
+        let total = u64::try_from(total).unwrap_or(CAP).min(CAP);
         self.last_fact_coverage.store(
-            u64::try_from(total.saturating_sub(wanted.len())).unwrap_or(u64::MAX),
+            (covered << 32) | total,
             std::sync::atomic::Ordering::Relaxed,
         );
         let mut attached = witness.clone();

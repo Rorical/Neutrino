@@ -32,6 +32,14 @@ impl<J: Send + 'static, O: Send + 'static> ProofQueue<J, O> {
     pub(crate) fn contains(&self, hash: &Hash) -> bool {
         self.known.contains(hash)
     }
+    /// Jobs waiting for a worker.
+    pub(crate) fn pending(&self) -> usize {
+        self.pending.len()
+    }
+    /// Jobs currently proving.
+    pub(crate) fn running(&self) -> usize {
+        self.running.len()
+    }
     pub(crate) fn is_running(&self) -> bool {
         !self.running.is_empty()
     }

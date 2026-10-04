@@ -103,6 +103,11 @@ fn print_usage() {
     eprintln!("    requests_per_second_per_connection = 50");
     eprintln!("    runtime_call_timeout_ms = 2000");
     eprintln!();
+    eprintln!(
+        "    [metrics]                                # Prometheus text format at GET /metrics"
+    );
+    eprintln!("    listen           = \"127.0.0.1:9615\"");
+    eprintln!();
     eprintln!("    [execution]                              # WASM fuel/memory caps");
     eprintln!("    query_fuel       = 50000000");
     eprintln!();

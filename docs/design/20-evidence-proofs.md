@@ -4,7 +4,8 @@ Status: implemented. Workspace checks for the current nil-vote, authenticated
 round-entry, full ChainSpec signing domain and signed-source availability format
 passed on 2026-10-04. See the
 [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
-Real compressed composition acceptance remains pending as a separate gate.
+Real compressed EvidenceProof → block → chunk → History composition passed on an NVIDIA
+A100 on 2026-10-04; see the [CUDA acceptance record](../gpu-proving.md#cuda-acceptance-record).
 History recursion composes completed Chunk statements; it never rechecks evidence offences.
 
 ## Composition
@@ -79,10 +80,10 @@ Malformed proofs, verifier panics and resource failures never establish guilt.
   and signed-source availability format: 1,010 tests passed, six real-proving
   gates remained ignored; see the
   [acceptance record](21-recursive-checkpoint-proofs.md#acceptance-and-boundaries).
-- [ ] Real SP1 EvidenceProof → block → chunk → History composition gate: local acceptance
-  was cancelled. The upgraded programs require a fresh run on a suitable prover.
-  An opt-in CUDA gate uses the same fixture with independent local verification;
-  see [GPU proving](../gpu-proving.md). Hardware acceptance remains pending.
+- [x] Real SP1 EvidenceProof → block → chunk → History composition gate: passed on
+  CUDA (NVIDIA A100-SXM4-80GB) on 2026-10-04 with independent local verification of
+  every receipt; timings in the [CUDA acceptance record](../gpu-proving.md#cuda-acceptance-record).
+  CPU acceptance and the history Merge gate remain to be run.
 
 Early fact compression and batch evidence proving are implemented. Individual BFT
 votes never wait for a fact proof. A bounded background worker coalesces queued

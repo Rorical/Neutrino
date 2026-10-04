@@ -61,6 +61,13 @@ pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
         }
         let worker = Arc::clone(&backend);
         jobs.start(move |hash| worker.prove_block(&hash));
+        let metrics = backend.metrics();
+        metrics
+            .block_proof_queue_pending
+            .store(jobs.pending() as u64, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .block_proof_queue_running
+            .store(jobs.running() as u64, std::sync::atomic::Ordering::Relaxed);
         tokio::select! {
             () = cmd_tx.closed() => break,
             (hash, result) = jobs.completed(), if jobs.is_running() => {
@@ -113,6 +120,10 @@ async fn attempt_slot<P: ProgramProver + 'static>(
             backend.queue_header_facts(&outcome.block.header);
             info!(slot, height = outcome.block.header.height,
                 hash = ?outcome.block_hash, "produced block; queued for proving");
+            backend
+                .metrics()
+                .blocks_produced
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(Ok(None)) => debug!(slot, "validator not eligible for slot"),
         Ok(Err(ProductionError::NonMonotonicSlot { parent_slot, .. })) => {

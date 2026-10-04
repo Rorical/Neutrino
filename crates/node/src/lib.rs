@@ -18,6 +18,7 @@ pub mod chain_spec;
 pub mod config;
 pub mod db;
 pub mod genesis;
+pub mod metrics;
 pub(crate) mod producer;
 pub mod runner;
 
@@ -29,6 +30,7 @@ pub use config::{
 };
 pub use db::{NodeDb, NodeDbError};
 pub use genesis::{GenesisState, build_genesis_state};
+pub use metrics::{MetricsSnapshot, MetricsSource, NodeMetrics};
 pub use runner::{NodeError, run};
 
 mod proof_queue;

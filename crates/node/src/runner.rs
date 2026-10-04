@@ -71,6 +71,14 @@ pub enum NodeError {
     /// Generic I/O surface (signal hookup, config read, ...).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The configured metrics listen address could not be parsed or bound.
+    #[error("metrics listen address `{addr}` is invalid or unavailable: {reason}")]
+    MetricsListen {
+        /// Configured `host:port` string.
+        addr: String,
+        /// Parse or bind failure.
+        reason: String,
+    },
     /// The configured RPC listen address could not be parsed.
     #[error("rpc listen address `{addr}` is invalid: {source}")]
     RpcListen {
@@ -347,6 +355,26 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
         tasks.spawn(Arc::clone(&concrete_backend).run_bft_round_timeouts());
     }
     let producer_job = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
+    if let Some(metrics_cfg) = config.metrics.as_ref() {
+        let addr: std::net::SocketAddr =
+            metrics_cfg
+                .listen
+                .parse()
+                .map_err(|err: std::net::AddrParseError| NodeError::MetricsListen {
+                    addr: metrics_cfg.listen.clone(),
+                    reason: err.to_string(),
+                })?;
+        let listener =
+            crate::metrics::bind(addr)
+                .await
+                .map_err(|err| NodeError::MetricsListen {
+                    addr: metrics_cfg.listen.clone(),
+                    reason: err.to_string(),
+                })?;
+        let source = Arc::clone(&concrete_backend) as Arc<dyn crate::metrics::MetricsSource>;
+        tasks.spawn(crate::metrics::serve(listener, source));
+        info!(listen = %addr, "metrics endpoint listening");
+    }
     let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
     let backend: Arc<dyn SyncBackend> = Arc::clone(&concrete_backend) as Arc<dyn SyncBackend>;
 

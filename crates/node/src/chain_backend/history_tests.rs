@@ -375,6 +375,7 @@ fn missing_progress_artifact_fails_without_proving_or_advancing_coverage() {
         &MockProofSystem::new(),
         &Arc::new(ProvingBudget::new(1)),
         &super::HistoryRuntime::default(),
+        &crate::metrics::NodeMetrics::default(),
         queued,
     )
     .unwrap_err();
@@ -409,6 +410,7 @@ fn mismatched_progress_anchor_is_rejected_before_receipt_verification() {
         &MockProofSystem::new(),
         &Arc::new(ProvingBudget::new(1)),
         &super::HistoryRuntime::default(),
+        &crate::metrics::NodeMetrics::default(),
         queued,
     )
     .unwrap_err();
@@ -430,6 +432,7 @@ fn progress_already_at_target_still_requires_a_real_verified_receipt() {
             &MockProofSystem::new(),
             &Arc::new(ProvingBudget::new(1)),
             &super::HistoryRuntime::default(),
+            &crate::metrics::NodeMetrics::default(),
             queued,
         )
         .is_err()
@@ -470,6 +473,7 @@ async fn shutdown_interrupts_a_waiting_retry_and_lease_expiry() {
     save(&mut engine, &queued).unwrap();
     let (publisher, receiver) = tokio::sync::mpsc::channel(1);
     let actor = super::HistoryActor {
+        metrics: std::sync::Arc::new(crate::metrics::NodeMetrics::default()),
         engine: Arc::new(Mutex::new(engine)),
         prover: Arc::new(MockProofSystem::new()),
         budget: Arc::new(ProvingBudget::new(1)),
@@ -575,6 +579,7 @@ fn paused_history_worker_does_not_enter_proving_or_verify_saved_progress() {
         &MockProofSystem::new(),
         &Arc::new(ProvingBudget::new(1)),
         &runtime,
+        &crate::metrics::NodeMetrics::default(),
         queued,
     )
     .unwrap_err();

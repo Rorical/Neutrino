@@ -63,6 +63,7 @@ where
         let budget = Arc::clone(&self.proving_budget);
         let engine = Arc::clone(&self.engine);
         let notify = Arc::clone(&self.consensus_proof_notify);
+        let metrics = Arc::clone(&self.metrics);
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -75,8 +76,20 @@ where
                 {
                     return Err(ProofError::InvalidWitness);
                 }
-                let proof = prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
-                Ok((prepared.witness, proof))
+                let started = std::time::Instant::now();
+                let proof = prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness);
+                metrics
+                    .chunk_proofs
+                    .observe(started.elapsed(), proof.is_ok());
+                if let Some((covered, total)) = prover.last_chunk_fact_coverage() {
+                    metrics
+                        .chunk_fact_checks_covered
+                        .store(covered, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .chunk_fact_checks_total
+                        .store(total, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok((prepared.witness, proof?))
             })
             .await
             .unwrap_or(Err(ProofError::InvalidWitness));

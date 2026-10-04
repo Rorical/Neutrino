@@ -66,7 +66,9 @@ proving time): the block guest executes about 67 k instructions for an empty blo
 30.3 M instructions with in-circuit BLS and about 3.9 M when one Fact statement covers
 all nine checks. Precompile syscalls count as single instructions here, and deferred
 receipt verification is paid in the recursion stage, so these ratios bound the RISC-V
-side only. Real proving time remains unmeasured.
+side only. Measured GPU proving time for the same programs is in the
+[CUDA acceptance record](../gpu-proving.md#cuda-acceptance-record): about 116 s for a chunk
+with in-circuit BLS on an A100.
 
 Historical commitments exclude certificate signer subsets; alternative valid quorum
 certificates cannot produce different history roots. The block-proof root commits

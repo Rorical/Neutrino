@@ -1,8 +1,16 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/png/neutrino-logo-dark.png">
+    <img alt="Neutrino" src="docs/brand/png/neutrino-logo-light.png" width="420">
+  </picture>
+</p>
+
 # Neutrino
 
 Shared WASM/SP1 execution, complete chunk consensus proofs, EvidenceProof
-accountability and recursive history proofs are implemented. Real compressed composition acceptance remains
-separate from workspace tests; see [evidence proofs](docs/design/20-evidence-proofs.md).
+accountability and recursive history proofs are implemented. Real compressed composition has passed on an NVIDIA A100; see the
+[CUDA acceptance record](docs/gpu-proving.md#cuda-acceptance-record) and
+[evidence proofs](docs/design/20-evidence-proofs.md).
 
 A proof-aware, modular layer-1 blockchain built from scratch in Rust.
 
@@ -73,6 +81,9 @@ the spec file is distributed. The validator key is read from `NEUTRINO_PROPOSER_
 or an owner-only key file, never from the config. The RPC server caps concurrent
 requests, per-connection request rate, batch size and `runtime_call` wall time, and
 WASM queries run under fuel and memory budgets (`[rpc]` and `[execution]` in the config).
+A `[metrics]` listener exposes Prometheus text at `GET /metrics`: head and finality
+heights, history-proof lag, peers, mempool, BFT session flags, proof queue depth, proving
+latency histograms per stage and the fact coverage of the last chunk proof.
 
 ## Design Documents
 

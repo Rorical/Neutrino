@@ -32,7 +32,7 @@ pub mod store;
 mod test_db;
 pub mod validator_set;
 
-pub use bft_loop::{BftAction, BftLoopError, BftQuorumIdentity, BftSession};
+pub use bft_loop::{BftAction, BftLoopError, BftQuorumIdentity, BftSession, BftSessionOverview};
 pub use block_state::{BlockState, InvalidTransition};
 pub use body::{BodyRoots, apply_body_roots, compute_body_roots};
 pub use clock::SlotClock;

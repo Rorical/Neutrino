@@ -32,6 +32,7 @@ mod evidence;
 mod facts;
 mod history;
 mod light;
+mod metrics_source;
 mod p2p_queries;
 mod rpc_queries;
 mod state_sync;
@@ -120,6 +121,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     network_publisher: Mutex<Option<mpsc::Sender<NetworkCommand>>>,
     /// Live peer/sync summary published by the running [`neutrino_sync::SyncDriver`].
     sync_status: Mutex<Option<SyncStatus>>,
+    /// Proving counters and latencies exported by the metrics endpoint.
+    metrics: Arc<crate::metrics::NodeMetrics>,
     /// Local validator key used to sign BFT votes and act as the
     /// `voter` argument to [`Engine::finalize_chunk`]. Wrapped in an
     /// [`Arc`] so async tasks can hold a snapshot without re-locking.
@@ -302,6 +305,7 @@ where
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
             sync_status: Mutex::new(None),
+            metrics: Arc::new(crate::metrics::NodeMetrics::default()),
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(slashing_pool),
             block_executor: Mutex::new(None),
@@ -403,6 +407,12 @@ where
             .sync_status
             .lock()
             .expect("ChainBackend sync_status poisoned") = Some(status);
+    }
+
+    /// Counters updated by the proving and production paths.
+    #[must_use]
+    pub const fn metrics(&self) -> &Arc<crate::metrics::NodeMetrics> {
+        &self.metrics
     }
 
     /// Installed sync status handle, if a driver has published one.
@@ -861,7 +871,12 @@ where
         let permit = self
             .proving_budget
             .acquire(crate::proving_budget::ProvingPriority::Critical);
-        let completed = job.prove(self.proof_system.as_ref())?;
+        let started = std::time::Instant::now();
+        let completed = job.prove(self.proof_system.as_ref());
+        self.metrics
+            .block_proofs
+            .observe(started.elapsed(), completed.is_ok());
+        let completed = completed?;
         drop(permit);
         self.with_engine_mut(|e| {
             if self.bootstrap_pending() {

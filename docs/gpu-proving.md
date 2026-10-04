@@ -92,11 +92,32 @@ from `cargo test -p neutrino-runtime-host --test proof_work_profile -- --ignored
 (see design 19): roughly 30 M chunk-guest instructions with in-circuit BLS versus
 4 M when Fact receipts cover the chunk's signature checks. Measure both variants.
 
+## CUDA acceptance record
+
+First real compressed composition on GPU, 2026-10-04, tree `c880ce9` (guest programs as
+of `4c49064`), Google Colab, NVIDIA A100-SXM4-80GB, driver 580.82.07, SP1 6.8.1,
+`sp1-gpu-server` 6.8.1, single GPU, worker buffers 1, shard size 1,048,576:
+
+| Stage | Guest cycles (approx.) | Wall time |
+| --- | --- | --- |
+| Fact + Evidence batch (real BLS verification) | 128 M + 1.4 M | 44.2 s |
+| Block (2.13 M instructions, 154 Poseidon2 syscalls) | 2.1 M | 5.0 s |
+| Complete consensus Chunk (in-circuit BLS, recursive block receipt) | 403 M | 115.7 s |
+| History Fold of one Chunk | 1.4 M | 5.8 s |
+| Whole gate (`evidence_block_chunk_cuda_compressed_recursion`) | | 211 s |
+
+Throughput was about 3.5 M cycles/s in both the Fact and Chunk stages, with roughly
+5 s of fixed setup and recursion overhead per proof. The client process peaked at
+840 MiB resident; `sp1-gpu-server` memory and GPU memory were not captured. All receipts
+verified under the independent CPU verifier. A second run resumed every stage from the
+saved caches and re-verified the four receipts in under 6 s. The Chunk in this gate
+carried no Fact statements, so its time is the in-circuit BLS upper bound.
+
 Keep those directories to resume an interrupted GPU run; use new directories to
 measure fresh proving latency. The CUDA hardware gate and speed measurements
 remain pending: development here is on a Mac without an NVIDIA GPU. Compilation,
 configuration rejection tests and CPU regressions are separate from hardware
-acceptance; no speedup has been measured.
+acceptance. See the CUDA acceptance record above for the first measured GPU run.
 
 Current ELF acceptance must be rerun after the history-tree, compact Chunk and
 checkpoint Guest changes. Earlier program hashes and test counts do not certify

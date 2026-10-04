@@ -78,6 +78,12 @@ pub trait ProofSystem {
     fn fact_key(&self) -> Option<[u32; 8]> {
         None
     }
+    /// `(covered, total)` signature checks of the most recently proven chunk,
+    /// where `covered` were answered by fact receipts. `None` when the
+    /// backend does not track coverage or has not proven a chunk yet.
+    fn last_chunk_fact_coverage(&self) -> Option<(u64, u64)> {
+        None
+    }
 
     /// Compress observed signed artifacts before misconduct is discovered.
     /// Implementations retain a bounded cache of verified receipts for reuse.

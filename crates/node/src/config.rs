@@ -108,6 +108,17 @@ pub struct NodeConfig {
     /// but external observers have no read API.
     #[serde(default)]
     pub rpc: Option<RpcConfigToml>,
+    /// Prometheus metrics listener. When omitted no metrics endpoint is started.
+    #[serde(default)]
+    pub metrics: Option<MetricsConfigToml>,
+}
+
+/// `[metrics]` section: a plain-text Prometheus endpoint at `GET /metrics`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfigToml {
+    /// `host:port` to bind on, e.g. `"127.0.0.1:9615"`.
+    pub listen: String,
 }
 
 /// Local weak-subjectivity trust configuration. Peers cannot supply this anchor.
@@ -512,6 +523,19 @@ query_fuel = 1000000
             .is_none()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_section_parses_and_defaults_off() {
+        let cfg: NodeConfig =
+            toml::from_str("chain_id = 1\n[metrics]\nlisten = \"127.0.0.1:9615\"\n").unwrap();
+        assert_eq!(cfg.metrics.unwrap().listen, "127.0.0.1:9615");
+        assert!(
+            toml::from_str::<NodeConfig>("chain_id = 1\n")
+                .unwrap()
+                .metrics
+                .is_none()
+        );
     }
 
     #[test]

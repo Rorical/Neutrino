@@ -1082,6 +1082,45 @@ fn build_local_vote(
     }
 }
 
+/// Observer-facing summary of one live BFT session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent phase flags mirrored as gauges"
+)]
+pub struct BftSessionOverview {
+    /// Chunk under vote.
+    pub chunk_id: ChunkId,
+    /// Current round.
+    pub round: u32,
+    /// Local validator has prevoted in the current round.
+    pub local_prevoted: bool,
+    /// Local validator has precommitted in the current round.
+    pub local_precommitted: bool,
+    /// A prevote quorum has been observed.
+    pub prevote_quorum: bool,
+    /// A precommit quorum has been observed.
+    pub precommit_quorum: bool,
+}
+
+impl<DB: Database> Engine<DB> {
+    /// Snapshot every live BFT session for metrics and diagnostics.
+    #[must_use]
+    pub fn bft_session_overview(&self) -> Vec<BftSessionOverview> {
+        self.bft_sessions
+            .values()
+            .map(|session| BftSessionOverview {
+                chunk_id: session.chunk_id(),
+                round: session.round(),
+                local_prevoted: session.local_prevoted(),
+                local_precommitted: session.local_precommitted(),
+                prevote_quorum: session.prevote_quorum_observed(),
+                precommit_quorum: session.precommit_quorum_observed(),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

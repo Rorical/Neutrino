@@ -320,6 +320,7 @@ where
             budget: Arc::clone(&self.proving_budget),
             state: Arc::clone(&self.history),
             publisher: self.publisher_snapshot(),
+            metrics: Arc::clone(&self.metrics),
         };
         runtime.spawn(actor.run());
     }
@@ -442,6 +443,7 @@ struct HistoryActor<DB: Database, P> {
     budget: Arc<crate::proving_budget::ProvingBudget>,
     state: Arc<HistoryRuntime>,
     publisher: Option<tokio::sync::mpsc::Sender<NetworkCommand>>,
+    metrics: Arc<crate::metrics::NodeMetrics>,
 }
 
 impl<DB, P> HistoryActor<DB, P>
@@ -584,8 +586,9 @@ where
         let budget = Arc::clone(&self.budget);
         let work = job.clone();
         let state = Arc::clone(&self.state);
+        let metrics = Arc::clone(&self.metrics);
         let result = tokio::task::spawn_blocking(move || {
-            run_job(&engine, prover.as_ref(), &budget, &state, work)
+            run_job(&engine, prover.as_ref(), &budget, &state, &metrics, work)
         })
         .await;
         let completed = self.finish(job, result);
@@ -667,6 +670,7 @@ struct HistoryWorker<'a, DB: Database, P> {
     engine: &'a Mutex<Engine<DB>>,
     prover: &'a P,
     budget: &'a Arc<crate::proving_budget::ProvingBudget>,
+    metrics: &'a crate::metrics::NodeMetrics,
     spec: neutrino_primitives::ChainSpec,
     range: HistoryStatement,
     created: u64,
@@ -678,6 +682,7 @@ fn run_job<DB, P>(
     prover: &P,
     budget: &Arc<crate::proving_budget::ProvingBudget>,
     state: &HistoryRuntime,
+    metrics: &crate::metrics::NodeMetrics,
     mut job: Job,
 ) -> Result<Job, String>
 where
@@ -690,6 +695,7 @@ where
         engine,
         prover,
         budget,
+        metrics,
         range: job.range,
         created: job.created,
         paused: &state.paused,
@@ -822,9 +828,14 @@ where
             .budget
             .acquire(crate::proving_budget::ProvingPriority::Background);
         self.check_pause()?;
-        self.prover
-            .prove_history_fold(&self.spec, previous, &chunks)
-            .map_err(|error| error.to_string())
+        let started = std::time::Instant::now();
+        let proof = self
+            .prover
+            .prove_history_fold(&self.spec, previous, &chunks);
+        self.metrics
+            .history_folds
+            .observe(started.elapsed(), proof.is_ok());
+        proof.map_err(|error| error.to_string())
     }
 
     fn fold_forward(
@@ -925,9 +936,12 @@ where
                 .budget
                 .acquire(crate::proving_budget::ProvingPriority::Background);
             self.check_pause()?;
-            self.prover
-                .prove_history_merge(&self.spec, &left, &right)
-                .map_err(|error| error.to_string())?
+            let started = std::time::Instant::now();
+            let proof = self.prover.prove_history_merge(&self.spec, &left, &right);
+            self.metrics
+                .history_merges
+                .observe(started.elapsed(), proof.is_ok());
+            proof.map_err(|error| error.to_string())?
         };
         let proof = verified.proof().clone();
         if proof.statement.domain != self.range.domain

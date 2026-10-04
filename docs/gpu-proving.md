@@ -79,6 +79,14 @@ cargo test --locked --release -p neutrino-runtime-host --features cuda \
   -- --ignored --exact --nocapture
 ```
 
+`notebooks/neutrino-gpu-gate.ipynb` wraps the same flow for Google Colab (parameters,
+Drive mount, clone, gate, summary). `scripts/colab-gpu-gate.sh` performs the whole sequence on a fresh Linux x86-64 GPU
+box (dependencies, pinned toolchains, CUDA build, gate, instruction profile) and keeps
+caches and logs under `OUT_DIR`, which on Google Colab should be a mounted Drive path so
+an interrupted session can resume. SP1's CUDA prover downloads a standalone
+`sp1-gpu-server` binary; no Docker is required. Plan for a high-memory runtime: the
+CPU-side traces and recursion need well over the 12 GiB of a free-tier instance.
+
 Before measuring, note the only numbers recorded so far are guest instruction counts
 from `cargo test -p neutrino-runtime-host --test proof_work_profile -- --ignored --nocapture`
 (see design 19): roughly 30 M chunk-guest instructions with in-circuit BLS versus

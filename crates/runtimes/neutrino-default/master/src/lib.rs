@@ -292,17 +292,19 @@ mod tests {
             proposer_address: [0u8; 32],
             transactions: alloc::vec![],
         };
-        // `apply_block` reads the validator-set key for the canonical
-        // `validator_set_root` commitment even on empty blocks, so the
-        // witness must include it; the value is absent so the read
-        // returns `None`.
+        // Even an empty block reads the validator-set key for the canonical
+        // `validator_set_root` commitment, the mandatory sanction queue and
+        // the two governance records, so the witness must list them; the
+        // values are absent so every read returns `None`.
         let witness = StateWitness {
             pre_state_root: empty_state_root(),
             nodes: alloc::vec![],
             values: alloc::vec![],
             witnessed_keys: alloc::vec![
                 VALIDATOR_SET_KEY.to_vec(),
-                neutrino_default_runtime_core::accountability::QUEUE_KEY.to_vec()
+                neutrino_default_runtime_core::accountability::QUEUE_KEY.to_vec(),
+                neutrino_default_runtime_core::UPGRADE_KEY.to_vec(),
+                neutrino_default_runtime_core::governance::UPGRADE_PROPOSAL_KEY.to_vec(),
             ],
         };
         let bytes = borsh::to_vec(&(input, witness)).unwrap();

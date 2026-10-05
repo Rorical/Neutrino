@@ -250,3 +250,79 @@ fn fact_statements_replace_in_circuit_signature_checks() {
     conflicting.facts.push(flipped);
     assert!(validate_consensus(&conflicting).is_err());
 }
+
+#[test]
+fn enacted_upgrade_switches_the_end_boundary_at_its_activation_chunk() {
+    use neutrino_consensus_types::history_proof::{ExecutionPrograms, ProgramSet};
+    use neutrino_default_runtime_core::{
+        Account, ProposeUpgradeTx, Transaction, VALIDATOR_SET_KEY, Validator, ValidatorSet,
+        account_key, encode_account, encode_validator, governance::propose_upgrade_sig_message,
+        validator_key,
+    };
+    use neutrino_runtime_core::host::LiveTrie;
+    // The sole runtime validator holds all stake, so its proposal enacts at once.
+    let key = neutrino_crypto::ed25519::SecretKey::from_bytes(&[9; 32]);
+    let address = key.public_key().to_bytes();
+    let mut live = LiveTrie::default();
+    live.insert(
+        &account_key(&address),
+        encode_account(&Account {
+            nonce: 0,
+            balance: 1_000_000,
+        }),
+    );
+    live.insert(
+        &validator_key(&address),
+        encode_validator(&Validator {
+            stake: 100,
+            active: true,
+        }),
+    );
+    let mut set = ValidatorSet::default();
+    set.upsert(address, 100);
+    live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+    let next = ProgramSet {
+        runtime_code_hash: [5; 32],
+        execution: ExecutionPrograms {
+            fact: [13; 8],
+            evidence: [12; 8],
+            block: [11; 8],
+        },
+        chunk: [17; 8],
+        checkpoint: [18; 8],
+    };
+    let propose = |activate_at_chunk| {
+        let mut tx = ProposeUpgradeTx {
+            proposer: address,
+            programs: next,
+            activate_at_chunk,
+            nonce: 0,
+            signature: [0; 64],
+        };
+        tx.signature = key.sign(&propose_upgrade_sig_message(7, &tx));
+        vec![Transaction::ProposeUpgrade(tx)]
+    };
+    // Activation at the next chunk: this chunk's end boundary adopts the set
+    // and the next context executes under it.
+    let (witness, _, _) =
+        support::fixture_with_live([1; 8], [4; 32], propose(1), 30_000_000, &live);
+    assert_eq!(witness.blocks[0].output.applied, 1);
+    let validated =
+        neutrino_prover_chunk::consensus::validate_consensus_with_context(&witness).unwrap();
+    assert_eq!(validated.statement.start.programs, witness.context.programs);
+    assert_eq!(validated.statement.end.programs, next);
+    assert_eq!(validated.next_context.programs, next);
+    assert_eq!(validated.next_context.vm_code_hash, next.runtime_code_hash);
+    assert_ne!(
+        validated.statement.end.programs,
+        validated.statement.start.programs
+    );
+    // A later activation leaves this boundary under the current set.
+    let (witness, _, _) =
+        support::fixture_with_live([1; 8], [4; 32], propose(2), 30_000_000, &live);
+    assert_eq!(witness.blocks[0].output.applied, 1);
+    let validated =
+        neutrino_prover_chunk::consensus::validate_consensus_with_context(&witness).unwrap();
+    assert_eq!(validated.statement.end.programs, witness.context.programs);
+    assert_eq!(validated.next_context.programs, witness.context.programs);
+}

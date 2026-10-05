@@ -127,13 +127,18 @@ pub fn fixture_with_live(
         proposer_address: validators[0].withdrawal_credentials,
         transactions,
     };
+    // Execution witness over the pre-state, then the chunk's rotation witness
+    // over the committed post-state, exactly as the engine builds them.
     let mut state = TracingState::new(live);
-    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut state, &validators) {
-        let _ = state.read(&key);
-    }
     let output = apply_block(&input, &mut state);
-    assert_eq!(output.post_state_root, live.trie().root());
-    let witness = state.into_witness();
+    let (committed, execution_witness) = state.into_committed_and_witness();
+    let post_live = LiveTrie::from_trie(committed);
+    assert_eq!(output.post_state_root, post_live.state_root());
+    let mut post_state = TracingState::new(&post_live);
+    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut post_state, &validators) {
+        let _ = post_state.read(&key);
+    }
+    let witness = post_state.into_witness();
     let body = Body {
         transactions: input
             .transactions
@@ -286,13 +291,13 @@ pub fn fixture_with_live(
             seed: [0; 32],
             blocks,
             bodies: vec![neutrino_prover_chunk::body::ConsensusBody::from_body(&body).unwrap()],
-            post_state: witness.clone(),
+            post_state: witness,
             history: neutrino_prover_chunk::history::HistoryWitness::default(),
             finality_cert: cert,
             block_guest_vk_digest: key_digest,
             facts: Vec::new(),
         },
         input,
-        witness,
+        execution_witness,
     )
 }

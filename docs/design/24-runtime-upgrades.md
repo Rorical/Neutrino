@@ -1,9 +1,10 @@
 # 24 — Runtime and program upgrades
 
-Status: phase 1 implemented (program sets in consensus boundaries, state-driven
-switching at chunk boundaries, cross-program history recursion). Governance
-transactions, on-chain program distribution and the SP1 version bridge are later
-phases and are described here so the phase 1 formats already accommodate them.
+Status: phases 1 and 2 implemented (program sets in consensus boundaries,
+state-driven switching at chunk boundaries, cross-program history recursion,
+validator-stake governance in the runtime). On-chain program distribution and the
+SP1 version bridge are later phases and are described here so the current formats
+already accommodate them.
 
 ## Goal
 
@@ -119,10 +120,41 @@ appear at each step, and only as input.
 
 ## Phase 2: governance in the runtime
 
-New transaction kinds, stake-weighted: propose a program set (hashes and digests),
-vote, enact. Enactment writes `ScheduledUpgrade` with `activate_at_chunk` at least a
-configured number of chunks ahead so provers can obtain the new programs. The STF
-clears records whose activation chunk is at or below the current evidence anchor.
+Governance is an ordinary runtime rule in `neutrino_default_runtime_core::governance`,
+upgradable with the runtime, exactly as a Substrate governance pallet dispatching
+`set_code` is. Consensus never sees proposals or votes; it only consumes the
+`ScheduledUpgrade` record the runtime writes.
+
+```text
+ProposeUpgradeTx { proposer, programs: ProgramSet, activate_at_chunk, nonce, signature }
+VoteUpgradeTx    { voter, proposal_id, nonce, signature }
+UpgradeProposal  { proposer, programs, activate_at_chunk, proposed_at_chunk, voters }  // upgrade:proposal
+ScheduledUpgrade { activate_at_chunk, programs }                                       // upgrade:scheduled
+```
+
+- Only active runtime validators (nonzero stake in the canonical `ValidatorSet`)
+  may propose or vote, signing with their Ed25519 account key; both kinds pay gas.
+- One decision is in flight at a time: a live proposal or an enacted switch awaiting
+  its boundary blocks new proposals.
+- Votes are weighted by the voter's stake at tally time. The proposer's stake counts
+  as a vote. Enactment happens inside the transaction whose vote reaches two thirds
+  of the active stake: the proposal is deleted and `ScheduledUpgrade` is written.
+- `activate_at_chunk` must lie in `[current + UPGRADE_MIN_LEAD_CHUNKS,
+  current + UPGRADE_MAX_LEAD_CHUNKS]` (currently 1 and 1024 chunks). A proposal
+  without quorum expires `UPGRADE_VOTING_PERIOD_CHUNKS` (64) after its proposal
+  chunk, so no validator can hold the single slot indefinitely. Phase 3 raises the
+  minimum lead together with program distribution.
+- Block-start housekeeping deletes a schedule whose activation chunk has been reached
+  (the chunk Guest consumed it at the boundary entering that chunk) and a proposal
+  that can no longer be enacted in time. The chunk Guest ignores stale records
+  regardless, so the housekeeping is tidiness, not safety.
+- Mempool admission has no chunk context and checks signature, nonce, fee,
+  membership and structure; chunk-relative rules are enforced at execution.
+- The `upgrade_status` runtime query returns the open proposal and pending schedule.
+
+The runtime cannot verify that the named Guest digests correspond to the named code:
+SP1 setup is not possible in the STF. Proposals name both, and voters are
+accountable for the pairing through reproducible builds and off-chain audit.
 
 ## Phase 3: on-chain program distribution
 

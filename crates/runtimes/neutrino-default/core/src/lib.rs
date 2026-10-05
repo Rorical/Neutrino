@@ -18,6 +18,7 @@ extern crate alloc;
 
 pub mod accountability;
 pub mod commitments;
+pub mod governance;
 
 pub use neutrino_consensus_types::evidence::EvidenceAnchor;
 
@@ -75,6 +76,8 @@ pub const fn tx_gas(tx: &Transaction) -> u64 {
         Transaction::Withdraw(_) => GAS_WITHDRAW,
         Transaction::RegisterValidator(_) => GAS_REGISTER_VALIDATOR,
         Transaction::SubmitEvidence(_) => accountability::GAS_EVIDENCE_ADMISSION,
+        Transaction::ProposeUpgrade(_) => governance::GAS_PROPOSE_UPGRADE,
+        Transaction::VoteUpgrade(_) => governance::GAS_VOTE_UPGRADE,
     }
 }
 
@@ -95,6 +98,8 @@ pub const fn tx_kind_code(tx: &Transaction) -> u8 {
         Transaction::Withdraw(_) => 5,
         Transaction::RegisterValidator(_) => 6,
         Transaction::SubmitEvidence(_) => 7,
+        Transaction::ProposeUpgrade(_) => 8,
+        Transaction::VoteUpgrade(_) => 9,
     }
 }
 
@@ -116,6 +121,8 @@ pub const fn tx_charges_fee(tx: &Transaction) -> bool {
             | Transaction::VoluntaryExit(_)
             | Transaction::Withdraw(_)
             | Transaction::RegisterValidator(_)
+            | Transaction::ProposeUpgrade(_)
+            | Transaction::VoteUpgrade(_)
     )
 }
 
@@ -169,6 +176,7 @@ pub const VALIDATOR_REGISTRATIONS_KEY: &[u8] = b"validator_registrations";
 /// `activate_at_chunk`. Written by governance (design 24); read from the
 /// post-state witness.
 pub const UPGRADE_KEY: &[u8] = b"upgrade:scheduled";
+pub use governance::{ProposeUpgradeTx, UpgradeProposal, UpgradeStatus, VoteUpgradeTx};
 pub use neutrino_consensus_types::history_proof::{ProgramSet, ScheduledUpgrade};
 /// Prefix used to derive state keys for per-validator registration
 /// records: `registration_key(addr) = REGISTRATION_KEY_PREFIX || addr`.
@@ -419,6 +427,10 @@ pub enum Transaction {
     RegisterValidator(RegisterValidatorTx),
     /// Proof-authenticated evidence admission; processed before user transactions.
     SubmitEvidence(neutrino_consensus_types::evidence::EvidenceSubmission),
+    /// Propose a program-set upgrade; see [`governance`].
+    ProposeUpgrade(ProposeUpgradeTx),
+    /// Vote for the open upgrade proposal; see [`governance`].
+    VoteUpgrade(VoteUpgradeTx),
 }
 
 /// Ed25519-signed transfer of `amount` between two accounts.
@@ -747,6 +759,16 @@ pub enum ReceiptStatus {
     /// Defensive; in practice unreachable for any realistic
     /// transaction volume.
     Overflow,
+    /// The signer is not an active validator for a validator-only action.
+    Unauthorized,
+    /// An upgrade decision is already in flight (open proposal or enacted
+    /// switch awaiting its boundary).
+    UpgradeConflict,
+    /// The proposal is malformed, too close to its activation chunk, or
+    /// the vote names no live proposal.
+    InvalidUpgrade,
+    /// The validator already voted for this proposal.
+    AlreadyVoted,
 }
 
 impl ReceiptStatus {
@@ -760,6 +782,10 @@ impl ReceiptStatus {
             Self::InsufficientBalance => 3,
             Self::OutOfBlockGas => 4,
             Self::Overflow => 5,
+            Self::Unauthorized => 6,
+            Self::UpgradeConflict => 7,
+            Self::InvalidUpgrade => 8,
+            Self::AlreadyVoted => 9,
         }
     }
 
@@ -1171,6 +1197,7 @@ pub fn apply_block_validated<B: StateBackend>(
     let mut applied: u32 = 0;
     let mut failed: u32 = 0;
     let (accountability, mut gas_used, mut receipts) = accountability::apply(checked, state);
+    governance::expire(state, input.evidence_anchor.chunk_id);
     let mut proposer_fee: u128 = 0;
     receipts.reserve(input.transactions.len());
 
@@ -1230,6 +1257,20 @@ pub fn apply_block_validated<B: StateBackend>(
             Transaction::RegisterValidator(register_tx) => {
                 apply_register_validator(state, input.chain_id, fee, register_tx)
             }
+            Transaction::ProposeUpgrade(propose_tx) => governance::apply_propose(
+                state,
+                input.chain_id,
+                input.evidence_anchor.chunk_id,
+                fee,
+                propose_tx,
+            ),
+            Transaction::VoteUpgrade(vote_tx) => governance::apply_vote(
+                state,
+                input.chain_id,
+                input.evidence_anchor.chunk_id,
+                fee,
+                vote_tx,
+            ),
         };
         match result {
             Ok(()) => {
@@ -1378,6 +1419,12 @@ pub fn validate_tx<B: StateBackend>(
         // The producer injects them directly into `body.transactions`
         // without ever passing them through the mempool.
         Transaction::SubmitEvidence(_) => TxValidity::invalid(TxValidationCode::Unauthorized),
+        Transaction::ProposeUpgrade(propose_tx) => {
+            governance::validate_propose(state, chain_id, fee, propose_tx)
+        }
+        Transaction::VoteUpgrade(vote_tx) => {
+            governance::validate_vote(state, chain_id, fee, vote_tx)
+        }
     }
 }
 
@@ -2118,6 +2165,10 @@ pub const QUERY_METHOD_PENDING_WITHDRAWALS: &str = "pending_withdrawals";
 /// validation authenticates the index and records directly against the
 /// block-proven state root.
 pub const QUERY_METHOD_VALIDATOR_REGISTRATIONS: &str = "validator_registrations";
+/// Query method: open upgrade proposal and enacted switch.
+///
+/// Args: none. Returns a borsh [`UpgradeStatus`].
+pub const QUERY_METHOD_UPGRADE_STATUS: &str = "upgrade_status";
 
 /// Dispatch a [`neutrino_runtime_abi::QueryRequest`] against `state`.
 ///
@@ -2143,6 +2194,11 @@ pub fn query<B: neutrino_runtime_core::StateBackend>(
         QUERY_METHOD_RUNTIME_INFO => query_runtime_info(),
         QUERY_METHOD_PENDING_WITHDRAWALS => query_pending_withdrawals(&request.args, state),
         QUERY_METHOD_VALIDATOR_REGISTRATIONS => query_validator_registrations(state),
+        QUERY_METHOD_UPGRADE_STATUS => {
+            let payload = borsh::to_vec(&governance::status(state))
+                .expect("borsh encode UpgradeStatus never fails");
+            neutrino_runtime_abi::QueryResponse::ok(payload)
+        }
         unknown => QueryResponse::err(QueryStatus::UnknownMethod, unknown.as_bytes().to_vec()),
     }
 }

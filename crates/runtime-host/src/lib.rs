@@ -572,13 +572,16 @@ mod tests {
         assert_eq!(output.applied, 0);
         assert_eq!(output.failed, 0);
         assert_eq!(output.pre_state_root, output.post_state_root);
-        // Empty blocks must also inspect pending mandatory sanctions.
-        assert_eq!(witness.witnessed_keys.len(), 2);
-        assert!(
-            witness
-                .witnessed_keys
-                .contains(&neutrino_default_runtime_core::accountability::QUEUE_KEY.to_vec())
-        );
+        // Empty blocks must also inspect pending mandatory sanctions and the
+        // governance records whose expiry is block-start housekeeping.
+        assert_eq!(witness.witnessed_keys.len(), 4);
+        for key in [
+            neutrino_default_runtime_core::accountability::QUEUE_KEY,
+            neutrino_default_runtime_core::UPGRADE_KEY,
+            neutrino_default_runtime_core::governance::UPGRADE_PROPOSAL_KEY,
+        ] {
+            assert!(witness.witnessed_keys.contains(&key.to_vec()));
+        }
         // Read-only blocks fall back to a clone of the live trie so
         // the producer's swap path remains unconditional.
         assert_eq!(post_state.root(), live.state_root());

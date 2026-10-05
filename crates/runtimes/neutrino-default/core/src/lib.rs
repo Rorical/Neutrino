@@ -163,6 +163,13 @@ pub const VALIDATOR_SET_KEY: &[u8] = b"validator_set";
 /// transition to discover new consensus-side
 /// [`neutrino_primitives::Validator`] entries.
 pub const VALIDATOR_REGISTRATIONS_KEY: &[u8] = b"validator_registrations";
+/// Canonical key holding at most one [`ScheduledUpgrade`].
+///
+/// The chunk Guest adopts the scheduled program set at the boundary entering
+/// `activate_at_chunk`. Written by governance (design 24); read from the
+/// post-state witness.
+pub const UPGRADE_KEY: &[u8] = b"upgrade:scheduled";
+pub use neutrino_consensus_types::history_proof::{ProgramSet, ScheduledUpgrade};
 /// Prefix used to derive state keys for per-validator registration
 /// records: `registration_key(addr) = REGISTRATION_KEY_PREFIX || addr`.
 /// Each key holds a borsh-encoded [`ValidatorRegistration`].

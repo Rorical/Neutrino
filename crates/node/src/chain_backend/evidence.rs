@@ -26,10 +26,8 @@ where
     /// Triggered by evidence arrival, finalization and block-production events.
     /// Proving never holds the engine lock or blocks the BFT message task.
     pub(super) fn start_evidence_jobs(&self) {
-        let (Some(block_key), Some(evidence_key)) = (
-            self.proof_system.consensus_block_key(),
-            self.proof_system.evidence_key(),
-        ) else {
+        let (Some(block_key), Some(evidence_key)) = (self.block_program(), self.evidence_program())
+        else {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -219,13 +217,13 @@ where
         artifact: EvidenceArtifact,
     ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
-        if Some(artifact.membership.batch.fact_guest_vk_digest) != self.proof_system.fact_key()
+        if Some(artifact.membership.batch.fact_guest_vk_digest) != self.fact_program()
             || !artifact.membership.binds(
                 &artifact.statement,
-                &self.proof_system.fact_key().unwrap_or_default(),
+                &self.fact_program().unwrap_or_default(),
             )
             || artifact.proof_bytes.is_empty()
-            || Some(artifact.evidence_guest_vk_digest) != self.proof_system.evidence_key()
+            || Some(artifact.evidence_guest_vk_digest) != self.evidence_program()
             || artifact.proof_bytes.len()
                 > neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES
         {

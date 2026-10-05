@@ -60,7 +60,7 @@ fn engine() -> Engine<MemoryDatabase> {
 #[tokio::test]
 async fn persisted_program_profile_does_not_enable_pruning_before_authentication() {
     let mut engine = engine();
-    engine.set_history_domain(job(0, 4).range.domain).unwrap();
+    engine.set_history_domain(domain_of(&job(0, 4))).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
     backend.start_history_jobs();
     assert!(
@@ -79,11 +79,28 @@ async fn persisted_program_profile_does_not_enable_pruning_before_authentication
     );
 }
 
+fn domain_of(job: &Job) -> ProofDomain {
+    ProofDomain {
+        chain: job.range.chain,
+        programs: job.range.start.programs,
+    }
+}
+
 fn job(start: u64, end: u64) -> Job {
     let spec = spec();
     let chain = ChainBinding::from_spec(&spec);
+    let programs = neutrino_consensus_types::history_proof::ProgramSet {
+        runtime_code_hash: spec.runtime_code_hash,
+        execution: ExecutionPrograms {
+            fact: [1; 8],
+            evidence: [2; 8],
+            block: [3; 8],
+        },
+        chunk: [4; 8],
+        checkpoint: [5; 8],
+    };
     let boundary = |count| {
-        let mut boundary = ConsensusBoundary::genesis(&spec);
+        let mut boundary = ConsensusBoundary::genesis(&spec, programs);
         boundary.next_chunk_id = count;
         boundary.height = count * chain.chunk_size;
         boundary.slot = boundary.height;
@@ -91,16 +108,7 @@ fn job(start: u64, end: u64) -> Job {
     };
     Job {
         range: HistoryStatement {
-            domain: ProofDomain {
-                chain,
-                execution: ExecutionPrograms {
-                    fact: [1; 8],
-                    evidence: [2; 8],
-                    block: [3; 8],
-                },
-                chunk: [4; 8],
-                checkpoint: [5; 8],
-            },
+            chain,
             start: boundary(start),
             end: boundary(end),
         },
@@ -503,7 +511,7 @@ fn archived_ranges_split_on_reusable_aligned_boundaries_without_overflow() {
 async fn bootstrap_pause_cancels_dormant_jobs_and_releases_their_pins() {
     let mut engine = engine();
     let queued = job(0, 4);
-    engine.set_history_domain(queued.range.domain).unwrap();
+    engine.set_history_domain(domain_of(&queued)).unwrap();
     let mut interrupted = job(4, 8);
     interrupted.state = 1;
     save(&mut engine, &queued).unwrap();

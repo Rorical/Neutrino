@@ -16,9 +16,7 @@ use neutrino_consensus_types::{
     AggregatedVote, Block, BlockProofPublicInputs, Body, FinalityCert, FinalityVoteData,
     FinalityVotePhase, Header, VoteAttestation,
     history::{HistoryFrontier, HistoryPath},
-    history_proof::{
-        ChainBinding, Checkpoint, ExecutionPrograms, HistoryProof, HistoryStatement, ProofDomain,
-    },
+    history_proof::{ChainBinding, Checkpoint, HistoryProof, HistoryStatement, ProofDomain},
 };
 use neutrino_crypto::bls::SecretKey;
 use neutrino_default_runtime_core::apply_block;
@@ -56,18 +54,26 @@ impl ProofSystem for NativeHistory {
     fn history_domain(&self, spec: &ChainSpec) -> Result<ProofDomain, ProofError> {
         Ok(ProofDomain {
             chain: ChainBinding::from_spec(spec),
-            execution: ExecutionPrograms {
-                fact: [3; 8],
-                evidence: [2; 8],
-                block: [1; 8],
-            },
-            chunk: [4; 8],
-            checkpoint: [5; 8],
+            programs: support::programs([1; 8], [4; 32]),
         })
     }
 
-    fn verify_history(&self, spec: &ChainSpec, proof: &HistoryProof) -> Result<(), ProofError> {
-        if proof.statement.domain != self.history_domain(spec)? || proof.receipt.as_slice() != [7] {
+    fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
+        Some(support::programs([1; 8], [4; 32]).guests())
+    }
+
+    fn verify_history(
+        &self,
+        spec: &ChainSpec,
+        proof: &HistoryProof,
+        trusted_start: &neutrino_consensus_types::history_proof::ConsensusBoundary,
+    ) -> Result<(), ProofError> {
+        assert_eq!(proof.statement.start, *trusted_start);
+        let domain = self.history_domain(spec)?;
+        if proof.statement.chain != domain.chain
+            || proof.statement.start.programs != domain.programs
+            || proof.receipt.as_slice() != [7]
+        {
             return Err(ProofError::BackendRejected);
         }
         Ok(())
@@ -203,7 +209,10 @@ impl Fixture {
         Self {
             proof: HistoryProof {
                 statement: HistoryStatement {
-                    domain: NativeHistory.history_domain(&witness.chain_spec).unwrap(),
+                    chain: NativeHistory
+                        .history_domain(&witness.chain_spec)
+                        .unwrap()
+                        .chain,
                     start: validated.statement.start,
                     end: validated.statement.end,
                 },
@@ -237,10 +246,17 @@ impl Fixture {
     fn source(&self) -> Backend {
         let mut engine = Engine::genesis(self.spec.clone(), MemoryDatabase::new()).unwrap();
         engine
-            .set_history_domain(self.proof.statement.domain)
+            .set_history_domain(NativeHistory.history_domain(&self.spec).unwrap())
             .unwrap();
-        let token =
-            || verify_history_proof(&NativeHistory, &self.spec, self.proof.clone()).unwrap();
+        let token = || {
+            verify_history_proof(
+                &NativeHistory,
+                &self.spec,
+                self.proof.clone(),
+                &self.proof.statement.start,
+            )
+            .unwrap()
+        };
         engine
             .install_bootstrap(
                 token(),

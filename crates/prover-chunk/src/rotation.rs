@@ -3,8 +3,8 @@
 use alloc::vec::Vec;
 use neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS;
 use neutrino_default_runtime_core::{
-    VALIDATOR_REGISTRATIONS_KEY, VALIDATOR_SET_KEY, ValidatorRegistration, ValidatorRegistrations,
-    ValidatorSet, registration_key,
+    UPGRADE_KEY, VALIDATOR_REGISTRATIONS_KEY, VALIDATOR_SET_KEY, ValidatorRegistration,
+    ValidatorRegistrations, ValidatorSet, registration_key,
 };
 use neutrino_primitives::{ConsensusParams, Hash, Validator};
 use neutrino_runtime_abi::StateWitness;
@@ -19,7 +19,8 @@ use neutrino_runtime_core::{StateBackend, WitnessState};
 pub fn witness_keys(previous: &[Validator], index: &ValidatorRegistrations) -> Vec<Vec<u8>> {
     let mut keys = alloc::vec![
         VALIDATOR_SET_KEY.to_vec(),
-        VALIDATOR_REGISTRATIONS_KEY.to_vec()
+        VALIDATOR_REGISTRATIONS_KEY.to_vec(),
+        UPGRADE_KEY.to_vec()
     ];
     keys.extend(previous.iter().map(|validator| {
         neutrino_default_runtime_core::validator_key(&validator.withdrawal_credentials)
@@ -44,6 +45,44 @@ pub fn witness_keys_from<B: StateBackend>(state: &mut B, previous: &[Validator])
         .and_then(|bytes| borsh::from_slice(&bytes).ok())
         .unwrap_or_default();
     witness_keys(previous, &index)
+}
+
+/// Program set the next chunk runs under, from the authenticated post-state.
+///
+/// A scheduled upgrade applies exactly at the boundary entering
+/// `activate_at_chunk`; stale or future records leave the current set in
+/// force. The key must have been witnessed (see [`witness_keys`]).
+///
+/// # Errors
+/// Returns [`RotationError::Witness`] when the key was not witnessed and
+/// [`RotationError::Codec`] when the record is malformed or names an
+/// incomplete program set.
+pub fn next_programs_from_witness(
+    current: neutrino_consensus_types::history_proof::ProgramSet,
+    next_chunk_id: u64,
+    witness: &StateWitness,
+) -> Result<neutrino_consensus_types::history_proof::ProgramSet, RotationError> {
+    if !witness
+        .witnessed_keys
+        .iter()
+        .any(|entry| entry == UPGRADE_KEY)
+    {
+        return Err(RotationError::Witness);
+    }
+    let mut state = WitnessState::new(witness).map_err(|_| RotationError::Witness)?;
+    let Some(bytes) = state.read(UPGRADE_KEY) else {
+        return Ok(current);
+    };
+    let upgrade: neutrino_default_runtime_core::ScheduledUpgrade =
+        borsh::from_slice(&bytes).map_err(|_| RotationError::Codec)?;
+    if !upgrade.programs.is_complete() {
+        return Err(RotationError::Codec);
+    }
+    Ok(if upgrade.activate_at_chunk == next_chunk_id {
+        upgrade.programs
+    } else {
+        current
+    })
 }
 
 fn is_seated(previous: &[Validator], address: &Hash) -> bool {

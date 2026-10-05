@@ -23,8 +23,10 @@ pub struct ExecutionContext {
     pub pre_state_root: Hash,
     /// Slot of the preceding block.
     pub parent_slot: u64,
-    /// Runtime artifact required by the chain specification.
+    /// Runtime artifact executing this chunk; equals `programs.runtime_code_hash`.
     pub vm_code_hash: Hash,
+    /// Complete program set active for this chunk (design 24).
+    pub programs: neutrino_consensus_types::history_proof::ProgramSet,
     /// Fee rate required by the chain specification.
     pub gas_price: u128,
     /// Authenticated consensus validator set for this chunk.

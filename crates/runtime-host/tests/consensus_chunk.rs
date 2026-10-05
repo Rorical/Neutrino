@@ -139,8 +139,9 @@ fn pipeline<P: neutrino_runtime_host::ProgramProver>(prover: P, real: bool) {
     let runtime_hash = neutrino_runtime_host::default_runtime_code_hash();
     let (mut witness, mut inputs) =
         two_block_fixture(system.verifying_key().hash_u32(), runtime_hash);
-    witness.evidence_guest_vk_digest = system.evidence_key().unwrap();
-    witness.fact_guest_vk_digest = system.fact_key().unwrap();
+    witness.context.programs = system.programs().unwrap().with_runtime(runtime_hash);
+    witness.evidence_guest_vk_digest = witness.context.programs.execution.evidence;
+    witness.fact_guest_vk_digest = witness.context.programs.execution.fact;
     for ((input, _), block) in inputs.iter_mut().zip(&mut witness.blocks) {
         input.evidence_anchor.evidence_guest_vk_digest = witness.evidence_guest_vk_digest;
         input.evidence_anchor.fact_guest_vk_digest = witness.fact_guest_vk_digest;
@@ -243,7 +244,7 @@ fn pipeline<P: neutrino_runtime_host::ProgramProver>(prover: P, real: bool) {
             .is_err()
     );
     let mut wrong_key = expected;
-    wrong_key.programs.block[0] ^= 1;
+    wrong_key.start.programs.chunk[0] ^= 1;
     assert!(system.verify_consensus_chunk(&proof, &wrong_key).is_err());
 }
 

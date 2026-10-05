@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use neutrino_consensus_types::history_proof::ConsensusStatement;
-use neutrino_consensus_types::history_proof::{ChainBinding, ConsensusBoundary, ExecutionPrograms};
+use neutrino_consensus_types::history_proof::{ChainBinding, ConsensusBoundary, ProgramSet};
 use neutrino_consensus_types::{Body, Chunk, ChunkProofPublicInputs};
 use neutrino_primitives::{ChainSpec, Hash, Seed, merkle_root_of_hashes};
 use neutrino_runtime_abi::StateWitness;
@@ -63,8 +63,9 @@ pub struct ValidatedConsensus {
     pub next_context: ExecutionContext,
 }
 
-/// Construct the canonical execution context from a validated chain specification.
-pub fn genesis_context(spec: &ChainSpec) -> ExecutionContext {
+/// Construct the canonical execution context from a validated chain specification
+/// and the program set every node trusts at genesis.
+pub fn genesis_context(spec: &ChainSpec, programs: ProgramSet) -> ExecutionContext {
     ExecutionContext {
         chain_id: spec.chain_id,
         chain_spec_hash: spec.hash(),
@@ -73,7 +74,8 @@ pub fn genesis_context(spec: &ChainSpec) -> ExecutionContext {
         parent_block_hash: spec.genesis_block_hash,
         pre_state_root: spec.genesis_state_root,
         parent_slot: 0,
-        vm_code_hash: spec.runtime_code_hash,
+        vm_code_hash: programs.runtime_code_hash,
+        programs,
         gas_price: spec.runtime.gas_price,
         active_validators: spec.initial_validators.clone(),
         history_root: neutrino_consensus_types::history::empty_history_root(),
@@ -105,6 +107,7 @@ fn boundary_with_validators(
         validators_root,
         seed,
         history_root: context.history_root,
+        programs: context.programs,
     })
 }
 
@@ -217,11 +220,20 @@ pub fn validate_consensus_using(
     let history_root = frontier
         .append(commitment(&historical))
         .ok_or(ConsensusError::Context)?;
+    let next_chunk_id = context
+        .chunk_id
+        .checked_add(1)
+        .ok_or(ConsensusError::Context)?;
+    // A scheduled upgrade in the authenticated post-state switches the program
+    // set at this boundary; otherwise the current set stays in force.
+    let next_programs = crate::rotation::next_programs_from_witness(
+        context.programs,
+        next_chunk_id,
+        &input.post_state,
+    )
+    .map_err(|_| ConsensusError::Rotation)?;
     let next_context = ExecutionContext {
-        chunk_id: context
-            .chunk_id
-            .checked_add(1)
-            .ok_or(ConsensusError::Context)?,
+        chunk_id: next_chunk_id,
         parent_block_hash: execution.chunk.end_block_hash,
         pre_state_root: execution.chunk.end_state_root,
         parent_slot: input
@@ -235,7 +247,8 @@ pub fn validate_consensus_using(
         chain_id: context.chain_id,
         chain_spec_hash: context.chain_spec_hash,
         chunk_size: context.chunk_size,
-        vm_code_hash: context.vm_code_hash,
+        vm_code_hash: next_programs.runtime_code_hash,
+        programs: next_programs,
         gas_price: context.gas_price,
     };
     let start = boundary_with_validators(
@@ -251,11 +264,6 @@ pub fn validate_consensus_using(
     Ok(ValidatedConsensus {
         statement: ConsensusStatement {
             chain: ChainBinding::from_spec(spec),
-            programs: ExecutionPrograms {
-                fact: input.fact_guest_vk_digest,
-                evidence: input.evidence_guest_vk_digest,
-                block: input.block_guest_vk_digest,
-            },
             start,
             end,
             chunk: execution.chunk,
@@ -374,17 +382,25 @@ fn validate_context(input: &ConsensusWitness) -> Result<(), ConsensusError> {
     let context = &input.context;
     let spec = &input.chain_spec;
     spec.validate().map_err(|_| ConsensusError::Context)?;
+    // The witness programs must be the ones the incoming boundary names; the
+    // chunk receipt is only meaningful under that exact set.
     if context.chain_spec_hash != spec.hash()
         || context.chain_id != spec.chain_id
         || context.chunk_size != spec.consensus.chunk_size
         || context.gas_price != spec.runtime.gas_price
-        || context.vm_code_hash != spec.runtime_code_hash
+        || !context.programs.is_complete()
+        || context.vm_code_hash != context.programs.runtime_code_hash
+        || input.fact_guest_vk_digest != context.programs.execution.fact
+        || input.evidence_guest_vk_digest != context.programs.execution.evidence
+        || input.block_guest_vk_digest != context.programs.execution.block
         || input.blocks.len() != input.bodies.len()
     {
         return Err(ConsensusError::Context);
     }
     if context.chunk_id == 0
-        && (context != &genesis_context(spec) || input.seed != spec.genesis_seed)
+        && (context != &genesis_context(spec, context.programs)
+            || context.programs.runtime_code_hash != spec.runtime_code_hash
+            || input.seed != spec.genesis_seed)
     {
         return Err(ConsensusError::Context);
     }
@@ -412,9 +428,6 @@ pub fn validate_successor(
 ) -> Result<ConsensusStatement, ConsensusError> {
     if context_boundary(&input.context, input.seed)? != previous.end
         || ChainBinding::from_spec(&input.chain_spec) != previous.chain
-        || input.evidence_guest_vk_digest != previous.programs.evidence
-        || input.block_guest_vk_digest != previous.programs.block
-        || input.fact_guest_vk_digest != previous.programs.fact
     {
         return Err(ConsensusError::Context);
     }

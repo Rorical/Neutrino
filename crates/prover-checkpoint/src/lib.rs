@@ -11,7 +11,8 @@
 extern crate alloc;
 
 use neutrino_consensus_types::history_proof::{
-    CheckpointInput, ConsensusStatement, HistoryStatement, MAX_FOLD_CHUNKS, ProofDomain,
+    ChainBinding, CheckpointInput, ConsensusBoundary, ConsensusStatement, HistoryStatement,
+    MAX_FOLD_CHUNKS, ProofDomain,
 };
 
 /// A malformed domain, range, chunk, or cross-proof boundary.
@@ -19,7 +20,7 @@ use neutrino_consensus_types::history_proof::{
 pub enum CheckpointError {
     /// A zero chain identifier, chunk size, or program key.
     Domain,
-    /// A child uses a different chain or program profile.
+    /// A child uses a different chain identity.
     Identity,
     /// Invalid, empty, oversized, or overflowing range.
     Range,
@@ -41,29 +42,33 @@ impl core::fmt::Display for CheckpointError {
 }
 impl core::error::Error for CheckpointError {}
 
-/// Validate structural domain obligations; the outer verifier pins its exact value.
-pub fn validate_domain(domain: &ProofDomain) -> Result<(), CheckpointError> {
-    if domain.chain.chain_id == 0
-        || domain.chain.chunk_size == 0
-        || [
-            domain.execution.fact,
-            domain.execution.evidence,
-            domain.execution.block,
-            domain.chunk,
-            domain.checkpoint,
-        ]
-        .contains(&[0; 8])
-    {
+/// Validate structural chain obligations; the outer verifier pins the exact value.
+pub const fn validate_chain(chain: &ChainBinding) -> Result<(), CheckpointError> {
+    if chain.chain_id == 0 || chain.chunk_size == 0 {
         return Err(CheckpointError::Domain);
     }
     Ok(())
 }
 
+/// Validate a trust profile: its chain and the program set trusted at the anchor.
+pub fn validate_domain(domain: &ProofDomain) -> Result<(), CheckpointError> {
+    validate_chain(&domain.chain)?;
+    if !domain.programs.is_complete() {
+        return Err(CheckpointError::Domain);
+    }
+    Ok(())
+}
+
+/// A boundary is usable when its arithmetic holds and it names complete programs.
+fn boundary_is_valid(boundary: &ConsensusBoundary, chain: &ChainBinding) -> bool {
+    boundary.is_well_formed(chain) && boundary.programs.is_complete()
+}
+
 /// Validate a positive conditional range without authenticating its start or receipt.
 pub fn validate_history(statement: &HistoryStatement) -> Result<u64, CheckpointError> {
-    validate_domain(&statement.domain)?;
-    if !statement.start.is_well_formed(&statement.domain.chain)
-        || !statement.end.is_well_formed(&statement.domain.chain)
+    validate_chain(&statement.chain)?;
+    if !boundary_is_valid(&statement.start, &statement.chain)
+        || !boundary_is_valid(&statement.end, &statement.chain)
         || statement.end.slot <= statement.start.slot
     {
         return Err(CheckpointError::Range);
@@ -75,14 +80,16 @@ pub fn validate_history(statement: &HistoryStatement) -> Result<u64, CheckpointE
 #[allow(clippy::suspicious_operation_groupings)] // Wire fields intentionally use different names.
 pub fn validate_chunk(
     statement: &ConsensusStatement,
-    domain: &ProofDomain,
+    chain: &ChainBinding,
 ) -> Result<(), CheckpointError> {
-    if statement.chain != domain.chain || statement.programs != domain.execution {
+    if statement.chain != *chain {
         return Err(CheckpointError::Identity);
     }
     let (start, end, chunk) = (&statement.start, &statement.end, &statement.chunk);
-    if !start.is_well_formed(&domain.chain)
-        || !end.is_well_formed(&domain.chain)
+    // A program switch between `start` and `end` is legal: the chunk receipt,
+    // verified under `start.programs.chunk`, proved the upgrade that authorised it.
+    if !boundary_is_valid(start, chain)
+        || !boundary_is_valid(end, chain)
         || start.next_chunk_id.checked_add(1) != Some(end.next_chunk_id)
         || chunk.chunk_id != start.next_chunk_id
         || start.height.checked_add(1) != Some(chunk.start_height)
@@ -106,32 +113,34 @@ pub fn validate_chunk(
 pub fn validate(input: &CheckpointInput) -> Result<HistoryStatement, CheckpointError> {
     match input {
         CheckpointInput::Fold {
-            domain,
+            chain,
             previous,
             chunks,
         } => {
-            validate_domain(domain)?;
+            validate_chain(chain)?;
             if chunks.is_empty() || chunks.len() > MAX_FOLD_CHUNKS {
                 return Err(CheckpointError::Range);
             }
             let first = &chunks[0];
             let (start, mut boundary, previous_count) = if let Some(prior) = previous {
-                if prior.domain != *domain {
+                if prior.chain != *chain {
                     return Err(CheckpointError::Identity);
                 }
                 (prior.start, prior.end, validate_history(prior)?)
             } else {
                 (first.start, first.start, 0)
             };
+            // Boundary equality carries the program set, so a switch inside the
+            // range is continuous exactly when the next chunk starts under it.
             for chunk in chunks.iter() {
-                validate_chunk(chunk, domain)?;
+                validate_chunk(chunk, chain)?;
                 if chunk.start != boundary {
                     return Err(CheckpointError::Boundary);
                 }
                 boundary = chunk.end;
             }
             let output = HistoryStatement {
-                domain: *domain,
+                chain: *chain,
                 start,
                 end: boundary,
             };
@@ -143,7 +152,7 @@ pub fn validate(input: &CheckpointInput) -> Result<HistoryStatement, CheckpointE
             Ok(output)
         }
         CheckpointInput::Merge { left, right } => {
-            if left.domain != right.domain {
+            if left.chain != right.chain {
                 return Err(CheckpointError::Identity);
             }
             let left_count = validate_history(left)?;
@@ -152,7 +161,7 @@ pub fn validate(input: &CheckpointInput) -> Result<HistoryStatement, CheckpointE
                 return Err(CheckpointError::Boundary);
             }
             let output = HistoryStatement {
-                domain: left.domain,
+                chain: left.chain,
                 start: left.start,
                 end: right.end,
             };

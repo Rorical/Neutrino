@@ -14,8 +14,29 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
     P: ProofSystem + Send + Sync + 'static,
 {
+    /// Block program of the embedded set, when the backend can prove at all.
+    pub(super) fn block_program(&self) -> Option<[u32; 8]> {
+        self.proof_system
+            .programs()
+            .map(|programs| programs.execution.block)
+    }
+
+    /// Evidence program of the embedded set.
+    pub(super) fn evidence_program(&self) -> Option<[u32; 8]> {
+        self.proof_system
+            .programs()
+            .map(|programs| programs.execution.evidence)
+    }
+
+    /// Fact program of the embedded set.
+    pub(super) fn fact_program(&self) -> Option<[u32; 8]> {
+        self.proof_system
+            .programs()
+            .map(|programs| programs.execution.fact)
+    }
+
     pub(super) fn ready_consensus_quorum(&self) -> Option<BftQuorumIdentity> {
-        self.proof_system.consensus_block_key()?;
+        self.block_program()?;
         self.with_engine(|engine| engine.bft_quorum_identity(engine.finalized_next_chunk_id()))
     }
 

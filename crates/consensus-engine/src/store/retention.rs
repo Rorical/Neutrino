@@ -100,10 +100,14 @@ impl<DB: Database> ChainStore<DB> {
             .ok_or(StoreError::Corrupt(
                 "retention has no covering recursive proof",
             ))?;
-        if prefix.statement.domain.chain
+        let Some(domain) = self.history_domain()? else {
+            return Err(StoreError::Corrupt(
+                "retention has no trusted history domain",
+            ));
+        };
+        if prefix.statement.chain
             != neutrino_consensus_types::history_proof::ChainBinding::from_spec(spec)
-            || prefix.statement.start
-                != neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(spec)
+            || prefix.statement.start != domain.genesis_boundary(spec)
             || self.consensus_boundary(coverage)? != Some(prefix.statement.end)
             || info.pruned_before_chunk > coverage
         {

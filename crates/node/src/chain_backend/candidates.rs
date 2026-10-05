@@ -20,7 +20,7 @@ where
     ) -> Result<CandidateByChunkResponse, SyncBackendError> {
         if self.light_checkpoint().is_some()
             || self.bootstrap_pending()
-            || self.proof_system.consensus_block_key().is_none()
+            || self.block_program().is_none()
         {
             return Err(SyncBackendError::NotAvailable(
                 "candidate unavailable".into(),
@@ -197,7 +197,7 @@ where
         &self,
         candidate: &BftCandidate,
     ) -> Result<(), SyncBackendError> {
-        if self.light_checkpoint().is_some() || self.proof_system.consensus_block_key().is_none() {
+        if self.light_checkpoint().is_some() || self.block_program().is_none() {
             return Err(SyncBackendError::NotAvailable(
                 "complete consensus backend unavailable".into(),
             ));

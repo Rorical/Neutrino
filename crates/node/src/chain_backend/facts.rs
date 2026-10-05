@@ -14,7 +14,7 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     pub(super) fn queue_facts(&self, requests: &[FactRequest]) {
-        if requests.is_empty() || self.proof_system.fact_key().is_none() {
+        if requests.is_empty() || self.fact_program().is_none() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {

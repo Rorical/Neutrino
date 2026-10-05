@@ -126,7 +126,7 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     pub(super) fn begin_block_verdict(&self, source: Hash) -> VerdictToken {
-        let program = self.proof_system.consensus_block_key();
+        let program = self.block_program();
         let chain_spec = self.with_engine(|engine| engine.chain_spec().hash());
         let generation = self
             .availability_verdicts
@@ -147,7 +147,7 @@ where
     }
 
     pub(super) fn cached_block_verdict_at(&self, token: VerdictToken) -> Option<ProofVerdict> {
-        let program = self.proof_system.consensus_block_key();
+        let program = self.block_program();
         let chain_spec = self.with_engine(|engine| engine.chain_spec().hash());
         // Scope reads release the Engine lock before taking the cache lock.
         // Bootstrap holds Engine while invalidating this generation, so a reset
@@ -163,7 +163,7 @@ where
         token: VerdictToken,
         verdict: ProofVerdict,
     ) -> bool {
-        let program = self.proof_system.consensus_block_key();
+        let program = self.block_program();
         let chain_spec = self.with_engine(|engine| engine.chain_spec().hash());
         self.availability_verdicts
             .lock()

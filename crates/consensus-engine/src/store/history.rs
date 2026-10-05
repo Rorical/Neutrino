@@ -509,7 +509,7 @@ impl<DB: Database> ChainStore<DB> {
         }
         for boundary in boundaries {
             let checkpoint = neutrino_consensus_types::Checkpoint {
-                domain: *domain,
+                chain: domain.chain,
                 boundary,
             };
             batch.put(
@@ -846,23 +846,13 @@ mod tests {
     fn range_artifact(start: u64, end: u64) -> neutrino_consensus_types::HistoryProof {
         use neutrino_consensus_types::history_proof::{
             ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryProof, HistoryStatement,
-            ProofDomain,
+            ProgramSet,
         };
-        let domain = ProofDomain {
-            chain: ChainBinding {
-                chain_id: 7,
-                chain_spec_hash: [1; 32],
-                chunk_size: 1,
-                runtime_code_hash: [2; 32],
-                gas_price: 0,
-            },
-            execution: ExecutionPrograms {
-                fact: [1; 8],
-                evidence: [2; 8],
-                block: [3; 8],
-            },
-            chunk: [4; 8],
-            checkpoint: [5; 8],
+        let chain = ChainBinding {
+            chain_id: 7,
+            chain_spec_hash: [1; 32],
+            chunk_size: 1,
+            gas_price: 0,
         };
         let boundary = |count| ConsensusBoundary {
             next_chunk_id: count,
@@ -873,10 +863,20 @@ mod tests {
             validators_root: [5; 32],
             seed: [6; 32],
             history_root: [7; 32],
+            programs: ProgramSet {
+                runtime_code_hash: [2; 32],
+                execution: ExecutionPrograms {
+                    fact: [1; 8],
+                    evidence: [2; 8],
+                    block: [3; 8],
+                },
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
         };
         HistoryProof {
             statement: HistoryStatement {
-                domain,
+                chain,
                 start: boundary(start),
                 end: boundary(end),
             },

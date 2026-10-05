@@ -299,9 +299,8 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
     let system = Sp1ProofSystem::new(prover).unwrap();
     // Independent local verification also checks CUDA-to-CPU interoperability.
     let verifier = Sp1ProofSystem::new(ProverClient::builder().light().build()).unwrap();
-    assert_eq!(system.consensus_block_key(), verifier.consensus_block_key());
-    assert_eq!(system.evidence_key(), verifier.evidence_key());
-    assert_eq!(system.fact_key(), verifier.fact_key());
+    assert_eq!(system.programs(), verifier.programs());
+    assert!(system.programs().unwrap().is_complete());
     let cache = AcceptanceCache::from_env().unwrap();
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     let mut live = LiveTrie::default();
@@ -327,8 +326,12 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         30_000_000,
         &live,
     );
-    first.evidence_guest_vk_digest = system.evidence_key().unwrap();
-    first.fact_guest_vk_digest = system.fact_key().unwrap();
+    first.context.programs = system
+        .programs()
+        .unwrap()
+        .with_runtime(neutrino_runtime_host::default_runtime_code_hash());
+    first.evidence_guest_vk_digest = first.context.programs.execution.evidence;
+    first.fact_guest_vk_digest = first.context.programs.execution.fact;
     input.evidence_anchor.fact_guest_vk_digest = first.fact_guest_vk_digest;
     input.evidence_anchor.evidence_guest_vk_digest = first.evidence_guest_vk_digest;
     first.blocks[0].output.accountability.anchor = input.evidence_anchor;
@@ -559,7 +562,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
     // STARK layer. This range starts at the explicitly trusted first boundary.
     let chunk: Sp1ChunkProof = borsh::from_slice(&chunk_bytes).unwrap();
     let history_expected = neutrino_consensus_types::history_proof::HistoryStatement {
-        domain: system.history_domain(&next.chain_spec).unwrap(),
+        chain: system.history_domain(&next.chain_spec).unwrap().chain,
         start: expected.start,
         end: expected.end,
     };
@@ -579,7 +582,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
                 if proof.statement != history_expected {
                     return Err(ProofError::PublicInputMismatch);
                 }
-                verifier.verify_history(&next.chain_spec, &proof)
+                verifier.verify_history(&next.chain_spec, &proof, &history_expected.start)
             },
             || {
                 let proof = system

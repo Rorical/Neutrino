@@ -184,7 +184,13 @@ where
             .store()
             .history_domain()
             .map_err(storage_error)?
-            .map_or(ZERO_HASH, |domain| Checkpoint { domain, boundary }.hash());
+            .map_or(ZERO_HASH, |domain| {
+                Checkpoint {
+                    chain: domain.chain,
+                    boundary,
+                }
+                .hash()
+            });
         let finalized = rpc_queries::finalized_info(engine).map_err(query_error)?;
         let chunk_hash = match finalized.chunk_id {
             Some(id) => {
@@ -230,8 +236,8 @@ where
     pub(super) fn p2p_local_status(&self) -> Result<Status, SyncBackendError> {
         if let Some(checkpoint) = self.light_checkpoint() {
             return Ok(Status {
-                chain_id: checkpoint.domain.chain.chain_id,
-                chain_spec_hash: checkpoint.domain.chain.chain_spec_hash,
+                chain_id: checkpoint.chain.chain_id,
+                chain_spec_hash: checkpoint.chain.chain_spec_hash,
                 finalized_chunk_id: None,
                 finalized_chunk_hash: ZERO_HASH,
                 recursive_covered_chunks: checkpoint.boundary.next_chunk_id,
@@ -248,8 +254,8 @@ where
         if let Some(checkpoint) = self.light_checkpoint() {
             let boundary = checkpoint.boundary;
             return Ok(LocalProgress {
-                chain_id: checkpoint.domain.chain.chain_id,
-                chain_spec_hash: checkpoint.domain.chain.chain_spec_hash,
+                chain_id: checkpoint.chain.chain_id,
+                chain_spec_hash: checkpoint.chain.chain_spec_hash,
                 finalized_chunk_id: None,
                 finalized_chunk_hash: ZERO_HASH,
                 recursive_covered_chunks: boundary.next_chunk_id,

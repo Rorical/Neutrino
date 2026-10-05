@@ -53,6 +53,11 @@ Neutrino separates the chain into two cleanly decoupled layers:
   exact offence inputs. Archive nodes may keep older sources; admissible evidence
   remains bounded by the protocol window. See
   [design 23](docs/design/23-evidence-availability.md).
+- **Program sets travel in consensus boundaries.** Every boundary names the runtime
+  code hash and the five Guest keys in force from it on; a scheduled upgrade read
+  from authenticated state switches them at a chunk boundary, and history recursion
+  verifies each receipt under the program set of its already-proven start boundary.
+  See [design 24](docs/design/24-runtime-upgrades.md).
 
 The development protocol has one current format without version numbers.
 Upgrades are incompatible; deprecated formats and migration paths are not
@@ -100,6 +105,7 @@ latency histograms per stage and the fact coverage of the last chunk proof.
 | [recursive-checkpoint-proofs](docs/design/21-recursive-checkpoint-proofs.md) | Fold/Merge recursion, bounded history access and anchored light-client updates |
 | [BFT protocol](docs/design/22-bft-candidate-replacement.md) | Fair leaders, nil phases, certified round changes, locks and durable recovery |
 | [evidence availability](docs/design/23-evidence-availability.md) | Authenticated signed artifacts, bounded discovery, retrieval and pruning |
+| [runtime upgrades](docs/design/24-runtime-upgrades.md) | Program sets in boundaries, state-driven switches at chunk boundaries, recursion across upgrades |
 
 ## Prerequisites
 

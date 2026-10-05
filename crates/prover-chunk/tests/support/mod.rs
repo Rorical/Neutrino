@@ -21,6 +21,23 @@ use neutrino_runtime_core::{
     host::{LiveTrie, TracingState},
 };
 
+/// The program set every fixture context carries for the given block key and runtime.
+pub const fn programs(
+    key_digest: [u32; 8],
+    runtime_hash: Hash,
+) -> neutrino_consensus_types::history_proof::ProgramSet {
+    neutrino_consensus_types::history_proof::ProgramSet {
+        runtime_code_hash: runtime_hash,
+        execution: neutrino_consensus_types::history_proof::ExecutionPrograms {
+            fact: [3; 8],
+            evidence: [2; 8],
+            block: key_digest,
+        },
+        chunk: [7; 8],
+        checkpoint: [8; 8],
+    }
+}
+
 #[allow(clippy::too_many_lines)] // The complete signed protocol fixture is intentionally explicit.
 /// Construct matching execution and consensus inputs.
 pub fn fixture(
@@ -178,6 +195,7 @@ pub fn fixture_with_live(
         pre_state_root: output.pre_state_root,
         parent_slot: 0,
         vm_code_hash: runtime_hash,
+        programs: programs(key_digest, runtime_hash),
         gas_price: pi.gas_price,
         active_validators: validators.clone(),
         history_root: neutrino_prover_chunk::history::history_commitment(&[]),

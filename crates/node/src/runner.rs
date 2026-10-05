@@ -225,10 +225,8 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
             }
             (None, None) => (
                 neutrino_consensus_types::history_proof::Checkpoint {
-                    domain,
-                    boundary: neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(
-                        &spec,
-                    ),
+                    chain: domain.chain,
+                    boundary: domain.genesis_boundary(&spec),
                 },
                 spec.genesis_time,
             ),

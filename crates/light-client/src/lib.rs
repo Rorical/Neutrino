@@ -19,13 +19,16 @@ use neutrino_primitives::{ChainSpec, Hash};
 
 /// Cryptographic receipt verifier, implemented by the trusted proof backend.
 ///
-/// Implementations must reject non-Compressed, malformed, wrong-program and
-/// non-success receipts, bind the exact statement bytes, and compare the whole
-/// domain with independently configured chain and program keys.
+/// Implementations must reject non-Compressed, malformed and non-success
+/// receipts, bind the exact statement bytes, compare the statement's chain with
+/// the trusted chain, and verify the receipt under the checkpoint program named
+/// by the trusted anchor (design 24). The backend must verify the receipt under
+/// `trusted.programs.checkpoint` and require the statement to start under the
+/// same program set; statements may legitimately end under a later set.
 pub trait HistoryVerifier {
     /// Backend verification failure.
     type Error;
-    /// Authenticate the exact conditional range and expected program domain.
+    /// Authenticate the exact conditional range against the trusted chain.
     fn verify_history(
         &self,
         proof: &HistoryProof,
@@ -106,10 +109,17 @@ impl LightClient {
             .map_err(|_| LightClientError::InvalidAnchor)?;
         if (trusted.boundary.next_chunk_id == 0
             && trusted.boundary
-                != neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(spec))
-            || trusted.domain.chain != ChainBinding::from_spec(spec)
-            || !trusted.boundary.is_well_formed(&trusted.domain.chain)
-            || neutrino_prover_checkpoint::validate_domain(&trusted.domain).is_err()
+                != neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(
+                    spec,
+                    trusted.boundary.programs,
+                ))
+            || trusted.chain != ChainBinding::from_spec(spec)
+            || !trusted.boundary.is_well_formed(&trusted.chain)
+            || neutrino_prover_checkpoint::validate_domain(&ProofDomain {
+                chain: trusted.chain,
+                programs: trusted.boundary.programs,
+            })
+            .is_err()
         {
             return Err(LightClientError::InvalidAnchor);
         }
@@ -146,7 +156,7 @@ impl LightClient {
         snapshot: &LightClientSnapshot,
         max_future_drift_secs: u64,
     ) -> Result<Self, LightClientError> {
-        if snapshot.checkpoint.domain != *trusted_domain {
+        if snapshot.checkpoint.chain != trusted_domain.chain {
             return Err(LightClientError::Domain);
         }
         let trusted_at = snapshot
@@ -160,6 +170,16 @@ impl LightClient {
     #[must_use]
     pub const fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
+    }
+
+    /// Trust profile at the current anchor: the chain plus the program set the
+    /// anchor boundary names.
+    #[must_use]
+    pub const fn trusted_domain(&self) -> ProofDomain {
+        ProofDomain {
+            chain: self.checkpoint.chain,
+            programs: self.checkpoint.boundary.programs,
+        }
     }
 
     /// Local expiry; receipt replay cannot extend it.
@@ -181,7 +201,7 @@ impl LightClient {
             return Err(LightClientError::Expired);
         }
         let statement = &proof.statement;
-        if statement.domain != self.checkpoint.domain {
+        if statement.chain != self.checkpoint.chain {
             return Err(LightClientError::Domain);
         }
         neutrino_prover_checkpoint::validate_history(statement)
@@ -191,7 +211,7 @@ impl LightClient {
             return Err(LightClientError::UnexpectedTarget);
         }
         verifier
-            .verify_history(proof, &self.checkpoint.domain)
+            .verify_history(proof, &self.trusted_domain())
             .map_err(|_| LightClientError::Verification)?;
         if endpoint == self.checkpoint {
             return Ok(UpdateOutcome::AlreadyCurrent);

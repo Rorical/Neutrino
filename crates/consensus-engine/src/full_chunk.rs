@@ -45,15 +45,34 @@ pub struct PreparedConsensusChunk<P: ProofSystem> {
 }
 
 impl<DB: Database> Engine<DB> {
-    /// Pin all three accepted programs from the configured proof backend. These are
-    /// process configuration, never chosen by a peer or evidence reporter.
-    pub const fn set_evidence_programs(
+    /// Pin the Guest identities of the configured proof backend. This is
+    /// process configuration, never chosen by a peer or evidence reporter. Bound
+    /// to the chain specification's runtime artifact, it names the genesis
+    /// boundary's program set and the evidence anchor digests.
+    pub const fn set_programs(
         &mut self,
-        block: [u32; 8],
-        evidence: [u32; 8],
-        facts: [u32; 8],
+        guests: neutrino_consensus_types::history_proof::GuestPrograms,
     ) {
-        self.evidence_programs = Some((block, evidence, facts));
+        self.programs = Some(guests.with_runtime(self.chain_spec().runtime_code_hash));
+    }
+
+    /// The genesis boundary's program set: the pinned Guests bound to the
+    /// specification's runtime. Without a proof backend the Guests are zero;
+    /// such a node can serve and import blocks but never proves, verifies or
+    /// agrees on a chunk statement, because incomplete sets fail validation.
+    pub fn genesis_programs(&self) -> neutrino_consensus_types::history_proof::ProgramSet {
+        self.programs.unwrap_or_else(|| {
+            neutrino_consensus_types::history_proof::GuestPrograms {
+                execution: neutrino_consensus_types::history_proof::ExecutionPrograms {
+                    fact: [0; 8],
+                    evidence: [0; 8],
+                    block: [0; 8],
+                },
+                chunk: [0; 8],
+                checkpoint: [0; 8],
+            }
+            .with_runtime(self.chain_spec().runtime_code_hash)
+        })
     }
 
     /// Build the trusted incoming anchor for ordinary or replay execution.
@@ -61,9 +80,7 @@ impl<DB: Database> Engine<DB> {
         &self,
         height: u64,
     ) -> Result<neutrino_consensus_types::evidence::EvidenceAnchor, alloc::string::String> {
-        let Some((block_guest_vk_digest, evidence_guest_vk_digest, fact_guest_vk_digest)) =
-            self.evidence_programs
-        else {
+        let Some(programs) = self.programs else {
             return Ok(neutrino_consensus_types::evidence::EvidenceAnchor::default());
         };
         let spec = self.chain_spec();
@@ -81,9 +98,9 @@ impl<DB: Database> Engine<DB> {
             history_root: frontier
                 .root()
                 .ok_or_else(|| alloc::string::String::from("invalid historical boundary"))?,
-            block_guest_vk_digest,
-            evidence_guest_vk_digest,
-            fact_guest_vk_digest,
+            block_guest_vk_digest: programs.execution.block,
+            evidence_guest_vk_digest: programs.execution.evidence,
+            fact_guest_vk_digest: programs.execution.fact,
             policy: spec.runtime,
         })
     }
@@ -93,8 +110,11 @@ impl<DB: Database> Engine<DB> {
         &self,
         evidence: &neutrino_consensus_types::SlashingEvidence,
     ) -> Result<neutrino_prover_chunk::evidence::EvidenceWitness, FinalizeError<DB::Error>> {
-        let (block_guest_vk_digest, _, _) =
-            self.evidence_programs.ok_or(ProofError::Unsupported)?;
+        let block_guest_vk_digest = self
+            .programs
+            .ok_or(ProofError::Unsupported)?
+            .execution
+            .block;
         let id = neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
             .map_err(|_| ProofError::InvalidWitness)?;
         if !is_recent_history_index(id, self.finalized_next_chunk_id()) {
@@ -173,8 +193,8 @@ impl<DB: Database> Engine<DB> {
         }
         if ancestor != context.parent_block_hash
             || self
-                .evidence_programs
-                .is_some_and(|(key, _, _)| &key != block_key)
+                .programs
+                .is_some_and(|programs| &programs.execution.block != block_key)
         {
             return Err(ProofError::InvalidWitness.into());
         }
@@ -257,8 +277,9 @@ impl<DB: Database> Engine<DB> {
         self.validate_chunk_id_sequence(chunk_id)?;
         let spec = self.chain_spec();
         if chunk_id == 0 {
+            let programs = self.genesis_programs();
             return Ok((
-                genesis_context(spec),
+                genesis_context(spec, programs),
                 spec.genesis_seed,
                 HistoryWitness::default(),
             ));
@@ -339,10 +360,17 @@ impl<DB: Database> Engine<DB> {
         end_hash: Hash,
         proof_system: &P,
     ) -> Result<PreparedConsensusChunk<P>, FinalizeError<DB::Error>> {
-        let key = proof_system
-            .consensus_block_key()
-            .ok_or(ProofError::Unsupported)?;
+        let programs = proof_system
+            .programs()
+            .ok_or(ProofError::Unsupported)?
+            .with_runtime(self.chain_spec().runtime_code_hash);
+        let key = programs.execution.block;
         let (context, seed, _) = self.consensus_boundary(chunk_id)?;
+        // A node can only prove chunks that start under its embedded program
+        // set; after a switch it follows by verification until it is upgraded.
+        if context.programs != programs {
+            return Err(ProofError::Unsupported.into());
+        }
         let start = chunk_id
             .checked_mul(context.chunk_size)
             .and_then(|height| height.checked_add(1))
@@ -420,8 +448,8 @@ impl<DB: Database> Engine<DB> {
                 .flat_map(|body| body.finality_votes.iter().map(|vote| vote.data.chunk_id)),
         )?;
         let witness = ConsensusWitness {
-            fact_guest_vk_digest: proof_system.fact_key().ok_or(ProofError::Unsupported)?,
-            evidence_guest_vk_digest: proof_system.evidence_key().ok_or(ProofError::Unsupported)?,
+            fact_guest_vk_digest: programs.execution.fact,
+            evidence_guest_vk_digest: programs.execution.evidence,
             chain_spec: self.chain_spec().clone(),
             context,
             seed,
@@ -580,7 +608,10 @@ impl<DB: Database> Engine<DB> {
         if witness.context != context
             || witness.seed != seed
             || witness.chain_spec != *self.chain_spec()
-            || proof_system.consensus_block_key() != Some(witness.block_guest_vk_digest)
+            || proof_system
+                .programs()
+                .map(|programs| programs.execution.block)
+                != Some(witness.block_guest_vk_digest)
         {
             return Err(ProofError::PublicInputMismatch.into());
         }

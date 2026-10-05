@@ -48,7 +48,7 @@ impl<DB: Database> Engine<DB> {
             return Err(ProofError::InvalidWitness.into());
         }
         if count == 0 {
-            return Ok(ConsensusBoundary::genesis(self.chain_spec()));
+            return self.trusted_genesis_boundary();
         }
         let boundary = self
             .store()
@@ -60,6 +60,14 @@ impl<DB: Database> Engine<DB> {
         Ok(boundary)
     }
 
+    /// Genesis boundary under the program set pinned by [`Self::set_programs`].
+    pub fn trusted_genesis_boundary(&self) -> Result<ConsensusBoundary, FinalizeError<DB::Error>> {
+        Ok(ConsensusBoundary::genesis(
+            self.chain_spec(),
+            self.genesis_programs(),
+        ))
+    }
+
     /// Pin the active history program profile and index retained canonical endpoints.
     /// Called once after the configured proof backend derives its trusted keys.
     pub fn set_history_domain(
@@ -69,21 +77,16 @@ impl<DB: Database> Engine<DB> {
         if domain.chain != ChainBinding::from_spec(self.chain_spec()) {
             return Err(ProofError::PublicInputMismatch.into());
         }
-        if self
-            .evidence_programs
-            .is_some_and(|(block, evidence, facts)| {
-                (block, evidence, facts)
-                    != (
-                        domain.execution.block,
-                        domain.execution.evidence,
-                        domain.execution.fact,
-                    )
-            })
+        if !domain.programs.is_complete()
+            || self
+                .programs
+                .is_some_and(|programs| programs != domain.programs)
         {
             return Err(ProofError::PublicInputMismatch.into());
         }
-        let genesis = ConsensusBoundary::genesis(self.chain_spec());
+        let genesis = domain.genesis_boundary(self.chain_spec());
         self.store_mut().set_history_domain(&domain, &genesis)?;
+        self.programs = Some(domain.programs);
         Ok(())
     }
 
@@ -140,9 +143,9 @@ impl<DB: Database> Engine<DB> {
         let domain = *verified.domain();
         let proof = verified.into_proof();
         let statement = &proof.statement;
-        if statement.domain != domain
-            || statement.domain.chain != ChainBinding::from_spec(self.chain_spec())
-            || self.store().history_domain()? != Some(statement.domain)
+        if statement.chain != domain.chain
+            || statement.chain != ChainBinding::from_spec(self.chain_spec())
+            || self.store().history_domain()?.map(|trusted| trusted.chain) != Some(statement.chain)
             || statement.covered_chunks().is_none()
             || self.canonical_boundary(statement.start.next_chunk_id)? != statement.start
             || self.canonical_boundary(statement.end.next_chunk_id)? != statement.end
@@ -168,7 +171,9 @@ impl<DB: Database> Engine<DB> {
         proof: &HistoryProof,
         prover: &P,
     ) -> Result<HistoryImportOutcome, FinalizeError<DB::Error>> {
-        let verified = verify_history_proof(prover, self.chain_spec(), proof.clone())?;
+        let trusted_start = self.canonical_boundary(proof.statement.start.next_chunk_id)?;
+        let verified =
+            verify_history_proof(prover, self.chain_spec(), proof.clone(), &trusted_start)?;
         self.commit_verified_history(verified)
     }
 
@@ -199,8 +204,8 @@ impl<DB: Database> Engine<DB> {
             .store()
             .checkpoint_by_hash(&end_hash)?
             .ok_or(ProofError::InvalidWitness)?;
-        if start.domain != end.domain
-            || self.store().history_domain()? != Some(start.domain)
+        if start.chain != end.chain
+            || self.store().history_domain()?.map(|trusted| trusted.chain) != Some(start.chain)
             || start.boundary.next_chunk_id >= end.boundary.next_chunk_id
             || self.canonical_boundary(start.boundary.next_chunk_id)? != start.boundary
             || self.canonical_boundary(end.boundary.next_chunk_id)? != end.boundary

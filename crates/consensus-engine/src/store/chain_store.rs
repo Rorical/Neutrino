@@ -201,7 +201,10 @@ impl<DB: Database> ChainStore<DB> {
         );
         if let Some(domain) = self.history_domain()? {
             for boundary in [statement.start, statement.end] {
-                let checkpoint = Checkpoint { domain, boundary };
+                let checkpoint = Checkpoint {
+                    chain: domain.chain,
+                    boundary,
+                };
                 batch.put(
                     Column::Checkpoints,
                     keys::chunk_id_key(boundary.next_chunk_id),
@@ -914,26 +917,26 @@ mod tests {
 
     fn checkpoint(index: u64, parent: Hash) -> Checkpoint {
         use neutrino_consensus_types::history_proof::{
-            ChainBinding, ConsensusBoundary, ExecutionPrograms, ProofDomain,
+            ChainBinding, ConsensusBoundary, ExecutionPrograms, ProgramSet,
         };
         Checkpoint {
-            domain: ProofDomain {
-                chain: ChainBinding {
-                    chain_id: 7,
-                    chain_spec_hash: h(1),
-                    chunk_size: 128,
-                    runtime_code_hash: h(2),
-                    gas_price: 0,
-                },
-                execution: ExecutionPrograms {
-                    fact: [1; 8],
-                    evidence: [2; 8],
-                    block: [3; 8],
-                },
-                chunk: [4; 8],
-                checkpoint: [5; 8],
+            chain: ChainBinding {
+                chain_id: 7,
+                chain_spec_hash: h(1),
+                chunk_size: 128,
+                gas_price: 0,
             },
             boundary: ConsensusBoundary {
+                programs: ProgramSet {
+                    runtime_code_hash: h(2),
+                    execution: ExecutionPrograms {
+                        fact: [1; 8],
+                        evidence: [2; 8],
+                        block: [3; 8],
+                    },
+                    chunk: [4; 8],
+                    checkpoint: [5; 8],
+                },
                 next_chunk_id: index,
                 height: index * 128,
                 block_hash: parent,
@@ -1180,7 +1183,7 @@ mod tests {
         let end = checkpoint(3, h(101));
         let proof = HistoryProof {
             statement: HistoryStatement {
-                domain: start.domain,
+                chain: start.chain,
                 start: start.boundary,
                 end: end.boundary,
             },

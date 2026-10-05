@@ -9,7 +9,7 @@ compose the current proof path:
 | EvidenceProof | Batch of objective offences and historical membership | Block native SP1 recursion |
 | Block proof | STF, authenticated state, execution commitments and sanctions | Chunk optimized SP1 recursion |
 | Chunk proof | Block composition, continuity, BFT, VRF, validator rotation and compact next boundary | Node finalization/import and History recursion |
-| History proof | Adjacent Chunk or History ranges under one chain/program domain | Anchored verification and further History recursion |
+| History proof | Adjacent Chunk or History ranges under one chain binding, across program switches | Anchored verification and further History recursion |
 
 Transactions are checked inside the block STF; there is no separate transaction
 proof artifact. `MockProofSystem` supplies only deterministic block fixtures; it

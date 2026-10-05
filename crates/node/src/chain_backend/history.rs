@@ -129,7 +129,7 @@ where
                 .history_proof(&id)
                 .map_err(|error| error.to_string())?
                 .filter(|proof| {
-                    proof.statement.domain == job.range.domain
+                    proof.statement.chain == job.range.chain
                         && proof.statement.start == job.range.start
                         && proof.statement.end.next_chunk_id <= job.range.end.next_chunk_id
                 })
@@ -213,7 +213,7 @@ where
     }
     let target = end.min(engine.recursive_covered_chunks().saturating_add(16));
     let range = HistoryStatement {
-        domain,
+        chain: domain.chain,
         start: engine
             .canonical_boundary(0)
             .map_err(|error| error.to_string())?,
@@ -266,7 +266,10 @@ where
             .with_engine(Engine::latest_history_proof)
             .map_err(|error| error.to_string())?;
         if let Some(proof) = saved {
-            let verified = verify_history_proof(self.proof_system.as_ref(), &spec, proof)
+            let genesis = self
+                .with_engine(Engine::trusted_genesis_boundary)
+                .map_err(|error| error.to_string())?;
+            let verified = verify_history_proof(self.proof_system.as_ref(), &spec, proof, &genesis)
                 .map_err(|error| error.to_string())?;
             self.with_engine_mut(|engine| engine.commit_verified_history(verified))
                 .map_err(|error| error.to_string())?;
@@ -365,7 +368,7 @@ where
             super::rpc_queries::ensure_history_endpoints(engine, start, end)?;
             let (start, end) = engine.history_endpoints(start, end).map_err(query_error)?;
             let range = HistoryStatement {
-                domain: start.domain,
+                chain: start.chain,
                 start: start.boundary,
                 end: end.boundary,
             };
@@ -741,7 +744,14 @@ where
     }
 
     fn verify(&self, proof: HistoryProof) -> Result<VerifiedHistory, String> {
-        verify_history_proof(self.prover, &self.spec, proof).map_err(|error| error.to_string())
+        let trusted_start = self
+            .engine
+            .lock()
+            .expect("engine")
+            .canonical_boundary(proof.statement.start.next_chunk_id)
+            .map_err(|error| error.to_string())?;
+        verify_history_proof(self.prover, &self.spec, proof, &trusted_start)
+            .map_err(|error| error.to_string())
     }
 
     fn commit(&self, verified: VerifiedHistory) -> Result<(), String> {
@@ -774,7 +784,7 @@ where
             .history_proof(&id)
             .map_err(|error| error.to_string())?
             .ok_or("persisted history progress is unavailable")?;
-        if proof.statement.domain != self.range.domain
+        if proof.statement.chain != self.range.chain
             || proof.statement.start != self.range.start
             || proof.statement.end.next_chunk_id > self.range.end.next_chunk_id
         {
@@ -790,7 +800,8 @@ where
             .store()
             .history_domain()
             .map_err(|error| error.to_string())?
-            == Some(self.range.domain)
+            .map(|domain| domain.chain)
+            == Some(self.range.chain)
             && engine
                 .canonical_boundary(self.range.start.next_chunk_id)
                 .map_err(|error| error.to_string())?
@@ -872,7 +883,7 @@ where
                 self.fold(cursor, next, previous.as_ref())?
             };
             let proof = verified.proof().clone();
-            if proof.statement.domain != job.range.domain
+            if proof.statement.chain != job.range.chain
                 || proof.statement.start != job.range.start
                 || proof.statement.end.next_chunk_id != next
             {
@@ -944,7 +955,7 @@ where
             proof.map_err(|error| error.to_string())?
         };
         let proof = verified.proof().clone();
-        if proof.statement.domain != self.range.domain
+        if proof.statement.chain != self.range.chain
             || proof.statement.start.next_chunk_id != start
             || proof.statement.end.next_chunk_id != end
         {

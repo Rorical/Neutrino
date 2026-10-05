@@ -148,8 +148,8 @@ where
             .proof_system
             .history_domain(&spec)
             .map_err(|error| error.to_string())?;
-        if trusted.domain != domain {
-            return Err("light trust origin uses a different program domain".to_owned());
+        if trusted.chain != domain.chain || !trusted.boundary.programs.is_complete() {
+            return Err("light trust origin uses a different chain binding".to_owned());
         }
         let (state_bytes, proof_bytes) = self.with_engine(|engine| {
             let db = engine.store().db();
@@ -171,7 +171,11 @@ where
             let latest = stored
                 .decode_latest(proof_bytes.as_deref(), expiry)?
                 .map(|proof| {
-                    verify_history_proof(self.proof_system.as_ref(), &spec, proof)
+                    // `decode_latest` bound the whole statement, start included,
+                    // to the durable snapshot's range identity, so the start
+                    // boundary is authenticated by local trusted storage.
+                    let start = proof.statement.start;
+                    verify_history_proof(self.proof_system.as_ref(), &spec, proof, &start)
                         .map(VerifiedHistory::into_proof)
                         .map_err(|error| error.to_string())
                 })
@@ -243,12 +247,18 @@ where
         &self,
         proof: HistoryProof,
     ) -> Result<CheckpointsImported, SyncBackendError> {
-        let (mut next, origin, trusted_at) = {
+        let (mut next, origin, trusted_at, latest_start) = {
             let guard = self.light.lock().expect("light state");
             let state = guard.as_ref().ok_or_else(|| {
                 SyncBackendError::NotAvailable("light client is not initialized".to_owned())
             })?;
-            let snapshot = (state.client.clone(), state.trust_origin, state.trusted_at);
+            let latest_start = state.latest.as_ref().map(|latest| latest.statement.start);
+            let snapshot = (
+                state.client.clone(),
+                state.trust_origin,
+                state.trusted_at,
+                latest_start,
+            );
             drop(guard);
             snapshot
         };
@@ -258,8 +268,13 @@ where
         }
         let spec = self.with_engine(|engine| engine.chain_spec().clone());
         let verifier = Arc::clone(&self.proof_system);
+        // Trusted starts are the current anchor or the start of the already
+        // accepted latest artifact (an exact re-import), never a peer's claim.
+        let anchor = latest_start
+            .filter(|start| *start == proof.statement.start)
+            .unwrap_or(before.checkpoint.boundary);
         let authenticated = tokio::task::spawn_blocking(move || {
-            verify_history_proof(verifier.as_ref(), &spec, proof)
+            verify_history_proof(verifier.as_ref(), &spec, proof, &anchor)
         })
         .await
         .map_err(|error| SyncBackendError::Storage(error.to_string()))?
@@ -333,19 +348,14 @@ where
 mod tests {
     use super::*;
     use neutrino_consensus_types::history_proof::{
-        ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProofDomain,
+        ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProgramSet,
+        ProofDomain,
     };
     use neutrino_primitives::BoundedBytes;
 
-    fn artifact() -> HistoryProof {
-        let domain = ProofDomain {
-            chain: ChainBinding {
-                chain_id: 1,
-                chain_spec_hash: [1; 32],
-                chunk_size: 1,
-                runtime_code_hash: [2; 32],
-                gas_price: 0,
-            },
+    fn programs() -> ProgramSet {
+        ProgramSet {
+            runtime_code_hash: [2; 32],
             execution: ExecutionPrograms {
                 fact: [1; 8],
                 evidence: [2; 8],
@@ -353,6 +363,15 @@ mod tests {
             },
             chunk: [4; 8],
             checkpoint: [5; 8],
+        }
+    }
+
+    fn artifact() -> HistoryProof {
+        let chain = ChainBinding {
+            chain_id: 1,
+            chain_spec_hash: [1; 32],
+            chunk_size: 1,
+            gas_price: 0,
         };
         let start = ConsensusBoundary {
             next_chunk_id: 0,
@@ -363,6 +382,7 @@ mod tests {
             validators_root: [3; 32],
             seed: [4; 32],
             history_root: [5; 32],
+            programs: programs(),
         };
         let end = ConsensusBoundary {
             next_chunk_id: 1,
@@ -371,7 +391,7 @@ mod tests {
             ..start
         };
         HistoryProof {
-            statement: HistoryStatement { domain, start, end },
+            statement: HistoryStatement { chain, start, end },
             receipt: BoundedBytes::new(vec![1]).unwrap(),
         }
     }
@@ -453,17 +473,22 @@ mod tests {
             &self,
             spec: &neutrino_primitives::ChainSpec,
         ) -> Result<ProofDomain, neutrino_proof_system::ProofError> {
-            let mut domain = artifact().statement.domain;
-            domain.chain = ChainBinding::from_spec(spec);
-            Ok(domain)
+            Ok(ProofDomain {
+                chain: ChainBinding::from_spec(spec),
+                programs: programs(),
+            })
         }
 
         fn verify_history(
             &self,
             spec: &neutrino_primitives::ChainSpec,
             proof: &HistoryProof,
+            trusted_start: &ConsensusBoundary,
         ) -> Result<(), neutrino_proof_system::ProofError> {
-            if proof.statement.domain == self.history_domain(spec)?
+            let domain = self.history_domain(spec)?;
+            if proof.statement.chain == domain.chain
+                && proof.statement.start == *trusted_start
+                && trusted_start.programs == domain.programs
                 && proof.receipt.as_slice() == proof.statement.range_id()
             {
                 Ok(())
@@ -565,9 +590,10 @@ mod tests {
         spec: &neutrino_primitives::ChainSpec,
         trusted_at: u64,
     ) -> (TestBackend, Checkpoint) {
+        let domain = FixtureVerifier.history_domain(spec).unwrap();
         let origin = Checkpoint {
-            domain: FixtureVerifier.history_domain(spec).unwrap(),
-            boundary: ConsensusBoundary::genesis(spec),
+            chain: domain.chain,
+            boundary: domain.genesis_boundary(spec),
         };
         let engine =
             neutrino_consensus_engine::Engine::genesis(spec.clone(), FaultDatabase::default())
@@ -585,7 +611,7 @@ mod tests {
     }
     fn jump(origin: &Checkpoint) -> HistoryProof {
         signed(&HistoryStatement {
-            domain: origin.domain,
+            chain: origin.chain,
             start: origin.boundary,
             end: ConsensusBoundary {
                 next_chunk_id: 3,

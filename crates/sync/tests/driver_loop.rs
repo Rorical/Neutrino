@@ -1821,7 +1821,7 @@ async fn unavailable_backend_data_returns_an_explicit_rpc_reply() {
 
 fn sample_history_proof() -> HistoryProof {
     use neutrino_consensus_types::history_proof::{
-        ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProofDomain,
+        ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProgramSet,
     };
     let start = ConsensusBoundary {
         next_chunk_id: 1,
@@ -1832,24 +1832,24 @@ fn sample_history_proof() -> HistoryProof {
         validators_root: [3; 32],
         seed: [4; 32],
         history_root: [5; 32],
+        programs: ProgramSet {
+            runtime_code_hash: [2; 32],
+            execution: ExecutionPrograms {
+                fact: [1; 8],
+                evidence: [2; 8],
+                block: [3; 8],
+            },
+            chunk: [4; 8],
+            checkpoint: [5; 8],
+        },
     };
     HistoryProof {
         statement: HistoryStatement {
-            domain: ProofDomain {
-                chain: ChainBinding {
-                    chain_id: 1,
-                    chain_spec_hash: [0; 32],
-                    chunk_size: 2,
-                    runtime_code_hash: [2; 32],
-                    gas_price: 0,
-                },
-                execution: ExecutionPrograms {
-                    fact: [1; 8],
-                    evidence: [2; 8],
-                    block: [3; 8],
-                },
-                chunk: [4; 8],
-                checkpoint: [5; 8],
+            chain: ChainBinding {
+                chain_id: 1,
+                chain_spec_hash: [0; 32],
+                chunk_size: 2,
+                gas_price: 0,
             },
             start,
             end: ConsensusBoundary {

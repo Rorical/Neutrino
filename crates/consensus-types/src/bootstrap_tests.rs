@@ -1,5 +1,7 @@
 use super::*;
-use crate::history_proof::{ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement};
+use crate::history_proof::{
+    ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProgramSet,
+};
 
 fn data() -> BootstrapData {
     let boundary = ConsensusBoundary {
@@ -11,27 +13,27 @@ fn data() -> BootstrapData {
         validators_root: [3; 32],
         seed: [4; 32],
         history_root: crate::history::empty_history_root(),
-    };
-    let domain = crate::history_proof::ProofDomain {
-        chain: ChainBinding {
-            chain_id: 1,
-            chain_spec_hash: [5; 32],
-            chunk_size: 1,
+        programs: ProgramSet {
             runtime_code_hash: [6; 32],
-            gas_price: 0,
+            execution: ExecutionPrograms {
+                fact: [7; 8],
+                evidence: [8; 8],
+                block: [9; 8],
+            },
+            chunk: [10; 8],
+            checkpoint: [11; 8],
         },
-        execution: ExecutionPrograms {
-            fact: [7; 8],
-            evidence: [8; 8],
-            block: [9; 8],
-        },
-        chunk: [10; 8],
-        checkpoint: [11; 8],
+    };
+    let chain = ChainBinding {
+        chain_id: 1,
+        chain_spec_hash: [5; 32],
+        chunk_size: 1,
+        gas_price: 0,
     };
     BootstrapData::new(
         HistoryProof {
             statement: HistoryStatement {
-                domain,
+                chain,
                 start: boundary,
                 end: ConsensusBoundary {
                     next_chunk_id: 1,

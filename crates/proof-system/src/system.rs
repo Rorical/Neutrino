@@ -12,7 +12,9 @@ use core::fmt::Debug;
 use crate::error::ProofError;
 use crate::history::VerifiedHistory;
 use crate::public_inputs::BlockProofPublicInputs;
-use neutrino_consensus_types::history_proof::{HistoryProof, ProofDomain};
+use neutrino_consensus_types::history_proof::{
+    ConsensusBoundary, GuestPrograms, HistoryProof, ProofDomain,
+};
 use neutrino_primitives::ChainSpec;
 
 /// Backend-agnostic proof system interface.
@@ -62,20 +64,12 @@ pub trait ProofSystem {
         Err(ProofError::Unsupported)
     }
 
-    /// Authenticated block program for the complete consensus aggregation path.
-    /// `None` denotes partial test backends; it must not authorize a production
-    /// substitute for a missing complete proof.
-    fn consensus_block_key(&self) -> Option<[u32; 8]> {
-        None
-    }
-
-    /// Independent objective-evidence program accepted by this backend.
-    fn evidence_key(&self) -> Option<[u32; 8]> {
-        None
-    }
-
-    /// Early cryptographic fact program accepted by evidence recursion.
-    fn fact_key(&self) -> Option<[u32; 8]> {
+    /// The Guest identities this backend embeds and can prove under: the three
+    /// execution Guests, the chunk Guest and the checkpoint Guest. The engine
+    /// binds them to the chain specification's runtime artifact for the genesis
+    /// boundary. `None` denotes partial test backends; it must not authorize a
+    /// production substitute for a missing complete proof.
+    fn programs(&self) -> Option<GuestPrograms> {
         None
     }
     /// `(covered, total)` signature checks of the most recently proven chunk,
@@ -176,9 +170,17 @@ pub trait ProofSystem {
         Err(ProofError::Unsupported)
     }
 
-    /// Authenticate a compressed history receipt and its exact trusted domain.
-    /// Use `verify_history_proof` to obtain the token accepted by engine storage.
-    fn verify_history(&self, _spec: &ChainSpec, _proof: &HistoryProof) -> Result<(), ProofError> {
+    /// Authenticate a compressed history receipt under the program set of
+    /// `trusted_start`, a boundary the caller has already authenticated from
+    /// its own canonical store or trust anchor and that the statement must start
+    /// at. The key is never taken from the receipt's own statement. Use
+    /// `verify_history_proof` to obtain the token accepted by engine storage.
+    fn verify_history(
+        &self,
+        _spec: &ChainSpec,
+        _proof: &HistoryProof,
+        _trusted_start: &ConsensusBoundary,
+    ) -> Result<(), ProofError> {
         Err(ProofError::Unsupported)
     }
 }

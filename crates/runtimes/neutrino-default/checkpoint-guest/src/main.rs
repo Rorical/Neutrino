@@ -22,22 +22,25 @@ fn main() {
     );
     let input: CheckpointInput = borsh::from_slice(&bytes).expect("canonical checkpoint input");
     let output = neutrino_prover_checkpoint::validate(&input).expect("valid history composition");
+    // Program identities are inputs committed through the boundaries, never
+    // constants of this program. Every receipt is verified under the program
+    // named by its START boundary: the output start is the verifier's trusted
+    // anchor, each child's start equals an already-proven boundary, so no
+    // receipt ever selects the key it is checked against (design 24).
     match &input {
         CheckpointInput::Fold {
-            domain,
-            previous,
-            chunks,
+            previous, chunks, ..
         } => {
             if let Some(previous) = previous {
-                verify(previous, &domain.checkpoint);
+                verify(previous, &previous.start.programs.checkpoint);
             }
             for chunk in chunks.iter() {
-                verify(chunk, &domain.chunk);
+                verify(chunk, &chunk.start.programs.chunk);
             }
         }
         CheckpointInput::Merge { left, right } => {
-            verify(left, &output.domain.checkpoint);
-            verify(right, &output.domain.checkpoint);
+            verify(left, &left.start.programs.checkpoint);
+            verify(right, &right.start.programs.checkpoint);
         }
     }
     sp1_zkvm::io::commit_slice(&borsh::to_vec(&output).expect("canonical history statement"));

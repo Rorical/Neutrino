@@ -1,6 +1,6 @@
 //! Authenticated history tokens keep expensive verification outside engine locks.
 
-use neutrino_consensus_types::history_proof::{HistoryProof, ProofDomain};
+use neutrino_consensus_types::history_proof::{ConsensusBoundary, HistoryProof, ProofDomain};
 use neutrino_primitives::ChainSpec;
 
 use crate::{ProofError, ProofSystem};
@@ -31,16 +31,22 @@ impl VerifiedHistory {
 }
 
 /// Authenticate exact bytes once before handing a range to an engine or scheduler.
-/// The caller must still establish that the start is its trusted canonical anchor.
+///
+/// `trusted_start` is a boundary the caller authenticated itself (canonical
+/// store, genesis derivation or explicit trust anchor). The statement must start
+/// exactly there and the receipt is verified under that boundary's program set,
+/// so no receipt can select the key it is checked against. Callers still
+/// recheck the end against their canonical state before committing.
 pub fn verify_history_proof<P: ProofSystem + ?Sized>(
     backend: &P,
     spec: &ChainSpec,
     proof: HistoryProof,
+    trusted_start: &ConsensusBoundary,
 ) -> Result<VerifiedHistory, ProofError> {
     let domain = backend.history_domain(spec)?;
-    if proof.statement.domain != domain {
+    if proof.statement.chain != domain.chain || proof.statement.start != *trusted_start {
         return Err(ProofError::PublicInputMismatch);
     }
-    backend.verify_history(spec, &proof)?;
+    backend.verify_history(spec, &proof, trusted_start)?;
     Ok(VerifiedHistory { proof, domain })
 }

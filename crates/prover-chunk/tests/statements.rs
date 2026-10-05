@@ -52,6 +52,16 @@ fn context() -> ExecutionContext {
         pre_state_root: [3; 32],
         parent_slot: 0,
         vm_code_hash: [4; 32],
+        programs: neutrino_consensus_types::history_proof::ProgramSet {
+            runtime_code_hash: [4; 32],
+            execution: neutrino_consensus_types::history_proof::ExecutionPrograms {
+                fact: [3; 8],
+                evidence: [2; 8],
+                block: [1; 8],
+            },
+            chunk: [7; 8],
+            checkpoint: [8; 8],
+        },
         gas_price: 9,
         active_validators: vec![validator()],
         history_root: commitment(&Vec::<u8>::new()),

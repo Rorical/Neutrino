@@ -1211,7 +1211,7 @@ impl<DB: Database> Engine<DB> {
             }
             return Err(ImportError::InvalidBlockProof(err));
         }
-        if self.evidence_programs.is_some() {
+        if self.programs.is_some() {
             let expected_anchor = self.evidence_anchor(header.height).map_err(|_| {
                 ImportError::InvalidBlockProof(
                     neutrino_proof_system::ProofError::PublicInputMismatch,

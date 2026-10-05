@@ -39,16 +39,16 @@ impl ProofSystem for NativeChunkTestSystem {
         self.0.verify_block(proof, pi)
     }
 
-    fn consensus_block_key(&self) -> Option<[u32; 8]> {
-        self.0.consensus_block_key()
-    }
-
-    fn fact_key(&self) -> Option<[u32; 8]> {
-        Some([3; 8])
-    }
-
-    fn evidence_key(&self) -> Option<[u32; 8]> {
-        self.0.evidence_key()
+    // Mock block and evidence programs, with native chunk and checkpoint
+    // identities: this adapter never sets up the recursive Guests.
+    fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
+        let mut execution = self.0.execution_programs();
+        execution.fact = [3; 8];
+        Some(neutrino_consensus_types::history_proof::GuestPrograms {
+            execution,
+            chunk: [7; 8],
+            checkpoint: [8; 8],
+        })
     }
 
     fn block_statement(
@@ -64,7 +64,8 @@ impl ProofSystem for NativeChunkTestSystem {
         witness: &ConsensusWitness,
     ) -> Result<Self::ChunkProof, ProofError> {
         if proofs.len() != witness.blocks.len()
-            || self.consensus_block_key() != Some(witness.block_guest_vk_digest)
+            || self.programs() != Some(witness.context.programs.guests())
+            || witness.context.programs.execution.block != witness.block_guest_vk_digest
         {
             return Err(ProofError::PublicInputMismatch);
         }
@@ -82,7 +83,10 @@ impl ProofSystem for NativeChunkTestSystem {
         proof: &Self::ChunkProof,
         expected: &ConsensusStatement,
     ) -> Result<(), ProofError> {
-        if proof != expected || self.consensus_block_key() != Some(expected.programs.block) {
+        if proof != expected
+            || self.programs().map(|programs| programs.execution.block)
+                != Some(expected.start.programs.execution.block)
+        {
             return Err(ProofError::PublicInputMismatch);
         }
         Ok(())

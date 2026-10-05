@@ -36,25 +36,34 @@ no consensus vote and does not gate Chunk finality.
 
 The authoritative Borsh types are in
 [`consensus-types::history_proof`](../../crates/consensus-types/src/history_proof.rs).
-`ChainBinding` binds chain ID, chain-spec hash, chunk size, runtime hash and gas price.
-`ProofDomain` additionally pins the Fact, Evidence, Block, Chunk and checkpoint VK
-digests. The outer verifier derives every program identity from its own configuration.
+`ChainBinding` binds chain ID, chain-spec hash, chunk size and gas price; it is
+immutable for the life of a chain. Program identities travel in every boundary as a
+`ProgramSet` (runtime code hash plus Fact, Evidence, Block, Chunk and checkpoint VK
+digests), so a chain can switch programs at a chunk boundary without changing its
+binding; see [24 — Runtime and program upgrades](24-runtime-upgrades.md).
+`ProofDomain { chain, programs }` is the verifier's trust profile: the chain binding and
+the program set it trusts at its anchor. The outer verifier derives the genesis program
+set from its own embedded programs and verifies every receipt under the program set of
+the receipt's start boundary, which it has already authenticated.
 There is one incompatible current format, with no version suffixes or fallback decoders.
 
 `ConsensusBoundary` is the state immediately before the next chunk and contains:
 
 - `next_chunk_id`, block height, block hash, state root and slot;
-- validator-set root, seed and history root.
+- validator-set root, seed and history root;
+- the `ProgramSet` in force from this boundary on.
 
-`ConsensusStatement` contains the chain/execution program bindings, compact start
-and end boundaries, canonical Chunk public inputs and finality-certificate hash.
+`ConsensusStatement` contains the chain binding, compact start and end boundaries,
+canonical Chunk public inputs and finality-certificate hash. Its blocks are verified
+under the start boundary's Block program; a scheduled upgrade read from the post-state
+witness may give the end boundary a different program set.
 Full next-context vectors are node-side results, not public values. Wire Chunk
 metadata and the supplied certificate must match the committed statement exactly.
 
-`HistoryStatement { domain, start, end }` is exactly **624 Borsh bytes**, independent
+`HistoryStatement { chain, start, end }` is exactly **816 Borsh bytes**, independent
 of chain age and composition grouping. A receipt is separately bounded to 2 MiB.
 The semantic range ID hashes the whole statement with `DOMAIN_HISTORY`.
-`Checkpoint { domain, boundary }` uses `DOMAIN_CHECKPOINT`; its identity excludes
+`Checkpoint { chain, boundary }` uses `DOMAIN_CHECKPOINT`; its identity excludes
 proof bytes and the range start. Two valid composition groupings therefore produce
 the same endpoint identity, while different starting anchors have different range IDs.
 
@@ -63,13 +72,19 @@ the same endpoint identity, while different starting anchors have different rang
 `Fold` consumes one to sixteen consecutive Chunk statements, optionally preceded
 by a History statement. `Merge` consumes exactly two adjacent History statements.
 Shared no_std validation rejects empty/reversed ranges, overflow, gaps, overlaps,
-reordered chunks, mismatched domains and any differing boundary field. Genesis
-starts use the canonical genesis boundary, including the empty history root.
+reordered chunks, mismatched chain bindings and any differing boundary field,
+including the program set. Genesis starts use the canonical genesis boundary,
+including the empty history root and the genesis program set.
 
 The checkpoint Guest invokes SP1's recursive verifier for each child in exact
-order and commits the derived History statement. The checkpoint self-VK travels
-in the input/output domain; it is not embedded circularly into its own ELF. The
-outer verifier pins it to the independently derived checkpoint program key.
+order and commits the derived History statement. Every child is verified under the
+program named by its own start boundary: a previous or left History receipt under
+`start.programs.checkpoint`, a Chunk receipt under `start.programs.chunk`, and the
+right side of a Merge under `right.start.programs.checkpoint`, which equals the
+left side's proven end. No key is embedded circularly in any ELF and no receipt
+selects the key it is checked against. The outer verifier checks the output under
+the checkpoint program of its trusted start boundary, so a receipt for a range that
+starts at genesis is always the work of the genesis checkpoint Guest.
 
 The host requires `SP1Proof::Compressed`, verifies child receipts with the real
 local verifier and compares exact public-value bytes. A mock SP1 receipt cannot
@@ -128,7 +143,7 @@ Those runtime markers are live state and are not made constant-size by recursion
 Chunk finalization atomically retains its verified compact statement, receipt,
 full next context, immutable boundary and history-tree append. A full-node history
 commit accepts an authenticated `VerifiedHistory` token and rechecks both endpoints
-against local canonical finalized boundaries under the pinned domain. Artifact,
+against local canonical finalized boundaries under the pinned chain binding. Artifact,
 range index, checkpoint and coverage writes are atomic. Importing an old range
 never rewinds the live seed, validator set or execution state.
 
@@ -192,7 +207,7 @@ append frontier remain sufficient to open recent records and append the next lea
 Persistent deletions and the watermark commit atomically before changing in-memory
 state. Restart validates the retained canonical suffix against its boundary. Before
 enabling history jobs or pruning, node startup cryptographically verifies the saved
-latest prefix under the independently derived program domain; corrupt receipt bytes
+latest prefix under the independently derived genesis program set; corrupt receipt bytes
 fail startup while their remaining source data is still retained.
 
 `role = "archive"` preserves complete source history. Archive capability is only

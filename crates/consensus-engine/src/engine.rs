@@ -41,7 +41,7 @@ extern crate alloc;
 #[derive(Debug)]
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
-    pub(crate) evidence_programs: Option<([u32; 8], [u32; 8], [u32; 8])>,
+    pub(crate) programs: Option<neutrino_consensus_types::history_proof::ProgramSet>,
     store: ChainStore<DB>,
     clock: SlotClock,
     state: Trie,
@@ -164,7 +164,7 @@ impl<DB: Database> Engine<DB> {
             active_validator_set,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
-            evidence_programs: None,
+            programs: None,
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),
             rejected_proofs: BTreeMap::new(),
@@ -261,7 +261,9 @@ impl<DB: Database> Engine<DB> {
                 || consensus.next_context.chain_id != chain_spec.chain_id
                 || consensus.next_context.chain_spec_hash != chain_spec.hash()
                 || consensus.next_context.chunk_size != chain_spec.consensus.chunk_size
-                || consensus.next_context.vm_code_hash != chain_spec.runtime_code_hash
+                || consensus.next_context.vm_code_hash
+                    != consensus.next_context.programs.runtime_code_hash
+                || consensus.next_context.programs != boundary.programs
                 || consensus.next_context.gas_price != chain_spec.runtime.gas_price
                 || latest_finalized_chunk_id != boundary.next_chunk_id.checked_sub(1)
                 || finalized_head != boundary.block_hash
@@ -286,6 +288,10 @@ impl<DB: Database> Engine<DB> {
         )?;
 
         let fork_choice = Self::restore_fork_choice(&store, finalized_head, head_hash)?;
+        // The pinned trust profile is process configuration this node persisted
+        // itself; restoring it keeps genesis boundaries derivable before the
+        // proof backend re-pins the same set (a different set is rejected then).
+        let programs = store.history_domain()?.map(|domain| domain.programs);
 
         let mut engine = Self {
             chain_spec,
@@ -301,7 +307,7 @@ impl<DB: Database> Engine<DB> {
             active_validator_set,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
-            evidence_programs: None,
+            programs,
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),
             rejected_proofs: BTreeMap::new(),
@@ -351,11 +357,13 @@ impl<DB: Database> Engine<DB> {
                 .ok_or(StoreError::Corrupt(
                     "history coverage has no prefix receipt",
                 ))?;
-            if Some(proof.statement.domain) != store.history_domain()?
-                || proof.statement.start
-                    != neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(
-                        chain_spec,
-                    )
+            let Some(domain) = store.history_domain()? else {
+                return Err(StoreError::Corrupt(
+                    "history coverage has no trusted domain",
+                ));
+            };
+            if proof.statement.chain != domain.chain
+                || proof.statement.start != domain.genesis_boundary(chain_spec)
                 || store.consensus_boundary(recursive_covered_chunks)? != Some(proof.statement.end)
             {
                 return Err(StoreError::Corrupt("history coverage anchor mismatch"));

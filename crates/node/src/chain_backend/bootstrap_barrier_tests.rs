@@ -5,7 +5,7 @@ use super::{BootstrapRuntime, ChainBackend};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_consensus_types::{
     BlockProofPublicInputs, Chunk,
-    history_proof::{ChainBinding, Checkpoint, ConsensusBoundary, ExecutionPrograms, ProofDomain},
+    history_proof::{ChainBinding, Checkpoint, ConsensusBoundary, ExecutionPrograms},
 };
 use neutrino_proof_system::{
     MockBlockProof, MockProofSystem, ProofError, ProofSystem, UnsupportedExecutor,
@@ -20,18 +20,19 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     let spec = state_sync_tests::spec();
-    let origin = Checkpoint {
-        domain: ProofDomain {
-            chain: ChainBinding::from_spec(&spec),
-            execution: ExecutionPrograms {
-                fact: [1; 8],
-                evidence: [2; 8],
-                block: [3; 8],
-            },
-            chunk: [4; 8],
-            checkpoint: [5; 8],
+    let programs = neutrino_consensus_types::history_proof::ProgramSet {
+        runtime_code_hash: spec.runtime_code_hash,
+        execution: ExecutionPrograms {
+            fact: [1; 8],
+            evidence: [2; 8],
+            block: [3; 8],
         },
-        boundary: ConsensusBoundary::genesis(&spec),
+        chunk: [4; 8],
+        checkpoint: [5; 8],
+    };
+    let origin = Checkpoint {
+        chain: ChainBinding::from_spec(&spec),
+        boundary: ConsensusBoundary::genesis(&spec, programs),
     };
     let backend = ChainBackend::new(
         Engine::genesis(spec, MemoryDatabase::new()).unwrap(),
@@ -75,7 +76,7 @@ impl ProofSystem for PausingProofSystem {
         MockProofSystem.verify_block(proof, inputs)
     }
 
-    fn consensus_block_key(&self) -> Option<[u32; 8]> {
+    fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
         if !self.paused.swap(true, Ordering::AcqRel) {
             self.entered.send(()).unwrap();
             self.resume.lock().unwrap().recv().unwrap();

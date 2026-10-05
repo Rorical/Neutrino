@@ -19,7 +19,7 @@ pub const MAX_CHECKPOINT_INPUT_BYTES: usize = 64 * 1024;
 /// Maximum entire SDK input, including deferred receipts and keys.
 pub const MAX_HISTORY_PROVING_INPUT_BYTES: usize = 64 * 1024 * 1024;
 /// Exact canonical history public-value length.
-pub const HISTORY_STATEMENT_BYTES: usize = 624;
+pub const HISTORY_STATEMENT_BYTES: usize = 816;
 
 /// Immutable chain configuration authenticated by the consumer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -30,8 +30,6 @@ pub struct ChainBinding {
     pub chain_spec_hash: Hash,
     /// Blocks in each chunk.
     pub chunk_size: u64,
-    /// Runtime artifact commitment.
-    pub runtime_code_hash: Hash,
     /// Required runtime fee rate.
     pub gas_price: u128,
 }
@@ -43,7 +41,6 @@ impl ChainBinding {
             chain_id: spec.chain_id,
             chain_spec_hash: spec.hash(),
             chunk_size: spec.consensus.chunk_size,
-            runtime_code_hash: spec.runtime_code_hash,
             gas_price: spec.runtime.gas_price,
         }
     }
@@ -60,20 +57,111 @@ pub struct ExecutionPrograms {
     pub block: VkDigest,
 }
 
-/// Trusted chain and complete program profile. Never selected by a peer.
+/// Every upgradable program identity active between two consensus boundaries.
+///
+/// Carried inside each [`ConsensusBoundary`], so a program switch is a chunk whose
+/// end boundary names a different set; see design 24.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct ProgramSet {
+    /// Runtime artifact commitment used for ordinary execution.
+    pub runtime_code_hash: Hash,
+    /// Inner execution programs recursively verified by the chunk Guest.
+    pub execution: ExecutionPrograms,
+    /// Complete Chunk Guest identity producing this period's chunk receipts.
+    pub chunk: VkDigest,
+    /// Recursive Checkpoint Guest identity producing this period's history receipts.
+    pub checkpoint: VkDigest,
+}
+
+impl ProgramSet {
+    /// `true` when every Guest identity is nonzero. The runtime hash follows
+    /// the chain specification's own rules, which admit a zero commitment.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.guests().is_complete()
+    }
+
+    /// The Guest identities without the runtime artifact.
+    #[must_use]
+    pub const fn guests(&self) -> GuestPrograms {
+        GuestPrograms {
+            execution: self.execution,
+            chunk: self.chunk,
+            checkpoint: self.checkpoint,
+        }
+    }
+}
+
+/// The five Guest identities a proof backend embeds.
+///
+/// A node binary contributes these; the runtime artifact of the genesis
+/// boundary is named by the chain specification, and later boundaries by
+/// proven upgrades.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct GuestPrograms {
+    /// Inner execution programs recursively verified by the chunk Guest.
+    pub execution: ExecutionPrograms,
+    /// Complete Chunk Guest identity.
+    pub chunk: VkDigest,
+    /// Recursive Checkpoint Guest identity.
+    pub checkpoint: VkDigest,
+}
+
+impl GuestPrograms {
+    /// `true` when no identity is zero.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        ![
+            self.execution.fact,
+            self.execution.evidence,
+            self.execution.block,
+            self.chunk,
+            self.checkpoint,
+        ]
+        .contains(&[0; 8])
+    }
+
+    /// Bind these Guests to a runtime artifact.
+    #[must_use]
+    pub const fn with_runtime(self, runtime_code_hash: Hash) -> ProgramSet {
+        ProgramSet {
+            runtime_code_hash,
+            execution: self.execution,
+            chunk: self.chunk,
+            checkpoint: self.checkpoint,
+        }
+    }
+}
+
+/// A program switch scheduled in runtime state and executed by the chunk Guest at
+/// the boundary entering `activate_at_chunk`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct ScheduledUpgrade {
+    /// First chunk executed under `programs`.
+    pub activate_at_chunk: u64,
+    /// Program set that boundary adopts.
+    pub programs: ProgramSet,
+}
+
+/// Trusted chain identity plus the program set trusted at an anchor. Never
+/// selected by a peer; statements carry program sets in their boundaries.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ProofDomain {
     /// Immutable chain identity.
     pub chain: ChainBinding,
-    /// Inner execution programs.
-    pub execution: ExecutionPrograms,
-    /// Complete Chunk Guest identity.
-    pub chunk: VkDigest,
-    /// Self-recursive Checkpoint Guest identity, pinned by the outer verifier.
-    pub checkpoint: VkDigest,
+    /// Program set trusted at the anchor (the genesis set for a fresh node).
+    pub programs: ProgramSet,
 }
 
-/// Authenticated state immediately before the next chunk; exactly 184 Borsh bytes.
+impl ProofDomain {
+    /// Canonical genesis boundary under this trust profile.
+    #[must_use]
+    pub fn genesis_boundary(&self, spec: &ChainSpec) -> ConsensusBoundary {
+        ConsensusBoundary::genesis(spec, self.programs)
+    }
+}
+
+/// Authenticated state immediately before the next chunk; exactly 376 Borsh bytes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ConsensusBoundary {
     /// Next chunk to execute.
@@ -92,11 +180,13 @@ pub struct ConsensusBoundary {
     pub seed: Seed,
     /// Counted authenticated history root.
     pub history_root: Hash,
+    /// Programs that execute and prove the next chunk.
+    pub programs: ProgramSet,
 }
 impl ConsensusBoundary {
-    /// Canonical genesis boundary; callers validate the complete spec first.
+    /// Canonical genesis boundary under `programs`; callers validate the spec first.
     #[must_use]
-    pub fn genesis(spec: &ChainSpec) -> Self {
+    pub fn genesis(spec: &ChainSpec, programs: ProgramSet) -> Self {
         Self {
             next_chunk_id: 0,
             height: 0,
@@ -106,6 +196,7 @@ impl ConsensusBoundary {
             validators_root: spec.genesis_validator_set_root,
             seed: spec.genesis_seed,
             history_root: crate::history::empty_history_root(),
+            programs,
         }
     }
 
@@ -128,11 +219,9 @@ impl ConsensusBoundary {
 pub struct ConsensusStatement {
     /// Immutable chain identity.
     pub chain: ChainBinding,
-    /// Recursively authenticated execution programs.
-    pub programs: ExecutionPrograms,
-    /// Incoming authenticated boundary.
+    /// Incoming authenticated boundary; its program set verified this chunk.
     pub start: ConsensusBoundary,
-    /// Derived outgoing authenticated boundary.
+    /// Derived outgoing authenticated boundary; its program set rules the next chunk.
     pub end: ConsensusBoundary,
     /// Existing canonical chunk commitment.
     pub chunk: ChunkProofPublicInputs,
@@ -143,8 +232,8 @@ pub struct ConsensusStatement {
 /// A positive, conditional range of consecutive complete chunks.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct HistoryStatement {
-    /// Chain and program identities pinned by the consumer.
-    pub domain: ProofDomain,
+    /// Immutable chain identity pinned by the consumer.
+    pub chain: ChainBinding,
     /// State before the first covered chunk.
     pub start: ConsensusBoundary,
     /// State after the last covered chunk.
@@ -168,7 +257,7 @@ impl HistoryStatement {
     #[must_use]
     pub const fn start_checkpoint(&self) -> Checkpoint {
         Checkpoint {
-            domain: self.domain,
+            chain: self.chain,
             boundary: self.start,
         }
     }
@@ -176,7 +265,7 @@ impl HistoryStatement {
     #[must_use]
     pub const fn end_checkpoint(&self) -> Checkpoint {
         Checkpoint {
-            domain: self.domain,
+            chain: self.chain,
             boundary: self.end,
         }
     }
@@ -194,9 +283,9 @@ pub struct HistoryProof {
 /// A locally authenticated endpoint, independent of proof tree shape.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct Checkpoint {
-    /// Immutable chain and program profile.
-    pub domain: ProofDomain,
-    /// Authenticated boundary.
+    /// Immutable chain identity.
+    pub chain: ChainBinding,
+    /// Authenticated boundary, including the program set active after it.
     pub boundary: ConsensusBoundary,
 }
 impl Checkpoint {
@@ -256,8 +345,8 @@ impl<T: BorshDeserialize, const N: usize> BorshDeserialize for BoundedVec<T, N> 
 pub enum CheckpointInput {
     /// Start a conditional range or append new chunks to a verified range.
     Fold {
-        /// Consumer-pinned program profile, propagated through all children.
-        domain: ProofDomain,
+        /// Consumer-pinned chain identity, propagated through all children.
+        chain: ChainBinding,
         /// Optional earlier History statement, verified first when present.
         previous: Option<HistoryStatement>,
         /// One through sixteen ordered Chunk statements.

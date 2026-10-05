@@ -1,6 +1,6 @@
 use super::*;
 use neutrino_consensus_types::history_proof::{
-    ConsensusBoundary, ExecutionPrograms, HistoryStatement,
+    ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProgramSet,
 };
 use neutrino_primitives::BoundedBytes;
 
@@ -21,26 +21,26 @@ fn boundary(n: u64) -> ConsensusBoundary {
         validators_root: [3; 32],
         seed: [4; 32],
         history_root: [5; 32],
+        programs: ProgramSet {
+            runtime_code_hash: [2; 32],
+            execution: ExecutionPrograms {
+                fact: [1; 8],
+                evidence: [2; 8],
+                block: [3; 8],
+            },
+            chunk: [4; 8],
+            checkpoint: [5; 8],
+        },
     }
 }
 fn client() -> LightClient {
     LightClient {
         checkpoint: Checkpoint {
-            domain: ProofDomain {
-                chain: ChainBinding {
-                    chain_id: 1,
-                    chain_spec_hash: [1; 32],
-                    chunk_size: 1,
-                    runtime_code_hash: [2; 32],
-                    gas_price: 0,
-                },
-                execution: ExecutionPrograms {
-                    fact: [1; 8],
-                    evidence: [2; 8],
-                    block: [3; 8],
-                },
-                chunk: [4; 8],
-                checkpoint: [5; 8],
+            chain: ChainBinding {
+                chain_id: 1,
+                chain_spec_hash: [1; 32],
+                chunk_size: 1,
+                gas_price: 0,
             },
             boundary: boundary(1),
         },
@@ -55,7 +55,7 @@ fn client() -> LightClient {
 fn proof(start: u64, end: u64) -> HistoryProof {
     HistoryProof {
         statement: HistoryStatement {
-            domain: client().checkpoint.domain,
+            chain: client().checkpoint.chain,
             start: boundary(start),
             end: boundary(end),
         },
@@ -132,7 +132,7 @@ fn domain_target_clock_and_expiry_fail_without_mutation() {
         Err(LightClientError::UnexpectedTarget)
     );
     let mut wrong = receipt;
-    wrong.statement.domain.checkpoint = [8; 8];
+    wrong.statement.chain.chain_id = 8;
     assert_eq!(
         client.accept(
             &wrong,
@@ -197,10 +197,10 @@ fn spec() -> neutrino_primitives::ChainSpec {
 fn persistent_snapshot_does_not_renew_trust_on_restart() {
     let spec = spec();
     let mut original = client();
-    original.checkpoint.domain.chain = ChainBinding::from_spec(&spec);
+    original.checkpoint.chain = ChainBinding::from_spec(&spec);
     let bytes = borsh::to_vec(&original.snapshot()).unwrap();
     let saved: LightClientSnapshot = borsh::from_slice(&bytes).unwrap();
-    let mut restored = LightClient::restore(&spec, &original.checkpoint.domain, &saved, 2).unwrap();
+    let mut restored = LightClient::restore(&spec, &original.trusted_domain(), &saved, 2).unwrap();
     assert_eq!(restored, original);
     let receipt = proof(1, 2);
     assert_eq!(
@@ -213,9 +213,9 @@ fn persistent_snapshot_does_not_renew_trust_on_restart() {
         Err(LightClientError::Expired)
     );
     let mut wrong = saved;
-    wrong.checkpoint.domain.checkpoint = [99; 8];
+    wrong.checkpoint.chain.chain_id = 99;
     assert_eq!(
-        LightClient::restore(&spec, &original.checkpoint.domain, &wrong, 2),
+        LightClient::restore(&spec, &original.trusted_domain(), &wrong, 2),
         Err(LightClientError::Domain)
     );
 }
@@ -224,8 +224,8 @@ fn persistent_snapshot_does_not_renew_trust_on_restart() {
 fn genesis_bootstrap_checks_all_boundary_lanes() {
     let spec = spec();
     let mut anchor = client().checkpoint;
-    anchor.domain.chain = ChainBinding::from_spec(&spec);
-    anchor.boundary = ConsensusBoundary::genesis(&spec);
+    anchor.chain = ChainBinding::from_spec(&spec);
+    anchor.boundary = ConsensusBoundary::genesis(&spec, anchor.boundary.programs);
     assert!(LightClient::new(&spec, anchor, spec.genesis_time, 2).is_ok());
     anchor.boundary.history_root = [99; 32];
     assert_eq!(

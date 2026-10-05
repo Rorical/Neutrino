@@ -37,14 +37,8 @@ impl ProofSystem for NotifyingNativeConsensusBackend {
         self.inner.verify_block(proof, inputs)
     }
 
-    fn consensus_block_key(&self) -> Option<[u32; 8]> {
-        self.inner.consensus_block_key()
-    }
-    fn evidence_key(&self) -> Option<[u32; 8]> {
-        self.inner.evidence_key()
-    }
-    fn fact_key(&self) -> Option<[u32; 8]> {
-        self.inner.fact_key()
+    fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
+        self.inner.programs()
     }
 
     fn block_statement(&self, proof: &Self::BlockProof) -> Result<StfPublicOutput, ProofError> {
@@ -107,7 +101,7 @@ fn three_validator_fixture() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     }
     witness.blocks[0].output = neutrino_default_runtime_core::apply_block(&input, &mut traced);
     witness.post_state = traced.into_witness();
-    witness.context = genesis_context(&witness.chain_spec);
+    witness.context = genesis_context(&witness.chain_spec, witness.context.programs);
     let domain = witness.chain_spec.consensus_domain();
     let header = &mut witness.blocks[0].header;
     header.vrf_proof = voter(0).vrf_eval(domain, &witness.seed, header.slot);
@@ -115,6 +109,7 @@ fn three_validator_fixture() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     let hash = header.hash();
     witness.blocks[0].public_inputs.block_hash = hash;
     let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
     let block = &witness.blocks[0];
     let hash = block.header.hash();
     engine

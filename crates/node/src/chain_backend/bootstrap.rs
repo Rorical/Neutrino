@@ -115,17 +115,27 @@ fn authenticate<P: ProofSystem>(
     pending: &Pending,
     future: u64,
 ) -> Result<AuthenticatedBootstrap, SyncBackendError> {
-    let prefix = verify_history_proof(verifier, spec, pending.data.genesis_prefix.clone())
-        .map_err(rejected)?;
+    // The prefix must start at the genesis boundary derived from this node's
+    // own programs; a bridge must start at the explicitly trusted origin.
+    let genesis = verifier
+        .history_domain(spec)
+        .map_err(rejected)?
+        .genesis_boundary(spec);
+    let prefix = verify_history_proof(
+        verifier,
+        spec,
+        pending.data.genesis_prefix.clone(),
+        &genesis,
+    )
+    .map_err(rejected)?;
     let bridge = pending
         .bridge
         .clone()
-        .map(|proof| verify_history_proof(verifier, spec, proof).map_err(rejected))
+        .map(|proof| {
+            verify_history_proof(verifier, spec, proof, &pending.origin.boundary).map_err(rejected)
+        })
         .transpose()?;
     let endpoint = prefix.proof().statement.end_checkpoint();
-    if prefix.proof().statement.start != ConsensusBoundary::genesis(spec) {
-        return Err(rejected("bootstrap requires a genesis prefix"));
-    }
     let mut policy =
         LightClient::new(spec, pending.origin, pending.trusted_at, future).map_err(rejected)?;
     let clock = now().map_err(rejected)?;
@@ -238,7 +248,13 @@ where
                     .checked_mul(spec.consensus.slot_duration_secs)
                     .and_then(|time| spec.genesis_time.checked_add(time))
                     .ok_or("bootstrap trust timestamp overflow")?;
-                (Checkpoint { domain, boundary }, time)
+                (
+                    Checkpoint {
+                        chain: domain.chain,
+                        boundary,
+                    },
+                    time,
+                )
             }
             _ => {
                 return Err(
@@ -247,8 +263,8 @@ where
                 );
             }
         };
-        if origin.domain != domain {
-            return Err("bootstrap origin has a different program domain".into());
+        if origin.chain != domain.chain {
+            return Err("bootstrap origin has a different chain binding".into());
         }
         LightClient::new(&spec, origin, trusted_at, config.max_future_drift_secs)
             .map_err(|error| error.to_string())?;
@@ -312,10 +328,14 @@ where
                         == Some(&pending.data.genesis_prefix))
             })?;
             if installed {
+                let genesis = self
+                    .with_engine(neutrino_consensus_engine::Engine::trusted_genesis_boundary)
+                    .map_err(|error| error.to_string())?;
                 verify_history_proof(
                     self.proof_system.as_ref(),
                     spec,
                     pending.data.genesis_prefix.clone(),
+                    &genesis,
                 )
                 .map_err(|error| error.to_string())?;
                 self.clear_state_download(end.state_root)

@@ -43,17 +43,16 @@ impl<DB: Database> Engine<DB> {
             || count == 0
             || count < local_count
             || self.head_height() > end.height
-            || statement.domain != *prefix.domain()
-            || Some(statement.domain) != self.store().history_domain()?
-            || statement.start
-                != neutrino_consensus_types::history_proof::ConsensusBoundary::genesis(spec)
-            || statement.domain.chain
+            || statement.chain != prefix.domain().chain
+            || self.store().history_domain()?.map(|trusted| trusted.chain) != Some(statement.chain)
+            || statement.start != prefix.domain().genesis_boundary(spec)
+            || statement.chain
                 != neutrino_consensus_types::history_proof::ChainBinding::from_spec(spec)
-            || !end.is_well_formed(&statement.domain.chain)
+            || !end.is_well_formed(&statement.chain)
             || bridge.map_or_else(
                 || trusted_start != statement.end_checkpoint(),
                 |bridge| {
-                    *bridge.domain() != *prefix.domain()
+                    bridge.domain().chain != prefix.domain().chain
                         || bridge.proof().statement.start_checkpoint() != trusted_start
                         || bridge.proof().statement.end != end
                 },
@@ -105,7 +104,7 @@ impl<DB: Database> Engine<DB> {
         }) {
             return Err(ProofError::InvalidWitness.into());
         }
-        authenticate_history(spec, end, header, frontier, recent)?;
+        authenticate_history(spec, &end, header, frontier, recent)?;
         let before = (state.node_count(), state.value_count());
         state
             .retain_roots(&[])
@@ -113,7 +112,7 @@ impl<DB: Database> Engine<DB> {
         if before != (state.node_count(), state.value_count()) {
             return Err(ProofError::InvalidWitness.into());
         }
-        let mut context = genesis_context(spec);
+        let mut context = genesis_context(spec, end.programs);
         context.chunk_id = count;
         context.parent_block_hash = end.block_hash;
         context.pre_state_root = end.state_root;
@@ -139,7 +138,7 @@ impl<DB: Database> Engine<DB> {
 
 fn authenticate_history(
     spec: &ChainSpec,
-    end: ConsensusBoundary,
+    end: &ConsensusBoundary,
     header: &Header,
     frontier: &HistoryFrontier,
     recent: &[HistoricalOpening],

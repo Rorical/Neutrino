@@ -69,13 +69,16 @@ fn spec() -> ChainSpec {
 fn domain(spec: &ChainSpec) -> ProofDomain {
     ProofDomain {
         chain: ChainBinding::from_spec(spec),
-        execution: ExecutionPrograms {
-            fact: [1; 8],
-            evidence: [2; 8],
-            block: [3; 8],
+        programs: neutrino_consensus_types::history_proof::ProgramSet {
+            runtime_code_hash: spec.runtime_code_hash,
+            execution: ExecutionPrograms {
+                fact: [1; 8],
+                evidence: [2; 8],
+                block: [3; 8],
+            },
+            chunk: [4; 8],
+            checkpoint: [5; 8],
         },
-        chunk: [4; 8],
-        checkpoint: [5; 8],
     }
 }
 
@@ -167,16 +170,16 @@ where
         validators_root: spec.genesis_validator_set_root,
         seed: spec.genesis_seed,
         history_root: frontier.root().unwrap(),
+        programs: domain(&spec).programs,
     };
     let statement = ConsensusStatement {
         chain: domain(&spec).chain,
-        programs: domain(&spec).execution,
         start,
         end,
         chunk: inputs.clone(),
         finality_cert_hash: commitment(&cert),
     };
-    let mut next_context = genesis_context(&spec);
+    let mut next_context = genesis_context(&spec, domain(&spec).programs);
     next_context.chunk_id = id + 1;
     next_context.parent_block_hash = hash;
     next_context.pre_state_root = end.state_root;
@@ -222,7 +225,7 @@ where
             borsh::to_vec(&boundary).unwrap(),
         );
         let checkpoint = neutrino_consensus_types::Checkpoint {
-            domain: domain(&spec),
+            chain: domain(&spec).chain,
             boundary,
         };
         batch.put(
@@ -283,7 +286,7 @@ where
 {
     let proof = HistoryProof {
         statement: HistoryStatement {
-            domain: domain(engine.chain_spec()),
+            chain: domain(engine.chain_spec()).chain,
             start: engine.canonical_boundary(start).unwrap(),
             end: engine.canonical_boundary(end).unwrap(),
         },

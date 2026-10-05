@@ -191,6 +191,16 @@ where
     pub const fn verifying_key(&self) -> &SP1VerifyingKey {
         &self.ctx.vk
     }
+
+    /// Digests of the three embedded execution Guests, available without
+    /// setting up the chunk or checkpoint programs.
+    pub fn execution_programs(&self) -> neutrino_consensus_types::history_proof::ExecutionPrograms {
+        neutrino_consensus_types::history_proof::ExecutionPrograms {
+            fact: self.fact_vk.hash_u32(),
+            evidence: self.evidence_vk.hash_u32(),
+            block: self.ctx.vk.hash_u32(),
+        }
+    }
 }
 
 impl Sp1ProofSystem<MockProver> {
@@ -241,20 +251,13 @@ where
         &self,
         spec: &neutrino_primitives::ChainSpec,
         proof: &neutrino_consensus_types::history_proof::HistoryProof,
+        trusted_start: &neutrino_consensus_types::history_proof::ConsensusBoundary,
     ) -> Result<(), ProofError> {
-        self.verify_history_receipt(spec, proof)
+        self.verify_history_receipt(spec, proof, trusted_start)
     }
 
-    fn consensus_block_key(&self) -> Option<[u32; 8]> {
-        Some(self.ctx.vk.hash_u32())
-    }
-
-    fn evidence_key(&self) -> Option<[u32; 8]> {
-        Some(self.evidence_vk.hash_u32())
-    }
-
-    fn fact_key(&self) -> Option<[u32; 8]> {
-        Some(self.fact_vk.hash_u32())
+    fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
+        self.embedded_guests().ok()
     }
     fn last_chunk_fact_coverage(&self) -> Option<(u64, u64)> {
         Self::last_chunk_fact_coverage(self)
@@ -643,6 +646,7 @@ where
         if witness.fact_guest_vk_digest != self.fact_vk.hash_u32()
             || witness.block_guest_vk_digest != self.ctx.vk.hash_u32()
             || witness.evidence_guest_vk_digest != self.evidence_vk.hash_u32()
+            || witness.context.programs.guests() != self.embedded_guests()?
             || block_proofs.len() != witness.blocks.len()
         {
             return Err(ProofError::PublicInputMismatch);
@@ -710,12 +714,6 @@ where
         proof: &Sp1ChunkProof,
         expected: &neutrino_prover_chunk::consensus::ConsensusStatement,
     ) -> Result<(), ProofError> {
-        if expected.programs.fact != self.fact_vk.hash_u32()
-            || expected.programs.block != self.ctx.vk.hash_u32()
-            || expected.programs.evidence != self.evidence_vk.hash_u32()
-        {
-            return Err(ProofError::PublicInputMismatch);
-        }
         let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
         let committed: neutrino_prover_chunk::consensus::ConsensusStatement =
             borsh::from_slice(bundle.public_values.as_slice())
@@ -723,12 +721,27 @@ where
         if committed != *expected || !matches!(bundle.proof, SP1Proof::Compressed(_)) {
             return Err(ProofError::PublicInputMismatch);
         }
+        // The receipt is verified under the chunk program of the caller's
+        // trusted start boundary, never one the peer's statement selects. The
+        // embedded program verifies with the full key; any other program set
+        // is checked by digest, which never accepts mock receipts (design 24).
         let pk = self
             .chunk_proving_key()
             .map_err(|_| ProofError::BackendRejected)?;
-        self.ctx
-            .prover
-            .verify(&bundle, pk.verifying_key(), None)
-            .map_err(|_| ProofError::BackendRejected)
+        if expected.start.programs.chunk == pk.verifying_key().hash_u32() {
+            return self
+                .ctx
+                .prover
+                .verify(&bundle, pk.verifying_key(), None)
+                .map_err(|_| ProofError::BackendRejected);
+        }
+        neutrino_prover_chunk::proof_verification::verify_typed_receipt(
+            &bundle.proof,
+            bundle.public_values.as_slice(),
+            &bundle.sp1_version,
+            expected,
+            &expected.start.programs.chunk,
+        )
+        .map_err(|_| ProofError::BackendRejected)
     }
 }

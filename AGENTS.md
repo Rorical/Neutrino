@@ -69,6 +69,11 @@ have passed.
   current plus eight-chunk evidence window. Read
   `docs/design/23-evidence-availability.md` before changing evidence retention,
   discovery or retrieval. Archive retention does not extend admissible consensus history.
+- Program identities live in every `ConsensusBoundary` as a `ProgramSet`; `ChainBinding`
+  is immutable and `ProofDomain { chain, programs }` is only a verifier's trust profile.
+  Receipts are verified under the program set of their start boundary, never one the
+  receipt names itself. Read `docs/design/24-runtime-upgrades.md` before changing
+  program identities, boundaries, verifying-key handling or the upgrade switch.
 - There is one current protocol format with unversioned types, fields and paths.
   Incompatible development upgrades replace formats directly. Do not introduce
   deprecated variants, compatibility shims, fake recursive proofs or empty-proof

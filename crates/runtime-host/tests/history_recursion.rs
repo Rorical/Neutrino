@@ -9,8 +9,8 @@ pub mod support;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::history_proof::{
-    BoundedVec, CheckpointInput, ConsensusStatement, HistoryProof, HistoryStatement,
-    MAX_HISTORY_RECEIPT_BYTES, ProofDomain,
+    BoundedVec, ChainBinding, CheckpointInput, ConsensusStatement, HISTORY_STATEMENT_BYTES,
+    HistoryProof, HistoryStatement, MAX_HISTORY_RECEIPT_BYTES,
 };
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::consensus::{
@@ -25,7 +25,7 @@ use sp1_sdk::{
     blocking::{ProveRequest, Prover, ProverClient},
 };
 
-fn execution_fixture() -> (ProofDomain, Vec<ConsensusStatement>) {
+fn execution_fixture() -> (ChainBinding, Vec<ConsensusStatement>) {
     let (first, input, _) = support::fixture([1; 8], [4; 32]);
     let second = empty_successor(&first, &input).0;
     let (third, _) = empty_successor(&second, &input);
@@ -33,22 +33,16 @@ fn execution_fixture() -> (ProofDomain, Vec<ConsensusStatement>) {
         .iter()
         .map(|witness| validate_consensus(witness).unwrap())
         .collect::<Vec<_>>();
-    let domain = ProofDomain {
-        chain: statements[0].chain,
-        execution: statements[0].programs,
-        chunk: [4; 8],
-        checkpoint: [5; 8],
-    };
-    (domain, statements)
+    (statements[0].chain, statements)
 }
 
 fn fold_input(
-    domain: ProofDomain,
+    chain: ChainBinding,
     previous: Option<&HistoryStatement>,
     chunks: &[ConsensusStatement],
 ) -> CheckpointInput {
     CheckpointInput::Fold {
-        domain,
+        chain,
         previous: previous.copied(),
         chunks: BoundedVec::new(chunks.to_vec()).unwrap(),
     }
@@ -84,7 +78,7 @@ fn checkpoint_guest_execution_matches_base_append_merge_and_parent() {
             .unwrap();
         assert_eq!(report.exit_code, 0);
         assert_eq!(values.as_slice(), borsh::to_vec(&expected).unwrap());
-        assert_eq!(values.as_slice().len(), 624);
+        assert_eq!(values.as_slice().len(), HISTORY_STATEMENT_BYTES);
     }
 }
 
@@ -96,11 +90,11 @@ fn checkpoint_guest_rejects_invalid_boundaries_and_empty_composition() {
     let mut wrong_boundary = chunks[1].clone();
     wrong_boundary.start.history_root[0] ^= 1;
     let mut wrong_program = chunks[1].clone();
-    wrong_program.programs.fact[0] ^= 1;
+    wrong_program.start.programs.execution.fact[0] ^= 1;
     let mut wrong_height = chunks[1].clone();
     wrong_height.end.height += 1;
     let mut wrong_self = previous;
-    wrong_self.domain.checkpoint[0] ^= 1;
+    wrong_self.chain.chain_id ^= 1;
     let malformed = [
         fold_input(domain, None, &[]),
         fold_input(domain, Some(&previous), &[wrong_boundary]),
@@ -138,8 +132,9 @@ fn production_history_verification_rejects_mock_receipts() {
     );
     let domain = system.history_domain(&witness.chain_spec).unwrap();
     let mut statement = validate_consensus(&witness).unwrap();
-    statement.programs = domain.execution;
-    let input = fold_input(domain, None, &[statement]);
+    statement.start.programs = domain.programs;
+    statement.end.programs = domain.programs;
+    let input = fold_input(domain.chain, None, &[statement]);
     let expected = neutrino_prover_checkpoint::validate(&input).unwrap();
     let key = mock
         .setup(neutrino_runtime_host::DEFAULT_CHECKPOINT_GUEST_ELF.clone())
@@ -159,7 +154,11 @@ fn production_history_verification_rejects_mock_receipts() {
             .try_into()
             .unwrap(),
     };
-    assert!(system.verify_history(&witness.chain_spec, &proof).is_err());
+    assert!(
+        system
+            .verify_history(&witness.chain_spec, &proof, &proof.statement.start)
+            .is_err()
+    );
 }
 
 /// Advance an empty, one-block chunk without changing its state trie.
@@ -303,8 +302,12 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
         system.verifying_key().hash_u32(),
         neutrino_runtime_host::default_runtime_code_hash(),
     );
-    witness.fact_guest_vk_digest = system.fact_key().unwrap();
-    witness.evidence_guest_vk_digest = system.evidence_key().unwrap();
+    witness.context.programs = system
+        .programs()
+        .unwrap()
+        .with_runtime(neutrino_runtime_host::default_runtime_code_hash());
+    witness.fact_guest_vk_digest = witness.context.programs.execution.fact;
+    witness.evidence_guest_vk_digest = witness.context.programs.execution.evidence;
     input.evidence_anchor.fact_guest_vk_digest = witness.fact_guest_vk_digest;
     input.evidence_anchor.evidence_guest_vk_digest = witness.evidence_guest_vk_digest;
     witness.blocks[0].output.accountability.anchor = input.evidence_anchor;
@@ -383,7 +386,7 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
             if proof.statement != merged_expected {
                 return Err(ProofError::PublicInputMismatch);
             }
-            verifier.verify_history(&spec, proof)
+            verifier.verify_history(&spec, proof, &base.statement.start)
         },
         || {
             Ok(system
@@ -403,19 +406,28 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
     assert_eq!(parent.statement.start.next_chunk_id, 0);
     assert_eq!(parent.statement.end.next_chunk_id, 3);
     assert_eq!(right.statement.start, base.statement.end);
+    let genesis = parent.statement.start;
     let mut wrong = parent.clone();
     wrong.statement.end.state_root[0] ^= 1;
-    assert!(verifier.verify_history(&spec, &wrong).is_err());
+    assert!(verifier.verify_history(&spec, &wrong, &genesis).is_err());
+    // A receipt never selects its own key: a statement naming another start
+    // program set is rejected against the trusted start, and a verifier that
+    // trusts that other set takes the digest path and must fail there too.
     let mut wrong = parent;
-    wrong.statement.domain.checkpoint[0] ^= 1;
-    assert!(verifier.verify_history(&spec, &wrong).is_err());
+    wrong.statement.start.programs.checkpoint[0] ^= 1;
+    assert!(verifier.verify_history(&spec, &wrong, &genesis).is_err());
+    assert!(
+        verifier
+            .verify_history(&spec, &wrong, &wrong.statement.start)
+            .is_err()
+    );
     assert!(system.prove_history_merge(&spec, &right, &base).is_err());
     assert!(
         system
             .prove_history_fold(&spec, Some(&base), &chunks[..1])
             .is_err()
     );
-    reject_false_recursive_claims(&challenge_prover, &base.statement.domain, &chunks[0]);
+    reject_false_recursive_claims(&challenge_prover, base.statement.chain, &chunks[0]);
     let children = [chunks[0].to_sp1().unwrap(), chunks[1].to_sp1().unwrap()];
     let statements = children
         .iter()
@@ -423,7 +435,7 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
         .collect::<Vec<ConsensusStatement>>();
     reject_reordered_children(
         &challenge_prover,
-        &fold_input(base.statement.domain, None, &statements),
+        &fold_input(base.statement.chain, None, &statements),
         children,
     );
     let histories = [&base, &right].map(|proof| {
@@ -492,7 +504,7 @@ fn reject_reordered_children<P: ProgramProver>(
 /// Only real compression can authenticate the requested statement/proof-stream pairing.
 fn reject_false_recursive_claims<P: ProgramProver>(
     prover: &P,
-    domain: &ProofDomain,
+    chain: ChainBinding,
     chunk: &Sp1ChunkProof,
 ) {
     let bundle = chunk.to_sp1().unwrap();
@@ -514,7 +526,7 @@ fn reject_false_recursive_claims<P: ProgramProver>(
         if attack == 0 {
             claimed.end.history_root[0] ^= 1;
         }
-        let input = fold_input(*domain, None, &[claimed]);
+        let input = fold_input(chain, None, &[claimed]);
         assert!(neutrino_prover_checkpoint::validate(&input).is_ok());
         let mut stdin = SP1Stdin::new();
         stdin.write_vec(borsh::to_vec(&input).unwrap());
@@ -549,7 +561,7 @@ fn save_fold<P: ProgramProver, V: ProgramProver>(
     previous: Option<&HistoryProof>,
     chunks: &[Sp1ChunkProof],
 ) -> HistoryProof {
-    let domain = system.history_domain(spec).unwrap();
+    let chain = system.history_domain(spec).unwrap().chain;
     let statements = chunks
         .iter()
         .map(|proof| {
@@ -559,7 +571,7 @@ fn save_fold<P: ProgramProver, V: ProgramProver>(
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let input = fold_input(domain, previous.map(|proof| &proof.statement), &statements);
+    let input = fold_input(chain, previous.map(|proof| &proof.statement), &statements);
     let expected = neutrino_prover_checkpoint::validate(&input).unwrap();
     let identity = acceptance::StageIdentity::new(
         "history-fold",
@@ -574,7 +586,7 @@ fn save_fold<P: ProgramProver, V: ProgramProver>(
             if proof.statement != expected {
                 return Err(ProofError::PublicInputMismatch);
             }
-            verifier.verify_history(spec, proof)
+            verifier.verify_history(spec, proof, &expected.start)
         },
         || {
             Ok(system

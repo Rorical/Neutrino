@@ -272,12 +272,10 @@ where
     /// is semantically fine because slashing outcomes do not depend
     /// on the order evidence is observed.
     pub fn new(mut engine: Engine<DB>, proof_system: P) -> Self {
-        if let (Some(block), Some(evidence), Some(facts)) = (
-            proof_system.consensus_block_key(),
-            proof_system.evidence_key(),
-            proof_system.fact_key(),
-        ) {
-            engine.set_evidence_programs(block, evidence, facts);
+        if let Some(programs) = proof_system.programs() {
+            engine.set_programs(programs);
+        } else {
+            warn!("proof backend reports no Guest identities; chunk consensus is disabled");
         }
         let mut slashing_pool = SlashingPool::default();
         let persisted = engine
@@ -698,7 +696,7 @@ where
         if self.history_lag_exceeded().is_some() && self.backlog_policy().pause_production {
             return Ok(None);
         }
-        if self.proof_system.consensus_block_key().is_some()
+        if self.block_program().is_some()
             && !self.with_engine(|e| {
                 let next_chunk = e
                     .latest_finalized_chunk_id()
@@ -727,7 +725,7 @@ where
                     if self.bootstrap_pending() {
                         return Ok(None);
                     }
-                    if let Some(key) = self.proof_system.consensus_block_key() {
+                    if let Some(key) = self.block_program() {
                         let height = e.head_height().checked_add(1).ok_or_else(|| {
                             ProductionError::Executor("height overflow".to_owned())
                         })?;
@@ -755,7 +753,7 @@ where
     }
 
     fn authorize_incoming_consensus_body(&self, block: &Block) -> Result<(), SyncBackendError> {
-        let Some(key) = self.proof_system.consensus_block_key() else {
+        let Some(key) = self.block_program() else {
             return Ok(());
         };
         let replaces_attachments = self.with_engine(|engine| {
@@ -793,7 +791,7 @@ where
         // replay may reuse archived execution; verify replacement witnesses here.
         if self.block_executor_snapshot().is_none() || replaces_attachments {
             for attachment in &block.body.evidence_proofs {
-                if Some(attachment.evidence_guest_vk_digest) != self.proof_system.evidence_key() {
+                if Some(attachment.evidence_guest_vk_digest) != self.evidence_program() {
                     return Err(SyncBackendError::Rejected(
                         "evidence program identity mismatch".to_owned(),
                     ));
@@ -1298,7 +1296,7 @@ where
         if self.with_engine(|e| e.bft_session(chunk_id).is_some()) {
             return;
         }
-        let assembled = if self.proof_system.consensus_block_key().is_some() {
+        let assembled = if self.block_program().is_some() {
             self.with_engine(|e| {
                 let prepared =
                     e.prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())?;
@@ -1348,7 +1346,7 @@ where
         engine: &Engine<DB>,
         chunk_id: ChunkId,
     ) -> Result<(), SyncBackendError> {
-        if engine.local_voter().is_none() || self.proof_system.consensus_block_key().is_none() {
+        if engine.local_voter().is_none() || self.block_program().is_none() {
             return Ok(());
         }
         if engine.bft_session(chunk_id).is_none() {
@@ -1572,7 +1570,7 @@ where
         if self.light_checkpoint().is_some() {
             return Ok(None);
         }
-        if self.proof_system.consensus_block_key().is_none() {
+        if self.block_program().is_none() {
             return Ok(None);
         }
         self.with_engine(|engine| {
@@ -1594,7 +1592,7 @@ where
         })
     }
     fn supports_bft_candidate_sync(&self) -> bool {
-        self.light_checkpoint().is_none() && self.proof_system.consensus_block_key().is_some()
+        self.light_checkpoint().is_none() && self.block_program().is_some()
     }
 
     async fn bft_candidate(
@@ -1626,7 +1624,7 @@ where
     fn supports_bft_message_sync(&self) -> bool {
         !self.bootstrap_pending()
             && self.light_checkpoint().is_none()
-            && self.proof_system.consensus_block_key().is_some()
+            && self.block_program().is_some()
     }
 
     async fn current_bft_round(&self) -> Option<(ChunkId, u32)> {
@@ -1855,10 +1853,21 @@ where
             return self.accept_light_history(proof).await;
         }
         let statement = proof.statement;
-        let spec = self.with_engine(|engine| engine.chain_spec().clone());
+        let (spec, trusted_start) = self
+            .with_engine(|engine| {
+                engine
+                    .canonical_boundary(statement.start.next_chunk_id)
+                    .map(|boundary| (engine.chain_spec().clone(), boundary))
+            })
+            .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
         let prover = Arc::clone(&self.proof_system);
         let verified = tokio::task::spawn_blocking(move || {
-            neutrino_proof_system::verify_history_proof(prover.as_ref(), &spec, proof)
+            neutrino_proof_system::verify_history_proof(
+                prover.as_ref(),
+                &spec,
+                proof,
+                &trusted_start,
+            )
         })
         .await
         .map_err(|error| SyncBackendError::Rejected(error.to_string()))?
@@ -2107,7 +2116,7 @@ where
                 self.pool_and_gossip_slashing(item).await;
             }
         }
-        if self.proof_system.consensus_block_key().is_some() {
+        if self.block_program().is_some() {
             self.with_engine(|engine| {
                 if engine
                     .latest_finalized_chunk_id()
@@ -2147,7 +2156,7 @@ where
             }
             .map_err(Self::map_import_err)
         })?;
-        if self.proof_system.consensus_block_key().is_some() {
+        if self.block_program().is_some() {
             let certificate = &proof.finality_cert;
             self.retain_availability_vote(&certificate.prevote_vote())
                 .await;
@@ -2320,7 +2329,7 @@ where
                             .is_some_and(|last| id <= last)
                     });
             if historical {
-                self.proof_system.consensus_block_key().is_some_and(|key| {
+                self.block_program().is_some_and(|key| {
                     engine
                         .verify_historical_slashing_evidence(&evidence, &key)
                         .is_ok()

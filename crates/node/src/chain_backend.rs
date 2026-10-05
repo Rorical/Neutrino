@@ -34,6 +34,7 @@ mod history;
 mod light;
 mod metrics_source;
 mod p2p_queries;
+mod programs;
 mod rpc_queries;
 mod state_sync;
 #[cfg(test)]
@@ -88,6 +89,12 @@ const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 256 * 1024;
 /// gossip size caps retention. Verified receipts have a separate byte-bounded cache.
 const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 
+/// Fact pre-proving requests queued for one fact program.
+type FactJobSender = mpsc::Sender<(
+    neutrino_consensus_types::history_proof::VkDigest,
+    Vec<neutrino_prover_chunk::facts::FactRequest>,
+)>;
+
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
 /// Internally wraps an [`Engine`] behind a `std::sync::Mutex`. The mutex
@@ -100,7 +107,7 @@ const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 /// path the mutex can be swapped for an `RwLock`.
 pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Arc<Mutex<Engine<DB>>>,
-    fact_jobs: Mutex<Option<mpsc::Sender<Vec<neutrino_prover_chunk::facts::FactRequest>>>>,
+    fact_jobs: Mutex<Option<FactJobSender>>,
     history: Arc<history::HistoryRuntime>,
     light: Mutex<Option<light::LightRuntime>>,
     bootstrap: Mutex<Option<bootstrap::BootstrapRuntime>>,
@@ -140,6 +147,13 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// startup. Tests that exercise gossip / BFT but not local
     /// production deliberately leave this unset.
     block_executor: Mutex<Option<Arc<dyn ErasedBlockExecutor>>>,
+    /// Program-lane reassembly, persistence and publication (design 24).
+    programs: Mutex<Arc<crate::programs::ProgramStore>>,
+    /// Guards concurrent Guest installations, which run SP1 setup.
+    installing_programs: Arc<std::sync::atomic::AtomicBool>,
+    /// Content hashes governance named at the last program sync; served to
+    /// the status RPC so an unauthenticated call never runs a runtime query.
+    wanted_programs: Mutex<Vec<Hash>>,
 }
 
 type ConsensusProofTask<P> = (
@@ -313,7 +327,28 @@ where
             local_voter: Mutex::new(None),
             slashing_pool: Mutex::new(slashing_pool),
             block_executor: Mutex::new(None),
+            programs: Mutex::new(Arc::new(crate::programs::ProgramStore::in_memory())),
+            installing_programs: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wanted_programs: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Install the artifact store; the node binary roots it under the data
+    /// directory so accepted artifacts survive restarts.
+    pub fn set_program_store(&self, store: crate::programs::ProgramStore) {
+        *self
+            .programs
+            .lock()
+            .expect("ChainBackend program store poisoned") = Arc::new(store);
+    }
+
+    pub(crate) fn program_store(&self) -> Arc<crate::programs::ProgramStore> {
+        Arc::clone(
+            &self
+                .programs
+                .lock()
+                .expect("ChainBackend program store poisoned"),
+        )
     }
 
     /// Install the dynamic-runtime [`ErasedBlockExecutor`] the
@@ -327,6 +362,14 @@ where
     where
         X: ErasedBlockExecutor + 'static,
     {
+        // The chain specification names the genesis runtime; the embedded
+        // module serves it. Production executors accept only the identity
+        // alias, and node startup has already asserted the hashes agree, so a
+        // failure here means a misconfigured harness.
+        let genesis_runtime = self.with_engine(|engine| engine.chain_spec().runtime_code_hash);
+        if let Err(error) = executor.alias_default_runtime(genesis_runtime) {
+            warn!(%error, "executor does not serve the chain's declared genesis runtime");
+        }
         *self
             .block_executor
             .lock()
@@ -391,7 +434,14 @@ where
         if let Some(verdict) = self.cached_block_verdict_at(token) {
             return matches!(verdict, availability::ProofVerdict::Rejected(_));
         }
-        let Ok(verdict) = self.proof_system.classify_block_rejection(proof) else {
+        let Ok(expected) = self.with_engine(|engine| {
+            engine
+                .programs_for_height(proof.height)
+                .map(|programs| programs.execution.block)
+        }) else {
+            return false;
+        };
+        let Ok(verdict) = self.proof_system.classify_block_rejection(proof, &expected) else {
             return false;
         };
         self.remember_block_verdict(token, verdict.into()) && verdict.is_some()
@@ -708,8 +758,12 @@ where
         {
             return Ok(None);
         }
+        self.sync_programs();
         let drained_mempool = self.drain_mempool(DEFAULT_BODY_TX_BUDGET_BYTES);
-        let (body, included_mempool) = self.select_evidence_body(&drained_mempool);
+        let (mut body, included_mempool) = self.select_evidence_body(&drained_mempool);
+        body.programs = self
+            .program_store()
+            .next_pieces(neutrino_consensus_types::MAX_PROGRAM_PIECES_PER_BLOCK);
         // The executor lives behind an `Arc<dyn ErasedBlockExecutor>`
         // so we can hold a snapshot across the engine mutex without
         // poisoning. Production fails fast if no executor has been
@@ -790,14 +844,24 @@ where
         // Initial execution authenticates attachments in its WASM shell. A
         // replay may reuse archived execution; verify replacement witnesses here.
         if self.block_executor_snapshot().is_none() || replaces_attachments {
+            // Attachments must name the evidence and fact programs of the
+            // block's own chunk boundary, never ones the peer declares.
+            let programs = self
+                .with_engine(|engine| engine.programs_for_height(block.header.height))
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?
+                .execution;
             for attachment in &block.body.evidence_proofs {
-                if Some(attachment.evidence_guest_vk_digest) != self.evidence_program() {
+                if !attachment.binds(&attachment.statement, &programs.evidence, &programs.fact) {
                     return Err(SyncBackendError::Rejected(
                         "evidence program identity mismatch".to_owned(),
                     ));
                 }
                 self.proof_system
-                    .verify_evidence(&attachment.proof_bytes, &attachment.membership.batch)
+                    .verify_evidence(
+                        &attachment.proof_bytes,
+                        &attachment.membership.batch,
+                        &programs.evidence,
+                    )
                     .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
             }
         }
@@ -824,20 +888,21 @@ where
         // view. The mempool itself takes its own lock below;
         // serialising them through one critical section would
         // deadlock with concurrent gossip + production paths.
-        let (chain_id, gas_limit, gas_price, state_snapshot, executor) = {
+        let (chain_id, gas_limit, gas_price, runtime_code_hash, state_snapshot, executor) = {
             let executor = self.block_executor_snapshot();
             self.with_engine(|e| {
                 (
                     e.chain_spec().chain_id,
                     e.chain_spec().genesis_gas_limit,
                     e.chain_spec().runtime.gas_price,
+                    e.runtime_code_hash_for(e.head_height()).ok(),
                     e.state().clone(),
                     executor,
                 )
             })
         };
-        let Some(executor) = executor else {
-            debug!("submit_transaction: no executor installed; rejecting");
+        let (Some(executor), Some(runtime_code_hash)) = (executor, runtime_code_hash) else {
+            debug!("submit_transaction: no executor or runtime resolvable; rejecting");
             let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
             return pool.insert_validated(bytes, |_| false);
         };
@@ -846,14 +911,20 @@ where
         // `RejectedByValidator` so a misbehaving runtime never poisons
         // the mempool; the runtime owns the soft-reject codes
         // (BadSignature / NonceMismatch / ...).
-        let validity =
-            match executor.validate_tx(&bytes, chain_id, gas_limit, gas_price, &state_snapshot) {
-                Ok(v) => v,
-                Err(err) => {
-                    debug!(%err, "validate_tx executor trap; rejecting tx");
-                    TxValidity::invalid(TxValidationCode::StateReadFailed)
-                }
-            };
+        let validity = match executor.validate_tx(
+            &bytes,
+            chain_id,
+            gas_limit,
+            gas_price,
+            runtime_code_hash,
+            &state_snapshot,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                debug!(%err, "validate_tx executor trap; rejecting tx");
+                TxValidity::invalid(TxValidationCode::StateReadFailed)
+            }
+        };
 
         let mut pool = self.mempool.lock().expect("ChainBackend mempool poisoned");
         if validity.is_valid() {
@@ -1920,6 +1991,7 @@ where
             })?;
             self.queue_header_facts(&block.header);
             self.forget_mined_transactions(&block.body.transactions);
+            self.absorb_programs(&block.body.programs);
             last = Some(HeadersImported {
                 new_head_height: outcome.new_head_height,
                 new_head_hash: outcome.block_hash,
@@ -2080,6 +2152,7 @@ where
         };
         self.queue_header_facts(&block.header);
         self.forget_mined_transactions(&block.body.transactions);
+        self.absorb_programs(&block.body.programs);
         Ok(HeadersImported {
             new_head_height: outcome.new_head_height,
             new_head_hash: outcome.block_hash,

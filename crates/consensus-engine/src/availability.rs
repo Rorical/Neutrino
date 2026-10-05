@@ -292,7 +292,9 @@ impl<DB: Database> Engine<DB> {
                 .ok_or(StoreError::Corrupt("artifact proof parent unavailable"))?
                 .state_root
         };
-        let mut expected = self.block_proof_public_inputs(&header, before, proof.block_hash);
+        let mut expected = self
+            .block_proof_public_inputs(&header, before, proof.block_hash)
+            .map_err(|_| StoreError::Corrupt("artifact proof program set unavailable"))?;
         expected.proposer_address = validators
             .get(header.proposer_index as usize)
             .ok_or(StoreError::Corrupt("artifact proof proposer"))?

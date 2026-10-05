@@ -21,6 +21,7 @@ pub mod history;
 pub mod import;
 pub mod merkle;
 pub mod produce;
+pub mod programs;
 pub mod proposer;
 pub mod prove;
 pub mod retention;

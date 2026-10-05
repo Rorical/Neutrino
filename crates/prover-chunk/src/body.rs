@@ -14,6 +14,9 @@ use crate::{consensus::ConsensusError, execution::commitment, history::HistoryEr
 pub struct ConsensusBody {
     /// Complete header-committed embedded-vote lane.
     pub finality_votes: Vec<FinalityVote>,
+    /// Leaves of the program-artifact lane: one commitment per piece. The
+    /// bytes themselves never enter consensus validation.
+    pub program_leaves: Vec<neutrino_primitives::Hash>,
 }
 
 impl ConsensusBody {
@@ -23,8 +26,12 @@ impl ConsensusBody {
         for bytes in &body.transactions {
             let _: Transaction = borsh::from_slice(bytes).map_err(|_| HistoryError::Transaction)?;
         }
+        if !body.programs_well_formed() {
+            return Err(HistoryError::Program);
+        }
         Ok(Self {
             finality_votes: body.finality_votes.clone(),
+            program_leaves: body.programs.iter().map(commitment).collect(),
         })
     }
 
@@ -44,11 +51,18 @@ impl ConsensusBody {
                 .map(commitment)
                 .collect::<Vec<_>>(),
         );
+        if self.program_leaves.len() > neutrino_consensus_types::MAX_PROGRAM_PIECES_PER_BLOCK {
+            return Err(ConsensusError::Header);
+        }
         let da = neutrino_primitives::da_root_from_lane_roots([
             (summary.transaction_count, header.transactions_root),
             (
                 u32::try_from(self.finality_votes.len()).map_err(|_| ConsensusError::Header)?,
                 votes,
+            ),
+            (
+                u32::try_from(self.program_leaves.len()).map_err(|_| ConsensusError::Header)?,
+                merkle_root_of_hashes(&self.program_leaves),
             ),
         ]);
         if header.votes_root != votes || header.da_root != da {

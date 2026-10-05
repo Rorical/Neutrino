@@ -14,10 +14,11 @@
 //! advance during the loop or a `head_state_root` divergence after
 //! re-open.
 //!
-//! `N_SLOTS` is sized to exercise multiple chunk boundaries
-//! (`chunk_size = 4` → at least `N_SLOTS / 4` chunks reached) while
-//! staying well within the CI budget. The mock SP1 prover keeps the
-//! per-slot wall-clock under 100 ms.
+//! The whole run stays inside chunk 0 (`chunk_size = 64 > N_SLOTS`): a node
+//! never produces into a later chunk before the previous one finalizes,
+//! and since program sets travel in boundaries (design 24) the engine needs
+//! that finality to anchor blocks of a later chunk. The mock SP1 prover
+//! keeps the per-slot wall-clock under 100 ms.
 
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProductionConfig, ProposerKey};
@@ -29,10 +30,9 @@ use neutrino_primitives::{
 use neutrino_runtime_host::{Sp1ProofSystem, WasmExecutor};
 use neutrino_storage::MemoryDatabase;
 
-/// Number of consecutive produce/prove cycles to run. 60 slots
-/// crosses 15 chunk boundaries (`chunk_size = 4`), exercising
-/// chunk-bounded execution multiple times without hitting CI
-/// timeouts on the mock prover.
+/// Number of consecutive produce/prove cycles to run. 60 slots stay
+/// inside the single 64-block chunk (see the module docs) without
+/// hitting CI timeouts on the mock prover.
 const N_SLOTS: u64 = 60;
 const CHAIN_ID: u64 = 5_555_555;
 const GENESIS_SEED: [u8; 32] = [0xCE; 32];
@@ -56,13 +56,13 @@ fn single_validator_set() -> Vec<Validator> {
 fn chain_spec() -> ChainSpec {
     let validators = single_validator_set();
     let proof = ProofParams {
-        slot_budget_per_chunk: 4,
+        slot_budget_per_chunk: 64,
         ..ProofParams::default()
     };
     let vs_root = validator_set_root(&validators);
     let genesis_block_hash: BlockHash = [0xAB; 32];
     let consensus = ConsensusParams {
-        chunk_size: 4,
+        chunk_size: 64,
         expected_proposers_per_slot: fixed_u128_from_integer(8),
         ..ConsensusParams::default()
     };
@@ -94,7 +94,13 @@ fn many_slots_produce_prove_advance_monotonically_and_replay_round_trips() {
     let db = MemoryDatabase::new();
     let mut engine = Engine::genesis(chain_spec(), db).expect("genesis");
     let proof_system = Sp1ProofSystem::mock().expect("mock SP1 adapter");
+    // An engine-only harness pins the backend's Guests itself, as
+    // `ChainBackend::new` does for a node.
+    engine.set_programs(proof_system.embedded_guests());
     let executor = WasmExecutor::default_runtime().expect("wasm runtime");
+    executor
+        .alias_default_runtime(engine.chain_spec().runtime_code_hash)
+        .expect("harness alias");
     let proposer = proposer();
 
     let mut last_head_hash = engine.head_hash();

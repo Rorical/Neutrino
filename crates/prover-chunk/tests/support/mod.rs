@@ -185,6 +185,7 @@ pub fn fixture_with_live(
         receipt_root: output.receipts_root,
         da_root: header.da_root,
         vm_code_hash: runtime_hash,
+        block_program: key_digest,
         gas_used: output.gas_used,
         gas_limit: input.block_gas_limit,
         gas_price: input.gas_price,

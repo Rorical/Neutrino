@@ -350,20 +350,31 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
     let bytes = cache
         .prove_or_resume(
             &evidence_identity,
-            |bytes| verifier.verify_evidence(bytes, &batch),
+            |bytes| verifier.verify_evidence(bytes, &batch, &first.evidence_guest_vk_digest),
             || {
                 system
-                    .prove_evidence_batch(std::slice::from_ref(&evidence))
+                    .prove_evidence_batch(
+                        std::slice::from_ref(&evidence),
+                        &first.context.programs.execution,
+                    )
                     .map(|artifacts| artifacts[0].proof_bytes.clone())
             },
         )
         .unwrap();
     let mut wrong = batch.clone();
     wrong.root[0] ^= 1;
-    assert!(verifier.verify_evidence(&bytes, &wrong).is_err());
+    assert!(
+        verifier
+            .verify_evidence(&bytes, &wrong, &first.evidence_guest_vk_digest)
+            .is_err()
+    );
     let mut corrupt = bytes.clone();
     corrupt.push(0);
-    assert!(verifier.verify_evidence(&corrupt, &batch).is_err());
+    assert!(
+        verifier
+            .verify_evidence(&corrupt, &batch, &first.evidence_guest_vk_digest)
+            .is_err()
+    );
     let input = submission_input(&first, input);
     let attachments = vec![EvidenceArtifact {
         evidence_guest_vk_digest: first.evidence_guest_vk_digest,
@@ -427,6 +438,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
     };
     let context = neutrino_proof_system::BlockExecutionContext {
         evidence_anchor: input.evidence_anchor,
+        runtime_code_hash: neutrino_runtime_host::default_runtime_code_hash(),
         chain_id: input.chain_id,
         block_height: input.block_height,
         gas_limit: input.block_gas_limit,
@@ -534,7 +546,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
             },
             || {
                 let started = std::time::Instant::now();
-                system.preprove_facts(&requests)?;
+                system.preprove_facts(&next.context.programs.execution.fact, &requests)?;
                 eprintln!(
                     "evidence gate: {} fact requests proven in {:?}",
                     requests.len(),

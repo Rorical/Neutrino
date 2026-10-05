@@ -42,6 +42,10 @@ extern crate alloc;
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
     pub(crate) programs: Option<neutrino_consensus_types::history_proof::ProgramSet>,
+    /// Upgrade records observed at unfinalized chunk boundaries, by block hash.
+    pub(crate) program_switches: RefCell<
+        BTreeMap<BlockHash, Option<neutrino_consensus_types::history_proof::ScheduledUpgrade>>,
+    >,
     store: ChainStore<DB>,
     clock: SlotClock,
     state: Trie,
@@ -165,6 +169,7 @@ impl<DB: Database> Engine<DB> {
             bft_sessions: BTreeMap::new(),
             local_voter: None,
             programs: None,
+            program_switches: Self::new_program_switch_cache(),
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),
             rejected_proofs: BTreeMap::new(),
@@ -308,6 +313,7 @@ impl<DB: Database> Engine<DB> {
             bft_sessions: BTreeMap::new(),
             local_voter: None,
             programs,
+            program_switches: Self::new_program_switch_cache(),
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),
             rejected_proofs: BTreeMap::new(),

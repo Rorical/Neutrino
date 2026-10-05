@@ -1,6 +1,7 @@
 //! Opportunistic early fact compression. BFT never waits on a proof.
 
 use super::ChainBackend;
+use neutrino_consensus_types::history_proof::VkDigest;
 use neutrino_proof_system::ProofSystem;
 use neutrino_prover_chunk::facts::{FactRequest, MAX_FACTS};
 use neutrino_storage::Database;
@@ -17,30 +18,50 @@ where
         if requests.is_empty() || self.fact_program().is_none() {
             return;
         }
+        // Facts are proven under the fact program of the chunk being built,
+        // the one whose chunk proof will consume the receipts.
+        let Ok(fact_program) = self.with_engine(|engine| {
+            engine
+                .programs_at_chunk(engine.finalized_next_chunk_id())
+                .map(|programs| programs.execution.fact)
+        }) else {
+            return;
+        };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let mut guard = self.fact_jobs.lock().expect("fact queue mutex");
         if guard.as_ref().is_none_or(mpsc::Sender::is_closed) {
-            let (tx, mut rx) = mpsc::channel::<Vec<FactRequest>>(8);
+            let (tx, mut rx) = mpsc::channel::<(VkDigest, Vec<FactRequest>)>(8);
             let prover = Arc::clone(&self.proof_system);
             let budget = Arc::clone(&self.proving_budget);
             runtime.spawn(async move {
-                while let Some(mut requests) = rx.recv().await {
-                    // Coalesce already queued groups without delaying consensus
-                    // or starting a timer. Drain at most the bounded queue's
-                    // capacity so continuous arrivals cannot starve proving.
+                let mut carried: Option<(VkDigest, Vec<FactRequest>)> = None;
+                while let Some((program, mut requests)) = match carried.take() {
+                    Some(group) => Some(group),
+                    None => rx.recv().await,
+                } {
+                    // Coalesce already queued groups for the same program
+                    // without delaying consensus or starting a timer. Drain at
+                    // most the bounded queue's capacity so continuous arrivals
+                    // cannot starve proving; a group for another program is
+                    // carried into the next round.
                     for _ in 0..8 {
-                        let Ok(group) = rx.try_recv() else {
+                        let Ok((next_program, group)) = rx.try_recv() else {
                             break;
                         };
-                        requests.extend(group);
+                        if next_program == program {
+                            requests.extend(group);
+                        } else {
+                            carried = Some((next_program, group));
+                            break;
+                        }
                     }
                     let prover = Arc::clone(&prover);
                     let budget = Arc::clone(&budget);
                     match tokio::task::spawn_blocking(move || {
                         let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Normal);
-                        prover.preprove_facts(&requests)
+                        prover.preprove_facts(&program, &requests)
                     }).await {
                         Ok(Ok(())) => {},
                         Ok(Err(error)) => tracing::debug!(%error, "early fact proof unavailable; evidence will prove on demand"),
@@ -55,7 +76,7 @@ where
         for group in requests.chunks(MAX_FACTS) {
             // Eight queued groups, one worker, at most 2 MiB per group.
             if borsh::object_length(&group).is_ok_and(|bytes| bytes <= 2 * 1024 * 1024)
-                && sender.try_send(group.to_vec()).is_err()
+                && sender.try_send((fact_program, group.to_vec())).is_err()
             {
                 break;
             }

@@ -72,8 +72,11 @@ have passed.
 - Program identities live in every `ConsensusBoundary` as a `ProgramSet`; `ChainBinding`
   is immutable and `ProofDomain { chain, programs }` is only a verifier's trust profile.
   Receipts are verified under the program set of their start boundary, never one the
-  receipt names itself. Read `docs/design/24-runtime-upgrades.md` before changing
-  program identities, boundaries, verifying-key handling or the upgrade switch.
+  receipt names itself. Upgrade governance is runtime state (`governance` module of the
+  default runtime); artifacts travel in the block body's program lane and are installed
+  by the node only when governance names their content hash, after local SP1 setup.
+  Read `docs/design/24-runtime-upgrades.md` before changing program identities,
+  boundaries, verifying-key handling, the upgrade switch or program distribution.
 - There is one current protocol format with unversioned types, fields and paths.
   Incompatible development upgrades replace formats directly. Do not introduce
   deprecated variants, compatibility shims, fake recursive proofs or empty-proof

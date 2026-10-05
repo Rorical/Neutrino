@@ -95,10 +95,11 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
 /// `StfPublicOutput` the guest just committed.  Tests that intend the
 /// happy path call this; tests that exercise individual cross-check
 /// rejections mutate one field after constructing it.
-const fn matching_public_inputs(
+fn matching_public_inputs(
     input: &StfInput,
     output: &neutrino_default_runtime_core::StfPublicOutput,
 ) -> BlockProofPublicInputs {
+    use sp1_sdk::HashableKey;
     BlockProofPublicInputs {
         chain_id: input.chain_id,
         height: input.block_height,
@@ -110,6 +111,7 @@ const fn matching_public_inputs(
         receipt_root: output.receipts_root,
         da_root: ZERO_HASH,
         vm_code_hash: ZERO_HASH,
+        block_program: mock_ctx().vk.hash_u32(),
         gas_used: output.gas_used,
         gas_limit: input.block_gas_limit,
         gas_price: input.gas_price,

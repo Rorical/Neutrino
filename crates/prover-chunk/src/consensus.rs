@@ -458,6 +458,7 @@ pub fn body_da_root(body: &Body) -> Hash {
     neutrino_primitives::da_root_from_lane_roots([
         lane_root(&body.transactions),
         lane_root(&body.finality_votes),
+        lane_root(&body.programs),
     ])
 }
 

@@ -133,6 +133,42 @@ impl GuestPrograms {
     }
 }
 
+/// BLAKE3 content hashes of the artifacts a program set is built from.
+///
+/// They are distributed through the block body's program lane (design 24,
+/// phase 3). A zero hash means the artifact is not distributed on chain.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct ProgramArtifacts {
+    /// Runtime WASM whose hash is `ProgramSet::runtime_code_hash`.
+    pub runtime: Hash,
+    /// Fact Guest ELF.
+    pub fact: Hash,
+    /// Evidence Guest ELF.
+    pub evidence: Hash,
+    /// Block Guest ELF.
+    pub block: Hash,
+    /// Chunk Guest ELF.
+    pub chunk: Hash,
+    /// Checkpoint Guest ELF.
+    pub checkpoint: Hash,
+}
+
+impl ProgramArtifacts {
+    /// Every nonzero content hash.
+    pub fn named(&self) -> impl Iterator<Item = Hash> {
+        [
+            self.runtime,
+            self.fact,
+            self.evidence,
+            self.block,
+            self.chunk,
+            self.checkpoint,
+        ]
+        .into_iter()
+        .filter(|hash| *hash != [0; 32])
+    }
+}
+
 /// A program switch scheduled in runtime state and executed by the chunk Guest at
 /// the boundary entering `activate_at_chunk`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -141,6 +177,8 @@ pub struct ScheduledUpgrade {
     pub activate_at_chunk: u64,
     /// Program set that boundary adopts.
     pub programs: ProgramSet,
+    /// Content hashes nodes fetch from the program lane and install.
+    pub artifacts: ProgramArtifacts,
 }
 
 /// Trusted chain identity plus the program set trusted at an anchor. Never

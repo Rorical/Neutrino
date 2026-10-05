@@ -134,6 +134,8 @@ pub enum HistoryError {
     Evidence,
     /// Runtime transaction does not match its authorized evidence or amount.
     Transaction,
+    /// A program-artifact piece violates the DA lane bounds.
+    Program,
     /// A rule lacks an objective witness or its verifier is unavailable.
     Unsupported,
 }

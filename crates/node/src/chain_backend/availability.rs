@@ -426,18 +426,26 @@ where
             return Some(verdict);
         }
         let prover = std::sync::Arc::clone(&self.proof_system);
+        let expected = self
+            .with_engine(|engine| {
+                engine
+                    .programs_for_height(proof.height)
+                    .map(|programs| programs.execution.block)
+            })
+            .ok()?;
         let proof = proof.clone();
-        let verdict =
-            tokio::task::spawn_blocking(move || match prover.classify_block_rejection(&proof) {
+        let verdict = tokio::task::spawn_blocking(move || {
+            match prover.classify_block_rejection(&proof, &expected) {
                 Ok(verdict) => Some(ProofVerdict::from(verdict)),
                 Err(_) => borsh::from_slice::<P::BlockProof>(&proof.proof_bytes)
                     .ok()
                     .filter(|decoded| prover.verify_block(decoded, &proof.public_inputs).is_ok())
                     .map(|_| ProofVerdict::Valid),
-            })
-            .await
-            .ok()
-            .flatten()?;
+            }
+        })
+        .await
+        .ok()
+        .flatten()?;
         self.remember_block_verdict(token, verdict)
             .then_some(verdict)
     }

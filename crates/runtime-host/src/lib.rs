@@ -23,6 +23,7 @@ mod evidence_prover;
 pub mod executor;
 mod fact_cache;
 mod history_prover;
+pub mod programs;
 pub mod proof_system;
 pub mod wasm;
 

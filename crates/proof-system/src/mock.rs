@@ -47,6 +47,7 @@ impl ProofSystem for MockProofSystem {
     fn classify_block_rejection(
         &self,
         proof: &neutrino_consensus_types::BlockProof,
+        _expected_block_program: &neutrino_consensus_types::history_proof::VkDigest,
     ) -> Result<Option<neutrino_consensus_types::ProofRejectionReason>, ProofError> {
         use neutrino_consensus_types::ProofRejectionReason;
         let Ok(decoded) = borsh::from_slice::<MockBlockProof>(&proof.proof_bytes) else {
@@ -119,6 +120,7 @@ mod tests {
             receipt_root: [6; 32],
             da_root: [7; 32],
             vm_code_hash: [8; 32],
+            block_program: [8; 8],
             gas_used: 0,
             gas_limit: 1_000_000,
             gas_price: 0,

@@ -133,6 +133,7 @@ pub fn validate_execution(
             receipt_root: header.receipts_root,
             da_root: header.da_root,
             vm_code_hash: context.vm_code_hash,
+            block_program: context.programs.execution.block,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
             gas_price: context.gas_price,

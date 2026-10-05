@@ -21,13 +21,6 @@ where
             .map(|programs| programs.execution.block)
     }
 
-    /// Evidence program of the embedded set.
-    pub(super) fn evidence_program(&self) -> Option<[u32; 8]> {
-        self.proof_system
-            .programs()
-            .map(|programs| programs.execution.evidence)
-    }
-
     /// Fact program of the embedded set.
     pub(super) fn fact_program(&self) -> Option<[u32; 8]> {
         self.proof_system

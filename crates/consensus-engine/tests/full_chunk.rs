@@ -57,7 +57,12 @@ impl ErasedBlockExecutor for NativeReplayExecutor {
         })
     }
 
-    fn query(&self, _: &QueryRequest, _: &Trie<Poseidon2Hasher>) -> Result<QueryResponse, String> {
+    fn query(
+        &self,
+        _: &QueryRequest,
+        _: neutrino_primitives::Hash,
+        _: &Trie<Poseidon2Hasher>,
+    ) -> Result<QueryResponse, String> {
         Err(String::from("query is outside this replay regression"))
     }
 
@@ -67,11 +72,26 @@ impl ErasedBlockExecutor for NativeReplayExecutor {
         _: u64,
         _: u64,
         _: u128,
+        _: neutrino_primitives::Hash,
         _: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String> {
         Err(String::from(
             "transaction admission is outside this replay regression",
         ))
+    }
+
+    fn install_runtime(&self, _: &[u8]) -> Result<neutrino_primitives::Hash, String> {
+        Err(String::from(
+            "runtime installation is outside this replay regression",
+        ))
+    }
+
+    fn alias_default_runtime(&self, _: neutrino_primitives::Hash) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn installed_runtimes(&self) -> Vec<neutrino_primitives::Hash> {
+        Vec::new()
     }
 }
 
@@ -716,6 +736,7 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
         address,
         bls_pubkey: *newcomer.public_key_bytes(),
         pop_signature: newcomer.prove_possession().to_bytes(),
+        registered_at_height: 0,
     };
     let mut registrations = ValidatorRegistrations::default();
     registrations.insert(address);

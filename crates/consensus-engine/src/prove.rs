@@ -173,7 +173,7 @@ impl<DB: Database> Engine<DB> {
             return Err(ProofError::PublicInputMismatch.into());
         }
         let state_root_before = self.parent_state_root(&header)?;
-        let public_inputs = self.public_inputs_for(&header, state_root_before, block_hash);
+        let public_inputs = self.public_inputs_for(&header, state_root_before, block_hash)?;
 
         let witness_bytes = self
             .store()
@@ -264,8 +264,11 @@ impl<DB: Database> Engine<DB> {
         header: &Header,
         state_root_before: StateRoot,
         block_hash: &BlockHash,
-    ) -> BlockProofPublicInputs {
-        BlockProofPublicInputs {
+    ) -> Result<BlockProofPublicInputs, ProveError<DB::Error>> {
+        let programs = self
+            .programs_for_height(header.height)
+            .map_err(|_| ProveError::Backend(ProofError::InvalidWitness))?;
+        Ok(BlockProofPublicInputs {
             chain_id: self.chain_spec().chain_id,
             height: header.height,
             parent_block_hash: header.parent_hash,
@@ -275,13 +278,14 @@ impl<DB: Database> Engine<DB> {
             transactions_root: header.transactions_root,
             receipt_root: header.receipts_root,
             da_root: header.da_root,
-            vm_code_hash: self.chain_spec().runtime_code_hash,
+            vm_code_hash: programs.runtime_code_hash,
+            block_program: programs.execution.block,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
             gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: self.proposer_runtime_address(header.proposer_index),
             runtime_extra: header.runtime_extra,
-        }
+        })
     }
 
     /// Look up the runtime account address (withdrawal credentials)

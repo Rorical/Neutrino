@@ -124,6 +124,7 @@ fn engine_with_proof(spec: &ChainSpec) -> (Engine<FaultDb>, Chunk) {
         receipt_root: ZERO_HASH,
         da_root: ZERO_HASH,
         vm_code_hash: spec.runtime_code_hash,
+        block_program: [0; 8],
         gas_used: 0,
         gas_limit: header.gas_limit,
         gas_price: 0,

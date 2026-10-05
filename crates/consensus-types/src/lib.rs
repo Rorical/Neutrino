@@ -322,13 +322,103 @@ pub struct Body {
     /// witnesses are transported and archived with the body, outside header
     /// transaction/vote/DA commitments; alternate valid proofs are interchangeable.
     pub evidence_proofs: Vec<evidence::EvidenceArtifact>,
+    /// Program-artifact pieces of the data-availability lane (design 24):
+    /// upgrade runtime and Guest bytes travelling with ordinary block sync,
+    /// committed by the header's DA root, never read by the STF.
+    pub programs: Vec<ProgramPiece>,
 }
 
 impl Body {
     /// Compare the header-committed lanes independently of proof attachments.
     #[must_use]
     pub fn same_consensus_content(&self, other: &Self) -> bool {
-        self.transactions == other.transactions && self.finality_votes == other.finality_votes
+        self.transactions == other.transactions
+            && self.finality_votes == other.finality_votes
+            && self.programs == other.programs
+    }
+
+    /// `true` when the program lane respects every bound and every piece
+    /// authenticates against its artifact.
+    #[must_use]
+    pub fn programs_well_formed(&self) -> bool {
+        self.programs.len() <= MAX_PROGRAM_PIECES_PER_BLOCK
+            && self.programs.iter().all(ProgramPiece::authenticates)
+    }
+}
+
+/// Fixed size of every program-artifact piece except the last one.
+pub const MAX_PROGRAM_PIECE_BYTES: usize = 512 * 1024;
+/// Upper bound of program-artifact pieces per block.
+pub const MAX_PROGRAM_PIECES_PER_BLOCK: usize = 2;
+/// Upper bound of one complete program artifact (runtime WASM or Guest ELF).
+pub const MAX_PROGRAM_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Number of pieces an artifact of `total_len` bytes splits into.
+#[must_use]
+pub const fn program_piece_count(total_len: u32) -> u64 {
+    (total_len as u64).div_ceil(MAX_PROGRAM_PIECE_BYTES as u64)
+}
+
+/// Content hash governance names for an artifact.
+///
+/// It is the counted Merkle root of the pieces' BLAKE3 hashes bound to the
+/// artifact length. Every piece is authenticated against it on arrival, so a
+/// forged piece can never spoil the reassembly of an honest artifact.
+#[must_use]
+pub fn program_content_hash(total_len: u32, root: Hash) -> Hash {
+    evidence::commitment(&(b"neutrino-program-artifact", total_len, root))
+}
+
+/// One self-authenticating slice of a program artifact in the DA lane.
+///
+/// Its bytes open the artifact's piece Merkle tree at the piece index, and
+/// the artifact's content hash follows from `total_len` and `root`.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct ProgramPiece {
+    /// Merkle root of the artifact's piece hashes.
+    pub root: Hash,
+    /// Length of the complete artifact.
+    pub total_len: u32,
+    /// Offset of `bytes` inside the artifact; a multiple of the piece size.
+    pub offset: u32,
+    /// Piece bytes: exactly the piece size except for the last piece.
+    pub bytes: Vec<u8>,
+    /// Opening of `BLAKE3(bytes)` in the artifact's piece tree.
+    pub opening: evidence::MerkleOpening,
+}
+
+impl ProgramPiece {
+    /// Content hash of the artifact this piece belongs to.
+    #[must_use]
+    pub fn content_hash(&self) -> Hash {
+        program_content_hash(self.total_len, self.root)
+    }
+
+    /// `true` when sizes, offsets and the opening shape are consistent.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        let piece = MAX_PROGRAM_PIECE_BYTES as u64;
+        let (total, offset) = (u64::from(self.total_len), u64::from(self.offset));
+        let expected_len = (total.saturating_sub(offset)).min(piece);
+        self.total_len > 0
+            && self.total_len <= MAX_PROGRAM_BYTES
+            && offset % piece == 0
+            && offset < total
+            && self.bytes.len() as u64 == expected_len
+            && self.opening.count == program_piece_count(self.total_len)
+            && self.opening.index == offset / piece
+            && self.opening.siblings.len() <= 64
+    }
+
+    /// `true` when the piece is well formed and its bytes open the artifact's
+    /// piece tree at this index.
+    #[must_use]
+    pub fn authenticates(&self) -> bool {
+        self.is_well_formed()
+            && self.opening.verify(
+                blake3_256(&self.bytes),
+                evidence::counted_merkle_root(self.opening.count, self.root),
+            )
     }
 }
 
@@ -606,6 +696,10 @@ pub struct BlockProofPublicInputs {
     pub da_root: Hash,
     /// BLAKE3 of the WASM runtime artifact bytes.
     pub vm_code_hash: Hash,
+    /// Block Guest expected to have produced this proof: the block program
+    /// of the chunk boundary the block executes under (design 24). The
+    /// verifier checks the receipt's verifying key against it.
+    pub block_program: history_proof::VkDigest,
     /// Sum of per-transaction gas the runtime charged inside the block.
     /// Cross-checked against `header.gas_used` so a malicious prover
     /// cannot understate the block's gas consumption.
@@ -914,6 +1008,7 @@ mod tests {
                         receipt_root: hash(54),
                         da_root: hash(55),
                         vm_code_hash: hash(56),
+                        block_program: [56; 8],
                         gas_used: 0,
                         gas_limit: 1_000_000,
                         gas_price: 0,
@@ -962,6 +1057,7 @@ mod tests {
             receipt_root: hash(61),
             da_root: hash(62),
             vm_code_hash: hash(63),
+            block_program: [63; 8],
             gas_used: 0,
             gas_limit: 1_000_000,
             gas_price: 0,

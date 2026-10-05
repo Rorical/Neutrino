@@ -26,8 +26,16 @@ where
     /// Triggered by evidence arrival, finalization and block-production events.
     /// Proving never holds the engine lock or blocks the BFT message task.
     pub(super) fn start_evidence_jobs(&self) {
-        let (Some(block_key), Some(evidence_key)) = (self.block_program(), self.evidence_program())
-        else {
+        if self.block_program().is_none() {
+            return;
+        }
+        // Evidence is proven under the execution programs of the chunk being
+        // built, which is where its admission will be checked.
+        let Ok(execution) = self.with_engine(|engine| {
+            engine
+                .programs_at_chunk(engine.finalized_next_chunk_id())
+                .map(|programs| programs.execution)
+        }) else {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -36,7 +44,7 @@ where
         if self.evidence_job_running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let witnesses = self.select_evidence_jobs(block_key);
+        let witnesses = self.select_evidence_jobs(execution.block);
         if witnesses.is_empty() {
             self.evidence_job_running.store(false, Ordering::Release);
             return;
@@ -54,7 +62,7 @@ where
                     let result = {
                         let _permit =
                             budget.acquire(crate::proving_budget::ProvingPriority::Normal);
-                        prover.prove_evidence_batch(&batch)
+                        prover.prove_evidence_batch(&batch, &execution)
                     };
                     let artifacts = match result {
                         Ok(artifacts) => artifacts,
@@ -71,7 +79,7 @@ where
                     for artifact in artifacts {
                         // The backend returns verified artifacts. Storage/network
                         // readers verify independently at their trust boundary.
-                        if artifact.evidence_guest_vk_digest != evidence_key {
+                        if artifact.evidence_guest_vk_digest != execution.evidence {
                             continue;
                         }
                         let stored = engine
@@ -217,57 +225,66 @@ where
         artifact: EvidenceArtifact,
     ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
-        if Some(artifact.membership.batch.fact_guest_vk_digest) != self.fact_program()
-            || !artifact.membership.binds(
-                &artifact.statement,
-                &self.fact_program().unwrap_or_default(),
-            )
-            || artifact.proof_bytes.is_empty()
-            || Some(artifact.evidence_guest_vk_digest) != self.evidence_program()
+        if artifact.proof_bytes.is_empty()
             || artifact.proof_bytes.len()
                 > neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES
         {
             return Rejected;
         }
+        // Program identities come from the anchor of the block that would
+        // admit the artifact, never from the artifact itself.
         let readiness = self.with_engine(|engine| {
             if artifact.statement.chain_id != engine.chain_spec().chain_id
                 || artifact.statement.chain_spec_hash != engine.chain_spec().hash()
             {
-                return Rejected;
+                return Err(Rejected);
             }
             let Some(height) = engine.head_height().checked_add(1) else {
-                return Deferred;
+                return Err(Deferred);
             };
             let Ok(anchor) = engine.evidence_anchor(height) else {
-                return Deferred;
+                return Err(Deferred);
             };
+            if artifact.membership.batch.fact_guest_vk_digest != anchor.fact_guest_vk_digest
+                || !artifact
+                    .membership
+                    .binds(&artifact.statement, &anchor.fact_guest_vk_digest)
+                || artifact.evidence_guest_vk_digest != anchor.evidence_guest_vk_digest
+            {
+                return Err(Rejected);
+            }
             if artifact.statement.context.chunk_id < anchor.chunk_id
                 && !is_recent_history_index(artifact.statement.context.chunk_id, anchor.chunk_id)
             {
-                return Rejected;
+                return Err(Rejected);
             }
             if artifact.statement.context.end_height >= height
                 || height - artifact.statement.context.end_height
                     > anchor.policy.evidence_max_age_blocks
             {
-                return Deferred;
+                return Err(Deferred);
             }
             match engine.evidence_submission(artifact.statement.clone()) {
                 Ok(submission)
                     if submission.binds(engine.chain_spec().chain_id, height, &anchor) =>
                 {
-                    Accepted
+                    Ok(anchor.evidence_guest_vk_digest)
                 }
-                _ => Rejected,
+                _ => Err(Rejected),
             }
         });
-        if readiness != Accepted {
-            return readiness;
-        }
+        let evidence_program = match readiness {
+            Ok(program) => program,
+            Err(outcome) => return outcome,
+        };
         let prover = Arc::clone(&self.proof_system);
         let result = tokio::task::spawn_blocking(move || {
             prover
-                .verify_evidence(&artifact.proof_bytes, &artifact.membership.batch)
+                .verify_evidence(
+                    &artifact.proof_bytes,
+                    &artifact.membership.batch,
+                    &evidence_program,
+                )
                 .map(|()| artifact)
         })
         .await;

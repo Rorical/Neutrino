@@ -1,10 +1,10 @@
 # 24 — Runtime and program upgrades
 
-Status: phases 1 and 2 implemented (program sets in consensus boundaries,
+Status: phases 1 to 3 implemented (program sets in consensus boundaries,
 state-driven switching at chunk boundaries, cross-program history recursion,
-validator-stake governance in the runtime). On-chain program distribution and the
-SP1 version bridge are later phases and are described here so the current formats
-already accommodate them.
+validator-stake governance in the runtime, on-chain program distribution with
+dynamic Guest setup and runtime loading). The SP1 version bridge is described here
+so the current formats already accommodate it.
 
 ## Goal
 
@@ -134,8 +134,17 @@ ScheduledUpgrade { activate_at_chunk, programs }                                
 
 - Only active runtime validators (nonzero stake in the canonical `ValidatorSet`)
   may propose or vote, signing with their Ed25519 account key; both kinds pay gas.
-- One decision is in flight at a time: a live proposal or an enacted switch awaiting
-  its boundary blocks new proposals.
+  A registration must be at least `UPGRADE_VOTER_MIN_AGE_BLOCKS` (1024) old to count
+  as proposer, voter or in the quorum denominator, so freshly deposited stake cannot
+  decide an upgrade before consensus would even seat it; genesis validators have no
+  registration record and always count.
+- One decision is in flight at a time. An enacted switch awaiting its boundary blocks
+  new proposals; a live proposal is displaced only by a proposer whose own stake
+  exceeds the stake already voting for it, so a small holder cannot park the slot
+  and two thirds of the stake can always reach a decision.
+- Proposals name the BLAKE3 content hashes of the six artifacts (`ProgramArtifacts`)
+  beside the program set, and the enacted `ScheduledUpgrade` carries them, so nodes
+  know which program-lane pieces to assemble and install.
 - Votes are weighted by the voter's stake at tally time. The proposer's stake counts
   as a vote. Enactment happens inside the transaction whose vote reaches two thirds
   of the active stake: the proposal is deleted and `ScheduledUpgrade` is written.
@@ -159,13 +168,47 @@ accountable for the pairing through reproducible builds and off-chain audit.
 ## Phase 3: on-chain program distribution
 
 Program bytes (about 7 MB for the WASM and five Guests today) travel in the block
-body's data-availability lane, committed by content hash, never read by the STF and
-never stored in the state trie. Nodes fetch them with ordinary block sync, check the
-hash, run SP1 setup locally to derive each verifying key and compare it with the
-approved digest. WASM already loads dynamically; Guest ELFs can be set up at runtime.
-After this phase no upgrade of runtime or Guests needs a new node binary; only the
-governance approval must name both the code hash and the key digests, and builds must
-be reproducible so anyone can audit the pairing.
+body's program lane, never read by the STF and never stored in the state trie:
+
+```text
+Body { transactions, finality_votes, evidence_proofs, programs: Vec<ProgramPiece> }
+ProgramPiece { root, total_len, offset, bytes, opening }    // 512 KiB pieces, <= 2 per block
+content_hash = BLAKE3("neutrino-program-artifact" || total_len || root)
+root         = Merkle root of BLAKE3(piece_i); opening proves BLAKE3(bytes) at the piece index
+da_root      = lanes[(tx_count, tx_root), (vote_count, votes_root), (piece_count, pieces_root)]
+```
+
+Every piece authenticates on its own against the artifact's content hash, so a forged
+piece is dropped on arrival and can never spoil the reassembly of an honest artifact.
+The header's DA root commits the piece lane through a third lane; the chunk Guest sees
+only the pieces' leaves (`ConsensusBody::program_leaves`) and never their bytes. Block
+import rejects bodies with unauthenticated pieces or more than two of them.
+
+Nodes assemble only artifacts the runtime's open proposal or enacted schedule names
+(read through the `upgrade_status` query), with declared lengths counted against a
+fixed memory budget. A completed artifact is installed only if it produces exactly the
+identity governance declared for it: a runtime's BLAKE3 hash must equal the program
+set's runtime code hash before the module is compiled, and a Guest's SP1 setup must
+derive the digest named in the program set. Only then is the artifact persisted under
+`<data_dir>/programs`, so a restart reinstalls exactly the approved set. WASM artifacts are compiled into the executor, which now holds one runtime per
+code hash and executes each block under the runtime its chunk boundary names. ELF
+artifacts go through SP1 setup once and enter the proof backend's program registry,
+keyed by the derived verifying-key digest; the node proves and fully verifies under any
+installed set and verifies other sets by digest. Nodes publish artifacts by dropping the
+files into `<data_dir>/programs/publish`; the producer streams them two pieces per
+block and the `programs_status` RPC reports assembly, installation and publication
+state. No upgrade of runtime or Guests needs a new node binary; the governance approval
+names the code hash, the key digests and the artifact hashes, and builds must be
+reproducible so anyone can audit the pairings.
+
+### Per-block program resolution
+
+Finalized boundaries carry their program set. For a block in an unfinalized chunk the
+engine derives the set from the `ScheduledUpgrade` record in the post-state of the
+previous chunk's last canonical block, exactly the rule the chunk Guest applies, cached
+by that block's hash so reorganisations never reuse a stale answer. The block's public
+inputs now carry the expected block Guest digest (`block_program`) beside the runtime
+hash, so verifiers check a receipt under the key the block's boundary names.
 
 ## SP1 version upgrades
 

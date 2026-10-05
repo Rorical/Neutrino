@@ -98,6 +98,7 @@ fn block(height: u64, parent: [u8; 32], state: [u8; 32]) -> ProvenBlock {
         receipt_root: header.receipts_root,
         da_root: header.da_root,
         vm_code_hash: context.vm_code_hash,
+        block_program: context.programs.execution.block,
         gas_used: header.gas_used,
         gas_limit: header.gas_limit,
         gas_price: context.gas_price,
@@ -407,6 +408,7 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
         address: [12; 32],
         bls_pubkey: key.public_key().to_bytes(),
         pop_signature: key.prove_possession().to_bytes(),
+        registered_at_height: 0,
     };
     let mut index = ValidatorRegistrations::default();
     index.insert([12; 32]);

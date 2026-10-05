@@ -3,15 +3,15 @@
 use std::sync::Arc;
 
 use neutrino_consensus_types::history_proof::{
-    BoundedVec, ChainBinding, CheckpointInput, ConsensusBoundary, ExecutionPrograms, GuestPrograms,
-    HistoryProof, MAX_CHECKPOINT_INPUT_BYTES, MAX_FOLD_CHUNKS, MAX_HISTORY_PROVING_INPUT_BYTES,
+    BoundedVec, ChainBinding, CheckpointInput, ConsensusBoundary, HistoryProof,
+    MAX_CHECKPOINT_INPUT_BYTES, MAX_FOLD_CHUNKS, MAX_HISTORY_PROVING_INPUT_BYTES,
     MAX_HISTORY_RECEIPT_BYTES, ProgramSet, ProofDomain,
 };
 use neutrino_primitives::{ChainSpec, Hash, blake3_256};
 use neutrino_proof_system::{ProofError, VerifiedHistory, verify_history_proof};
 use neutrino_prover_chunk::{consensus::ConsensusStatement, receipt_codec};
 use sp1_sdk::{
-    HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1Stdin, SP1VerifyingKey,
+    HashableKey, SP1Proof, SP1ProofWithPublicValues, SP1Stdin, SP1VerifyingKey,
     blocking::{ProveRequest, Prover, ProverClient},
 };
 
@@ -29,42 +29,6 @@ pub(crate) struct CachedHistory {
 }
 
 impl<P: ProgramProver> Sp1ProofSystem<P> {
-    fn history_proving_key(&self) -> Result<Arc<P::ProvingKey>, ProofError> {
-        let mut cached = self
-            .history_pk
-            .lock()
-            .map_err(|_| ProofError::BackendRejected)?;
-        if let Some(key) = cached.as_ref() {
-            return Ok(Arc::clone(key));
-        }
-        let key = Arc::new(
-            self.ctx
-                .prover
-                .setup_program(crate::DEFAULT_CHECKPOINT_GUEST_ELF.clone())
-                .map_err(|_| ProofError::BackendRejected)?,
-        );
-        *cached = Some(Arc::clone(&key));
-        drop(cached);
-        Ok(key)
-    }
-
-    /// The Guest identities this node embeds and can prove under.
-    pub(super) fn embedded_guests(&self) -> Result<GuestPrograms, ProofError> {
-        Ok(GuestPrograms {
-            execution: ExecutionPrograms {
-                fact: self.fact_vk.hash_u32(),
-                evidence: self.evidence_vk.hash_u32(),
-                block: self.ctx.vk.hash_u32(),
-            },
-            chunk: self
-                .chunk_proving_key()
-                .map_err(|_| ProofError::BackendRejected)?
-                .verifying_key()
-                .hash_u32(),
-            checkpoint: self.history_proving_key()?.verifying_key().hash_u32(),
-        })
-    }
-
     pub(super) fn trusted_history_domain(
         &self,
         spec: &ChainSpec,
@@ -72,7 +36,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         spec.validate().map_err(|_| ProofError::InvalidWitness)?;
         Ok(ProofDomain {
             chain: ChainBinding::from_spec(spec),
-            programs: self.embedded_guests()?.with_runtime(spec.runtime_code_hash),
+            programs: self.embedded.with_runtime(spec.runtime_code_hash),
         })
     }
 
@@ -92,9 +56,8 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         neutrino_prover_checkpoint::validate_history(statement)
             .map_err(|_| ProofError::PublicInputMismatch)?;
         let expected_pv = borsh::to_vec(statement).map_err(|_| ProofError::MalformedProof)?;
-        let key = self.history_proving_key()?;
-        if programs.checkpoint == key.verifying_key().hash_u32() {
-            let bundle = self.authenticated_child(proof.receipt.as_ref(), key.verifying_key())?;
+        if let Ok(checkpoint) = self.keys(&programs.checkpoint) {
+            let bundle = self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?;
             if bundle.public_values.as_slice() != expected_pv {
                 return Err(ProofError::PublicInputMismatch);
             }
@@ -203,48 +166,47 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             return Err(ProofError::InvalidWitness);
         }
         let domain = self.trusted_history_domain(spec)?;
-        let history_key = self.history_proving_key()?;
-        let chunk_key = self
-            .chunk_proving_key()
-            .map_err(|_| ProofError::BackendRejected)?;
-        // Deferred receipts need full verifying keys, which this node only
-        // holds for its embedded programs, and the output is verified under
-        // the start boundary's checkpoint program, which must therefore be the
-        // embedded one. Composing across another program set is a phase 3
-        // capability; refuse rather than guess.
+        // Deferred receipts need full verifying keys, and the output is
+        // verified under the start boundary's checkpoint program, whose
+        // proving key this node must hold. Every child's start program set
+        // is read from the child itself only after the caller-authenticated
+        // start of the range pins the first one; continuity is enforced by
+        // validation, so each later start equals a proven end.
         let mut children = Vec::with_capacity(chunks.len() + usize::from(previous.is_some()));
         if let Some(proof) = previous {
-            // The previous range must start under the embedded set, which is
-            // the key the output will be verified under.
-            if proof.statement.start.programs != domain.programs {
-                return Err(ProofError::Unsupported);
-            }
             self.verify_history_receipt(spec, proof, &proof.statement.start)?;
+            let checkpoint = self.keys(&proof.statement.start.programs.checkpoint)?;
             children.push((
-                self.authenticated_child(proof.receipt.as_ref(), history_key.verifying_key())?,
-                history_key.verifying_key().clone(),
+                self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?,
+                checkpoint.vk.clone(),
             ));
         }
         let mut statements = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            let bundle = self.authenticated_child(&chunk.bytes, chunk_key.verifying_key())?;
+            let bundle =
+                receipt_codec::decode::<SP1ProofWithPublicValues, MAX_HISTORY_RECEIPT_BYTES>(
+                    &chunk.bytes,
+                )
+                .map_err(|_| ProofError::MalformedProof)?;
             let statement: ConsensusStatement = borsh::from_slice(bundle.public_values.as_slice())
                 .map_err(|_| ProofError::MalformedProof)?;
-            if statement.start.programs.chunk != domain.programs.chunk
-                || (previous.is_none()
-                    && statement.start.programs.checkpoint != domain.programs.checkpoint)
-            {
-                return Err(ProofError::Unsupported);
-            }
+            let chunk_keys = self.keys(&statement.start.programs.chunk)?;
+            let bundle = self.authenticated_child(&chunk.bytes, &chunk_keys.vk)?;
             statements.push(statement);
-            children.push((bundle, chunk_key.verifying_key().clone()));
+            children.push((bundle, chunk_keys.vk.clone()));
         }
+        let start = previous
+            .map_or_else(
+                || statements.first().map(|statement| statement.start),
+                |proof| Some(proof.statement.start),
+            )
+            .ok_or(ProofError::InvalidWitness)?;
         let input = CheckpointInput::Fold {
             chain: domain.chain,
             previous: previous.map(|proof| proof.statement),
             chunks: BoundedVec::new(statements).map_err(|_| ProofError::InvalidWitness)?,
         };
-        self.prove_history_input(spec, &input, &children)
+        self.prove_history_input(spec, &start.programs.checkpoint, &input, &children)
     }
 
     pub(super) fn merge_history(
@@ -253,22 +215,21 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         left: &HistoryProof,
         right: &HistoryProof,
     ) -> Result<VerifiedHistory, ProofError> {
-        let key = self.history_proving_key()?;
         let mut children = Vec::with_capacity(2);
         for proof in [left, right] {
-            if proof.statement.start.programs.checkpoint != key.verifying_key().hash_u32() {
-                return Err(ProofError::Unsupported);
-            }
-            // Both inputs are composed under the embedded checkpoint program;
-            // continuity (`left.end == right.start`) is enforced by validation.
+            // Each side is verified under its own start program; continuity
+            // (`left.end == right.start`) is enforced by validation, so the
+            // right start is a boundary the left side proved.
             self.verify_history_receipt(spec, proof, &proof.statement.start)?;
+            let checkpoint = self.keys(&proof.statement.start.programs.checkpoint)?;
             children.push((
-                self.authenticated_child(proof.receipt.as_ref(), key.verifying_key())?,
-                key.verifying_key().clone(),
+                self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?,
+                checkpoint.vk.clone(),
             ));
         }
         self.prove_history_input(
             spec,
+            &left.statement.start.programs.checkpoint,
             &CheckpointInput::Merge {
                 left: left.statement,
                 right: right.statement,
@@ -280,6 +241,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
     fn prove_history_input(
         &self,
         spec: &ChainSpec,
+        checkpoint_program: &neutrino_consensus_types::history_proof::VkDigest,
         input: &CheckpointInput,
         children: &[(Arc<SP1ProofWithPublicValues>, SP1VerifyingKey)],
     ) -> Result<VerifiedHistory, ProofError> {
@@ -304,11 +266,10 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         {
             return Err(ProofError::InvalidWitness);
         }
-        let key = self.history_proving_key()?;
+        let key = self.keys(checkpoint_program)?;
         let bundle = self
-            .ctx
             .prover
-            .prove(&key, stdin)
+            .prove(&key.pk, stdin)
             .deferred_proof_verification(true)
             .compressed()
             .run()

@@ -255,6 +255,57 @@ pub struct SystemInfoJson {
     pub runtime_code_hash: Option<HashHex>,
 }
 
+/// One installed Guest, as returned by `programs_status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InstalledGuestJson {
+    /// Verifying-key digest.
+    pub digest: [u32; 8],
+    /// BLAKE3 hash of the ELF bytes.
+    pub elf_hash: HashHex,
+}
+
+/// Progress of one artifact, as returned by `programs_status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactProgressJson {
+    /// Content hash.
+    pub content_hash: HashHex,
+    /// Bytes received or sent so far.
+    pub bytes: u32,
+    /// Complete length.
+    pub total: u32,
+}
+
+/// One persisted artifact, as returned by `programs_status`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedArtifactJson {
+    /// Content hash.
+    pub content_hash: HashHex,
+    /// `wasm`, `elf` or `unknown`.
+    pub kind: String,
+}
+
+/// JSON shape returned by `programs_status` (design 24, phase 3).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramsStatusJson {
+    /// Guests the proof backend can prove under.
+    pub installed_guests: Vec<InstalledGuestJson>,
+    /// Runtime code hashes the executor can run.
+    pub runtimes: Vec<HashHex>,
+    /// Content hashes governance currently names.
+    pub wanted: Vec<HashHex>,
+    /// Artifacts being reassembled from the program lane.
+    pub assembling: Vec<ArtifactProgressJson>,
+    /// Complete artifacts not installed, usually because governance has not
+    /// named them.
+    pub complete: Vec<HashHex>,
+    /// Artifacts persisted on disk.
+    pub persisted: Vec<PersistedArtifactJson>,
+    /// Local file being streamed into produced blocks.
+    pub publishing: Option<ArtifactProgressJson>,
+    /// Files waiting in the publish directory.
+    pub publish_queue: Vec<String>,
+}
+
 /// JSON shape returned by `validator_set_active`. Validators are
 /// emitted in the order the engine uses for proposer eligibility.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

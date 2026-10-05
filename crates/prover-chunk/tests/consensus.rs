@@ -295,6 +295,7 @@ fn enacted_upgrade_switches_the_end_boundary_at_its_activation_chunk() {
         let mut tx = ProposeUpgradeTx {
             proposer: address,
             programs: next,
+            artifacts: neutrino_consensus_types::history_proof::ProgramArtifacts::default(),
             activate_at_chunk,
             nonce: 0,
             signature: [0; 64],

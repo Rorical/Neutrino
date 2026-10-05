@@ -292,15 +292,17 @@ pub fn merkle_root_from_hashes(mut leaves: Vec<Hash>) -> Hash {
 /// Domain for counted transaction and vote DA commitments to counted body-lane Merkle roots.
 pub const DOMAIN_DA_LANE: DomainTag = *b"NEUTRINO_DA_____";
 
-/// Commit the transaction and vote lanes without hashing their bytes
-/// again.
+/// Commit the transaction, vote and program-artifact lanes without hashing
+/// their bytes again.
 ///
 /// Each leaf binds its domain, lane index, exact count and Merkle root.
 /// Counts are essential: Merkle roots alone do not encode a tree's shape.
+/// The program lane carries upgrade artifacts (design 24); the STF never
+/// reads it and the chunk Guest only commits the pieces' leaves.
 #[must_use]
-pub fn da_root_from_lane_roots(lanes: [(u32, Hash); 2]) -> Hash {
-    let mut leaves = [[0; 32]; 2];
-    for (tag, (count, root)) in (0_u8..2).zip(lanes) {
+pub fn da_root_from_lane_roots(lanes: [(u32, Hash); 3]) -> Hash {
+    let mut leaves = [[0; 32]; 3];
+    for (tag, (count, root)) in (0_u8..3).zip(lanes) {
         let mut bytes = [0; 53];
         bytes[..16].copy_from_slice(&DOMAIN_DA_LANE);
         bytes[16] = tag;

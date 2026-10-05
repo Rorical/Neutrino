@@ -324,7 +324,8 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
     P: ProofSystem + Send + Sync + 'static,
 {
-    async fn rpc_state_snapshot(&self, at: &BlockId) -> Result<Trie, QueryError> {
+    /// State at `at` together with the runtime artifact that interprets it.
+    async fn rpc_state_snapshot(&self, at: &BlockId) -> Result<(Trie, Hash), QueryError> {
         if self.light_checkpoint().is_some() {
             return Err(QueryError::StateUnavailable);
         }
@@ -332,7 +333,18 @@ where
         let at = at.clone();
         tokio::task::spawn_blocking(move || {
             let engine = engine.lock().expect("engine mutex poisoned");
-            read_state(&engine, &at)
+            let state = read_state(&engine, &at)?;
+            let hash = resolve_id(&engine, &at)?.ok_or(QueryError::BlockNotFound)?;
+            let height = if hash == engine.chain_spec().genesis_block_hash {
+                0
+            } else {
+                required_header(&engine, hash)?.height
+            };
+            let runtime = engine
+                .runtime_code_hash_for(height)
+                .map_err(|_| QueryError::StateUnavailable)?;
+            drop(engine);
+            Ok((state, runtime))
         })
         .await
         .map_err(storage_error)?
@@ -426,6 +438,10 @@ where
 
     fn peer_count(&self) -> u64 {
         self.sync_status().map_or(0, |status| status.peer_count())
+    }
+
+    fn programs_status(&self) -> neutrino_rpc::ProgramsStatusJson {
+        Self::programs_status(self)
     }
 
     fn is_syncing(&self) -> bool {
@@ -526,7 +542,7 @@ where
     }
 
     async fn storage_at(&self, key: &[u8], at: &BlockId) -> Result<Option<Vec<u8>>, QueryError> {
-        Ok(self.rpc_state_snapshot(at).await?.get(key))
+        Ok(self.rpc_state_snapshot(at).await?.0.get(key))
     }
 
     async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, SubmitError> {
@@ -556,12 +572,13 @@ where
         let executor = self
             .block_executor_snapshot()
             .ok_or(RuntimeCallError::RuntimeNotConfigured)?;
-        let state = self.rpc_state_snapshot(at).await?;
+        let (state, runtime) = self.rpc_state_snapshot(at).await?;
         let request = neutrino_runtime_abi::QueryRequest { method, args };
-        let response = tokio::task::spawn_blocking(move || executor.query(&request, &state))
-            .await
-            .map_err(|err| RuntimeCallError::Runtime(format!("query join error: {err}")))?
-            .map_err(RuntimeCallError::Runtime)?;
+        let response =
+            tokio::task::spawn_blocking(move || executor.query(&request, runtime, &state))
+                .await
+                .map_err(|err| RuntimeCallError::Runtime(format!("query join error: {err}")))?
+                .map_err(RuntimeCallError::Runtime)?;
         Ok(RuntimeCallResponse {
             code: response.code,
             payload: response.payload,

@@ -80,9 +80,12 @@ impl<DB: Database> Engine<DB> {
         &self,
         height: u64,
     ) -> Result<neutrino_consensus_types::evidence::EvidenceAnchor, alloc::string::String> {
-        let Some(programs) = self.programs else {
+        if self.programs.is_none() {
             return Ok(neutrino_consensus_types::evidence::EvidenceAnchor::default());
-        };
+        }
+        let programs = self
+            .programs_for_height(height)
+            .map_err(|_| alloc::string::String::from(crate::import::PROGRAMS_UNAVAILABLE))?;
         let spec = self.chain_spec();
         let chunk_id = height
             .checked_sub(1)
@@ -366,9 +369,9 @@ impl<DB: Database> Engine<DB> {
             .with_runtime(self.chain_spec().runtime_code_hash);
         let key = programs.execution.block;
         let (context, seed, _) = self.consensus_boundary(chunk_id)?;
-        // A node can only prove chunks that start under its embedded program
-        // set; after a switch it follows by verification until it is upgraded.
-        if context.programs != programs {
+        // A node can only prove chunks whose program set its backend holds;
+        // otherwise it follows by verification until the programs arrive.
+        if !proof_system.can_prove(&context.programs.guests()) {
             return Err(ProofError::Unsupported.into());
         }
         let start = chunk_id

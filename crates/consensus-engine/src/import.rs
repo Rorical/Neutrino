@@ -39,6 +39,9 @@ use crate::store::StoreError;
 /// seconds shows up as `Δ` of error in this comparison.
 pub const MAX_HEADER_TIMESTAMP_DRIFT_SECS: u64 = 60;
 
+/// Dry-run failure text when a block's program set cannot be resolved.
+pub(crate) const PROGRAMS_UNAVAILABLE: &str = "program set of the block's chunk is unavailable";
+
 /// Successful outcome of [`Engine::import_block`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportBlockOutcome {
@@ -166,6 +169,8 @@ pub enum ImportError<E> {
     },
     /// Block proof references a block header that is not stored locally.
     UnknownBlock(BlockHash),
+    /// The program-artifact lane violates its piece count or size bounds.
+    ProgramPieces,
     /// Body lane roots derived from the supplied body do not match the header.
     BodyRootsMismatch {
         /// Roots committed in the header.
@@ -276,6 +281,7 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
                  is below finalised height {finalized_height}",
             ),
             Self::UnknownBlock(hash) => write!(f, "block proof targets unknown block {hash:?}"),
+            Self::ProgramPieces => write!(f, "block body program lane exceeds its bounds"),
             Self::BodyRootsMismatch { header, computed } => write!(
                 f,
                 "block body roots mismatch: header {header:?}, computed {computed:?}"
@@ -539,6 +545,9 @@ impl<DB: Database> Engine<DB> {
         )
         .map_err(ImportError::HeaderVrf)?;
 
+        if !block.body.programs_well_formed() {
+            return Err(ImportError::ProgramPieces);
+        }
         let header_roots = BodyRoots {
             transactions_root: block.header.transactions_root,
             votes_root: block.header.votes_root,
@@ -701,6 +710,9 @@ impl<DB: Database> Engine<DB> {
             evidence_anchor: self
                 .evidence_anchor(block.header.height)
                 .map_err(ImportError::DryRunFailed)?,
+            runtime_code_hash: self
+                .runtime_code_hash_for(block.header.height)
+                .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?,
             chain_id: self.chain_spec().chain_id,
             block_height: block.header.height,
             gas_limit: block.header.gas_limit,
@@ -789,6 +801,9 @@ impl<DB: Database> Engine<DB> {
             evidence_anchor: self
                 .evidence_anchor(block.header.height)
                 .map_err(ImportError::DryRunFailed)?,
+            runtime_code_hash: self
+                .runtime_code_hash_for(block.header.height)
+                .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?,
             chain_id: self.chain_spec().chain_id,
             block_height: block.header.height,
             gas_limit: block.header.gas_limit,
@@ -965,6 +980,9 @@ impl<DB: Database> Engine<DB> {
                 evidence_anchor: self
                     .evidence_anchor(header.height)
                     .map_err(ImportError::DryRunFailed)?,
+                runtime_code_hash: self
+                    .runtime_code_hash_for(header.height)
+                    .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?,
                 chain_id: self.chain_spec().chain_id,
                 block_height: header.height,
                 gas_limit: header.gas_limit,
@@ -1164,7 +1182,7 @@ impl<DB: Database> Engine<DB> {
 
         let state_root_before = self.block_proof_state_root_before(&header)?;
         let expected_public_inputs =
-            self.block_proof_public_inputs(&header, state_root_before, canonical_hash);
+            self.block_proof_public_inputs(&header, state_root_before, canonical_hash)?;
         if proof.public_inputs != expected_public_inputs {
             return Err(ImportError::BlockProofPublicInputsMismatch {
                 hash: canonical_hash,
@@ -1374,8 +1392,11 @@ impl<DB: Database> Engine<DB> {
         header: &neutrino_consensus_types::Header,
         state_root_before: StateRoot,
         block_hash: BlockHash,
-    ) -> BlockProofPublicInputs {
-        BlockProofPublicInputs {
+    ) -> Result<BlockProofPublicInputs, ImportError<DB::Error>> {
+        let programs = self
+            .programs_for_height(header.height)
+            .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?;
+        Ok(BlockProofPublicInputs {
             chain_id: self.chain_spec().chain_id,
             height: header.height,
             parent_block_hash: header.parent_hash,
@@ -1385,13 +1406,14 @@ impl<DB: Database> Engine<DB> {
             transactions_root: header.transactions_root,
             receipt_root: header.receipts_root,
             da_root: header.da_root,
-            vm_code_hash: self.chain_spec().runtime_code_hash,
+            vm_code_hash: programs.runtime_code_hash,
+            block_program: programs.execution.block,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
             gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: self.proposer_runtime_address_for_import(header.proposer_index),
             runtime_extra: header.runtime_extra,
-        }
+        })
     }
 
     /// Equivalent of `Engine::proposer_runtime_address` available
@@ -1575,7 +1597,9 @@ mod tests {
         let block = block(1, 1, engine.head_hash(), [5; 32]);
         engine.import_block(&block).unwrap();
         let hash = block.hash();
-        let inputs = engine.block_proof_public_inputs(&block.header, ZERO_HASH, hash);
+        let inputs = engine
+            .block_proof_public_inputs(&block.header, ZERO_HASH, hash)
+            .unwrap();
         let backend = AlternateMockBlockProofSystem;
         let mut decoded = backend.prove_block(&[], &inputs).unwrap();
         let receipt = BlockProof {

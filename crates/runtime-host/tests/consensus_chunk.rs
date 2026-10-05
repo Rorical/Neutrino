@@ -351,7 +351,18 @@ fn check_rejection_classifier<P: neutrino_runtime_host::ProgramProver>(
         public_inputs: block.public_inputs.clone(),
         proof_bytes: borsh::to_vec(proof).unwrap(),
     };
-    assert_eq!(system.classify_block_rejection(&envelope), Ok(None));
+    let program = block.public_inputs.block_program;
+    assert_eq!(
+        system.classify_block_rejection(&envelope, &program),
+        Ok(None)
+    );
+    // A signer naming its own program never selects the verifier's key.
+    let mut foreign = envelope.clone();
+    foreign.public_inputs.block_program[0] ^= 1;
+    assert_eq!(
+        system.classify_block_rejection(&foreign, &program),
+        Ok(Some(ProofRejectionReason::PublicInputsMismatch))
+    );
     // The compact summary is part of the exact authenticated public values,
     // even though it is not copied into the wire BlockProofPublicInputs.
     let mut forged_summary = proof.to_sp1().unwrap();
@@ -364,13 +375,13 @@ fn check_rejection_classifier<P: neutrino_runtime_host::ProgramProver>(
     )
     .unwrap();
     assert_eq!(
-        system.classify_block_rejection(&forged_envelope),
+        system.classify_block_rejection(&forged_envelope, &program),
         Ok(Some(ProofRejectionReason::VerifierRejected))
     );
     let mut bad = envelope;
     bad.public_inputs.state_root_after[0] ^= 1;
     assert_eq!(
-        system.classify_block_rejection(&bad),
+        system.classify_block_rejection(&bad, &program),
         Ok(Some(ProofRejectionReason::PublicInputsMismatch))
     );
     // Make the envelope and decoded public output agree again, while retaining
@@ -384,7 +395,7 @@ fn check_rejection_classifier<P: neutrino_runtime_host::ProgramProver>(
     )
     .unwrap();
     assert_eq!(
-        system.classify_block_rejection(&bad),
+        system.classify_block_rejection(&bad, &program),
         Ok(Some(ProofRejectionReason::VerifierRejected))
     );
 }

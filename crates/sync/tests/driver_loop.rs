@@ -1051,6 +1051,7 @@ fn sample_block_proof(height: Height) -> BlockProof {
             receipt_root: ZERO_HASH,
             da_root: ZERO_HASH,
             vm_code_hash: ZERO_HASH,
+            block_program: [0; 8],
             gas_used: 0,
             gas_limit: 1_000_000,
             gas_price: 0,

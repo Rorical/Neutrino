@@ -16,8 +16,13 @@ use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Poseidon2Hasher, Trie};
 use thiserror::Error;
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use neutrino_primitives::Hash;
+
 use crate::DryRun;
-use crate::wasm::{WasmError, WasmRuntime};
+use crate::wasm::{WasmError, WasmLimits, WasmRuntime};
 
 /// Errors produced by [`WasmExecutor::execute_block`].
 #[derive(Debug, Error)]
@@ -28,6 +33,27 @@ pub enum ExecutorError {
     /// Borsh failure encoding the prover stdin payload.
     #[error("borsh codec error: {0}")]
     Codec(String),
+    /// The block names a runtime artifact this executor has not installed.
+    #[error("runtime {} is not installed", hex_hash(.0))]
+    UnknownRuntime(Hash),
+    /// The chain specification declares a genesis runtime other than the
+    /// embedded module, and this executor does not permit aliasing.
+    #[error("chain declares runtime {} but the embedded runtime is {}", hex_hash(.declared), hex_hash(.embedded))]
+    RuntimeHashMismatch {
+        /// Hash the chain specification names.
+        declared: Hash,
+        /// Hash of the embedded module.
+        embedded: Hash,
+    },
+}
+
+fn hex_hash(hash: &Hash) -> String {
+    use std::fmt::Write as _;
+    hash.iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 impl From<WasmError> for ExecutorError {
@@ -36,31 +62,54 @@ impl From<WasmError> for ExecutorError {
     }
 }
 
-/// Production block executor: WASM dynamic runtime + witness emission.
+/// Production block executor: WASM dynamic runtimes + witness emission.
 ///
-/// One per process; the embedded master cdylib is compiled in by
-/// `runtime-host/build.rs` and shared across slots. `execute_block`
-/// creates a fresh wasmtime `Store` per call so concurrent execution
-/// on different threads is safe.
+/// Holds one compiled [`WasmRuntime`] per runtime code hash. The embedded
+/// default-runtime master cdylib is installed at construction; upgrade
+/// runtimes distributed on chain are installed later with
+/// [`Self::install_runtime`] (design 24). Each call picks the runtime the
+/// engine names for the block, so a program switch at a chunk boundary
+/// needs no new process. `execute_block` creates a fresh wasmtime `Store`
+/// per call so concurrent execution on different threads is safe.
 pub struct WasmExecutor {
-    wasm: WasmRuntime,
+    runtimes: RwLock<HashMap<Hash, Arc<WasmRuntime>>>,
+    /// Code hash the constructor installed the embedded module under.
+    default_hash: Hash,
+    /// Whether the embedded module may serve a different declared hash.
+    /// Only the harness constructor sets this.
+    allow_alias: bool,
+    limits: WasmLimits,
 }
 
 impl WasmExecutor {
-    /// Wrap an explicit [`WasmRuntime`]. Use [`Self::default_runtime`]
-    /// for the embedded default-runtime cdylib.
+    /// Wrap an explicit [`WasmRuntime`] under its code hash. Use
+    /// [`Self::default_runtime`] for the embedded default-runtime cdylib.
     #[must_use]
-    pub const fn new(wasm: WasmRuntime) -> Self {
-        Self { wasm }
+    pub fn new(code_hash: Hash, wasm: WasmRuntime) -> Self {
+        let limits = wasm.limits();
+        Self {
+            runtimes: RwLock::new(HashMap::from([(code_hash, Arc::new(wasm))])),
+            default_hash: code_hash,
+            allow_alias: false,
+            limits,
+        }
     }
 
-    /// Build with the embedded default-runtime master cdylib.
+    /// Harness constructor: the embedded default-runtime master cdylib with
+    /// default limits, permitted to serve whatever genesis runtime hash the
+    /// chain specification declares. Production nodes use
+    /// [`Self::default_runtime_with_limits`], which refuses any alias.
     ///
     /// # Errors
     /// Surfaces [`WasmError`] if wasmtime fails to compile the
     /// embedded module.
     pub fn default_runtime() -> Result<Self, WasmError> {
-        Ok(Self::new(WasmRuntime::default_runtime()?))
+        let mut executor = Self::new(
+            crate::default_runtime_code_hash(),
+            WasmRuntime::default_runtime()?,
+        );
+        executor.allow_alias = true;
+        Ok(executor)
     }
 
     /// Build with the embedded default-runtime master cdylib and explicit
@@ -69,16 +118,92 @@ impl WasmExecutor {
     /// # Errors
     /// Surfaces [`WasmError`] if wasmtime fails to compile the embedded
     /// module or `limits` are invalid.
-    pub fn default_runtime_with_limits(limits: crate::wasm::WasmLimits) -> Result<Self, WasmError> {
+    pub fn default_runtime_with_limits(limits: WasmLimits) -> Result<Self, WasmError> {
         Ok(Self::new(
+            crate::default_runtime_code_hash(),
             WasmRuntime::default_runtime()?.with_limits(limits)?,
         ))
     }
 
-    /// Borrow the underlying [`WasmRuntime`] (mostly for tests).
+    /// Compile and install a runtime artifact under its BLAKE3 code hash,
+    /// with this executor's limits. Idempotent for an already installed hash.
+    ///
+    /// # Errors
+    /// Surfaces [`WasmError`] when the bytes are not a loadable runtime.
+    pub fn install_runtime(&self, wasm: &[u8]) -> Result<Hash, WasmError> {
+        let code_hash = neutrino_primitives::blake3_256(wasm);
+        if self.has_runtime(&code_hash) {
+            return Ok(code_hash);
+        }
+        let runtime = WasmRuntime::new(wasm)?.with_limits(self.limits)?;
+        self.runtimes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(code_hash)
+            .or_insert_with(|| Arc::new(runtime));
+        Ok(code_hash)
+    }
+
+    /// Serve `code_hash` with the module installed by the constructor. An
+    /// identity alias always succeeds; a different hash is accepted only by
+    /// the harness constructor. See [`BlockExecutor::alias_default_runtime`].
+    ///
+    /// # Errors
+    /// Returns [`ExecutorError::RuntimeHashMismatch`] when the chain declares
+    /// another runtime and aliasing is not permitted.
+    pub fn alias_default_runtime(&self, code_hash: Hash) -> Result<(), ExecutorError> {
+        if code_hash == self.default_hash {
+            return Ok(());
+        }
+        if !self.allow_alias {
+            return Err(ExecutorError::RuntimeHashMismatch {
+                declared: code_hash,
+                embedded: self.default_hash,
+            });
+        }
+        let default = self
+            .runtimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.default_hash)
+            .cloned();
+        if let Some(default) = default {
+            self.runtimes
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(code_hash)
+                .or_insert(default);
+        }
+        Ok(())
+    }
+
+    /// `true` when a runtime with this code hash is installed.
     #[must_use]
-    pub const fn wasm(&self) -> &WasmRuntime {
-        &self.wasm
+    pub fn has_runtime(&self, code_hash: &Hash) -> bool {
+        self.runtimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(code_hash)
+    }
+
+    /// Installed runtime code hashes.
+    #[must_use]
+    pub fn runtime_hashes(&self) -> Vec<Hash> {
+        self.runtimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn runtime(&self, code_hash: &Hash) -> Result<Arc<WasmRuntime>, ExecutorError> {
+        self.runtimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(code_hash)
+            .cloned()
+            .ok_or(ExecutorError::UnknownRuntime(*code_hash))
     }
 }
 
@@ -141,7 +266,9 @@ impl BlockExecutor for WasmExecutor {
             output,
             witness,
             post_state,
-        } = self.wasm.dry_run(&input, &live, &body.evidence_proofs)?;
+        } = self
+            .runtime(&ctx.runtime_code_hash)?
+            .dry_run(&input, &live, &body.evidence_proofs)?;
 
         // Commit the dry-run's post-state into the engine's trie.
         // Read-only blocks fall back to a clone of `live`, so the
@@ -164,6 +291,7 @@ impl BlockExecutor for WasmExecutor {
     fn query(
         &self,
         request: &QueryRequest,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, ExecutorError> {
         // Snapshot the trie into a read-only LiveTrie view. The
@@ -171,7 +299,7 @@ impl BlockExecutor for WasmExecutor {
         // and discards it after the call so no mutation can leak
         // back into `state`.
         let live = LiveTrie::from_trie(state.clone());
-        Ok(self.wasm.query(request, &live)?)
+        Ok(self.runtime(&runtime_code_hash)?.query(request, &live)?)
     }
 
     fn validate_tx(
@@ -180,12 +308,29 @@ impl BlockExecutor for WasmExecutor {
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, ExecutorError> {
         let live = LiveTrie::from_trie(state.clone());
-        Ok(self
-            .wasm
-            .validate_tx(tx_bytes, chain_id, block_gas_limit, gas_price, &live)?)
+        Ok(self.runtime(&runtime_code_hash)?.validate_tx(
+            tx_bytes,
+            chain_id,
+            block_gas_limit,
+            gas_price,
+            &live,
+        )?)
+    }
+
+    fn install_runtime(&self, wasm: &[u8]) -> Result<Hash, ExecutorError> {
+        Ok(Self::install_runtime(self, wasm)?)
+    }
+
+    fn alias_default_runtime(&self, code_hash: Hash) -> Result<(), ExecutorError> {
+        Self::alias_default_runtime(self, code_hash)
+    }
+
+    fn installed_runtimes(&self) -> Vec<Hash> {
+        self.runtime_hashes()
     }
 }
 

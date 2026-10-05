@@ -259,6 +259,19 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
             WasmExecutor::default_runtime_with_limits(config.execution.to_wasm_limits())
                 .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
         concrete_backend.set_block_executor(block_executor);
+        // On-chain program artifacts (design 24): accepted artifacts persist
+        // under the data directory and are reinstalled on every start.
+        if let Some(data_dir) = &config.data_dir {
+            let programs_dir = data_dir.join("programs");
+            let store = crate::programs::ProgramStore::open(&programs_dir).map_err(|source| {
+                NodeError::DataDir {
+                    path: programs_dir.display().to_string(),
+                    source,
+                }
+            })?;
+            concrete_backend.set_program_store(store);
+            concrete_backend.restore_programs();
+        }
         if config.role == NodeRole::Archive {
             concrete_backend
                 .discard_bootstrap_download()

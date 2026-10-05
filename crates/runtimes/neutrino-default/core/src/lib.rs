@@ -633,6 +633,11 @@ pub struct ValidatorRegistration {
     /// DST before lifting the registration into the consensus
     /// active validator set.
     pub pop_signature: neutrino_primitives::BlsSignature,
+    /// Height of the block that registered the validator. Governance
+    /// weights only registrations older than a minimum age, so freshly
+    /// deposited stake cannot steer an upgrade before it can even vote in
+    /// consensus.
+    pub registered_at_height: u64,
 }
 
 /// Index of addresses that currently hold a [`ValidatorRegistration`] record.
@@ -1254,13 +1259,18 @@ pub fn apply_block_validated<B: StateBackend>(
             Transaction::Withdraw(withdraw_tx) => {
                 apply_withdraw(state, input.chain_id, input.block_height, fee, withdraw_tx)
             }
-            Transaction::RegisterValidator(register_tx) => {
-                apply_register_validator(state, input.chain_id, fee, register_tx)
-            }
+            Transaction::RegisterValidator(register_tx) => apply_register_validator(
+                state,
+                input.chain_id,
+                input.block_height,
+                fee,
+                register_tx,
+            ),
             Transaction::ProposeUpgrade(propose_tx) => governance::apply_propose(
                 state,
                 input.chain_id,
                 input.evidence_anchor.chunk_id,
+                input.block_height,
                 fee,
                 propose_tx,
             ),
@@ -1268,6 +1278,7 @@ pub fn apply_block_validated<B: StateBackend>(
                 state,
                 input.chain_id,
                 input.evidence_anchor.chunk_id,
+                input.block_height,
                 fee,
                 vote_tx,
             ),
@@ -1942,6 +1953,7 @@ fn apply_withdraw<B: StateBackend>(
 fn apply_register_validator<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
+    block_height: u64,
     fee: u128,
     tx: &RegisterValidatorTx,
 ) -> Result<(), ReceiptStatus> {
@@ -1996,6 +2008,7 @@ fn apply_register_validator<B: StateBackend>(
             address: tx.validator,
             bls_pubkey: tx.bls_pubkey,
             pop_signature: tx.pop_signature,
+            registered_at_height: block_height,
         },
     );
 
@@ -3881,6 +3894,7 @@ mod tests {
             address: addr,
             bls_pubkey: [1; 48],
             pop_signature: [2; 96],
+            registered_at_height: 0,
         };
         live.insert(
             &registration_key(&addr),

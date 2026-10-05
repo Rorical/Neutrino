@@ -215,6 +215,11 @@ pub trait RpcBackend: Send + Sync + 'static {
         0
     }
 
+    /// Program distribution and installation state (design 24, phase 3).
+    fn programs_status(&self) -> crate::types::ProgramsStatusJson {
+        crate::types::ProgramsStatusJson::default()
+    }
+
     /// Whether the sync driver still trails the network. Backends without
     /// a sync driver report `false`.
     fn is_syncing(&self) -> bool {

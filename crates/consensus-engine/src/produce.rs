@@ -220,6 +220,9 @@ impl<DB: Database> Engine<DB> {
             evidence_anchor: self
                 .evidence_anchor(height)
                 .map_err(ProductionError::Executor)?,
+            runtime_code_hash: self.runtime_code_hash_for(height).map_err(|_| {
+                ProductionError::Executor(crate::import::PROGRAMS_UNAVAILABLE.to_owned())
+            })?,
             chain_id,
             block_height: height,
             gas_limit,

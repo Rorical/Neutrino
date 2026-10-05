@@ -24,6 +24,7 @@ use crate::{
     Account, Address, ProgramSet, ReceiptStatus, ScheduledUpgrade, UPGRADE_KEY, ValidatorSet,
     load_account, load_validator_set, store_account,
 };
+pub use neutrino_consensus_types::history_proof::ProgramArtifacts;
 
 /// Gas charged for a proposal, which writes the open-proposal record.
 pub const GAS_PROPOSE_UPGRADE: u64 = 100_000;
@@ -57,9 +58,18 @@ pub const UPGRADE_MAX_LEAD_CHUNKS: u64 = 1024;
 /// validator can hold governance hostage with a proposal nobody supports.
 pub const UPGRADE_VOTING_PERIOD_CHUNKS: u64 = 64;
 
-/// Stake fraction of the active validator set that must have voted for a
+/// Stake fraction of the eligible validator set that must have voted for a
 /// proposal before it is enacted, as `(numerator, denominator)`.
 pub const UPGRADE_QUORUM: (u128, u128) = (2, 3);
+
+/// Blocks a registration must have aged before its stake counts in
+/// governance, as proposer, voter or quorum denominator.
+///
+/// Consensus seats a registration only after its activation delay;
+/// governance must not let freshly deposited stake decide an upgrade sooner
+/// than that. Genesis validators have no registration record and are always
+/// eligible.
+pub const UPGRADE_VOTER_MIN_AGE_BLOCKS: u64 = 1024;
 
 /// `domain || chain_id || proposer || proposal_id || nonce`.
 pub const PROPOSE_UPGRADE_SIG_MSG_LEN: usize = 16 + 8 + 32 + 32 + 8;
@@ -76,6 +86,9 @@ pub struct ProposeUpgradeTx {
     /// every Guest digest; the pairing is audited off chain through
     /// reproducible builds, the runtime cannot verify it.
     pub programs: ProgramSet,
+    /// Content hashes of the artifacts behind `programs`, so nodes know
+    /// which program-lane pieces to assemble and install.
+    pub artifacts: ProgramArtifacts,
     /// First chunk executed under `programs`.
     pub activate_at_chunk: u64,
     /// Proposer's expected next nonce.
@@ -105,6 +118,8 @@ pub struct UpgradeProposal {
     pub proposer: Address,
     /// Proposed program set.
     pub programs: ProgramSet,
+    /// Artifacts behind the proposed set.
+    pub artifacts: ProgramArtifacts,
     /// Requested activation chunk.
     pub activate_at_chunk: u64,
     /// Chunk the proposal was made in.
@@ -117,7 +132,12 @@ impl UpgradeProposal {
     /// Identity bound by every vote; see [`upgrade_proposal_id`].
     #[must_use]
     pub fn id(&self) -> [u8; 32] {
-        upgrade_proposal_id(&self.proposer, &self.programs, self.activate_at_chunk)
+        upgrade_proposal_id(
+            &self.proposer,
+            &self.programs,
+            &self.artifacts,
+            self.activate_at_chunk,
+        )
     }
 
     /// Stake of the current active validators that voted.
@@ -158,17 +178,19 @@ pub struct UpgradeStatus {
 }
 
 /// `BLAKE3(DOMAIN_UPGRADE_PROPOSAL_ID || proposer || borsh(programs) ||
-/// activate_at_chunk_le)`.
+/// borsh(artifacts) || activate_at_chunk_le)`.
 #[must_use]
 pub fn upgrade_proposal_id(
     proposer: &Address,
     programs: &ProgramSet,
+    artifacts: &ProgramArtifacts,
     activate_at_chunk: u64,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN_UPGRADE_PROPOSAL_ID);
     hasher.update(proposer);
     hasher.update(&borsh::to_vec(programs).expect("borsh encode ProgramSet never fails"));
+    hasher.update(&borsh::to_vec(artifacts).expect("borsh encode ProgramArtifacts never fails"));
     hasher.update(&activate_at_chunk.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
@@ -179,7 +201,12 @@ pub fn propose_upgrade_sig_message(
     chain_id: u64,
     tx: &ProposeUpgradeTx,
 ) -> [u8; PROPOSE_UPGRADE_SIG_MSG_LEN] {
-    let id = upgrade_proposal_id(&tx.proposer, &tx.programs, tx.activate_at_chunk);
+    let id = upgrade_proposal_id(
+        &tx.proposer,
+        &tx.programs,
+        &tx.artifacts,
+        tx.activate_at_chunk,
+    );
     bound_message(
         DOMAIN_PROPOSE_UPGRADE,
         chain_id,
@@ -306,12 +333,44 @@ fn proposal_shape_ok(tx: &ProposeUpgradeTx, current_chunk: u64) -> bool {
             .is_some_and(|latest| tx.activate_at_chunk <= latest)
 }
 
+/// `true` when `addr` may take part in governance at `block_height`: it has
+/// no registration record (a genesis validator) or registered at least
+/// [`UPGRADE_VOTER_MIN_AGE_BLOCKS`] ago. Without a height (mempool
+/// admission) every seated validator is treated as eligible.
+fn eligible<B: StateBackend>(state: &mut B, addr: &Address, block_height: Option<u64>) -> bool {
+    let Some(height) = block_height else {
+        return true;
+    };
+    crate::load_validator_registration(state, addr).is_none_or(|registration| {
+        registration
+            .registered_at_height
+            .checked_add(UPGRADE_VOTER_MIN_AGE_BLOCKS)
+            .is_some_and(|mature| height >= mature)
+    })
+}
+
+/// The seated validators eligible for governance at `block_height`; the
+/// quorum denominator is their stake, not the whole active set's.
+fn governance_set<B: StateBackend>(state: &mut B, block_height: Option<u64>) -> ValidatorSet {
+    let mut set = load_validator_set(state);
+    let eligible_entries: Vec<_> = set
+        .entries
+        .iter()
+        .filter(|entry| entry.stake > 0 && eligible(state, &entry.address, block_height))
+        .copied()
+        .collect();
+    set.entries = eligible_entries;
+    set
+}
+
 /// Signer checks shared by both transactions: signature, nonce, fee and
-/// active-validator membership. Returns the signer's account on success.
+/// eligible-validator membership. Returns the signer's account and the
+/// governance set on success.
 fn authorize_signer<B: StateBackend>(
     state: &mut B,
     signer: &Address,
     nonce: u64,
+    block_height: Option<u64>,
     fee: u128,
     message: &[u8],
     signature: &[u8; 64],
@@ -326,12 +385,12 @@ fn authorize_signer<B: StateBackend>(
     if account.balance < fee {
         return Err(ReceiptStatus::InsufficientBalance);
     }
-    let set = load_validator_set(state);
-    let seated = set
+    let set = governance_set(state, block_height);
+    if set
         .entries
         .binary_search_by(|entry| entry.address.cmp(signer))
-        .is_ok_and(|index| set.entries[index].stake > 0);
-    if !seated {
+        .is_err()
+    {
         return Err(ReceiptStatus::Unauthorized);
     }
     Ok((account, set))
@@ -357,7 +416,7 @@ pub fn validate_propose<B: StateBackend>(
     fee: u128,
     tx: &ProposeUpgradeTx,
 ) -> TxValidity {
-    match check_propose(state, chain_id, None, fee, tx) {
+    match check_propose(state, chain_id, None, None, fee, tx) {
         Ok(_) => TxValidity::valid(0),
         Err(status) => validity(status),
     }
@@ -370,7 +429,7 @@ pub fn validate_vote<B: StateBackend>(
     fee: u128,
     tx: &VoteUpgradeTx,
 ) -> TxValidity {
-    match check_vote(state, chain_id, None, fee, tx) {
+    match check_vote(state, chain_id, None, None, fee, tx) {
         Ok(_) => TxValidity::valid(0),
         Err(status) => validity(status),
     }
@@ -380,6 +439,7 @@ fn check_propose<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     current_chunk: Option<u64>,
+    block_height: Option<u64>,
     fee: u128,
     tx: &ProposeUpgradeTx,
 ) -> Result<(Account, ValidatorSet), ReceiptStatus> {
@@ -392,17 +452,32 @@ fn check_propose<B: StateBackend>(
         state,
         &tx.proposer,
         tx.nonce,
+        block_height,
         fee,
         &propose_upgrade_sig_message(chain_id, tx),
         &tx.signature,
     )?;
-    // One decision in flight at a time: neither an enacted switch awaiting
-    // its boundary nor a live proposal can be displaced.
-    if let Some(current) = current_chunk
-        && (load_scheduled(state).is_some_and(|scheduled| scheduled.activate_at_chunk > current)
-            || load_proposal(state).is_some_and(|proposal| proposal.is_live(current)))
-    {
-        return Err(ReceiptStatus::UpgradeConflict);
+    // One decision in flight at a time. An enacted switch awaiting its
+    // boundary is never displaced. A live proposal is displaced only by a
+    // proposer whose own stake exceeds the stake already voting for it, so a
+    // small holder cannot park the slot while a larger one can always
+    // reclaim it; at least two thirds of the stake can therefore always
+    // reach a decision.
+    if let Some(current) = current_chunk {
+        if load_scheduled(state).is_some_and(|scheduled| scheduled.activate_at_chunk > current) {
+            return Err(ReceiptStatus::UpgradeConflict);
+        }
+        if let Some(open) = load_proposal(state).filter(|proposal| proposal.is_live(current)) {
+            let set = &authorized.1;
+            let proposer_stake = set
+                .entries
+                .iter()
+                .find(|entry| entry.address == tx.proposer)
+                .map_or(0, |entry| entry.stake);
+            if proposer_stake <= open.voted_stake(set) {
+                return Err(ReceiptStatus::UpgradeConflict);
+            }
+        }
     }
     Ok(authorized)
 }
@@ -411,6 +486,7 @@ fn check_vote<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     current_chunk: Option<u64>,
+    block_height: Option<u64>,
     fee: u128,
     tx: &VoteUpgradeTx,
 ) -> Result<(Account, ValidatorSet, UpgradeProposal), ReceiptStatus> {
@@ -418,6 +494,7 @@ fn check_vote<B: StateBackend>(
         state,
         &tx.voter,
         tx.nonce,
+        block_height,
         fee,
         &vote_upgrade_sig_message(chain_id, tx),
         &tx.signature,
@@ -440,16 +517,25 @@ pub fn apply_propose<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     current_chunk: u64,
+    block_height: u64,
     fee: u128,
     tx: &ProposeUpgradeTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut account, set) = check_propose(state, chain_id, Some(current_chunk), fee, tx)?;
+    let (mut account, set) = check_propose(
+        state,
+        chain_id,
+        Some(current_chunk),
+        Some(block_height),
+        fee,
+        tx,
+    )?;
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
     store_account(state, &tx.proposer, &account);
     let proposal = UpgradeProposal {
         proposer: tx.proposer,
         programs: tx.programs,
+        artifacts: tx.artifacts,
         activate_at_chunk: tx.activate_at_chunk,
         proposed_at_chunk: current_chunk,
         voters: alloc::vec![tx.proposer],
@@ -463,11 +549,18 @@ pub fn apply_vote<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     current_chunk: u64,
+    block_height: u64,
     fee: u128,
     tx: &VoteUpgradeTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut account, set, mut proposal) =
-        check_vote(state, chain_id, Some(current_chunk), fee, tx)?;
+    let (mut account, set, mut proposal) = check_vote(
+        state,
+        chain_id,
+        Some(current_chunk),
+        Some(block_height),
+        fee,
+        tx,
+    )?;
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
     store_account(state, &tx.voter, &account);
@@ -488,6 +581,7 @@ fn settle<B: StateBackend>(state: &mut B, proposal: &UpgradeProposal, set: &Vali
             &ScheduledUpgrade {
                 activate_at_chunk: proposal.activate_at_chunk,
                 programs: proposal.programs,
+                artifacts: proposal.artifacts,
             },
         );
         state.delete(UPGRADE_PROPOSAL_KEY);
@@ -562,6 +656,7 @@ mod tests {
         let mut tx = ProposeUpgradeTx {
             proposer: sk.verifying_key().to_bytes(),
             programs,
+            artifacts: ProgramArtifacts::default(),
             activate_at_chunk: activate,
             nonce,
             signature: [0; 64],
@@ -628,6 +723,7 @@ mod tests {
             Some(ScheduledUpgrade {
                 activate_at_chunk: 1,
                 programs: programs(7),
+                artifacts: ProgramArtifacts::default(),
             })
         );
         // Blocks of the activation chunk clear the consumed record.
@@ -639,7 +735,12 @@ mod tests {
     fn votes_accumulate_by_stake_until_two_thirds() {
         let (a, b, c) = (key(1), key(2), key(3));
         let mut live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
-        let proposal_id = upgrade_proposal_id(&a.verifying_key().to_bytes(), &programs(9), 5);
+        let proposal_id = upgrade_proposal_id(
+            &a.verifying_key().to_bytes(),
+            &programs(9),
+            &ProgramArtifacts::default(),
+            5,
+        );
         let (applied, _, status) = run(&live, &block(0, vec![propose(&a, programs(9), 5, 0)]));
         assert_eq!(applied, 1);
         let proposal = status.proposal.unwrap();
@@ -694,6 +795,7 @@ mod tests {
         let stale = UpgradeProposal {
             proposer: a.verifying_key().to_bytes(),
             programs: programs(3),
+            artifacts: ProgramArtifacts::default(),
             activate_at_chunk: 2,
             proposed_at_chunk: 0,
             voters: vec![a.verifying_key().to_bytes()],
@@ -708,11 +810,53 @@ mod tests {
             borsh::to_vec(&ScheduledUpgrade {
                 activate_at_chunk: 8,
                 programs: programs(5),
+                artifacts: ProgramArtifacts::default(),
             })
             .unwrap(),
         );
         let (applied, failed, _) = run(&live, &block(4, vec![propose(&a, programs(6), 9, 0)]));
         assert_eq!((applied, failed), (0, 1));
+    }
+
+    #[test]
+    fn a_larger_stake_displaces_a_live_proposal_but_a_smaller_one_cannot() {
+        let (small, big, other) = (key(1), key(2), key(3));
+        let mut live = live(&[(&small, 10), (&big, 60), (&other, 30)]);
+        let (applied, _, status) = run(&live, &block(0, vec![propose(&small, programs(3), 5, 0)]));
+        assert_eq!(applied, 1);
+        live.insert(
+            UPGRADE_PROPOSAL_KEY,
+            borsh::to_vec(&status.proposal.unwrap()).unwrap(),
+        );
+        // An equal or smaller stake cannot displace; a larger one replaces.
+        let (applied, failed, status) = run(
+            &live,
+            &block(
+                0,
+                vec![
+                    propose(&small, programs(4), 6, 1),
+                    propose(&big, programs(5), 7, 0),
+                ],
+            ),
+        );
+        assert_eq!((applied, failed), (1, 1));
+        let open = status.proposal.unwrap();
+        assert_eq!(open.programs, programs(5));
+        assert_eq!(open.voters, vec![big.verifying_key().to_bytes()]);
+        live.insert(UPGRADE_PROPOSAL_KEY, borsh::to_vec(&open).unwrap());
+        // 60 of 100 already votes for it; 30 cannot displace, 60 + 30 enacts.
+        let (applied, failed, status) = run(
+            &live,
+            &block(
+                0,
+                vec![
+                    propose(&other, programs(6), 8, 0),
+                    vote(&other, open.id(), 0),
+                ],
+            ),
+        );
+        assert_eq!((applied, failed), (1, 1));
+        assert_eq!(status.scheduled.map(|s| s.programs), Some(programs(5)));
     }
 
     #[test]
@@ -759,6 +903,42 @@ mod tests {
         );
         assert_eq!(applied, 1);
         assert_eq!(status.proposal.map(|p| p.programs), Some(programs(4)));
+    }
+
+    #[test]
+    fn young_registrations_neither_vote_nor_count_until_they_age() {
+        use crate::{ValidatorRegistration, registration_key};
+        let (old, young) = (key(1), key(2));
+        // Equal stake: alone, `old` holds 100% of the eligible set.
+        let mut live = live(&[(&old, 50), (&young, 50)]);
+        let registration = ValidatorRegistration {
+            address: young.verifying_key().to_bytes(),
+            bls_pubkey: [1; 48],
+            pop_signature: [2; 96],
+            registered_at_height: 0,
+        };
+        live.insert(
+            &registration_key(&registration.address),
+            borsh::to_vec(&registration).unwrap(),
+        );
+        // Before the registration ages the young validator cannot propose,
+        // and the old one enacts alone because the denominator excludes it.
+        let mut input = block(0, vec![propose(&young, programs(2), 3, 0)]);
+        input.block_height = UPGRADE_VOTER_MIN_AGE_BLOCKS - 1;
+        let (applied, failed, _) = run(&live, &input);
+        assert_eq!((applied, failed), (0, 1));
+        let mut input = block(0, vec![propose(&old, programs(2), 3, 0)]);
+        input.block_height = UPGRADE_VOTER_MIN_AGE_BLOCKS - 1;
+        let (applied, _, status) = run(&live, &input);
+        assert_eq!(applied, 1);
+        assert!(status.scheduled.is_some());
+        // Once aged, both count: the old validator alone holds only half.
+        let mut input = block(0, vec![propose(&old, programs(2), 3, 0)]);
+        input.block_height = UPGRADE_VOTER_MIN_AGE_BLOCKS;
+        let (applied, _, status) = run(&live, &input);
+        assert_eq!(applied, 1);
+        assert!(status.scheduled.is_none());
+        assert!(status.proposal.is_some());
     }
 
     #[test]

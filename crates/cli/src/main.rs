@@ -52,6 +52,7 @@ fn run() -> Result<(), String> {
         "keygen" => keygen(&opts),
         "genesis" => genesis(&opts),
         "node-config" => node_config(&opts),
+        "program-hash" => program_hash(&opts),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -76,6 +77,8 @@ fn print_usage() {
     eprintln!("      [--bootnode <multiaddr>]... [--rpc <host:port>] [--metrics <host:port>]");
     eprintln!("      [--proving cpu|cuda]");
     eprintln!("      Emit a node config; the proposer key stays in the referenced file.");
+    eprintln!("  program-hash --file <path>");
+    eprintln!("      Print the content hash and kind of an upgrade artifact (WASM or Guest ELF).");
 }
 
 /// Minimal `--flag value` / `--flag` parser; repeated flags accumulate.
@@ -178,6 +181,27 @@ fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
 }
 
 // --------------------------------------------------------------- genesis
+
+/// Content hash an upgrade proposal names for a runtime or Guest artifact.
+fn program_hash(opts: &Options) -> Result<(), String> {
+    let path = opts
+        .get("file")
+        .ok_or_else(|| "program-hash requires --file <path>".to_owned())?;
+    let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
+    let kind = match neutrino_node::programs::ArtifactKind::of(&bytes) {
+        neutrino_node::programs::ArtifactKind::Wasm => "wasm",
+        neutrino_node::programs::ArtifactKind::Elf => "elf",
+        neutrino_node::programs::ArtifactKind::Unknown => "unknown",
+    };
+    let hash = neutrino_node::programs::content_hash(&bytes)
+        .ok_or_else(|| "artifact is empty or exceeds the 16 MiB protocol bound".to_owned())?;
+    println!(
+        "{} {kind} {} bytes",
+        neutrino_node::programs::hex_hash(&hash),
+        bytes.len()
+    );
+    Ok(())
+}
 
 fn genesis(opts: &Options) -> Result<(), String> {
     let spec_path = PathBuf::from(opts.require("spec")?);

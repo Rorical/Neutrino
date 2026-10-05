@@ -53,6 +53,11 @@ pub trait ProofSystem {
 
     /// Classify an exact signed artifact for objective slashing.
     ///
+    /// `expected_block_program` is the block Guest the block's chunk boundary
+    /// names, resolved by the caller from its own state; an artifact naming
+    /// any other program is rejected as a public-input mismatch, so a signer
+    /// can never make its own program the verifier's key.
+    ///
     /// `Ok(None)` means valid, `Ok(Some(reason))` establishes rejection.
     /// An error means the backend could not make this determination and must
     /// never be converted into a slash. Operational proving/verification
@@ -60,6 +65,7 @@ pub trait ProofSystem {
     fn classify_block_rejection(
         &self,
         _proof: &neutrino_consensus_types::BlockProof,
+        _expected_block_program: &neutrino_consensus_types::history_proof::VkDigest,
     ) -> Result<Option<neutrino_consensus_types::ProofRejectionReason>, ProofError> {
         Err(ProofError::Unsupported)
     }
@@ -72,6 +78,31 @@ pub trait ProofSystem {
     fn programs(&self) -> Option<GuestPrograms> {
         None
     }
+
+    /// `true` when this backend holds every program of `guests` and can prove
+    /// under it. Backends with a program registry (design 24) override this.
+    fn can_prove(&self, guests: &GuestPrograms) -> bool {
+        self.programs().as_ref() == Some(guests)
+    }
+
+    /// Install a Guest from its ELF bytes and return its verifying-key
+    /// digest. Backends without a program registry refuse.
+    fn install_guest(
+        &self,
+        _elf: alloc::vec::Vec<u8>,
+    ) -> Result<neutrino_consensus_types::history_proof::VkDigest, ProofError> {
+        Err(ProofError::Unsupported)
+    }
+
+    /// `(digest, ELF hash)` of every installed Guest.
+    fn installed_guests(
+        &self,
+    ) -> alloc::vec::Vec<(
+        neutrino_consensus_types::history_proof::VkDigest,
+        neutrino_primitives::Hash,
+    )> {
+        alloc::vec::Vec::new()
+    }
     /// `(covered, total)` signature checks of the most recently proven chunk,
     /// where `covered` were answered by fact receipts. `None` when the
     /// backend does not track coverage or has not proven a chunk yet.
@@ -83,6 +114,7 @@ pub trait ProofSystem {
     /// Implementations retain a bounded cache of verified receipts for reuse.
     fn preprove_facts(
         &self,
+        _fact_program: &neutrino_consensus_types::history_proof::VkDigest,
         _requests: &[neutrino_prover_chunk::facts::FactRequest],
     ) -> Result<(), ProofError> {
         Err(ProofError::Unsupported)
@@ -94,6 +126,7 @@ pub trait ProofSystem {
     fn prove_evidence_batch(
         &self,
         _witnesses: &[neutrino_prover_chunk::evidence::EvidenceWitness],
+        _execution: &neutrino_consensus_types::history_proof::ExecutionPrograms,
     ) -> Result<alloc::vec::Vec<neutrino_consensus_types::evidence::EvidenceArtifact>, ProofError>
     {
         Err(ProofError::Unsupported)
@@ -104,6 +137,7 @@ pub trait ProofSystem {
         &self,
         _proof: &[u8],
         _batch: &neutrino_consensus_types::evidence::EvidenceBatch,
+        _evidence_program: &neutrino_consensus_types::history_proof::VkDigest,
     ) -> Result<(), ProofError> {
         Err(ProofError::Unsupported)
     }

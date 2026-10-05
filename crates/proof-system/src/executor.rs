@@ -32,6 +32,9 @@ use neutrino_trie::{Poseidon2Hasher, Trie};
 pub struct BlockExecutionContext {
     /// Trusted prior consensus context and accepted evidence/block programs.
     pub evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor,
+    /// Runtime artifact the block executes under: the runtime code hash of
+    /// its chunk boundary's program set (design 24).
+    pub runtime_code_hash: Hash,
     /// Chain identifier the transactions are bound to.
     pub chain_id: u64,
     /// Height of the block being executed (`header.height`).
@@ -128,6 +131,7 @@ pub trait BlockExecutor {
     fn query(
         &self,
         request: &QueryRequest,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, Self::Error>;
 
@@ -163,8 +167,28 @@ pub trait BlockExecutor {
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, Self::Error>;
+
+    /// Install a runtime artifact distributed on chain (design 24) and return
+    /// its code hash. Executors with one fixed runtime refuse.
+    ///
+    /// # Errors
+    /// Surfaces executor-specific failures.
+    fn install_runtime(&self, _wasm: &[u8]) -> Result<Hash, Self::Error>;
+
+    /// Serve `code_hash`, the chain specification's declared genesis runtime,
+    /// with the embedded default module. Production executors accept only
+    /// the identity alias and refuse any other hash; harness constructors may
+    /// permit placeholder specification hashes.
+    ///
+    /// # Errors
+    /// Surfaces executor-specific failures.
+    fn alias_default_runtime(&self, _code_hash: Hash) -> Result<(), Self::Error>;
+
+    /// Code hashes of every installed runtime.
+    fn installed_runtimes(&self) -> Vec<Hash>;
 }
 
 /// Dyn-friendly companion to [`BlockExecutor`].
@@ -198,6 +222,7 @@ pub trait ErasedBlockExecutor: Send + Sync {
     fn query(
         &self,
         request: &QueryRequest,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, String>;
 
@@ -212,8 +237,24 @@ pub trait ErasedBlockExecutor: Send + Sync {
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String>;
+
+    /// Type-erased counterpart to [`BlockExecutor::install_runtime`].
+    ///
+    /// # Errors
+    /// Surfaces the underlying executor's error rendered as a string.
+    fn install_runtime(&self, wasm: &[u8]) -> Result<Hash, String>;
+
+    /// Type-erased counterpart to [`BlockExecutor::alias_default_runtime`].
+    ///
+    /// # Errors
+    /// Surfaces the underlying executor's error rendered as a string.
+    fn alias_default_runtime(&self, code_hash: Hash) -> Result<(), String>;
+
+    /// Type-erased counterpart to [`BlockExecutor::installed_runtimes`].
+    fn installed_runtimes(&self) -> Vec<Hash>;
 }
 
 impl<X> ErasedBlockExecutor for X
@@ -232,9 +273,10 @@ where
     fn query(
         &self,
         request: &QueryRequest,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, String> {
-        BlockExecutor::query(self, request, state).map_err(|err| err.to_string())
+        BlockExecutor::query(self, request, runtime_code_hash, state).map_err(|err| err.to_string())
     }
 
     fn validate_tx(
@@ -243,10 +285,31 @@ where
         chain_id: u64,
         block_gas_limit: u64,
         gas_price: u128,
+        runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String> {
-        BlockExecutor::validate_tx(self, tx_bytes, chain_id, block_gas_limit, gas_price, state)
-            .map_err(|err| err.to_string())
+        BlockExecutor::validate_tx(
+            self,
+            tx_bytes,
+            chain_id,
+            block_gas_limit,
+            gas_price,
+            runtime_code_hash,
+            state,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    fn install_runtime(&self, wasm: &[u8]) -> Result<Hash, String> {
+        BlockExecutor::install_runtime(self, wasm).map_err(|err| err.to_string())
+    }
+
+    fn alias_default_runtime(&self, code_hash: Hash) -> Result<(), String> {
+        BlockExecutor::alias_default_runtime(self, code_hash).map_err(|err| err.to_string())
+    }
+
+    fn installed_runtimes(&self) -> Vec<Hash> {
+        BlockExecutor::installed_runtimes(self)
     }
 }
 
@@ -273,6 +336,7 @@ impl BlockExecutor for UnsupportedExecutor {
     fn query(
         &self,
         _request: &QueryRequest,
+        _runtime_code_hash: Hash,
         _state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, Self::Error> {
         Err(String::from("block executor not configured"))
@@ -284,6 +348,7 @@ impl BlockExecutor for UnsupportedExecutor {
         _chain_id: u64,
         _block_gas_limit: u64,
         _gas_price: u128,
+        _runtime_code_hash: Hash,
         _state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, Self::Error> {
         // Without an executor the system has no way to interpret the
@@ -292,5 +357,17 @@ impl BlockExecutor for UnsupportedExecutor {
         // returned `TxValidationCode`, not on the error path.
         let _ = TxValidationCode::StateReadFailed;
         Err(String::from("block executor not configured"))
+    }
+
+    fn install_runtime(&self, _wasm: &[u8]) -> Result<Hash, Self::Error> {
+        Err(String::from("block executor not configured"))
+    }
+
+    fn alias_default_runtime(&self, _code_hash: Hash) -> Result<(), Self::Error> {
+        Err(String::from("block executor not configured"))
+    }
+
+    fn installed_runtimes(&self) -> Vec<Hash> {
+        Vec::new()
     }
 }

@@ -373,6 +373,12 @@ fn register_system_methods(module: &mut RpcModule<RpcContext>) -> Result<(), Rpc
         })
         .map_err(reg_err)?;
 
+    module
+        .register_async_method("programs_status", |_, ctx, _| async move {
+            Ok::<_, ErrorObjectOwned>(ctx.backend().programs_status())
+        })
+        .map_err(reg_err)?;
+
     Ok(())
 }
 

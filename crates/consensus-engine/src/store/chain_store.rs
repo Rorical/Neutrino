@@ -987,6 +987,7 @@ mod tests {
         let body = Body {
             transactions: vec![vec![1, 2, 3]],
             evidence_proofs: Vec::new(),
+            programs: Vec::new(),
             finality_votes: vec![FinalityVote {
                 attestations: Vec::new(),
                 aggregation_bits: {
@@ -1026,6 +1027,7 @@ mod tests {
                 receipt_root: ZERO_HASH,
                 da_root: ZERO_HASH,
                 vm_code_hash: h(50),
+                block_program: [50; 8],
                 gas_used: 0,
                 gas_limit: 1_000_000,
                 gas_price: 0,

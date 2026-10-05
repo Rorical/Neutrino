@@ -20,6 +20,7 @@ pub mod db;
 pub mod genesis;
 pub mod metrics;
 pub(crate) mod producer;
+pub mod programs;
 pub mod runner;
 
 pub use chain_backend::ChainBackend;

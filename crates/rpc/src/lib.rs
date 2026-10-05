@@ -53,6 +53,7 @@ pub use backend::{
 pub use history::{HistoryJobInfo, HistoryJobStatus};
 pub use server::{RpcConfig, RpcContext, RpcStartError, build_module, build_module_with, serve};
 pub use types::{
-    BlockIdJson, BlockJson, BodyJson, BytesHex, FinalizedInfoJson, HashHex, HeadInfoJson,
-    HeaderJson, HealthJson, RuntimeCallResultJson, SubmitResultJson, SystemInfoJson, ValidatorJson,
+    ArtifactProgressJson, BlockIdJson, BlockJson, BodyJson, BytesHex, FinalizedInfoJson, HashHex,
+    HeadInfoJson, HeaderJson, HealthJson, InstalledGuestJson, PersistedArtifactJson,
+    ProgramsStatusJson, RuntimeCallResultJson, SubmitResultJson, SystemInfoJson, ValidatorJson,
 };

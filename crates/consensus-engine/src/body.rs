@@ -24,6 +24,7 @@ pub struct BodyRoots {
 pub fn compute_body_roots(body: &Body) -> BodyRoots {
     let transactions_root = merkle_root(&body.transactions);
     let votes_root = merkle_root(&body.finality_votes);
+    let programs_root = merkle_root(&body.programs);
     BodyRoots {
         transactions_root,
         votes_root,
@@ -35,6 +36,10 @@ pub fn compute_body_roots(body: &Body) -> BodyRoots {
             (
                 u32::try_from(body.finality_votes.len()).expect("borsh count"),
                 votes_root,
+            ),
+            (
+                u32::try_from(body.programs.len()).expect("borsh count"),
+                programs_root,
             ),
         ]),
     }
@@ -90,7 +95,7 @@ mod tests {
                 neutrino_prover_chunk::consensus::body_da_root(&body)
             );
         }
-        let lanes = [(3, [7; 32]), (2, [8; 32])];
+        let lanes = [(3, [7; 32]), (2, [8; 32]), (1, [9; 32])];
         let root = da_root_from_lane_roots(lanes);
         let mut wrong_count = lanes;
         wrong_count[0].0 += 1;

@@ -1169,6 +1169,7 @@ mod tests {
                 receipt_root: [0; 32],
                 da_root: [0; 32],
                 vm_code_hash: [0; 32],
+                block_program: [0; 8],
                 gas_used: 0,
                 gas_limit: 0,
                 gas_price: 0,

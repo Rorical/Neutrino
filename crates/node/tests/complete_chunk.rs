@@ -55,7 +55,11 @@ impl ProofSystem for NativeConsensusBackend {
     fn prove_evidence_batch(
         &self,
         witnesses: &[neutrino_prover_chunk::evidence::EvidenceWitness],
+        execution: &neutrino_consensus_types::history_proof::ExecutionPrograms,
     ) -> Result<Vec<neutrino_consensus_types::evidence::EvidenceArtifact>, ProofError> {
+        if execution.fact != [3; 8] || execution.evidence != [2; 8] {
+            return Err(ProofError::Unsupported);
+        }
         let statements = witnesses
             .iter()
             .map(neutrino_prover_chunk::evidence::validate_evidence)
@@ -83,7 +87,11 @@ impl ProofSystem for NativeConsensusBackend {
         &self,
         bytes: &[u8],
         expected: &neutrino_consensus_types::evidence::EvidenceBatch,
+        evidence_program: &neutrino_consensus_types::history_proof::VkDigest,
     ) -> Result<(), ProofError> {
+        if *evidence_program != [2; 8] {
+            return Err(ProofError::PublicInputMismatch);
+        }
         let witnesses: Vec<neutrino_prover_chunk::evidence::EvidenceWitness> =
             borsh::from_slice(bytes).map_err(|_| ProofError::MalformedProof)?;
         let statements = witnesses

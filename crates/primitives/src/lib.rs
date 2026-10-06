@@ -144,8 +144,17 @@ pub const DEFAULT_ACTIVATION_DELAY_EPOCHS: u64 = 2;
 /// quorum weighting. The delay leaves room for slashing windows to
 /// close before stake walks free.
 pub const DEFAULT_EXIT_DELAY_EPOCHS: u64 = 2;
-/// Default withdrawal delay and weak-subjectivity period in seconds.
-pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 = 14 * 24 * 60 * 60;
+/// Default weak-subjectivity period in seconds.
+///
+/// A trust anchor must be refreshed before the validators that were
+/// accountable at it can unbond, otherwise exited validators could sign an
+/// alternative history inside the trust window with nothing left to slash.
+/// The period is therefore bounded by the unbonding delay in wall-clock
+/// terms, and the default equals it: `DEFAULT_UNBONDING_DELAY_BLOCKS *
+/// DEFAULT_SLOT_DURATION_SECS`. Production specifications that want a
+/// longer window must lengthen the unbonding delay with it.
+pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 =
+    DEFAULT_UNBONDING_DELAY_BLOCKS * DEFAULT_SLOT_DURATION_SECS;
 /// Default number of chunks to retain lock-violation evidence.
 pub const DEFAULT_LOCK_WINDOW_CHUNKS: u64 = 64;
 /// Default recent-state retention in blocks.
@@ -930,6 +939,19 @@ impl ChainSpec {
             return Err(ChainSpecError::InvalidEvidencePolicy);
         }
 
+        // Weak subjectivity is only sound while the anchor's validators remain
+        // slashable: the trust window may not outlast the unbonding delay.
+        if self
+            .runtime
+            .unbonding_delay_blocks
+            .checked_mul(self.consensus.slot_duration_secs)
+            .is_none_or(|unbonding_secs| {
+                self.light_client.weak_subjectivity_period_secs > unbonding_secs
+            })
+        {
+            return Err(ChainSpecError::WeakSubjectivityOutlivesUnbonding);
+        }
+
         if self.initial_validators.is_empty() {
             return Err(ChainSpecError::EmptyValidatorSet);
         }
@@ -1083,6 +1105,9 @@ pub enum ChainSpecError {
     ZeroStateParameter,
     /// At least one light-client parameter was zero.
     ZeroLightClientParameter,
+    /// The weak-subjectivity period exceeds the unbonding delay in seconds, so
+    /// exited validators could rewrite history inside a still-trusted window.
+    WeakSubjectivityOutlivesUnbonding,
     /// The initial validator set must not be empty.
     EmptyValidatorSet,
     /// Validators must start with non-zero effective stake.
@@ -1117,6 +1142,10 @@ impl fmt::Display for ChainSpecError {
             Self::ZeroLightClientParameter => {
                 f.write_str("light-client parameters must be non-zero")
             }
+            Self::WeakSubjectivityOutlivesUnbonding => write!(
+                f,
+                "weak-subjectivity period must not exceed unbonding_delay_blocks * slot_duration_secs"
+            ),
             Self::EmptyValidatorSet => f.write_str("initial validator set must not be empty"),
             Self::ZeroValidatorStake => f.write_str("validator effective stake must be non-zero"),
             Self::ValidatorStakeOverflow => f.write_str("total validator stake overflowed"),
@@ -1319,6 +1348,30 @@ mod tests {
         spec.runtime.evidence_max_age_blocks = 1;
         spec.runtime.unbonding_delay_blocks = spec.consensus.chunk_size + 1;
         assert_eq!(spec.validate(), Err(ChainSpecError::InvalidEvidencePolicy));
+        spec.runtime.unbonding_delay_blocks += 1;
+        // A shorter unbonding delay also shrinks the admissible trust window.
+        assert_eq!(
+            spec.validate(),
+            Err(ChainSpecError::WeakSubjectivityOutlivesUnbonding)
+        );
+        spec.light_client.weak_subjectivity_period_secs =
+            spec.runtime.unbonding_delay_blocks * spec.consensus.slot_duration_secs;
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn weak_subjectivity_window_cannot_outlive_unbonding() {
+        let mut spec = test_chain_spec();
+        let unbonding_secs =
+            spec.runtime.unbonding_delay_blocks * spec.consensus.slot_duration_secs;
+        spec.light_client.weak_subjectivity_period_secs = unbonding_secs;
+        assert_eq!(spec.validate(), Ok(()));
+        spec.light_client.weak_subjectivity_period_secs = unbonding_secs + 1;
+        assert_eq!(
+            spec.validate(),
+            Err(ChainSpecError::WeakSubjectivityOutlivesUnbonding)
+        );
+        // Lengthening the unbonding delay restores the longer window.
         spec.runtime.unbonding_delay_blocks += 1;
         assert_eq!(spec.validate(), Ok(()));
     }

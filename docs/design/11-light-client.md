@@ -39,7 +39,11 @@ an origin-to-current proof or authenticated storage; peer snapshots cannot be us
 as trusted local state.
 
 Genesis recursion proves a rules-valid history. It does not prove latestness or
-eliminate the PoS long-range/weak-subjectivity problem. Peer advertisements are
+eliminate the PoS long-range/weak-subjectivity problem. The trust window is bounded
+by accountability: `ChainSpec::validate` rejects a `weak_subjectivity_period_secs`
+longer than `unbonding_delay_blocks * slot_duration_secs`, because validators who
+were accountable at an anchor must still be slashable for as long as the anchor is
+trusted. Chains wanting a longer window must lengthen the unbonding delay with it. Peer advertisements are
 hints; requests pin both endpoint hashes and reject mismatched replies. Missing
 suffixes remain unavailable until a provider can supply or construct them.
 

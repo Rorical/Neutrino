@@ -113,10 +113,16 @@ impl<DB: Database> ChainStore<DB> {
     pub fn prune_evidence_artifacts(
         &mut self,
         finalized_height: u64,
-        max_age: u64,
+        liveness_max_age: u64,
+        safety_max_age: u64,
     ) -> Result<(), StoreError<DB::Error>> {
+        use neutrino_consensus_types::evidence::SanctionKind;
         let mut batch = neutrino_storage::Batch::new();
         for artifact in self.evidence_artifacts()? {
+            let max_age = match artifact.statement.kind {
+                SanctionKind::Slash => safety_max_age,
+                SanctionKind::Inactivity => liveness_max_age,
+            };
             if finalized_height.saturating_sub(artifact.statement.context.end_height) >= max_age
                 || self.is_offence_finalized(&artifact.statement.offence_id)?
             {

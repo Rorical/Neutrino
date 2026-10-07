@@ -56,10 +56,17 @@ have passed.
   receipts and merges adjacent History ranges using Compressed STARK recursion.
   History coverage never gates chunk finality. Read `docs/design/21-recursive-checkpoint-proofs.md`
   before changing recursion, history storage or light-client trust policy.
-- Historical consensus references are restricted to the preceding eight finalized
-  chunks. Full/validator nodes prune older raw data only below saved recursive
-  coverage; archive nodes preserve history. Proof jobs pin receipts and boundaries,
-  not old transaction bodies or execution state. Current sanctions remain live state.
+- Historical consensus references and liveness evidence are restricted to the
+  preceding eight finalized chunks. Safety evidence (`SanctionKind::Slash`) uses the
+  genesis-fixed `safety_evidence_max_age_blocks` instead (thirteen days by default;
+  `safety + chunk_size < unbonding_delay_blocks`; weak subjectivity may not exceed it),
+  and full/validator nodes keep historical records and their tree paths for
+  `safety_history_window_chunks`. Everything else prunes below saved recursive
+  coverage past the eight-chunk window; archive nodes preserve history. Proof jobs pin
+  receipts and boundaries, not old transaction bodies or execution state. Current
+  sanctions remain live state: a safety admission tombstones the BLS identity, a
+  liveness admission marks the offence, and both markers are swept one unbonding
+  delay after admission.
 - Full/validator snapshot bootstrap verifies a genesis History prefix and an exact
   bridge from local trust, then authenticates validators, recent history and the
   complete execution state before durable atomic installation. Archive nodes replay
@@ -76,9 +83,10 @@ have passed.
   exactly two runtime records, `consensus:candidates` and the scheduled upgrade, and
   hands the runtime one input, the previous chunk's certified `ParticipationReport`,
   whose commitment travels in the boundary; economic rules never enter the Guests.
-  Governable runtime policy (fee rate, evidence windows, sanction amounts) is runtime
-  state under `runtime:policy`, seeded from the spec at genesis and changed only by
-  governance; unbonding delay, chunk size and all consensus parameters stay in the spec.
+  Governable runtime policy (fee rate, the liveness evidence window, sanction amounts)
+  is runtime state under `runtime:policy`, seeded from the spec at genesis and changed
+  only by governance; unbonding delay, the safety evidence window, chunk size and all
+  consensus parameters stay in the spec.
   Receipts are verified under the program set of their start boundary, never one the
   receipt names itself. Upgrade governance is runtime state (`governance` module of the
   default runtime); artifacts travel in the block body's program lane and are installed

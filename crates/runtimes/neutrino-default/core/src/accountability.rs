@@ -6,8 +6,10 @@
 
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_consensus_types::evidence::{EvidenceAnchor, SanctionKind, commitment};
-use neutrino_primitives::{Hash, Validator};
+use neutrino_consensus_types::evidence::{
+    EvidenceAnchor, EvidenceStatement, SanctionKind, commitment,
+};
+use neutrino_primitives::{BlsPublicKey, Hash, Validator};
 use neutrino_runtime_core::StateBackend;
 
 use crate::{
@@ -30,6 +32,18 @@ pub struct Sanction {
     pub offender: Validator,
     /// Misconduct or certificate non-inclusion.
     pub kind: SanctionKind,
+}
+
+impl Sanction {
+    /// Replay marker this sanction writes: the identity tombstone for safety
+    /// sanctions, the per-offence status key for liveness sanctions.
+    #[must_use]
+    pub fn marker_key(&self) -> Vec<u8> {
+        match self.kind {
+            SanctionKind::Slash => slashed_key(&self.offender.pubkey),
+            SanctionKind::Inactivity => offence_key(&self.offence_id),
+        }
+    }
 }
 
 /// Verified obligation; its fixed amount survives later policy changes.
@@ -56,22 +70,50 @@ pub struct AccountabilityOutput {
     pub queue_after: Hash,
 }
 
-/// Status key rejecting duplicate or re-encoded offences while admissible.
+/// Status key rejecting duplicate or re-encoded liveness offences while
+/// admissible.
 ///
 /// It is swept through the [`expiry_key`] bucket of its admitting height
-/// once that height's admission window has closed.
+/// once the unbonding delay has passed.
 pub fn offence_key(id: &Hash) -> Vec<u8> {
     let mut key = Vec::from(&b"accountability:event:v1:"[..]);
     key.extend_from_slice(id);
     key
 }
 
-/// Bucket listing the offence IDs admitted at `height`.
+/// Tombstone of a BLS identity whose safety sanction has been admitted.
+///
+/// One safety sanction retires an identity for good: consensus marks it
+/// `slashed` at the next boundary and never seats it again, so a second
+/// safety claim against the same key, from any chunk, is rejected while the
+/// tombstone stands. The tombstone therefore replaces per-offence markers for
+/// safety evidence, and the number of live tombstones is bounded by the
+/// identities that were accountable inside one unbonding delay rather than
+/// by how many offences they signed inside the long safety window.
+pub fn slashed_key(pubkey: &BlsPublicKey) -> Vec<u8> {
+    let mut key = Vec::from(&b"accountability:slashed:v1:"[..]);
+    key.extend_from_slice(pubkey);
+    key
+}
+
+/// Replay marker a statement must not find in state to be admissible.
+#[must_use]
+pub fn marker_key(statement: &EvidenceStatement) -> Vec<u8> {
+    match statement.kind {
+        SanctionKind::Slash => slashed_key(&statement.offender.pubkey),
+        SanctionKind::Inactivity => offence_key(&statement.offence_id),
+    }
+}
+
+/// Bucket listing the marker keys written by admissions at `height`.
 ///
 /// The block at `height + unbonding_delay_blocks + 1` deletes the bucket and
-/// every listed status key. The unbonding delay is fixed at genesis and
-/// exceeds every evidence window governance may ever set, so a swept offence
-/// can never bind again, however the window changes in between.
+/// every listed marker. The unbonding delay is fixed at genesis and exceeds
+/// the safety window plus one chunk, which in turn bounds every liveness
+/// window governance may set, so a swept marker can never bind again: a
+/// tombstoned identity is `slashed` in every validator vector after the chunk
+/// containing `height`, and claims about that chunk or earlier ones expire
+/// at most `chunk_size + safety_evidence_max_age_blocks` blocks later.
 pub fn expiry_key(height: u64) -> Vec<u8> {
     let mut key = Vec::from(&b"accountability:expiry:v1:"[..]);
     key.extend_from_slice(&height.to_be_bytes());
@@ -80,12 +122,8 @@ pub fn expiry_key(height: u64) -> Vec<u8> {
 
 /// Delete the markers admitted one unbonding delay before this block.
 ///
-/// A claim admitted at height `h` ends before `h`, so under any policy it is
-/// bindable at most until `h + evidence_max_age_blocks`, which the genesis
-/// rule `evidence_max_age_blocks + chunk_size < unbonding_delay_blocks`
-/// keeps below the sweep height. Retention therefore never depends on the
-/// governable window. The sweep is bounded by that block's admission cap
-/// and is mandatory, so it carries no gas.
+/// Retention never depends on a governable window. The sweep is bounded by
+/// that block's admission cap and is mandatory, so it carries no gas.
 fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, retention: u64) {
     let Some(expired) = height
         .checked_sub(retention)
@@ -96,9 +134,9 @@ fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, retention:
     let Some(bytes) = state.read(&expiry_key(expired)) else {
         return;
     };
-    let ids: Vec<Hash> = borsh::from_slice(&bytes).expect("canonical expiry bucket");
-    for id in &ids {
-        state.delete(&offence_key(id));
+    let keys: Vec<Vec<u8>> = borsh::from_slice(&bytes).expect("canonical expiry bucket");
+    for key in &keys {
+        state.delete(key);
     }
     state.delete(&expiry_key(expired));
 }
@@ -108,10 +146,10 @@ fn record_expiry_bucket<B: StateBackend>(state: &mut B, height: u64, admitted: &
     if admitted.is_empty() {
         return;
     }
-    let ids: Vec<Hash> = admitted.iter().map(|s| s.offence_id).collect();
+    let keys: Vec<Vec<u8>> = admitted.iter().map(Sanction::marker_key).collect();
     state.write(
         &expiry_key(height),
-        borsh::to_vec(&ids).expect("canonical expiry bucket"),
+        borsh::to_vec(&keys).expect("canonical expiry bucket"),
     );
 }
 
@@ -127,7 +165,7 @@ pub fn load_queue<B: StateBackend>(state: &mut B) -> Vec<PendingSanction> {
 #[must_use]
 pub fn validate_input(input: &StfInput) -> ValidatedInput<'_> {
     assert!(
-        input.evidence_anchor.unbonding_delay_blocks > input.evidence_anchor.chunk_size,
+        input.evidence_anchor.is_well_formed(),
         "invalid accountability anchor"
     );
     let mut ordinary = false;
@@ -177,10 +215,7 @@ impl ValidatedInput<'_> {
 fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::RuntimePolicy {
     let policy = crate::load_runtime_policy(state);
     assert!(
-        policy.is_valid_for(
-            input.evidence_anchor.unbonding_delay_blocks,
-            input.evidence_anchor.chunk_size,
-        ),
+        policy.is_valid_for(&input.evidence_anchor),
         "invalid accountability policy"
     );
     let mut admissions = 0_u32;
@@ -189,7 +224,10 @@ fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::Ru
             break;
         };
         assert!(
-            submission.within_age(input.block_height, policy.evidence_max_age_blocks),
+            submission.within_age(
+                input.block_height,
+                submission.admissible_age(policy.evidence_max_age_blocks, &input.evidence_anchor),
+            ),
             "evidence window"
         );
         admissions += 1;
@@ -209,14 +247,13 @@ fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<S
             break;
         };
         let claim = &submission.statement;
+        assert!(state.read(&marker_key(claim)).is_none(), "offence replay");
         assert!(
-            state.read(&offence_key(&claim.offence_id)).is_none(),
-            "offence replay"
-        );
-        assert!(
-            !admitted
-                .iter()
-                .any(|s: &Sanction| s.offence_id == claim.offence_id),
+            !admitted.iter().any(|s: &Sanction| match claim.kind {
+                SanctionKind::Slash =>
+                    s.kind == SanctionKind::Slash && s.offender.pubkey == claim.offender.pubkey,
+                SanctionKind::Inactivity => s.offence_id == claim.offence_id,
+            }),
             "duplicate offence"
         );
         admitted.push(Sanction {
@@ -268,7 +305,7 @@ pub(crate) fn apply<B: StateBackend>(
         "queue capacity"
     );
     for sanction in &admitted {
-        state.write(&offence_key(&sanction.offence_id), alloc::vec![0]);
+        state.write(&sanction.marker_key(), alloc::vec![0]);
         let amount = match sanction.kind {
             SanctionKind::Slash => policy.slash_amount,
             SanctionKind::Inactivity => policy.inactivity_leak_amount,
@@ -293,7 +330,7 @@ pub(crate) fn apply<B: StateBackend>(
             Err(ReceiptStatus::InsufficientBalance) => ReceiptStatus::InsufficientBalance,
             Err(error) => panic!("unexpected mandatory deduction failure: {error:?}"),
         };
-        state.write(&offence_key(&item.sanction.offence_id), alloc::vec![1]);
+        state.write(&item.sanction.marker_key(), alloc::vec![1]);
         executed.push(item.sanction);
         receipts.push(Receipt {
             status_code: status.as_u32(),
@@ -462,7 +499,8 @@ pub(crate) mod tests {
         assert_eq!(second.accountability.executed[0].offence_id, [2; 32]);
         assert_eq!(load_queue(&mut next), [] as [PendingSanction; 0]);
         assert_eq!(crate::load_validator(&mut next, &[2; 32]).stake, 70);
-        assert_eq!(next.read(&offence_key(&[2; 32])), Some(vec![1]));
+        assert_eq!(next.read(&slashed_key(&[2; 48])), Some(vec![1]));
+        assert_eq!(next.read(&offence_key(&[2; 32])), None);
     }
 
     #[test]
@@ -472,8 +510,9 @@ pub(crate) mod tests {
         // policy that widens the five-block window can never rebind an offence
         // whose marker was already swept.
         input.evidence_anchor.chunk_size = 1;
+        input.evidence_anchor.safety_evidence_max_age_blocks = 5;
         input.evidence_anchor.unbonding_delay_blocks = 8;
-        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Inactivity)];
         let mut live = LiveTrie::default();
         seed_policy(&mut live, |policy| policy.evidence_max_age_blocks = 5);
         live.insert(
@@ -487,9 +526,9 @@ pub(crate) mod tests {
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.accountability.executed.len(), 1);
         assert_eq!(state.read(&offence_key(&[1; 32])), Some(vec![1]));
-        let bucket: Vec<Hash> =
+        let bucket: Vec<Vec<u8>> =
             borsh::from_slice(&state.read(&expiry_key(input.block_height)).unwrap()).unwrap();
-        assert_eq!(bucket, vec![[1; 32]]);
+        assert_eq!(bucket, vec![offence_key(&[1; 32])]);
         let admitted_at = input.block_height;
         let (post, _) = state.into_committed_and_witness();
         // The window closes after five blocks but the marker stays for the
@@ -578,6 +617,75 @@ pub(crate) mod tests {
             crate::load_withdrawal_queue(&mut state, &address).entries,
             [] as [crate::Withdrawal; 0]
         );
+    }
+
+    #[test]
+    fn safety_tombstone_rejects_further_safety_claims_but_not_liveness_and_is_swept() {
+        let mut input = input();
+        input.evidence_anchor.chunk_size = 1;
+        input.evidence_anchor.safety_evidence_max_age_blocks = 5;
+        input.evidence_anchor.unbonding_delay_blocks = 8;
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
+        let mut live = LiveTrie::default();
+        seed_policy(&mut live, |policy| {
+            policy.evidence_max_age_blocks = 5;
+            policy.slash_amount = 10;
+        });
+        live.insert(
+            &crate::validator_key(&[1; 32]),
+            crate::encode_validator(&crate::Validator {
+                stake: 100,
+                active: true,
+            }),
+        );
+        let mut state = TracingState::new(&live);
+        crate::apply_block(&input, &mut state);
+        assert_eq!(state.read(&slashed_key(&[1; 48])), Some(vec![1]));
+        let admitted_at = input.block_height;
+        let (post, _) = state.into_committed_and_witness();
+
+        // A different offence by the same identity is rejected while the
+        // tombstone stands, so the partial slash cannot be repeated per round.
+        let live = LiveTrie::from_trie(post);
+        let mut second = input.clone();
+        second.block_height += 1;
+        second.transactions = vec![admission(&mut second, 1, [1; 32], SanctionKind::Slash)];
+        if let Transaction::SubmitEvidence(submission) = &mut second.transactions[0] {
+            submission.statement.offence_id = [99; 32];
+        }
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::apply_block(&second, &mut TracingState::new(&live))
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(
+            crate::load_validator(&mut TracingState::new(&live), &[1; 32]).stake,
+            90
+        );
+
+        // Liveness evidence against the same identity keys by offence and
+        // is unaffected by the tombstone.
+        let mut liveness = input.clone();
+        liveness.block_height += 1;
+        liveness.transactions = vec![admission(
+            &mut liveness,
+            1,
+            [1; 32],
+            SanctionKind::Inactivity,
+        )];
+        let mut state = TracingState::new(&live);
+        let output = crate::apply_block(&liveness, &mut state);
+        assert_eq!(output.accountability.admitted.len(), 1);
+        assert_eq!(state.read(&offence_key(&[1; 32])), Some(vec![1]));
+
+        // Once the unbonding delay has passed the tombstone is swept too.
+        let (post, _) = state.into_committed_and_witness();
+        let live = LiveTrie::from_trie(post);
+        let mut state = TracingState::new(&live);
+        input.transactions.clear();
+        input.block_height = admitted_at + 9;
+        crate::apply_block(&input, &mut state);
+        assert!(state.read(&slashed_key(&[1; 48])).is_none());
+        assert!(state.read(&expiry_key(admitted_at)).is_none());
     }
 
     #[test]

@@ -354,6 +354,7 @@ fn validate_candidate_using(
         block_guest_vk_digest: input.block_guest_vk_digest,
         evidence_guest_vk_digest: input.evidence_guest_vk_digest,
         unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+        safety_evidence_max_age_blocks: spec.runtime.safety_evidence_max_age_blocks,
         chunk_size: context.chunk_size,
     };
     for (block, body) in input.blocks.iter().zip(&input.bodies) {

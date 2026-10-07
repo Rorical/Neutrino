@@ -18,8 +18,8 @@ use crate::chain_spec::{ChainSpecError, ChainSpecFile, decode_hex_exact};
 pub struct GenesisState {
     /// State trie holding every genesis record.
     pub trie: Trie,
-    /// Root committed in the chain spec. All-zero when the allocation is
-    /// empty, matching a spec that declares no runtime state.
+    /// Root committed in the chain spec. Never all-zero: the governable
+    /// runtime policy is seeded into state even when the allocation is empty.
     pub root: Hash,
     /// Number of funded accounts.
     pub accounts: usize,
@@ -41,7 +41,6 @@ pub struct GenesisState {
 /// duplicate validator credential.
 pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSpecError> {
     let mut trie = Trie::new();
-    let mut entries = 0_usize;
     let mut seen_accounts = std::collections::BTreeSet::new();
     for (idx, entry) in file.accounts.iter().enumerate() {
         let field = format!("accounts[{idx}].address_hex");
@@ -58,7 +57,6 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
         };
         trie.insert(&account_key(&address), encode_account(&account))
             .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
-        entries += 1;
     }
     let mut set = ValidatorSet::default();
     let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
@@ -97,7 +95,6 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
             identity: None,
         });
         staked_validators += 1;
-        entries += 1;
     }
     if !set.entries.is_empty() {
         trie.insert(
@@ -112,19 +109,17 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
             borsh::to_vec(&candidates).expect("borsh encode ConsensusCandidates never fails"),
         )
         .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
-        entries += 1;
     }
     // The governable runtime policy starts from the specification's values
-    // and lives in state from here on (design 24).
-    let policy =
-        neutrino_default_runtime_core::RuntimePolicy::from_params(&file.to_chain_spec()?.runtime);
+    // and lives in state from here on (design 24). The parameters come from
+    // the file directly: `to_chain_spec` needs this function's root first.
+    let policy = neutrino_default_runtime_core::RuntimePolicy::from_params(&file.runtime_params());
     trie.insert(
         neutrino_default_runtime_core::RUNTIME_POLICY_KEY,
         borsh::to_vec(&policy).expect("borsh encode RuntimePolicy never fails"),
     )
     .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
-    entries += 1;
-    let root = if entries == 0 { ZERO_HASH } else { trie.root() };
+    let root = trie.root();
     Ok(GenesisState {
         trie,
         root,
@@ -158,7 +153,7 @@ effective_stake = 500
     }
 
     #[test]
-    fn empty_allocation_keeps_zero_root() {
+    fn empty_allocation_seeds_only_the_runtime_policy() {
         let file = ChainSpecFile::from_toml_str(&format!(
             r#"
 name = "x"
@@ -172,7 +167,18 @@ effective_stake = 1
         ))
         .unwrap();
         let state = build_genesis_state(&file).unwrap();
-        assert_eq!(state.root, ZERO_HASH);
+        // No accounts and no runtime validator, yet the policy record is
+        // always present, so the root is that of a policy-only trie.
+        let mut expected: Trie = Trie::new();
+        expected
+            .insert(
+                neutrino_default_runtime_core::RUNTIME_POLICY_KEY,
+                borsh::to_vec(&neutrino_default_runtime_core::RuntimePolicy::default()).unwrap(),
+            )
+            .unwrap();
+        assert_ne!(state.root, ZERO_HASH);
+        assert_eq!(state.root, expected.root());
+        assert_eq!(state.accounts, 0);
         assert_eq!(state.staked_validators, 0);
     }
 

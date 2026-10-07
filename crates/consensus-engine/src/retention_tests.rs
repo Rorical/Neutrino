@@ -59,8 +59,18 @@ fn spec() -> ChainSpec {
             ..ProofParams::default()
         },
         state: StateParams::default(),
-        light_client: LightClientParams::default(),
-        runtime: RuntimeParams::default(),
+        light_client: LightClientParams {
+            weak_subjectivity_period_secs: 7 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS,
+            ..LightClientParams::default()
+        },
+        // A seven-block safety window over one-block chunks keeps the safety
+        // history window at the eight-chunk minimum these fixtures count on.
+        runtime: RuntimeParams {
+            evidence_max_age_blocks: 7,
+            safety_evidence_max_age_blocks: 7,
+            unbonding_delay_blocks: 9,
+            ..RuntimeParams::default()
+        },
         initial_validators: validators,
         metadata: BoundedBytes::new(Vec::new()).unwrap(),
     }
@@ -90,9 +100,15 @@ fn fixture<DB: Database>(db: DB, count: u64) -> Engine<DB>
 where
     DB::Error: std::fmt::Debug,
 {
-    let spec = spec();
+    fixture_with_spec(db, count, &spec())
+}
+
+fn fixture_with_spec<DB: Database>(db: DB, count: u64, spec: &ChainSpec) -> Engine<DB>
+where
+    DB::Error: std::fmt::Debug,
+{
     let mut engine = Engine::genesis(spec.clone(), db).unwrap();
-    engine.set_history_domain(domain(&spec)).unwrap();
+    engine.set_history_domain(domain(spec)).unwrap();
     for _ in 0..count {
         append(&mut engine);
     }
@@ -175,7 +191,7 @@ where
         seed: spec.genesis_seed,
         history_root: frontier.root().unwrap(),
         programs: domain(&spec).programs,
-        participation: [id as u8; 32],
+        participation: [u8::try_from(id).expect("fixture chunk ids fit u8"); 32],
     };
     let statement = ConsensusStatement {
         chain: domain(&spec).chain,
@@ -404,6 +420,49 @@ fn covered_pruning_retains_eight_chunks_and_supports_restart_and_append() {
             .unwrap()
     );
     Engine::open(reopened.chain_spec().clone(), reopened.store().db().clone()).unwrap();
+}
+
+#[test]
+fn safety_window_keeps_historical_records_and_openings_past_the_raw_window() {
+    let mut spec = spec();
+    // Twenty one-block chunks of safety evidence: records stay for 21 chunks
+    // while raw blocks keep the eight-chunk window.
+    spec.runtime.safety_evidence_max_age_blocks = 20;
+    spec.runtime.unbonding_delay_blocks = 22;
+    spec.light_client.weak_subjectivity_period_secs =
+        20 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS;
+    spec.validate().unwrap();
+    let mut engine = fixture_with_spec(MemoryDatabase::new(), 70, &spec);
+    artifact(&mut engine, 0, 70, true);
+    let info = engine.prune_history_covered().unwrap();
+    assert_eq!(info.pruned_before_chunk, 62);
+    assert_eq!(engine.safety_history_window_chunks(), 21);
+    assert!(engine.store().get_header_by_height(61).unwrap().is_none());
+    assert!(engine.store().get_chunk_proof(61).unwrap().is_none());
+    assert!(engine.store().historical_chunk(48).unwrap().is_none());
+    for id in [49, 61, 69] {
+        assert!(engine.store().historical_chunk(id).unwrap().is_some());
+        engine.store().historical_opening(id, 70).unwrap();
+        assert!(engine.in_safety_history_window(id));
+    }
+    assert!(!engine.in_safety_history_window(48));
+    assert_eq!(
+        engine
+            .store()
+            .db()
+            .iter_column(Column::HistoricalChunks)
+            .unwrap()
+            .len(),
+        21
+    );
+    // The retained paths survive restart and a further append.
+    let mut reopened =
+        Engine::open(engine.chain_spec().clone(), engine.store().db().clone()).unwrap();
+    append(&mut reopened);
+    reopened.store().historical_opening(49, 71).unwrap();
+    reopened.prune_history_covered().unwrap();
+    assert!(reopened.store().historical_chunk(49).unwrap().is_none());
+    reopened.store().historical_opening(50, 71).unwrap();
 }
 
 #[test]

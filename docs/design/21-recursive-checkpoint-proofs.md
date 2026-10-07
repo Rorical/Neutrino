@@ -121,15 +121,18 @@ data, enforced during decoding. The archive may hold full historical records, bu
 witness construction uses indexed reads: an opening needs at most 64 sibling-node
 lookups plus its record/root metadata. It never scans all prior chunks.
 
-For incoming Chunk `n`, historical source indices must be in
-`[n.saturating_sub(8), n)`. Chunk 10,000 can reference Chunk 9,992, but cannot
-reference Chunk 9,991 or Chunk 1, even if an archive supplies a valid opening.
-The witness supplies the vote's authenticated context and one fixed-depth opening.
-The opening targets the current incoming history root;
+For incoming Chunk `n`, historical source indices read by the chunk witness must
+be in `[n.saturating_sub(8), n)`. Chunk 10,000 can reference Chunk 9,992, but
+cannot reference Chunk 9,991 or Chunk 1, even if an archive supplies a valid
+opening. The witness supplies the vote's authenticated context and one fixed-depth
+opening. The opening targets the current incoming history root;
 an opening for an older leaf count cannot be reused unchanged. It authenticates
 the historical validator context, not past inclusion of that particular vote.
-The vote's signature and attestation are checked separately. New slashing admission
-also enforces the evidence-age window (1,024 blocks by default).
+The vote's signature and attestation are checked separately. Liveness evidence
+admission enforces the same eight-chunk window plus the governable evidence-age
+window (1,024 blocks by default); safety evidence admission enforces only the
+genesis-fixed safety window (thirteen days by default), opening older records
+through the same fixed-depth path. See [evidence proofs](20-evidence-proofs.md).
 Raw data must still be available from a retaining node.
 A root or recursive proof cannot reconstruct deleted records. Fixed depth bounds
 work with respect to chain age; actual work still varies with current transactions,
@@ -203,7 +206,11 @@ The pruning batch removes old raw blocks, headers and their indices, execution
 witnesses, block/chunk receipts and certificates, obsolete historical records,
 frontiers, tree nodes, range proofs and checkpoint metadata. It retains the latest
 genesis-prefix receipt, current consensus boundary, the recent window, active proof
-dependencies and state reachable from retained roots. A history job leases only
+dependencies and state reachable from retained roots. Finalized historical records
+and the tree paths that open them are the one exception to the eight-chunk window:
+they stay for `safety_history_window_chunks` so safety evidence can still be built
+and rebound (see [evidence proofs](20-evidence-proofs.md)); a path to a record
+inside a 64-level tree costs about 64 nodes regardless of its age. A history job leases only
 its Chunk receipts/statements/boundaries and progress receipt; it never requires old
 transaction bodies or old execution state and does not lower the raw-data watermark.
 Historical tree paths and the

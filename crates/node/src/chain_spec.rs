@@ -139,9 +139,14 @@ pub struct ChainSpecFile {
     /// Defaults to the canonical evidence-safe delay in `RuntimeParams`.
     #[serde(default)]
     pub unbonding_delay_blocks: Option<u64>,
-    /// Evidence admission window after the source chunk ends.
+    /// Liveness evidence admission window after the source chunk ends.
     #[serde(default)]
     pub evidence_max_age_blocks: Option<u64>,
+    /// Safety evidence admission window after the source chunk ends. Fixed
+    /// at genesis; bounds the weak-subjectivity period and the historical
+    /// records nodes retain.
+    #[serde(default)]
+    pub safety_evidence_max_age_blocks: Option<u64>,
     /// Maximum pending mandatory sanctions.
     #[serde(default)]
     pub evidence_max_pending: Option<u32>,
@@ -192,6 +197,44 @@ impl ChainSpecFile {
     /// Returns [`ChainSpecError::Toml`] when the input is invalid TOML.
     pub fn from_toml_str(raw: &str) -> Result<Self, ChainSpecError> {
         toml::from_str(raw).map_err(ChainSpecError::Toml)
+    }
+
+    /// Runtime parameters declared by this file over the canonical defaults.
+    ///
+    /// Genesis state construction seeds the governable policy from these
+    /// values directly, because the full [`ChainSpec`] cannot be built before
+    /// the genesis state root it embeds.
+    #[must_use]
+    pub fn runtime_params(&self) -> RuntimeParams {
+        let mut runtime = RuntimeParams::default();
+        if let Some(gas_price) = self.gas_price {
+            runtime.gas_price = gas_price;
+        }
+        if let Some(unbonding) = self.unbonding_delay_blocks {
+            runtime.unbonding_delay_blocks = unbonding;
+        }
+        if let Some(value) = self.evidence_max_age_blocks {
+            runtime.evidence_max_age_blocks = value;
+        }
+        if let Some(value) = self.safety_evidence_max_age_blocks {
+            runtime.safety_evidence_max_age_blocks = value;
+        }
+        if let Some(value) = self.evidence_max_pending {
+            runtime.evidence_max_pending = value;
+        }
+        if let Some(value) = self.evidence_admissions_per_block {
+            runtime.evidence_admissions_per_block = value;
+        }
+        if let Some(value) = self.evidence_executions_per_block {
+            runtime.evidence_executions_per_block = value;
+        }
+        if let Some(slash) = self.slash_amount {
+            runtime.slash_amount = slash;
+        }
+        if let Some(leak) = self.inactivity_leak_amount {
+            runtime.inactivity_leak_amount = leak;
+        }
+        runtime
     }
 
     /// Materialise a canonical [`ChainSpec`] from this file.
@@ -261,7 +304,7 @@ impl ChainSpecFile {
         let mut consensus = ConsensusParams::default();
         let state = StateParams::default();
         let light_client = LightClientParams::default();
-        let mut runtime = RuntimeParams::default();
+        let runtime = self.runtime_params();
         let runtime_info = RuntimeInfo::default();
 
         if let Some(slot_duration_secs) = self.slot_duration_secs {
@@ -270,30 +313,6 @@ impl ChainSpecFile {
         if let Some(chunk_size) = self.chunk_size {
             consensus.chunk_size = chunk_size;
             proof_params.slot_budget_per_chunk = chunk_size;
-        }
-        if let Some(gas_price) = self.gas_price {
-            runtime.gas_price = gas_price;
-        }
-        if let Some(unbonding) = self.unbonding_delay_blocks {
-            runtime.unbonding_delay_blocks = unbonding;
-        }
-        if let Some(value) = self.evidence_max_age_blocks {
-            runtime.evidence_max_age_blocks = value;
-        }
-        if let Some(value) = self.evidence_max_pending {
-            runtime.evidence_max_pending = value;
-        }
-        if let Some(value) = self.evidence_admissions_per_block {
-            runtime.evidence_admissions_per_block = value;
-        }
-        if let Some(value) = self.evidence_executions_per_block {
-            runtime.evidence_executions_per_block = value;
-        }
-        if let Some(slash) = self.slash_amount {
-            runtime.slash_amount = slash;
-        }
-        if let Some(leak) = self.inactivity_leak_amount {
-            runtime.inactivity_leak_amount = leak;
         }
 
         let genesis_validator_set_root =

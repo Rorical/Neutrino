@@ -665,6 +665,7 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
         block_guest_vk_digest: [1; 8],
         evidence_guest_vk_digest: [2; 8],
         unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+        safety_evidence_max_age_blocks: spec.runtime.safety_evidence_max_age_blocks,
         chunk_size: spec.consensus.chunk_size,
     };
     let submission = EvidenceSubmission {

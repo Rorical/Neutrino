@@ -118,8 +118,20 @@ impl<DB: Database> ChainStore<DB> {
             info.pruned_before_chunk,
             prefix.statement.range_id(),
         )?;
-        self.prune_count_columns(&mut batch, info.pruned_before_chunk, &boundaries)?;
-        self.prune_history_nodes(&mut batch, info.pruned_before_chunk)?;
+        // Historical records and the tree paths opening them outlive raw
+        // blocks: a safety claim may reference any chunk inside the safety
+        // window, and the eight-chunk liveness window never exceeds it.
+        let safety_window = neutrino_consensus_types::history::safety_history_window_chunks(
+            spec.runtime.safety_evidence_max_age_blocks,
+            spec.consensus.chunk_size,
+        );
+        self.prune_count_columns(
+            &mut batch,
+            info.pruned_before_chunk,
+            &boundaries,
+            safety_window,
+        )?;
+        self.prune_history_nodes(&mut batch, info.pruned_before_chunk, safety_window)?;
         let roots = self.prune_blocks(&mut batch, info)?;
         let finalized_count = self
             .get_latest_finalized_chunk_id()?
@@ -131,6 +143,8 @@ impl<DB: Database> ChainStore<DB> {
                 finalized_count
                     .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS),
             ),
+            info.pruned_before_chunk
+                .min(finalized_count.saturating_sub(safety_window)),
         )?;
         batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
         Ok((batch, roots))
@@ -189,12 +203,12 @@ impl<DB: Database> ChainStore<DB> {
         batch: &mut Batch,
         floor: u64,
         boundaries: &BTreeSet<u64>,
+        safety_window: u64,
     ) -> Result<(), StoreError<DB::Error>> {
         let pins = self.history_dependencies()?;
-        let record_floor = self.get_latest_finalized_chunk_id()?.map_or(0, |id| {
-            id.saturating_add(1)
-                .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS)
-        });
+        let record_floor = self
+            .get_latest_finalized_chunk_id()?
+            .map_or(0, |id| id.saturating_add(1).saturating_sub(safety_window));
         let checkpoint_count = self.get_recursive_covered_chunks()?.unwrap_or(0);
         let checkpoint_floor = checkpoint_count
             .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
@@ -248,6 +262,7 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         batch: &mut Batch,
         floor: u64,
+        safety_window: u64,
     ) -> Result<(), StoreError<DB::Error>> {
         let mut retained = BTreeSet::new();
         for (key, bytes) in self
@@ -268,11 +283,10 @@ impl<DB: Database> ChainStore<DB> {
             {
                 return Err(StoreError::Corrupt("retained history frontier is invalid"));
             }
-            // Keep paths to each recent record and to the next append location. Old
-            // subtrees remain opaque sibling hashes; their internal nodes are dispensable.
-            let record_floor = floor.min(
-                count.saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS),
-            );
+            // Keep paths to each record inside the safety window and to the next
+            // append location. Older subtrees remain opaque sibling hashes; their
+            // internal nodes are dispensable.
+            let record_floor = floor.min(count.saturating_sub(safety_window));
             self.retain_history_paths(root, record_floor, count, &mut retained)?;
         }
         for (key, _) in self
@@ -451,13 +465,22 @@ impl<DB: Database> ChainStore<DB> {
         Ok(())
     }
 
+    /// Drop pooled evidence whose source chunk left its admission window:
+    /// `liveness_floor` for inactivity claims, `safety_floor` for signed
+    /// misconduct, raw reports and finalized-admission indexes.
     fn prune_evidence(
         &self,
         batch: &mut Batch,
         spec: &ChainSpec,
-        floor: u64,
+        liveness_floor: u64,
+        safety_floor: u64,
     ) -> Result<(), StoreError<DB::Error>> {
+        use neutrino_consensus_types::evidence::SanctionKind;
         for artifact in self.evidence_artifacts()? {
+            let floor = match artifact.statement.kind {
+                SanctionKind::Slash => safety_floor,
+                SanctionKind::Inactivity => liveness_floor,
+            };
             if artifact.statement.context.chunk_id < floor
                 || self.is_offence_finalized(&artifact.statement.offence_id)?
             {
@@ -466,7 +489,7 @@ impl<DB: Database> ChainStore<DB> {
         }
         for (key, evidence) in self.iter_slashing_evidence()? {
             if neutrino_prover_chunk::history::evidence_chunk_id(spec, &evidence)
-                .is_ok_and(|id| id < floor)
+                .is_ok_and(|id| id < safety_floor)
             {
                 batch.delete(Column::SlashingPool, key);
             }
@@ -480,7 +503,7 @@ impl<DB: Database> ChainStore<DB> {
             if height
                 .checked_sub(1)
                 .and_then(|h| h.checked_div(spec.consensus.chunk_size))
-                .is_some_and(|id| id < floor)
+                .is_some_and(|id| id < safety_floor)
             {
                 batch.delete(Column::FinalizedOffences, key);
             }

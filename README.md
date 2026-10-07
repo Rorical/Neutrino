@@ -32,7 +32,9 @@ Neutrino separates the chain into two cleanly decoupled layers:
   SP1 Compressed STARK recursion; acceptance gates are tracked in design 19.
   A history proof connects compact authenticated boundaries without replaying the chain.
 - **Proof-backed pruning.** Full and validator nodes retain the recent eight-chunk
-  window once a persisted recursive prefix covers older data. `role = "archive"`
+  window once a persisted recursive prefix covers older data, plus the compact
+  historical validator records for the thirteen-day safety evidence window so a
+  late-discovered signed fork can still be punished. `role = "archive"`
   keeps complete source history voluntarily. Old transactions may become globally
   unavailable when no archive retains them; proof lag delays deletion.
 - **Authenticated snapshot bootstrap.** Full/validator nodes verify a recursive

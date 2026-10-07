@@ -210,10 +210,16 @@ pub fn derive_next_validators(
         let Some(identity) = candidate.identity else {
             continue;
         };
-        if next.iter().any(|validator| {
-            validator.withdrawal_credentials == candidate.address
-                || validator.pubkey == identity.pubkey
-        }) || !crate::bls::verify_pop(&identity.pubkey, &identity.pop_signature)
+        // Neither the address nor the BLS key may already be seated.
+        let address_seated = next
+            .iter()
+            .any(|validator| validator.withdrawal_credentials == candidate.address);
+        let key_seated = next
+            .iter()
+            .any(|validator| validator.pubkey == identity.pubkey);
+        if address_seated
+            || key_seated
+            || !crate::bls::verify_pop(&identity.pubkey, &identity.pop_signature)
         {
             continue;
         }

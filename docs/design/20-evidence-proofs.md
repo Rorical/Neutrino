@@ -174,19 +174,50 @@ There is one current unversioned format for chain specs, headers, proofs, storag
 and network paths. Existing
 nodes or databases must not silently interpret the new wire format.
 
-Defaults are 1,024 blocks for evidence admission, 2,048 blocks for unbonding,
-1,024 pending sanctions, and 16 admissions/executions per block. The chain spec
-requires `evidence_max_age_blocks + chunk_size < unbonding_delay_blocks` and
-nonzero bounded queue throughput. A full FIFO therefore drains within 64
+Two admission windows exist, selected by `SanctionKind`:
+
+- **Liveness evidence** (`Inactivity`) uses the governable
+  `evidence_max_age_blocks` (default 1,024 blocks) and must additionally reference
+  one of the eight preceding finalized chunks: for incoming chunk `n`, source IDs
+  lie in `[n.saturating_sub(8), n)`. The eighth preceding chunk is admissible; the
+  ninth is rejected even with a valid membership proof. This chunk window also
+  bounds ordinary embedded votes and chunk-witness historical reads.
+- **Safety evidence** (`Slash`: double proposals and votes, lock violations,
+  invalid-proof acceptance, signed fork participation, DA fraud, invalid VRF
+  claims) uses the genesis-fixed `safety_evidence_max_age_blocks` (default
+  thirteen days, 280,800 blocks) carried in the `EvidenceAnchor`. Any finalized
+  source chunk whose last block is at most that many blocks behind the admitting
+  height is admissible; the fixed 64-level history opening costs the same at any
+  age. Governance cannot change this window because it bounds the
+  weak-subjectivity period and the historical records nodes must retain.
+
+The chain spec requires `evidence_max_age_blocks <= safety_evidence_max_age_blocks`,
+`safety_evidence_max_age_blocks + chunk_size < unbonding_delay_blocks` (default
+unbonding is fourteen days, leaving one day of honest proposer opportunities before
+stake can leave), `weak_subjectivity_period_secs <= safety_evidence_max_age_blocks *
+slot_duration_secs`, and nonzero bounded queue throughput; defaults keep 1,024
+pending sanctions and 16 admissions/executions per block. The STF asserts the same
+anchor and policy invariants on every block. A full FIFO drains within 64
 advancing blocks at default throughput. An admitted obligation does not expire.
 
-Evidence must also reference one of the eight preceding finalized chunks:
-for incoming chunk `n`, source IDs must lie in `[n.saturating_sub(8), n)`.
-Both the block-age limit and this chunk window apply, including on archive nodes.
-The eighth preceding chunk is admissible; the ninth is rejected even with a valid
-membership proof and signatures. This rule also bounds ordinary embedded votes.
-Pruning never expires an admitted FIFO obligation or removes its current-state
-withdrawal hold or offence replay marker.
+Replay protection is bounded by the unbonding delay, not by chain age. A liveness
+admission writes a per-offence marker; a safety admission writes a **tombstone
+keyed by the offender's BLS public key**. Consensus marks a tombstoned identity
+`slashed` at the next boundary and never seats it again, so a second safety claim
+against that key, from any chunk, is rejected while the tombstone stands; the
+number of live tombstones is bounded by the identities accountable inside one
+unbonding delay, not by how many offences they signed inside the safety window.
+Every marker is listed in the expiry bucket of its admitting height and swept one
+unbonding delay later, by which time no claim can bind to it. Pruning never expires
+an admitted FIFO obligation or removes its current-state withdrawal hold.
+
+Full and validator nodes keep the finalized historical records (chunk, validator
+vector, seed and certificate) and the history-tree paths opening them for
+`safety_history_window_chunks = max(8, ceil(safety_evidence_max_age_blocks /
+chunk_size) + 1)` preceding chunks, so any still-admissible safety claim can be
+constructed and rebound locally; raw blocks, proofs and signed-source caches
+keep the eight-chunk window. Pooled safety receipts and raw reports expire at the
+safety floor, liveness receipts at the liveness floor.
 
 Signed-source storage observes the current chunk and those eight preceding
 authenticated chunks. Full/validator retention follows recursive coverage;

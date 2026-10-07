@@ -170,14 +170,18 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
             hex_short(&actual),
         ))));
     }
-    if chain_spec
-        .runtime
-        .evidence_max_age_blocks
-        .checked_add(chain_spec.consensus.chunk_size)
-        .is_none_or(|window| window >= chain_spec.runtime.unbonding_delay_blocks)
+    if chain_spec.runtime.evidence_max_age_blocks
+        > chain_spec.runtime.safety_evidence_max_age_blocks
+        || chain_spec
+            .runtime
+            .safety_evidence_max_age_blocks
+            .checked_add(chain_spec.consensus.chunk_size)
+            .is_none_or(|window| window >= chain_spec.runtime.unbonding_delay_blocks)
     {
         return Err(NodeError::ChainSpec(ChainSpecError::Validation(
-            "unbonding delay must exceed evidence window plus one chunk".into(),
+            "unbonding delay must exceed the safety evidence window plus one chunk, \
+             which in turn bounds the liveness evidence window"
+                .into(),
         )));
     }
     let production_config = build_block_producer_config(&config, &chain_spec)?;

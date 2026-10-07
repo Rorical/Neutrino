@@ -503,24 +503,21 @@ fn check_propose<B: StateBackend>(
     )
 }
 
-/// Checks of a policy proposal. `fixed` is `(unbonding_delay_blocks,
-/// chunk_size)` from the anchor at execution; admission knows neither and
-/// checks only the structural bounds.
+/// Checks of a policy proposal. `anchor` carries the genesis-fixed facts at
+/// execution; admission has no anchor and checks only the structural bounds.
 fn check_propose_policy<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     current_chunk: Option<u64>,
     block_height: Option<u64>,
-    fixed: Option<(u64, u64)>,
+    anchor: Option<&neutrino_consensus_types::evidence::EvidenceAnchor>,
     fee: u128,
     tx: &ProposePolicyTx,
 ) -> Result<(Account, ValidatorSet), ReceiptStatus> {
-    let valid = match fixed {
-        Some((unbonding, chunk_size)) => {
-            tx.policy.is_valid_for(unbonding, chunk_size) && policy_enactable(state, &tx.policy)
-        }
-        None => tx.policy.is_well_formed(),
-    };
+    let valid = anchor.map_or_else(
+        || tx.policy.is_well_formed(),
+        |anchor| tx.policy.is_valid_for(anchor) && policy_enactable(state, &tx.policy),
+    );
     if !valid {
         return Err(ReceiptStatus::InvalidUpgrade);
     }
@@ -664,14 +661,13 @@ pub fn validate_propose_policy<B: StateBackend>(
     }
 }
 
-/// Execute a policy proposal; `fixed` is `(unbonding_delay_blocks,
-/// chunk_size)` from the authenticated anchor.
+/// Execute a policy proposal against the authenticated anchor's fixed facts.
 pub fn apply_propose_policy<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     current_chunk: u64,
     block_height: u64,
-    fixed: (u64, u64),
+    anchor: &neutrino_consensus_types::evidence::EvidenceAnchor,
     fee: u128,
     tx: &ProposePolicyTx,
 ) -> Result<(), ReceiptStatus> {
@@ -680,7 +676,7 @@ pub fn apply_propose_policy<B: StateBackend>(
         chain_id,
         Some(current_chunk),
         Some(block_height),
-        Some(fixed),
+        Some(anchor),
         fee,
         tx,
     )?;
@@ -951,12 +947,12 @@ mod tests {
             evidence_max_age_blocks: 777,
             ..RuntimePolicy::default()
         };
-        assert!(policy.is_valid_for(anchor.unbonding_delay_blocks, anchor.chunk_size));
+        assert!(policy.is_valid_for(&anchor));
 
         // Policies the genesis facts or the structural bounds reject never
         // open a proposal, even from the largest validator.
         let too_old = RuntimePolicy {
-            evidence_max_age_blocks: anchor.unbonding_delay_blocks - anchor.chunk_size,
+            evidence_max_age_blocks: anchor.safety_evidence_max_age_blocks + 1,
             ..policy
         };
         let no_queue = RuntimePolicy {

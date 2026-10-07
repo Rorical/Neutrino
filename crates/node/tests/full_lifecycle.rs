@@ -116,6 +116,7 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
     let runtime = RuntimeParams {
         unbonding_delay_blocks: UNBONDING_DELAY_BLOCKS,
         evidence_max_age_blocks: 2,
+        safety_evidence_max_age_blocks: 2,
         ..RuntimeParams::default()
     };
     live.insert(
@@ -150,9 +151,8 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         proof,
         state: StateParams::default(),
         light_client: LightClientParams {
-            // The trust window may not outlive this test's short unbonding delay.
-            weak_subjectivity_period_secs: UNBONDING_DELAY_BLOCKS
-                * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS,
+            // The trust window may not outlive this test's short safety window.
+            weak_subjectivity_period_secs: 2 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS,
             ..LightClientParams::default()
         },
         runtime,

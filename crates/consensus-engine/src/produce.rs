@@ -154,6 +154,10 @@ impl<DB: Database> Engine<DB> {
     ///   counter would overflow `u64`.
     /// - [`ProductionError::Executor`] if the dynamic runtime fails.
     /// - [`ProductionError::Engine`] on persistence failures.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One linear production pipeline; splitting it would only scatter the ordering invariants."
+    )]
     pub fn try_produce_block(
         &mut self,
         slot: Slot,

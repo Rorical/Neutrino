@@ -245,15 +245,18 @@ impl RuntimePolicy {
             && self.evidence_executions_per_block <= self.evidence_max_pending
     }
 
-    /// Full validity against the genesis-fixed facts: evidence about a
-    /// chunk's last block must stay admissible until its signers can unbond.
+    /// Full validity against the genesis-fixed facts carried by the anchor:
+    /// the governable liveness window never exceeds the fixed safety window,
+    /// which the anchor itself keeps more than one chunk inside unbonding.
     #[must_use]
-    pub const fn is_valid_for(&self, unbonding_delay_blocks: u64, chunk_size: u64) -> bool {
+    pub const fn is_valid_for(
+        &self,
+        anchor: &neutrino_consensus_types::evidence::EvidenceAnchor,
+    ) -> bool {
+        let safety_window = anchor.safety_evidence_max_age_blocks;
         self.is_well_formed()
-            && match self.evidence_max_age_blocks.checked_add(chunk_size) {
-                Some(window) => window < unbonding_delay_blocks,
-                None => false,
-            }
+            && anchor.is_well_formed()
+            && self.evidence_max_age_blocks <= safety_window
     }
 }
 
@@ -1553,10 +1556,7 @@ pub fn apply_block_validated<B: StateBackend>(
                 input.chain_id,
                 input.evidence_anchor.chunk_id,
                 input.block_height,
-                (
-                    input.evidence_anchor.unbonding_delay_blocks,
-                    input.evidence_anchor.chunk_size,
-                ),
+                &input.evidence_anchor,
                 fee,
                 policy_tx,
             ),

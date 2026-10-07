@@ -165,8 +165,31 @@ impl<DB: Database> Engine<DB> {
             evidence_guest_vk_digest: programs.execution.evidence,
             fact_guest_vk_digest: programs.execution.fact,
             unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+            safety_evidence_max_age_blocks: spec.runtime.safety_evidence_max_age_blocks,
             chunk_size: spec.consensus.chunk_size,
         })
+    }
+
+    /// Preceding finalized chunks whose historical records this node keeps
+    /// so any still-admissible safety claim can be opened: the eight-chunk
+    /// liveness window or the safety window, whichever is longer.
+    #[must_use]
+    pub const fn safety_history_window_chunks(&self) -> u64 {
+        let spec = self.chain_spec();
+        neutrino_consensus_types::history::safety_history_window_chunks(
+            spec.runtime.safety_evidence_max_age_blocks,
+            spec.consensus.chunk_size,
+        )
+    }
+
+    /// Whether a finalized chunk is a source safety evidence may still cite.
+    #[must_use]
+    pub fn in_safety_history_window(&self, chunk_id: u64) -> bool {
+        neutrino_consensus_types::history::is_history_index_within(
+            chunk_id,
+            self.finalized_next_chunk_id(),
+            self.safety_history_window_chunks(),
+        )
     }
 
     /// The governable runtime policy in force at the head state. Genesis
@@ -191,7 +214,7 @@ impl<DB: Database> Engine<DB> {
             .block;
         let id = neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
             .map_err(|_| ProofError::InvalidWitness)?;
-        if !is_recent_history_index(id, self.finalized_next_chunk_id()) {
+        if !self.in_safety_history_window(id) {
             return Err(ProofError::InvalidWitness.into());
         }
         let source = self
@@ -213,7 +236,15 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<neutrino_consensus_types::evidence::EvidenceSubmission, FinalizeError<DB::Error>>
     {
         let count = self.finalized_next_chunk_id();
-        if !is_recent_history_index(statement.context.chunk_id, count) {
+        let in_window = match statement.kind {
+            neutrino_consensus_types::evidence::SanctionKind::Slash => {
+                self.in_safety_history_window(statement.context.chunk_id)
+            }
+            neutrino_consensus_types::evidence::SanctionKind::Inactivity => {
+                is_recent_history_index(statement.context.chunk_id, count)
+            }
+        };
+        if !in_window {
             return Err(ProofError::InvalidWitness.into());
         }
         let opening = self
@@ -323,7 +354,7 @@ impl<DB: Database> Engine<DB> {
         let source_id =
             neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
                 .map_err(|_| ProofError::InvalidWitness)?;
-        if !is_recent_history_index(source_id, self.finalized_next_chunk_id()) {
+        if !self.in_safety_history_window(source_id) {
             return Err(ProofError::InvalidWitness.into());
         }
         let source = self

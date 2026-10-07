@@ -2,10 +2,13 @@
 
 use super::ChainBackend;
 use neutrino_consensus_types::history::{HISTORY_RETENTION_CHUNKS, is_recent_history_index};
-use neutrino_consensus_types::{Body, evidence::EvidenceArtifact};
+use neutrino_consensus_types::{
+    Body,
+    evidence::{EvidenceArtifact, SanctionKind},
+};
 use neutrino_default_runtime_core::{
     Transaction,
-    accountability::{GAS_EVIDENCE_ADMISSION, PendingSanction, QUEUE_KEY, offence_key},
+    accountability::{GAS_EVIDENCE_ADMISSION, PendingSanction, QUEUE_KEY, marker_key, offence_key},
 };
 use neutrino_network::{Topic, service::NetworkCommand};
 use neutrino_proof_system::ProofSystem;
@@ -132,10 +135,12 @@ where
                 .and_then(|n| n.checked_mul(engine.chain_spec().consensus.chunk_size))
                 .unwrap_or(0);
             let max_age = engine.runtime_policy().evidence_max_age_blocks;
-            if let Err(error) = engine
-                .store_mut()
-                .prune_evidence_artifacts(finalized_height, max_age)
-            {
+            let safety_max_age = engine.chain_spec().runtime.safety_evidence_max_age_blocks;
+            if let Err(error) = engine.store_mut().prune_evidence_artifacts(
+                finalized_height,
+                max_age,
+                safety_max_age,
+            ) {
                 tracing::warn!(?error, "evidence pool pruning failed");
             }
             let mut witnesses = Vec::new();
@@ -162,12 +167,14 @@ where
                 if let Ok(witness) = engine.evidence_witness(evidence) {
                     // Signature/proof checking is expensive and happens in the
                     // worker. The content commitment deduplicates queued copies.
+                    // Raw reports are signed misconduct, so the safety window
+                    // applies.
                     let facts = neutrino_prover_chunk::execution::commitment(&witness.claim);
                     if engine
                         .head_height()
                         .saturating_add(1)
                         .saturating_sub(witness.source.chunk.end_height)
-                        <= engine.runtime_policy().evidence_max_age_blocks
+                        <= safety_max_age
                         && !existing
                             .iter()
                             .any(|item| item.statement.facts_commitment == facts)
@@ -253,12 +260,18 @@ where
             {
                 return Err(Rejected);
             }
-            if artifact.statement.context.chunk_id < anchor.chunk_id
-                && !is_recent_history_index(artifact.statement.context.chunk_id, anchor.chunk_id)
-            {
+            let source = artifact.statement.context.chunk_id;
+            let in_window = match artifact.statement.kind {
+                SanctionKind::Slash => engine.in_safety_history_window(source),
+                SanctionKind::Inactivity => is_recent_history_index(source, anchor.chunk_id),
+            };
+            if source < anchor.chunk_id && !in_window {
                 return Err(Rejected);
             }
-            let max_age = engine.runtime_policy().evidence_max_age_blocks;
+            let max_age = match artifact.statement.kind {
+                SanctionKind::Slash => anchor.safety_evidence_max_age_blocks,
+                SanctionKind::Inactivity => engine.runtime_policy().evidence_max_age_blocks,
+            };
             if artifact.statement.context.end_height >= height
                 || height - artifact.statement.context.end_height > max_age
             {
@@ -271,7 +284,11 @@ where
                 {
                     Ok(anchor.evidence_guest_vk_digest)
                 }
-                _ => Err(Rejected),
+                Ok(_) => Err(Rejected),
+                // A record this node cannot open yet (for example right after
+                // a snapshot bootstrap that installed only the recent window)
+                // is a local gap, not a verdict on the artifact.
+                Err(_) => Err(Deferred),
             }
         });
         let evidence_program = match readiness {
@@ -326,10 +343,19 @@ where
                 if selected >= policy.evidence_admissions_per_block as usize {
                     break;
                 }
+                // A tombstoned identity or an already admitted liveness
+                // offence cannot be admitted again; neither can a second safety
+                // claim against an identity selected earlier in this body.
                 if engine
                     .state()
-                    .get(&offence_key(&artifact.statement.offence_id))
+                    .get(&marker_key(&artifact.statement))
                     .is_some()
+                    || (artifact.statement.kind == SanctionKind::Slash
+                        && body.evidence_proofs.iter().any(|selected| {
+                            selected.statement.kind == SanctionKind::Slash
+                                && selected.statement.offender.pubkey
+                                    == artifact.statement.offender.pubkey
+                        }))
                 {
                     continue;
                 }
@@ -337,7 +363,10 @@ where
                     continue;
                 };
                 if !submission.binds(engine.chain_spec().chain_id, height, &anchor)
-                    || !submission.within_age(height, policy.evidence_max_age_blocks)
+                    || !submission.within_age(
+                        height,
+                        submission.admissible_age(policy.evidence_max_age_blocks, &anchor),
+                    )
                 {
                     continue;
                 }

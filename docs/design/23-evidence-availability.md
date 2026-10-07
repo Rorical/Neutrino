@@ -107,10 +107,19 @@ errors never establish rejection evidence.
 
 Ordinary source observation accepts the current unfinalized chunk and the eight
 preceding authenticated finalized chunks. Evidence admission still requires a
-preceding finalized chunk, its block-age limit and the authenticated historical
-opening. Full and validator nodes delete older source rows only below saved
-recursive coverage. Archive nodes can retain and serve older sources, but old
-sources do not extend the protocol's offence-admission window.
+preceding finalized chunk, its kind's block-age limit and the authenticated
+historical opening. Full and validator nodes delete older source rows only below
+saved recursive coverage. Archive nodes can retain and serve older sources, but old
+sources do not extend the protocol's offence-admission windows.
+
+Safety evidence remains admissible for the genesis-fixed safety window (thirteen
+days by default), far beyond the eight-chunk source cache. The canonical side of
+such a claim comes from the retained historical records, which keep each
+finalized certificate's individual attestations for the whole safety window; the
+conflicting side comes from whoever observed the signed fork, typically the light
+client or bridge it was presented to. This layer therefore guarantees that a late
+fork can be *attributed* against the canonical history, not that every ephemeral
+unfinalized-round message from thirteen days ago is still cached.
 
 The current-plus-eight-chunk full/validator source cache is bounded by 4,096
 records and 512 MiB of source storage. Peer-origin admission stops at 3,840

@@ -17,7 +17,38 @@ pub const HISTORY_RETENTION_CHUNKS: u64 = 8;
 /// Current and future chunks are excluded; genesis has no historical records.
 #[must_use]
 pub const fn is_recent_history_index(index: u64, count: u64) -> bool {
-    index < count && index >= count.saturating_sub(HISTORY_RETENTION_CHUNKS)
+    is_history_index_within(index, count, HISTORY_RETENTION_CHUNKS)
+}
+
+/// Whether an index belongs to the `window` finalized chunks before `count`.
+#[must_use]
+pub const fn is_history_index_within(index: u64, count: u64, window: u64) -> bool {
+    index < count && index >= count.saturating_sub(window)
+}
+
+/// Number of preceding finalized chunks whose historical records a node keeps
+/// so every still-admissible safety claim can be opened and verified.
+///
+/// A safety claim about chunk `k` is admissible while the block height is at
+/// most `safety_evidence_max_age_blocks` past `k`'s last block, so the oldest
+/// admissible source lies `ceil(window / chunk_size)` chunks behind the chunk
+/// under construction; one more chunk absorbs the boundary block.
+#[must_use]
+pub const fn safety_history_window_chunks(
+    safety_evidence_max_age_blocks: u64,
+    chunk_size: u64,
+) -> u64 {
+    if chunk_size == 0 {
+        return HISTORY_RETENTION_CHUNKS;
+    }
+    let chunks = safety_evidence_max_age_blocks
+        .div_ceil(chunk_size)
+        .saturating_add(1);
+    if chunks > HISTORY_RETENTION_CHUNKS {
+        chunks
+    } else {
+        HISTORY_RETENTION_CHUNKS
+    }
 }
 
 /// Distinguish an empty slot from an occupied context commitment.
@@ -265,6 +296,26 @@ mod tests {
                 assert!(!is_recent_history_index(first - 1, count));
             }
         }
+    }
+
+    #[test]
+    fn safety_history_window_covers_the_oldest_admissible_source_chunk() {
+        // 1,024 blocks of 128-block chunks: eight chunks back plus the boundary.
+        assert_eq!(safety_history_window_chunks(1_024, 128), 9);
+        // Thirteen days of 4 s slots at the default chunk size.
+        assert_eq!(safety_history_window_chunks(280_800, 128), 2_195);
+        // A window shorter than eight chunks never shrinks ordinary retention.
+        assert_eq!(
+            safety_history_window_chunks(1, 128),
+            HISTORY_RETENTION_CHUNKS
+        );
+        assert_eq!(
+            safety_history_window_chunks(10, 0),
+            HISTORY_RETENTION_CHUNKS
+        );
+        assert!(is_history_index_within(0, 9, 9));
+        assert!(!is_history_index_within(0, 10, 9));
+        assert!(!is_history_index_within(10, 10, 9));
     }
 
     #[test]

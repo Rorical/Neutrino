@@ -442,7 +442,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         block_height: input.block_height,
         gas_limit: input.block_gas_limit,
         proposer_address: input.proposer_address,
-        participation: input.participation.clone(),
+        participation: input.participation,
     };
     let mut state = live.trie().clone();
     let produced =

@@ -225,10 +225,42 @@ pub struct EvidenceAnchor {
     /// Trusted evidence program for recursive receipt verification.
     pub evidence_guest_vk_digest: [u32; 8],
     /// Genesis-fixed unbonding delay in blocks. Withdrawal maturity and the
-    /// upper bound of every governable evidence window derive from it.
+    /// upper bound of every evidence window derive from it.
     pub unbonding_delay_blocks: u64,
+    /// Genesis-fixed admission window for safety evidence in blocks. Objective
+    /// signed misconduct stays admissible this long after its source chunk
+    /// ends; the governable liveness window may not exceed it.
+    pub safety_evidence_max_age_blocks: u64,
     /// Genesis-fixed blocks per chunk, needed to bound evidence windows.
     pub chunk_size: u64,
+}
+
+impl EvidenceAnchor {
+    /// Timeline the anchor must satisfy for any admission to be sound: a
+    /// safety claim about a chunk's last block remains admissible until at
+    /// least one chunk before its signers can unbond.
+    #[must_use]
+    pub const fn is_well_formed(&self) -> bool {
+        self.chunk_size > 0
+            && self.safety_evidence_max_age_blocks > 0
+            && match self
+                .safety_evidence_max_age_blocks
+                .checked_add(self.chunk_size)
+            {
+                Some(window) => window < self.unbonding_delay_blocks,
+                None => false,
+            }
+    }
+
+    /// Preceding finalized chunks whose historical records remain openable
+    /// for safety claims under this anchor.
+    #[must_use]
+    pub const fn safety_history_window_chunks(&self) -> u64 {
+        crate::history::safety_history_window_chunks(
+            self.safety_evidence_max_age_blocks,
+            self.chunk_size,
+        )
+    }
 }
 
 impl Default for EvidenceAnchor {
@@ -244,6 +276,8 @@ impl Default for EvidenceAnchor {
             block_guest_vk_digest: [0; 8],
             evidence_guest_vk_digest: [0; 8],
             unbonding_delay_blocks: neutrino_primitives::DEFAULT_UNBONDING_DELAY_BLOCKS,
+            safety_evidence_max_age_blocks:
+                neutrino_primitives::DEFAULT_SAFETY_EVIDENCE_MAX_AGE_BLOCKS,
             chunk_size: neutrino_primitives::DEFAULT_CHUNK_SIZE,
         }
     }
@@ -333,26 +367,56 @@ fn pair_hash(left: Hash, right: Hash) -> Hash {
 impl EvidenceSubmission {
     /// Cheap authenticated-input bindings, shared by the runtime and native
     /// admission. This does not replace verification of the SP1 receipt.
+    ///
+    /// Liveness claims must reference one of the eight preceding finalized
+    /// chunks. Safety claims may reference any finalized chunk whose last
+    /// block is at most the anchor's safety window behind `height`; the
+    /// fixed-depth history opening costs the same at any age.
     pub fn binds(&self, chain_id: u64, height: u64, anchor: &EvidenceAnchor) -> bool {
         let statement = &self.statement;
+        let source = statement.context.chunk_id;
+        let in_window = match statement.kind {
+            SanctionKind::Slash => {
+                source < anchor.chunk_id
+                    && self.within_age(height, anchor.safety_evidence_max_age_blocks)
+            }
+            SanctionKind::Inactivity => {
+                crate::history::is_recent_history_index(source, anchor.chunk_id)
+            }
+        };
         statement.chain_id == chain_id
             && statement.chain_spec_hash == anchor.chain_spec_hash
             && statement.block_guest_vk_digest == anchor.block_guest_vk_digest
-            && self.history.index == statement.context.chunk_id
+            && self.history.index == source
             && self.history.count == anchor.chunk_id
-            && crate::history::is_recent_history_index(statement.context.chunk_id, anchor.chunk_id)
+            && in_window
             && self
                 .history
                 .verify(commitment(&statement.context), anchor.history_root)
             && statement.context.end_height < height
     }
 
-    /// `true` while the offence is still admissible under the runtime's
-    /// governable evidence window, read from state by the caller.
+    /// Admission window that applies to this claim's sanction kind: the
+    /// anchor's genesis-fixed safety window for signed misconduct, the
+    /// runtime's governable window for liveness evidence.
     #[must_use]
-    pub const fn within_age(&self, height: u64, evidence_max_age_blocks: u64) -> bool {
+    pub const fn admissible_age(
+        &self,
+        evidence_max_age_blocks: u64,
+        anchor: &EvidenceAnchor,
+    ) -> u64 {
+        match self.statement.kind {
+            SanctionKind::Slash => anchor.safety_evidence_max_age_blocks,
+            SanctionKind::Inactivity => evidence_max_age_blocks,
+        }
+    }
+
+    /// `true` while the offence is still admissible under `max_age_blocks`
+    /// after its source chunk's last block.
+    #[must_use]
+    pub const fn within_age(&self, height: u64, max_age_blocks: u64) -> bool {
         let end = self.statement.context.end_height;
-        end < height && height - end <= evidence_max_age_blocks
+        end < height && height - end <= max_age_blocks
     }
 }
 
@@ -462,10 +526,11 @@ mod tests {
     }
 
     #[test]
-    fn evidence_window_includes_the_eighth_chunk_and_exact_block_age() {
+    fn liveness_window_includes_the_eighth_chunk_and_exact_block_age() {
         use crate::history::{HistoryPath, history_root};
 
         let mut statement = artifact().statement;
+        statement.kind = SanctionKind::Inactivity;
         statement.context.end_height = 128;
         let mut leaves = alloc::vec![[0; 32]; 8];
         leaves[0] = commitment(&statement.context);
@@ -482,6 +547,7 @@ mod tests {
         };
         assert!(submission.binds(7, 1025, &anchor));
         assert!(submission.binds(7, 1153, &anchor));
+        assert_eq!(submission.admissible_age(1024, &anchor), 1024);
         assert!(submission.within_age(1152, 1024));
         assert!(!submission.within_age(1153, 1024));
         assert!(submission.within_age(1153, 2048));
@@ -492,5 +558,43 @@ mod tests {
         submission.history = HistoryPath::build(&leaves, 0).unwrap();
         assert!(submission.history.verify(leaves[0], anchor.history_root));
         assert!(!submission.binds(7, 1153, &anchor));
+    }
+
+    #[test]
+    fn safety_window_reaches_past_eight_chunks_until_the_anchor_age_bound() {
+        use crate::history::{HistoryPath, history_root};
+
+        let mut statement = artifact().statement;
+        statement.kind = SanctionKind::Slash;
+        statement.context.end_height = 128;
+        let mut leaves = alloc::vec![[0; 32]; 40];
+        leaves[0] = commitment(&statement.context);
+        let anchor = EvidenceAnchor {
+            chain_spec_hash: statement.chain_spec_hash,
+            chunk_id: 40,
+            history_root: history_root(&leaves),
+            block_guest_vk_digest: statement.block_guest_vk_digest,
+            safety_evidence_max_age_blocks: 5_000,
+            unbonding_delay_blocks: 6_000,
+            chunk_size: 128,
+            ..EvidenceAnchor::default()
+        };
+        assert!(anchor.is_well_formed());
+        assert_eq!(anchor.safety_history_window_chunks(), 41);
+        let submission = EvidenceSubmission {
+            statement,
+            history: HistoryPath::build(&leaves, 0).unwrap(),
+        };
+        assert_eq!(submission.admissible_age(1024, &anchor), 5_000);
+        // Chunk 0 is 40 chunks behind the anchor, far outside the eight-chunk
+        // liveness window, yet admissible while the safety age bound holds.
+        assert!(submission.binds(7, 5_128, &anchor));
+        assert!(!submission.binds(7, 5_129, &anchor));
+        let mut liveness = submission;
+        liveness.statement.kind = SanctionKind::Inactivity;
+        assert!(!liveness.binds(7, 5_128, &anchor));
+        let mut tight = anchor;
+        tight.unbonding_delay_blocks = 5_128;
+        assert!(!tight.is_well_formed());
     }
 }

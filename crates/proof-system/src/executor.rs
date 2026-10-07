@@ -28,7 +28,7 @@ use neutrino_trie::{Poseidon2Hasher, Trie};
 /// per-gas fee, and the proposer's runtime account address (fee
 /// recipient). Grouping them keeps the trait signature compact and
 /// stable as more consensus context is added later.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockExecutionContext {
     /// Trusted prior consensus context and accepted evidence/block programs.
     pub evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor,
@@ -41,12 +41,15 @@ pub struct BlockExecutionContext {
     pub block_height: u64,
     /// Block-level gas ceiling (`header.gas_limit`).
     pub gas_limit: u64,
-    /// Native-token cost per gas unit. `0` disables fees.
-    pub gas_price: u128,
     /// Runtime account that receives the block's accumulated fees.
     /// The engine sources it from
     /// `active_validator_set[header.proposer_index].withdrawal_credentials`.
     pub proposer_address: Hash,
+    /// Certified precommit participation of the previous chunk, identical for
+    /// every block of a chunk and `None` in chunk zero. The engine resolves it
+    /// from the finalized certificate; the chunk Guest checks the runtime's
+    /// commitment against the chunk boundary.
+    pub participation: Option<neutrino_consensus_types::participation::ParticipationReport>,
 }
 
 /// Outcome of a successful [`BlockExecutor::execute_block`] call.
@@ -144,15 +147,13 @@ pub trait BlockExecutor {
     /// describing whether (and why not) the transaction is
     /// admissible, plus a mempool priority for the `Valid` case.
     ///
-    /// `gas_price` is the chain's current per-gas fee (typically
-    /// surfaced through `ChainSpec`); the runtime uses it to extend
-    /// the balance check to `sender.balance >= tx.amount + tx_gas *
-    /// gas_price`. `gas_price = 0` disables fee admission and
-    /// allows zero-price execution.
+    /// The per-gas fee comes from the runtime policy held in `state`,
+    /// so the balance check covers `tx.amount + tx_gas * gas_price`
+    /// under the policy that will apply to the next block.
     ///
     /// Implementations MUST NOT mutate `state` and MUST NOT depend on
     /// non-deterministic inputs: the same `(tx, state, chain_id,
-    /// block_gas_limit, gas_price)` tuple must always produce the
+    /// block_gas_limit)` tuple must always produce the
     /// same result so peers cannot disagree about admission outcomes.
     ///
     /// # Errors
@@ -166,7 +167,6 @@ pub trait BlockExecutor {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
-        gas_price: u128,
         runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, Self::Error>;
@@ -236,7 +236,6 @@ pub trait ErasedBlockExecutor: Send + Sync {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
-        gas_price: u128,
         runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String>;
@@ -284,7 +283,6 @@ where
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
-        gas_price: u128,
         runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String> {
@@ -293,7 +291,6 @@ where
             tx_bytes,
             chain_id,
             block_gas_limit,
-            gas_price,
             runtime_code_hash,
             state,
         )
@@ -347,7 +344,6 @@ impl BlockExecutor for UnsupportedExecutor {
         _tx_bytes: &[u8],
         _chain_id: u64,
         _block_gas_limit: u64,
-        _gas_price: u128,
         _runtime_code_hash: Hash,
         _state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, Self::Error> {

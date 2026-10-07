@@ -46,11 +46,6 @@ fn expectations(
             artifacts.block,
             ExpectedIdentity::Guest(programs.execution.block),
         ),
-        (artifacts.chunk, ExpectedIdentity::Guest(programs.chunk)),
-        (
-            artifacts.checkpoint,
-            ExpectedIdentity::Guest(programs.checkpoint),
-        ),
     ]
     .into_iter()
     .filter(|(hash, _)| *hash != [0; 32])
@@ -103,8 +98,14 @@ where
             return BTreeMap::new();
         };
         let mut wanted = BTreeMap::new();
-        if let Some(proposal) = &status.proposal {
-            wanted.extend(expectations(&proposal.programs, &proposal.artifacts));
+        if let Some(proposal) = &status.proposal
+            && let neutrino_default_runtime_core::governance::ProposalAction::Programs {
+                programs,
+                artifacts,
+                ..
+            } = &proposal.action
+        {
+            wanted.extend(expectations(programs, artifacts));
         }
         if let Some(scheduled) = &status.scheduled {
             wanted.extend(expectations(&scheduled.programs, &scheduled.artifacts));
@@ -147,8 +148,6 @@ where
                 programs.execution.fact,
                 programs.execution.evidence,
                 programs.execution.block,
-                programs.chunk,
-                programs.checkpoint,
             ] {
                 named.insert(ExpectedIdentity::Guest(digest));
             }

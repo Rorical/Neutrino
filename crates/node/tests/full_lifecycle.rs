@@ -22,9 +22,9 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, DepositTx, GAS_DEPOSIT, GAS_UNSTAKE, GAS_WITHDRAW, Receipt, Transaction,
-    UnstakeTx, ValidatorSet, WithdrawTx, account_key, compute_receipts_root, deposit_sig_message,
-    encode_account, tx_kind_code, unstake_sig_message, withdraw_sig_message,
+    Account, Address, DepositTx, GAS_DEPOSIT, GAS_UNSTAKE, GAS_WITHDRAW, RUNTIME_POLICY_KEY,
+    Receipt, RuntimePolicy, Transaction, UnstakeTx, WithdrawTx, account_key, compute_receipts_root,
+    deposit_sig_message, encode_account, tx_kind_code, unstake_sig_message, withdraw_sig_message,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
@@ -110,6 +110,18 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
     for (addr, acct) in seeds {
         live.insert(&account_key(addr), encode_account(acct));
     }
+    // Genesis seeds the governable policy from the spec. The STF checks it
+    // against the anchor's unbonding delay, so the short delay below needs
+    // the matching short evidence window in state too.
+    let runtime = RuntimeParams {
+        unbonding_delay_blocks: UNBONDING_DELAY_BLOCKS,
+        evidence_max_age_blocks: 2,
+        ..RuntimeParams::default()
+    };
+    live.insert(
+        RUNTIME_POLICY_KEY,
+        borsh::to_vec(&RuntimePolicy::from_params(&runtime)).expect("encode policy"),
+    );
     let state_root = live.state_root();
 
     let vs_root = neutrino_consensus_engine::validator_set_root(&validators());
@@ -143,15 +155,24 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
                 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS,
             ..LightClientParams::default()
         },
-        runtime: RuntimeParams {
-            unbonding_delay_blocks: UNBONDING_DELAY_BLOCKS,
-            evidence_max_age_blocks: 2,
-            ..RuntimeParams::default()
-        },
+        runtime,
         initial_validators: validators(),
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     };
     (spec, live)
+}
+
+/// Header commitment of a candidate record holding `entries` without BLS identities.
+fn candidates_root(entries: &[(Address, u128)]) -> neutrino_primitives::Hash {
+    let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
+    for (address, stake) in entries {
+        candidates.upsert(neutrino_default_runtime_core::ConsensusCandidate {
+            address: *address,
+            stake: *stake,
+            identity: None,
+        });
+    }
+    candidates.root()
 }
 
 fn seeded_backend(seeds: &[(Address, Account)]) -> Arc<LifecycleBackend> {
@@ -270,17 +291,16 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
     }]);
     assert_eq!(h1.receipts_root, expected_receipts);
 
-    // The validator now exists in the runtime-side validator set.
-    let mut expected_set = ValidatorSet::default();
-    expected_set.upsert(validator_addr, 60);
-    assert_eq!(h1.runtime_extra, expected_set.root());
+    // The validator now exists in the consensus candidate record.
+    assert_eq!(h1.runtime_extra, candidates_root(&[(validator_addr, 60)]));
 
     // Slot 2: validator unstakes the full 60 units.
     let unstake = Transaction::Unstake(signed_unstake(&validator, 60, 0));
     let h2 = produce_with_tx(&backend, &proposer, 2, &unstake);
     assert_eq!(h2.gas_used, GAS_UNSTAKE);
-    // Validator set is now empty again.
-    assert_eq!(h2.runtime_extra, ValidatorSet::default().root());
+    // The runtime index drops the validator but the candidate record keeps
+    // an authenticated zero until the withdrawal retires it.
+    assert_eq!(h2.runtime_extra, candidates_root(&[(validator_addr, 0)]));
 
     // Balance still zero; queue carries 60.
     let acct_after_unstake = query_account(&backend, validator_addr);

@@ -13,7 +13,12 @@ fees, evidence windows, queue capacity and unbonding delays. Validator registrat
 and consensus rotation verify possession of registered BLS keys. Registration records
 are keyed per address behind a compact index of live registrations; a validator that
 has fully withdrawn loses its record, index entry and runtime validator entry, and the
-consensus vector drops the exited identity after the retirement delay.
+consensus vector drops the exited identity after the retirement delay. Consensus never
+reads these records directly: the runtime projects every validator it knows into the
+`consensus:candidates` record (address, stake, optional BLS identity), which the chunk
+Guest reads, and the header commits it. In the other direction each block receives the
+previous chunk's certified `ParticipationReport` as an input and records the latest one
+under `consensus:participation`, so reward and liveness economics are runtime rules.
 
 `SubmitEvidence` is admitted through the verified evidence path rather than ordinary
 mempool precheck. The STF authenticates historical openings and records admitted

@@ -34,8 +34,8 @@ impl ErasedBlockExecutor for NativeReplayExecutor {
             chain_id: context.chain_id,
             block_height: context.block_height,
             block_gas_limit: context.gas_limit,
-            gas_price: context.gas_price,
             proposer_address: context.proposer_address,
+            participation: context.participation.clone(),
             transactions: body
                 .transactions
                 .iter()
@@ -71,7 +71,6 @@ impl ErasedBlockExecutor for NativeReplayExecutor {
         _: &[u8],
         _: u64,
         _: u64,
-        _: u128,
         _: neutrino_primitives::Hash,
         _: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, String> {
@@ -125,7 +124,10 @@ impl ProofSystem for NativeConsensusBackend {
     }
 
     fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
-        Some(support::programs([1; 8], [4; 32]).guests())
+        Some(neutrino_consensus_types::history_proof::GuestPrograms {
+            execution: support::programs([1; 8], [4; 32]).execution,
+            consensus: support::consensus_programs(),
+        })
     }
 
     fn block_statement(&self, proof: &Self::BlockProof) -> Result<StfPublicOutput, ProofError> {
@@ -158,7 +160,7 @@ impl ProofSystem for NativeConsensusBackend {
 fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     let (mut witness, _, _) = support::fixture([1; 8], [4; 32]);
     let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let block = &witness.blocks[0];
     let hash = block.header.hash();
     engine
@@ -266,7 +268,7 @@ fn body_authorization_follows_candidate_ancestry_and_checks_the_boundary() {
     witness.chain_spec.consensus.chunk_size = 2;
     witness.chain_spec.proof.slot_budget_per_chunk = 2;
     let mut engine = Engine::genesis(witness.chain_spec, MemoryDatabase::new()).unwrap();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let parent = &witness.blocks[0].header;
     let parent_hash = engine.store_mut().put_header(parent).unwrap();
     engine
@@ -649,7 +651,7 @@ fn restored_bft_finalizes_its_signed_branch_after_the_canonical_head_changes() {
     drop(engine);
 
     let mut restored = Engine::open(input.chain_spec.clone(), database).unwrap();
-    restored.set_programs(support::programs([1; 8], [4; 32]).guests());
+    restored.set_programs(support::guests([1; 8], [4; 32]));
     restored.set_local_voter(voter.clone());
     assert_eq!(restored.head_hash(), sibling_hash);
     assert_eq!(restored.bft_session(0).unwrap().chunk_hash(), signed_hash);
@@ -740,6 +742,17 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     };
     let mut registrations = ValidatorRegistrations::default();
     registrations.insert(address);
+    // Consensus reads only the candidate record the runtime projects from
+    // these records; seed both exactly as the runtime would have left them.
+    let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
+    candidates.upsert(neutrino_default_runtime_core::ConsensusCandidate {
+        address,
+        stake: 100,
+        identity: Some(neutrino_default_runtime_core::BlsIdentity {
+            pubkey: registration.bls_pubkey,
+            pop_signature: registration.pop_signature,
+        }),
+    });
     let mut live = LiveTrie::default();
     live.insert(
         VALIDATOR_SET_KEY,
@@ -752,6 +765,10 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     live.insert(
         &registration_key(&address),
         borsh::to_vec(&registration).unwrap(),
+    );
+    live.insert(
+        neutrino_default_runtime_core::CONSENSUS_CANDIDATES_KEY,
+        borsh::to_vec(&candidates).unwrap(),
     );
     let (mut witness, mut input, _) =
         support::fixture_with_live([1; 8], [4; 32], Vec::new(), 30_000_000, &live);
@@ -776,7 +793,7 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     let mut producer = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
     let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
     for engine in [&mut producer, &mut follower] {
-        engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+        engine.set_programs(support::guests([1; 8], [4; 32]));
         engine.replace_state_with_reconstructed(live.trie().clone());
         engine.flush_trie_to_store().unwrap();
         let block = &witness.blocks[0];
@@ -866,7 +883,12 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     let receipt = producer
         .prove_block(&next_block.block_hash, &backend)
         .unwrap();
-    follower.import_block(&next_block.block).unwrap();
+    // The first block of a later chunk records the previous chunk's
+    // participation, so a follower must execute it to hold the post-state
+    // the chunk witness is built from.
+    follower
+        .import_block_with_dry_run(&next_block.block, &NativeReplayExecutor)
+        .unwrap();
     follower
         .import_block_proof(&receipt.block_proof, &backend)
         .unwrap();
@@ -973,7 +995,7 @@ fn history_preparation_uses_immutable_finalized_boundaries_without_advancing_cov
     use neutrino_consensus_types::history_proof::{ChainBinding, ProofDomain};
     let (mut engine, input) = engine();
     let domain = ProofDomain {
-        chain: ChainBinding::from_spec(&input.chain_spec),
+        chain: ChainBinding::new(&input.chain_spec, support::consensus_programs()),
         programs: support::programs([1; 8], [4; 32]),
     };
     engine.set_history_domain(domain).unwrap();
@@ -1172,7 +1194,7 @@ fn retarget_fixture() -> (
     let mut state = TracingState::new(&live);
     let output = apply_block(&input, &mut state);
     let mut engine = Engine::genesis(spec.clone(), RetargetDatabase::default()).unwrap();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let key = &retarget_keys()[0];
     let mut branch_hashes = Vec::new();
     for slot in 1..=2 {
@@ -1476,7 +1498,7 @@ fn a_locked_validator_switches_only_with_a_signed_leader_and_earlier_higher_quor
     );
     let mut engine =
         Engine::open(engine.chain_spec().clone(), engine.store().db().clone()).unwrap();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     engine.set_local_voter(retarget_keys()[0].clone());
     engine.resume_bft_actions().unwrap();
     assert_eq!(engine.bft_session(0).unwrap().chunk_hash(), second.hash());
@@ -1542,7 +1564,7 @@ fn signed_candidate_transition_crashes_keep_the_retained_lock_and_exact_new_targ
         let mut database = engine.store().db().clone();
         database.fail_durable_after = None;
         let mut restored = Engine::open(engine.chain_spec().clone(), database).unwrap();
-        restored.set_programs(support::programs([1; 8], [4; 32]).guests());
+        restored.set_programs(support::guests([1; 8], [4; 32]));
         restored.set_local_voter(retarget_keys()[0].clone());
         restored.resume_bft_actions().unwrap();
         assert_eq!(
@@ -1601,7 +1623,7 @@ fn initial_proposal_signing_crashes_keep_original_branch_after_fork_choice_chang
         let mut database = engine.store().db().clone();
         database.fail_durable_after = None;
         let mut restored = Engine::open(engine.chain_spec().clone(), database).unwrap();
-        restored.set_programs(support::programs([1; 8], [4; 32]).guests());
+        restored.set_programs(support::guests([1; 8], [4; 32]));
         restored.set_local_voter(voter);
         assert_eq!(restored.head_hash(), second.end_block_hash);
         let prepared = restored.prepare_bft_consensus_chunk(0, &backend).unwrap();

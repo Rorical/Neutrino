@@ -144,15 +144,15 @@ pub const DEFAULT_ACTIVATION_DELAY_EPOCHS: u64 = 2;
 /// quorum weighting. The delay leaves room for slashing windows to
 /// close before stake walks free.
 pub const DEFAULT_EXIT_DELAY_EPOCHS: u64 = 2;
-/// Default weak-subjectivity period in seconds.
+/// Default weak-subjectivity period in seconds: fourteen days.
 ///
 /// A trust anchor must be refreshed before the validators that were
 /// accountable at it can unbond, otherwise exited validators could sign an
 /// alternative history inside the trust window with nothing left to slash.
 /// The period is therefore bounded by the unbonding delay in wall-clock
 /// terms, and the default equals it: `DEFAULT_UNBONDING_DELAY_BLOCKS *
-/// DEFAULT_SLOT_DURATION_SECS`. Production specifications that want a
-/// longer window must lengthen the unbonding delay with it.
+/// DEFAULT_SLOT_DURATION_SECS`. Specifications that want a different window
+/// set the unbonding delay and the period together.
 pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 =
     DEFAULT_UNBONDING_DELAY_BLOCKS * DEFAULT_SLOT_DURATION_SECS;
 /// Default number of chunks to retain lock-violation evidence.
@@ -213,6 +213,8 @@ pub const DOMAIN_HISTORY_LEAF: DomainTag = *b"NEUTRINO_HSTLEAF";
 pub const DOMAIN_HISTORY_NODE: DomainTag = *b"NEUTRINO_HSTNODE";
 /// Counted history root commitment.
 pub const DOMAIN_HISTORY_ROOT: DomainTag = *b"NEUTRINO_HSTROOT";
+/// Certified precommit participation handed from consensus to the runtime.
+pub const DOMAIN_PARTICIPATION: DomainTag = *b"NEUTRINO_PARTICI";
 
 /// Converts an integer into `Q64.64`.
 pub const fn fixed_u128_from_integer(value: u64) -> FixedU128 {
@@ -777,9 +779,14 @@ impl Default for LightClientParams {
 }
 
 /// Default unbonding delay used when a chain spec does not override
-/// `runtime.unbonding_delay_blocks`. Leaves a full evidence window plus
-/// a chunk before funds can become withdrawable.
-pub const DEFAULT_UNBONDING_DELAY_BLOCKS: u64 = 2048;
+/// `runtime.unbonding_delay_blocks`: fourteen days at the default slot duration.
+///
+/// Stake stays slashable for the whole weak-subjectivity window
+/// ([`DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS`] equals this delay in seconds),
+/// and the delay comfortably exceeds the evidence window plus one chunk that
+/// `ChainSpec::validate` requires. Chains with a different slot duration or
+/// trust window set both values together.
+pub const DEFAULT_UNBONDING_DELAY_BLOCKS: u64 = 14 * 24 * 60 * 60 / DEFAULT_SLOT_DURATION_SECS;
 
 /// Default per-occurrence consensus-slash amount.
 ///
@@ -803,12 +810,12 @@ pub const DEFAULT_INACTIVITY_LEAK_AMOUNT: u128 = 1;
 /// Borsh uses one positional wire format; adding or reordering fields is an
 /// incompatible protocol change, with no fallback for previous layouts.
 /// `Default` returns the canonical no-fee, full-stake-slash configuration with
-/// [`DEFAULT_UNBONDING_DELAY_BLOCKS`] (2048 blocks). Chains override individual
+/// [`DEFAULT_UNBONDING_DELAY_BLOCKS`] (fourteen days). Chains override individual
 /// fields through `chain-spec.toml`:
 ///
 /// ```toml
 /// gas_price = "3"
-/// unbonding_delay_blocks = 2048
+/// unbonding_delay_blocks = 302_400   // fourteen days of 4 s slots
 /// slash_amount = "1000000000000000000000"
 /// inactivity_leak_amount = "1000000000"
 /// ```

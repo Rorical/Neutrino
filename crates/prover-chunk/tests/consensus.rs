@@ -24,6 +24,23 @@ fn composes_executed_block_proposer_rotation_and_both_finality_phases() {
     let mut corrupt = input.clone();
     corrupt.post_state.pre_state_root[0] ^= 1;
     assert_eq!(validate_consensus(&corrupt), Err(ConsensusError::Rotation));
+    // A block that reports participation other than what the incoming
+    // boundary certified is not part of this chunk.
+    let mut corrupt = input.clone();
+    corrupt.blocks[0].output.participation[0] ^= 1;
+    assert_eq!(validate_consensus(&corrupt), Err(ConsensusError::Context));
+    // The end boundary commits the report derived from the verified certificate.
+    assert_eq!(
+        statement.end.participation,
+        neutrino_consensus_types::participation::ParticipationReport::from_certificate(
+            0,
+            &input.context.active_validators,
+            &input.finality_cert.precommit.aggregation_bits,
+        )
+        .unwrap()
+        .commitment()
+    );
+    assert_eq!(full.next_context.participation, statement.end.participation);
     let mut corrupt = input;
     corrupt.blocks[0]
         .output
@@ -84,6 +101,8 @@ fn successor(
     block.output.block_height = 2;
     block.output.accountability.anchor.chunk_id = next.context.chunk_id;
     block.output.accountability.anchor.history_root = next.context.history_root;
+    // The successor's blocks report the participation its start boundary certified.
+    block.output.participation = next.context.participation;
     let chunk = as_chunk(&validate_candidate(&next).unwrap().execution.chunk);
     next.finality_cert.chunk_id = 1;
     next.finality_cert.chunk_hash = chunk.hash();
@@ -288,8 +307,6 @@ fn enacted_upgrade_switches_the_end_boundary_at_its_activation_chunk() {
             evidence: [12; 8],
             block: [11; 8],
         },
-        chunk: [17; 8],
-        checkpoint: [18; 8],
     };
     let propose = |activate_at_chunk| {
         let mut tx = ProposeUpgradeTx {

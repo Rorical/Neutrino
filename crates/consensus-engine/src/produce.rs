@@ -226,8 +226,10 @@ impl<DB: Database> Engine<DB> {
             chain_id,
             block_height: height,
             gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address,
+            participation: self
+                .participation_for_height(height)
+                .map_err(ProductionError::Executor)?,
         };
         let ExecutionOutcome {
             state_root_after,

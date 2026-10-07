@@ -54,7 +54,7 @@ impl<DB: Database> Engine<DB> {
             .store()
             .consensus_boundary(count)?
             .ok_or(ProofError::InvalidWitness)?;
-        if !boundary.is_well_formed(&ChainBinding::from_spec(self.chain_spec())) {
+        if !boundary.is_well_formed(&self.chain_binding()) {
             return Err(ProofError::PublicInputMismatch.into());
         }
         Ok(boundary)
@@ -74,7 +74,14 @@ impl<DB: Database> Engine<DB> {
         &mut self,
         domain: ProofDomain,
     ) -> Result<(), FinalizeError<DB::Error>> {
-        if domain.chain != ChainBinding::from_spec(self.chain_spec()) {
+        // The domain's chain must be this specification under consensus
+        // Guests that are complete and, if already pinned, identical.
+        if domain.chain != ChainBinding::new(self.chain_spec(), domain.chain.consensus)
+            || !domain.chain.is_complete()
+            || self
+                .consensus_programs
+                .is_some_and(|pinned| pinned != domain.chain.consensus)
+        {
             return Err(ProofError::PublicInputMismatch.into());
         }
         if !domain.programs.is_complete()
@@ -87,6 +94,7 @@ impl<DB: Database> Engine<DB> {
         let genesis = domain.genesis_boundary(self.chain_spec());
         self.store_mut().set_history_domain(&domain, &genesis)?;
         self.programs = Some(domain.programs);
+        self.consensus_programs = Some(domain.chain.consensus);
         Ok(())
     }
 
@@ -144,7 +152,7 @@ impl<DB: Database> Engine<DB> {
         let proof = verified.into_proof();
         let statement = &proof.statement;
         if statement.chain != domain.chain
-            || statement.chain != ChainBinding::from_spec(self.chain_spec())
+            || statement.chain != self.chain_binding()
             || self.store().history_domain()?.map(|trusted| trusted.chain) != Some(statement.chain)
             || statement.covered_chunks().is_none()
             || self.canonical_boundary(statement.start.next_chunk_id)? != statement.start

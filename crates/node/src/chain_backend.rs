@@ -883,18 +883,17 @@ where
     /// one at startup, but tests that exercise gossip without a
     /// running runtime intentionally leave it unset.
     pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
-        // Capture chain_id + gas_limit + gas_price + state snapshot
+        // Capture chain_id + gas_limit + state snapshot
         // under the engine mutex so the executor sees a consistent
         // view. The mempool itself takes its own lock below;
         // serialising them through one critical section would
         // deadlock with concurrent gossip + production paths.
-        let (chain_id, gas_limit, gas_price, runtime_code_hash, state_snapshot, executor) = {
+        let (chain_id, gas_limit, runtime_code_hash, state_snapshot, executor) = {
             let executor = self.block_executor_snapshot();
             self.with_engine(|e| {
                 (
                     e.chain_spec().chain_id,
                     e.chain_spec().genesis_gas_limit,
-                    e.chain_spec().runtime.gas_price,
                     e.runtime_code_hash_for(e.head_height()).ok(),
                     e.state().clone(),
                     executor,
@@ -915,7 +914,6 @@ where
             &bytes,
             chain_id,
             gas_limit,
-            gas_price,
             runtime_code_hash,
             &state_snapshot,
         ) {
@@ -1602,6 +1600,11 @@ where
             ImportError::HeightMismatch { .. }
             | ImportError::ParentMismatch { .. }
             | ImportError::UnknownBlock(_) => SyncBackendError::ChainBehind(err.to_string()),
+            // The block's chunk context (programs, history root or the previous
+            // chunk's participation) is not finalized here yet: retry later.
+            lagging if lagging.awaits_local_finality() => {
+                SyncBackendError::ChainBehind(lagging.to_string())
+            }
             other => SyncBackendError::Rejected(other.to_string()),
         }
     }

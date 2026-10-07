@@ -68,7 +68,13 @@ fn spec() -> ChainSpec {
 
 fn domain(spec: &ChainSpec) -> ProofDomain {
     ProofDomain {
-        chain: ChainBinding::from_spec(spec),
+        chain: ChainBinding::new(
+            spec,
+            neutrino_consensus_types::history_proof::ConsensusPrograms {
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
+        ),
         programs: neutrino_consensus_types::history_proof::ProgramSet {
             runtime_code_hash: spec.runtime_code_hash,
             execution: ExecutionPrograms {
@@ -76,8 +82,6 @@ fn domain(spec: &ChainSpec) -> ProofDomain {
                 evidence: [2; 8],
                 block: [3; 8],
             },
-            chunk: [4; 8],
-            checkpoint: [5; 8],
         },
     }
 }
@@ -171,6 +175,7 @@ where
         seed: spec.genesis_seed,
         history_root: frontier.root().unwrap(),
         programs: domain(&spec).programs,
+        participation: [id as u8; 32],
     };
     let statement = ConsensusStatement {
         chain: domain(&spec).chain,
@@ -185,6 +190,7 @@ where
     next_context.pre_state_root = end.state_root;
     next_context.parent_slot = end.slot;
     next_context.history_root = end.history_root;
+    next_context.participation = end.participation;
     let state = ConsensusState {
         boundary: statement.end,
         next_context,

@@ -16,10 +16,7 @@ use neutrino_prover_chunk::{
     rotation::rotate_from_witness,
 };
 use neutrino_runtime_abi::StateWitness;
-use neutrino_runtime_core::{
-    StateBackend,
-    host::{LiveTrie, TracingState},
-};
+use neutrino_runtime_core::host::{LiveTrie, TracingState};
 
 /// The program set every fixture context carries for the given block key and runtime.
 pub const fn programs(
@@ -33,6 +30,25 @@ pub const fn programs(
             evidence: [2; 8],
             block: key_digest,
         },
+    }
+}
+
+/// The embedded Guest set a fixture backend reports: the execution Guests of
+/// [`programs`] plus the pinned consensus Guests.
+#[allow(dead_code)] // Used by the engine and node suites that share this module.
+pub const fn guests(
+    key_digest: [u32; 8],
+    runtime_hash: Hash,
+) -> neutrino_consensus_types::history_proof::GuestPrograms {
+    neutrino_consensus_types::history_proof::GuestPrograms {
+        execution: programs(key_digest, runtime_hash).execution,
+        consensus: consensus_programs(),
+    }
+}
+
+/// The chunk and checkpoint identities every fixture pins.
+pub const fn consensus_programs() -> neutrino_consensus_types::history_proof::ConsensusPrograms {
+    neutrino_consensus_types::history_proof::ConsensusPrograms {
         chunk: [7; 8],
         checkpoint: [8; 8],
     }
@@ -118,13 +134,14 @@ pub fn fixture_with_live(
             history_root: neutrino_prover_chunk::history::history_commitment(&[]),
             block_guest_vk_digest: key_digest,
             evidence_guest_vk_digest: [2; 8],
-            policy: spec.runtime,
+            unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+            chunk_size: spec.consensus.chunk_size,
         },
         chain_id: 7,
         block_height: 1,
         block_gas_limit: spec.genesis_gas_limit,
-        gas_price: spec.runtime.gas_price,
         proposer_address: validators[0].withdrawal_credentials,
+        participation: None,
         transactions,
     };
     // Execution witness over the pre-state, then the chunk's rotation witness
@@ -135,9 +152,7 @@ pub fn fixture_with_live(
     let post_live = LiveTrie::from_trie(committed);
     assert_eq!(output.post_state_root, post_live.state_root());
     let mut post_state = TracingState::new(&post_live);
-    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut post_state, &validators) {
-        let _ = post_state.read(&key);
-    }
+    neutrino_prover_chunk::rotation::witness_keys_from(&mut post_state);
     let witness = post_state.into_witness();
     let body = Body {
         transactions: input
@@ -188,7 +203,6 @@ pub fn fixture_with_live(
         block_program: key_digest,
         gas_used: output.gas_used,
         gas_limit: input.block_gas_limit,
-        gas_price: input.gas_price,
         proposer_address: input.proposer_address,
         runtime_extra: output.validator_set_root,
     };
@@ -202,7 +216,7 @@ pub fn fixture_with_live(
         parent_slot: 0,
         vm_code_hash: runtime_hash,
         programs: programs(key_digest, runtime_hash),
-        gas_price: pi.gas_price,
+        participation: neutrino_consensus_types::participation::NO_PARTICIPATION,
         active_validators: validators.clone(),
         history_root: neutrino_prover_chunk::history::history_commitment(&[]),
     };
@@ -287,6 +301,7 @@ pub fn fixture_with_live(
         ConsensusWitness {
             fact_guest_vk_digest: [3; 8],
             evidence_guest_vk_digest: [2; 8],
+            consensus_programs: consensus_programs(),
             chain_spec: spec,
             context,
             seed: [0; 32],

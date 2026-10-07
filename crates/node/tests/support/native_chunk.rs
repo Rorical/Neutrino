@@ -46,8 +46,10 @@ impl ProofSystem for NativeChunkTestSystem {
         execution.fact = [3; 8];
         Some(neutrino_consensus_types::history_proof::GuestPrograms {
             execution,
-            chunk: [7; 8],
-            checkpoint: [8; 8],
+            consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                chunk: [7; 8],
+                checkpoint: [8; 8],
+            },
         })
     }
 
@@ -64,7 +66,9 @@ impl ProofSystem for NativeChunkTestSystem {
         witness: &ConsensusWitness,
     ) -> Result<Self::ChunkProof, ProofError> {
         if proofs.len() != witness.blocks.len()
-            || self.programs() != Some(witness.context.programs.guests())
+            || self.programs().map(|guests| guests.execution)
+                != Some(witness.context.programs.execution)
+            || self.programs().map(|guests| guests.consensus) != Some(witness.consensus_programs)
             || witness.context.programs.execution.block != witness.block_guest_vk_digest
         {
             return Err(ProofError::PublicInputMismatch);

@@ -120,16 +120,9 @@ pub fn load_queue<B: StateBackend>(state: &mut B) -> Vec<PendingSanction> {
 /// obligation and is never inferred from an input boolean.
 #[must_use]
 pub fn validate_input(input: &StfInput) -> ValidatedInput<'_> {
-    let policy = input.evidence_anchor.policy;
     assert!(
-        policy.evidence_max_age_blocks > 0
-            && policy.evidence_admissions_per_block > 0
-            && policy.evidence_executions_per_block > 0
-            && policy.evidence_executions_per_block <= policy.evidence_max_pending
-            && policy.evidence_max_pending <= MAX_PENDING
-            && policy.evidence_admissions_per_block <= policy.evidence_max_pending
-            && policy.evidence_max_age_blocks < policy.unbonding_delay_blocks,
-        "invalid accountability policy"
+        input.evidence_anchor.unbonding_delay_blocks > input.evidence_anchor.chunk_size,
+        "invalid accountability anchor"
     );
     let mut ordinary = false;
     let mut count = 0_u32;
@@ -149,10 +142,7 @@ pub fn validate_input(input: &StfInput) -> ValidatedInput<'_> {
             _ => ordinary = true,
         }
     }
-    assert!(
-        count <= policy.evidence_admissions_per_block,
-        "evidence admission cap"
-    );
+    assert!(count <= MAX_PENDING, "evidence admission cap");
     ValidatedInput { input }
 }
 
@@ -174,23 +164,40 @@ impl ValidatedInput<'_> {
     }
 }
 
-/// Admit all proof-authenticated claims, then execute the mandatory FIFO prefix
-/// before ordinary transactions. Returns reserved gas and autonomous receipts.
-pub(crate) fn apply<B: StateBackend>(
-    checked: &ValidatedInput<'_>,
-    state: &mut B,
-) -> (AccountabilityOutput, u64, Vec<Receipt>) {
-    let input = checked.input();
-    let policy = input.evidence_anchor.policy;
-    let mut queue = load_queue(state);
+/// Load the governed policy and check the block's admissions against it.
+///
+/// The policy is authenticated state; the anchor supplies the genesis-fixed
+/// facts it must respect.
+fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::RuntimePolicy {
+    let policy = crate::load_runtime_policy(state);
     assert!(
-        queue.len() <= policy.evidence_max_pending as usize,
-        "queue bound"
+        policy.is_valid_for(
+            input.evidence_anchor.unbonding_delay_blocks,
+            input.evidence_anchor.chunk_size,
+        ),
+        "invalid accountability policy"
     );
-    let before = commitment(&queue);
-    sweep_expired_markers(state, input.block_height, policy.evidence_max_age_blocks);
+    let mut admissions = 0_u32;
+    for tx in &input.transactions {
+        let Transaction::SubmitEvidence(submission) = tx else {
+            break;
+        };
+        assert!(
+            submission.within_age(input.block_height, policy.evidence_max_age_blocks),
+            "evidence window"
+        );
+        admissions += 1;
+    }
+    assert!(
+        admissions <= policy.evidence_admissions_per_block,
+        "evidence admission cap"
+    );
+    policy
+}
+
+/// Validate every admission and its replay key before any state mutates.
+fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<Sanction> {
     let mut admitted = Vec::new();
-    // Validate every admission and its replay key before mutating any state.
     for tx in &input.transactions {
         let Transaction::SubmitEvidence(submission) = tx else {
             break;
@@ -212,6 +219,25 @@ pub(crate) fn apply<B: StateBackend>(
             kind: claim.kind,
         });
     }
+    admitted
+}
+
+/// Admit all proof-authenticated claims, then execute the mandatory FIFO prefix
+/// before ordinary transactions. Returns reserved gas and autonomous receipts.
+pub(crate) fn apply<B: StateBackend>(
+    checked: &ValidatedInput<'_>,
+    state: &mut B,
+) -> (AccountabilityOutput, u64, Vec<Receipt>) {
+    let input = checked.input();
+    let policy = checked_policy(input, state);
+    let mut queue = load_queue(state);
+    assert!(
+        queue.len() <= policy.evidence_max_pending as usize,
+        "queue bound"
+    );
+    let before = commitment(&queue);
+    sweep_expired_markers(state, input.block_height, policy.evidence_max_age_blocks);
+    let admitted = collect_admissions(input, state);
     let execution_count =
         (queue.len() + admitted.len()).min(policy.evidence_executions_per_block as usize);
     // Existing obligations always have budget, even if the body is empty.
@@ -351,14 +377,21 @@ pub(crate) mod tests {
         })
     }
 
+    /// Governable policy lives in state; seed the test trie with a variant.
+    fn seed_policy(live: &mut LiveTrie, mutate: impl FnOnce(&mut crate::RuntimePolicy)) {
+        let mut policy = crate::RuntimePolicy::default();
+        mutate(&mut policy);
+        live.insert(crate::RUNTIME_POLICY_KEY, borsh::to_vec(&policy).unwrap());
+    }
+
     fn input() -> StfInput {
         StfInput {
             evidence_anchor: EvidenceAnchor::default(),
             chain_id: 7,
             block_height: 2,
             block_gas_limit: 1_000_000,
-            gas_price: 0,
             proposer_address: [0; 32],
+            participation: None,
             transactions: Vec::new(),
         }
     }
@@ -383,13 +416,15 @@ pub(crate) mod tests {
     #[test]
     fn fifo_holds_withdrawals_and_executes_without_new_transactions() {
         let mut input = input();
-        input.evidence_anchor.policy.evidence_executions_per_block = 1;
-        input.evidence_anchor.policy.slash_amount = 30;
         input.transactions = vec![
             admission(&mut input, 1, [1; 32], SanctionKind::Slash),
             admission(&mut input, 2, [2; 32], SanctionKind::Slash),
         ];
         let mut live = LiveTrie::default();
+        seed_policy(&mut live, |policy| {
+            policy.evidence_executions_per_block = 1;
+            policy.slash_amount = 30;
+        });
         for id in [1, 2] {
             live.insert(
                 &crate::validator_key(&[id; 32]),
@@ -423,9 +458,9 @@ pub(crate) mod tests {
     #[test]
     fn offence_marker_is_swept_once_its_admission_window_closes() {
         let mut input = input();
-        input.evidence_anchor.policy.evidence_max_age_blocks = 5;
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let mut live = LiveTrie::default();
+        seed_policy(&mut live, |policy| policy.evidence_max_age_blocks = 5);
         live.insert(
             &crate::validator_key(&[1; 32]),
             crate::encode_validator(&crate::Validator {
@@ -480,14 +515,16 @@ pub(crate) mod tests {
             .sign(&crate::withdraw_sig_message(7, &withdraw))
             .to_bytes();
         let mut input = input();
-        input.evidence_anchor.policy.evidence_executions_per_block = 1;
-        input.evidence_anchor.policy.slash_amount = 30;
         input.transactions = vec![
             admission(&mut input, 1, [1; 32], SanctionKind::Slash),
             admission(&mut input, 2, address, SanctionKind::Slash),
             Transaction::Withdraw(withdraw.clone()),
         ];
         let mut live = LiveTrie::default();
+        seed_policy(&mut live, |policy| {
+            policy.evidence_executions_per_block = 1;
+            policy.slash_amount = 30;
+        });
         live.insert(
             &crate::withdrawal_key(&address),
             borsh::to_vec(&crate::WithdrawalQueue {

@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{Hash, RuntimeParams, Validator, blake3_256, merkle_root_of_hashes};
+use neutrino_primitives::{Hash, Validator, blake3_256, merkle_root_of_hashes};
 
 /// Maximum encoded SP1 evidence receipt accepted from the network.
 pub const MAX_EVIDENCE_PROOF_BYTES: usize = 2 * 1024 * 1024;
@@ -210,7 +210,7 @@ impl EvidenceArtifact {
 }
 
 /// Incoming block authorization context. The chunk authenticates every field.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct EvidenceAnchor {
     /// Trusted early cryptographic-fact program.
     pub fact_guest_vk_digest: [u32; 8],
@@ -224,8 +224,29 @@ pub struct EvidenceAnchor {
     pub block_guest_vk_digest: [u32; 8],
     /// Trusted evidence program for recursive receipt verification.
     pub evidence_guest_vk_digest: [u32; 8],
-    /// Runtime monetary, window and queue policy, bound by the chain spec.
-    pub policy: RuntimeParams,
+    /// Genesis-fixed unbonding delay in blocks. Withdrawal maturity and the
+    /// upper bound of every governable evidence window derive from it.
+    pub unbonding_delay_blocks: u64,
+    /// Genesis-fixed blocks per chunk, needed to bound evidence windows.
+    pub chunk_size: u64,
+}
+
+impl Default for EvidenceAnchor {
+    /// Zero program and history identities with the canonical consensus
+    /// facts, so a default anchor is a usable test input while the STF keeps
+    /// asserting the real invariants.
+    fn default() -> Self {
+        Self {
+            fact_guest_vk_digest: [0; 8],
+            chain_spec_hash: [0; 32],
+            chunk_id: 0,
+            history_root: [0; 32],
+            block_guest_vk_digest: [0; 8],
+            evidence_guest_vk_digest: [0; 8],
+            unbonding_delay_blocks: neutrino_primitives::DEFAULT_UNBONDING_DELAY_BLOCKS,
+            chunk_size: neutrino_primitives::DEFAULT_CHUNK_SIZE,
+        }
+    }
 }
 
 /// Canonical Borsh commitment used by evidence statements and context leaves.
@@ -324,7 +345,14 @@ impl EvidenceSubmission {
                 .history
                 .verify(commitment(&statement.context), anchor.history_root)
             && statement.context.end_height < height
-            && height - statement.context.end_height <= anchor.policy.evidence_max_age_blocks
+    }
+
+    /// `true` while the offence is still admissible under the runtime's
+    /// governable evidence window, read from state by the caller.
+    #[must_use]
+    pub const fn within_age(&self, height: u64, evidence_max_age_blocks: u64) -> bool {
+        let end = self.statement.context.end_height;
+        end < height && height - end <= evidence_max_age_blocks
     }
 }
 
@@ -446,7 +474,6 @@ mod tests {
             chunk_id: 8,
             history_root: history_root(&leaves),
             block_guest_vk_digest: statement.block_guest_vk_digest,
-            policy: RuntimeParams::default(),
             ..EvidenceAnchor::default()
         };
         let mut submission = EvidenceSubmission {
@@ -454,13 +481,14 @@ mod tests {
             history: HistoryPath::build(&leaves, 0).unwrap(),
         };
         assert!(submission.binds(7, 1025, &anchor));
-        assert!(submission.binds(7, 1152, &anchor));
-        assert!(!submission.binds(7, 1153, &anchor));
+        assert!(submission.binds(7, 1153, &anchor));
+        assert!(submission.within_age(1152, 1024));
+        assert!(!submission.within_age(1153, 1024));
+        assert!(submission.within_age(1153, 2048));
 
         leaves.push([1; 32]);
         anchor.chunk_id = 9;
         anchor.history_root = history_root(&leaves);
-        anchor.policy.evidence_max_age_blocks = 2048;
         submission.history = HistoryPath::build(&leaves, 0).unwrap();
         assert!(submission.history.verify(leaves[0], anchor.history_root));
         assert!(!submission.binds(7, 1153, &anchor));

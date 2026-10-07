@@ -24,10 +24,7 @@ use neutrino_prover_chunk::{
     execution::commitment,
     history::{HistoricalChunk, history_commitment},
 };
-use neutrino_runtime_core::{
-    StateBackend,
-    host::{LiveTrie, TracingState},
-};
+use neutrino_runtime_core::host::{LiveTrie, TracingState};
 use neutrino_runtime_host::{
     Sp1BlockProof, Sp1ProofSystem, proof_system::Sp1ChunkProof, wasm::WasmRuntime,
 };
@@ -330,6 +327,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         .programs()
         .unwrap()
         .with_runtime(neutrino_runtime_host::default_runtime_code_hash());
+    first.consensus_programs = system.programs().unwrap().consensus;
     first.evidence_guest_vk_digest = first.context.programs.execution.evidence;
     first.fact_guest_vk_digest = first.context.programs.execution.fact;
     input.evidence_anchor.fact_guest_vk_digest = first.fact_guest_vk_digest;
@@ -375,7 +373,8 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
             .verify_evidence(&corrupt, &batch, &first.evidence_guest_vk_digest)
             .is_err()
     );
-    let input = submission_input(&first, input);
+    let mut input = submission_input(&first, input);
+    input.participation = participation_of(&first);
     let attachments = vec![EvidenceArtifact {
         evidence_guest_vk_digest: first.evidence_guest_vk_digest,
         membership: EvidenceMembership::build(
@@ -442,8 +441,8 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         chain_id: input.chain_id,
         block_height: input.block_height,
         gas_limit: input.block_gas_limit,
-        gas_price: input.gas_price,
         proposer_address: input.proposer_address,
+        participation: input.participation.clone(),
     };
     let mut state = live.trie().clone();
     let produced =
@@ -606,6 +605,17 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         .unwrap();
 }
 
+/// The report every block of the chunk after `first` hands to the runtime.
+fn participation_of(
+    first: &ConsensusWitness,
+) -> Option<neutrino_consensus_types::participation::ParticipationReport> {
+    neutrino_consensus_types::participation::ParticipationReport::from_certificate(
+        first.context.chunk_id,
+        &first.context.active_validators,
+        &first.finality_cert.precommit.aggregation_bits,
+    )
+}
+
 #[allow(clippy::too_many_lines)] // Full signed successor fixture shared by native and real-proof gates.
 fn successor_fixture(
     first: &ConsensusWitness,
@@ -671,12 +681,7 @@ fn successor_fixture(
     let (post, _) = state.into_committed_and_witness();
     let post = LiveTrie::from_trie(post);
     let mut trace = TracingState::new(&post);
-    for key in neutrino_prover_chunk::rotation::witness_keys_from(
-        &mut trace,
-        &next.context.active_validators,
-    ) {
-        let _ = trace.read(&key);
-    }
+    neutrino_prover_chunk::rotation::witness_keys_from(&mut trace);
     next.post_state = trace.into_witness();
     let chunk = as_chunk(&validate_candidate(&next).unwrap().execution.chunk);
     next.finality_cert.chunk_id = 1;
@@ -746,7 +751,8 @@ fn block_proven_sanction_changes_consensus_without_rechecking_raw_evidence() {
         borsh::to_vec(&set).unwrap(),
     );
     let (first, input, _) = support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, &live);
-    let input = submission_input(&first, input);
+    let mut input = submission_input(&first, input);
+    input.participation = participation_of(&first);
     let mut trace = TracingState::new(&live);
     let output = neutrino_default_runtime_core::apply_block(&input, &mut trace);
     assert_eq!(output.accountability.executed.len(), 1);

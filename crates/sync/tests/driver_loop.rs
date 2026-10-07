@@ -1054,7 +1054,6 @@ fn sample_block_proof(height: Height) -> BlockProof {
             block_program: [0; 8],
             gas_used: 0,
             gas_limit: 1_000_000,
-            gas_price: 0,
             proposer_address: [0u8; 32],
             runtime_extra: ZERO_HASH,
         },
@@ -1825,6 +1824,7 @@ fn sample_history_proof() -> HistoryProof {
         ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryStatement, ProgramSet,
     };
     let start = ConsensusBoundary {
+        participation: [0; 32],
         next_chunk_id: 1,
         height: 2,
         block_hash: [1; 32],
@@ -1840,8 +1840,6 @@ fn sample_history_proof() -> HistoryProof {
                 evidence: [2; 8],
                 block: [3; 8],
             },
-            chunk: [4; 8],
-            checkpoint: [5; 8],
         },
     };
     HistoryProof {
@@ -1850,7 +1848,10 @@ fn sample_history_proof() -> HistoryProof {
                 chain_id: 1,
                 chain_spec_hash: [0; 32],
                 chunk_size: 2,
-                gas_price: 0,
+                consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                    chunk: [4; 8],
+                    checkpoint: [5; 8],
+                },
             },
             start,
             end: ConsensusBoundary {

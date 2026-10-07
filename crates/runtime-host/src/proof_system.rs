@@ -5,7 +5,7 @@
 //! persisted input, state witness and evidence attachments the producer hands off,
 //! pre-validates every cross-checked field of
 //! [`BlockProofPublicInputs`] (`chain_id`, `height`, `block_gas_limit`,
-//! `gas_price`, `proposer_address`, `pre_state_root`) against the SP1
+//! `proposer_address`, `pre_state_root`) against the SP1
 //! input, drives the configured SP1 CPU/CUDA prover (mock in tests),
 //! and cross-checks the committed [`StfPublicOutput`]
 //! (`pre_state_root`, `post_state_root`, `gas_used`, `receipts_root`)
@@ -157,8 +157,10 @@ where
                     evidence,
                     block,
                 },
-                chunk,
-                checkpoint,
+                consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                    chunk,
+                    checkpoint,
+                },
             },
             programs: SharedRegistry::new(registry),
             facts: Mutex::new(BTreeMap::new()),
@@ -439,13 +441,6 @@ where
         if input.block_height != public_inputs.height {
             return Err(ProofError::PublicInputMismatch);
         }
-        // Bind the STF input's fee parameters to the consensus
-        // header. A prover that diverged from the chain spec's
-        // configured `gas_price` could otherwise redirect fees
-        // away from the proposer or skip them entirely.
-        if input.gas_price != public_inputs.gas_price {
-            return Err(ProofError::PublicInputMismatch);
-        }
         if input.proposer_address != public_inputs.proposer_address {
             return Err(ProofError::PublicInputMismatch);
         }
@@ -510,9 +505,6 @@ where
             return Err(ProofError::PublicInputMismatch);
         }
         if committed.block_gas_limit != public_inputs.gas_limit {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.gas_price != public_inputs.gas_price {
             return Err(ProofError::PublicInputMismatch);
         }
         if committed.proposer_address != public_inputs.proposer_address {
@@ -636,7 +628,6 @@ where
             || output.chain_id != inputs.chain_id
             || output.block_height != inputs.height
             || output.block_gas_limit != inputs.gas_limit
-            || output.gas_price != inputs.gas_price
             || output.proposer_address != inputs.proposer_address
             || output.transactions_root != inputs.transactions_root
         {
@@ -718,19 +709,26 @@ where
         witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
     ) -> Result<Sp1ChunkProof, ProofError> {
         let programs = witness.context.programs;
+        // The consensus Guests are pinned for the chain: this backend proves
+        // only under the pair it embeds, which the witness must name.
         if witness.fact_guest_vk_digest != programs.execution.fact
             || witness.block_guest_vk_digest != programs.execution.block
             || witness.evidence_guest_vk_digest != programs.execution.evidence
+            || witness.consensus_programs != self.embedded.consensus
             || block_proofs.len() != witness.blocks.len()
         {
             return Err(ProofError::PublicInputMismatch);
         }
-        if !self.holds(&programs.guests()) {
+        let guests = GuestPrograms {
+            execution: programs.execution,
+            consensus: self.embedded.consensus,
+        };
+        if !self.holds(&guests) {
             return Err(ProofError::Unsupported);
         }
         let block_keys = self.keys(&programs.execution.block)?;
         let fact_keys = self.keys(&programs.execution.fact)?;
-        let chunk_keys = self.keys(&programs.chunk)?;
+        let chunk_keys = self.keys(&self.embedded.consensus.chunk)?;
         if !witness.facts.is_empty() {
             // The host owns receipt selection; callers hand over bare witnesses.
             return Err(ProofError::InvalidWitness);
@@ -796,11 +794,12 @@ where
         if committed != *expected || !matches!(bundle.proof, SP1Proof::Compressed(_)) {
             return Err(ProofError::PublicInputMismatch);
         }
-        // The receipt is verified under the chunk program of the caller's
-        // trusted start boundary, never one the peer's statement selects. An
-        // installed program verifies with the full key; any other program set
-        // is checked by digest, which never accepts mock receipts (design 24).
-        if let Ok(chunk) = self.keys(&expected.start.programs.chunk) {
+        // The receipt is verified under the chunk program pinned in the
+        // caller's trusted chain binding, never one the peer's statement
+        // selects. An installed program verifies with the full key; any other
+        // identity is checked by digest, which never accepts mock receipts.
+        let chunk_program = expected.chain.consensus.chunk;
+        if let Ok(chunk) = self.keys(&chunk_program) {
             return self
                 .prover
                 .verify(&bundle, &chunk.vk, None)
@@ -811,7 +810,7 @@ where
             bundle.public_values.as_slice(),
             &bundle.sp1_version,
             expected,
-            &expected.start.programs.chunk,
+            &chunk_program,
         )
         .map_err(|_| ProofError::BackendRejected)
     }

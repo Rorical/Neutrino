@@ -36,22 +36,27 @@ no consensus vote and does not gate Chunk finality.
 
 The authoritative Borsh types are in
 [`consensus-types::history_proof`](../../crates/consensus-types/src/history_proof.rs).
-`ChainBinding` binds chain ID, chain-spec hash, chunk size and gas price; it is
-immutable for the life of a chain. Program identities travel in every boundary as a
-`ProgramSet` (runtime code hash plus Fact, Evidence, Block, Chunk and checkpoint VK
-digests), so a chain can switch programs at a chunk boundary without changing its
-binding; see [24 — Runtime and program upgrades](24-runtime-upgrades.md).
+`ChainBinding` binds chain ID, chain-spec hash, chunk size and the pinned chunk and
+checkpoint Guest identities; it is immutable for the life of a chain, so changing a
+consensus Guest is a hard fork. Execution program identities travel in every boundary
+as a `ProgramSet` (runtime code hash plus Fact, Evidence and Block VK digests), so a
+chain can switch execution programs at a chunk boundary without changing its binding;
+see [24 — Runtime and program upgrades](24-runtime-upgrades.md).
 `ProofDomain { chain, programs }` is the verifier's trust profile: the chain binding and
-the program set it trusts at its anchor. The outer verifier derives the genesis program
-set from its own embedded programs and verifies every receipt under the program set of
-the receipt's start boundary, which it has already authenticated.
+the execution program set it trusts at its anchor. The outer verifier derives the
+genesis program set and the binding from its own embedded programs, verifies block
+receipts under the program set of the receipt's start boundary, which it has already
+authenticated, and chunk and history receipts under the binding's consensus Guests.
 There is one incompatible current format, with no version suffixes or fallback decoders.
 
 `ConsensusBoundary` is the state immediately before the next chunk and contains:
 
 - `next_chunk_id`, block height, block hash, state root and slot;
 - validator-set root, seed and history root;
-- the `ProgramSet` in force from this boundary on.
+- the `ProgramSet` in force from this boundary on;
+- the commitment of the `ParticipationReport` derived from the certificate that
+  finalized the chunk ending here, which every block of the next chunk hands to the
+  runtime (zero at genesis).
 
 `ConsensusStatement` contains the chain binding, compact start and end boundaries,
 canonical Chunk public inputs and finality-certificate hash. Its blocks are verified
@@ -78,13 +83,12 @@ including the empty history root and the genesis program set.
 
 The checkpoint Guest invokes SP1's recursive verifier for each child in exact
 order and commits the derived History statement. Every child is verified under the
-program named by its own start boundary: a previous or left History receipt under
-`start.programs.checkpoint`, a Chunk receipt under `start.programs.chunk`, and the
-right side of a Merge under `right.start.programs.checkpoint`, which equals the
-left side's proven end. No key is embedded circularly in any ELF and no receipt
-selects the key it is checked against. The outer verifier checks the output under
-the checkpoint program of its trusted start boundary, so a receipt for a range that
-starts at genesis is always the work of the genesis checkpoint Guest.
+consensus Guests pinned in the chain binding every child must share: a previous or
+left History receipt and both sides of a Merge under `chain.consensus.checkpoint`,
+a Chunk receipt under `chain.consensus.chunk`. No key is embedded circularly in any
+ELF (a Guest cannot know its own identity) and no receipt selects the key it is
+checked against: the binding is an input the outer verifier compares with the one
+it derives from its own embedded programs and chain specification.
 
 The host requires `SP1Proof::Compressed`, verifies child receipts with the real
 local verifier and compares exact public-value bytes. A mock SP1 receipt cannot

@@ -29,10 +29,7 @@ use neutrino_prover_chunk::{
     execution::commitment,
     history::{HistoricalChunk, HistoricalOpening},
 };
-use neutrino_runtime_core::{
-    StateBackend,
-    host::{LiveTrie, TracingState},
-};
+use neutrino_runtime_core::host::{LiveTrie, TracingState};
 use neutrino_storage::{Batch, BatchOp, Column, ColumnSnapshot, Database, MemoryDatabase};
 use neutrino_sync::{StateProgress, SyncBackend};
 use neutrino_trie::Trie;
@@ -53,13 +50,13 @@ impl ProofSystem for NativeHistory {
 
     fn history_domain(&self, spec: &ChainSpec) -> Result<ProofDomain, ProofError> {
         Ok(ProofDomain {
-            chain: ChainBinding::from_spec(spec),
+            chain: ChainBinding::new(spec, support::consensus_programs()),
             programs: support::programs([1; 8], [4; 32]),
         })
     }
 
     fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
-        Some(support::programs([1; 8], [4; 32]).guests())
+        Some(support::guests([1; 8], [4; 32]))
     }
 
     fn verify_history(
@@ -114,12 +111,7 @@ impl Fixture {
         witness.context.chain_spec_hash = spec_hash;
         input.evidence_anchor.chain_spec_hash = spec_hash;
         let mut traced = TracingState::new(&live);
-        for key in neutrino_prover_chunk::rotation::witness_keys_from(
-            &mut traced,
-            &witness.context.active_validators,
-        ) {
-            let _ = traced.read(&key);
-        }
+        neutrino_prover_chunk::rotation::witness_keys_from(&mut traced);
         witness.blocks[0].output = apply_block(&input, &mut traced);
         witness.post_state = traced.into_witness();
         witness.blocks[0].header.timestamp =

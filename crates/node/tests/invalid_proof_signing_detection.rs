@@ -144,7 +144,6 @@ fn bad_mock_proof(block: &Block) -> BlockProof {
         block_program: [0; 8],
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
-        gas_price: 0,
         proposer_address: [0x44; 32],
         runtime_extra: block.header.runtime_extra,
     };
@@ -181,7 +180,6 @@ fn good_mock_proof(block: &Block) -> BlockProof {
         block_program: [0; 8],
         gas_used: block.header.gas_used,
         gas_limit: block.header.gas_limit,
-        gas_price: 0,
         proposer_address: [0x44; 32],
         runtime_extra: block.header.runtime_extra,
     };

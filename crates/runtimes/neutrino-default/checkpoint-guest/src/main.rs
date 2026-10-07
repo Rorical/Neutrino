@@ -22,25 +22,27 @@ fn main() {
     );
     let input: CheckpointInput = borsh::from_slice(&bytes).expect("canonical checkpoint input");
     let output = neutrino_prover_checkpoint::validate(&input).expect("valid history composition");
-    // Program identities are inputs committed through the boundaries, never
-    // constants of this program. Every receipt is verified under the program
-    // named by its START boundary: the output start is the verifier's trusted
-    // anchor, each child's start equals an already-proven boundary, so no
-    // receipt ever selects the key it is checked against (design 24).
+    // The chunk and checkpoint identities are pinned in the chain binding,
+    // which is an input committed through the output statement, never a
+    // constant of this program: a Guest cannot know its own key. Validation
+    // already required every child to carry the same binding, so each receipt
+    // is verified under the identity the verifier's own trust profile names,
+    // and no receipt ever selects the key it is checked against (design 24).
+    let chain = output.chain.consensus;
     match &input {
         CheckpointInput::Fold {
             previous, chunks, ..
         } => {
             if let Some(previous) = previous {
-                verify(previous, &previous.start.programs.checkpoint);
+                verify(previous, &chain.checkpoint);
             }
             for chunk in chunks.iter() {
-                verify(chunk, &chunk.start.programs.chunk);
+                verify(chunk, &chain.chunk);
             }
         }
         CheckpointInput::Merge { left, right } => {
-            verify(left, &left.start.programs.checkpoint);
-            verify(right, &right.start.programs.checkpoint);
+            verify(left, &chain.checkpoint);
+            verify(right, &chain.checkpoint);
         }
     }
     sp1_zkvm::io::commit_slice(&borsh::to_vec(&output).expect("canonical history statement"));

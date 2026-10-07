@@ -251,8 +251,8 @@ impl BlockExecutor for WasmExecutor {
             chain_id: ctx.chain_id,
             block_height: ctx.block_height,
             block_gas_limit: ctx.gas_limit,
-            gas_price: ctx.gas_price,
             proposer_address: ctx.proposer_address,
+            participation: ctx.participation.clone(),
             transactions: txs,
         };
 
@@ -307,7 +307,6 @@ impl BlockExecutor for WasmExecutor {
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
-        gas_price: u128,
         runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, ExecutorError> {
@@ -316,7 +315,6 @@ impl BlockExecutor for WasmExecutor {
             tx_bytes,
             chain_id,
             block_gas_limit,
-            gas_price,
             &live,
         )?)
     }

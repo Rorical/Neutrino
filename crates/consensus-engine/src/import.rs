@@ -40,7 +40,14 @@ use crate::store::StoreError;
 pub const MAX_HEADER_TIMESTAMP_DRIFT_SECS: u64 = 60;
 
 /// Dry-run failure text when a block's program set cannot be resolved.
-pub(crate) const PROGRAMS_UNAVAILABLE: &str = "program set of the block's chunk is unavailable";
+/// The program set of the block's chunk cannot be derived yet.
+pub const PROGRAMS_UNAVAILABLE: &str = "program set of the block's chunk is unavailable";
+/// The previous chunk's certificate, which every block of this chunk reports
+/// to the runtime, is not finalized locally yet.
+pub const PARTICIPATION_UNAVAILABLE: &str =
+    "participation report of the block's chunk is unavailable";
+/// The history root of the block's chunk is not finalized locally yet.
+pub const HISTORY_UNAVAILABLE: &str = "unavailable historical boundary";
 
 /// Successful outcome of [`Engine::import_block`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +228,22 @@ pub enum ImportError<E> {
     },
     /// Underlying chain store / database error.
     Store(StoreError<E>),
+}
+
+impl<E> ImportError<E> {
+    /// `true` when the block could not be checked only because this node has
+    /// not finalized the chunk its execution context depends on. The block is
+    /// not known to be invalid; import it again after catching up.
+    #[must_use]
+    pub fn awaits_local_finality(&self) -> bool {
+        matches!(
+            self,
+            Self::DryRunFailed(reason)
+                if reason == PROGRAMS_UNAVAILABLE
+                    || reason == PARTICIPATION_UNAVAILABLE
+                    || reason == HISTORY_UNAVAILABLE
+        )
+    }
 }
 
 impl<E> From<StoreError<E>> for ImportError<E> {
@@ -716,8 +739,10 @@ impl<DB: Database> Engine<DB> {
             chain_id: self.chain_spec().chain_id,
             block_height: block.header.height,
             gas_limit: block.header.gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address,
+            participation: self
+                .participation_for_height(block.header.height)
+                .map_err(ImportError::DryRunFailed)?,
         };
 
         // Snapshot the engine's state trie into a scratch buffer.
@@ -807,8 +832,10 @@ impl<DB: Database> Engine<DB> {
             chain_id: self.chain_spec().chain_id,
             block_height: block.header.height,
             gas_limit: block.header.gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address,
+            participation: self
+                .participation_for_height(block.header.height)
+                .map_err(ImportError::DryRunFailed)?,
         };
 
         // Content-addressed storage: loading every persisted node /
@@ -986,8 +1013,10 @@ impl<DB: Database> Engine<DB> {
                 chain_id: self.chain_spec().chain_id,
                 block_height: header.height,
                 gas_limit: header.gas_limit,
-                gas_price: self.chain_spec().runtime.gas_price,
                 proposer_address,
+                participation: self
+                    .participation_for_height(header.height)
+                    .map_err(ImportError::DryRunFailed)?,
             };
 
             let ExecutionOutcome {
@@ -1410,7 +1439,6 @@ impl<DB: Database> Engine<DB> {
             block_program: programs.execution.block,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: self.proposer_runtime_address_for_import(header.proposer_index),
             runtime_extra: header.runtime_extra,
         })

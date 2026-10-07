@@ -7,7 +7,10 @@
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use neutrino_consensus_types::history_proof::ConsensusStatement;
-use neutrino_consensus_types::history_proof::{ChainBinding, ConsensusBoundary, ProgramSet};
+use neutrino_consensus_types::history_proof::{
+    ChainBinding, ConsensusBoundary, ConsensusPrograms, ProgramSet,
+};
+use neutrino_consensus_types::participation::{NO_PARTICIPATION, ParticipationReport};
 use neutrino_consensus_types::{Body, Chunk, ChunkProofPublicInputs};
 use neutrino_primitives::{ChainSpec, Hash, Seed, merkle_root_of_hashes};
 use neutrino_runtime_abi::StateWitness;
@@ -30,6 +33,10 @@ pub struct ConsensusWitness {
     pub fact_guest_vk_digest: [u32; 8],
     /// Independent evidence guest pinned by the outer verifier.
     pub evidence_guest_vk_digest: [u32; 8],
+    /// The chunk and checkpoint Guests pinned for the chain. A Guest cannot
+    /// know its own identity, so the verifier supplies both and checks the
+    /// committed binding against its own trust profile.
+    pub consensus_programs: ConsensusPrograms,
     /// Trusted chain configuration, committed by the execution context.
     pub chain_spec: ChainSpec,
     /// Incoming context. Its commitment must be checked by the verifier.
@@ -76,7 +83,7 @@ pub fn genesis_context(spec: &ChainSpec, programs: ProgramSet) -> ExecutionConte
         parent_slot: 0,
         vm_code_hash: programs.runtime_code_hash,
         programs,
-        gas_price: spec.runtime.gas_price,
+        participation: NO_PARTICIPATION,
         active_validators: spec.initial_validators.clone(),
         history_root: neutrino_consensus_types::history::empty_history_root(),
     }
@@ -108,6 +115,7 @@ fn boundary_with_validators(
         seed,
         history_root: context.history_root,
         programs: context.programs,
+        participation: context.participation,
     })
 }
 
@@ -204,6 +212,15 @@ pub fn validate_consensus_using(
         verifier,
     )
     .map_err(|_| ConsensusError::Finality)?;
+    // The certificate just verified is what the next chunk's blocks report to
+    // the runtime; its commitment travels in the end boundary.
+    let participation = ParticipationReport::from_certificate(
+        chunk.chunk_id,
+        &context.active_validators,
+        &input.finality_cert.precommit.aggregation_bits,
+    )
+    .ok_or(ConsensusError::Finality)?
+    .commitment();
     let vrfs: Vec<_> = input
         .blocks
         .iter()
@@ -249,7 +266,7 @@ pub fn validate_consensus_using(
         chunk_size: context.chunk_size,
         vm_code_hash: next_programs.runtime_code_hash,
         programs: next_programs,
-        gas_price: context.gas_price,
+        participation,
     };
     let start = boundary_with_validators(
         context,
@@ -263,7 +280,7 @@ pub fn validate_consensus_using(
     )?;
     Ok(ValidatedConsensus {
         statement: ConsensusStatement {
-            chain: ChainBinding::from_spec(spec),
+            chain: ChainBinding::new(spec, input.consensus_programs),
             start,
             end,
             chunk: execution.chunk,
@@ -336,10 +353,15 @@ fn validate_candidate_using(
         history_root: context.history_root,
         block_guest_vk_digest: input.block_guest_vk_digest,
         evidence_guest_vk_digest: input.evidence_guest_vk_digest,
-        policy: spec.runtime,
+        unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+        chunk_size: context.chunk_size,
     };
     for (block, body) in input.blocks.iter().zip(&input.bodies) {
-        if block.output.accountability.anchor != expected_anchor {
+        // Every block consumed exactly the participation report the incoming
+        // boundary certified, and the anchor the boundary authenticates.
+        if block.output.accountability.anchor != expected_anchor
+            || block.output.participation != context.participation
+        {
             return Err(ConsensusError::Context);
         }
         for vote in &body.finality_votes {
@@ -387,8 +409,8 @@ fn validate_context(input: &ConsensusWitness) -> Result<(), ConsensusError> {
     if context.chain_spec_hash != spec.hash()
         || context.chain_id != spec.chain_id
         || context.chunk_size != spec.consensus.chunk_size
-        || context.gas_price != spec.runtime.gas_price
         || !context.programs.is_complete()
+        || !input.consensus_programs.is_complete()
         || context.vm_code_hash != context.programs.runtime_code_hash
         || input.fact_guest_vk_digest != context.programs.execution.fact
         || input.evidence_guest_vk_digest != context.programs.execution.evidence
@@ -427,7 +449,7 @@ pub fn validate_successor(
     input: &ConsensusWitness,
 ) -> Result<ConsensusStatement, ConsensusError> {
     if context_boundary(&input.context, input.seed)? != previous.end
-        || ChainBinding::from_spec(&input.chain_spec) != previous.chain
+        || ChainBinding::new(&input.chain_spec, input.consensus_programs) != previous.chain
     {
         return Err(ConsensusError::Context);
     }

@@ -924,7 +924,10 @@ mod tests {
                 chain_id: 7,
                 chain_spec_hash: h(1),
                 chunk_size: 128,
-                gas_price: 0,
+                consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                    chunk: [4; 8],
+                    checkpoint: [5; 8],
+                },
             },
             boundary: ConsensusBoundary {
                 programs: ProgramSet {
@@ -934,9 +937,8 @@ mod tests {
                         evidence: [2; 8],
                         block: [3; 8],
                     },
-                    chunk: [4; 8],
-                    checkpoint: [5; 8],
                 },
+                participation: h(25),
                 next_chunk_id: index,
                 height: index * 128,
                 block_hash: parent,
@@ -1030,7 +1032,6 @@ mod tests {
                 block_program: [50; 8],
                 gas_used: 0,
                 gas_limit: 1_000_000,
-                gas_price: 0,
                 proposer_address: [0u8; 32],
                 runtime_extra: ZERO_HASH,
             },

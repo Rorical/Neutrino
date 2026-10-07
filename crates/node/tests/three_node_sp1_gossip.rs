@@ -36,7 +36,6 @@ use std::time::Duration;
 use neutrino_consensus_engine::validator_set::validator_set_root;
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_consensus_types::{Block, BlockProof};
-use neutrino_default_runtime_core::ValidatorSet;
 use neutrino_network::Topic;
 use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkEvent, NetworkService};
@@ -382,11 +381,12 @@ async fn three_nodes_agree_with_real_sp1_proof_envelopes() {
     .await
     .expect("spawn_blocking prove_block");
 
-    // The runtime emits the canonical empty validator-set commitment
+    // The runtime emits the canonical empty candidate-record commitment
     // (no Stake transactions yet), and the engine wires it into
     // `header.runtime_extra` for downstream consumers (chunk BFT,
     // M7-new finality).
-    let expected_runtime_extra = ValidatorSet::default().root();
+    let expected_runtime_extra =
+        neutrino_default_runtime_core::ConsensusCandidates::default().root();
     assert_eq!(outcome.block.header.runtime_extra, expected_runtime_extra);
     assert_ne!(outcome.block.header.runtime_extra, ZERO_HASH);
 

@@ -18,10 +18,11 @@ pub const MAX_HISTORY_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CHECKPOINT_INPUT_BYTES: usize = 64 * 1024;
 /// Maximum entire SDK input, including deferred receipts and keys.
 pub const MAX_HISTORY_PROVING_INPUT_BYTES: usize = 64 * 1024 * 1024;
-/// Exact canonical history public-value length.
-pub const HISTORY_STATEMENT_BYTES: usize = 816;
+/// Exact canonical history public-value length: a chain binding and two boundaries.
+pub const HISTORY_STATEMENT_BYTES: usize = 800;
 
-/// Immutable chain configuration authenticated by the consumer.
+/// Immutable chain identity authenticated by the consumer: the specification
+/// commitment plus the consensus Guests pinned for the life of the chain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ChainBinding {
     /// Chain identifier.
@@ -30,19 +31,49 @@ pub struct ChainBinding {
     pub chain_spec_hash: Hash,
     /// Blocks in each chunk.
     pub chunk_size: u64,
-    /// Required runtime fee rate.
-    pub gas_price: u128,
+    /// The chunk and checkpoint Guests every statement of this chain is
+    /// verified under.
+    pub consensus: ConsensusPrograms,
 }
+
 impl ChainBinding {
-    /// Derive identity from the consumer's validated specification.
+    /// Bind the consumer's validated specification to its pinned consensus Guests.
     #[must_use]
-    pub fn from_spec(spec: &ChainSpec) -> Self {
+    pub fn new(spec: &ChainSpec, consensus: ConsensusPrograms) -> Self {
         Self {
             chain_id: spec.chain_id,
             chain_spec_hash: spec.hash(),
             chunk_size: spec.consensus.chunk_size,
-            gas_price: spec.runtime.gas_price,
+            consensus,
         }
+    }
+
+    /// `true` when both pinned consensus Guests are named.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.consensus.is_complete()
+    }
+}
+
+/// The Guests that define finality and history recursion.
+///
+/// They are fixed at genesis and never governable: a chain whose chunk or
+/// checkpoint Guest changes is a different chain (a hard fork), so these
+/// identities live in the immutable binding rather than in boundaries, and
+/// every chunk and history receipt of the chain is verified under them.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct ConsensusPrograms {
+    /// Complete Chunk Guest identity.
+    pub chunk: VkDigest,
+    /// Recursive Checkpoint Guest identity.
+    pub checkpoint: VkDigest,
+}
+
+impl ConsensusPrograms {
+    /// `true` when neither identity is zero.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        ![self.chunk, self.checkpoint].contains(&[0; 8])
     }
 }
 
@@ -57,20 +88,26 @@ pub struct ExecutionPrograms {
     pub block: VkDigest,
 }
 
-/// Every upgradable program identity active between two consensus boundaries.
+impl ExecutionPrograms {
+    /// `true` when no identity is zero.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        ![self.fact, self.evidence, self.block].contains(&[0; 8])
+    }
+}
+
+/// Every upgradable program identity active between two consensus boundaries:
+/// the runtime and the execution Guests the chunk Guest verifies recursively.
 ///
 /// Carried inside each [`ConsensusBoundary`], so a program switch is a chunk whose
-/// end boundary names a different set; see design 24.
+/// end boundary names a different set; see design 24. The chunk and checkpoint
+/// Guests are not here: they are pinned in the [`ChainBinding`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ProgramSet {
     /// Runtime artifact commitment used for ordinary execution.
     pub runtime_code_hash: Hash,
     /// Inner execution programs recursively verified by the chunk Guest.
     pub execution: ExecutionPrograms,
-    /// Complete Chunk Guest identity producing this period's chunk receipts.
-    pub chunk: VkDigest,
-    /// Recursive Checkpoint Guest identity producing this period's history receipts.
-    pub checkpoint: VkDigest,
 }
 
 impl ProgramSet {
@@ -78,57 +115,36 @@ impl ProgramSet {
     /// the chain specification's own rules, which admit a zero commitment.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.guests().is_complete()
-    }
-
-    /// The Guest identities without the runtime artifact.
-    #[must_use]
-    pub const fn guests(&self) -> GuestPrograms {
-        GuestPrograms {
-            execution: self.execution,
-            chunk: self.chunk,
-            checkpoint: self.checkpoint,
-        }
+        self.execution.is_complete()
     }
 }
 
 /// The five Guest identities a proof backend embeds.
 ///
-/// A node binary contributes these; the runtime artifact of the genesis
-/// boundary is named by the chain specification, and later boundaries by
-/// proven upgrades.
+/// A node binary contributes these. The execution Guests bound to the
+/// specification's runtime artifact form the genesis boundary's program set;
+/// the consensus Guests form the chain binding and never change.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct GuestPrograms {
     /// Inner execution programs recursively verified by the chunk Guest.
     pub execution: ExecutionPrograms,
-    /// Complete Chunk Guest identity.
-    pub chunk: VkDigest,
-    /// Recursive Checkpoint Guest identity.
-    pub checkpoint: VkDigest,
+    /// Pinned chunk and checkpoint Guests.
+    pub consensus: ConsensusPrograms,
 }
 
 impl GuestPrograms {
     /// `true` when no identity is zero.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        ![
-            self.execution.fact,
-            self.execution.evidence,
-            self.execution.block,
-            self.chunk,
-            self.checkpoint,
-        ]
-        .contains(&[0; 8])
+        self.execution.is_complete() && self.consensus.is_complete()
     }
 
-    /// Bind these Guests to a runtime artifact.
+    /// Bind the execution Guests to a runtime artifact.
     #[must_use]
     pub const fn with_runtime(self, runtime_code_hash: Hash) -> ProgramSet {
         ProgramSet {
             runtime_code_hash,
             execution: self.execution,
-            chunk: self.chunk,
-            checkpoint: self.checkpoint,
         }
     }
 }
@@ -147,25 +163,14 @@ pub struct ProgramArtifacts {
     pub evidence: Hash,
     /// Block Guest ELF.
     pub block: Hash,
-    /// Chunk Guest ELF.
-    pub chunk: Hash,
-    /// Checkpoint Guest ELF.
-    pub checkpoint: Hash,
 }
 
 impl ProgramArtifacts {
     /// Every nonzero content hash.
     pub fn named(&self) -> impl Iterator<Item = Hash> {
-        [
-            self.runtime,
-            self.fact,
-            self.evidence,
-            self.block,
-            self.chunk,
-            self.checkpoint,
-        ]
-        .into_iter()
-        .filter(|hash| *hash != [0; 32])
+        [self.runtime, self.fact, self.evidence, self.block]
+            .into_iter()
+            .filter(|hash| *hash != [0; 32])
     }
 }
 
@@ -199,7 +204,7 @@ impl ProofDomain {
     }
 }
 
-/// Authenticated state immediately before the next chunk; exactly 376 Borsh bytes.
+/// Authenticated state immediately before the next chunk; exactly 344 Borsh bytes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct ConsensusBoundary {
     /// Next chunk to execute.
@@ -220,6 +225,11 @@ pub struct ConsensusBoundary {
     pub history_root: Hash,
     /// Programs that execute and prove the next chunk.
     pub programs: ProgramSet,
+    /// Commitment of the [`crate::participation::ParticipationReport`] of the
+    /// chunk that ended at this boundary, derived from its finality
+    /// certificate. Every block of the next chunk hands exactly this report
+    /// to the runtime; zero at genesis.
+    pub participation: Hash,
 }
 impl ConsensusBoundary {
     /// Canonical genesis boundary under `programs`; callers validate the spec first.
@@ -235,6 +245,7 @@ impl ConsensusBoundary {
             seed: spec.genesis_seed,
             history_root: crate::history::empty_history_root(),
             programs,
+            participation: crate::participation::NO_PARTICIPATION,
         }
     }
 

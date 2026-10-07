@@ -69,8 +69,16 @@ have passed.
   current plus eight-chunk evidence window. Read
   `docs/design/23-evidence-availability.md` before changing evidence retention,
   discovery or retrieval. Archive retention does not extend admissible consensus history.
-- Program identities live in every `ConsensusBoundary` as a `ProgramSet`; `ChainBinding`
-  is immutable and `ProofDomain { chain, programs }` is only a verifier's trust profile.
+- Execution program identities (runtime, fact, evidence, block) live in every
+  `ConsensusBoundary` as a `ProgramSet` and are governable. The chunk and checkpoint
+  Guests are pinned in the immutable `ChainBinding`: changing either is a hard fork.
+  `ProofDomain { chain, programs }` is only a verifier's trust profile. Consensus reads
+  exactly two runtime records, `consensus:candidates` and the scheduled upgrade, and
+  hands the runtime one input, the previous chunk's certified `ParticipationReport`,
+  whose commitment travels in the boundary; economic rules never enter the Guests.
+  Governable runtime policy (fee rate, evidence windows, sanction amounts) is runtime
+  state under `runtime:policy`, seeded from the spec at genesis and changed only by
+  governance; unbonding delay, chunk size and all consensus parameters stay in the spec.
   Receipts are verified under the program set of their start boundary, never one the
   receipt names itself. Upgrade governance is runtime state (`governance` module of the
   default runtime); artifacts travel in the block body's program lane and are installed

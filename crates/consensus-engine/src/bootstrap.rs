@@ -46,8 +46,7 @@ impl<DB: Database> Engine<DB> {
             || statement.chain != prefix.domain().chain
             || self.store().history_domain()?.map(|trusted| trusted.chain) != Some(statement.chain)
             || statement.start != prefix.domain().genesis_boundary(spec)
-            || statement.chain
-                != neutrino_consensus_types::history_proof::ChainBinding::from_spec(spec)
+            || statement.chain != self.chain_binding()
             || !end.is_well_formed(&statement.chain)
             || bridge.map_or_else(
                 || trusted_start != statement.end_checkpoint(),
@@ -119,6 +118,7 @@ impl<DB: Database> Engine<DB> {
         context.parent_slot = end.slot;
         context.active_validators = validators.to_vec();
         context.history_root = end.history_root;
+        context.participation = end.participation;
         if context_boundary(&context, end.seed).map_err(|_| ProofError::InvalidWitness)? != end {
             return Err(ProofError::PublicInputMismatch.into());
         }

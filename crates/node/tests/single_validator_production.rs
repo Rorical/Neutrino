@@ -25,7 +25,6 @@
 use std::sync::Arc;
 
 use neutrino_consensus_engine::{BlockState, Engine, ProposerKey, validator_set_root};
-use neutrino_default_runtime_core::ValidatorSet;
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
     BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
@@ -120,13 +119,14 @@ fn produces_proves_and_advances_single_validator_chain() {
     // Head advanced.
     assert_eq!(backend.head_height(), 1);
 
-    // The runtime emits a deterministic `validator_set_root` for the
-    // canonical empty runtime-side validator set; the engine wires
-    // that into `header.runtime_extra` for consensus to authenticate.
-    let expected_runtime_extra = ValidatorSet::default().root();
+    // The runtime emits a deterministic commitment of the empty consensus
+    // candidate record; the engine wires that into `header.runtime_extra`
+    // for consensus to authenticate.
+    let expected_runtime_extra =
+        neutrino_default_runtime_core::ConsensusCandidates::default().root();
     assert_eq!(
         outcome.block.header.runtime_extra, expected_runtime_extra,
-        "runtime_extra carries the canonical empty validator-set commitment",
+        "runtime_extra carries the canonical empty candidate commitment",
     );
     assert_ne!(
         outcome.block.header.runtime_extra, ZERO_HASH,

@@ -563,8 +563,8 @@ mod tests {
                 chain_id: 1,
                 block_height: 1,
                 block_gas_limit: 30_000_000,
-                gas_price: 0,
                 proposer_address: [0u8; 32],
+                participation: None,
                 transactions: Vec::new(),
             },
             &live,
@@ -573,11 +573,14 @@ mod tests {
         assert_eq!(output.applied, 0);
         assert_eq!(output.failed, 0);
         assert_eq!(output.pre_state_root, output.post_state_root);
-        // Empty blocks must also inspect pending mandatory sanctions and the
+        // Empty blocks must also inspect pending mandatory sanctions, the
+        // runtime policy, the consensus candidate record it commits and the
         // governance records whose expiry is block-start housekeeping.
-        assert_eq!(witness.witnessed_keys.len(), 4);
+        assert_eq!(witness.witnessed_keys.len(), 5);
         for key in [
             neutrino_default_runtime_core::accountability::QUEUE_KEY,
+            neutrino_default_runtime_core::CONSENSUS_CANDIDATES_KEY,
+            neutrino_default_runtime_core::RUNTIME_POLICY_KEY,
             neutrino_default_runtime_core::UPGRADE_KEY,
             neutrino_default_runtime_core::governance::UPGRADE_PROPOSAL_KEY,
         ] {

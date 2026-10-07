@@ -12,7 +12,10 @@ fn chain() -> ChainBinding {
         chain_id: 1,
         chain_spec_hash: [1; 32],
         chunk_size: 2,
-        gas_price: 3,
+        consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+            chunk: [4; 8],
+            checkpoint: [5; 8],
+        },
     }
 }
 
@@ -24,8 +27,6 @@ fn programs(tag: u32) -> ProgramSet {
             evidence: [tag + 2; 8],
             block: [tag + 3; 8],
         },
-        chunk: [tag + 4; 8],
-        checkpoint: [tag + 5; 8],
     }
 }
 
@@ -47,6 +48,7 @@ fn boundary(n: u8) -> ConsensusBoundary {
         seed: [n; 32],
         history_root: [n; 32],
         programs: programs(0),
+        participation: [n; 32],
     }
 }
 
@@ -105,7 +107,7 @@ fn fold_merge_and_suffix_have_one_endpoint() {
         borsh::to_vec(&merged).unwrap().len(),
         HISTORY_STATEMENT_BYTES
     );
-    assert_eq!(borsh::to_vec(&merged.start).unwrap().len(), 376);
+    assert_eq!(borsh::to_vec(&merged.start).unwrap().len(), 344);
     assert_eq!(
         validate(&fold(0, 1, None)).unwrap().covered_chunks(),
         Some(1)
@@ -185,7 +187,7 @@ fn program_switch_inside_a_range_is_continuous_and_merges() {
     );
     // Incomplete program sets never pass, even as a switch target.
     let mut zero = after;
-    zero.end.programs.checkpoint = [0; 8];
+    zero.end.programs.execution.block = [0; 8];
     assert_eq!(validate_chunk(&zero, &chain()), Err(CheckpointError::Chunk));
 }
 
@@ -226,7 +228,7 @@ fn chunk_fields_are_bound_and_parent_is_not_first_block_hash() {
         |c: &mut ConsensusStatement| c.chunk.next_validator_set_root = [55; 32],
         |c: &mut ConsensusStatement| c.end.slot = c.start.slot,
         |c: &mut ConsensusStatement| c.end.next_chunk_id += 1,
-        |c: &mut ConsensusStatement| c.start.programs.chunk = [0; 8],
+        |c: &mut ConsensusStatement| c.start.programs.execution.block = [0; 8],
     ] as [Mutation; 11]
     {
         let mut changed = valid.clone();
@@ -254,7 +256,7 @@ fn empty_overflow_and_oversized_inputs_fail_closed() {
     history.end = history.start;
     assert!(validate_history(&history).is_err());
     let mut invalid_domain = domain();
-    invalid_domain.programs.checkpoint = [0; 8];
+    invalid_domain.chain.consensus.checkpoint = [0; 8];
     assert_eq!(
         validate_domain(&invalid_domain),
         Err(CheckpointError::Domain)

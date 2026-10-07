@@ -282,7 +282,6 @@ impl<DB: Database> Engine<DB> {
             block_program: programs.execution.block,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: self.proposer_runtime_address(header.proposer_index),
             runtime_extra: header.runtime_extra,
         })

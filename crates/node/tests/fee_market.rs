@@ -8,18 +8,19 @@
 //! - The receiver's balance grows by `amount`.
 //! - The proposer's runtime account grows by `tx_gas(Transfer) * N`.
 //!
-//! The `Sp1ProofSystem` cross-check now binds the chain spec's
-//! `gas_price` and the per-block `proposer_address` into
-//! `BlockProofPublicInputs`, so a successful `prove_block` confirms
-//! the runtime did not divert fees.
+//! The fee rate lives in runtime state (seeded from the spec at
+//! genesis) and the `Sp1ProofSystem` cross-check binds the per-block
+//! `proposer_address` into `BlockProofPublicInputs`, so the balance
+//! movements above plus a successful `prove_block` confirm the runtime
+//! applied the configured fee and did not divert it.
 
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, GAS_TRANSFER, Transaction, TransferTx, account_key, encode_account,
-    transfer_sig_message,
+    Account, Address, GAS_TRANSFER, RUNTIME_POLICY_KEY, RuntimePolicy, Transaction, TransferTx,
+    account_key, encode_account, transfer_sig_message,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
@@ -90,6 +91,16 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
     for (addr, acct) in seeds {
         live.insert(&account_key(addr), encode_account(acct));
     }
+    // Genesis seeds the governable policy from the spec; the fee rate the
+    // runtime charges is read from this record, not from the spec.
+    let runtime = RuntimeParams {
+        gas_price: GAS_PRICE,
+        ..RuntimeParams::default()
+    };
+    live.insert(
+        RUNTIME_POLICY_KEY,
+        borsh::to_vec(&RuntimePolicy::from_params(&runtime)).expect("encode policy"),
+    );
     let state_root = live.state_root();
 
     let vs_root = neutrino_consensus_engine::validator_set_root(&validators());
@@ -118,10 +129,7 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
-        runtime: RuntimeParams {
-            gas_price: GAS_PRICE,
-            ..RuntimeParams::default()
-        },
+        runtime,
         initial_validators: validators(),
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     };
@@ -198,14 +206,13 @@ fn transfer_block_charges_fee_and_credits_proposer_through_sp1_pipeline() {
     // Prove the block. The Sp1ProofSystem cross-check binds the
     // committed StfPublicOutput's state roots, gas_used, and
     // receipts_root against the consensus public inputs, plus the
-    // STF input's gas_price + proposer_address against the chain
-    // spec. A successful prove confirms the runtime applied the
-    // chain's configured fee and credited the proposer at the
-    // right address.
+    // STF input's proposer_address against the chain spec. The fee
+    // rate itself is runtime state seeded from the spec at genesis,
+    // so the credited balance below is what proves the runtime
+    // applied the configured fee.
     let proven = backend
         .prove_block(&outcome.block_hash)
-        .expect("prove_block accepts the matching gas_price + proposer");
-    assert_eq!(proven.public_inputs.gas_price, GAS_PRICE);
+        .expect("prove_block accepts the matching proposer");
     assert_eq!(proven.public_inputs.proposer_address, proposer_runtime);
     assert_eq!(proven.public_inputs.gas_used, GAS_TRANSFER);
 

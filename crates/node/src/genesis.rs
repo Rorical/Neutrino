@@ -61,6 +61,7 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
         entries += 1;
     }
     let mut set = ValidatorSet::default();
+    let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
     let mut staked_validators = 0_usize;
     for (idx, validator) in file.validators.iter().enumerate() {
         let Some(hex) = validator.withdrawal_credentials_hex.as_deref() else {
@@ -88,6 +89,13 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
         if stake > 0 {
             set.upsert(credentials, stake);
         }
+        // Genesis validators are seated from the specification, so their
+        // candidate entry carries no BLS identity; it only reports stake.
+        candidates.upsert(neutrino_default_runtime_core::ConsensusCandidate {
+            address: credentials,
+            stake,
+            identity: None,
+        });
         staked_validators += 1;
         entries += 1;
     }
@@ -98,6 +106,24 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
         )
         .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
     }
+    if !candidates.entries.is_empty() {
+        trie.insert(
+            neutrino_default_runtime_core::CONSENSUS_CANDIDATES_KEY,
+            borsh::to_vec(&candidates).expect("borsh encode ConsensusCandidates never fails"),
+        )
+        .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+        entries += 1;
+    }
+    // The governable runtime policy starts from the specification's values
+    // and lives in state from here on (design 24).
+    let policy =
+        neutrino_default_runtime_core::RuntimePolicy::from_params(&file.to_chain_spec()?.runtime);
+    trie.insert(
+        neutrino_default_runtime_core::RUNTIME_POLICY_KEY,
+        borsh::to_vec(&policy).expect("borsh encode RuntimePolicy never fails"),
+    )
+    .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+    entries += 1;
     let root = if entries == 0 { ZERO_HASH } else { trie.root() };
     Ok(GenesisState {
         trie,

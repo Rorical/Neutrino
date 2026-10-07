@@ -31,12 +31,15 @@ impl ProofSystem for NativeHistory {
     }
     fn history_domain(&self, spec: &ChainSpec) -> Result<ProofDomain, ProofError> {
         Ok(ProofDomain {
-            chain: ChainBinding::from_spec(spec),
+            chain: ChainBinding::new(spec, support::consensus_programs()),
             programs: support::programs([1; 8], [4; 32]),
         })
     }
     fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
-        Some(support::programs([1; 8], [4; 32]).guests())
+        Some(neutrino_consensus_types::history_proof::GuestPrograms {
+            execution: support::programs([1; 8], [4; 32]).execution,
+            consensus: support::consensus_programs(),
+        })
     }
     fn verify_history(
         &self,

@@ -96,7 +96,7 @@ fn three_validator_fixture() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     input.evidence_anchor.chain_spec_hash = witness.chain_spec.hash();
     let live = LiveTrie::default();
     let mut traced = TracingState::new(&live);
-    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut traced, &validators) {
+    for key in neutrino_prover_chunk::rotation::witness_keys_from(&mut traced) {
         let _ = traced.read(&key);
     }
     witness.blocks[0].output = neutrino_default_runtime_core::apply_block(&input, &mut traced);
@@ -109,7 +109,7 @@ fn three_validator_fixture() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     let hash = header.hash();
     witness.blocks[0].public_inputs.block_hash = hash;
     let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let block = &witness.blocks[0];
     let hash = block.header.hash();
     engine
@@ -203,12 +203,14 @@ fn import_executed_successor(
         chain_id: spec.chain_id,
         block_height: 2,
         block_gas_limit: spec.genesis_gas_limit,
-        gas_price: context.gas_price,
         proposer_address: context.active_validators[0].withdrawal_credentials,
+        // Chunk one's blocks report chunk zero's certified participation.
+        participation: engine.participation_for_height(2).unwrap(),
         transactions: Vec::new(),
     };
     let mut traced = TracingState::new(&live);
     let output = neutrino_default_runtime_core::apply_block(&input, &mut traced);
+    let (post_state, _) = traced.into_committed_and_witness();
     let proposer = voter(0);
     let mut header = first.blocks[0].header.clone();
     header.height = 2;
@@ -235,6 +237,10 @@ fn import_executed_successor(
             body: neutrino_consensus_types::Body::default(),
         })
         .unwrap();
+    // The block wrote the participation record; persist its post-state so the
+    // chunk witness can be built from the store, as an executing node would.
+    engine.replace_state_with_reconstructed(post_state);
+    engine.flush_trie_to_store().unwrap();
     let mut inputs = first.blocks[0].public_inputs.clone();
     inputs.height = 2;
     inputs.parent_block_hash = header.parent_hash;

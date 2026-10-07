@@ -139,7 +139,6 @@ pub fn verify_block_artifact(
         || output.validator_set_root != pi.runtime_extra
         || output.gas_used != pi.gas_used
         || output.block_gas_limit != pi.gas_limit
-        || output.gas_price != pi.gas_price
         || output.proposer_address != pi.proposer_address
     {
         return Err(ProofRejectionReason::PublicInputsMismatch);

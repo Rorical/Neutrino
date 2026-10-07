@@ -27,8 +27,10 @@ pub struct ExecutionContext {
     pub vm_code_hash: Hash,
     /// Complete program set active for this chunk (design 24).
     pub programs: neutrino_consensus_types::history_proof::ProgramSet,
-    /// Fee rate required by the chain specification.
-    pub gas_price: u128,
+    /// Commitment of the participation report every block of this chunk
+    /// hands to the runtime: the previous chunk's certified precommit
+    /// signers, or zero in chunk zero.
+    pub participation: Hash,
     /// Authenticated consensus validator set for this chunk.
     pub active_validators: Vec<Validator>,
     /// Commitment to finalized historical consensus records.
@@ -136,7 +138,6 @@ pub fn validate_execution(
             block_program: context.programs.execution.block,
             gas_used: header.gas_used,
             gas_limit: header.gas_limit,
-            gas_price: context.gas_price,
             proposer_address: proposer.withdrawal_credentials,
             runtime_extra: header.runtime_extra,
         };
@@ -149,7 +150,6 @@ pub fn validate_execution(
             || output.receipts_root != pi.receipt_root
             || output.gas_used != pi.gas_used
             || output.block_gas_limit != pi.gas_limit
-            || output.gas_price != pi.gas_price
             || output.proposer_address != pi.proposer_address
             || output.validator_set_root != pi.runtime_extra
             || output.gas_used > output.block_gas_limit

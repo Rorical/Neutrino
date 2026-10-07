@@ -28,9 +28,14 @@ fn boundary(n: u64) -> ConsensusBoundary {
                 evidence: [2; 8],
                 block: [3; 8],
             },
-            chunk: [4; 8],
-            checkpoint: [5; 8],
         },
+        participation: [6; 32],
+    }
+}
+fn consensus() -> neutrino_consensus_types::history_proof::ConsensusPrograms {
+    neutrino_consensus_types::history_proof::ConsensusPrograms {
+        chunk: [4; 8],
+        checkpoint: [5; 8],
     }
 }
 fn client() -> LightClient {
@@ -40,7 +45,7 @@ fn client() -> LightClient {
                 chain_id: 1,
                 chain_spec_hash: [1; 32],
                 chunk_size: 1,
-                gas_price: 0,
+                consensus: consensus(),
             },
             boundary: boundary(1),
         },
@@ -197,7 +202,7 @@ fn spec() -> neutrino_primitives::ChainSpec {
 fn persistent_snapshot_does_not_renew_trust_on_restart() {
     let spec = spec();
     let mut original = client();
-    original.checkpoint.chain = ChainBinding::from_spec(&spec);
+    original.checkpoint.chain = ChainBinding::new(&spec, consensus());
     let bytes = borsh::to_vec(&original.snapshot()).unwrap();
     let saved: LightClientSnapshot = borsh::from_slice(&bytes).unwrap();
     let mut restored = LightClient::restore(&spec, &original.trusted_domain(), &saved, 2).unwrap();
@@ -224,7 +229,7 @@ fn persistent_snapshot_does_not_renew_trust_on_restart() {
 fn genesis_bootstrap_checks_all_boundary_lanes() {
     let spec = spec();
     let mut anchor = client().checkpoint;
-    anchor.chain = ChainBinding::from_spec(&spec);
+    anchor.chain = ChainBinding::new(&spec, consensus());
     anchor.boundary = ConsensusBoundary::genesis(&spec, anchor.boundary.programs);
     assert!(LightClient::new(&spec, anchor, spec.genesis_time, 2).is_ok());
     anchor.boundary.history_root = [99; 32];

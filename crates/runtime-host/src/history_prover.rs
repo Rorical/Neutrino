@@ -35,15 +35,16 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
     ) -> Result<ProofDomain, ProofError> {
         spec.validate().map_err(|_| ProofError::InvalidWitness)?;
         Ok(ProofDomain {
-            chain: ChainBinding::from_spec(spec),
+            chain: ChainBinding::new(spec, self.embedded.consensus),
             programs: self.embedded.with_runtime(spec.runtime_code_hash),
         })
     }
 
-    /// Verify a history receipt under the checkpoint program of a trusted
-    /// program set, which the statement must start under. The embedded program
-    /// uses the full key; any other set is checked by digest, which never
-    /// accepts mock receipts. The key is never taken from the receipt itself.
+    /// Verify a history receipt that must start under a trusted program set,
+    /// under the checkpoint program pinned in the chain binding the caller
+    /// already authenticated. The embedded program uses the full key; any
+    /// other identity is checked by digest, which never accepts mock
+    /// receipts. The key is never taken from the receipt itself.
     fn verify_history_under(
         &self,
         proof: &HistoryProof,
@@ -56,7 +57,8 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         neutrino_prover_checkpoint::validate_history(statement)
             .map_err(|_| ProofError::PublicInputMismatch)?;
         let expected_pv = borsh::to_vec(statement).map_err(|_| ProofError::MalformedProof)?;
-        if let Ok(checkpoint) = self.keys(&programs.checkpoint) {
+        let checkpoint_program = statement.chain.consensus.checkpoint;
+        if let Ok(checkpoint) = self.keys(&checkpoint_program) {
             let bundle = self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?;
             if bundle.public_values.as_slice() != expected_pv {
                 return Err(ProofError::PublicInputMismatch);
@@ -72,7 +74,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             bundle.public_values.as_slice(),
             &bundle.sp1_version,
             statement,
-            &programs.checkpoint,
+            &checkpoint_program,
         )
         .map_err(|_| ProofError::BackendRejected)
     }
@@ -173,9 +175,10 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         // start of the range pins the first one; continuity is enforced by
         // validation, so each later start equals a proven end.
         let mut children = Vec::with_capacity(chunks.len() + usize::from(previous.is_some()));
+        let checkpoint_program = domain.chain.consensus.checkpoint;
         if let Some(proof) = previous {
             self.verify_history_receipt(spec, proof, &proof.statement.start)?;
-            let checkpoint = self.keys(&proof.statement.start.programs.checkpoint)?;
+            let checkpoint = self.keys(&checkpoint_program)?;
             children.push((
                 self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?,
                 checkpoint.vk.clone(),
@@ -190,23 +193,20 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
                 .map_err(|_| ProofError::MalformedProof)?;
             let statement: ConsensusStatement = borsh::from_slice(bundle.public_values.as_slice())
                 .map_err(|_| ProofError::MalformedProof)?;
-            let chunk_keys = self.keys(&statement.start.programs.chunk)?;
+            if statement.chain != domain.chain {
+                return Err(ProofError::PublicInputMismatch);
+            }
+            let chunk_keys = self.keys(&domain.chain.consensus.chunk)?;
             let bundle = self.authenticated_child(&chunk.bytes, &chunk_keys.vk)?;
             statements.push(statement);
             children.push((bundle, chunk_keys.vk.clone()));
         }
-        let start = previous
-            .map_or_else(
-                || statements.first().map(|statement| statement.start),
-                |proof| Some(proof.statement.start),
-            )
-            .ok_or(ProofError::InvalidWitness)?;
         let input = CheckpointInput::Fold {
             chain: domain.chain,
             previous: previous.map(|proof| proof.statement),
             chunks: BoundedVec::new(statements).map_err(|_| ProofError::InvalidWitness)?,
         };
-        self.prove_history_input(spec, &start.programs.checkpoint, &input, &children)
+        self.prove_history_input(spec, &checkpoint_program, &input, &children)
     }
 
     pub(super) fn merge_history(
@@ -215,13 +215,14 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         left: &HistoryProof,
         right: &HistoryProof,
     ) -> Result<VerifiedHistory, ProofError> {
+        let domain = self.trusted_history_domain(spec)?;
+        let checkpoint_program = domain.chain.consensus.checkpoint;
         let mut children = Vec::with_capacity(2);
         for proof in [left, right] {
-            // Each side is verified under its own start program; continuity
-            // (`left.end == right.start`) is enforced by validation, so the
-            // right start is a boundary the left side proved.
+            // Both sides carry the pinned chain binding; continuity
+            // (`left.end == right.start`) is enforced by validation.
             self.verify_history_receipt(spec, proof, &proof.statement.start)?;
-            let checkpoint = self.keys(&proof.statement.start.programs.checkpoint)?;
+            let checkpoint = self.keys(&checkpoint_program)?;
             children.push((
                 self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?,
                 checkpoint.vk.clone(),
@@ -229,7 +230,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         }
         self.prove_history_input(
             spec,
-            &left.statement.start.programs.checkpoint,
+            &checkpoint_program,
             &CheckpointInput::Merge {
                 left: left.statement,
                 right: right.statement,

@@ -123,7 +123,6 @@ mod tests {
             block_program: [8; 8],
             gas_used: 0,
             gas_limit: 1_000_000,
-            gas_price: 0,
             proposer_address: [0u8; 32],
             runtime_extra: [9; 32],
         }

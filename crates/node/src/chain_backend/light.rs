@@ -361,6 +361,11 @@ mod tests {
                 evidence: [2; 8],
                 block: [3; 8],
             },
+        }
+    }
+
+    fn consensus() -> neutrino_consensus_types::history_proof::ConsensusPrograms {
+        neutrino_consensus_types::history_proof::ConsensusPrograms {
             chunk: [4; 8],
             checkpoint: [5; 8],
         }
@@ -371,7 +376,7 @@ mod tests {
             chain_id: 1,
             chain_spec_hash: [1; 32],
             chunk_size: 1,
-            gas_price: 0,
+            consensus: consensus(),
         };
         let start = ConsensusBoundary {
             next_chunk_id: 0,
@@ -383,6 +388,7 @@ mod tests {
             seed: [4; 32],
             history_root: [5; 32],
             programs: programs(),
+            participation: [6; 32],
         };
         let end = ConsensusBoundary {
             next_chunk_id: 1,
@@ -474,7 +480,7 @@ mod tests {
             spec: &neutrino_primitives::ChainSpec,
         ) -> Result<ProofDomain, neutrino_proof_system::ProofError> {
             Ok(ProofDomain {
-                chain: ChainBinding::from_spec(spec),
+                chain: ChainBinding::new(spec, consensus()),
                 programs: programs(),
             })
         }

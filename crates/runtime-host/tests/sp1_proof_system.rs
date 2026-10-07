@@ -114,7 +114,6 @@ fn matching_public_inputs(
         block_program: mock_ctx().vk.hash_u32(),
         gas_used: output.gas_used,
         gas_limit: input.block_gas_limit,
-        gas_price: input.gas_price,
         proposer_address: input.proposer_address,
         runtime_extra: output.validator_set_root,
     }
@@ -137,8 +136,8 @@ fn build_block_proof(seed: u64) -> (Sp1BlockProof, BlockProofPublicInputs) {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: BLOCK_GAS_LIMIT,
-        gas_price: 0,
         proposer_address: [0u8; 32],
+        participation: None,
         transactions: vec![Transaction::Transfer(tx)],
     };
     let dry = dry_run(&input, &live, &[]);
@@ -251,17 +250,6 @@ fn sp1_proof_system_rejects_gas_limit_mismatch() {
     let err = proof_system
         .verify_block(&proof, &pi)
         .expect_err("tampered gas_limit must reject (block-gas-ceiling defence)");
-    assert_eq!(err, ProofError::PublicInputMismatch);
-}
-
-#[test]
-fn sp1_proof_system_rejects_gas_price_mismatch() {
-    let proof_system = Sp1ProofSystem::mock().expect("mock setup");
-    let (proof, mut pi) = build_block_proof(19);
-    pi.gas_price = pi.gas_price.wrapping_add(1);
-    let err = proof_system
-        .verify_block(&proof, &pi)
-        .expect_err("tampered gas_price must reject (fee-drain defence)");
     assert_eq!(err, ProofError::PublicInputMismatch);
 }
 

@@ -43,8 +43,8 @@ impl core::fmt::Display for CheckpointError {
 impl core::error::Error for CheckpointError {}
 
 /// Validate structural chain obligations; the outer verifier pins the exact value.
-pub const fn validate_chain(chain: &ChainBinding) -> Result<(), CheckpointError> {
-    if chain.chain_id == 0 || chain.chunk_size == 0 {
+pub fn validate_chain(chain: &ChainBinding) -> Result<(), CheckpointError> {
+    if chain.chain_id == 0 || chain.chunk_size == 0 || !chain.is_complete() {
         return Err(CheckpointError::Domain);
     }
     Ok(())

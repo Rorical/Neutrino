@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_default_runtime_core::{
-    Account, Address, StakeTx, StfInput, Transaction, UnstakeTx, ValidatorSet, account_key,
-    encode_account, stake_sig_message, unstake_sig_message,
+    Account, Address, StakeTx, StfInput, Transaction, UnstakeTx, account_key, encode_account,
+    stake_sig_message, unstake_sig_message,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{ProverCtx, dry_run};
@@ -64,6 +64,19 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     live
 }
 
+/// Header commitment of a candidate record holding `entries` without BLS identities.
+fn candidates_root(entries: &[(Address, u128)]) -> neutrino_primitives::Hash {
+    let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
+    for (address, stake) in entries {
+        candidates.upsert(neutrino_default_runtime_core::ConsensusCandidate {
+            address: *address,
+            stake: *stake,
+            identity: None,
+        });
+    }
+    candidates.root()
+}
+
 #[test]
 fn stake_pipeline_prove_verify_mock() {
     let ctx = mock_ctx();
@@ -82,15 +95,16 @@ fn stake_pipeline_prove_verify_mock() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
-        gas_price: 0,
         proposer_address: [0u8; 32],
+        participation: None,
         transactions: vec![Transaction::Stake(signed_stake(&alice, 60, 0))],
     };
     let dry = dry_run(&input, &live, &[]);
     assert_eq!(dry.output.applied, 1);
-    let mut expected_set = ValidatorSet::default();
-    expected_set.upsert(addr, 60);
-    assert_eq!(dry.output.validator_set_root, expected_set.root());
+    assert_eq!(
+        dry.output.validator_set_root,
+        candidates_root(&[(addr, 60)])
+    );
 
     let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     ctx.verify(&proof.proof, &dry.output)
@@ -115,8 +129,8 @@ fn stake_then_unstake_round_trip() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
-        gas_price: 0,
         proposer_address: [0u8; 32],
+        participation: None,
         transactions: vec![
             Transaction::Stake(signed_stake(&alice, 40, 0)),
             Transaction::Unstake(signed_unstake(&alice, 40, 1)),
@@ -124,11 +138,9 @@ fn stake_then_unstake_round_trip() {
     };
     let dry = dry_run(&input, &live, &[]);
     assert_eq!(dry.output.applied, 2);
-    // Net effect: validator set is empty again.
-    assert_eq!(
-        dry.output.validator_set_root,
-        ValidatorSet::default().root()
-    );
+    // Net effect: the runtime index is empty again, while the candidate
+    // record keeps an authenticated zero for the address.
+    assert_eq!(dry.output.validator_set_root, candidates_root(&[(addr, 0)]));
 
     let proof = ctx.prove(&input, dry.witness.clone(), &[]).unwrap();
     ctx.verify(&proof.proof, &dry.output)

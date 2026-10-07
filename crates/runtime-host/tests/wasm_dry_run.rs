@@ -64,8 +64,8 @@ fn wasm_dry_run_matches_native_on_signed_transfer() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
-        gas_price: 0,
         proposer_address: [0u8; 32],
+        participation: None,
         transactions: vec![Transaction::Transfer(tx)],
     };
 
@@ -89,8 +89,8 @@ fn wasm_dry_run_matches_native_on_empty_block() {
         chain_id: CHAIN_ID,
         block_height: 1,
         block_gas_limit: 30_000_000,
-        gas_price: 0,
         proposer_address: [0u8; 32],
+        participation: None,
         transactions: vec![],
     };
 

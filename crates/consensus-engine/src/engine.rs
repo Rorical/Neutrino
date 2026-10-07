@@ -42,6 +42,10 @@ extern crate alloc;
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
     pub(crate) programs: Option<neutrino_consensus_types::history_proof::ProgramSet>,
+    /// The chunk and checkpoint Guests pinned for this chain by the proof
+    /// backend; part of the chain binding, never governable.
+    pub(crate) consensus_programs:
+        Option<neutrino_consensus_types::history_proof::ConsensusPrograms>,
     /// Upgrade records observed at unfinalized chunk boundaries, by block hash.
     pub(crate) program_switches: RefCell<
         BTreeMap<BlockHash, Option<neutrino_consensus_types::history_proof::ScheduledUpgrade>>,
@@ -169,6 +173,7 @@ impl<DB: Database> Engine<DB> {
             bft_sessions: BTreeMap::new(),
             local_voter: None,
             programs: None,
+            consensus_programs: None,
             program_switches: Self::new_program_switch_cache(),
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),
@@ -269,7 +274,6 @@ impl<DB: Database> Engine<DB> {
                 || consensus.next_context.vm_code_hash
                     != consensus.next_context.programs.runtime_code_hash
                 || consensus.next_context.programs != boundary.programs
-                || consensus.next_context.gas_price != chain_spec.runtime.gas_price
                 || latest_finalized_chunk_id != boundary.next_chunk_id.checked_sub(1)
                 || finalized_head != boundary.block_hash
                 || finalized_seed != boundary.seed
@@ -296,7 +300,9 @@ impl<DB: Database> Engine<DB> {
         // The pinned trust profile is process configuration this node persisted
         // itself; restoring it keeps genesis boundaries derivable before the
         // proof backend re-pins the same set (a different set is rejected then).
-        let programs = store.history_domain()?.map(|domain| domain.programs);
+        let domain = store.history_domain()?;
+        let programs = domain.map(|domain| domain.programs);
+        let consensus_programs = domain.map(|domain| domain.chain.consensus);
 
         let mut engine = Self {
             chain_spec,
@@ -313,6 +319,7 @@ impl<DB: Database> Engine<DB> {
             bft_sessions: BTreeMap::new(),
             local_voter: None,
             programs,
+            consensus_programs,
             program_switches: Self::new_program_switch_cache(),
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),

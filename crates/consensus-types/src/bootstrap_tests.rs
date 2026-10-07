@@ -20,15 +20,17 @@ fn data() -> BootstrapData {
                 evidence: [8; 8],
                 block: [9; 8],
             },
-            chunk: [10; 8],
-            checkpoint: [11; 8],
         },
+        participation: crate::participation::NO_PARTICIPATION,
     };
     let chain = ChainBinding {
         chain_id: 1,
         chain_spec_hash: [5; 32],
         chunk_size: 1,
-        gas_price: 0,
+        consensus: crate::history_proof::ConsensusPrograms {
+            chunk: [10; 8],
+            checkpoint: [11; 8],
+        },
     };
     BootstrapData::new(
         HistoryProof {

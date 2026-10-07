@@ -54,6 +54,64 @@ impl<DB: Database> Engine<DB> {
         guests: neutrino_consensus_types::history_proof::GuestPrograms,
     ) {
         self.programs = Some(guests.with_runtime(self.chain_spec().runtime_code_hash));
+        self.consensus_programs = Some(guests.consensus);
+    }
+
+    /// The immutable chain binding: the specification plus the consensus
+    /// Guests pinned by [`Self::set_programs`]. Without a proof backend the
+    /// Guests are zero and no statement can verify.
+    #[must_use]
+    pub fn chain_binding(&self) -> neutrino_consensus_types::history_proof::ChainBinding {
+        neutrino_consensus_types::history_proof::ChainBinding::new(
+            self.chain_spec(),
+            self.consensus_programs.unwrap_or(
+                neutrino_consensus_types::history_proof::ConsensusPrograms {
+                    chunk: [0; 8],
+                    checkpoint: [0; 8],
+                },
+            ),
+        )
+    }
+
+    /// The certified participation report every block of `height`'s chunk
+    /// hands to the runtime: the precommit signers of the previous chunk,
+    /// resolved from its finalized certificate. Chunk zero has none.
+    ///
+    /// # Errors
+    /// Returns [`crate::import::PARTICIPATION_UNAVAILABLE`] while the previous
+    /// chunk is not finalized locally; production waits and import defers,
+    /// exactly as for the evidence anchor's history root.
+    pub fn participation_for_height(
+        &self,
+        height: u64,
+    ) -> Result<
+        Option<neutrino_consensus_types::participation::ParticipationReport>,
+        alloc::string::String,
+    > {
+        if self.programs.is_none() {
+            return Ok(None);
+        }
+        let chunk_size = self.chain_spec().consensus.chunk_size;
+        let chunk_id = height
+            .checked_sub(1)
+            .and_then(|h| h.checked_div(chunk_size))
+            .ok_or_else(|| alloc::string::String::from("invalid participation height"))?;
+        let Some(previous) = chunk_id.checked_sub(1) else {
+            return Ok(None);
+        };
+        let unavailable = || alloc::string::String::from(crate::import::PARTICIPATION_UNAVAILABLE);
+        let record = self
+            .store()
+            .historical_chunk(previous)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        neutrino_consensus_types::participation::ParticipationReport::from_certificate(
+            previous,
+            &record.validators,
+            &record.finality.precommit.aggregation_bits,
+        )
+        .map(Some)
+        .ok_or_else(|| alloc::string::String::from("finalized certificate bitmap is malformed"))
     }
 
     /// The genesis boundary's program set: the pinned Guests bound to the
@@ -68,8 +126,10 @@ impl<DB: Database> Engine<DB> {
                     evidence: [0; 8],
                     block: [0; 8],
                 },
-                chunk: [0; 8],
-                checkpoint: [0; 8],
+                consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                    chunk: [0; 8],
+                    checkpoint: [0; 8],
+                },
             }
             .with_runtime(self.chain_spec().runtime_code_hash)
         })
@@ -94,7 +154,7 @@ impl<DB: Database> Engine<DB> {
         let frontier = self
             .store()
             .history_frontier(chunk_id)
-            .map_err(|_| alloc::string::String::from("unavailable historical boundary"))?;
+            .map_err(|_| alloc::string::String::from(crate::import::HISTORY_UNAVAILABLE))?;
         Ok(neutrino_consensus_types::evidence::EvidenceAnchor {
             chain_spec_hash: spec.hash(),
             chunk_id,
@@ -104,8 +164,19 @@ impl<DB: Database> Engine<DB> {
             block_guest_vk_digest: programs.execution.block,
             evidence_guest_vk_digest: programs.execution.evidence,
             fact_guest_vk_digest: programs.execution.fact,
-            policy: spec.runtime,
+            unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+            chunk_size: spec.consensus.chunk_size,
         })
+    }
+
+    /// The governable runtime policy in force at the head state. Genesis
+    /// seeds it from the chain specification; governance replaces it.
+    #[must_use]
+    pub fn runtime_policy(&self) -> neutrino_default_runtime_core::RuntimePolicy {
+        self.state()
+            .get(neutrino_default_runtime_core::RUNTIME_POLICY_KEY)
+            .and_then(|bytes| borsh::from_slice(&bytes).ok())
+            .unwrap_or_default()
     }
 
     /// Snapshot a self-contained offence for proving outside the engine lock.
@@ -209,8 +280,8 @@ impl<DB: Database> Engine<DB> {
             chain_id: self.chain_spec().chain_id,
             block_height: height,
             block_gas_limit: gas_limit,
-            gas_price: self.chain_spec().runtime.gas_price,
             proposer_address: [0; 32],
+            participation: None,
             transactions: body
                 .transactions
                 .iter()
@@ -363,15 +434,21 @@ impl<DB: Database> Engine<DB> {
         end_hash: Hash,
         proof_system: &P,
     ) -> Result<PreparedConsensusChunk<P>, FinalizeError<DB::Error>> {
-        let programs = proof_system
-            .programs()
-            .ok_or(ProofError::Unsupported)?
-            .with_runtime(self.chain_spec().runtime_code_hash);
+        let guests = proof_system.programs().ok_or(ProofError::Unsupported)?;
+        let programs = guests.with_runtime(self.chain_spec().runtime_code_hash);
         let key = programs.execution.block;
         let (context, seed, _) = self.consensus_boundary(chunk_id)?;
         // A node can only prove chunks whose program set its backend holds;
-        // otherwise it follows by verification until the programs arrive.
-        if !proof_system.can_prove(&context.programs.guests()) {
+        // otherwise it follows by verification until the programs arrive. The
+        // consensus Guests are pinned: the backend must embed this chain's.
+        if self
+            .consensus_programs
+            .is_some_and(|pinned| pinned != guests.consensus)
+            || !proof_system.can_prove(&neutrino_consensus_types::history_proof::GuestPrograms {
+                execution: context.programs.execution,
+                consensus: guests.consensus,
+            })
+        {
             return Err(ProofError::Unsupported.into());
         }
         let start = chunk_id
@@ -439,7 +516,7 @@ impl<DB: Database> Engine<DB> {
             .ok_or(ProofError::InvalidWitness)?
             .header
             .state_root;
-        let post_state = self.consensus_rotation_witness(post_root, &context.active_validators)?;
+        let post_state = self.consensus_rotation_witness(post_root)?;
         let aggregate = AggregatedVote {
             aggregation_bits: neutrino_primitives::BitVec::default(),
             signature: [0; 96],
@@ -453,6 +530,7 @@ impl<DB: Database> Engine<DB> {
         let witness = ConsensusWitness {
             fact_guest_vk_digest: programs.execution.fact,
             evidence_guest_vk_digest: programs.execution.evidence,
+            consensus_programs: guests.consensus,
             chain_spec: self.chain_spec().clone(),
             context,
             seed,
@@ -504,18 +582,13 @@ impl<DB: Database> Engine<DB> {
     fn consensus_rotation_witness(
         &self,
         root: Hash,
-        validators: &[neutrino_primitives::Validator],
     ) -> Result<StateWitness, FinalizeError<DB::Error>> {
         let trie: Trie = Trie::from_persisted(
             root,
             self.store().iter_trie_nodes()?,
             self.store().iter_state_values()?,
         );
-        let index: neutrino_default_runtime_core::ValidatorRegistrations = trie
-            .get(neutrino_default_runtime_core::VALIDATOR_REGISTRATIONS_KEY)
-            .and_then(|bytes| borsh::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        let keys = neutrino_prover_chunk::rotation::witness_keys(validators, &index);
+        let keys = neutrino_prover_chunk::rotation::witness_keys();
         let mut nodes = BTreeMap::new();
         let mut values = BTreeMap::new();
         for key in &keys {

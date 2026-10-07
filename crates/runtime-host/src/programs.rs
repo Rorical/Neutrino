@@ -90,8 +90,8 @@ pub(crate) fn can_prove<P: Prover>(registry: &SharedRegistry<P>, guests: &GuestP
         guests.execution.fact,
         guests.execution.evidence,
         guests.execution.block,
-        guests.chunk,
-        guests.checkpoint,
+        guests.consensus.chunk,
+        guests.consensus.checkpoint,
     ]
     .iter()
     .all(|digest| registry.get(digest).is_some())

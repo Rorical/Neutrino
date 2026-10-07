@@ -113,7 +113,8 @@ impl LightClient {
                     spec,
                     trusted.boundary.programs,
                 ))
-            || trusted.chain != ChainBinding::from_spec(spec)
+            || trusted.chain != ChainBinding::new(spec, trusted.chain.consensus)
+            || !trusted.chain.is_complete()
             || !trusted.boundary.is_well_formed(&trusted.chain)
             || neutrino_prover_checkpoint::validate_domain(&ProofDomain {
                 chain: trusted.chain,

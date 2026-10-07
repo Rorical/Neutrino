@@ -105,8 +105,7 @@ impl<DB: Database> ChainStore<DB> {
                 "retention has no trusted history domain",
             ));
         };
-        if prefix.statement.chain
-            != neutrino_consensus_types::history_proof::ChainBinding::from_spec(spec)
+        if prefix.statement.chain != domain.chain
             || prefix.statement.start != domain.genesis_boundary(spec)
             || self.consensus_boundary(coverage)? != Some(prefix.statement.end)
             || info.pruned_before_chunk > coverage

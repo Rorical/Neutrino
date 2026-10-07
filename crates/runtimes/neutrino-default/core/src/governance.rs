@@ -21,8 +21,8 @@ use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 use neutrino_runtime_core::StateBackend;
 
 use crate::{
-    Account, Address, ProgramSet, ReceiptStatus, ScheduledUpgrade, UPGRADE_KEY, ValidatorSet,
-    load_account, load_validator_set, store_account,
+    Account, Address, ProgramSet, ReceiptStatus, RuntimePolicy, ScheduledUpgrade, UPGRADE_KEY,
+    ValidatorSet, load_account, load_validator_set, store_account, store_runtime_policy,
 };
 pub use neutrino_consensus_types::history_proof::ProgramArtifacts;
 
@@ -35,6 +35,8 @@ pub const GAS_VOTE_UPGRADE: u64 = 40_000;
 pub const DOMAIN_PROPOSE_UPGRADE: &[u8; 16] = b"NTRO/upg-propose";
 /// Domain tag of the Ed25519 vote signature.
 pub const DOMAIN_VOTE_UPGRADE: &[u8; 16] = b"NTRO/upg-vote\x00\x00\x00";
+/// Domain tag of the Ed25519 policy-proposal signature.
+pub const DOMAIN_PROPOSE_POLICY: &[u8; 16] = b"NTRO/pol-propose";
 /// Domain tag of the proposal identity hash.
 pub const DOMAIN_UPGRADE_PROPOSAL_ID: &[u8; 16] = b"NTRO/upg-prop-id";
 
@@ -97,6 +99,40 @@ pub struct ProposeUpgradeTx {
     pub signature: [u8; 64],
 }
 
+/// Propose a new [`RuntimePolicy`]. Enacted immediately when the vote reaches
+/// quorum; the new policy applies from the next block.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct ProposePolicyTx {
+    /// Active validator proposing and signing.
+    pub proposer: Address,
+    /// Policy to install.
+    pub policy: RuntimePolicy,
+    /// Proposer's expected next nonce.
+    pub nonce: u64,
+    /// Ed25519 signature over [`propose_policy_sig_message`].
+    pub signature: [u8; 64],
+}
+
+/// What a proposal enacts when it reaches quorum.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Borsh wire type held once per proposal; both variants are plain data copied once."
+)]
+pub enum ProposalAction {
+    /// Switch program sets at a chunk boundary (design 24, phases 1 to 3).
+    Programs {
+        /// Program set to activate.
+        programs: ProgramSet,
+        /// Artifacts behind the set.
+        artifacts: ProgramArtifacts,
+        /// First chunk executed under `programs`.
+        activate_at_chunk: u64,
+    },
+    /// Replace the governable runtime policy.
+    Policy(RuntimePolicy),
+}
+
 /// Vote for the open proposal identified by `proposal_id`. Signed by an active
 /// validator; weight is the voter's active stake at tally time.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
@@ -116,12 +152,8 @@ pub struct VoteUpgradeTx {
 pub struct UpgradeProposal {
     /// Proposing validator.
     pub proposer: Address,
-    /// Proposed program set.
-    pub programs: ProgramSet,
-    /// Artifacts behind the proposed set.
-    pub artifacts: ProgramArtifacts,
-    /// Requested activation chunk.
-    pub activate_at_chunk: u64,
+    /// What quorum enacts.
+    pub action: ProposalAction,
     /// Chunk the proposal was made in.
     pub proposed_at_chunk: u64,
     /// Validators that voted, sorted ascending, proposer included.
@@ -129,15 +161,10 @@ pub struct UpgradeProposal {
 }
 
 impl UpgradeProposal {
-    /// Identity bound by every vote; see [`upgrade_proposal_id`].
+    /// Identity bound by every vote; see [`proposal_id`].
     #[must_use]
     pub fn id(&self) -> [u8; 32] {
-        upgrade_proposal_id(
-            &self.proposer,
-            &self.programs,
-            &self.artifacts,
-            self.activate_at_chunk,
-        )
+        proposal_id(&self.proposer, &self.action)
     }
 
     /// Stake of the current active validators that voted.
@@ -157,14 +184,21 @@ impl UpgradeProposal {
     }
 
     /// `true` while the proposal is still open: its voting period has not
-    /// ended and it can still be enacted in time for its activation chunk.
+    /// ended and, for a program switch, it can still be enacted in time for
+    /// its activation chunk.
     #[must_use]
     pub fn is_live(&self, current_chunk: u64) -> bool {
         let in_voting_period = self
             .proposed_at_chunk
             .checked_add(UPGRADE_VOTING_PERIOD_CHUNKS)
             .is_some_and(|deadline| current_chunk <= deadline);
-        in_voting_period && activation_in_time(self.activate_at_chunk, current_chunk)
+        in_voting_period
+            && match self.action {
+                ProposalAction::Programs {
+                    activate_at_chunk, ..
+                } => activation_in_time(activate_at_chunk, current_chunk),
+                ProposalAction::Policy(_) => true,
+            }
     }
 }
 
@@ -177,22 +211,36 @@ pub struct UpgradeStatus {
     pub scheduled: Option<ScheduledUpgrade>,
 }
 
-/// `BLAKE3(DOMAIN_UPGRADE_PROPOSAL_ID || proposer || borsh(programs) ||
-/// borsh(artifacts) || activate_at_chunk_le)`.
+/// `BLAKE3(DOMAIN_UPGRADE_PROPOSAL_ID || proposer || borsh(action))`.
 #[must_use]
-pub fn upgrade_proposal_id(
-    proposer: &Address,
-    programs: &ProgramSet,
-    artifacts: &ProgramArtifacts,
-    activate_at_chunk: u64,
-) -> [u8; 32] {
+pub fn proposal_id(proposer: &Address, action: &ProposalAction) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN_UPGRADE_PROPOSAL_ID);
     hasher.update(proposer);
-    hasher.update(&borsh::to_vec(programs).expect("borsh encode ProgramSet never fails"));
-    hasher.update(&borsh::to_vec(artifacts).expect("borsh encode ProgramArtifacts never fails"));
-    hasher.update(&activate_at_chunk.to_le_bytes());
+    hasher.update(&borsh::to_vec(action).expect("borsh encode ProposalAction never fails"));
     *hasher.finalize().as_bytes()
+}
+
+impl ProposeUpgradeTx {
+    /// The action this transaction proposes.
+    #[must_use]
+    pub const fn action(&self) -> ProposalAction {
+        ProposalAction::Programs {
+            programs: self.programs,
+            artifacts: self.artifacts,
+            activate_at_chunk: self.activate_at_chunk,
+        }
+    }
+}
+
+/// Canonical payload signed by a policy proposer.
+#[must_use]
+pub fn propose_policy_sig_message(
+    chain_id: u64,
+    tx: &ProposePolicyTx,
+) -> [u8; PROPOSE_UPGRADE_SIG_MSG_LEN] {
+    let id = proposal_id(&tx.proposer, &ProposalAction::Policy(tx.policy));
+    bound_message(DOMAIN_PROPOSE_POLICY, chain_id, &tx.proposer, &id, tx.nonce)
 }
 
 /// Canonical payload signed by a proposer.
@@ -201,12 +249,7 @@ pub fn propose_upgrade_sig_message(
     chain_id: u64,
     tx: &ProposeUpgradeTx,
 ) -> [u8; PROPOSE_UPGRADE_SIG_MSG_LEN] {
-    let id = upgrade_proposal_id(
-        &tx.proposer,
-        &tx.programs,
-        &tx.artifacts,
-        tx.activate_at_chunk,
-    );
+    let id = proposal_id(&tx.proposer, &tx.action());
     bound_message(
         DOMAIN_PROPOSE_UPGRADE,
         chain_id,
@@ -448,14 +491,70 @@ fn check_propose<B: StateBackend>(
     {
         return Err(ReceiptStatus::InvalidUpgrade);
     }
-    let authorized = authorize_signer(
+    check_new_proposal(
         state,
-        &tx.proposer,
-        tx.nonce,
+        current_chunk,
         block_height,
         fee,
+        &tx.proposer,
+        tx.nonce,
         &propose_upgrade_sig_message(chain_id, tx),
         &tx.signature,
+    )
+}
+
+/// Checks of a policy proposal. `fixed` is `(unbonding_delay_blocks,
+/// chunk_size)` from the anchor at execution; admission knows neither and
+/// checks only the structural bounds.
+fn check_propose_policy<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    current_chunk: Option<u64>,
+    block_height: Option<u64>,
+    fixed: Option<(u64, u64)>,
+    fee: u128,
+    tx: &ProposePolicyTx,
+) -> Result<(Account, ValidatorSet), ReceiptStatus> {
+    let valid = match fixed {
+        Some((unbonding, chunk_size)) => tx.policy.is_valid_for(unbonding, chunk_size),
+        None => tx.policy.is_well_formed(),
+    };
+    if !valid {
+        return Err(ReceiptStatus::InvalidUpgrade);
+    }
+    check_new_proposal(
+        state,
+        current_chunk,
+        block_height,
+        fee,
+        &tx.proposer,
+        tx.nonce,
+        &propose_policy_sig_message(chain_id, tx),
+        &tx.signature,
+    )
+}
+
+/// Signer authorization plus the single-slot rule shared by every proposal
+/// kind.
+#[allow(clippy::too_many_arguments)]
+fn check_new_proposal<B: StateBackend>(
+    state: &mut B,
+    current_chunk: Option<u64>,
+    block_height: Option<u64>,
+    fee: u128,
+    proposer: &Address,
+    nonce: u64,
+    message: &[u8],
+    signature: &[u8; 64],
+) -> Result<(Account, ValidatorSet), ReceiptStatus> {
+    let authorized = authorize_signer(
+        state,
+        proposer,
+        nonce,
+        block_height,
+        fee,
+        message,
+        signature,
     )?;
     // One decision in flight at a time. An enacted switch awaiting its
     // boundary is never displaced. A live proposal is displaced only by a
@@ -472,7 +571,7 @@ fn check_propose<B: StateBackend>(
             let proposer_stake = set
                 .entries
                 .iter()
-                .find(|entry| entry.address == tx.proposer)
+                .find(|entry| entry.address == *proposer)
                 .map_or(0, |entry| entry.stake);
             if proposer_stake <= open.voted_stake(set) {
                 return Err(ReceiptStatus::UpgradeConflict);
@@ -534,9 +633,53 @@ pub fn apply_propose<B: StateBackend>(
     store_account(state, &tx.proposer, &account);
     let proposal = UpgradeProposal {
         proposer: tx.proposer,
-        programs: tx.programs,
-        artifacts: tx.artifacts,
-        activate_at_chunk: tx.activate_at_chunk,
+        action: tx.action(),
+        proposed_at_chunk: current_chunk,
+        voters: alloc::vec![tx.proposer],
+    };
+    settle(state, &proposal, &set);
+    Ok(())
+}
+
+/// Mempool admission for a policy proposal; see [`validate_propose`].
+pub fn validate_propose_policy<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    fee: u128,
+    tx: &ProposePolicyTx,
+) -> TxValidity {
+    match check_propose_policy(state, chain_id, None, None, None, fee, tx) {
+        Ok(_) => TxValidity::valid(0),
+        Err(status) => validity(status),
+    }
+}
+
+/// Execute a policy proposal; `fixed` is `(unbonding_delay_blocks,
+/// chunk_size)` from the authenticated anchor.
+pub fn apply_propose_policy<B: StateBackend>(
+    state: &mut B,
+    chain_id: u64,
+    current_chunk: u64,
+    block_height: u64,
+    fixed: (u64, u64),
+    fee: u128,
+    tx: &ProposePolicyTx,
+) -> Result<(), ReceiptStatus> {
+    let (mut account, set) = check_propose_policy(
+        state,
+        chain_id,
+        Some(current_chunk),
+        Some(block_height),
+        Some(fixed),
+        fee,
+        tx,
+    )?;
+    account.balance -= fee;
+    account.nonce = account.nonce.saturating_add(1);
+    store_account(state, &tx.proposer, &account);
+    let proposal = UpgradeProposal {
+        proposer: tx.proposer,
+        action: ProposalAction::Policy(tx.policy),
         proposed_at_chunk: current_chunk,
         voters: alloc::vec![tx.proposer],
     };
@@ -575,19 +718,26 @@ pub fn apply_vote<B: StateBackend>(
 
 /// Enact when quorum is reached, otherwise keep the proposal open.
 fn settle<B: StateBackend>(state: &mut B, proposal: &UpgradeProposal, set: &ValidatorSet) {
-    if proposal.quorum_reached(set) {
-        store_scheduled(
+    if !proposal.quorum_reached(set) {
+        store_proposal(state, proposal);
+        return;
+    }
+    match proposal.action {
+        ProposalAction::Programs {
+            programs,
+            artifacts,
+            activate_at_chunk,
+        } => store_scheduled(
             state,
             &ScheduledUpgrade {
-                activate_at_chunk: proposal.activate_at_chunk,
-                programs: proposal.programs,
-                artifacts: proposal.artifacts,
+                activate_at_chunk,
+                programs,
+                artifacts,
             },
-        );
-        state.delete(UPGRADE_PROPOSAL_KEY);
-    } else {
-        store_proposal(state, proposal);
+        ),
+        ProposalAction::Policy(policy) => store_runtime_policy(state, &policy),
     }
+    state.delete(UPGRADE_PROPOSAL_KEY);
 }
 
 #[cfg(test)]
@@ -619,8 +769,6 @@ mod tests {
                 evidence: [tag + 1; 8],
                 block: [tag + 2; 8],
             },
-            chunk: [tag + 3; 8],
-            checkpoint: [tag + 4; 8],
         }
     }
 
@@ -678,6 +826,49 @@ mod tests {
         Transaction::VoteUpgrade(tx)
     }
 
+    fn propose_policy(sk: &SigningKey, policy: RuntimePolicy, nonce: u64) -> Transaction {
+        let mut tx = ProposePolicyTx {
+            proposer: sk.verifying_key().to_bytes(),
+            policy,
+            nonce,
+            signature: [0; 64],
+        };
+        tx.signature = sk
+            .sign(&propose_policy_sig_message(CHAIN_ID, &tx))
+            .to_bytes();
+        Transaction::ProposePolicy(tx)
+    }
+
+    /// Apply `input` and return the output with the committed post-state.
+    fn commit(live: &LiveTrie, input: &StfInput) -> (crate::StfPublicOutput, LiveTrie) {
+        let mut tracer = TracingState::new(live);
+        let out = apply_block(input, &mut tracer);
+        let (post, _) = tracer.into_committed_and_witness();
+        (out, LiveTrie::from_trie(post))
+    }
+
+    fn balance(live: &LiveTrie, sk: &SigningKey) -> u128 {
+        live.get(&account_key(&sk.verifying_key().to_bytes()))
+            .and_then(|bytes| crate::decode_account(&bytes))
+            .unwrap_or_default()
+            .balance
+    }
+
+    fn programs_action(programs: ProgramSet, activate_at_chunk: u64) -> ProposalAction {
+        ProposalAction::Programs {
+            programs,
+            artifacts: ProgramArtifacts::default(),
+            activate_at_chunk,
+        }
+    }
+
+    fn proposed_programs(proposal: &UpgradeProposal) -> Option<ProgramSet> {
+        match proposal.action {
+            ProposalAction::Programs { programs, .. } => Some(programs),
+            ProposalAction::Policy(_) => None,
+        }
+    }
+
     fn block(chunk: u64, transactions: Vec<Transaction>) -> StfInput {
         StfInput {
             evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor {
@@ -687,8 +878,8 @@ mod tests {
             chain_id: CHAIN_ID,
             block_height: chunk * 4 + 1,
             block_gas_limit: 30_000_000,
-            gas_price: 1,
             proposer_address: [0; 32],
+            participation: None,
             transactions,
         }
     }
@@ -732,14 +923,91 @@ mod tests {
     }
 
     #[test]
+    fn policy_proposals_enact_through_the_same_quorum_and_reprice_the_next_block() {
+        let (a, b, c) = (key(1), key(2), key(3));
+        let live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
+        let anchor = neutrino_consensus_types::evidence::EvidenceAnchor::default();
+        let policy = RuntimePolicy {
+            gas_price: 5,
+            evidence_max_age_blocks: 777,
+            ..RuntimePolicy::default()
+        };
+        assert!(policy.is_valid_for(anchor.unbonding_delay_blocks, anchor.chunk_size));
+
+        // Policies the genesis facts or the structural bounds reject never
+        // open a proposal, even from the largest validator.
+        let too_old = RuntimePolicy {
+            evidence_max_age_blocks: anchor.unbonding_delay_blocks - anchor.chunk_size,
+            ..policy
+        };
+        let no_queue = RuntimePolicy {
+            evidence_max_pending: 0,
+            ..policy
+        };
+        let (applied, failed, pending) = run(
+            &live,
+            &block(
+                0,
+                vec![
+                    propose_policy(&a, too_old, 0),
+                    propose_policy(&a, no_queue, 0),
+                ],
+            ),
+        );
+        assert_eq!((applied, failed), (0, 2));
+        assert_eq!(pending.proposal, None);
+
+        // A valid proposal waits for quorum like a program upgrade and does
+        // not touch the policy in force.
+        let (out, live) = commit(&live, &block(0, vec![propose_policy(&a, policy, 0)]));
+        assert_eq!((out.applied, out.failed), (1, 0));
+        assert_eq!(out.gas_price, 0);
+        let mut view = TracingState::new(&live);
+        let proposal = status(&mut view).proposal.unwrap();
+        assert_eq!(proposal.action, ProposalAction::Policy(policy));
+        assert_eq!(
+            proposal.id(),
+            proposal_id(
+                &a.verifying_key().to_bytes(),
+                &ProposalAction::Policy(policy)
+            )
+        );
+        assert_eq!(
+            crate::load_runtime_policy(&mut view),
+            RuntimePolicy::default()
+        );
+
+        // The vote that crosses two thirds installs the policy at once and
+        // leaves no schedule behind; the block itself was still priced under
+        // the old policy.
+        let (out, live) = commit(&live, &block(0, vec![vote(&b, proposal.id(), 0)]));
+        assert_eq!((out.applied, out.failed), (1, 0));
+        assert_eq!(out.gas_price, 0);
+        let mut view = TracingState::new(&live);
+        assert_eq!(status(&mut view), UpgradeStatus::default());
+        assert_eq!(crate::load_runtime_policy(&mut view), policy);
+
+        // The next block charges fees at the governed rate.
+        let before = balance(&live, &c);
+        let (out, live) = commit(
+            &live,
+            &block(0, vec![propose_policy(&c, RuntimePolicy::default(), 0)]),
+        );
+        assert_eq!((out.applied, out.failed), (1, 0));
+        assert_eq!(out.gas_price, 5);
+        assert_eq!(
+            balance(&live, &c),
+            before - u128::from(GAS_PROPOSE_UPGRADE) * 5
+        );
+    }
+
+    #[test]
     fn votes_accumulate_by_stake_until_two_thirds() {
         let (a, b, c) = (key(1), key(2), key(3));
         let mut live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
-        let proposal_id = upgrade_proposal_id(
+        let proposal_id = proposal_id(
             &a.verifying_key().to_bytes(),
-            &programs(9),
-            &ProgramArtifacts::default(),
-            5,
+            &programs_action(programs(9), 5),
         );
         let (applied, _, status) = run(&live, &block(0, vec![propose(&a, programs(9), 5, 0)]));
         assert_eq!(applied, 1);
@@ -776,7 +1044,7 @@ mod tests {
         let (a, b) = (key(1), key(2));
         let mut live = live(&[(&a, 50), (&b, 50)]);
         let mut incomplete = programs(3);
-        incomplete.chunk = [0; 8];
+        incomplete.execution.block = [0; 8];
         let (applied, failed, _) = run(
             &live,
             &block(
@@ -794,16 +1062,17 @@ mod tests {
         // A dead proposal is replaced in the same block that expires it.
         let stale = UpgradeProposal {
             proposer: a.verifying_key().to_bytes(),
-            programs: programs(3),
-            artifacts: ProgramArtifacts::default(),
-            activate_at_chunk: 2,
+            action: programs_action(programs(3), 2),
             proposed_at_chunk: 0,
             voters: vec![a.verifying_key().to_bytes()],
         };
         live.insert(UPGRADE_PROPOSAL_KEY, borsh::to_vec(&stale).unwrap());
         let (applied, _, status) = run(&live, &block(4, vec![propose(&b, programs(4), 6, 0)]));
         assert_eq!(applied, 1);
-        assert_eq!(status.proposal.map(|p| p.programs), Some(programs(4)));
+        assert_eq!(
+            status.proposal.as_ref().and_then(proposed_programs),
+            Some(programs(4))
+        );
         // A pending enacted switch blocks new proposals until consumed.
         live.insert(
             UPGRADE_KEY,
@@ -841,7 +1110,7 @@ mod tests {
         );
         assert_eq!((applied, failed), (1, 1));
         let open = status.proposal.unwrap();
-        assert_eq!(open.programs, programs(5));
+        assert_eq!(proposed_programs(&open), Some(programs(5)));
         assert_eq!(open.voters, vec![big.verifying_key().to_bytes()]);
         live.insert(UPGRADE_PROPOSAL_KEY, borsh::to_vec(&open).unwrap());
         // 60 of 100 already votes for it; 30 cannot displace, 60 + 30 enacts.
@@ -902,7 +1171,10 @@ mod tests {
             ),
         );
         assert_eq!(applied, 1);
-        assert_eq!(status.proposal.map(|p| p.programs), Some(programs(4)));
+        assert_eq!(
+            status.proposal.as_ref().and_then(proposed_programs),
+            Some(programs(4))
+        );
     }
 
     #[test]

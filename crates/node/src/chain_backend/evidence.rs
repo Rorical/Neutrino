@@ -131,7 +131,7 @@ where
                 .and_then(|id| id.checked_add(1))
                 .and_then(|n| n.checked_mul(engine.chain_spec().consensus.chunk_size))
                 .unwrap_or(0);
-            let max_age = engine.chain_spec().runtime.evidence_max_age_blocks;
+            let max_age = engine.runtime_policy().evidence_max_age_blocks;
             if let Err(error) = engine
                 .store_mut()
                 .prune_evidence_artifacts(finalized_height, max_age)
@@ -167,7 +167,7 @@ where
                         .head_height()
                         .saturating_add(1)
                         .saturating_sub(witness.source.chunk.end_height)
-                        <= engine.chain_spec().runtime.evidence_max_age_blocks
+                        <= engine.runtime_policy().evidence_max_age_blocks
                         && !existing
                             .iter()
                             .any(|item| item.statement.facts_commitment == facts)
@@ -184,7 +184,7 @@ where
                     .head_height()
                     .saturating_add(1)
                     .saturating_sub(source.chunk.end_height)
-                    > engine.chain_spec().runtime.evidence_max_age_blocks
+                    > engine.runtime_policy().evidence_max_age_blocks
                 {
                     continue;
                 }
@@ -258,15 +258,16 @@ where
             {
                 return Err(Rejected);
             }
+            let max_age = engine.runtime_policy().evidence_max_age_blocks;
             if artifact.statement.context.end_height >= height
-                || height - artifact.statement.context.end_height
-                    > anchor.policy.evidence_max_age_blocks
+                || height - artifact.statement.context.end_height > max_age
             {
                 return Err(Deferred);
             }
             match engine.evidence_submission(artifact.statement.clone()) {
                 Ok(submission)
-                    if submission.binds(engine.chain_spec().chain_id, height, &anchor) =>
+                    if submission.binds(engine.chain_spec().chain_id, height, &anchor)
+                        && submission.within_age(height, max_age) =>
                 {
                     Ok(anchor.evidence_guest_vk_digest)
                 }
@@ -318,7 +319,7 @@ where
                 .get(QUEUE_KEY)
                 .and_then(|bytes| borsh::from_slice(&bytes).ok())
                 .unwrap_or_default();
-            let policy = engine.chain_spec().runtime;
+            let policy = engine.runtime_policy();
             let mut selected = 0_usize;
             let mut bytes = 0_usize;
             for artifact in engine.store().evidence_artifacts().unwrap_or_default() {
@@ -335,7 +336,9 @@ where
                 let Ok(submission) = engine.evidence_submission(artifact.statement.clone()) else {
                     continue;
                 };
-                if !submission.binds(engine.chain_spec().chain_id, height, &anchor) {
+                if !submission.binds(engine.chain_spec().chain_id, height, &anchor)
+                    || !submission.within_age(height, policy.evidence_max_age_blocks)
+                {
                     continue;
                 }
                 if !artifact.binds(

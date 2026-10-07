@@ -664,7 +664,8 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
         history_root: neutrino_consensus_types::history::history_root(&leaves),
         block_guest_vk_digest: [1; 8],
         evidence_guest_vk_digest: [2; 8],
-        policy: spec.runtime,
+        unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
+        chunk_size: spec.consensus.chunk_size,
     };
     let submission = EvidenceSubmission {
         statement: claim,
@@ -673,8 +674,9 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
     assert!(submission.binds(7, 2, &anchor));
     assert!(!submission.binds(8, 2, &anchor));
     assert!(!submission.binds(7, 1, &anchor));
-    assert!(submission.binds(7, 1 + anchor.policy.evidence_max_age_blocks, &anchor));
-    assert!(!submission.binds(7, 2 + anchor.policy.evidence_max_age_blocks, &anchor));
+    let max_age = spec.runtime.evidence_max_age_blocks;
+    assert!(submission.within_age(1 + max_age, max_age));
+    assert!(!submission.within_age(2 + max_age, max_age));
     let mut wrong = anchor;
     wrong.chain_spec_hash[0] ^= 1;
     assert!(!submission.binds(7, 2, &wrong));

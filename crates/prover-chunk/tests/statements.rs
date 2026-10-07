@@ -5,9 +5,7 @@ use neutrino_consensus_types::{
     FinalityVotePhase, Header,
 };
 use neutrino_crypto::bls::SecretKey;
-use neutrino_default_runtime_core::{
-    StfPublicOutput, ValidatorRegistration, ValidatorRegistrations, ValidatorSet,
-};
+use neutrino_default_runtime_core::StfPublicOutput;
 use neutrino_primitives::{
     BitVec, ConsensusParams, DOMAIN_PROPOSER_SIG, Validator, fixed_u128_from_integer,
 };
@@ -59,10 +57,8 @@ fn context() -> ExecutionContext {
                 evidence: [2; 8],
                 block: [1; 8],
             },
-            chunk: [7; 8],
-            checkpoint: [8; 8],
         },
-        gas_price: 9,
+        participation: neutrino_consensus_types::participation::NO_PARTICIPATION,
         active_validators: vec![validator()],
         history_root: commitment(&Vec::<u8>::new()),
     }
@@ -101,7 +97,6 @@ fn block(height: u64, parent: [u8; 32], state: [u8; 32]) -> ProvenBlock {
         block_program: context.programs.execution.block,
         gas_used: header.gas_used,
         gas_limit: header.gas_limit,
-        gas_price: context.gas_price,
         proposer_address: validator().withdrawal_credentials,
         runtime_extra: header.runtime_extra,
     };
@@ -111,8 +106,9 @@ fn block(height: u64, parent: [u8; 32], state: [u8; 32]) -> ProvenBlock {
         chain_id: context.chain_id,
         block_height: height,
         block_gas_limit: header.gas_limit,
-        gas_price: context.gas_price,
+        gas_price: 0,
         proposer_address: public_inputs.proposer_address,
+        participation: neutrino_consensus_types::participation::NO_PARTICIPATION,
         transactions_root: header.transactions_root,
         transaction_summary:
             neutrino_default_runtime_core::commitments::TransactionSummary::default(),
@@ -159,7 +155,6 @@ fn binds_headers_and_all_inner_execution_fields() {
         |b| b.output.block_height += 1,
         |b| b.output.gas_used += 1,
         |b| b.output.block_gas_limit += 1,
-        |b| b.output.gas_price += 1,
         |b| b.output.proposer_address[0] ^= 1,
         |b| b.public_inputs.block_hash[0] ^= 1,
         |b| b.public_inputs.vm_code_hash[0] ^= 1,
@@ -403,18 +398,23 @@ fn verifies_header_signature_vrf_domain_and_threshold() {
 
 #[test]
 fn rotation_authenticates_possession_and_delays_activation_and_exit() {
+    use neutrino_default_runtime_core::{BlsIdentity, ConsensusCandidate, ConsensusCandidates};
     let key = SecretKey::key_gen(&[43; 32], &[]).unwrap();
-    let registration = ValidatorRegistration {
-        address: [12; 32],
-        bls_pubkey: key.public_key().to_bytes(),
+    let identity = BlsIdentity {
+        pubkey: key.public_key().to_bytes(),
         pop_signature: key.prove_possession().to_bytes(),
-        registered_at_height: 0,
     };
-    let mut index = ValidatorRegistrations::default();
-    index.insert([12; 32]);
-    let records = vec![registration];
-    let mut set = ValidatorSet::default();
-    set.upsert([12; 32], 300);
+    let candidate = |stake, identity| ConsensusCandidate {
+        address: [12; 32],
+        stake,
+        identity,
+    };
+    let with = |entry: ConsensusCandidate| {
+        let mut candidates = ConsensusCandidates::default();
+        candidates.upsert(entry);
+        candidates
+    };
+    let staked = with(candidate(300, Some(identity)));
     let params = ConsensusParams {
         epoch_length_in_chunks: 1,
         activation_delay_epochs: 2,
@@ -423,34 +423,31 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
     };
     let unbonding = params.chunk_size * 2;
     let initial = vec![validator()];
-    let next =
-        derive_next_validators(&initial, &set, &index, &records, &params, unbonding, 0).unwrap();
+    let next = derive_next_validators(&initial, &staked, &params, unbonding, 0).unwrap();
     assert_eq!(next.len(), 2);
     assert_eq!(next[1].activation_epoch, 3);
     assert_eq!(next[1].effective_stake, 0);
     // Seated identities are not registered again on later chunks.
-    let active =
-        derive_next_validators(&next, &set, &index, &records, &params, unbonding, 2).unwrap();
+    let active = derive_next_validators(&next, &staked, &params, unbonding, 2).unwrap();
     assert_eq!(active.len(), 2);
     assert_eq!(active[1].effective_stake, 300);
-    set.remove(&[12; 32]);
-    let exited = derive_next_validators(&active, &set, &index, &[], &params, unbonding, 3).unwrap();
+    // A zero candidate stake exits the seat.
+    let drained = with(candidate(0, Some(identity)));
+    let exited = derive_next_validators(&active, &drained, &params, unbonding, 3).unwrap();
     assert_eq!(exited[1].effective_stake, 0);
     assert_eq!(exited[1].exit_epoch, 6);
-    // While the runtime still lists the registration the entry stays seated,
+    // While the runtime still lists the candidate the entry stays seated,
     // however long ago it exited.
     let far = 6 + retirement_delay_chunks(&params, unbonding).unwrap() + 10;
-    let kept = derive_next_validators(&exited, &set, &index, &[], &params, unbonding, far).unwrap();
+    let kept = derive_next_validators(&exited, &drained, &params, unbonding, far).unwrap();
     assert_eq!(kept.len(), 2);
     // Once the runtime has withdrawn it, the exited entry is dropped after the
     // retirement delay but not before.
-    let empty = ValidatorRegistrations::default();
+    let empty = ConsensusCandidates::default();
     // `next_chunk` is `chunk_id + 1`; one chunk short of the delay keeps it.
-    let early =
-        derive_next_validators(&exited, &set, &empty, &[], &params, unbonding, far - 12).unwrap();
+    let early = derive_next_validators(&exited, &empty, &params, unbonding, far - 12).unwrap();
     assert_eq!(early.len(), 2);
-    let retired =
-        derive_next_validators(&exited, &set, &empty, &[], &params, unbonding, far).unwrap();
+    let retired = derive_next_validators(&exited, &empty, &params, unbonding, far).unwrap();
     assert_eq!(retired.len(), 1);
     assert_eq!(
         retired[0].withdrawal_credentials,
@@ -459,20 +456,30 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
     // A slashed identity is never retired and blocks re-registration of its key.
     let mut slashed = exited;
     slashed[1].slashed = true;
-    let kept =
-        derive_next_validators(&slashed, &set, &empty, &[], &params, unbonding, far).unwrap();
+    let kept = derive_next_validators(&slashed, &empty, &params, unbonding, far).unwrap();
     assert_eq!(kept.len(), 2);
-    let reseat =
-        derive_next_validators(&kept[..1], &set, &index, &records, &params, unbonding, far)
-            .unwrap();
+    let reseat = derive_next_validators(&kept[..1], &staked, &params, unbonding, far).unwrap();
     assert_eq!(reseat.len(), 2, "unslashed key may register again");
-    let blocked =
-        derive_next_validators(&kept, &set, &index, &records, &params, unbonding, far).unwrap();
+    let blocked = derive_next_validators(&kept, &staked, &params, unbonding, far).unwrap();
     assert_eq!(blocked.len(), 2, "slashed key cannot be seated twice");
-    let mut bad = records;
-    bad[0].pop_signature = [0; 96];
+    // An invalid possession proof never seats, and a candidate without an
+    // identity is a genesis validator's runtime record, not a registration.
+    let bad = with(candidate(
+        300,
+        Some(BlsIdentity {
+            pop_signature: [0; 96],
+            ..identity
+        }),
+    ));
     assert_eq!(
-        derive_next_validators(&initial, &set, &index, &bad, &params, unbonding, 0)
+        derive_next_validators(&initial, &bad, &params, unbonding, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    let anonymous = with(candidate(300, None));
+    assert_eq!(
+        derive_next_validators(&initial, &anonymous, &params, unbonding, 0)
             .unwrap()
             .len(),
         1
@@ -941,26 +948,26 @@ fn unlock_quorum_crypto_obeys_the_same_batched_and_direct_decision() {
 
 #[test]
 fn exhausted_genesis_account_cannot_recover_declared_genesis_stake() {
-    use neutrino_default_runtime_core::{Validator as RuntimeValidator, validator_key};
-    use neutrino_prover_chunk::rotation::{rotate_from_witness, witness_keys_from};
-    use neutrino_runtime_core::{
-        StateBackend,
-        host::{LiveTrie, TracingState},
+    use neutrino_default_runtime_core::{
+        CONSENSUS_CANDIDATES_KEY, ConsensusCandidate, ConsensusCandidates,
     };
+    use neutrino_prover_chunk::rotation::{rotate_from_witness, witness_keys_from};
+    use neutrino_runtime_core::host::{LiveTrie, TracingState};
     let previous = vec![validator()];
+    // The runtime projects an exhausted record as an authenticated zero.
+    let mut candidates = ConsensusCandidates::default();
+    candidates.upsert(ConsensusCandidate {
+        address: previous[0].withdrawal_credentials,
+        stake: 0,
+        identity: None,
+    });
     let mut live = LiveTrie::default();
     live.insert(
-        &validator_key(&previous[0].withdrawal_credentials),
-        borsh::to_vec(&RuntimeValidator {
-            stake: 0,
-            active: false,
-        })
-        .unwrap(),
+        CONSENSUS_CANDIDATES_KEY,
+        borsh::to_vec(&candidates).unwrap(),
     );
     let mut state = TracingState::new(&live);
-    for key in witness_keys_from(&mut state, &previous) {
-        let _ = state.read(&key);
-    }
+    witness_keys_from(&mut state);
     let witness = state.into_witness();
     let next = rotate_from_witness(
         &previous,
@@ -972,28 +979,26 @@ fn exhausted_genesis_account_cannot_recover_declared_genesis_stake() {
     )
     .unwrap();
     assert_eq!(next[0].effective_stake, 0);
+    assert_ne!(next[0].exit_epoch, u64::MAX);
 }
 
 #[test]
 fn epoch_zero_registration_exits_even_with_zero_activation_delay() {
+    use neutrino_default_runtime_core::{ConsensusCandidate, ConsensusCandidates};
     let registered = validator();
-    let mut index = ValidatorRegistrations::default();
-    index.insert(registered.withdrawal_credentials);
+    let mut candidates = ConsensusCandidates::default();
+    candidates.upsert(ConsensusCandidate {
+        address: registered.withdrawal_credentials,
+        stake: 0,
+        identity: None,
+    });
     let params = ConsensusParams {
         epoch_length_in_chunks: 10,
         activation_delay_epochs: 0,
         ..ConsensusParams::default()
     };
-    let next = derive_next_validators(
-        &[registered],
-        &ValidatorSet::default(),
-        &index,
-        &[],
-        &params,
-        params.chunk_size,
-        0,
-    )
-    .unwrap();
+    let next =
+        derive_next_validators(&[registered], &candidates, &params, params.chunk_size, 0).unwrap();
     assert_eq!(next[0].effective_stake, 0);
     assert_eq!(next[0].exit_epoch, params.exit_delay_epochs);
 }

@@ -17,6 +17,7 @@ pub use candidate::BftCandidate;
 pub mod evidence;
 pub mod history;
 pub mod history_proof;
+pub mod participation;
 pub mod signed_artifacts;
 pub use history_proof::{Checkpoint, HistoryProof, HistoryStatement};
 
@@ -708,10 +709,6 @@ pub struct BlockProofPublicInputs {
     /// against `header.gas_limit` so the proof's STF input cannot
     /// declare a different limit than the header committed to.
     pub gas_limit: u64,
-    /// Native-token cost per gas unit the runtime applied. Bound to
-    /// the chain-spec's `runtime.gas_price` through the proof's STF
-    /// input so a malicious prover cannot quietly disable fees.
-    pub gas_price: u128,
     /// Runtime account that received this block's accumulated fees.
     /// Bound to `active_validator_set[header.proposer_index].withdrawal_credentials`
     /// so a malicious prover cannot redirect fees to a different
@@ -1011,7 +1008,6 @@ mod tests {
                         block_program: [56; 8],
                         gas_used: 0,
                         gas_limit: 1_000_000,
-                        gas_price: 0,
                         proposer_address: [0u8; 32],
                         runtime_extra: hash(57),
                     },
@@ -1060,7 +1056,6 @@ mod tests {
             block_program: [63; 8],
             gas_used: 0,
             gas_limit: 1_000_000,
-            gas_price: 0,
             proposer_address: [0u8; 32],
             runtime_extra: hash(64),
         };

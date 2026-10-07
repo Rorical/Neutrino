@@ -47,7 +47,7 @@ impl ProofSystem for NativeConsensusBackend {
     }
 
     fn programs(&self) -> Option<neutrino_consensus_types::history_proof::GuestPrograms> {
-        Some(support::programs([1; 8], [4; 32]).guests())
+        Some(support::guests([1; 8], [4; 32]))
     }
 
     // Transparent native witness receipts are test-only. Production uses the
@@ -144,7 +144,7 @@ impl ProofSystem for NativeConsensusBackend {
 fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
     let (mut witness, _, _) = support::fixture([1; 8], [4; 32]);
     let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let block = &witness.blocks[0];
     let hash = block.header.hash();
     engine
@@ -256,7 +256,7 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     use neutrino_network::{Topic, service::NetworkCommand};
     use neutrino_sync::SyncBackend;
     let (mut engine, witness) = engine();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let (decisions, receiver) = mpsc::channel();
     decisions.send(true).unwrap();
     let prover = NativeConsensusBackend {
@@ -359,7 +359,7 @@ fn cached_candidate_fixture() -> (
     neutrino_consensus_types::Chunk,
 ) {
     let (mut engine, witness) = engine();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let first = witness.blocks[0].header.hash();
     let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
     let mut sibling = neutrino_consensus_types::Block {
@@ -408,7 +408,7 @@ fn cached_candidate_fixture() -> (
         .unwrap();
     let mut reopened = Engine::open(witness.chain_spec, engine.store().db().clone()).unwrap();
     // A restarted node re-pins its Guests from the proof backend before use.
-    reopened.set_programs(support::programs([1; 8], [4; 32]).guests());
+    reopened.set_programs(support::guests([1; 8], [4; 32]));
     (reopened, first_chunk, second_chunk)
 }
 
@@ -564,7 +564,7 @@ async fn historical_long_range_evidence_requires_the_finalized_canonical_hash_af
         FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
     };
     let (mut engine, witness) = engine();
-    engine.set_programs(support::programs([1; 8], [4; 32]).guests());
+    engine.set_programs(support::guests([1; 8], [4; 32]));
     let prover = ready_prover();
     let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
     let finalized = engine.finalize_chunk(0, &prover, &voter).unwrap();
@@ -668,7 +668,7 @@ async fn rpc_queries_follow_committed_roots_across_finality_forks_and_restart() 
     );
     let spec = witness.chain_spec.clone();
     let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
-    engine.set_programs(support::programs([1; 8], spec.runtime_code_hash).guests());
+    engine.set_programs(support::guests([1; 8], spec.runtime_code_hash));
     engine.replace_state_with_reconstructed(live.trie().clone());
     engine.flush_trie_to_store().unwrap();
     let prover = ready_prover();
@@ -1058,7 +1058,7 @@ async fn imported_finality_selects_a_proven_archived_fork_and_survives_restart()
         .signing_message(DOMAIN_PROPOSER_SIG, &local.hash());
     local.header.signature = key.sign(&message).to_bytes();
     let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
-    follower.set_programs(support::programs([1; 8], [4; 32]).guests());
+    follower.set_programs(support::guests([1; 8], [4; 32]));
     follower.import_block(&local).unwrap();
     follower.import_block(&remote).unwrap();
     let proof = producer

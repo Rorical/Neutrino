@@ -88,7 +88,13 @@ fn domain_of(job: &Job) -> ProofDomain {
 
 fn job(start: u64, end: u64) -> Job {
     let spec = spec();
-    let chain = ChainBinding::from_spec(&spec);
+    let chain = ChainBinding::new(
+        &spec,
+        neutrino_consensus_types::history_proof::ConsensusPrograms {
+            chunk: [4; 8],
+            checkpoint: [5; 8],
+        },
+    );
     let programs = neutrino_consensus_types::history_proof::ProgramSet {
         runtime_code_hash: spec.runtime_code_hash,
         execution: ExecutionPrograms {
@@ -96,8 +102,6 @@ fn job(start: u64, end: u64) -> Job {
             evidence: [2; 8],
             block: [3; 8],
         },
-        chunk: [4; 8],
-        checkpoint: [5; 8],
     };
     let boundary = |count| {
         let mut boundary = ConsensusBoundary::genesis(&spec, programs);

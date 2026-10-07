@@ -27,11 +27,15 @@ where
             evidence: [2; 8],
             block: [3; 8],
         },
-        chunk: [4; 8],
-        checkpoint: [5; 8],
     };
     let origin = Checkpoint {
-        chain: ChainBinding::from_spec(&spec),
+        chain: ChainBinding::new(
+            &spec,
+            neutrino_consensus_types::history_proof::ConsensusPrograms {
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
+        ),
         boundary: ConsensusBoundary::genesis(&spec, programs),
     };
     let backend = ChainBackend::new(

@@ -852,7 +852,10 @@ mod tests {
             chain_id: 7,
             chain_spec_hash: [1; 32],
             chunk_size: 1,
-            gas_price: 0,
+            consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
         };
         let boundary = |count| ConsensusBoundary {
             next_chunk_id: count,
@@ -870,9 +873,8 @@ mod tests {
                     evidence: [2; 8],
                     block: [3; 8],
                 },
-                chunk: [4; 8],
-                checkpoint: [5; 8],
             },
+            participation: [8; 32],
         };
         HistoryProof {
             statement: HistoryStatement {

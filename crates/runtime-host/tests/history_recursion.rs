@@ -17,6 +17,7 @@ use neutrino_prover_chunk::consensus::{
     ConsensusWitness, as_chunk, validate_candidate, validate_consensus,
     validate_consensus_with_context,
 };
+use neutrino_runtime_core::host::{LiveTrie, TracingState};
 use neutrino_runtime_host::{
     ProgramProver, Sp1BlockProof, Sp1ProofSystem, proof_system::Sp1ChunkProof,
 };
@@ -27,8 +28,10 @@ use sp1_sdk::{
 
 fn execution_fixture() -> (ChainBinding, Vec<ConsensusStatement>) {
     let (first, input, _) = support::fixture([1; 8], [4; 32]);
-    let second = empty_successor(&first, &input).0;
-    let (third, _) = empty_successor(&second, &input);
+    // The fixture's single empty block leaves the empty genesis trie untouched.
+    let live = LiveTrie::default();
+    let (second, input, _, live) = empty_successor(&first, &input, &live);
+    let (third, _, _, _) = empty_successor(&second, &input, &live);
     let statements = [first, second, third]
         .iter()
         .map(|witness| validate_consensus(witness).unwrap())
@@ -132,6 +135,7 @@ fn production_history_verification_rejects_mock_receipts() {
     );
     let domain = system.history_domain(&witness.chain_spec).unwrap();
     let mut statement = validate_consensus(&witness).unwrap();
+    statement.chain = domain.chain;
     statement.start.programs = domain.programs;
     statement.end.programs = domain.programs;
     let input = fold_input(domain.chain, None, &[statement]);
@@ -161,12 +165,19 @@ fn production_history_verification_rejects_mock_receipts() {
     );
 }
 
-/// Advance an empty, one-block chunk without changing its state trie.
+/// Advance an empty, one-block chunk, executing its block over `prior_state`
+/// so the participation record it writes is reflected in every root.
 #[allow(clippy::too_many_lines)]
 fn empty_successor(
     first: &ConsensusWitness,
     prior_input: &neutrino_default_runtime_core::StfInput,
-) -> (ConsensusWitness, neutrino_default_runtime_core::StfInput) {
+    prior_state: &LiveTrie,
+) -> (
+    ConsensusWitness,
+    neutrino_default_runtime_core::StfInput,
+    neutrino_runtime_abi::StateWitness,
+    LiveTrie,
+) {
     use neutrino_consensus_types::{FinalityVoteData, FinalityVotePhase};
     use neutrino_crypto::bls::SecretKey;
     use neutrino_primitives::DOMAIN_PROPOSER_SIG;
@@ -195,13 +206,31 @@ fn empty_successor(
     input.block_height = validated.statement.end.height + 1;
     input.evidence_anchor.chunk_id = next.context.chunk_id;
     input.evidence_anchor.history_root = next.context.history_root;
+    // Every block of the next chunk reports the certificate just verified.
+    input.participation =
+        neutrino_consensus_types::participation::ParticipationReport::from_certificate(
+            validated.statement.chunk.chunk_id,
+            &first.context.active_validators,
+            &first.finality_cert.precommit.aggregation_bits,
+        );
+    let mut tracing = TracingState::new(prior_state);
+    let output = neutrino_default_runtime_core::apply_block(&input, &mut tracing);
+    let (post_state, execution_witness) = tracing.into_committed_and_witness();
+    let post_live = LiveTrie::from_trie(post_state);
+    assert_eq!(output.participation, next.context.participation);
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     let block = &mut next.blocks[0];
+    block.output = output.clone();
     block.header.height = input.block_height;
     block.header.slot += 1;
     block.header.parent_hash = next.context.parent_block_hash;
     block.header.timestamp = next.chain_spec.genesis_time
         + next.chain_spec.consensus.slot_duration_secs * block.header.slot;
+    block.header.state_root = output.post_state_root;
+    block.header.transactions_root = output.transactions_root;
+    block.header.receipts_root = output.receipts_root;
+    block.header.gas_used = output.gas_used;
+    block.header.runtime_extra = output.validator_set_root;
     block.header.vrf_proof = key
         .sign(&neutrino_vrf::vrf_message(
             next.chain_spec.consensus_domain(),
@@ -217,8 +246,15 @@ fn empty_successor(
     block.public_inputs.height = input.block_height;
     block.public_inputs.parent_block_hash = block.header.parent_hash;
     block.public_inputs.block_hash = block.header.hash();
-    block.output.block_height = input.block_height;
-    block.output.accountability.anchor = input.evidence_anchor;
+    block.public_inputs.state_root_before = output.pre_state_root;
+    block.public_inputs.state_root_after = output.post_state_root;
+    block.public_inputs.transactions_root = output.transactions_root;
+    block.public_inputs.receipt_root = output.receipts_root;
+    block.public_inputs.gas_used = output.gas_used;
+    block.public_inputs.runtime_extra = output.validator_set_root;
+    let mut trace = TracingState::new(&post_live);
+    neutrino_prover_chunk::rotation::witness_keys_from(&mut trace);
+    next.post_state = trace.into_witness();
     let chunk = as_chunk(&validate_candidate(&next).unwrap().execution.chunk);
     next.finality_cert.chunk_id = chunk.chunk_id;
     next.finality_cert.chunk_hash = chunk.hash();
@@ -263,7 +299,7 @@ fn empty_successor(
     claim.signature = key
         .sign(&claim.signing_message(next.chain_spec.consensus_domain()))
         .to_bytes();
-    (next, input)
+    (next, input, execution_witness, post_live)
 }
 
 fn cached_stage<T: BorshDeserialize + BorshSerialize>(
@@ -298,14 +334,17 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
         std::path::PathBuf::from,
     );
     let cache = acceptance::AcceptanceCache::new(directory).unwrap();
-    let (mut witness, mut input, state) = support::fixture(
+    let (mut witness, mut input, mut state) = support::fixture(
         system.verifying_key().hash_u32(),
         neutrino_runtime_host::default_runtime_code_hash(),
     );
+    // The fixture's single empty block leaves the empty genesis trie untouched.
+    let mut live = LiveTrie::default();
     witness.context.programs = system
         .programs()
         .unwrap()
         .with_runtime(neutrino_runtime_host::default_runtime_code_hash());
+    witness.consensus_programs = system.programs().unwrap().consensus;
     witness.fact_guest_vk_digest = witness.context.programs.execution.fact;
     witness.evidence_guest_vk_digest = witness.context.programs.execution.evidence;
     input.evidence_anchor.fact_guest_vk_digest = witness.fact_guest_vk_digest;
@@ -356,7 +395,7 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
             || system.prove_consensus_chunk(&[block], &witness),
         );
         chunks.push(chunk);
-        (witness, input) = empty_successor(&witness, &input);
+        (witness, input, state, live) = empty_successor(&witness, &input, &live);
     }
     let base = save_fold(&system, &verifier, &cache, &spec, None, &chunks[..1]);
     let appended = save_fold(
@@ -410,11 +449,14 @@ fn real_pipeline<P: ProgramProver>(prover: P) {
     let mut wrong = parent.clone();
     wrong.statement.end.state_root[0] ^= 1;
     assert!(verifier.verify_history(&spec, &wrong, &genesis).is_err());
-    // A receipt never selects its own key: a statement naming another start
-    // program set is rejected against the trusted start, and a verifier that
-    // trusts that other set takes the digest path and must fail there too.
+    // A receipt never selects its own key: a statement naming another chain
+    // binding is rejected outright, and one whose start program set differs
+    // from the trusted start is rejected against that start.
+    let mut wrong = parent.clone();
+    wrong.statement.chain.consensus.checkpoint[0] ^= 1;
+    assert!(verifier.verify_history(&spec, &wrong, &genesis).is_err());
     let mut wrong = parent;
-    wrong.statement.start.programs.checkpoint[0] ^= 1;
+    wrong.statement.start.programs.execution.block[0] ^= 1;
     assert!(verifier.verify_history(&spec, &wrong, &genesis).is_err());
     assert!(
         verifier

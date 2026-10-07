@@ -175,7 +175,6 @@ mod wasm_abi {
     /// ```text
     ///    8B  chain_id (little-endian u64)
     ///    8B  block_gas_limit (little-endian u64)
-    ///   16B  gas_price (little-endian u128)
     ///   N    borsh-encoded Transaction bytes
     /// ```
     ///
@@ -188,8 +187,8 @@ mod wasm_abi {
     /// pointer, low 32 bits = output length (always
     /// [`neutrino_runtime_abi::TX_VALIDITY_ENCODED_LEN`]).
     /// Header length of the `_neutrino_validate_tx` envelope:
-    /// 8 (`chain_id`) + 8 (`block_gas_limit`) + 16 (`gas_price`).
-    const VALIDATE_TX_HEADER_LEN: usize = 8 + 8 + 16;
+    /// 8 (`chain_id`) + 8 (`block_gas_limit`). The fee rate is runtime state.
+    const VALIDATE_TX_HEADER_LEN: usize = 8 + 8;
 
     #[unsafe(no_mangle)]
     extern "C" fn _neutrino_validate_tx(in_ptr: u32, in_len: u32) -> u64 {
@@ -206,12 +205,9 @@ mod wasm_abi {
             let mut gas_buf = [0u8; 8];
             gas_buf.copy_from_slice(&bytes[8..16]);
             let block_gas_limit = u64::from_le_bytes(gas_buf);
-            let mut price_buf = [0u8; 16];
-            price_buf.copy_from_slice(&bytes[16..32]);
-            let gas_price = u128::from_le_bytes(price_buf);
             let tx_bytes = &bytes[VALIDATE_TX_HEADER_LEN..];
             let mut backend = WasmHostBackend;
-            core_validate_tx(tx_bytes, &mut backend, chain_id, block_gas_limit, gas_price)
+            core_validate_tx(tx_bytes, &mut backend, chain_id, block_gas_limit)
         };
 
         let encoded = validity.encode();
@@ -277,7 +273,6 @@ mod wasm_abi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_default_runtime_core::VALIDATOR_SET_KEY;
     use neutrino_runtime_abi::StateWitness;
     use neutrino_runtime_core::empty_state_root;
 
@@ -288,21 +283,23 @@ mod tests {
             chain_id: 1,
             block_height: 1,
             block_gas_limit: 30_000_000,
-            gas_price: 0,
             proposer_address: [0u8; 32],
+            participation: None,
             transactions: alloc::vec![],
         };
-        // Even an empty block reads the validator-set key for the canonical
-        // `validator_set_root` commitment, the mandatory sanction queue and
-        // the two governance records, so the witness must list them; the
-        // values are absent so every read returns `None`.
+        // Even an empty block reads the consensus candidate record for the
+        // canonical `validator_set_root` commitment, the mandatory sanction
+        // queue, the runtime policy and the two governance records, so the
+        // witness must list them; the values are absent so every read
+        // returns `None`.
         let witness = StateWitness {
             pre_state_root: empty_state_root(),
             nodes: alloc::vec![],
             values: alloc::vec![],
             witnessed_keys: alloc::vec![
-                VALIDATOR_SET_KEY.to_vec(),
+                neutrino_default_runtime_core::CONSENSUS_CANDIDATES_KEY.to_vec(),
                 neutrino_default_runtime_core::accountability::QUEUE_KEY.to_vec(),
+                neutrino_default_runtime_core::RUNTIME_POLICY_KEY.to_vec(),
                 neutrino_default_runtime_core::UPGRADE_KEY.to_vec(),
                 neutrino_default_runtime_core::governance::UPGRADE_PROPOSAL_KEY.to_vec(),
             ],

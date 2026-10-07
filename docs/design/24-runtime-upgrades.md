@@ -223,7 +223,12 @@ sanction amounts. `ProposePolicyTx` opens a proposal whose action is
 `ProposalAction::Policy`; quorum writes the new policy and it applies from the next
 block. Genesis seeds the record from the chain specification's `[runtime]` values,
 and the STF, the mempool admission path and the node's evidence selection all read it
-from state, so a policy change needs no new programs.
+from state, so a policy change needs no new programs. A policy whose
+`evidence_max_pending` is below the live mandatory queue can neither be proposed into
+force nor enacted by the vote reaching quorum: that vote fails and the proposal stays
+open, because the STF treats a queue longer than the bound as an invariant violation.
+Offence replay markers are retained for the unbonding delay rather than for the
+governable window, so widening the window never resurrects a swept offence.
 
 What stays fixed at genesis, because consensus or proof identity depends on it: the
 chain identity and genesis commitments, every `ConsensusParams` field (slot duration,

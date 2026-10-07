@@ -66,23 +66,29 @@ pub fn offence_key(id: &Hash) -> Vec<u8> {
     key
 }
 
-/// Bucket listing the offence IDs admitted at `height`. The block at
-/// `height + evidence_max_age_blocks + 1` deletes the bucket and every
-/// listed status key; by then no claim with those IDs can bind.
+/// Bucket listing the offence IDs admitted at `height`.
+///
+/// The block at `height + unbonding_delay_blocks + 1` deletes the bucket and
+/// every listed status key. The unbonding delay is fixed at genesis and
+/// exceeds every evidence window governance may ever set, so a swept offence
+/// can never bind again, however the window changes in between.
 pub fn expiry_key(height: u64) -> Vec<u8> {
     let mut key = Vec::from(&b"accountability:expiry:v1:"[..]);
     key.extend_from_slice(&height.to_be_bytes());
     key
 }
 
-/// Delete the markers admitted at the height whose window closed this block.
+/// Delete the markers admitted one unbonding delay before this block.
 ///
-/// Markers older than the window can no longer collide with a bindable
-/// claim. The sweep is bounded by that block's admission cap and is
-/// mandatory, so it carries no gas.
-fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, max_age: u64) {
+/// A claim admitted at height `h` ends before `h`, so under any policy it is
+/// bindable at most until `h + evidence_max_age_blocks`, which the genesis
+/// rule `evidence_max_age_blocks + chunk_size < unbonding_delay_blocks`
+/// keeps below the sweep height. Retention therefore never depends on the
+/// governable window. The sweep is bounded by that block's admission cap
+/// and is mandatory, so it carries no gas.
+fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, retention: u64) {
     let Some(expired) = height
-        .checked_sub(max_age)
+        .checked_sub(retention)
         .and_then(|height| height.checked_sub(1))
     else {
         return;
@@ -236,7 +242,11 @@ pub(crate) fn apply<B: StateBackend>(
         "queue bound"
     );
     let before = commitment(&queue);
-    sweep_expired_markers(state, input.block_height, policy.evidence_max_age_blocks);
+    sweep_expired_markers(
+        state,
+        input.block_height,
+        input.evidence_anchor.unbonding_delay_blocks,
+    );
     let admitted = collect_admissions(input, state);
     let execution_count =
         (queue.len() + admitted.len()).min(policy.evidence_executions_per_block as usize);
@@ -456,8 +466,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn offence_marker_is_swept_once_its_admission_window_closes() {
+    fn offence_marker_is_swept_after_the_unbonding_delay_not_the_window() {
         let mut input = input();
+        // Retention follows the genesis-fixed unbonding delay, so a later
+        // policy that widens the five-block window can never rebind an offence
+        // whose marker was already swept.
+        input.evidence_anchor.chunk_size = 1;
+        input.evidence_anchor.unbonding_delay_blocks = 8;
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let mut live = LiveTrie::default();
         seed_policy(&mut live, |policy| policy.evidence_max_age_blocks = 5);
@@ -477,20 +492,21 @@ pub(crate) mod tests {
         assert_eq!(bucket, vec![[1; 32]]);
         let admitted_at = input.block_height;
         let (post, _) = state.into_committed_and_witness();
-        // The last block inside the window keeps the marker.
+        // The window closes after five blocks but the marker stays for the
+        // whole unbonding delay.
         let live = LiveTrie::from_trie(post);
         let mut state = TracingState::new(&live);
         input.transactions.clear();
-        input.block_height = admitted_at + 5;
+        input.block_height = admitted_at + 8;
         crate::apply_block(&input, &mut state);
         assert!(state.read(&offence_key(&[1; 32])).is_some());
         assert!(state.read(&expiry_key(admitted_at)).is_some());
         let (post, _) = state.into_committed_and_witness();
-        // The first block past the window sweeps the bucket and its markers,
-        // and the Guest replays the same deletions from the witness.
+        // The first block past the unbonding delay sweeps the bucket and its
+        // markers, and the Guest replays the same deletions from the witness.
         let live = LiveTrie::from_trie(post);
         let mut state = TracingState::new(&live);
-        input.block_height = admitted_at + 6;
+        input.block_height = admitted_at + 9;
         let output = crate::apply_block(&input, &mut state);
         assert!(state.read(&offence_key(&[1; 32])).is_none());
         assert!(state.read(&expiry_key(admitted_at)).is_none());

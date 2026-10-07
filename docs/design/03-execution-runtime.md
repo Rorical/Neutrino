@@ -22,8 +22,10 @@ under `consensus:participation`, so reward and liveness economics are runtime ru
 
 `SubmitEvidence` is admitted through the verified evidence path rather than ordinary
 mempool precheck. The STF authenticates historical openings and records admitted
-offence IDs for the admission window; each block sweeps the markers its height can no
-longer collide with. Pending sanctions hold withdrawal collateral. Each block
+offence IDs for one unbonding delay, which is fixed at genesis and exceeds every
+evidence window governance may set, so a swept offence can never bind again; each
+block sweeps the markers admitted one delay before it. Pending sanctions hold
+withdrawal collateral. Each block
 executes the mandatory FIFO prefix before ordinary transactions, reserving gas.
 Deductions are internal operations, not unsigned user transaction variants.
 

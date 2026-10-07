@@ -516,7 +516,9 @@ fn check_propose_policy<B: StateBackend>(
     tx: &ProposePolicyTx,
 ) -> Result<(Account, ValidatorSet), ReceiptStatus> {
     let valid = match fixed {
-        Some((unbonding, chunk_size)) => tx.policy.is_valid_for(unbonding, chunk_size),
+        Some((unbonding, chunk_size)) => {
+            tx.policy.is_valid_for(unbonding, chunk_size) && policy_enactable(state, &tx.policy)
+        }
         None => tx.policy.is_well_formed(),
     };
     if !valid {
@@ -532,6 +534,14 @@ fn check_propose_policy<B: StateBackend>(
         &propose_policy_sig_message(chain_id, tx),
         &tx.signature,
     )
+}
+
+/// A policy may take effect only if the mandatory sanction queue already
+/// fits its capacity: the STF treats a queue longer than
+/// `evidence_max_pending` as an invariant violation, so enacting a smaller
+/// bound over a longer backlog would stop every block.
+fn policy_enactable<B: StateBackend>(state: &mut B, policy: &RuntimePolicy) -> bool {
+    crate::accountability::load_queue(state).len() <= policy.evidence_max_pending as usize
 }
 
 /// Signer authorization plus the single-slot rule shared by every proposal
@@ -704,14 +714,23 @@ pub fn apply_vote<B: StateBackend>(
         fee,
         tx,
     )?;
-    account.balance -= fee;
-    account.nonce = account.nonce.saturating_add(1);
-    store_account(state, &tx.voter, &account);
     let index = proposal
         .voters
         .binary_search(&tx.voter)
         .unwrap_or_else(|index| index);
     proposal.voters.insert(index, tx.voter);
+    // The vote that would enact a policy the live queue no longer fits fails
+    // instead; the proposal stays open and the vote can be cast once the
+    // mandatory queue has drained.
+    if let ProposalAction::Policy(policy) = proposal.action
+        && proposal.quorum_reached(&set)
+        && !policy_enactable(state, &policy)
+    {
+        return Err(ReceiptStatus::InvalidUpgrade);
+    }
+    account.balance -= fee;
+    account.nonce = account.nonce.saturating_add(1);
+    store_account(state, &tx.voter, &account);
     settle(state, &proposal, &set);
     Ok(())
 }
@@ -998,6 +1017,63 @@ mod tests {
         assert_eq!(
             balance(&live, &c),
             before - u128::from(GAS_PROPOSE_UPGRADE) * 5
+        );
+    }
+
+    #[test]
+    fn policies_cannot_shrink_the_queue_bound_below_the_live_backlog() {
+        let (a, b, c) = (key(1), key(2), key(3));
+        let live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
+        let narrow = RuntimePolicy {
+            evidence_max_pending: 1,
+            evidence_admissions_per_block: 1,
+            evidence_executions_per_block: 1,
+            ..RuntimePolicy::default()
+        };
+        // Twenty queued sanctions outlast one block of mandatory executions.
+        let backlog: Vec<crate::accountability::PendingSanction> = (0..20)
+            .map(|tag| crate::accountability::PendingSanction {
+                sanction: crate::accountability::Sanction {
+                    offence_id: [tag; 32],
+                    offender: neutrino_primitives::Validator {
+                        pubkey: [tag; 48],
+                        withdrawal_credentials: [tag; 32],
+                        effective_stake: 1,
+                        slashed: false,
+                        activation_epoch: 0,
+                        exit_epoch: u64::MAX,
+                        last_active_chunk: 0,
+                    },
+                    kind: neutrino_consensus_types::evidence::SanctionKind::Slash,
+                },
+                amount: 1,
+            })
+            .collect();
+        let queue = borsh::to_vec(&backlog).unwrap();
+        // The bound cannot be proposed into force over a longer backlog.
+        let mut backlogged = live.clone();
+        backlogged.insert(crate::accountability::QUEUE_KEY, queue.clone());
+        let (applied, failed, pending) =
+            run(&backlogged, &block(0, vec![propose_policy(&a, narrow, 0)]));
+        assert_eq!((applied, failed), (0, 1));
+        assert_eq!(pending.proposal, None);
+        // Proposed while the queue was empty, it cannot be enacted by the vote
+        // that reaches quorum once a backlog has built up; the proposal stays
+        // open for a later vote.
+        let (_, mut opened) = commit(&live, &block(0, vec![propose_policy(&b, narrow, 0)]));
+        opened.insert(crate::accountability::QUEUE_KEY, queue);
+        let narrow_id = proposal_id(
+            &b.verifying_key().to_bytes(),
+            &ProposalAction::Policy(narrow),
+        );
+        // Stakes 30 + 40 of 100 reach quorum, so this vote would enact.
+        let (applied, failed, pending) = run(&opened, &block(0, vec![vote(&a, narrow_id, 0)]));
+        assert_eq!((applied, failed), (0, 1));
+        assert!(pending.proposal.is_some());
+        let mut view = TracingState::new(&opened);
+        assert_eq!(
+            crate::load_runtime_policy(&mut view),
+            RuntimePolicy::default()
         );
     }
 

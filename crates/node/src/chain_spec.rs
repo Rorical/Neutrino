@@ -140,13 +140,10 @@ pub struct ChainSpecFile {
     #[serde(default)]
     pub unbonding_delay_blocks: Option<u64>,
     /// Liveness evidence admission window after the source chunk ends.
+    /// Safety evidence has no window: it binds while the offender still holds
+    /// slashable balance.
     #[serde(default)]
     pub evidence_max_age_blocks: Option<u64>,
-    /// Safety evidence admission window after the source chunk ends. Fixed
-    /// at genesis; bounds the weak-subjectivity period and the historical
-    /// records nodes retain.
-    #[serde(default)]
-    pub safety_evidence_max_age_blocks: Option<u64>,
     /// Maximum pending mandatory sanctions.
     #[serde(default)]
     pub evidence_max_pending: Option<u32>,
@@ -215,9 +212,6 @@ impl ChainSpecFile {
         }
         if let Some(value) = self.evidence_max_age_blocks {
             runtime.evidence_max_age_blocks = value;
-        }
-        if let Some(value) = self.safety_evidence_max_age_blocks {
-            runtime.safety_evidence_max_age_blocks = value;
         }
         if let Some(value) = self.evidence_max_pending {
             runtime.evidence_max_pending = value;

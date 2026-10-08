@@ -116,7 +116,6 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
     let runtime = RuntimeParams {
         unbonding_delay_blocks: UNBONDING_DELAY_BLOCKS,
         evidence_max_age_blocks: 2,
-        safety_evidence_max_age_blocks: 2,
         ..RuntimeParams::default()
     };
     live.insert(

@@ -57,20 +57,24 @@ have passed.
   History coverage never gates chunk finality. Read `docs/design/21-recursive-checkpoint-proofs.md`
   before changing recursion, history storage or light-client trust policy.
 - Historical consensus references and liveness evidence are restricted to the
-  preceding eight finalized chunks. Safety evidence (`SanctionKind::Slash`) uses the
-  genesis-fixed `safety_evidence_max_age_blocks` instead (thirteen days by default;
-  `safety + chunk_size < unbonding_delay_blocks`; weak subjectivity may not exceed it),
-  and full/validator nodes keep historical records and their tree paths for
-  `safety_history_window_chunks`. Everything else prunes below saved recursive
-  coverage past the eight-chunk window; archive nodes preserve history. Proof jobs pin
-  receipts and boundaries, not old transaction bodies or execution state. Current
-  sanctions remain live state: a safety admission tombstones the BLS identity, a
-  liveness admission marks the offence, and both markers are swept one unbonding
-  delay after admission. A safety identity is accountable once end to end: the
-  node pools at most one safety receipt per identity under the current program,
-  does not verify, store or prove reports against a tombstoned or pooled identity,
-  and a finalized safety admission (`FinalizedSlashes`) releases every pooled
-  receipt and raw report against that key.
+  preceding eight finalized chunks. Safety evidence (`SanctionKind::Slash`) has no
+  age window: it cites any finalized chunk and the runtime admits it while the
+  offender's address still holds slashable balance (`is_accountable`: active stake
+  or unmatured unbonding). The unbonding delay is therefore the accountability
+  horizon: `evidence_max_age_blocks < unbonding_delay_blocks > chunk_size`, and
+  weak subjectivity may not exceed it. The history tree is never pruned, so any
+  record's path stays openable; full/validator nodes keep complete historical
+  records for `history_record_window_chunks` (one unbonding delay) and everything
+  else prunes below saved recursive coverage past the eight-chunk window; archive
+  nodes preserve history. Proof jobs pin receipts and boundaries, not old
+  transaction bodies or execution state. Current sanctions remain live state: a
+  safety admission writes a permanent BLS-identity tombstone (consensus never seats
+  the identity again), a liveness admission marks the offence and that marker is
+  swept one unbonding delay after admission. A safety identity is accountable once
+  end to end: the node pools at most one safety receipt per identity under the
+  current program, does not verify, store or prove reports against a tombstoned,
+  pooled or fully withdrawn identity, and a finalized safety admission
+  (`FinalizedSlashes`) releases every pooled receipt and raw report against that key.
 - Full/validator snapshot bootstrap verifies a genesis History prefix and an exact
   bridge from local trust, then authenticates validators, recent history and the
   complete execution state before durable atomic installation. Archive nodes replay
@@ -89,8 +93,8 @@ have passed.
   whose commitment travels in the boundary; economic rules never enter the Guests.
   Governable runtime policy (fee rate, the liveness evidence window, sanction amounts)
   is runtime state under `runtime:policy`, seeded from the spec at genesis and changed
-  only by governance; unbonding delay, the safety evidence window, chunk size and all
-  consensus parameters stay in the spec.
+  only by governance; unbonding delay, chunk size and all consensus parameters stay
+  in the spec.
   Receipts are verified under the program set of their start boundary, never one the
   receipt names itself. Upgrade governance is runtime state (`governance` module of the
   default runtime); artifacts travel in the block body's program lane and are installed

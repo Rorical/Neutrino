@@ -665,7 +665,6 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
         block_guest_vk_digest: [1; 8],
         evidence_guest_vk_digest: [2; 8],
         unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
-        safety_evidence_max_age_blocks: spec.runtime.safety_evidence_max_age_blocks,
         chunk_size: spec.consensus.chunk_size,
     };
     let submission = EvidenceSubmission {
@@ -676,8 +675,13 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
     assert!(!submission.binds(8, 2, &anchor));
     assert!(!submission.binds(7, 1, &anchor));
     let max_age = spec.runtime.evidence_max_age_blocks;
-    assert!(submission.within_age(1 + max_age, max_age));
-    assert!(!submission.within_age(2 + max_age, max_age));
+    // A safety claim has no age window; a liveness claim about the same
+    // context expires with the governable window.
+    assert!(submission.within_age(2 + max_age, max_age));
+    let mut liveness = submission.clone();
+    liveness.statement.kind = neutrino_consensus_types::evidence::SanctionKind::Inactivity;
+    assert!(liveness.within_age(1 + max_age, max_age));
+    assert!(!liveness.within_age(2 + max_age, max_age));
     let mut wrong = anchor;
     wrong.chain_spec_hash[0] ^= 1;
     assert!(!submission.binds(7, 2, &wrong));

@@ -165,30 +165,32 @@ impl<DB: Database> Engine<DB> {
             evidence_guest_vk_digest: programs.execution.evidence,
             fact_guest_vk_digest: programs.execution.fact,
             unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
-            safety_evidence_max_age_blocks: spec.runtime.safety_evidence_max_age_blocks,
             chunk_size: spec.consensus.chunk_size,
         })
     }
 
-    /// Preceding finalized chunks whose historical records this node keeps
-    /// so any still-admissible safety claim can be opened: the eight-chunk
-    /// liveness window or the safety window, whichever is longer.
+    /// Preceding finalized chunks whose complete historical records (validator
+    /// vector, seed, certificate) this node keeps so safety evidence can still
+    /// be constructed and raw reports verified locally: one unbonding delay,
+    /// never less than the eight-chunk liveness window.
     #[must_use]
-    pub const fn safety_history_window_chunks(&self) -> u64 {
+    pub const fn history_record_window_chunks(&self) -> u64 {
         let spec = self.chain_spec();
-        neutrino_consensus_types::history::safety_history_window_chunks(
-            spec.runtime.safety_evidence_max_age_blocks,
+        neutrino_consensus_types::history::history_record_window_chunks(
+            spec.runtime.unbonding_delay_blocks,
             spec.consensus.chunk_size,
         )
     }
 
-    /// Whether a finalized chunk is a source safety evidence may still cite.
+    /// Whether this node still keeps the complete historical record of a
+    /// finalized chunk. Receipts about older chunks stay admissible; rebinding
+    /// them needs only the never-pruned history tree.
     #[must_use]
-    pub fn in_safety_history_window(&self, chunk_id: u64) -> bool {
+    pub fn in_history_record_window(&self, chunk_id: u64) -> bool {
         neutrino_consensus_types::history::is_history_index_within(
             chunk_id,
             self.finalized_next_chunk_id(),
-            self.safety_history_window_chunks(),
+            self.history_record_window_chunks(),
         )
     }
 
@@ -214,9 +216,8 @@ impl<DB: Database> Engine<DB> {
             .block;
         let id = neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
             .map_err(|_| ProofError::InvalidWitness)?;
-        if !self.in_safety_history_window(id) {
-            return Err(ProofError::InvalidWitness.into());
-        }
+        // Proving needs the complete record; a chunk this node no longer
+        // retains can be proven by an archive, never here.
         let source = self
             .store()
             .historical_chunk(id)?
@@ -236,24 +237,27 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<neutrino_consensus_types::evidence::EvidenceSubmission, FinalizeError<DB::Error>>
     {
         let count = self.finalized_next_chunk_id();
+        let source = statement.context.chunk_id;
         let in_window = match statement.kind {
-            neutrino_consensus_types::evidence::SanctionKind::Slash => {
-                self.in_safety_history_window(statement.context.chunk_id)
-            }
+            // Any finalized chunk: the opening needs only the history tree,
+            // which is never pruned, so a receipt about a chunk whose record
+            // this node dropped long ago still rebinds here.
+            neutrino_consensus_types::evidence::SanctionKind::Slash => source < count,
             neutrino_consensus_types::evidence::SanctionKind::Inactivity => {
-                is_recent_history_index(statement.context.chunk_id, count)
+                is_recent_history_index(source, count)
             }
         };
         if !in_window {
             return Err(ProofError::InvalidWitness.into());
         }
-        let opening = self
-            .store()
-            .historical_opening(statement.context.chunk_id, count)?;
-        if opening.record.evidence_context() != statement.context {
-            return Err(ProofError::PublicInputMismatch.into());
-        }
-        let history = opening.path;
+        // The path is authenticated against the statement's own context, so a
+        // statement about a context that never was the canonical record fails
+        // here rather than in the block.
+        let history = self.store().history_path(
+            source,
+            count,
+            neutrino_consensus_types::evidence::commitment(&statement.context),
+        )?;
         Ok(neutrino_consensus_types::evidence::EvidenceSubmission { statement, history })
     }
 
@@ -354,9 +358,6 @@ impl<DB: Database> Engine<DB> {
         let source_id =
             neutrino_prover_chunk::history::evidence_chunk_id(self.chain_spec(), evidence)
                 .map_err(|_| ProofError::InvalidWitness)?;
-        if !self.in_safety_history_window(source_id) {
-            return Err(ProofError::InvalidWitness.into());
-        }
         let source = self
             .store()
             .historical_chunk(source_id)?

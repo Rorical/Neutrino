@@ -130,9 +130,9 @@ an opening for an older leaf count cannot be reused unchanged. It authenticates
 the historical validator context, not past inclusion of that particular vote.
 The vote's signature and attestation are checked separately. Liveness evidence
 admission enforces the same eight-chunk window plus the governable evidence-age
-window (1,024 blocks by default); safety evidence admission enforces only the
-genesis-fixed safety window (thirteen days by default), opening older records
-through the same fixed-depth path. See [evidence proofs](20-evidence-proofs.md).
+window (1,024 blocks by default); safety evidence admission enforces no age at
+all, only that the offender still holds slashable balance, opening any finalized
+record through the same fixed-depth path. See [evidence proofs](20-evidence-proofs.md).
 Raw data must still be available from a retaining node.
 A root or recursive proof cannot reconstruct deleted records. Fixed depth bounds
 work with respect to chain age; actual work still varies with current transactions,
@@ -206,11 +206,16 @@ The pruning batch removes old raw blocks, headers and their indices, execution
 witnesses, block/chunk receipts and certificates, obsolete historical records,
 frontiers, tree nodes, range proofs and checkpoint metadata. It retains the latest
 genesis-prefix receipt, current consensus boundary, the recent window, active proof
-dependencies and state reachable from retained roots. Finalized historical records
-and the tree paths that open them are the one exception to the eight-chunk window:
-they stay for `safety_history_window_chunks` so safety evidence can still be built
-and rebound (see [evidence proofs](20-evidence-proofs.md)); a path to a record
-inside a 64-level tree costs about 64 nodes regardless of its age. A history job leases only
+dependencies and state reachable from retained roots. Two things outlive the
+eight-chunk window. The history tree's nodes are never pruned, so the path opening
+any finalized record stays available and a safety receipt about any chunk can be
+rebound by a proposer that never kept the record; the filled part of the tree holds
+about two nodes per chunk. Complete historical records (validator vector, seed,
+certificate) stay for `history_record_window_chunks`, one unbonding delay, so safety
+evidence can still be built here from raw reports (see
+[evidence proofs](20-evidence-proofs.md)); older records come from archives. A
+path to a record inside a 64-level tree costs about 64 nodes regardless of its age.
+A history job leases only
 its Chunk receipts/statements/boundaries and progress receipt; it never requires old
 transaction bodies or old execution state and does not lower the raw-data watermark.
 Historical tree paths and the

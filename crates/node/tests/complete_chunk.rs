@@ -141,9 +141,37 @@ impl ProofSystem for NativeConsensusBackend {
     }
 }
 
+/// Genesis runtime state with a stake record for the fixture validator, as
+/// the node's genesis builder seeds for every validator with withdrawal
+/// credentials: a safety claim binds only to slashable balance.
+fn seeded_genesis_state() -> neutrino_runtime_core::host::LiveTrie {
+    let mut live = neutrino_runtime_core::host::LiveTrie::default();
+    live.insert(
+        &neutrino_default_runtime_core::validator_key(&[8; 32]),
+        neutrino_default_runtime_core::encode_validator(
+            &neutrino_default_runtime_core::Validator {
+                stake: 100,
+                active: true,
+            },
+        ),
+    );
+    live
+}
+
+/// A fresh engine at the fixture genesis with the seeded state installed.
+fn genesis_engine(spec: neutrino_primitives::ChainSpec) -> Engine<MemoryDatabase> {
+    let live = seeded_genesis_state();
+    let mut engine = Engine::genesis(spec, MemoryDatabase::new()).unwrap();
+    engine.replace_state_with_reconstructed(live.trie().clone());
+    engine.flush_trie_to_store().unwrap();
+    engine
+}
+
 fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
-    let (mut witness, _, _) = support::fixture([1; 8], [4; 32]);
-    let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    let live = seeded_genesis_state();
+    let (mut witness, _, _) =
+        support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, &live);
+    let mut engine = genesis_engine(witness.chain_spec.clone());
     engine.set_programs(support::guests([1; 8], [4; 32]));
     let block = &witness.blocks[0];
     let hash = block.header.hash();
@@ -1168,7 +1196,7 @@ async fn imported_finality_selects_a_proven_archived_fork_and_survives_restart()
         .consensus_domain()
         .signing_message(DOMAIN_PROPOSER_SIG, &local.hash());
     local.header.signature = key.sign(&message).to_bytes();
-    let mut follower = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    let mut follower = genesis_engine(witness.chain_spec.clone());
     follower.set_programs(support::guests([1; 8], [4; 32]));
     follower.import_block(&local).unwrap();
     follower.import_block(&remote).unwrap();

@@ -11,6 +11,7 @@ use neutrino_default_runtime_core::{
     accountability::{
         GAS_EVIDENCE_ADMISSION, PendingSanction, QUEUE_KEY, marker_key, offence_key, slashed_key,
     },
+    accountable_from_records, validator_key, withdrawal_key,
 };
 use neutrino_network::{Topic, service::NetworkCommand};
 use neutrino_proof_system::ProofSystem;
@@ -130,15 +131,16 @@ where
     }
 
     /// Raw signed-misconduct reports worth proving now, rotating through the
-    /// persistent raw pool so no report starves. Signature/proof checking is
-    /// expensive and happens in the worker; the content commitment deduplicates
-    /// queued copies and raw reports use the safety window.
+    /// persistent raw pool so no report starves, plus the reports that can
+    /// never be admitted again because the accused has nothing left at stake.
+    /// Signature/proof checking is expensive and happens in the worker; the
+    /// content commitment deduplicates queued copies. A raw report has no age:
+    /// a safety claim binds for as long as the identity holds slashable balance.
     fn raw_report_jobs(
         &self,
         engine: &neutrino_consensus_engine::Engine<DB>,
         pooled: &[EvidenceArtifact],
-        safety_max_age: u64,
-    ) -> Vec<EvidenceWitness> {
+    ) -> (Vec<EvidenceWitness>, Vec<neutrino_primitives::Hash>) {
         let anchor_program = engine
             .head_height()
             .checked_add(1)
@@ -147,7 +149,8 @@ where
         let raw = engine.store().iter_slashing_evidence().unwrap_or_default();
         let offset = self.evidence_job_cursor.fetch_add(8, Ordering::Relaxed);
         let mut witnesses = Vec::new();
-        for (_, evidence) in raw
+        let mut dead = Vec::new();
+        for (key, evidence) in raw
             .iter()
             .cycle()
             .skip(if raw.is_empty() {
@@ -163,29 +166,29 @@ where
             let Ok(witness) = engine.evidence_witness(evidence) else {
                 continue;
             };
-            let accused = witness
+            let Some(accused) = witness
                 .source
                 .validators
-                .get(evidence.offender_index() as usize);
-            if accused.is_none_or(|accused| {
-                safety_identity_covered(engine, pooled, anchor_program, &accused.pubkey, None)
-            }) {
+                .get(evidence.offender_index() as usize)
+            else {
+                continue;
+            };
+            if !accountable(engine, &accused.withdrawal_credentials) {
+                dead.push(*key);
+                continue;
+            }
+            if safety_identity_covered(engine, pooled, anchor_program, &accused.pubkey, None) {
                 continue;
             }
             let facts = neutrino_prover_chunk::execution::commitment(&witness.claim);
-            if engine
-                .head_height()
-                .saturating_add(1)
-                .saturating_sub(witness.source.chunk.end_height)
-                <= safety_max_age
-                && !pooled
-                    .iter()
-                    .any(|item| item.statement.facts_commitment == facts)
+            if !pooled
+                .iter()
+                .any(|item| item.statement.facts_commitment == facts)
             {
                 witnesses.push(witness);
             }
         }
-        witnesses
+        (witnesses, dead)
     }
 
     fn select_evidence_jobs(&self, block_key: [u32; 8]) -> Vec<EvidenceWitness> {
@@ -200,21 +203,39 @@ where
                 .and_then(|n| n.checked_mul(engine.chain_spec().consensus.chunk_size))
                 .unwrap_or(0);
             let max_age = engine.runtime_policy().evidence_max_age_blocks;
-            let safety_max_age = engine.chain_spec().runtime.safety_evidence_max_age_blocks;
-            if let Err(error) = engine.store_mut().prune_evidence_artifacts(
-                finalized_height,
-                max_age,
-                safety_max_age,
-            ) {
+            // Safety receipts have no age; they leave the pool when the
+            // identity has fully withdrawn and can never be sanctioned again.
+            let retired: std::collections::BTreeSet<neutrino_primitives::Hash> = engine
+                .store()
+                .evidence_artifacts()
+                .unwrap_or_default()
+                .iter()
+                .filter(|artifact| {
+                    artifact.statement.kind == SanctionKind::Slash
+                        && !accountable(engine, &artifact.statement.offender.withdrawal_credentials)
+                })
+                .map(EvidenceArtifact::statement_id)
+                .collect();
+            if let Err(error) =
+                engine
+                    .store_mut()
+                    .prune_evidence_artifacts(finalized_height, max_age, |artifact| {
+                        retired.contains(&artifact.statement_id())
+                    })
+            {
                 tracing::warn!(?error, "evidence pool pruning failed");
             }
-            let mut witnesses = Vec::new();
             let existing = engine.store().evidence_artifacts().unwrap_or_default();
+            let (mut witnesses, dead_reports) = self.raw_report_jobs(engine, &existing);
+            for key in &dead_reports {
+                if let Err(error) = engine.store_mut().delete_slashing_evidence(key) {
+                    tracing::warn!(?error, "dropping a retired raw report failed");
+                }
+            }
             let known = |id: &[u8; 32]| {
                 existing.iter().any(|item| item.statement.offence_id == *id)
                     || engine.state().get(&offence_key(id)).is_some()
             };
-            witnesses.extend(self.raw_report_jobs(engine, &existing, safety_max_age));
             for chunk_id in next_chunk.saturating_sub(HISTORY_RETENTION_CHUNKS)..next_chunk {
                 let Ok(Some(source)) = engine.store().historical_chunk(chunk_id) else {
                     continue;
@@ -292,23 +313,8 @@ where
             {
                 return Err(Rejected);
             }
-            let source = artifact.statement.context.chunk_id;
-            let in_window = match artifact.statement.kind {
-                SanctionKind::Slash => engine.in_safety_history_window(source),
-                SanctionKind::Inactivity => is_recent_history_index(source, anchor.chunk_id),
-            };
-            if source < anchor.chunk_id && !in_window {
-                return Err(Rejected);
-            }
-            let max_age = match artifact.statement.kind {
-                SanctionKind::Slash => anchor.safety_evidence_max_age_blocks,
-                SanctionKind::Inactivity => engine.runtime_policy().evidence_max_age_blocks,
-            };
-            if artifact.statement.context.end_height >= height
-                || height - artifact.statement.context.end_height > max_age
-            {
-                return Err(Deferred);
-            }
+            let max_age = engine.runtime_policy().evidence_max_age_blocks;
+            receipt_window(engine, &anchor, &artifact.statement, height, max_age)?;
             // A redundant receipt is not wrong, so relaying peers are not
             // penalised; it is simply not verified or stored.
             let pooled = engine.store().evidence_artifacts().unwrap_or_default();
@@ -328,9 +334,9 @@ where
                     Ok(anchor.evidence_guest_vk_digest)
                 }
                 Ok(_) => Err(Rejected),
-                // A record this node cannot open yet (for example right after
-                // a snapshot bootstrap that installed only the recent window)
-                // is a local gap, not a verdict on the artifact.
+                // A path this node cannot open yet (for example right after a
+                // snapshot bootstrap that installed only the recent tree) is a
+                // local gap, not a verdict on the artifact.
                 Err(_) => Err(Deferred),
             }
         });
@@ -388,17 +394,21 @@ where
                 }
                 // A tombstoned identity or an already admitted liveness
                 // offence cannot be admitted again; neither can a second safety
-                // claim against an identity selected earlier in this body.
+                // claim against an identity selected earlier in this body, nor
+                // a safety claim against an identity with nothing left at stake.
                 if engine
                     .state()
                     .get(&marker_key(&artifact.statement))
                     .is_some()
                     || (artifact.statement.kind == SanctionKind::Slash
-                        && body.evidence_proofs.iter().any(|selected| {
+                        && (!accountable(
+                            engine,
+                            &artifact.statement.offender.withdrawal_credentials,
+                        ) || body.evidence_proofs.iter().any(|selected| {
                             selected.statement.kind == SanctionKind::Slash
                                 && selected.statement.offender.pubkey
                                     == artifact.statement.offender.pubkey
-                        }))
+                        })))
                 {
                     continue;
                 }
@@ -406,10 +416,7 @@ where
                     continue;
                 };
                 if !submission.binds(engine.chain_spec().chain_id, height, &anchor)
-                    || !submission.within_age(
-                        height,
-                        submission.admissible_age(policy.evidence_max_age_blocks, &anchor),
-                    )
+                    || !submission.within_age(height, policy.evidence_max_age_blocks)
                 {
                     continue;
                 }
@@ -459,15 +466,61 @@ where
     }
 }
 
+/// Whether a receipt could be admitted at `height` as far as windows go. A
+/// safety receipt about any finalized chunk is admissible while the identity
+/// holds slashable balance; one about a chunk not yet finalized here, or an
+/// identity with nothing left, is not wrong and is deferred. A liveness
+/// receipt outside the eight-chunk rule can never bind and is rejected; one
+/// outside the governable age, or about the future, is deferred.
+fn receipt_window<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+    anchor: &neutrino_consensus_types::evidence::EvidenceAnchor,
+    statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+    height: u64,
+    max_age: u64,
+) -> Result<(), EvidenceProofAcceptance> {
+    use EvidenceProofAcceptance::{Deferred, Rejected};
+    let source = statement.context.chunk_id;
+    let end = statement.context.end_height;
+    match statement.kind {
+        SanctionKind::Slash => {
+            if source >= anchor.chunk_id
+                || end >= height
+                || !accountable(engine, &statement.offender.withdrawal_credentials)
+            {
+                return Err(Deferred);
+            }
+        }
+        SanctionKind::Inactivity => {
+            if source < anchor.chunk_id && !is_recent_history_index(source, anchor.chunk_id) {
+                return Err(Rejected);
+            }
+            if end >= height || height - end > max_age {
+                return Err(Deferred);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `address` still holds slashable balance at the head state: active
+/// stake or queued unbonding. This is the runtime's admissibility rule for
+/// safety evidence, read here without a state backend.
+fn accountable<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+    address: &neutrino_default_runtime_core::Address,
+) -> bool {
+    accountable_from_records(
+        engine.state().get(&validator_key(address)).as_deref(),
+        engine.state().get(&withdrawal_key(address)).as_deref(),
+    )
+}
+
 /// A safety identity is accountable once. A tombstone at the head, a finalized
-/// safety sanction, or a pooled safety receipt (other than `except`) that the
-/// next block could actually admit already covers every offence the identity
+/// safety sanction, or a pooled safety receipt (other than `except`) under the
+/// program the next block anchors already covers every offence the identity
 /// could still answer for, so further reports and receipts against it are
-/// redundant. A pooled receipt only counts while it is admissible: it must
-/// carry the program the next block anchors and still sit inside the safety
-/// window at that height. A receipt that has expired at the head but is not
-/// yet pruned at the finalized height, or one under a superseded program, must
-/// not shield the identity from a receipt that can be admitted.
+/// redundant. A receipt under a superseded program shields nothing.
 fn safety_identity_covered<DB: Database>(
     engine: &neutrino_consensus_engine::Engine<DB>,
     pooled: &[EvidenceArtifact],
@@ -475,24 +528,22 @@ fn safety_identity_covered<DB: Database>(
     pubkey: &neutrino_primitives::BlsPublicKey,
     except: Option<&neutrino_consensus_types::evidence::EvidenceStatement>,
 ) -> bool {
-    let height = engine.head_height().saturating_add(1);
-    let safety_max_age = engine.chain_spec().runtime.safety_evidence_max_age_blocks;
     engine.state().get(&slashed_key(pubkey)).is_some()
         || engine.store().is_identity_slashed(pubkey).unwrap_or(false)
         || pooled.iter().any(|item| {
             item.statement.kind == SanctionKind::Slash
                 && item.statement.offender.pubkey == *pubkey
                 && Some(item.evidence_guest_vk_digest) == anchor_program
-                && item.statement.context.end_height < height
-                && height - item.statement.context.end_height <= safety_max_age
                 && except.is_none_or(|statement| item.statement != *statement)
         })
 }
 
 /// Whether the head state, finalized history or the pool already covers what a
-/// receipt could admit: a liveness offence is admitted once, a safety identity
-/// is sanctioned once. The exact pooled statement is not redundant, so restarts
-/// and re-encodings still re-verify and answer `Accepted`.
+/// receipt could admit, or nothing is left to admit it against: a liveness
+/// offence is admitted once, a safety identity is sanctioned once and only
+/// while it holds slashable balance. The exact pooled statement is not
+/// redundant, so restarts and re-encodings still re-verify and answer
+/// `Accepted`.
 fn redundant_receipt<DB: Database>(
     engine: &neutrino_consensus_engine::Engine<DB>,
     pooled: &[EvidenceArtifact],
@@ -505,11 +556,12 @@ fn redundant_receipt<DB: Database>(
             .is_offence_finalized(&statement.offence_id)
             .unwrap_or(false)
         || (statement.kind == SanctionKind::Slash
-            && safety_identity_covered(
-                engine,
-                pooled,
-                anchor_program,
-                &statement.offender.pubkey,
-                Some(statement),
-            ))
+            && (!accountable(engine, &statement.offender.withdrawal_credentials)
+                || safety_identity_covered(
+                    engine,
+                    pooled,
+                    anchor_program,
+                    &statement.offender.pubkey,
+                    Some(statement),
+                )))
 }

@@ -174,7 +174,7 @@ There is one current unversioned format for chain specs, headers, proofs, storag
 and network paths. Existing
 nodes or databases must not silently interpret the new wire format.
 
-Two admission windows exist, selected by `SanctionKind`:
+Admissibility is selected by `SanctionKind`:
 
 - **Liveness evidence** (`Inactivity`) uses the governable
   `evidence_max_age_blocks` (default 1,024 blocks) and must additionally reference
@@ -184,54 +184,59 @@ Two admission windows exist, selected by `SanctionKind`:
   bounds ordinary embedded votes and chunk-witness historical reads.
 - **Safety evidence** (`Slash`: double proposals and votes, lock violations,
   invalid-proof acceptance, signed fork participation, DA fraud, invalid VRF
-  claims) uses the genesis-fixed `safety_evidence_max_age_blocks` (default
-  thirteen days, 280,800 blocks) carried in the `EvidenceAnchor`. Any finalized
-  source chunk whose last block is at most that many blocks behind the admitting
-  height is admissible; the fixed 64-level history opening costs the same at any
-  age. Governance cannot change this window because it bounds the
-  weak-subjectivity period and the historical records nodes must retain.
+  claims) has **no age window**. A safety claim may cite any finalized chunk, and
+  the runtime admits it while the offender's address still holds slashable
+  balance: active stake or queued unbonding that has not matured
+  (`is_accountable`). What ends accountability is the last slashable unit leaving
+  the staking lifecycle, after which consensus never seats the identity again.
+  The fixed 64-level history opening costs the same at any age, and the
+  `EvidenceAnchor` carries only the genesis-fixed unbonding delay and chunk size.
 
-The chain spec requires `evidence_max_age_blocks <= safety_evidence_max_age_blocks`,
-`safety_evidence_max_age_blocks + chunk_size < unbonding_delay_blocks` (default
-unbonding is fourteen days, leaving one day of honest proposer opportunities before
-stake can leave), `weak_subjectivity_period_secs <= safety_evidence_max_age_blocks *
-slot_duration_secs`, and nonzero bounded queue throughput; defaults keep 1,024
-pending sanctions and 16 admissions/executions per block. The STF asserts the same
-anchor and policy invariants on every block. A full FIFO drains within 64
-advancing blocks at default throughput. An admitted obligation does not expire.
+The chain spec requires `evidence_max_age_blocks < unbonding_delay_blocks`,
+`unbonding_delay_blocks > chunk_size`, `weak_subjectivity_period_secs <=
+unbonding_delay_blocks * slot_duration_secs` (default unbonding is fourteen days),
+and nonzero bounded queue throughput; defaults keep 1,024 pending sanctions and 16
+admissions/executions per block. The STF asserts the same anchor and policy
+invariants on every block. A full FIFO drains within 64 advancing blocks at default
+throughput. An admitted obligation does not expire.
 
-Replay protection is bounded by the unbonding delay, not by chain age. A liveness
-admission writes a per-offence marker; a safety admission writes a **tombstone
+Replay protection for liveness offences is bounded by the unbonding delay, not by
+chain age: a liveness admission writes a per-offence marker, listed in the expiry
+bucket of its admitting height and swept one unbonding delay later, by which time
+no liveness claim can bind to it. A safety admission writes a **permanent tombstone
 keyed by the offender's BLS public key**. Consensus marks a tombstoned identity
 `slashed` at the next boundary and never seats it again, so a second safety claim
-against that key, from any chunk, is rejected while the tombstone stands; the
-number of live tombstones is bounded by the identities accountable inside one
-unbonding delay, not by how many offences they signed inside the safety window.
-Every marker is listed in the expiry bucket of its admitting height and swept one
-unbonding delay later, by which time no claim can bind to it. Pruning never expires
-an admitted FIFO obligation or removes its current-state withdrawal hold.
+against that key, from any chunk and at any later time, is rejected; the number
+of tombstones is bounded by the identities ever sanctioned, not by how many
+offences they signed. Pruning never expires an admitted FIFO obligation or removes
+its current-state withdrawal hold.
 
-Full and validator nodes keep the finalized historical records (chunk, validator
-vector, seed and certificate) and the history-tree paths opening them for
-`safety_history_window_chunks = max(8, ceil(safety_evidence_max_age_blocks /
-chunk_size) + 1)` preceding chunks, so any still-admissible safety claim can be
-constructed and rebound locally; raw blocks, proofs and signed-source caches
-keep the eight-chunk window. Pooled safety receipts and raw reports expire at the
-safety floor, liveness receipts at the liveness floor.
+Full and validator nodes never prune the history tree: the filled part holds about
+two nodes per finalized chunk, and with it a proposer can open the path for any
+record and rebind a safety receipt about any chunk, including chunks whose
+complete record it dropped long ago. Complete historical records (chunk, validator
+vector, seed and certificate) are needed only to construct evidence from raw
+reports and to verify incoming raw reports; they stay for
+`history_record_window_chunks = max(8, ceil(unbonding_delay_blocks / chunk_size))`
+preceding chunks, and older ones come from archives. Raw blocks, proofs and
+signed-source caches keep the eight-chunk window. Pooled liveness receipts expire
+at the liveness floor; pooled safety receipts have no age floor and leave when a
+finalized block has sanctioned their identity or the identity has nothing left at
+stake.
 
 A safety identity is accountable once, and the node applies that rule before any
 expensive work. A receipt or raw report against a key the head state has
-tombstoned, that finalized history has sanctioned, or that a pooled safety
-receipt the next block could admit (current Evidence program, still inside the
-safety window) already covers is neither verified, stored nor proven; an expired
-or superseded pooled receipt shields nothing; a network receipt in that position is deferred, not rejected,
-because it is redundant rather than wrong. Finalizing a safety admission records
-the identity in `FinalizedSlashes` next to the offence in `FinalizedOffences`,
-and the next pruning pass releases every pooled receipt and raw report against
-that key. The pool therefore holds at most one admissible safety receipt per
-identity; without this rule a validator that had already been sanctioned could
-fill the bounded cache with further proven offences for the whole safety window
-and keep every other receipt out.
+tombstoned, that finalized history has sanctioned, that a pooled safety receipt
+under the current Evidence program already covers, or whose address holds no
+slashable balance is neither verified, stored nor proven; a receipt under a
+superseded program shields nothing; a network receipt in that position is
+deferred, not rejected, because it is redundant or not yet usable rather than
+wrong. Finalizing a safety admission records the identity in `FinalizedSlashes`
+next to the offence in `FinalizedOffences`, and the next pruning pass releases
+every pooled receipt and raw report against that key. The pool therefore holds at
+most one admissible safety receipt per identity; without this rule a validator
+that had already been sanctioned could fill the bounded cache with further proven
+offences indefinitely and keep every other receipt out.
 
 Signed-source storage observes the current chunk and those eight preceding
 authenticated chunks. Full/validator retention follows recursive coverage;
@@ -257,7 +262,8 @@ Every claim binds the complete chain-spec hash and block program identity.
 Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 receipts
 and 32 MiB, never overwrites an existing verified statement, and prunes when its
 admission is finalized, when a finalized block has sanctioned its safety identity,
-or when its admission window is behind finalized history.
+when its safety identity has nothing left at stake, or (liveness only) when its
+admission window is behind finalized history.
 Receipts executed on an unfinalized branch remain available across reorgs. The block builder reserves
 mandatory execution gas and bounds attachment plus ordinary transaction bytes.
 Background jobs run outside the engine lock; startup/network initialization,

@@ -105,15 +105,17 @@ pub fn marker_key(statement: &EvidenceStatement) -> Vec<u8> {
     }
 }
 
-/// Bucket listing the marker keys written by admissions at `height`.
+/// Bucket listing the liveness offence markers written by admissions at
+/// `height`.
 ///
 /// The block at `height + unbonding_delay_blocks + 1` deletes the bucket and
 /// every listed marker. The unbonding delay is fixed at genesis and exceeds
-/// the safety window plus one chunk, which in turn bounds every liveness
-/// window governance may set, so a swept marker can never bind again: a
-/// tombstoned identity is `slashed` in every validator vector after the chunk
-/// containing `height`, and claims about that chunk or earlier ones expire
-/// at most `chunk_size + safety_evidence_max_age_blocks` blocks later.
+/// every liveness window governance may set, so a swept marker can never
+/// bind again. Safety tombstones are never listed: a safety claim stays
+/// admissible for as long as the identity holds slashable balance, which has
+/// no fixed horizon, and consensus never seats a slashed identity again, so
+/// the tombstone is permanent and the live set is bounded by the identities
+/// ever sanctioned.
 pub fn expiry_key(height: u64) -> Vec<u8> {
     let mut key = Vec::from(&b"accountability:expiry:v1:"[..]);
     key.extend_from_slice(&height.to_be_bytes());
@@ -141,12 +143,17 @@ fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, retention:
     state.delete(&expiry_key(expired));
 }
 
-/// Remember which markers this block created so a later block can sweep them.
+/// Remember which liveness markers this block created so a later block can
+/// sweep them. Safety tombstones are permanent.
 fn record_expiry_bucket<B: StateBackend>(state: &mut B, height: u64, admitted: &[Sanction]) {
-    if admitted.is_empty() {
+    let keys: Vec<Vec<u8>> = admitted
+        .iter()
+        .filter(|sanction| sanction.kind == SanctionKind::Inactivity)
+        .map(Sanction::marker_key)
+        .collect();
+    if keys.is_empty() {
         return;
     }
-    let keys: Vec<Vec<u8>> = admitted.iter().map(Sanction::marker_key).collect();
     state.write(
         &expiry_key(height),
         borsh::to_vec(&keys).expect("canonical expiry bucket"),
@@ -223,11 +230,10 @@ fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::Ru
         let Transaction::SubmitEvidence(submission) = tx else {
             break;
         };
+        // Liveness claims expire with the governable window; safety claims
+        // never do, their admissibility is the offender's slashable balance.
         assert!(
-            submission.within_age(
-                input.block_height,
-                submission.admissible_age(policy.evidence_max_age_blocks, &input.evidence_anchor),
-            ),
+            submission.within_age(input.block_height, policy.evidence_max_age_blocks),
             "evidence window"
         );
         admissions += 1;
@@ -248,6 +254,13 @@ fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<S
         };
         let claim = &submission.statement;
         assert!(state.read(&marker_key(claim)).is_none(), "offence replay");
+        // A safety claim binds to whatever the identity still has at stake,
+        // however old the signature. Nothing left means nothing to admit.
+        assert!(
+            claim.kind == SanctionKind::Inactivity
+                || crate::is_accountable(state, &claim.offender.withdrawal_credentials),
+            "offender not accountable"
+        );
         assert!(
             !admitted.iter().any(|s: &Sanction| match claim.kind {
                 SanctionKind::Slash =>
@@ -510,7 +523,6 @@ pub(crate) mod tests {
         // policy that widens the five-block window can never rebind an offence
         // whose marker was already swept.
         input.evidence_anchor.chunk_size = 1;
-        input.evidence_anchor.safety_evidence_max_age_blocks = 5;
         input.evidence_anchor.unbonding_delay_blocks = 8;
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Inactivity)];
         let mut live = LiveTrie::default();
@@ -581,6 +593,13 @@ pub(crate) mod tests {
             policy.slash_amount = 30;
         });
         live.insert(
+            &crate::validator_key(&[1; 32]),
+            crate::encode_validator(&crate::Validator {
+                stake: 100,
+                active: true,
+            }),
+        );
+        live.insert(
             &crate::withdrawal_key(&address),
             borsh::to_vec(&crate::WithdrawalQueue {
                 entries: vec![crate::Withdrawal {
@@ -620,10 +639,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn safety_tombstone_rejects_further_safety_claims_but_not_liveness_and_is_swept() {
+    fn safety_tombstone_rejects_further_safety_claims_but_not_liveness_and_is_permanent() {
         let mut input = input();
         input.evidence_anchor.chunk_size = 1;
-        input.evidence_anchor.safety_evidence_max_age_blocks = 5;
         input.evidence_anchor.unbonding_delay_blocks = 8;
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let mut live = LiveTrie::default();
@@ -677,15 +695,68 @@ pub(crate) mod tests {
         assert_eq!(output.accountability.admitted.len(), 1);
         assert_eq!(state.read(&offence_key(&[1; 32])), Some(vec![1]));
 
-        // Once the unbonding delay has passed the tombstone is swept too.
+        // The unbonding delay sweeps the liveness marker but never the
+        // tombstone: consensus never seats the identity again and a safety
+        // claim has no age window, so the tombstone must outlive any balance
+        // the identity could still hold.
         let (post, _) = state.into_committed_and_witness();
         let live = LiveTrie::from_trie(post);
         let mut state = TracingState::new(&live);
         input.transactions.clear();
         input.block_height = admitted_at + 9;
         crate::apply_block(&input, &mut state);
-        assert!(state.read(&slashed_key(&[1; 48])).is_none());
+        assert!(state.read(&slashed_key(&[1; 48])).is_some());
         assert!(state.read(&expiry_key(admitted_at)).is_none());
+        input.block_height = admitted_at + 10;
+        let (post, _) = state.into_committed_and_witness();
+        let live = LiveTrie::from_trie(post);
+        let mut state = TracingState::new(&live);
+        crate::apply_block(&input, &mut state);
+        assert!(state.read(&slashed_key(&[1; 48])).is_some());
+        assert!(state.read(&offence_key(&[1; 32])).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "offender not accountable")]
+    fn safety_claim_against_an_identity_with_nothing_at_stake_is_rejected() {
+        let mut input = input();
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
+        let live = LiveTrie::default();
+        crate::apply_block(&input, &mut TracingState::new(&live));
+    }
+
+    #[test]
+    fn safety_claim_binds_to_queued_unbonding_at_any_signature_age() {
+        // The offence happened at block 1; the claim arrives a million blocks
+        // later, long after any window, while the stake is still unbonding.
+        let mut input = input();
+        input.block_height = 2;
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
+        input.block_height = 1_000_000;
+        let mut live = LiveTrie::default();
+        seed_policy(&mut live, |policy| policy.slash_amount = 30);
+        live.insert(
+            &crate::withdrawal_key(&[1; 32]),
+            borsh::to_vec(&crate::WithdrawalQueue {
+                entries: vec![crate::Withdrawal {
+                    amount: 100,
+                    mature_at_height: 1_000_050,
+                }],
+            })
+            .unwrap(),
+        );
+        let mut state = TracingState::new(&live);
+        let output = crate::apply_block(&input, &mut state);
+        assert_eq!(output.accountability.executed.len(), 1);
+        assert_eq!(
+            crate::load_withdrawal_queue(&mut state, &[1; 32]).total(),
+            70
+        );
+        assert_eq!(state.read(&slashed_key(&[1; 48])), Some(vec![1]));
+        let (_, witness) = state.into_committed_and_witness();
+        let mut guest = WitnessState::new(&witness).unwrap();
+        let checked = validate_input(&input);
+        assert_eq!(crate::apply_block_validated(&checked, &mut guest), output);
     }
 
     #[test]
@@ -693,7 +764,14 @@ pub(crate) mod tests {
     fn replay_is_rejected_after_execution_even_with_different_statement_encoding() {
         let mut input = input();
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
-        let live = LiveTrie::default();
+        let mut live = LiveTrie::default();
+        live.insert(
+            &crate::validator_key(&[1; 32]),
+            crate::encode_validator(&crate::Validator {
+                stake: 100,
+                active: true,
+            }),
+        );
         let mut state = TracingState::new(&live);
         crate::apply_block(&input, &mut state);
         if let Transaction::SubmitEvidence(receipt) = &mut input.transactions[0] {
@@ -708,6 +786,14 @@ pub(crate) mod tests {
         let mut input = input();
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         input.block_gas_limit = GAS_EVIDENCE_ADMISSION;
-        crate::apply_block(&input, &mut TracingState::new(&LiveTrie::default()));
+        let mut live = LiveTrie::default();
+        live.insert(
+            &crate::validator_key(&[1; 32]),
+            crate::encode_validator(&crate::Validator {
+                stake: 100,
+                active: true,
+            }),
+        );
+        crate::apply_block(&input, &mut TracingState::new(&live));
     }
 }

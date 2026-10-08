@@ -952,7 +952,7 @@ mod tests {
         // Policies the genesis facts or the structural bounds reject never
         // open a proposal, even from the largest validator.
         let too_old = RuntimePolicy {
-            evidence_max_age_blocks: anchor.safety_evidence_max_age_blocks + 1,
+            evidence_max_age_blocks: anchor.unbonding_delay_blocks,
             ..policy
         };
         let no_queue = RuntimePolicy {

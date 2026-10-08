@@ -135,7 +135,6 @@ pub fn fixture_with_live(
             block_guest_vk_digest: key_digest,
             evidence_guest_vk_digest: [2; 8],
             unbonding_delay_blocks: spec.runtime.unbonding_delay_blocks,
-            safety_evidence_max_age_blocks: spec.runtime.safety_evidence_max_age_blocks,
             chunk_size: spec.consensus.chunk_size,
         },
         chain_id: 7,

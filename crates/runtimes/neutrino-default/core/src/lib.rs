@@ -246,18 +246,45 @@ impl RuntimePolicy {
     }
 
     /// Full validity against the genesis-fixed facts carried by the anchor:
-    /// the governable liveness window never exceeds the fixed safety window,
-    /// which the anchor itself keeps more than one chunk inside unbonding.
+    /// the governable liveness window ends strictly before the unbonding
+    /// delay, so an admitted liveness obligation always finds bonded stake
+    /// and a swept offence marker can never bind again.
     #[must_use]
     pub const fn is_valid_for(
         &self,
         anchor: &neutrino_consensus_types::evidence::EvidenceAnchor,
     ) -> bool {
-        let safety_window = anchor.safety_evidence_max_age_blocks;
+        let unbonding_delay_blocks = anchor.unbonding_delay_blocks;
         self.is_well_formed()
             && anchor.is_well_formed()
-            && self.evidence_max_age_blocks <= safety_window
+            && self.evidence_max_age_blocks < unbonding_delay_blocks
     }
+}
+
+/// Whether `address` still holds slashable balance.
+///
+/// Slashable balance is active stake or queued unbonding that has not matured
+/// into the spendable account. This is the admissibility rule for safety
+/// evidence: a signature has no expiry; what ends accountability is the last
+/// slashable unit leaving the staking lifecycle, after which the identity can
+/// never be seated again.
+pub fn is_accountable<B: StateBackend>(state: &mut B, address: &Address) -> bool {
+    accountable_from_records(
+        state.read(&validator_key(address)).as_deref(),
+        state.read(&withdrawal_key(address)).as_deref(),
+    )
+}
+
+/// [`is_accountable`] over raw stored records, for hosts that read state
+/// outside a [`StateBackend`]. Malformed records count as no balance.
+#[must_use]
+pub fn accountable_from_records(validator: Option<&[u8]>, withdrawals: Option<&[u8]>) -> bool {
+    validator
+        .and_then(decode_validator)
+        .is_some_and(|validator| validator.stake > 0)
+        || withdrawals
+            .and_then(decode_withdrawal_queue)
+            .is_some_and(|queue| queue.total() > 0)
 }
 
 /// Read the governable policy; absent state means the canonical defaults.
@@ -3220,7 +3247,11 @@ mod tests {
     }
 
     #[test]
-    fn slashing_an_unknown_validator_is_a_no_op() {
+    #[should_panic(expected = "offender not accountable")]
+    fn slashing_an_unknown_validator_is_rejected_at_admission() {
+        // A safety claim binds to slashable balance. An address the runtime
+        // never saw holds none, so the claim is invalid rather than a no-op:
+        // admitting it would only mint a permanent tombstone for nothing.
         let mut live = LiveTrie::default();
         let input = StfInput {
             evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
@@ -3238,15 +3269,7 @@ mod tests {
             10,
             neutrino_consensus_types::evidence::SanctionKind::Slash,
         );
-        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
-        assert_eq!(host_out, guest_out);
-        assert_eq!(host_out.applied, 1);
-        assert_eq!(host_out.failed, 0);
-        assert_eq!(host_out.accountability.executed.len(), 1);
-        assert_eq!(
-            host_out.validator_set_root,
-            ConsensusCandidates::default().root()
-        );
+        apply_block(&input, &mut TracingState::new(&live));
     }
 
     #[test]

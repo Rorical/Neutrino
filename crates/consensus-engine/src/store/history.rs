@@ -137,18 +137,19 @@ impl<DB: Database> ChainStore<DB> {
         Ok(frontier)
     }
 
-    /// Open one record at an exact historical boundary in 64 authenticated reads.
-    pub fn historical_opening(
+    /// Open the history-tree path for leaf `index` under the frontier at
+    /// `count`, authenticated against the leaf commitment the caller expects.
+    /// Needs only the never-pruned tree nodes, not the historical record, so a
+    /// proposer can rebind a safety receipt about any finalized chunk.
+    pub fn history_path(
         &self,
         index: u64,
         count: u64,
-    ) -> Result<HistoricalOpening, StoreError<DB::Error>> {
+        leaf: Hash,
+    ) -> Result<HistoryPath, StoreError<DB::Error>> {
         if index >= count {
             return Err(StoreError::Corrupt("history index outside boundary"));
         }
-        let record = self
-            .historical_chunk(index)?
-            .ok_or(StoreError::Corrupt("historical record is unavailable"))?;
         let (frontier, mut cursor) = self.history_snapshot(count)?;
         let empty = empty_history_hashes();
         let mut siblings = Vec::with_capacity(HISTORY_DEPTH);
@@ -168,7 +169,6 @@ impl<DB: Database> ChainStore<DB> {
             count,
             siblings,
         };
-        let leaf = commitment(&record.evidence_context());
         if cursor != history_leaf_hash(Some(leaf))
             || !path.verify(
                 leaf,
@@ -179,6 +179,20 @@ impl<DB: Database> ChainStore<DB> {
         {
             return Err(StoreError::Corrupt("history opening mismatch"));
         }
+        Ok(path)
+    }
+
+    /// Open a retained historical record together with its tree path under
+    /// the frontier at `count`.
+    pub fn historical_opening(
+        &self,
+        index: u64,
+        count: u64,
+    ) -> Result<HistoricalOpening, StoreError<DB::Error>> {
+        let record = self
+            .historical_chunk(index)?
+            .ok_or(StoreError::Corrupt("historical record is unavailable"))?;
+        let path = self.history_path(index, count, commitment(&record.evidence_context()))?;
         Ok(HistoricalOpening { record, path })
     }
 

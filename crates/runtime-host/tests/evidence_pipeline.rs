@@ -110,7 +110,17 @@ fn invalid_and_missing_attachments_are_rejected_before_guest_execution() {
     );
     // Supply every state key the STF needs. Otherwise a missing-key panic
     // could hide a missing recursive-verification check in the block Guest.
-    let live = LiveTrie::default();
+    // The offender must hold slashable balance for the claim to be admissible.
+    let mut live = LiveTrie::default();
+    live.insert(
+        &neutrino_default_runtime_core::validator_key(&[8; 32]),
+        neutrino_default_runtime_core::encode_validator(
+            &neutrino_default_runtime_core::Validator {
+                stake: 100,
+                active: true,
+            },
+        ),
+    );
     let mut trace = TracingState::new(&live);
     let expected = neutrino_default_runtime_core::apply_block(&input, &mut trace);
     let state = trace.into_witness();

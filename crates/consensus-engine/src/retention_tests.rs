@@ -63,12 +63,12 @@ fn spec() -> ChainSpec {
             weak_subjectivity_period_secs: 7 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS,
             ..LightClientParams::default()
         },
-        // A seven-block safety window over one-block chunks keeps the safety
-        // history window at the eight-chunk minimum these fixtures count on.
+        // An eight-block unbonding delay over one-block chunks keeps the
+        // historical record window at the eight-chunk minimum these fixtures
+        // count on; the liveness window stays strictly inside it.
         runtime: RuntimeParams {
             evidence_max_age_blocks: 7,
-            safety_evidence_max_age_blocks: 7,
-            unbonding_delay_blocks: 9,
+            unbonding_delay_blocks: 8,
             ..RuntimeParams::default()
         },
         initial_validators: validators,
@@ -374,14 +374,16 @@ fn covered_pruning_retains_eight_chunks_and_supports_restart_and_append() {
             .len(),
         8
     );
-    assert!(
+    // The history tree is never pruned: a safety receipt about any finalized
+    // chunk must stay openable here, whatever happened to the raw data.
+    assert_eq!(
         engine
             .store()
             .db()
             .iter_column(Column::HistoryNodes)
             .unwrap()
-            .len()
-            < nodes_before
+            .len(),
+        nodes_before
     );
     assert!(engine.state().node_count() < trie_before);
     assert!(engine.fork_choice.block(&old_head).is_none());
@@ -423,29 +425,36 @@ fn covered_pruning_retains_eight_chunks_and_supports_restart_and_append() {
 }
 
 #[test]
-fn safety_window_keeps_historical_records_and_openings_past_the_raw_window() {
+fn record_window_keeps_historical_records_and_every_path_outlives_the_record() {
     let mut spec = spec();
-    // Twenty one-block chunks of safety evidence: records stay for 21 chunks
-    // while raw blocks keep the eight-chunk window.
-    spec.runtime.safety_evidence_max_age_blocks = 20;
-    spec.runtime.unbonding_delay_blocks = 22;
+    // A 21-block unbonding delay over one-block chunks: complete records stay
+    // for 21 chunks while raw blocks keep the eight-chunk window.
+    spec.runtime.unbonding_delay_blocks = 21;
     spec.light_client.weak_subjectivity_period_secs =
         20 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS;
     spec.validate().unwrap();
     let mut engine = fixture_with_spec(MemoryDatabase::new(), 70, &spec);
     artifact(&mut engine, 0, 70, true);
+    let oldest_leaf = neutrino_consensus_types::evidence::commitment(
+        &engine
+            .store()
+            .historical_chunk(10)
+            .unwrap()
+            .unwrap()
+            .evidence_context(),
+    );
     let info = engine.prune_history_covered().unwrap();
     assert_eq!(info.pruned_before_chunk, 62);
-    assert_eq!(engine.safety_history_window_chunks(), 21);
+    assert_eq!(engine.history_record_window_chunks(), 21);
     assert!(engine.store().get_header_by_height(61).unwrap().is_none());
     assert!(engine.store().get_chunk_proof(61).unwrap().is_none());
     assert!(engine.store().historical_chunk(48).unwrap().is_none());
     for id in [49, 61, 69] {
         assert!(engine.store().historical_chunk(id).unwrap().is_some());
         engine.store().historical_opening(id, 70).unwrap();
-        assert!(engine.in_safety_history_window(id));
+        assert!(engine.in_history_record_window(id));
     }
-    assert!(!engine.in_safety_history_window(48));
+    assert!(!engine.in_history_record_window(48));
     assert_eq!(
         engine
             .store()
@@ -455,14 +464,23 @@ fn safety_window_keeps_historical_records_and_openings_past_the_raw_window() {
             .len(),
         21
     );
+    // A record this node dropped long ago still opens through the tree: a
+    // safety receipt about chunk 10 rebinds here without its record.
+    engine.store().history_path(10, 70, oldest_leaf).unwrap();
+    assert!(engine.store().historical_opening(10, 70).is_err());
     // The retained paths survive restart and a further append.
     let mut reopened =
         Engine::open(engine.chain_spec().clone(), engine.store().db().clone()).unwrap();
     append(&mut reopened);
     reopened.store().historical_opening(49, 71).unwrap();
+    reopened.store().history_path(10, 71, oldest_leaf).unwrap();
     reopened.prune_history_covered().unwrap();
     assert!(reopened.store().historical_chunk(49).unwrap().is_none());
     reopened.store().historical_opening(50, 71).unwrap();
+    reopened
+        .store()
+        .history_path(49, 71, oldest_leaf)
+        .unwrap_err();
 }
 
 #[test]
@@ -598,28 +616,6 @@ fn failed_prune_batch_preserves_watermark_disk_and_live_state() {
         engine.prune_history_covered().unwrap().pruned_before_chunk,
         4
     );
-}
-
-#[test]
-fn corrupt_retained_history_nodes_abort_before_deletion() {
-    let mut engine = fixture(MemoryDatabase::new(), 12);
-    artifact(&mut engine, 0, 12, true);
-    let snapshot = engine
-        .store()
-        .db()
-        .get(Column::HistoryFrontiers, &12u64.to_be_bytes())
-        .unwrap()
-        .unwrap();
-    let (_, root): (neutrino_consensus_types::history::HistoryFrontier, Hash) =
-        borsh::from_slice(&snapshot).unwrap();
-    engine
-        .store_mut()
-        .db_mut()
-        .delete(Column::HistoryNodes, &root)
-        .unwrap();
-    assert!(engine.prune_history_covered().is_err());
-    assert_eq!(engine.retention_info().unwrap().pruned_before_chunk, 0);
-    assert!(engine.store().get_chunk_proof(0).unwrap().is_some());
 }
 
 #[test]

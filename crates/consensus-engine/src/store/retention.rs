@@ -1,9 +1,6 @@
 //! Transactional deletion plans for proof-backed historical retention.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_consensus_types::history::{
-    HISTORY_DEPTH, HistoryFrontier, empty_history_hashes, history_node_hash,
-};
 use neutrino_consensus_types::{Checkpoint, Header, HistoryProof};
 use neutrino_primitives::{ChainSpec, Hash};
 use neutrino_storage::{Batch, Column, Database};
@@ -118,20 +115,20 @@ impl<DB: Database> ChainStore<DB> {
             info.pruned_before_chunk,
             prefix.statement.range_id(),
         )?;
-        // Historical records and the tree paths opening them outlive raw
-        // blocks: a safety claim may reference any chunk inside the safety
-        // window, and the eight-chunk liveness window never exceeds it.
-        let safety_window = neutrino_consensus_types::history::safety_history_window_chunks(
-            spec.runtime.safety_evidence_max_age_blocks,
+        // Complete historical records outlive raw blocks for one unbonding
+        // delay so safety evidence can still be built here; the history tree
+        // itself is never pruned, so any record's path stays openable and a
+        // safety receipt about any finalized chunk can be rebound.
+        let record_window = neutrino_consensus_types::history::history_record_window_chunks(
+            spec.runtime.unbonding_delay_blocks,
             spec.consensus.chunk_size,
         );
         self.prune_count_columns(
             &mut batch,
             info.pruned_before_chunk,
             &boundaries,
-            safety_window,
+            record_window,
         )?;
-        self.prune_history_nodes(&mut batch, info.pruned_before_chunk, safety_window)?;
         let roots = self.prune_blocks(&mut batch, info)?;
         let finalized_count = self
             .get_latest_finalized_chunk_id()?
@@ -144,7 +141,7 @@ impl<DB: Database> ChainStore<DB> {
                     .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS),
             ),
             info.pruned_before_chunk
-                .min(finalized_count.saturating_sub(safety_window)),
+                .min(finalized_count.saturating_sub(record_window)),
         )?;
         batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
         Ok((batch, roots))
@@ -203,12 +200,12 @@ impl<DB: Database> ChainStore<DB> {
         batch: &mut Batch,
         floor: u64,
         boundaries: &BTreeSet<u64>,
-        safety_window: u64,
+        record_window: u64,
     ) -> Result<(), StoreError<DB::Error>> {
         let pins = self.history_dependencies()?;
         let record_floor = self
             .get_latest_finalized_chunk_id()?
-            .map_or(0, |id| id.saturating_add(1).saturating_sub(safety_window));
+            .map_or(0, |id| id.saturating_add(1).saturating_sub(record_window));
         let checkpoint_count = self.get_recursive_covered_chunks()?.unwrap_or(0);
         let checkpoint_floor = checkpoint_count
             .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
@@ -254,87 +251,6 @@ impl<DB: Database> ChainStore<DB> {
             {
                 batch.delete(Column::Checkpoints, key);
             }
-        }
-        Ok(())
-    }
-
-    fn prune_history_nodes(
-        &self,
-        batch: &mut Batch,
-        floor: u64,
-        safety_window: u64,
-    ) -> Result<(), StoreError<DB::Error>> {
-        let mut retained = BTreeSet::new();
-        for (key, bytes) in self
-            .db
-            .iter_column(Column::HistoryFrontiers)
-            .map_err(StoreError::Database)?
-        {
-            let count = decode_count(&key)?;
-            if count < floor {
-                continue;
-            }
-            let (frontier, root): (HistoryFrontier, Hash) = borsh::from_slice(&bytes)?;
-            if frontier.count != count
-                || frontier.root()
-                    != Some(neutrino_consensus_types::history::counted_history_root(
-                        count, root,
-                    ))
-            {
-                return Err(StoreError::Corrupt("retained history frontier is invalid"));
-            }
-            // Keep paths to each record inside the safety window and to the next
-            // append location. Older subtrees remain opaque sibling hashes; their
-            // internal nodes are dispensable.
-            let record_floor = floor.min(count.saturating_sub(safety_window));
-            self.retain_history_paths(root, record_floor, count, &mut retained)?;
-        }
-        for (key, _) in self
-            .db
-            .iter_column(Column::HistoryNodes)
-            .map_err(StoreError::Database)?
-        {
-            let hash = Hash::try_from(key.as_slice())
-                .map_err(|_| StoreError::Corrupt("invalid history node key"))?;
-            if !retained.contains(&hash) {
-                batch.delete(Column::HistoryNodes, key);
-            }
-        }
-        Ok(())
-    }
-
-    fn retain_history_paths(
-        &self,
-        root: Hash,
-        floor: u64,
-        count: u64,
-        retained: &mut BTreeSet<Hash>,
-    ) -> Result<(), StoreError<DB::Error>> {
-        let empty = empty_history_hashes();
-        let mut pending = vec![(root, HISTORY_DEPTH, 0u128)];
-        let upper = u128::from(count) + 1;
-        while let Some((hash, height, begin)) = pending.pop() {
-            if height == 0 || hash == empty[height] {
-                continue;
-            }
-            let end = begin + (1u128 << height);
-            if end <= u128::from(floor) || begin >= upper {
-                continue;
-            }
-            // A content-addressed node may occur in multiple snapshots. Its path
-            // interval is fixed; already visited nodes need no repeated traversal.
-            if !retained.insert(hash) {
-                continue;
-            }
-            let (left, right): (Hash, Hash) = self
-                .get_decoded(Column::HistoryNodes, &hash)?
-                .ok_or(StoreError::Corrupt("retained history node is missing"))?;
-            if history_node_hash(height - 1, left, right) != hash {
-                return Err(StoreError::Corrupt("retained history node hash mismatch"));
-            }
-            let middle = begin + (1u128 << (height - 1));
-            pending.push((left, height - 1, begin));
-            pending.push((right, height - 1, middle));
         }
         Ok(())
     }
@@ -465,32 +381,28 @@ impl<DB: Database> ChainStore<DB> {
         Ok(())
     }
 
-    /// Drop pooled evidence whose source chunk left its admission window:
-    /// `liveness_floor` for inactivity claims, `safety_floor` for signed
-    /// misconduct, raw reports and finalized-admission indexes.
+    /// Release evidence no retaining node can still use: liveness receipts and
+    /// finalized-offence records below `liveness_floor`, raw reports whose
+    /// complete record this node no longer keeps (below `record_floor`), and
+    /// every receipt or report against an identity a finalized block has
+    /// already sanctioned. Safety receipts have no age floor; the node drops
+    /// them once their identity has nothing left at stake.
     fn prune_evidence(
         &self,
         batch: &mut Batch,
         spec: &ChainSpec,
         liveness_floor: u64,
-        safety_floor: u64,
+        record_floor: u64,
     ) -> Result<(), StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::SanctionKind;
         for artifact in self.evidence_artifacts()? {
-            let floor = match artifact.statement.kind {
-                SanctionKind::Slash => safety_floor,
-                SanctionKind::Inactivity => liveness_floor,
-            };
-            if artifact.statement.context.chunk_id < floor
-                || self.is_receipt_finalized(&artifact.statement)?
-            {
+            let expired = artifact.statement.kind == SanctionKind::Inactivity
+                && artifact.statement.context.chunk_id < liveness_floor;
+            if expired || self.is_receipt_finalized(&artifact.statement)? {
                 batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
         }
         for (key, evidence) in self.iter_slashing_evidence()? {
-            // A raw report is retained until its source chunk leaves the safety
-            // window or a finalized block has sanctioned the accused identity;
-            // after that nothing it could prove is admissible.
             let Ok(chunk_id) = neutrino_prover_chunk::history::evidence_chunk_id(spec, &evidence)
             else {
                 continue;
@@ -506,20 +418,25 @@ impl<DB: Database> ChainStore<DB> {
             } else {
                 false
             };
-            if chunk_id < safety_floor || accused_slashed {
+            if chunk_id < record_floor || accused_slashed {
                 batch.delete(Column::SlashingPool, key);
             }
         }
-        for column in [Column::FinalizedOffences, Column::FinalizedSlashes] {
-            for (key, bytes) in self.db.iter_column(column).map_err(StoreError::Database)? {
-                let height = decode_count(&bytes)?;
-                if height
-                    .checked_sub(1)
-                    .and_then(|h| h.checked_div(spec.consensus.chunk_size))
-                    .is_some_and(|id| id < safety_floor)
-                {
-                    batch.delete(column, key);
-                }
+        // Finalized offence identities only guard the bounded pool; past the
+        // record window nothing can cite them. Finalized safety identities are
+        // permanent, like the runtime tombstone they mirror.
+        for (key, bytes) in self
+            .db
+            .iter_column(Column::FinalizedOffences)
+            .map_err(StoreError::Database)?
+        {
+            let height = decode_count(&bytes)?;
+            if height
+                .checked_sub(1)
+                .and_then(|h| h.checked_div(spec.consensus.chunk_size))
+                .is_some_and(|id| id < record_floor)
+            {
+                batch.delete(Column::FinalizedOffences, key);
             }
         }
         Ok(())

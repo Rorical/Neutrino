@@ -108,24 +108,29 @@ impl<DB: Database> ChainStore<DB> {
         self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)
     }
 
-    /// Drop expired receipts or offences admitted by authenticated finalized blocks.
+    /// Drop expired liveness receipts, receipts whose offence or safety identity
+    /// finalized blocks already consumed, and receipts the caller marks stale.
     /// Unfinalized execution is retained for re-admission after reorg.
     pub fn prune_evidence_artifacts(
         &mut self,
         finalized_height: u64,
         liveness_max_age: u64,
-        safety_max_age: u64,
+        mut stale: impl FnMut(&neutrino_consensus_types::evidence::EvidenceArtifact) -> bool,
     ) -> Result<(), StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::SanctionKind;
         let mut batch = neutrino_storage::Batch::new();
         for artifact in self.evidence_artifacts()? {
-            let max_age = match artifact.statement.kind {
-                SanctionKind::Slash => safety_max_age,
-                SanctionKind::Inactivity => liveness_max_age,
+            // Liveness receipts expire with their window. Safety receipts have
+            // no age window: they leave when finalized blocks consumed them or
+            // when the caller knows the identity has nothing left at stake.
+            let expired = match artifact.statement.kind {
+                SanctionKind::Slash => false,
+                SanctionKind::Inactivity => {
+                    finalized_height.saturating_sub(artifact.statement.context.end_height)
+                        >= liveness_max_age
+                }
             };
-            if finalized_height.saturating_sub(artifact.statement.context.end_height) >= max_age
-                || self.is_receipt_finalized(&artifact.statement)?
-            {
+            if expired || self.is_receipt_finalized(&artifact.statement)? || stale(&artifact) {
                 batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
         }

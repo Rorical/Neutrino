@@ -26,24 +26,22 @@ pub const fn is_history_index_within(index: u64, count: u64, window: u64) -> boo
     index < count && index >= count.saturating_sub(window)
 }
 
-/// Number of preceding finalized chunks whose historical records a node keeps
-/// so every still-admissible safety claim can be opened and verified.
+/// Default number of preceding finalized chunks whose complete historical
+/// records (validator vector, seed, certificate) a full node keeps so safety
+/// evidence can still be constructed locally.
 ///
-/// A safety claim about chunk `k` is admissible while the block height is at
-/// most `safety_evidence_max_age_blocks` past `k`'s last block, so the oldest
-/// admissible source lies `ceil(window / chunk_size)` chunks behind the chunk
-/// under construction; one more chunk absorbs the boundary block.
+/// Safety claims have no age window, so this is a local service horizon, not
+/// an admissibility bound: one unbonding delay of records lets a node build
+/// evidence against anything signed by a validator that has not yet fully
+/// withdrawn, and the eight-chunk liveness window is never shrunk. Older
+/// records come from archive nodes. The history tree itself is never pruned,
+/// so a retained path can be opened for any record a node still has.
 #[must_use]
-pub const fn safety_history_window_chunks(
-    safety_evidence_max_age_blocks: u64,
-    chunk_size: u64,
-) -> u64 {
+pub const fn history_record_window_chunks(unbonding_delay_blocks: u64, chunk_size: u64) -> u64 {
     if chunk_size == 0 {
         return HISTORY_RETENTION_CHUNKS;
     }
-    let chunks = safety_evidence_max_age_blocks
-        .div_ceil(chunk_size)
-        .saturating_add(1);
+    let chunks = unbonding_delay_blocks.div_ceil(chunk_size);
     if chunks > HISTORY_RETENTION_CHUNKS {
         chunks
     } else {
@@ -299,18 +297,18 @@ mod tests {
     }
 
     #[test]
-    fn safety_history_window_covers_the_oldest_admissible_source_chunk() {
-        // 1,024 blocks of 128-block chunks: eight chunks back plus the boundary.
-        assert_eq!(safety_history_window_chunks(1_024, 128), 9);
-        // Thirteen days of 4 s slots at the default chunk size.
-        assert_eq!(safety_history_window_chunks(280_800, 128), 2_195);
-        // A window shorter than eight chunks never shrinks ordinary retention.
+    fn history_record_window_covers_one_unbonding_delay_of_records() {
+        // 1,152 blocks of 128-block chunks: nine chunks.
+        assert_eq!(history_record_window_chunks(1_152, 128), 9);
+        // Fourteen days of 4 s slots at the default chunk size.
+        assert_eq!(history_record_window_chunks(302_400, 128), 2_363);
+        // A delay shorter than eight chunks never shrinks ordinary retention.
         assert_eq!(
-            safety_history_window_chunks(1, 128),
+            history_record_window_chunks(1, 128),
             HISTORY_RETENTION_CHUNKS
         );
         assert_eq!(
-            safety_history_window_chunks(10, 0),
+            history_record_window_chunks(10, 0),
             HISTORY_RETENTION_CHUNKS
         );
         assert!(is_history_index_within(0, 9, 9));

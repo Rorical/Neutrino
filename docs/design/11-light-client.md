@@ -41,13 +41,12 @@ as trusted local state.
 Genesis recursion proves a rules-valid history. It does not prove latestness or
 eliminate the PoS long-range/weak-subjectivity problem. The trust window is bounded
 by accountability: `ChainSpec::validate` rejects a `weak_subjectivity_period_secs`
-longer than `safety_evidence_max_age_blocks * slot_duration_secs`. A fork signed by
-the validators who were accountable at an anchor may surface at any point while the
-anchor is trusted, and punishing it needs both their stake still bonded and their
-signatures still admissible as safety evidence; the safety window is the shorter of
-the two by construction (`safety_evidence_max_age_blocks + chunk_size <
-unbonding_delay_blocks`). Chains wanting a longer trust window must lengthen the
-safety window and the unbonding delay with it. Peer advertisements are
+longer than `unbonding_delay_blocks * slot_duration_secs`. A fork signed by the
+validators who were accountable at an anchor may surface at any point while the
+anchor is trusted. Safety evidence has no age window: a signature is admissible for
+as long as its signer still holds slashable balance, so the only way a signer
+escapes is to have fully withdrawn, which takes one unbonding delay. Chains wanting
+a longer trust window lengthen the unbonding delay. Peer advertisements are
 hints; requests pin both endpoint hashes and reject mismatched replies. Missing
 suffixes remain unavailable until a provider can supply or construct them.
 

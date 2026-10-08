@@ -91,7 +91,10 @@ resulting evidence.
 After restart, the node performs one authenticated replay of retained source
 metadata and original signed artifacts before resuming signing. The replay
 feeds discovered offences into the normal persistent evidence pool; it does
-not discard generated evidence during engine construction. Steady-state
+not discard generated evidence during engine construction. Raw reports and
+receipts against an identity that is tombstoned, finalized as slashed or already
+covered by a pooled safety receipt are skipped before proving or verification
+(see design 20). Steady-state
 observation uses dependency metadata and cached exact receipt verdicts rather
 than scanning or re-verifying every receipt after each vote.
 

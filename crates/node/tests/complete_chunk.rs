@@ -344,6 +344,117 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     });
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn one_safety_receipt_per_identity_is_pooled_and_redundant_reports_are_skipped() {
+    use neutrino_consensus_types::{
+        FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
+        evidence::EvidenceArtifact,
+    };
+    use neutrino_network::{Topic, service::NetworkCommand};
+    use neutrino_sync::{EvidenceProofAcceptance, SyncBackend};
+    let (mut engine, _) = engine();
+    engine.set_programs(support::guests([1; 8], [4; 32]));
+    let (decisions, receiver) = mpsc::channel();
+    decisions.send(true).unwrap();
+    let prover = NativeConsensusBackend {
+        decisions: Mutex::new(receiver),
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
+    let voter = ProposerKey::from_ikm(&[42; 32], 0).unwrap();
+    engine.finalize_chunk(0, &prover, &voter).unwrap();
+    let key = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    let domain = engine.chain_spec().consensus_domain();
+    let sign = |round: u32, hash: u8| {
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            round,
+            chunk_hash: [hash; 32],
+            phase: FinalityVotePhase::Precommit,
+        };
+        IndexedVote {
+            signature: key.sign(&data.signing_message(domain)).to_bytes(),
+            data,
+        }
+    };
+    // Two distinct offences by one identity: different rounds, different
+    // offence identities, one BLS key.
+    let first = SlashingEvidence::DoublePrecommit {
+        validator_index: 0,
+        vote_a: sign(2, 1),
+        vote_b: sign(2, 2),
+    };
+    let second = SlashingEvidence::DoublePrecommit {
+        validator_index: 0,
+        vote_a: sign(3, 3),
+        vote_b: sign(3, 4),
+    };
+    let second_receipt = prover
+        .prove_evidence_batch(
+            &[engine.evidence_witness(&second).unwrap()],
+            &support::guests([1; 8], [4; 32]).execution,
+        )
+        .unwrap()
+        .remove(0);
+    let backend = ChainBackend::new(engine, prover);
+    let (publisher, mut messages) = tokio::sync::mpsc::channel(8);
+    backend.set_network_publisher(publisher);
+    backend.ingest_slashing_evidence(first).await;
+    let pooled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let NetworkCommand::Publish {
+                topic: Topic::EvidenceProofs,
+                data,
+            } = messages.recv().await.unwrap()
+            {
+                break borsh::from_slice::<EvidenceArtifact>(&data).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("first receipt is proven and published");
+    assert_ne!(
+        pooled.statement.offence_id,
+        second_receipt.statement.offence_id
+    );
+    assert_eq!(
+        pooled.statement.offender.pubkey,
+        second_receipt.statement.offender.pubkey
+    );
+    // A different safety receipt against the pooled identity is redundant: it
+    // is neither verified nor stored, and relaying it is not penalised.
+    assert_eq!(
+        backend.ingest_evidence_proof(second_receipt).await,
+        EvidenceProofAcceptance::Deferred
+    );
+    // The exact pooled statement still answers Accepted.
+    assert_eq!(
+        backend.ingest_evidence_proof(pooled.clone()).await,
+        EvidenceProofAcceptance::Accepted
+    );
+    // A raw report against the covered identity enters the raw pool but never
+    // starts a proving job while the receipt stands.
+    backend.ingest_slashing_evidence(second).await;
+    while backend.evidence_worker_running_for_test() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(backend.slashing_pool_len(), 2);
+    while let Ok(message) = messages.try_recv() {
+        assert!(
+            !matches!(
+                message,
+                NetworkCommand::Publish {
+                    topic: Topic::EvidenceProofs,
+                    ..
+                }
+            ),
+            "redundant safety report must not produce a receipt"
+        );
+    }
+    backend.with_engine_mut_for_test(|engine| {
+        assert_eq!(engine.store().evidence_artifacts().unwrap(), vec![pooled]);
+    });
+}
+
 fn ready_prover() -> NativeConsensusBackend {
     let (sender, receiver) = mpsc::channel();
     sender.send(true).unwrap();

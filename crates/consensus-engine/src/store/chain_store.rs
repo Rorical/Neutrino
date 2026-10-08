@@ -124,7 +124,7 @@ impl<DB: Database> ChainStore<DB> {
                 SanctionKind::Inactivity => liveness_max_age,
             };
             if finalized_height.saturating_sub(artifact.statement.context.end_height) >= max_age
-                || self.is_offence_finalized(&artifact.statement.offence_id)?
+                || self.is_receipt_finalized(&artifact.statement)?
             {
                 batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
@@ -133,6 +133,19 @@ impl<DB: Database> ChainStore<DB> {
             return Ok(());
         }
         self.db.write_batch(batch).map_err(StoreError::Database)
+    }
+
+    /// Whether finalized blocks already consumed everything this receipt could
+    /// admit: its exact offence, or for a safety receipt any safety sanction
+    /// against the same identity.
+    pub fn is_receipt_finalized(
+        &self,
+        statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+    ) -> Result<bool, StoreError<DB::Error>> {
+        use neutrino_consensus_types::evidence::SanctionKind;
+        Ok(self.is_offence_finalized(&statement.offence_id)?
+            || (statement.kind == SanctionKind::Slash
+                && self.is_identity_slashed(&statement.offender.pubkey)?))
     }
 
     /// Load evidence receipts for restart recovery and re-admission after reorg.
@@ -253,6 +266,13 @@ impl<DB: Database> ChainStore<DB> {
                     admission.offence_id,
                     block.header.height.to_be_bytes(),
                 );
+                if admission.kind == neutrino_consensus_types::evidence::SanctionKind::Slash {
+                    batch.put(
+                        Column::FinalizedSlashes,
+                        admission.offender.pubkey,
+                        block.header.height.to_be_bytes(),
+                    );
+                }
             }
             batch.put(
                 Column::BlockStates,

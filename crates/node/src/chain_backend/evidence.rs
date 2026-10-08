@@ -8,7 +8,9 @@ use neutrino_consensus_types::{
 };
 use neutrino_default_runtime_core::{
     Transaction,
-    accountability::{GAS_EVIDENCE_ADMISSION, PendingSanction, QUEUE_KEY, marker_key, offence_key},
+    accountability::{
+        GAS_EVIDENCE_ADMISSION, PendingSanction, QUEUE_KEY, marker_key, offence_key, slashed_key,
+    },
 };
 use neutrino_network::{Topic, service::NetworkCommand};
 use neutrino_proof_system::ProofSystem;
@@ -85,12 +87,16 @@ where
                         if artifact.evidence_guest_vk_digest != execution.evidence {
                             continue;
                         }
-                        let stored = engine
-                            .lock()
-                            .expect("engine mutex")
-                            .store_mut()
-                            .put_evidence_artifact(&artifact)
-                            .is_ok();
+                        let stored = {
+                            let mut engine = engine.lock().expect("engine mutex");
+                            // A receipt whose identity or offence the head state
+                            // already sanctioned can never be admitted again.
+                            engine
+                                .state()
+                                .get(&marker_key(&artifact.statement))
+                                .is_none()
+                                && engine.store_mut().put_evidence_artifact(&artifact).is_ok()
+                        };
                         if stored {
                             produced.push(artifact);
                         }
@@ -123,6 +129,65 @@ where
         });
     }
 
+    /// Raw signed-misconduct reports worth proving now, rotating through the
+    /// persistent raw pool so no report starves. Signature/proof checking is
+    /// expensive and happens in the worker; the content commitment deduplicates
+    /// queued copies and raw reports use the safety window.
+    fn raw_report_jobs(
+        &self,
+        engine: &neutrino_consensus_engine::Engine<DB>,
+        pooled: &[EvidenceArtifact],
+        safety_max_age: u64,
+    ) -> Vec<EvidenceWitness> {
+        let anchor_program = engine
+            .head_height()
+            .checked_add(1)
+            .and_then(|height| engine.evidence_anchor(height).ok())
+            .map(|anchor| anchor.evidence_guest_vk_digest);
+        let raw = engine.store().iter_slashing_evidence().unwrap_or_default();
+        let offset = self.evidence_job_cursor.fetch_add(8, Ordering::Relaxed);
+        let mut witnesses = Vec::new();
+        for (_, evidence) in raw
+            .iter()
+            .cycle()
+            .skip(if raw.is_empty() {
+                0
+            } else {
+                offset % raw.len()
+            })
+            .take(raw.len())
+        {
+            if witnesses.len() >= 8 {
+                break;
+            }
+            let Ok(witness) = engine.evidence_witness(evidence) else {
+                continue;
+            };
+            let accused = witness
+                .source
+                .validators
+                .get(evidence.offender_index() as usize);
+            if accused.is_none_or(|accused| {
+                safety_identity_covered(engine, pooled, anchor_program, &accused.pubkey, None)
+            }) {
+                continue;
+            }
+            let facts = neutrino_prover_chunk::execution::commitment(&witness.claim);
+            if engine
+                .head_height()
+                .saturating_add(1)
+                .saturating_sub(witness.source.chunk.end_height)
+                <= safety_max_age
+                && !pooled
+                    .iter()
+                    .any(|item| item.statement.facts_commitment == facts)
+            {
+                witnesses.push(witness);
+            }
+        }
+        witnesses
+    }
+
     fn select_evidence_jobs(&self, block_key: [u32; 8]) -> Vec<EvidenceWitness> {
         self.with_engine_mut(|engine| {
             let next_chunk = engine.finalized_next_chunk_id();
@@ -149,40 +214,7 @@ where
                 existing.iter().any(|item| item.statement.offence_id == *id)
                     || engine.state().get(&offence_key(id)).is_some()
             };
-            let raw = engine.store().iter_slashing_evidence().unwrap_or_default();
-            let offset = self.evidence_job_cursor.fetch_add(8, Ordering::Relaxed);
-            for (_, evidence) in raw
-                .iter()
-                .cycle()
-                .skip(if raw.is_empty() {
-                    0
-                } else {
-                    offset % raw.len()
-                })
-                .take(raw.len())
-            {
-                if witnesses.len() >= 8 {
-                    break;
-                }
-                if let Ok(witness) = engine.evidence_witness(evidence) {
-                    // Signature/proof checking is expensive and happens in the
-                    // worker. The content commitment deduplicates queued copies.
-                    // Raw reports are signed misconduct, so the safety window
-                    // applies.
-                    let facts = neutrino_prover_chunk::execution::commitment(&witness.claim);
-                    if engine
-                        .head_height()
-                        .saturating_add(1)
-                        .saturating_sub(witness.source.chunk.end_height)
-                        <= safety_max_age
-                        && !existing
-                            .iter()
-                            .any(|item| item.statement.facts_commitment == facts)
-                    {
-                        witnesses.push(witness);
-                    }
-                }
-            }
+            witnesses.extend(self.raw_report_jobs(engine, &existing, safety_max_age));
             for chunk_id in next_chunk.saturating_sub(HISTORY_RETENTION_CHUNKS)..next_chunk {
                 let Ok(Some(source)) = engine.store().historical_chunk(chunk_id) else {
                     continue;
@@ -275,6 +307,17 @@ where
             if artifact.statement.context.end_height >= height
                 || height - artifact.statement.context.end_height > max_age
             {
+                return Err(Deferred);
+            }
+            // A redundant receipt is not wrong, so relaying peers are not
+            // penalised; it is simply not verified or stored.
+            let pooled = engine.store().evidence_artifacts().unwrap_or_default();
+            if redundant_receipt(
+                engine,
+                &pooled,
+                Some(anchor.evidence_guest_vk_digest),
+                &artifact.statement,
+            ) {
                 return Err(Deferred);
             }
             match engine.evidence_submission(artifact.statement.clone()) {
@@ -414,4 +457,50 @@ where
             (body, ordinary_count)
         })
     }
+}
+
+/// A safety identity is accountable once. A tombstone at the head, a finalized
+/// safety sanction, or a pooled safety receipt under the program the next block
+/// admits (other than `except`) already covers every offence the identity could
+/// still answer for, so further reports and receipts against it are redundant.
+fn safety_identity_covered<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+    pooled: &[EvidenceArtifact],
+    anchor_program: Option<[u32; 8]>,
+    pubkey: &neutrino_primitives::BlsPublicKey,
+    except: Option<&neutrino_consensus_types::evidence::EvidenceStatement>,
+) -> bool {
+    engine.state().get(&slashed_key(pubkey)).is_some()
+        || engine.store().is_identity_slashed(pubkey).unwrap_or(false)
+        || pooled.iter().any(|item| {
+            item.statement.kind == SanctionKind::Slash
+                && item.statement.offender.pubkey == *pubkey
+                && Some(item.evidence_guest_vk_digest) == anchor_program
+                && except.is_none_or(|statement| item.statement != *statement)
+        })
+}
+
+/// Whether the head state, finalized history or the pool already covers what a
+/// receipt could admit: a liveness offence is admitted once, a safety identity
+/// is sanctioned once. The exact pooled statement is not redundant, so restarts
+/// and re-encodings still re-verify and answer `Accepted`.
+fn redundant_receipt<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+    pooled: &[EvidenceArtifact],
+    anchor_program: Option<[u32; 8]>,
+    statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+) -> bool {
+    engine.state().get(&marker_key(statement)).is_some()
+        || engine
+            .store()
+            .is_offence_finalized(&statement.offence_id)
+            .unwrap_or(false)
+        || (statement.kind == SanctionKind::Slash
+            && safety_identity_covered(
+                engine,
+                pooled,
+                anchor_program,
+                &statement.offender.pubkey,
+                Some(statement),
+            ))
 }

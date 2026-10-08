@@ -1179,6 +1179,15 @@ where
         self.with_engine_mut(f)
     }
 
+    /// Test-only: whether a background evidence proving job is in flight.
+    /// Lets integration tests wait for the worker to settle before asserting
+    /// that a redundant report produced nothing.
+    #[doc(hidden)]
+    pub fn evidence_worker_running_for_test(&self) -> bool {
+        self.evidence_job_running
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// FSM state of the block at `hash`, if it has been observed.
     ///
     /// Used by production integration tests and by

@@ -66,6 +66,8 @@ pub enum Column {
     HistoryPins,
     /// Offence admissions authenticated by finalized block proofs.
     FinalizedOffences,
+    /// BLS identities whose safety sanction finalized blocks have admitted.
+    FinalizedSlashes,
     /// Reusable objective-evidence receipts keyed by offence ID.
     EvidenceProofs,
     /// Durable local signing intents and monotonic signing watermarks.
@@ -79,7 +81,7 @@ pub enum Column {
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 34] = [
+pub const ALL_COLUMNS: [Column; 35] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -109,6 +111,7 @@ pub const ALL_COLUMNS: [Column; 34] = [
     Column::HistoryJobs,
     Column::HistoryPins,
     Column::FinalizedOffences,
+    Column::FinalizedSlashes,
     Column::EvidenceProofs,
     Column::SigningJournal,
     Column::BftSessions,
@@ -150,6 +153,7 @@ impl Column {
             Self::HistoryJobs => "history_jobs",
             Self::HistoryPins => "history_pins",
             Self::FinalizedOffences => "finalized_offences",
+            Self::FinalizedSlashes => "finalized_slashes",
             Self::EvidenceProofs => "evidence_proofs",
             Self::SigningJournal => "signing_journal",
             Self::BftSessions => "bft_sessions",
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 34);
+        assert_eq!(ALL_COLUMNS.len(), 35);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -175,7 +179,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 34] = [
+        let names: [&str; 35] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -205,6 +209,7 @@ mod tests {
             "history_jobs",
             "history_pins",
             "finalized_offences",
+            "finalized_slashes",
             "evidence_proofs",
             "signing_journal",
             "bft_sessions",

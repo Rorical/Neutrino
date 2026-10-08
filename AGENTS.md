@@ -66,7 +66,11 @@ have passed.
   receipts and boundaries, not old transaction bodies or execution state. Current
   sanctions remain live state: a safety admission tombstones the BLS identity, a
   liveness admission marks the offence, and both markers are swept one unbonding
-  delay after admission.
+  delay after admission. A safety identity is accountable once end to end: the
+  node pools at most one safety receipt per identity under the current program,
+  does not verify, store or prove reports against a tombstoned or pooled identity,
+  and a finalized safety admission (`FinalizedSlashes`) releases every pooled
+  receipt and raw report against that key.
 - Full/validator snapshot bootstrap verifies a genesis History prefix and an exact
   bridge from local trust, then authenticates validators, recent history and the
   complete execution state before durable atomic installation. Archive nodes replay

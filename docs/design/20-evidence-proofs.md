@@ -219,6 +219,19 @@ constructed and rebound locally; raw blocks, proofs and signed-source caches
 keep the eight-chunk window. Pooled safety receipts and raw reports expire at the
 safety floor, liveness receipts at the liveness floor.
 
+A safety identity is accountable once, and the node applies that rule before any
+expensive work. A receipt or raw report against a key the head state has
+tombstoned, that finalized history has sanctioned, or that a pooled safety
+receipt under the current Evidence program already covers is neither verified,
+stored nor proven; a network receipt in that position is deferred, not rejected,
+because it is redundant rather than wrong. Finalizing a safety admission records
+the identity in `FinalizedSlashes` next to the offence in `FinalizedOffences`,
+and the next pruning pass releases every pooled receipt and raw report against
+that key. The pool therefore holds at most one admissible safety receipt per
+identity; without this rule a validator that had already been sanctioned could
+fill the bounded cache with further proven offences for the whole safety window
+and keep every other receipt out.
+
 Signed-source storage observes the current chunk and those eight preceding
 authenticated chunks. Full/validator retention follows recursive coverage;
 archives can serve older sources without extending evidence admission. The
@@ -242,7 +255,8 @@ Every claim binds the complete chain-spec hash and block program identity.
 
 Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 receipts
 and 32 MiB, never overwrites an existing verified statement, and prunes when its
-admission is finalized or its admission window is behind finalized history.
+admission is finalized, when a finalized block has sanctioned its safety identity,
+or when its admission window is behind finalized history.
 Receipts executed on an unfinalized branch remain available across reorgs. The block builder reserves
 mandatory execution gas and bounds attachment plus ordinary transaction bytes.
 Background jobs run outside the engine lock; startup/network initialization,

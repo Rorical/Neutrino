@@ -103,6 +103,34 @@ fn finalization_releases_cache_capacity_without_discarding_reorg_candidates() {
 }
 
 #[test]
+fn finalized_safety_sanction_releases_every_receipt_against_the_identity() {
+    let mut store = ChainStore::new(MemoryDatabase::new());
+    let first = artifact(1);
+    let mut second = artifact(2);
+    second.statement.facts_commitment = [6; 32];
+    let mut liveness = artifact(3);
+    liveness.statement.kind = SanctionKind::Inactivity;
+    for item in [&first, &second, &liveness] {
+        store.put_evidence_artifact(item).unwrap();
+    }
+    let identity = first.statement.offender.pubkey;
+    assert!(!store.is_identity_slashed(&identity).unwrap());
+    assert!(!store.is_receipt_finalized(&second.statement).unwrap());
+    // The finalization batch records the sanctioned identity, not only the
+    // admitted offence: the tombstone outlives the safety window, so no other
+    // safety receipt against the key can ever be admitted.
+    store
+        .db_mut()
+        .put(Column::FinalizedSlashes, &identity, &1_u64.to_be_bytes())
+        .unwrap();
+    assert!(store.is_identity_slashed(&identity).unwrap());
+    assert!(store.is_receipt_finalized(&second.statement).unwrap());
+    assert!(!store.is_receipt_finalized(&liveness.statement).unwrap());
+    store.prune_evidence_artifacts(1, 1024, 1024).unwrap();
+    assert_eq!(store.evidence_artifacts().unwrap(), vec![liveness]);
+}
+
+#[test]
 fn pool_identity_is_scoped_to_program_and_exact_statement() {
     let mut store = ChainStore::new(MemoryDatabase::new());
     let original = artifact(1);

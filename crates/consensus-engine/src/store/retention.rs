@@ -482,30 +482,44 @@ impl<DB: Database> ChainStore<DB> {
                 SanctionKind::Inactivity => liveness_floor,
             };
             if artifact.statement.context.chunk_id < floor
-                || self.is_offence_finalized(&artifact.statement.offence_id)?
+                || self.is_receipt_finalized(&artifact.statement)?
             {
                 batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
         }
         for (key, evidence) in self.iter_slashing_evidence()? {
-            if neutrino_prover_chunk::history::evidence_chunk_id(spec, &evidence)
-                .is_ok_and(|id| id < safety_floor)
-            {
+            // A raw report is retained until its source chunk leaves the safety
+            // window or a finalized block has sanctioned the accused identity;
+            // after that nothing it could prove is admissible.
+            let Ok(chunk_id) = neutrino_prover_chunk::history::evidence_chunk_id(spec, &evidence)
+            else {
+                continue;
+            };
+            let accused = self.historical_chunk(chunk_id)?.and_then(|source| {
+                source
+                    .validators
+                    .get(evidence.offender_index() as usize)
+                    .map(|validator| validator.pubkey)
+            });
+            let accused_slashed = if let Some(pubkey) = accused {
+                self.is_identity_slashed(&pubkey)?
+            } else {
+                false
+            };
+            if chunk_id < safety_floor || accused_slashed {
                 batch.delete(Column::SlashingPool, key);
             }
         }
-        for (key, bytes) in self
-            .db
-            .iter_column(Column::FinalizedOffences)
-            .map_err(StoreError::Database)?
-        {
-            let height = decode_count(&bytes)?;
-            if height
-                .checked_sub(1)
-                .and_then(|h| h.checked_div(spec.consensus.chunk_size))
-                .is_some_and(|id| id < safety_floor)
-            {
-                batch.delete(Column::FinalizedOffences, key);
+        for column in [Column::FinalizedOffences, Column::FinalizedSlashes] {
+            for (key, bytes) in self.db.iter_column(column).map_err(StoreError::Database)? {
+                let height = decode_count(&bytes)?;
+                if height
+                    .checked_sub(1)
+                    .and_then(|h| h.checked_div(spec.consensus.chunk_size))
+                    .is_some_and(|id| id < safety_floor)
+                {
+                    batch.delete(column, key);
+                }
             }
         }
         Ok(())

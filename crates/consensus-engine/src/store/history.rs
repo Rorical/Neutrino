@@ -216,6 +216,18 @@ impl<DB: Database> ChainStore<DB> {
             .map(|value| value.is_some())
     }
 
+    /// Whether a finalized block admitted a safety sanction against this BLS
+    /// identity inside the retained safety window. Every further safety
+    /// receipt or raw report against the identity is redundant: the tombstone
+    /// outlives the safety window, so none can be admitted again.
+    pub fn is_identity_slashed(
+        &self,
+        pubkey: &neutrino_primitives::BlsPublicKey,
+    ) -> Result<bool, StoreError<DB::Error>> {
+        self.get_raw(Column::FinalizedSlashes, pubkey)
+            .map(|value| value.is_some())
+    }
+
     /// Persist a bounded scheduler record. Jobs contain immutable artifact IDs.
     pub fn put_history_job(
         &mut self,

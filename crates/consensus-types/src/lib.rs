@@ -636,6 +636,39 @@ pub enum SlashingEvidence {
     },
 }
 
+impl SlashingEvidence {
+    /// Index of the validator this evidence accuses inside its source chunk's
+    /// validator set. Structural only: the Evidence Guest authenticates the
+    /// signatures, this merely names whose identity the claim is about.
+    #[must_use]
+    pub const fn offender_index(&self) -> ValidatorIndex {
+        match self {
+            Self::DoubleBftProposal { proposer_index, .. }
+            | Self::DoubleProposal { proposer_index, .. }
+            | Self::InvalidVrfClaim { proposer_index, .. }
+            | Self::DaCommitmentFraud { proposer_index, .. } => *proposer_index,
+            Self::ConflictingNilVote {
+                validator_index, ..
+            }
+            | Self::DoublePrevote {
+                validator_index, ..
+            }
+            | Self::DoublePrecommit {
+                validator_index, ..
+            }
+            | Self::LockViolation {
+                validator_index, ..
+            }
+            | Self::InvalidProofSigning {
+                validator_index, ..
+            }
+            | Self::LongRangeForkParticipation {
+                validator_index, ..
+            } => *validator_index,
+        }
+    }
+}
+
 /// Proven chunk commitment.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Chunk {

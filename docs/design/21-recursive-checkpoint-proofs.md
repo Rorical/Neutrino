@@ -131,8 +131,8 @@ the historical validator context, not past inclusion of that particular vote.
 The vote's signature and attestation are checked separately. Liveness evidence
 admission enforces the same eight-chunk window plus the governable evidence-age
 window (1,024 blocks by default); safety evidence admission enforces no age at
-all, only that the offender still holds slashable balance, opening any finalized
-record through the same fixed-depth path. See [evidence proofs](20-evidence-proofs.md).
+all, only the once-per-identity tombstone, opening any finalized record through
+the same fixed-depth path. See [evidence proofs](20-evidence-proofs.md).
 Raw data must still be available from a retaining node.
 A root or recursive proof cannot reconstruct deleted records. Fixed depth bounds
 work with respect to chain age; actual work still varies with current transactions,

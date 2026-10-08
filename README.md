@@ -34,7 +34,8 @@ Neutrino separates the chain into two cleanly decoupled layers:
 - **Proof-backed pruning.** Full and validator nodes retain the recent eight-chunk
   window once a persisted recursive prefix covers older data, the compact historical
   validator records for one unbonding delay, and the history tree forever, so a
-  signed fork is punishable for as long as its signers hold stake. `role = "archive"`
+  signed fork is attributable at any age and punishable for as long as its signers
+  hold stake. `role = "archive"`
   keeps complete source history voluntarily. Old transactions may become globally
   unavailable when no archive retains them; proof lag delays deletion.
 - **Authenticated snapshot bootstrap.** Full/validator nodes verify a recursive

@@ -92,9 +92,9 @@ After restart, the node performs one authenticated replay of retained source
 metadata and original signed artifacts before resuming signing. The replay
 feeds discovered offences into the normal persistent evidence pool; it does
 not discard generated evidence during engine construction. Raw reports and
-receipts against an identity that is tombstoned, finalized as slashed, already
-covered by a pooled safety receipt, or left with nothing at stake are skipped
-before proving or verification (see design 20). Steady-state
+receipts against an identity that is tombstoned, finalized as slashed or already
+covered by a pooled safety receipt are skipped before proving or verification
+(see design 20). Steady-state
 observation uses dependency metadata and cached exact receipt verdicts rather
 than scanning or re-verifying every receipt after each vote.
 
@@ -115,8 +115,8 @@ historical opening. Full and validator nodes delete older source rows only below
 saved recursive coverage. Archive nodes can retain and serve older sources, but old
 sources do not extend the protocol's offence-admission windows.
 
-Safety evidence has no age window: it remains admissible for as long as the
-accused still holds slashable balance, far beyond the eight-chunk source cache.
+Safety evidence has no age window: it remains admissible once per identity at
+any time, far beyond the eight-chunk source cache.
 The canonical side of such a claim comes from the historical records, which keep
 each finalized certificate's individual attestations for one unbonding delay on
 full nodes and indefinitely on archives; the conflicting side comes from whoever

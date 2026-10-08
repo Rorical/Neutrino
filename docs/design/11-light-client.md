@@ -43,10 +43,11 @@ eliminate the PoS long-range/weak-subjectivity problem. The trust window is boun
 by accountability: `ChainSpec::validate` rejects a `weak_subjectivity_period_secs`
 longer than `unbonding_delay_blocks * slot_duration_secs`. A fork signed by the
 validators who were accountable at an anchor may surface at any point while the
-anchor is trusted. Safety evidence has no age window: a signature is admissible for
-as long as its signer still holds slashable balance, so the only way a signer
-escapes is to have fully withdrawn, which takes one unbonding delay. Chains wanting
-a longer trust window lengthen the unbonding delay. Peer advertisements are
+anchor is trusted. Safety evidence has no age window: a signature is admissible
+once per identity at any time, and the deduction takes whatever the signer still
+has at stake, so the only way a signer escapes economically is to have fully
+withdrawn, which takes one unbonding delay. Chains wanting a longer trust window
+lengthen the unbonding delay. Peer advertisements are
 hints; requests pin both endpoint hashes and reject mismatched replies. Missing
 suffixes remain unavailable until a provider can supply or construct them.
 

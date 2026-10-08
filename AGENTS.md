@@ -58,9 +58,10 @@ have passed.
   before changing recursion, history storage or light-client trust policy.
 - Historical consensus references and liveness evidence are restricted to the
   preceding eight finalized chunks. Safety evidence (`SanctionKind::Slash`) has no
-  age window: it cites any finalized chunk and the runtime admits it while the
-  offender's address still holds slashable balance (`is_accountable`: active stake
-  or unmatured unbonding). The unbonding delay is therefore the accountability
+  age window: it cites any finalized chunk and is admitted once per identity at
+  any time; the deduction takes whatever slashable balance remains (active stake
+  or unmatured unbonding, possibly nothing) and consensus ejects the identity
+  regardless. The unbonding delay is therefore the economic accountability
   horizon: `evidence_max_age_blocks < unbonding_delay_blocks > chunk_size`, and
   weak subjectivity may not exceed it. The history tree is never pruned, so any
   record's path stays openable; full/validator nodes keep complete historical
@@ -72,9 +73,10 @@ have passed.
   the identity again), a liveness admission marks the offence and that marker is
   swept one unbonding delay after admission. A safety identity is accountable once
   end to end: the node pools at most one safety receipt per identity under the
-  current program, does not verify, store or prove reports against a tombstoned,
-  pooled or fully withdrawn identity, and a finalized safety admission
-  (`FinalizedSlashes`) releases every pooled receipt and raw report against that key.
+  current program, does not verify, store or prove reports against a tombstoned or
+  pooled identity, drops nothing on unfinalized head state, and a finalized safety
+  admission (`FinalizedSlashes`) releases every pooled receipt and raw report
+  against that key.
 - Full/validator snapshot bootstrap verifies a genesis History prefix and an exact
   bridge from local trust, then authenticates validators, recent history and the
   complete execution state before durable atomic installation. Archive nodes replay

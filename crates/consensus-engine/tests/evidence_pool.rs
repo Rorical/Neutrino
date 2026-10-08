@@ -49,13 +49,9 @@ fn verified_pool_survives_restart_preserves_first_receipt_and_expires_at_finalit
         restarted.evidence_artifacts().unwrap(),
         vec![original.clone()]
     );
-    restarted
-        .prune_evidence_artifacts(10, 10, |_| false)
-        .unwrap();
+    restarted.prune_evidence_artifacts(10, 10).unwrap();
     assert_eq!(restarted.evidence_artifacts().unwrap(), vec![original]);
-    restarted
-        .prune_evidence_artifacts(11, 10, |_| false)
-        .unwrap();
+    restarted.prune_evidence_artifacts(11, 10).unwrap();
     assert_eq!(
         restarted.evidence_artifacts().unwrap(),
         [] as [EvidenceArtifact; 0]
@@ -63,23 +59,23 @@ fn verified_pool_survives_restart_preserves_first_receipt_and_expires_at_finalit
 }
 
 #[test]
-fn safety_receipts_never_age_out_but_leave_when_the_identity_has_nothing_at_stake() {
+fn safety_receipts_never_age_out_but_leave_once_their_identity_is_finalized_slashed() {
     let mut store = ChainStore::new(MemoryDatabase::new());
     let safety = artifact(1);
     store.put_evidence_artifact(&safety).unwrap();
     // A million blocks past the source chunk the receipt is still pooled: a
-    // safety claim binds to whatever the identity still holds, not to an age.
-    store
-        .prune_evidence_artifacts(1_000_000, 10, |_| false)
-        .unwrap();
+    // safety claim has no age window.
+    store.prune_evidence_artifacts(1_000_000, 10).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap(), vec![safety.clone()]);
-    // The node, which can read the staking state, marks it stale once the
-    // identity has fully withdrawn.
     store
-        .prune_evidence_artifacts(1_000_000, 10, |item| {
-            item.statement_id() == safety.statement_id()
-        })
+        .db_mut()
+        .put(
+            Column::FinalizedSlashes,
+            &safety.statement.offender.pubkey,
+            &1_u64.to_be_bytes(),
+        )
         .unwrap();
+    store.prune_evidence_artifacts(1_000_000, 10).unwrap();
     assert_eq!(
         store.evidence_artifacts().unwrap(),
         [] as [EvidenceArtifact; 0]
@@ -104,7 +100,7 @@ fn persistent_pool_enforces_receipt_and_entry_bounds() {
         .db_mut()
         .put(Column::FinalizedOffences, &[0; 32], &1_u64.to_be_bytes())
         .unwrap();
-    store.prune_evidence_artifacts(1, 1024, |_| false).unwrap();
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     store.put_evidence_artifact(&item).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap().len(), 256);
 }
@@ -127,7 +123,7 @@ fn finalization_releases_cache_capacity_without_discarding_reorg_candidates() {
         )
         .unwrap();
     let mut store = ChainStore::new(store.into_db());
-    store.prune_evidence_artifacts(1, 1024, |_| false).unwrap();
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap(), vec![pending]);
 }
 
@@ -155,7 +151,7 @@ fn finalized_safety_sanction_releases_every_receipt_against_the_identity() {
     assert!(store.is_identity_slashed(&identity).unwrap());
     assert!(store.is_receipt_finalized(&second.statement).unwrap());
     assert!(!store.is_receipt_finalized(&liveness.statement).unwrap());
-    store.prune_evidence_artifacts(1, 1024, |_| false).unwrap();
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap(), vec![liveness]);
 }
 
@@ -179,7 +175,7 @@ fn pool_identity_is_scoped_to_program_and_exact_statement() {
             &1_u64.to_be_bytes(),
         )
         .unwrap();
-    store.prune_evidence_artifacts(1, 1024, |_| false).unwrap();
+    store.prune_evidence_artifacts(1, 1024).unwrap();
     assert_eq!(
         store.evidence_artifacts().unwrap(),
         [] as [EvidenceArtifact; 0]

@@ -108,21 +108,20 @@ impl<DB: Database> ChainStore<DB> {
         self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)
     }
 
-    /// Drop expired liveness receipts, receipts whose offence or safety identity
-    /// finalized blocks already consumed, and receipts the caller marks stale.
+    /// Drop expired liveness receipts and receipts whose offence or safety
+    /// identity finalized blocks already consumed.
     /// Unfinalized execution is retained for re-admission after reorg.
     pub fn prune_evidence_artifacts(
         &mut self,
         finalized_height: u64,
         liveness_max_age: u64,
-        mut stale: impl FnMut(&neutrino_consensus_types::evidence::EvidenceArtifact) -> bool,
     ) -> Result<(), StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::SanctionKind;
         let mut batch = neutrino_storage::Batch::new();
         for artifact in self.evidence_artifacts()? {
             // Liveness receipts expire with their window. Safety receipts have
-            // no age window: they leave when finalized blocks consumed them or
-            // when the caller knows the identity has nothing left at stake.
+            // no age window: they leave only when finalized blocks consumed
+            // their offence or sanctioned their identity.
             let expired = match artifact.statement.kind {
                 SanctionKind::Slash => false,
                 SanctionKind::Inactivity => {
@@ -130,7 +129,7 @@ impl<DB: Database> ChainStore<DB> {
                         >= liveness_max_age
                 }
             };
-            if expired || self.is_receipt_finalized(&artifact.statement)? || stale(&artifact) {
+            if expired || self.is_receipt_finalized(&artifact.statement)? {
                 batch.delete(Column::EvidenceProofs, artifact.statement_id());
             }
         }

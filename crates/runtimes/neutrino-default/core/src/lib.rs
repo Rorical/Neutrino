@@ -261,32 +261,6 @@ impl RuntimePolicy {
     }
 }
 
-/// Whether `address` still holds slashable balance.
-///
-/// Slashable balance is active stake or queued unbonding that has not matured
-/// into the spendable account. This is the admissibility rule for safety
-/// evidence: a signature has no expiry; what ends accountability is the last
-/// slashable unit leaving the staking lifecycle, after which the identity can
-/// never be seated again.
-pub fn is_accountable<B: StateBackend>(state: &mut B, address: &Address) -> bool {
-    accountable_from_records(
-        state.read(&validator_key(address)).as_deref(),
-        state.read(&withdrawal_key(address)).as_deref(),
-    )
-}
-
-/// [`is_accountable`] over raw stored records, for hosts that read state
-/// outside a [`StateBackend`]. Malformed records count as no balance.
-#[must_use]
-pub fn accountable_from_records(validator: Option<&[u8]>, withdrawals: Option<&[u8]>) -> bool {
-    validator
-        .and_then(decode_validator)
-        .is_some_and(|validator| validator.stake > 0)
-        || withdrawals
-            .and_then(decode_withdrawal_queue)
-            .is_some_and(|queue| queue.total() > 0)
-}
-
 /// Read the governable policy; absent state means the canonical defaults.
 pub fn load_runtime_policy<B: StateBackend>(state: &mut B) -> RuntimePolicy {
     state
@@ -3247,11 +3221,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "offender not accountable")]
-    fn slashing_an_unknown_validator_is_rejected_at_admission() {
-        // A safety claim binds to slashable balance. An address the runtime
-        // never saw holds none, so the claim is invalid rather than a no-op:
-        // admitting it would only mint a permanent tombstone for nothing.
+    fn slashing_an_unknown_validator_is_a_no_op() {
+        // A safety claim is admissible once per identity at any age. The
+        // mandatory deduction takes whatever slashable balance remains, here
+        // nothing, and consensus ejects the identity regardless.
         let mut live = LiveTrie::default();
         let input = StfInput {
             evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
@@ -3269,7 +3242,15 @@ mod tests {
             10,
             neutrino_consensus_types::evidence::SanctionKind::Slash,
         );
-        apply_block(&input, &mut TracingState::new(&live));
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, 1);
+        assert_eq!(host_out.failed, 0);
+        assert_eq!(host_out.accountability.executed.len(), 1);
+        assert_eq!(
+            host_out.validator_set_root,
+            ConsensusCandidates::default().root()
+        );
     }
 
     #[test]

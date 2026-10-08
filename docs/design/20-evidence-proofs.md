@@ -184,13 +184,15 @@ Admissibility is selected by `SanctionKind`:
   bounds ordinary embedded votes and chunk-witness historical reads.
 - **Safety evidence** (`Slash`: double proposals and votes, lock violations,
   invalid-proof acceptance, signed fork participation, DA fraud, invalid VRF
-  claims) has **no age window**. A safety claim may cite any finalized chunk, and
-  the runtime admits it while the offender's address still holds slashable
-  balance: active stake or queued unbonding that has not matured
-  (`is_accountable`). What ends accountability is the last slashable unit leaving
-  the staking lifecycle, after which consensus never seats the identity again.
-  The fixed 64-level history opening costs the same at any age, and the
-  `EvidenceAnchor` carries only the genesis-fixed unbonding delay and chunk size.
+  claims) has **no age window**. A safety claim may cite any finalized chunk and
+  is admitted once per identity, whenever it arrives. The mandatory deduction
+  takes whatever slashable balance the offender's address still holds, active
+  stake or queued unbonding that has not matured, possibly nothing; consensus
+  ejects the identity regardless, so a seated validator without a runtime
+  balance is still removed. The fixed 64-level history opening costs the same
+  at any age, and the `EvidenceAnchor` carries only the genesis-fixed unbonding
+  delay and chunk size. Economically, accountability therefore lasts exactly as
+  long as the unbonding delay keeps stake slashable.
 
 The chain spec requires `evidence_max_age_blocks < unbonding_delay_blocks`,
 `unbonding_delay_blocks > chunk_size`, `weak_subjectivity_period_secs <=
@@ -220,18 +222,17 @@ reports and to verify incoming raw reports; they stay for
 `history_record_window_chunks = max(8, ceil(unbonding_delay_blocks / chunk_size))`
 preceding chunks, and older ones come from archives. Raw blocks, proofs and
 signed-source caches keep the eight-chunk window. Pooled liveness receipts expire
-at the liveness floor; pooled safety receipts have no age floor and leave when a
-finalized block has sanctioned their identity or the identity has nothing left at
-stake.
+at the liveness floor; pooled safety receipts have no age floor and leave only
+when a finalized block has sanctioned their identity. Nothing is dropped on the
+strength of unfinalized head state, so a reorg cannot lose evidence.
 
 A safety identity is accountable once, and the node applies that rule before any
 expensive work. A receipt or raw report against a key the head state has
-tombstoned, that finalized history has sanctioned, that a pooled safety receipt
-under the current Evidence program already covers, or whose address holds no
-slashable balance is neither verified, stored nor proven; a receipt under a
-superseded program shields nothing; a network receipt in that position is
-deferred, not rejected, because it is redundant or not yet usable rather than
-wrong. Finalizing a safety admission records the identity in `FinalizedSlashes`
+tombstoned, that finalized history has sanctioned, or that a pooled safety
+receipt under the current Evidence program already covers is neither verified,
+stored nor proven; a receipt under a superseded program shields nothing; a
+network receipt in that position is deferred, not rejected, because it is
+redundant rather than wrong. Finalizing a safety admission records the identity in `FinalizedSlashes`
 next to the offence in `FinalizedOffences`, and the next pruning pass releases
 every pooled receipt and raw report against that key. The pool therefore holds at
 most one admissible safety receipt per identity; without this rule a validator
@@ -262,8 +263,7 @@ Every claim binds the complete chain-spec hash and block program identity.
 Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 receipts
 and 32 MiB, never overwrites an existing verified statement, and prunes when its
 admission is finalized, when a finalized block has sanctioned its safety identity,
-when its safety identity has nothing left at stake, or (liveness only) when its
-admission window is behind finalized history.
+or (liveness only) when its admission window is behind finalized history.
 Receipts executed on an unfinalized branch remain available across reorgs. The block builder reserves
 mandatory execution gas and bounds attachment plus ordinary transaction bytes.
 Background jobs run outside the engine lock; startup/network initialization,

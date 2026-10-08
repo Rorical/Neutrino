@@ -147,10 +147,10 @@ pub const DEFAULT_EXIT_DELAY_EPOCHS: u64 = 2;
 /// Default weak-subjectivity period in seconds: one unbonding delay.
 ///
 /// A trust anchor stays sound only while a fork signed by the validators who
-/// were accountable at it can still be punished. Safety evidence against an
-/// identity is admissible for as long as that identity still holds slashable
-/// balance, so the bound is the unbonding delay itself: once every signer of
-/// an old anchor has fully withdrawn, nothing they sign costs them anything.
+/// were accountable at it can still be punished. Safety evidence has no age
+/// window and the deduction takes whatever stake remains, so the bound is the
+/// unbonding delay itself: once every signer of an old anchor has fully
+/// withdrawn, nothing they sign costs them anything.
 /// The default equals `DEFAULT_UNBONDING_DELAY_BLOCKS * DEFAULT_SLOT_DURATION_SECS`;
 /// specifications wanting a longer trust window lengthen the unbonding delay.
 pub const DEFAULT_WEAK_SUBJECTIVITY_PERIOD_SECS: u64 =
@@ -781,11 +781,10 @@ impl Default for LightClientParams {
 /// Default unbonding delay used when a chain spec does not override
 /// `runtime.unbonding_delay_blocks`: fourteen days at the default slot duration.
 ///
-/// Unbonded stake stays slashable until it matures, and safety evidence
-/// against an identity is admissible for as long as the identity holds any
-/// slashable balance, so this delay is the chain's accountability horizon: it
-/// bounds the weak-subjectivity period and must exceed both one chunk and the
-/// governable liveness evidence window. Chains with a different slot duration
+/// Unbonded stake stays slashable until it matures, and safety evidence has
+/// no age window, so this delay is the chain's economic accountability
+/// horizon: it bounds the weak-subjectivity period and must exceed both one
+/// chunk and the governable liveness evidence window. Chains with a different slot duration
 /// or trust window set the delay accordingly.
 pub const DEFAULT_UNBONDING_DELAY_BLOCKS: u64 = 14 * 24 * 60 * 60 / DEFAULT_SLOT_DURATION_SECS;
 
@@ -825,7 +824,7 @@ pub struct RuntimeParams {
     /// Admission window for liveness evidence (inactivity) after its
     /// authenticated source chunk ends. Governable; strictly below
     /// `unbonding_delay_blocks`. Safety evidence has no age window: it is
-    /// admissible while the offender still holds slashable balance.
+    /// admitted once per identity whenever it arrives.
     pub evidence_max_age_blocks: u64,
     /// Maximum number of verified sanctions retained in the mandatory FIFO.
     pub evidence_max_pending: u32,
@@ -938,7 +937,7 @@ impl ChainSpec {
         // obligation always finds the stake it holds; the unbonding delay
         // itself exceeds one chunk so consensus observes a zero stake at a
         // boundary before a record can be retired. Safety evidence has no age
-        // window: it binds while the offender holds slashable balance.
+        // window: it is admitted once per identity whenever it arrives.
         if self.runtime.evidence_max_age_blocks == 0
             || self.runtime.evidence_max_age_blocks >= self.runtime.unbonding_delay_blocks
             || self.runtime.unbonding_delay_blocks <= self.consensus.chunk_size
@@ -953,8 +952,8 @@ impl ChainSpec {
         }
 
         // Weak subjectivity is only sound while a fork signed by the anchor's
-        // validators can still be punished. Safety evidence binds for as long
-        // as a signer holds slashable balance, so the trust window may not
+        // validators can still be punished. Safety evidence has no age window
+        // and deducts whatever stake remains, so the trust window may not
         // outlast the unbonding delay.
         if self
             .runtime

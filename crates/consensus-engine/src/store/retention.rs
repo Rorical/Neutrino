@@ -385,8 +385,8 @@ impl<DB: Database> ChainStore<DB> {
     /// finalized-offence records below `liveness_floor`, raw reports whose
     /// complete record this node no longer keeps (below `record_floor`), and
     /// every receipt or report against an identity a finalized block has
-    /// already sanctioned. Safety receipts have no age floor; the node drops
-    /// them once their identity has nothing left at stake.
+    /// already sanctioned. Safety receipts have no age floor and leave only
+    /// through those finalized facts, never on unfinalized head state.
     fn prune_evidence(
         &self,
         batch: &mut Batch,

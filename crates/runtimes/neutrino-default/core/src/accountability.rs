@@ -111,11 +111,10 @@ pub fn marker_key(statement: &EvidenceStatement) -> Vec<u8> {
 /// The block at `height + unbonding_delay_blocks + 1` deletes the bucket and
 /// every listed marker. The unbonding delay is fixed at genesis and exceeds
 /// every liveness window governance may set, so a swept marker can never
-/// bind again. Safety tombstones are never listed: a safety claim stays
-/// admissible for as long as the identity holds slashable balance, which has
-/// no fixed horizon, and consensus never seats a slashed identity again, so
-/// the tombstone is permanent and the live set is bounded by the identities
-/// ever sanctioned.
+/// bind again. Safety tombstones are never listed: a safety claim has no age
+/// window and consensus never seats a slashed identity again, so the
+/// tombstone is permanent and the live set is bounded by the identities ever
+/// sanctioned.
 pub fn expiry_key(height: u64) -> Vec<u8> {
     let mut key = Vec::from(&b"accountability:expiry:v1:"[..]);
     key.extend_from_slice(&height.to_be_bytes());
@@ -231,7 +230,7 @@ fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::Ru
             break;
         };
         // Liveness claims expire with the governable window; safety claims
-        // never do, their admissibility is the offender's slashable balance.
+        // never do. Replay protection is the identity tombstone.
         assert!(
             submission.within_age(input.block_height, policy.evidence_max_age_blocks),
             "evidence window"
@@ -254,13 +253,6 @@ fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<S
         };
         let claim = &submission.statement;
         assert!(state.read(&marker_key(claim)).is_none(), "offence replay");
-        // A safety claim binds to whatever the identity still has at stake,
-        // however old the signature. Nothing left means nothing to admit.
-        assert!(
-            claim.kind == SanctionKind::Inactivity
-                || crate::is_accountable(state, &claim.offender.withdrawal_credentials),
-            "offender not accountable"
-        );
         assert!(
             !admitted.iter().any(|s: &Sanction| match claim.kind {
                 SanctionKind::Slash =>
@@ -717,12 +709,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "offender not accountable")]
-    fn safety_claim_against_an_identity_with_nothing_at_stake_is_rejected() {
+    fn safety_claim_against_an_identity_with_nothing_at_stake_still_tombstones_it() {
+        // Nothing to deduct is an explicit outcome, not a reason to refuse the
+        // claim: the tombstone still ejects the identity from consensus.
         let mut input = input();
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let live = LiveTrie::default();
-        crate::apply_block(&input, &mut TracingState::new(&live));
+        let mut state = TracingState::new(&live);
+        let output = crate::apply_block(&input, &mut state);
+        assert_eq!(output.accountability.admitted.len(), 1);
+        assert_eq!(output.accountability.executed.len(), 1);
+        assert_eq!(state.read(&slashed_key(&[1; 48])), Some(vec![1]));
     }
 
     #[test]

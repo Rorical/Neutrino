@@ -222,8 +222,9 @@ safety floor, liveness receipts at the liveness floor.
 A safety identity is accountable once, and the node applies that rule before any
 expensive work. A receipt or raw report against a key the head state has
 tombstoned, that finalized history has sanctioned, or that a pooled safety
-receipt under the current Evidence program already covers is neither verified,
-stored nor proven; a network receipt in that position is deferred, not rejected,
+receipt the next block could admit (current Evidence program, still inside the
+safety window) already covers is neither verified, stored nor proven; an expired
+or superseded pooled receipt shields nothing; a network receipt in that position is deferred, not rejected,
 because it is redundant rather than wrong. Finalizing a safety admission records
 the identity in `FinalizedSlashes` next to the offence in `FinalizedOffences`,
 and the next pruning pass releases every pooled receipt and raw report against

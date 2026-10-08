@@ -460,9 +460,14 @@ where
 }
 
 /// A safety identity is accountable once. A tombstone at the head, a finalized
-/// safety sanction, or a pooled safety receipt under the program the next block
-/// admits (other than `except`) already covers every offence the identity could
-/// still answer for, so further reports and receipts against it are redundant.
+/// safety sanction, or a pooled safety receipt (other than `except`) that the
+/// next block could actually admit already covers every offence the identity
+/// could still answer for, so further reports and receipts against it are
+/// redundant. A pooled receipt only counts while it is admissible: it must
+/// carry the program the next block anchors and still sit inside the safety
+/// window at that height. A receipt that has expired at the head but is not
+/// yet pruned at the finalized height, or one under a superseded program, must
+/// not shield the identity from a receipt that can be admitted.
 fn safety_identity_covered<DB: Database>(
     engine: &neutrino_consensus_engine::Engine<DB>,
     pooled: &[EvidenceArtifact],
@@ -470,12 +475,16 @@ fn safety_identity_covered<DB: Database>(
     pubkey: &neutrino_primitives::BlsPublicKey,
     except: Option<&neutrino_consensus_types::evidence::EvidenceStatement>,
 ) -> bool {
+    let height = engine.head_height().saturating_add(1);
+    let safety_max_age = engine.chain_spec().runtime.safety_evidence_max_age_blocks;
     engine.state().get(&slashed_key(pubkey)).is_some()
         || engine.store().is_identity_slashed(pubkey).unwrap_or(false)
         || pooled.iter().any(|item| {
             item.statement.kind == SanctionKind::Slash
                 && item.statement.offender.pubkey == *pubkey
                 && Some(item.evidence_guest_vk_digest) == anchor_program
+                && item.statement.context.end_height < height
+                && height - item.statement.context.end_height <= safety_max_age
                 && except.is_none_or(|statement| item.statement != *statement)
         })
 }

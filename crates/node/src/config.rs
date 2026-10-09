@@ -24,14 +24,17 @@ pub enum NodeRole {
     LightClient,
     /// Archive node.
     Archive,
+    /// Non-validator that retains slashable identities' signed evidence inputs.
+    Reporter,
 }
 
 impl NodeRole {
-    /// Archive nodes keep source history; full nodes retain the protocol window.
+    /// Select complete, bounded or economically scoped source retention.
     #[must_use]
     pub const fn retention_policy(self) -> neutrino_consensus_engine::RetentionPolicy {
         match self {
             Self::Archive => neutrino_consensus_engine::RetentionPolicy::Archive,
+            Self::Reporter => neutrino_consensus_engine::RetentionPolicy::Reporter,
             Self::Validator | Self::Full | Self::LightClient => {
                 neutrino_consensus_engine::RetentionPolicy::Pruned
             }
@@ -44,7 +47,7 @@ impl NodeRole {
         match self {
             Self::LightClient => neutrino_sync::SyncMode::LightClient,
             Self::Archive => neutrino_sync::SyncMode::Archive,
-            Self::Validator | Self::Full => neutrino_sync::SyncMode::Snap,
+            Self::Validator | Self::Full | Self::Reporter => neutrino_sync::SyncMode::Snap,
         }
     }
 }
@@ -53,9 +56,12 @@ impl NodeRole {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    /// Self-declared role (validator / full / archive / light).
+    /// Self-declared role (validator / full / archive / light / reporter).
     #[serde(default)]
     pub role: NodeRole,
+    /// Proof-bound reward recipient, required when `role = "reporter"`.
+    #[serde(default)]
+    pub reporter: Option<ReporterConfig>,
     /// Chain id this node participates in.
     pub chain_id: u64,
     /// Proving backend, global concurrency and bounded block queue capacity.
@@ -111,6 +117,42 @@ pub struct NodeConfig {
     /// Prometheus metrics listener. When omitted no metrics endpoint is started.
     #[serde(default)]
     pub metrics: Option<MetricsConfigToml>,
+}
+
+/// Selective evidence retention and reward destination for reporter nodes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReporterConfig {
+    /// Nonzero 32-byte runtime account address encoded as hexadecimal.
+    pub reward_address_hex: String,
+}
+
+impl NodeConfig {
+    /// Validate the reporter role and decode its proof-bound payout address.
+    ///
+    /// # Errors
+    /// Rejects a missing, malformed or zero reward address, or a reporter section
+    /// on a different node role.
+    pub fn reporter_reward_address(&self) -> Result<Option<[u8; 32]>, String> {
+        match (self.role, &self.reporter) {
+            (NodeRole::Reporter, Some(config)) => {
+                let address = crate::chain_spec::decode_hex_exact::<32>(
+                    &config.reward_address_hex,
+                    "reporter.reward_address_hex",
+                )
+                .map_err(|error| error.to_string())?;
+                if address == [0; 32] {
+                    return Err("reporter.reward_address_hex must be nonzero".into());
+                }
+                Ok(Some(address))
+            }
+            (NodeRole::Reporter, None) => {
+                Err("role = reporter requires [reporter].reward_address_hex".into())
+            }
+            (_, Some(_)) => Err("[reporter] requires role = reporter".into()),
+            (_, None) => Ok(None),
+        }
+    }
 }
 
 /// `[metrics]` section: a plain-text Prometheus endpoint at `GET /metrics`.
@@ -405,6 +447,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reporter_config_requires_nonzero_recipient_and_pruned_nonvalidator_mode() {
+        let config: NodeConfig = toml::from_str(&format!(
+            "chain_id = 1\nrole = 'reporter'\n[reporter]\nreward_address_hex = '{}'\n",
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(config.reporter_reward_address().unwrap(), Some([0xab; 32]));
+        assert_eq!(config.role.sync_mode(), neutrino_sync::SyncMode::Snap);
+        assert_eq!(
+            config.role.retention_policy(),
+            neutrino_consensus_engine::RetentionPolicy::Reporter
+        );
+        assert!(config.proposer_ikm_path.is_none());
+        assert!(config.proposer_ikm_hex.is_none());
+        for hex in ["00".repeat(32), "ab".repeat(31), "zz".repeat(32)] {
+            let mut invalid = config.clone();
+            invalid.reporter.as_mut().unwrap().reward_address_hex = hex;
+            assert!(invalid.reporter_reward_address().is_err());
+        }
+        let mut missing = config.clone();
+        missing.reporter = None;
+        assert!(missing.reporter_reward_address().is_err());
+        let mut wrong_role = config;
+        wrong_role.role = NodeRole::Full;
+        assert!(wrong_role.reporter_reward_address().is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_reporter_config_fails_before_chain_spec_or_network() {
+        let config: NodeConfig = toml::from_str("chain_id = 1\nrole = 'reporter'\n").unwrap();
+        let error = crate::run(config).await.unwrap_err();
+        assert!(error.to_string().contains("reward_address_hex"));
+    }
+
+    #[test]
     fn parses_validator_production_fields() {
         let cfg: NodeConfig = toml::from_str(
             r#"
@@ -608,7 +685,7 @@ query_fuel = 1000000
 
     #[tokio::test]
     async fn invalid_proving_config_fails_before_network_and_chain_spec_for_every_role() {
-        for role in ["validator", "full", "archive", "light-client"] {
+        for role in ["validator", "full", "archive", "light-client", "reporter"] {
             let cfg: NodeConfig = toml::from_str(&format!(
                 "chain_id = 1\nrole = '{role}'\n[proving]\ncuda_device = 0"
             ))

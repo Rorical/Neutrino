@@ -67,6 +67,8 @@ fn successor(
     next.context = validated.next_context;
     next.seed = previous.end.seed;
     let historical = HistoricalChunk {
+        runtime_code_hash: first.context.programs.runtime_code_hash,
+        block_guest_vk_digest: first.context.programs.execution.block,
         chunk: as_chunk(&previous.chunk),
         validators: first.context.active_validators.clone(),
         seed: first.seed,
@@ -343,4 +345,141 @@ fn enacted_upgrade_switches_the_end_boundary_at_its_activation_chunk() {
         neutrino_prover_chunk::consensus::validate_consensus_with_context(&witness).unwrap();
     assert_eq!(validated.statement.end.programs, witness.context.programs);
     assert_eq!(validated.next_context.programs, witness.context.programs);
+}
+
+fn candidate_state(
+    key: &neutrino_crypto::bls::SecretKey,
+    address: [u8; 32],
+    stake: u128,
+) -> (
+    neutrino_runtime_core::host::LiveTrie,
+    neutrino_default_runtime_core::ConsensusCandidates,
+) {
+    use neutrino_default_runtime_core::{
+        BlsIdentity, CONSENSUS_CANDIDATES_KEY, ConsensusCandidate, ConsensusCandidates,
+    };
+    let mut candidates = ConsensusCandidates::default();
+    candidates.upsert(ConsensusCandidate {
+        address,
+        stake,
+        identity: Some(BlsIdentity {
+            pubkey: key.public_key().to_bytes(),
+            pop_signature: key.prove_possession().to_bytes(),
+        }),
+    });
+    let mut live = neutrino_runtime_core::host::LiveTrie::default();
+    live.insert(
+        CONSENSUS_CANDIDATES_KEY,
+        borsh::to_vec(&candidates).unwrap(),
+    );
+    (live, candidates)
+}
+
+#[test]
+fn historical_slash_ejects_the_same_identity_at_a_changed_withdrawal_account() {
+    use neutrino_consensus_types::evidence::SanctionKind;
+    use neutrino_default_runtime_core::accountability::Sanction;
+    use neutrino_prover_chunk::{
+        consensus::validate_candidate,
+        rotation::{derive_next_validators, retirement_delay_chunks},
+    };
+    let key = neutrino_crypto::bls::SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    let (live, candidates) = candidate_state(&key, [8; 32], 100);
+    let (mut input, _, _) = support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, &live);
+    let before = validate_candidate(&input).unwrap();
+    assert_eq!(before.next_validators[0].effective_stake, 100);
+    let mut historical = input.context.active_validators[0].clone();
+    historical.withdrawal_credentials = [9; 32];
+    // This native composition seam consumes the block-proven admission. The
+    // Chunk Guest separately verifies the containing block receipt.
+    input.blocks[0]
+        .output
+        .accountability
+        .admitted
+        .push(Sanction {
+            offence_id: [91; 32],
+            offender: historical,
+            kind: SanctionKind::Slash,
+        });
+    let after = validate_candidate(&input).unwrap();
+    assert_eq!(after.next_validators.len(), 1);
+    let seated = &after.next_validators[0];
+    assert_eq!(seated.withdrawal_credentials, [8; 32]);
+    assert_eq!(seated.pubkey, key.public_key().to_bytes());
+    assert!(seated.slashed);
+    assert_eq!(seated.effective_stake, 0);
+    let far = retirement_delay_chunks(
+        &input.chain_spec.consensus,
+        input.chain_spec.runtime.unbonding_delay_blocks,
+    )
+    .unwrap()
+        + 10;
+    let later = derive_next_validators(
+        &after.next_validators,
+        &candidates,
+        &input.chain_spec.consensus,
+        input.chain_spec.runtime.unbonding_delay_blocks,
+        far,
+    )
+    .unwrap();
+    assert_eq!(later.len(), 1);
+    assert!(later[0].slashed);
+    assert_eq!(later[0].effective_stake, 0);
+}
+
+#[test]
+fn historical_slash_of_a_retired_identity_blocks_its_queued_new_account() {
+    use neutrino_consensus_types::evidence::SanctionKind;
+    use neutrino_default_runtime_core::accountability::Sanction;
+    use neutrino_prover_chunk::{
+        consensus::validate_candidate,
+        rotation::{derive_next_validators, retirement_delay_chunks},
+    };
+    let key = neutrino_crypto::bls::SecretKey::key_gen(&[43; 32], &[]).unwrap();
+    let (live, candidates) = candidate_state(&key, [10; 32], 300);
+    let (mut input, _, _) = support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, &live);
+    let before = validate_candidate(&input).unwrap();
+    assert_eq!(before.next_validators.len(), 2);
+    assert_eq!(before.next_validators[1].withdrawal_credentials, [10; 32]);
+    assert!(!before.next_validators[1].slashed);
+    let mut historical = input.context.active_validators[0].clone();
+    historical.pubkey = key.public_key().to_bytes();
+    historical.withdrawal_credentials = [9; 32];
+    historical.exit_epoch = 0;
+    // The historical identity is absent from the incoming set, but the
+    // authenticated runtime candidate offers that key under another account.
+    input.blocks[0]
+        .output
+        .accountability
+        .admitted
+        .push(Sanction {
+            offence_id: [92; 32],
+            offender: historical,
+            kind: SanctionKind::Slash,
+        });
+    let after = validate_candidate(&input).unwrap();
+    assert_eq!(after.next_validators.len(), 2);
+    let tombstone = &after.next_validators[1];
+    assert_eq!(tombstone.pubkey, key.public_key().to_bytes());
+    assert_eq!(tombstone.withdrawal_credentials, [9; 32]);
+    assert!(tombstone.slashed);
+    assert_eq!(tombstone.effective_stake, 0);
+    let far = retirement_delay_chunks(
+        &input.chain_spec.consensus,
+        input.chain_spec.runtime.unbonding_delay_blocks,
+    )
+    .unwrap()
+        + 10;
+    let later = derive_next_validators(
+        &after.next_validators,
+        &candidates,
+        &input.chain_spec.consensus,
+        input.chain_spec.runtime.unbonding_delay_blocks,
+        far,
+    )
+    .unwrap();
+    assert_eq!(later.len(), 2);
+    assert!(later[1].slashed);
+    assert_eq!(later[1].effective_stake, 0);
+    assert_eq!(later[1].withdrawal_credentials, [9; 32]);
 }

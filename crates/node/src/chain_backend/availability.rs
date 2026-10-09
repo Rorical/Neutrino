@@ -17,6 +17,11 @@ use neutrino_sync::{EvidenceProofAcceptance, SyncBackendError};
 
 type Rejection = neutrino_consensus_types::ProofRejectionReason;
 
+fn deduplicate_source_votes(votes: &mut Vec<FinalityVote>) {
+    let mut seen = std::collections::BTreeSet::new();
+    votes.retain(|vote| seen.insert(SignedArtifact::Vote(vote.clone()).id()));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::redundant_pub_crate)] // The parent evidence gate consumes exact verdicts.
 pub(super) enum ProofVerdict {
@@ -183,6 +188,14 @@ where
         self.with_engine(|engine| {
             let next = engine.finalized_next_chunk_id();
             chunk_id == next
+                || (engine.retention_info().is_ok_and(|info| {
+                    info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
+                }) && engine
+                    .store()
+                    .historical_chunk(chunk_id)
+                    .ok()
+                    .flatten()
+                    .is_some())
                 || (neutrino_consensus_types::history::is_recent_history_index(chunk_id, next)
                     && engine
                         .store()
@@ -272,11 +285,14 @@ where
         let Some(chunk_id) = chunk else {
             return Rejected;
         };
-        let retained = self.with_engine_mut(|engine| match &artifact {
-            SignedArtifact::Vote(vote) => engine.retain_signed_vote(vote),
-            SignedArtifact::Quorum(quorum) => engine.retain_signed_quorum(quorum),
-            SignedArtifact::BlockProof(proof) => engine.retain_signed_proof(proof),
-            other => engine.retain_signed_artifact(other, false),
+        let retained = self.with_live_engine_mut(|engine| {
+            match &artifact {
+                SignedArtifact::Vote(vote) => engine.retain_signed_vote(vote),
+                SignedArtifact::Quorum(quorum) => engine.retain_signed_quorum(quorum),
+                SignedArtifact::BlockProof(proof) => engine.retain_signed_proof(proof),
+                other => engine.retain_signed_artifact(other, false),
+            }
+            .map_err(Self::map_store_err)
         });
         if retained.is_err() {
             return Deferred;
@@ -284,7 +300,11 @@ where
         if let SignedArtifact::Vote(vote) = &artifact {
             for claim in &vote.attestations {
                 if let Some(quorum) = &claim.unlock_quorum {
-                    let _ = self.with_engine_mut(|engine| engine.retain_signed_quorum(quorum));
+                    let _ = self.with_live_engine_mut(|engine| {
+                        engine
+                            .retain_signed_quorum(quorum)
+                            .map_err(Self::map_store_err)
+                    });
                 }
             }
         }
@@ -398,7 +418,11 @@ where
             let chunk = self
                 .with_engine(|engine| artifact.chunk_id(engine.chain_spec().consensus.chunk_size));
             if self
-                .with_engine_mut(|engine| engine.retain_signed_artifact(&artifact, true))
+                .with_live_engine_mut(|engine| {
+                    engine
+                        .retain_signed_artifact(&artifact, true)
+                        .map_err(Self::map_store_err)
+                })
                 .is_err()
             {
                 return false;
@@ -426,13 +450,7 @@ where
             return Some(verdict);
         }
         let prover = std::sync::Arc::clone(&self.proof_system);
-        let expected = self
-            .with_engine(|engine| {
-                engine
-                    .programs_for_height(proof.height)
-                    .map(|programs| programs.execution.block)
-            })
-            .ok()?;
+        let expected = self.accountability_block_program(proof.height)?;
         let proof = proof.clone();
         let verdict = tokio::task::spawn_blocking(move || {
             match prover.classify_block_rejection(&proof, &expected) {
@@ -500,36 +518,49 @@ where
         let mut evidence = self
             .with_engine_mut(|engine| engine.observe_signed_artifact(artifact))
             .unwrap_or_default();
-        let votes = match artifact {
-            SignedArtifact::Vote(vote) => vec![vote.clone()],
-            SignedArtifact::BlockProof(_) => {
-                let id = artifact.id();
-                let metadata = self
-                    .with_engine(|engine| {
-                        let chunk = artifact
-                            .chunk_id(engine.chain_spec().consensus.chunk_size)
-                            .ok_or(neutrino_consensus_engine::StoreError::Corrupt(
-                                "proof source range",
-                            ))?;
-                        engine.store().signed_artifact_metadata_for_chunk(chunk)
-                    })
-                    .unwrap_or_default();
-                let mut votes = Vec::new();
-                for item in metadata.into_iter().filter(|item| {
-                    item.kind == SignedArtifactKind::Vote && item.proof_hashes.contains(&id)
-                }) {
-                    if let Some((_, SignedArtifact::Vote(vote))) = self
-                        .with_engine(|engine| engine.store().signed_artifact(&item.id))
-                        .ok()
-                        .flatten()
-                    {
-                        votes.push(vote);
+        let votes =
+            match artifact {
+                SignedArtifact::Vote(vote) => vec![vote.clone()],
+                SignedArtifact::BlockProof(_) => {
+                    let id = artifact.id();
+                    let metadata = self
+                        .with_engine(|engine| {
+                            let chunk = artifact
+                                .chunk_id(engine.chain_spec().consensus.chunk_size)
+                                .ok_or(neutrino_consensus_engine::StoreError::Corrupt(
+                                    "proof source range",
+                                ))?;
+                            engine.store().signed_artifact_metadata_for_chunk(chunk)
+                        })
+                        .unwrap_or_default();
+                    let mut votes = Vec::new();
+                    for item in metadata.into_iter().filter(|item| {
+                        item.kind == SignedArtifactKind::Vote && item.proof_hashes.contains(&id)
+                    }) {
+                        if let Some((_, SignedArtifact::Vote(vote))) = self
+                            .with_engine(|engine| engine.store().signed_artifact(&item.id))
+                            .ok()
+                            .flatten()
+                        {
+                            votes.push(vote);
+                        }
                     }
+                    if let Some(chunk) = self.with_engine(|engine| {
+                        artifact.chunk_id(engine.chain_spec().consensus.chunk_size)
+                    }) {
+                        votes.extend(self.reporter_source_votes(chunk).into_iter().filter(
+                            |vote| {
+                                vote.attestations
+                                    .iter()
+                                    .any(|claim| claim.proof_hashes.contains(&id))
+                            },
+                        ));
+                    }
+                    deduplicate_source_votes(&mut votes);
+                    votes
                 }
-                votes
-            }
-            _ => Vec::new(),
-        };
+                _ => Vec::new(),
+            };
         evidence.extend(self.detect_signed_proof_offences(votes).await);
         for item in evidence {
             self.pool_and_gossip_slashing(item).await;
@@ -558,10 +589,43 @@ where
                 votes.push(vote);
             }
         }
+        let reporter_chunks = self.with_engine(|engine| {
+            if engine.retention_info().is_ok_and(|info| {
+                info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
+            }) {
+                engine.store().reporter_history_chunks().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        });
+        for chunk in reporter_chunks {
+            votes.extend(self.reporter_source_votes(chunk));
+        }
+        deduplicate_source_votes(&mut votes);
         evidence.extend(self.detect_signed_proof_offences(votes).await);
         for item in evidence {
             self.pool_and_gossip_slashing(item).await;
         }
+    }
+
+    fn reporter_source_votes(&self, chunk: ChunkId) -> Vec<FinalityVote> {
+        self.with_engine(|engine| {
+            if !engine.retention_info().is_ok_and(|info| {
+                info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
+            }) {
+                return Vec::new();
+            }
+            engine
+                .store()
+                .reporter_sources_for_chunk(chunk)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|source| match source {
+                    SignedArtifact::Vote(vote) => Some(vote),
+                    _ => None,
+                })
+                .collect()
+        })
     }
 
     /// Consume the ordinary import verdict without verifying accepted receipts twice.

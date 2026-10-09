@@ -60,7 +60,7 @@ have passed.
   preceding eight finalized chunks. Safety evidence (`SanctionKind::Slash`) has no
   age window: it cites any finalized chunk and is admitted once per identity at
   any time; the deduction takes whatever slashable balance remains (active stake
-  or unmatured unbonding, possibly nothing) and consensus ejects the identity
+  or not-yet-withdrawn unbonding, possibly nothing) and consensus ejects the identity
   regardless. The unbonding delay bounds the withdrawal accountability horizon:
   `evidence_max_age_blocks < unbonding_delay_blocks > chunk_size`, and weak
   subjectivity may not exceed it. Full/validator nodes store no historical tree
@@ -99,6 +99,24 @@ have passed.
   current plus eight-chunk evidence window. Read
   `docs/design/23-evidence-availability.md` before changing evidence retention,
   discovery or retrieval. Archive retention does not extend admissible consensus history.
+  Reporter nodes keep source signatures, compact historical contexts and current
+  paths while identities remain slashable, with eligibility queried through the
+  installed runtime against finalized state. An identity's retained historical
+  withdrawal accounts are queried together; a new account never overwrites an
+  old account's accountability. Safety ejection follows the BLS identity across
+  accounts and preserves a slashed seat even for an already retired offender.
+  They keep no complete tree or old
+  transaction bodies; forensic old-source admission never widens live BFT history.
+  Reporter destinations are bound by Evidence Guest statements. The runtime fixes
+  a governed reward percentage at safety admission and pays it from the actual
+  deduction at FIFO execution (default 10%); rewards never enter consensus rules.
+  Read `docs/design/25-reporter-nodes.md` before changing reporter retention,
+  discovery, bootstrap restrictions, reward attribution or runtime economic queries.
+  Historical context leaves bind their source Block Guest identity and runtime
+  artifact hash. Old receipt
+  rejection uses that authenticated source key; the EvidenceStatement's separate
+  Block key remains the current admission program. Never reinterpret an old valid
+  receipt under a new key to manufacture a safety offence.
 - Execution program identities (runtime, fact, evidence, block) live in every
   `ConsensusBoundary` as a `ProgramSet` and are governable. The chunk and checkpoint
   Guests are pinned in the immutable `ChainBinding`: changing either is a hard fork.

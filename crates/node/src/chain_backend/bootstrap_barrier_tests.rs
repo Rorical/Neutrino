@@ -2,16 +2,18 @@
 
 use super::super::state_sync_tests;
 use super::{BootstrapRuntime, ChainBackend};
-use neutrino_consensus_engine::{Engine, ProposerKey};
+use neutrino_consensus_engine::{Engine, ProposerKey, RetentionPolicy};
 use neutrino_consensus_types::{
-    BlockProofPublicInputs, Chunk,
+    BlockProof, BlockProofPublicInputs, Chunk, FinalityVotePhase, Header, NilVote,
+    NilVoteAttestation, NilVoteData,
     history_proof::{ChainBinding, Checkpoint, ConsensusBoundary, ExecutionPrograms},
+    signed_artifacts::SignedArtifact,
 };
 use neutrino_proof_system::{
     MockBlockProof, MockProofSystem, ProofError, ProofSystem, UnsupportedExecutor,
 };
 use neutrino_storage::{Column, Database, MemoryDatabase};
-use neutrino_sync::SyncBackendError;
+use neutrino_sync::{EvidenceProofAcceptance, SyncBackendError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -202,4 +204,217 @@ async fn barrier_waits_for_an_admitted_engine_mutation_to_finish() {
     mutation.join().unwrap();
     barrier.join().unwrap();
     assert!(backend.bootstrap_pending());
+}
+
+fn nil_source() -> SignedArtifact {
+    let signer = ProposerKey::from_ikm(&[6; 32], 0).unwrap();
+    let domain = state_sync_tests::spec().consensus_domain();
+    let data = NilVoteData {
+        chunk_id: 0,
+        round: 0,
+        phase: FinalityVotePhase::Prevote,
+    };
+    let signature = signer.sign_raw(&data.signing_message(domain)).to_bytes();
+    let mut attestation = NilVoteAttestation {
+        validator_index: 0,
+        vote: data.clone(),
+        vote_signature: signature,
+        signature: [0; 96],
+    };
+    attestation.signature = signer
+        .sign_raw(&attestation.signing_message(domain))
+        .to_bytes();
+    SignedArtifact::NilVote(NilVote {
+        data,
+        signature,
+        aggregation_bits: neutrino_primitives::BitVec::from_bytes(1, vec![1]).unwrap(),
+        attestations: vec![attestation],
+    })
+}
+
+#[tokio::test]
+async fn bootstrap_rechecks_reporter_history_created_by_an_admitted_source_write() {
+    let backend = Arc::new(backend(MockProofSystem));
+    backend.with_engine_mut(|engine| {
+        engine
+            .set_retention_policy(RetentionPolicy::Reporter)
+            .unwrap();
+    });
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let source = nil_source();
+    let source_id = source.id();
+    let writer = Arc::clone(&backend);
+    let write = std::thread::spawn(move || {
+        writer
+            .with_live_engine_mut(|engine| {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                engine
+                    .retain_signed_artifact(&source, false)
+                    .map_err(ChainBackend::<MemoryDatabase, MockProofSystem>::map_store_err)
+            })
+            .unwrap()
+    });
+    entered_rx.recv().unwrap();
+    let downloading = Arc::clone(&backend);
+    let runtime = tokio::runtime::Handle::current();
+    let fetch = std::thread::spawn(move || runtime.block_on(downloading.bootstrap_fetch(true)));
+    resume_tx.send(()).unwrap();
+    write.join().unwrap();
+    fetch.join().unwrap();
+    assert!(!backend.bootstrap_pending());
+    backend.with_engine(|engine| {
+        assert!(engine.reporter_has_history().unwrap());
+        assert!(
+            engine
+                .store()
+                .signed_artifact(&source_id)
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+struct PausedVerdictProofSystem {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ProofSystem for PausedVerdictProofSystem {
+    type BlockProof = MockBlockProof;
+    type ChunkProof = Vec<u8>;
+
+    fn prove_block(
+        &self,
+        witness: &[u8],
+        inputs: &BlockProofPublicInputs,
+    ) -> Result<MockBlockProof, ProofError> {
+        MockProofSystem.prove_block(witness, inputs)
+    }
+
+    fn verify_block(
+        &self,
+        proof: &MockBlockProof,
+        inputs: &BlockProofPublicInputs,
+    ) -> Result<(), ProofError> {
+        MockProofSystem.verify_block(proof, inputs)
+    }
+
+    fn classify_block_rejection(
+        &self,
+        proof: &BlockProof,
+        expected: &neutrino_consensus_types::history_proof::VkDigest,
+    ) -> Result<Option<neutrino_consensus_types::ProofRejectionReason>, ProofError> {
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        self.resume.lock().unwrap().recv().unwrap();
+        MockProofSystem.classify_block_rejection(proof, expected)
+    }
+}
+
+fn proof_source<P: ProofSystem + Send + Sync + 'static>(
+    backend: &ChainBackend<MemoryDatabase, P>,
+) -> SignedArtifact {
+    backend.with_engine_mut(|engine| {
+        engine.set_programs(neutrino_consensus_types::history_proof::GuestPrograms {
+            execution: ExecutionPrograms {
+                fact: [1; 8],
+                evidence: [2; 8],
+                block: [3; 8],
+            },
+            consensus: neutrino_consensus_types::history_proof::ConsensusPrograms {
+                chunk: [4; 8],
+                checkpoint: [5; 8],
+            },
+        });
+        let spec = engine.chain_spec();
+        let mut header = Header {
+            height: 1,
+            slot: 1,
+            parent_hash: spec.genesis_block_hash,
+            proposer_index: 0,
+            vrf_proof: [0; 96],
+            state_root: spec.genesis_state_root,
+            transactions_root: [0; 32],
+            votes_root: [0; 32],
+            da_root: [0; 32],
+            runtime_extra: [0; 32],
+            receipts_root: [0; 32],
+            gas_used: 0,
+            gas_limit: spec.genesis_gas_limit,
+            timestamp: 1,
+            signature: [0; 96],
+        };
+        header.signature = ProposerKey::from_ikm(&[6; 32], 0)
+            .unwrap()
+            .sign_proposer_message(spec.consensus_domain(), &header.hash());
+        let public_inputs = BlockProofPublicInputs {
+            chain_id: spec.chain_id,
+            height: header.height,
+            parent_block_hash: header.parent_hash,
+            block_hash: header.hash(),
+            state_root_before: spec.genesis_state_root,
+            state_root_after: header.state_root,
+            transactions_root: header.transactions_root,
+            receipt_root: header.receipts_root,
+            da_root: header.da_root,
+            vm_code_hash: spec.runtime_code_hash,
+            block_program: [3; 8],
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
+            proposer_address: spec.initial_validators[0].withdrawal_credentials,
+            runtime_extra: header.runtime_extra,
+        };
+        let receipt = MockProofSystem.prove_block(&[], &public_inputs).unwrap();
+        // The header was authenticated before enabling reporter retention; the
+        // proof's asynchronous verdict is its first selective source write.
+        engine.store_mut().put_header(&header).unwrap();
+        SignedArtifact::BlockProof(BlockProof {
+            height: header.height,
+            block_hash: header.hash(),
+            public_inputs,
+            proof_bytes: borsh::to_vec(&receipt).unwrap(),
+        })
+    })
+}
+
+#[tokio::test]
+async fn signed_source_rechecks_bootstrap_after_async_proof_classification() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let backend = Arc::new(backend(PausedVerdictProofSystem {
+        entered: Mutex::new(Some(entered_tx)),
+        resume: Mutex::new(resume_rx),
+    }));
+    let source = proof_source(&backend);
+    backend.with_engine_mut(|engine| {
+        engine
+            .set_retention_policy(RetentionPolicy::Reporter)
+            .unwrap();
+    });
+    let accepting = Arc::clone(&backend);
+    let accept = tokio::spawn(async move { accepting.accept_signed_source(source).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    backend.bootstrap_fetch(true).await;
+    assert!(backend.bootstrap_pending());
+    resume_tx.send(()).unwrap();
+    assert_eq!(accept.await.unwrap(), EvidenceProofAcceptance::Deferred);
+    backend.with_engine(|engine| {
+        assert!(!engine.reporter_has_history().unwrap());
+        for column in [Column::SignedArtifacts, Column::ReporterSources] {
+            assert_eq!(
+                engine.store().db().iter_column(column).unwrap(),
+                [] as [(Vec<u8>, Vec<u8>); 0]
+            );
+        }
+    });
 }

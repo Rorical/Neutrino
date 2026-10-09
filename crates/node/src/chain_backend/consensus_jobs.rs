@@ -189,6 +189,7 @@ where
         });
         match outcome {
             Ok(outcome) => {
+                self.refresh_reporter_tracking();
                 self.start_evidence_jobs();
                 self.start_history_jobs();
                 if let Some(publisher) = self.publisher_snapshot() {

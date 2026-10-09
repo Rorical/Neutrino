@@ -24,6 +24,8 @@ fn fixture() -> (ChainSpec, HistoryWitness) {
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let proven = validate_consensus(&input).unwrap();
     let record = HistoricalChunk {
+        runtime_code_hash: input.context.programs.runtime_code_hash,
+        block_guest_vk_digest: input.context.programs.execution.block,
         chunk: as_chunk(&proven.chunk),
         validators: input.context.active_validators,
         seed: input.seed,
@@ -86,6 +88,7 @@ fn nil_value_equivocation_is_objective_and_shares_the_phase_penalty_identity() {
         nil_vote: nil,
     };
     let statement = validate_evidence(&EvidenceWitness {
+        reporter: None,
         chain_spec: spec.clone(),
         source: source.clone(),
         claim: EvidenceClaim::Slash(evidence.clone()),
@@ -93,6 +96,7 @@ fn nil_value_equivocation_is_objective_and_shares_the_phase_penalty_identity() {
     })
     .unwrap();
     let double = validate_evidence(&EvidenceWitness {
+        reporter: None,
         chain_spec: spec.clone(),
         source: source.clone(),
         claim: EvidenceClaim::Slash(double_vote()),
@@ -109,6 +113,7 @@ fn nil_value_equivocation_is_objective_and_shares_the_phase_penalty_identity() {
     }
     assert_eq!(
         validate_evidence(&EvidenceWitness {
+            reporter: None,
             chain_spec: spec,
             source,
             claim: EvidenceClaim::Slash(bad),
@@ -139,6 +144,7 @@ fn leader_equivocation_has_proven_facts_even_with_an_invalid_carried_quorum() {
         .sign(&second.signing_message(spec.consensus_domain()))
         .to_bytes();
     let witness = EvidenceWitness {
+        reporter: None,
         chain_spec: spec,
         source,
         claim: EvidenceClaim::Slash(SlashingEvidence::DoubleBftProposal {
@@ -179,6 +185,16 @@ fn history_openings_cannot_be_substituted_or_reordered() {
     let (_, history) = fixture();
     let root = history.frontier.root().unwrap();
     assert_eq!(history.authenticate(1, root), Ok(()));
+    assert_eq!(
+        history.records[0]
+            .record
+            .evidence_context()
+            .source_runtime_code_hash,
+        [4; 32]
+    );
+    let mut wrong = history.clone();
+    wrong.records[0].record.runtime_code_hash[0] ^= 1;
+    assert_eq!(wrong.authenticate(1, root), Err(HistoryError::Anchor));
     let mut wrong = history.clone();
     wrong.records[0].record.validators[0].withdrawal_credentials[0] ^= 1;
     assert_eq!(wrong.authenticate(1, root), Err(HistoryError::Anchor));
@@ -309,6 +325,7 @@ fn rejected_proof_requires_the_exact_signed_artifact() {
         reason: ProofRejectionReason::MalformedProof,
     };
     let witness = EvidenceWitness {
+        reporter: None,
         chain_spec: spec,
         source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(evidence.clone()),
@@ -319,10 +336,104 @@ fn rejected_proof_requires_the_exact_signed_artifact() {
         rejected_proof.proof_bytes.push(0);
     }
     let bad = EvidenceWitness {
+        reporter: None,
         claim: EvidenceClaim::Slash(evidence),
         ..witness
     };
     assert_eq!(validate_evidence(&bad), Err(HistoryError::Evidence));
+}
+
+#[test]
+fn historical_proof_rejection_keeps_the_source_program_after_an_upgrade() {
+    use neutrino_consensus_types::{BlockProof, ProofRejectionReason, VoteAttestation};
+    use neutrino_primitives::{BlsPublicKey, BlsSignature};
+    use neutrino_prover_chunk::{bls, evidence::validate_evidence_using, facts::EvidenceVerifier};
+
+    #[derive(Default)]
+    struct ProgramRecorder {
+        queried: Vec<[u32; 8]>,
+    }
+    impl bls::Verifier for ProgramRecorder {
+        fn verify(&mut self, key: &BlsPublicKey, message: &[u8], signature: &BlsSignature) -> bool {
+            bls::verify(key, message, signature)
+        }
+        fn aggregate(
+            &mut self,
+            keys: &[BlsPublicKey],
+            message: &[u8],
+            signature: &BlsSignature,
+        ) -> bool {
+            bls::fast_aggregate_verify(keys, message, signature)
+        }
+        fn pop(&mut self, key: &BlsPublicKey, signature: &BlsSignature) -> bool {
+            bls::verify_pop(key, signature)
+        }
+    }
+    impl EvidenceVerifier for ProgramRecorder {
+        fn rejects_block(
+            &mut self,
+            proof: &BlockProof,
+            key: &[u32; 8],
+        ) -> Result<bool, HistoryError> {
+            self.queried.push(*key);
+            // This routing fixture models a receipt accepted by its original
+            // program. Real compressed verification is a separate gate.
+            Ok(*key != proof.public_inputs.block_program)
+        }
+    }
+
+    let (spec, history) = fixture();
+    let (input, _, _) = support::fixture([1; 8], [4; 32]);
+    let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
+    let SlashingEvidence::DoublePrecommit { vote_a: vote, .. } = double_vote() else {
+        unreachable!()
+    };
+    let receipt = BlockProof {
+        height: 1,
+        block_hash: input.blocks[0].header.hash(),
+        public_inputs: input.blocks[0].public_inputs.clone(),
+        proof_bytes: vec![1],
+    };
+    let mut attestation = VoteAttestation {
+        validator_index: 0,
+        vote: vote.data.clone(),
+        vote_signature: vote.signature,
+        proof_hashes: vec![commitment(&receipt)],
+        unlock_quorum: None,
+        signature: [0; 96],
+    };
+    attestation.signature = key
+        .sign(&attestation.signing_message(spec.consensus_domain()))
+        .to_bytes();
+    let mut witness = EvidenceWitness {
+        reporter: Some([42; 32]),
+        chain_spec: spec,
+        source: history.records[0].record.clone(),
+        claim: EvidenceClaim::Slash(SlashingEvidence::InvalidProofSigning {
+            validator_index: 0,
+            vote,
+            attestation,
+            rejected_proof: receipt,
+            reason: ProofRejectionReason::MalformedProof,
+        }),
+        block_guest_vk_digest: [9; 8],
+    };
+    let mut recorder = ProgramRecorder::default();
+    assert_eq!(
+        validate_evidence_using(&witness, &mut recorder),
+        Err(HistoryError::Evidence)
+    );
+    assert_eq!(recorder.queried, vec![[1; 8]]);
+
+    // Swapping the source key could fabricate a rejection, but changes the
+    // authenticated leaf, so the original canonical path cannot authorize it.
+    let root = history.frontier.root().unwrap();
+    let opening = &history.records[0].path;
+    witness.source.block_guest_vk_digest = [9; 8];
+    let forged = validate_evidence_using(&witness, &mut ProgramRecorder::default()).unwrap();
+    assert_eq!(forged.context.source_block_guest_vk_digest, [9; 8]);
+    assert_eq!(forged.block_guest_vk_digest, [9; 8]);
+    assert!(!opening.verify(commitment(&forged.context), root));
 }
 
 #[test]
@@ -346,6 +457,7 @@ fn finalized_divergence_requires_actual_equivocation_and_shares_its_replay_id() 
         },
     };
     let witness = EvidenceWitness {
+        reporter: None,
         chain_spec: spec,
         source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(double_vote()),
@@ -353,6 +465,7 @@ fn finalized_divergence_requires_actual_equivocation_and_shares_its_replay_id() 
     };
     let original = validate_evidence(&witness).unwrap();
     let divergence = EvidenceWitness {
+        reporter: None,
         claim: EvidenceClaim::Slash(evidence.clone()),
         ..witness.clone()
     };
@@ -364,6 +477,7 @@ fn finalized_divergence_requires_actual_equivocation_and_shares_its_replay_id() 
         canonical_vote.data.round += 1;
     }
     let bad = EvidenceWitness {
+        reporter: None,
         claim: EvidenceClaim::Slash(evidence),
         ..witness
     };
@@ -430,6 +544,7 @@ fn da_fraud_requires_the_proposers_signature_on_the_exact_published_bundle() {
 fn inactivity_requires_authenticated_certificate_non_inclusion() {
     let (spec, mut history) = fixture();
     let participating = EvidenceWitness {
+        reporter: None,
         chain_spec: spec.clone(),
         source: history.records[0].record.clone(),
         claim: EvidenceClaim::Inactivity {
@@ -494,6 +609,7 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
     // Inactivity means absence from a submitted valid certificate, not proof
     // that no vote was sent. Different valid certificates share one history root.
     let mut evidence = neutrino_prover_chunk::evidence::EvidenceWitness {
+        reporter: None,
         chain_spec: spec.clone(),
         source: record.clone(),
         claim: neutrino_prover_chunk::evidence::EvidenceClaim::Inactivity {
@@ -609,6 +725,7 @@ fn inactivity_requires_authenticated_certificate_non_inclusion() {
 fn evidence_guest_statement_binds_identity_rules_and_canonical_event() {
     let (spec, history) = fixture();
     let mut witness = EvidenceWitness {
+        reporter: None,
         chain_spec: spec,
         source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(double_vote()),
@@ -619,6 +736,13 @@ fn evidence_guest_statement_binds_identity_rules_and_canonical_event() {
     assert_eq!(claim.context, witness.source.evidence_context());
     assert_eq!(claim.offender, witness.source.validators[0]);
     assert_eq!(claim.block_guest_vk_digest, [1; 8]);
+    assert_eq!(claim.reporter, None);
+    witness.reporter = Some([42; 32]);
+    let rewarded = validate_evidence(&witness).unwrap();
+    assert_eq!(rewarded.reporter, witness.reporter);
+    assert_eq!(claim.offence_id, rewarded.offence_id);
+    assert_eq!(claim.facts_commitment, rewarded.facts_commitment);
+    assert_ne!(commitment(&claim), commitment(&rewarded));
     if let EvidenceClaim::Slash(SlashingEvidence::DoublePrecommit { vote_a, vote_b, .. }) =
         &mut witness.claim
     {
@@ -650,6 +774,7 @@ fn evidence_submission_rejects_wrong_anchor_window_and_history() {
     use neutrino_consensus_types::history::HistoryPath;
     let (spec, history) = fixture();
     let claim = validate_evidence(&EvidenceWitness {
+        reporter: None,
         chain_spec: spec.clone(),
         source: history.records[0].record.clone(),
         claim: EvidenceClaim::Slash(double_vote()),

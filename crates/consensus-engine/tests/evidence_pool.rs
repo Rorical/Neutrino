@@ -17,10 +17,13 @@ fn artifact(id: u64) -> EvidenceArtifact {
         membership: neutrino_consensus_types::evidence::EvidenceMembership::default(),
         evidence_guest_vk_digest: [2; 8],
         statement: EvidenceStatement {
+            reporter: None,
             chain_id: 7,
             chain_spec_hash: witness.chain_spec.hash(),
             block_guest_vk_digest: [1; 8],
             context: EvidenceContext {
+                source_runtime_code_hash: witness.context.programs.runtime_code_hash,
+                source_block_guest_vk_digest: [1; 8],
                 chunk_id: 0,
                 chunk_hash: [3; 32],
                 end_height: 1,

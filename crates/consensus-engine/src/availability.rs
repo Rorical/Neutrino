@@ -16,7 +16,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<(), crate::SlashingError> {
         neutrino_prover_chunk::slashing::verify_conflicting_nil_vote_using(
             self.chain_spec().consensus_domain(),
-            &self.accountability_validators(value.data.chunk_id)?,
+            &self.forensic_validators(value.data.chunk_id)?,
             index,
             value,
             nil,
@@ -33,7 +33,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<(), crate::SlashingError> {
         neutrino_prover_chunk::slashing::verify_double_bft_proposal_using(
             self.chain_spec().consensus_domain(),
-            &self.accountability_validators(first.chunk.chunk_id)?,
+            &self.forensic_validators(first.chunk.chunk_id)?,
             index,
             first,
             second,
@@ -66,7 +66,7 @@ impl<DB: Database> Engine<DB> {
 
     fn authenticate_artifact_vote(&self, vote: &FinalityVote) -> Result<(), StoreError<DB::Error>> {
         let validators = self
-            .accountability_validators(vote.data.chunk_id)
+            .forensic_validators(vote.data.chunk_id)
             .map_err(|_| StoreError::Corrupt("artifact source outside authenticated context"))?;
         neutrino_prover_chunk::finality::verify_vote_signatures_using(
             self.chain_spec().consensus_domain(),
@@ -96,7 +96,7 @@ impl<DB: Database> Engine<DB> {
         quorum: &QuorumCertificate,
     ) -> Result<(), StoreError<DB::Error>> {
         let validators = self
-            .accountability_validators(quorum.data.chunk_id)
+            .forensic_validators(quorum.data.chunk_id)
             .map_err(|_| StoreError::Corrupt("quorum source outside authenticated context"))?;
         let params = &self.chain_spec().consensus;
         neutrino_prover_chunk::slashing::verify_quorum_using(
@@ -205,7 +205,7 @@ impl<DB: Database> Engine<DB> {
         let Some(chunk) = artifact.chunk_id(self.chain_spec().consensus.chunk_size) else {
             return false;
         };
-        let Ok(validators) = self.accountability_validators(chunk) else {
+        let Ok(validators) = self.forensic_validators(chunk) else {
             return false;
         };
         let params = &self.chain_spec().consensus;
@@ -275,11 +275,12 @@ impl<DB: Database> Engine<DB> {
             .chunk_id(self.chain_spec().consensus.chunk_size)
             .ok_or(StoreError::Corrupt("artifact proof range"))?;
         let validators = self
-            .accountability_validators(source)
+            .forensic_validators(source)
             .map_err(|_| StoreError::Corrupt("artifact proof source"))?;
         let header = self
             .store()
             .get_header(&proof.block_hash)?
+            .or(self.store().reporter_header(&proof.block_hash)?)
             .ok_or(StoreError::Corrupt("artifact proof header unavailable"))?;
         if header.height != proof.height || header.hash() != proof.block_hash {
             return Err(StoreError::Corrupt("artifact proof header mismatch"));
@@ -289,12 +290,32 @@ impl<DB: Database> Engine<DB> {
         } else {
             self.store()
                 .get_header(&header.parent_hash)?
+                .or(self.store().reporter_header(&header.parent_hash)?)
                 .ok_or(StoreError::Corrupt("artifact proof parent unavailable"))?
                 .state_root
         };
-        let mut expected = self
-            .block_proof_public_inputs(&header, before, proof.block_hash)
-            .map_err(|_| StoreError::Corrupt("artifact proof program set unavailable"))?;
+        let mut expected = if let Some(record) = self.store().historical_chunk(source)? {
+            neutrino_consensus_types::BlockProofPublicInputs {
+                chain_id: self.chain_spec().chain_id,
+                height: header.height,
+                parent_block_hash: header.parent_hash,
+                block_hash: proof.block_hash,
+                state_root_before: before,
+                state_root_after: header.state_root,
+                transactions_root: header.transactions_root,
+                receipt_root: header.receipts_root,
+                da_root: header.da_root,
+                vm_code_hash: record.runtime_code_hash,
+                block_program: record.block_guest_vk_digest,
+                gas_used: header.gas_used,
+                gas_limit: header.gas_limit,
+                proposer_address: [0; 32],
+                runtime_extra: header.runtime_extra,
+            }
+        } else {
+            self.block_proof_public_inputs(&header, before, proof.block_hash)
+                .map_err(|_| StoreError::Corrupt("artifact proof program unavailable"))?
+        };
         expected.proposer_address = validators
             .get(header.proposer_index as usize)
             .ok_or(StoreError::Corrupt("artifact proof proposer"))?
@@ -313,6 +334,13 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<Vec<SlashingEvidence>, StoreError<DB::Error>> {
         if !self.validate_signed_artifact(artifact) {
             return Err(StoreError::Corrupt("signed source replay authentication"));
+        }
+        if self.retention_info()?.policy == crate::RetentionPolicy::Reporter {
+            let chunk = artifact
+                .chunk_id(self.chain_spec().consensus.chunk_size)
+                .ok_or(StoreError::Corrupt("reporter source range"))?;
+            self.store_mut().retain_reporter_source(chunk, artifact)?;
+            return self.observe_reporter_artifact(chunk, Some(artifact));
         }
         let restore_precommit = self.introduces_quorum(artifact);
         let mut evidence = self.observe_source(artifact);
@@ -514,6 +542,10 @@ impl<DB: Database> Engine<DB> {
             )
         });
         let mut evidence = Vec::new();
+        let reporter = self.retention_info()?.policy == crate::RetentionPolicy::Reporter;
+        if reporter {
+            evidence.extend(self.replay_reporter_sources()?);
+        }
         for item in metadata {
             if item.kind
                 == neutrino_consensus_types::signed_artifacts::SignedArtifactKind::BlockProof
@@ -523,7 +555,11 @@ impl<DB: Database> Engine<DB> {
             if let Some((_, artifact)) = self.store().signed_artifact(&item.id)?
                 && self.validate_signed_artifact(&artifact)
             {
-                evidence.extend(self.observe_source(&artifact));
+                if reporter {
+                    evidence.extend(self.observe_signed_artifact(&artifact)?);
+                } else {
+                    evidence.extend(self.observe_source(&artifact));
+                }
             }
         }
         Ok(evidence)

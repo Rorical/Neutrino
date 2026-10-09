@@ -73,6 +73,8 @@ impl Fixture {
         let validated = validate_consensus_with_context(&witness).unwrap();
         let statement = validated.statement;
         let record = HistoricalChunk {
+            runtime_code_hash: witness.context.programs.runtime_code_hash,
+            block_guest_vk_digest: witness.context.programs.execution.block,
             chunk: as_chunk(&statement.chunk),
             validators: witness.context.active_validators,
             seed: witness.seed,

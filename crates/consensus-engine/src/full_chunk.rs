@@ -230,6 +230,7 @@ impl<DB: Database> Engine<DB> {
             source,
             claim: neutrino_prover_chunk::evidence::EvidenceClaim::Slash(evidence.clone()),
             block_guest_vk_digest,
+            reporter: None,
         })
     }
 
@@ -824,6 +825,8 @@ impl<DB: Database> Engine<DB> {
             proof_bytes: borsh::to_vec(proof)?,
         };
         let record = HistoricalChunk {
+            runtime_code_hash: context.programs.runtime_code_hash,
+            block_guest_vk_digest: context.programs.execution.block,
             chunk: chunk.clone(),
             validators: context.active_validators,
             seed,

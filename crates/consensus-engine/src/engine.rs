@@ -847,13 +847,28 @@ impl<DB: Database> Engine<DB> {
         header: &Header,
     ) -> Result<Option<SlashingEvidence>, SlashingError> {
         let source_chunk = self.accountability_chunk_for_height(header.height)?;
-        let (validators, _) = self.accountability_header_context(header)?;
+        let (validators, _) = self.forensic_header_context(header)?;
         crate::signature::verify_header_signature(
             header,
             &validators,
             self.chain_spec().consensus_domain(),
         )
         .map_err(slashing_signature_to_slashing_err)?;
+        if self
+            .retention_info()
+            .map_err(|_| SlashingError::NotYetFinalizedLocally)?
+            .policy
+            == crate::RetentionPolicy::Reporter
+        {
+            self.store_mut()
+                .retain_reporter_header(source_chunk, header, &validators)
+                .map_err(|_| SlashingError::NotYetFinalizedLocally)?;
+            return Ok(self
+                .observe_reporter_artifact(source_chunk, None)
+                .map_err(|_| SlashingError::NotYetFinalizedLocally)?
+                .into_iter()
+                .next());
+        }
         self.retain_accountability_observations();
         Ok(self.slashing_monitor.record_header(source_chunk, header))
     }
@@ -1019,26 +1034,6 @@ impl<DB: Database> Engine<DB> {
             .checked_sub(1)
             .and_then(|offset| offset.checked_div(self.chain_spec().consensus.chunk_size))
             .ok_or(SlashingError::EvidenceFieldsInconsistent)
-    }
-
-    fn accountability_header_context(
-        &self,
-        header: &Header,
-    ) -> Result<(alloc::vec::Vec<Validator>, Seed), SlashingError> {
-        let source = self.accountability_chunk_for_height(header.height)?;
-        let context = self.accountability_context(source)?;
-        let index = usize::try_from(header.proposer_index).expect("u32 fits usize");
-        let proposer = context
-            .0
-            .get(index)
-            .ok_or(SlashingError::ValidatorIndexOutOfBounds {
-                index: header.proposer_index,
-                len: context.0.len(),
-            })?;
-        if proposer.slashed || proposer.effective_stake == 0 {
-            return Err(SlashingError::EvidenceFieldsInconsistent);
-        }
-        Ok(context)
     }
 
     fn retain_accountability_observations(&mut self) {
@@ -1395,7 +1390,7 @@ impl<DB: Database> Engine<DB> {
                     phase,
                     vote_a,
                     vote_b,
-                    &self.accountability_validators(vote_a.data.chunk_id)?,
+                    &self.forensic_validators(vote_a.data.chunk_id)?,
                     self.chain_spec().consensus_domain(),
                 )
             }
@@ -1424,7 +1419,7 @@ impl<DB: Database> Engine<DB> {
                 vote_a,
                 vote_b,
                 lock_evidence,
-                &self.accountability_validators(vote_a.data.chunk_id)?,
+                &self.forensic_validators(vote_a.data.chunk_id)?,
                 self.chain_spec().consensus_domain(),
                 (
                     self.chain_spec().consensus.bft_prevote_quorum_numerator,
@@ -1442,7 +1437,7 @@ impl<DB: Database> Engine<DB> {
                 vote,
                 attestation,
                 rejected_proof,
-                &self.accountability_validators(vote.data.chunk_id)?,
+                &self.forensic_validators(vote.data.chunk_id)?,
                 self.chain_spec().consensus_domain(),
                 self.chain_spec().consensus.chunk_size,
             ),
@@ -1473,7 +1468,7 @@ impl<DB: Database> Engine<DB> {
             index,
             header_a,
             header_b,
-            &self.accountability_header_context(header_a)?.0,
+            &self.forensic_header_context(header_a)?.0,
             self.chain_spec().consensus_domain(),
         )
     }
@@ -1484,7 +1479,7 @@ impl<DB: Database> Engine<DB> {
         header: &Header,
         reason: VrfRejectionReason,
     ) -> Result<(), SlashingError> {
-        let (validators, seed) = self.accountability_header_context(header)?;
+        let (validators, seed) = self.forensic_header_context(header)?;
         verify_invalid_vrf_claim_evidence(
             index,
             header,
@@ -1507,7 +1502,7 @@ impl<DB: Database> Engine<DB> {
         }
         neutrino_prover_chunk::slashing::verify_da_fraud(
             self.chain_spec().consensus_domain(),
-            &self.accountability_header_context(header)?.0,
+            &self.forensic_header_context(header)?.0,
             header,
             fraud,
         )
@@ -1523,7 +1518,7 @@ impl<DB: Database> Engine<DB> {
         vote: &neutrino_consensus_types::IndexedVote,
         canonical_vote: &neutrino_consensus_types::IndexedVote,
     ) -> Result<(), SlashingError> {
-        let _ = self.accountability_validators(vote.data.chunk_id)?;
+        let _ = self.forensic_validators(vote.data.chunk_id)?;
         let record = self
             .store()
             .historical_chunk(vote.data.chunk_id)

@@ -16,6 +16,8 @@ pub enum RetentionPolicy {
     /// Delete recursively covered data outside the most recent eight finalized chunks.
     #[default]
     Pruned,
+    /// Keep selective accountability sources while their identities remain slashable.
+    Reporter,
 }
 
 /// Durable lower bound for complete historical data served by this node.
@@ -50,7 +52,11 @@ impl<DB: Database> Engine<DB> {
         &mut self,
         policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
-        self.store_mut().set_retention_policy(policy)
+        self.store_mut().set_retention_policy(policy)?;
+        if policy == RetentionPolicy::Reporter {
+            self.seed_reporter_tracking()?;
+        }
+        Ok(())
     }
 
     /// Atomically prune only recursively covered, finalized, unpinned historical data.

@@ -96,6 +96,14 @@ where
             let next = engine.finalized_next_chunk_id();
             if chunk_id < next
                 && !neutrino_consensus_types::history::is_recent_history_index(chunk_id, next)
+                && !(engine.retention_info().is_ok_and(|info| {
+                    info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
+                }) && engine
+                    .store()
+                    .historical_chunk(chunk_id)
+                    .ok()
+                    .flatten()
+                    .is_some())
             {
                 return None;
             }

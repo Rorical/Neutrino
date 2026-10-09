@@ -194,6 +194,7 @@ impl<DB: Database> ChainStore<DB> {
             if source != chunk_id || prior != *artifact {
                 return Err(StoreError::Corrupt("signed artifact identity conflict"));
             }
+            self.retain_reporter_source(chunk_id, artifact)?;
             if local
                 && let Some(mut metadata) = self.signed_artifact_metadata_by_id(&id)?
                 && !metadata.local
@@ -260,6 +261,12 @@ impl<DB: Database> ChainStore<DB> {
             MAX_SIGNED_ARTIFACT_STORAGE_BYTES - 128 * 1024 * 1024
         };
         if count >= count_limit || size > size_limit {
+            if self.retention_info()?.policy == RetentionPolicy::Reporter {
+                self.retain_reporter_source(chunk_id, artifact)?;
+                if self.reporter_source(&id)?.is_some() {
+                    return Ok(id);
+                }
+            }
             return Err(StoreError::Corrupt(
                 "signed artifact capacity; defer publication",
             ));
@@ -269,6 +276,7 @@ impl<DB: Database> ChainStore<DB> {
         metadata.storage_bytes =
             u64::try_from(bytes.len()).map_err(|_| StoreError::Corrupt("source size overflow"))?;
         let mut batch = Batch::new();
+        self.retain_reporter_source_batch(&mut batch, chunk_id, artifact)?;
         for removed_id in removed {
             batch.delete(Column::SignedArtifacts, removed_id);
             delete_metadata(&mut batch, chunk_id, removed_id);
@@ -301,9 +309,9 @@ impl<DB: Database> ChainStore<DB> {
             chunk_id: source,
             payload: StoredPayload::AcceptedBlockProof(proof.block_hash),
         })?;
-        let mut metadata = self
-            .signed_artifact_metadata_by_id(&id)?
-            .ok_or(StoreError::Corrupt("source metadata missing"))?;
+        let Some(mut metadata) = self.signed_artifact_metadata_by_id(&id)? else {
+            return Ok(());
+        };
         metadata.storage_bytes =
             u64::try_from(bytes.len()).map_err(|_| StoreError::Corrupt("source size overflow"))?;
         let mut batch = Batch::new();
@@ -324,15 +332,21 @@ impl<DB: Database> ChainStore<DB> {
             .get(Column::SignedArtifacts, id)
             .map_err(StoreError::Database)?
         else {
-            return Ok(None);
+            return self.reporter_source(id);
         };
         let stored: StoredArtifact = borsh::from_slice(&bytes)?;
         let artifact = match stored.payload {
             StoredPayload::Source(artifact) => *artifact,
-            StoredPayload::AcceptedBlockProof(block_hash) => SignedArtifact::BlockProof(
-                self.get_block_proof(&block_hash)?
-                    .ok_or(StoreError::Corrupt("accepted source receipt unavailable"))?,
-            ),
+            StoredPayload::AcceptedBlockProof(block_hash) => {
+                if let Some(proof) = self.get_block_proof(&block_hash)? {
+                    SignedArtifact::BlockProof(proof)
+                } else {
+                    return self.reporter_source(id)?.map_or(
+                        Err(StoreError::Corrupt("accepted source receipt unavailable")),
+                        |source| Ok(Some(source)),
+                    );
+                }
+            }
         };
         if artifact.id() != *id {
             return Err(StoreError::Corrupt("signed artifact key mismatch"));
@@ -437,7 +451,13 @@ impl<DB: Database> ChainStore<DB> {
                 },
             )
             .collect();
+        entries.extend(
+            self.reporter_source_refs(chunk_id)?
+                .into_iter()
+                .filter(|entry| after.is_none_or(|cursor| entry.id > cursor)),
+        );
         entries.sort_by_key(|entry| entry.id);
+        entries.dedup_by_key(|entry| entry.id);
         let more = entries.len() > MAX_ARTIFACT_INVENTORY;
         entries.truncate(MAX_ARTIFACT_INVENTORY);
         let next = if more {

@@ -37,8 +37,11 @@ fn bad_vrf() -> EvidenceWitness {
         .sign(&message)
         .to_bytes();
     EvidenceWitness {
+        reporter: None,
         chain_spec: input.chain_spec,
         source: HistoricalChunk {
+            runtime_code_hash: input.context.programs.runtime_code_hash,
+            block_guest_vk_digest: input.context.programs.execution.block,
             chunk,
             validators: input.context.active_validators,
             seed: input.seed,
@@ -115,6 +118,9 @@ fn batch_openings_bind_count_order_identity_and_reject_duplicate_offences() {
     let membership = EvidenceMembership::build(&statements, 0, [3; 8]).unwrap();
     assert!(membership.binds(&statement, &[3; 8]));
     assert!(!membership.binds(&statements[1], &[3; 8]));
+    let mut redirected = statement.clone();
+    redirected.reporter = Some([42; 32]);
+    assert!(!membership.binds(&redirected, &[3; 8]));
     let mut wrong = membership.clone();
     wrong.batch.count += 1;
     assert!(!wrong.binds(&statement, &[3; 8]));
@@ -358,6 +364,7 @@ fn inactivity_claims() -> [EvidenceWitness; 2] {
         certificate: certificate.clone(),
     };
     let second = EvidenceWitness {
+        reporter: None,
         claim: EvidenceClaim::Inactivity {
             validator_index: 5,
             certificate,

@@ -417,18 +417,7 @@ impl<DB: Database> ChainStore<DB> {
             keys::chunk_id_key(statement.end.next_chunk_id),
             borsh::to_vec(&statement.end)?,
         );
-        let record = neutrino_prover_chunk::history::HistoricalChunk {
-            chunk,
-            validators: witness.context.active_validators.clone(),
-            seed: witness.seed,
-            finality: witness.finality_cert.clone(),
-        };
-        let frontier = self.append_history_batch(&mut batch, &record)?;
-        if frontier != state.frontier || frontier.root() != Some(state.boundary.history_root) {
-            return Err(StoreError::Corrupt(
-                "proven history append differs from archive",
-            ));
-        }
+        self.append_finalized_history_batch(&mut batch, witness, statement, state, &chunk)?;
         for block in &witness.blocks {
             for admission in &block.output.accountability.admitted {
                 batch.put(
@@ -451,6 +440,37 @@ impl<DB: Database> ChainStore<DB> {
             );
         }
         Ok(batch)
+    }
+
+    fn append_finalized_history_batch(
+        &self,
+        batch: &mut neutrino_storage::Batch,
+        witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
+        statement: &neutrino_consensus_types::history_proof::ConsensusStatement,
+        state: &crate::full_chunk::ConsensusState,
+        chunk: &Chunk,
+    ) -> Result<(), StoreError<DB::Error>> {
+        let record = neutrino_prover_chunk::history::HistoricalChunk {
+            runtime_code_hash: witness.context.programs.runtime_code_hash,
+            block_guest_vk_digest: witness.context.programs.execution.block,
+            chunk: chunk.clone(),
+            validators: witness.context.active_validators.clone(),
+            seed: witness.seed,
+            finality: witness.finality_cert.clone(),
+        };
+        let frontier = self.append_history_batch(batch, &record)?;
+        self.retain_reporter_finalization_batch(
+            batch,
+            &record,
+            &statement.start,
+            witness.blocks.iter().map(|block| block.header.clone()),
+        )?;
+        if frontier != state.frontier || frontier.root() != Some(state.boundary.history_root) {
+            return Err(StoreError::Corrupt(
+                "proven history append differs from archive",
+            ));
+        }
+        Ok(())
     }
 
     // ---------- Generic helpers ----------

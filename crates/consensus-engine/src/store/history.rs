@@ -98,8 +98,11 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         id: u64,
     ) -> Result<Option<HistoricalChunk>, StoreError<DB::Error>> {
-        let record: Option<HistoricalChunk> =
+        let mut record: Option<HistoricalChunk> =
             self.get_decoded(Column::HistoricalChunks, &keys::chunk_id_key(id))?;
+        if record.is_none() && self.retention_info()?.policy == RetentionPolicy::Reporter {
+            record = self.reporter_opening(id)?.map(|opening| opening.record);
+        }
         if record
             .as_ref()
             .is_some_and(|record| record.chunk.chunk_id != id)
@@ -205,6 +208,7 @@ impl<DB: Database> ChainStore<DB> {
             borsh::to_vec(record)?,
         );
         self.advance_evidence_reports_batch(batch, &old_frontier, leaf)?;
+        self.advance_reporter_history_batch(batch, record, &old_frontier, &path)?;
         self.prune_history_cache_batch(
             batch,
             frontier.count,
@@ -242,6 +246,12 @@ impl<DB: Database> ChainStore<DB> {
             return Ok(path);
         }
         if self.retention_info()?.policy != RetentionPolicy::Archive {
+            if let Some(opening) = self.reporter_opening(index)?
+                && opening.path.count == count
+                && commitment(&opening.record.evidence_context()) == leaf
+            {
+                return Ok(opening.path);
+            }
             return Err(StoreError::Corrupt("history opening is unavailable"));
         }
         let empty = empty_history_hashes();
@@ -270,6 +280,7 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Recheck every retained opening and frontier before resuming from disk.
     pub(crate) fn validate_history_cache(&self) -> Result<(), StoreError<DB::Error>> {
+        self.validate_reporter_history()?;
         for (key, bytes) in self
             .db
             .iter_column(Column::HistoryFrontiers)
@@ -358,7 +369,7 @@ impl<DB: Database> ChainStore<DB> {
                 batch.delete(Column::HistoryPaths, key);
             }
         }
-        if self.retention_info()?.policy == RetentionPolicy::Pruned {
+        if self.retention_info()?.policy != RetentionPolicy::Archive {
             self.prune_history_frontiers_batch(batch, current, prefix)?;
         }
         Ok(())
@@ -935,7 +946,7 @@ impl<DB: Database> ChainStore<DB> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use core::cell::Cell;
     use neutrino_consensus_types::{AggregatedVote, Chunk, FinalityCert};
@@ -980,7 +991,7 @@ mod tests {
             self.inner.iter_prefix(column, prefix)
         }
     }
-    fn record(id: u64) -> HistoricalChunk {
+    pub(in crate::store) fn record(id: u64) -> HistoricalChunk {
         let validators = Vec::new();
         let chunk = Chunk {
             chunk_id: id,
@@ -1020,6 +1031,8 @@ mod tests {
             active_validator_set_root: chunk.active_validator_set_root,
         };
         HistoricalChunk {
+            runtime_code_hash: [0; 32],
+            block_guest_vk_digest: [0; 8],
             chunk,
             validators,
             seed: [9; 32],
@@ -1161,7 +1174,10 @@ mod tests {
         assert!(store.historical_opening(0, 1).is_err());
     }
 
-    fn range_artifact(start: u64, end: u64) -> neutrino_consensus_types::HistoryProof {
+    pub(in crate::store) fn range_artifact(
+        start: u64,
+        end: u64,
+    ) -> neutrino_consensus_types::HistoryProof {
         use neutrino_consensus_types::history_proof::{
             ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryProof, HistoryStatement,
             ProgramSet,

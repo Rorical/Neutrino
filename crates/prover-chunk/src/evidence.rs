@@ -34,8 +34,10 @@ pub struct EvidenceWitness {
     pub source: HistoricalChunk,
     /// Exact signed evidence or inactivity certificate.
     pub claim: EvidenceClaim,
-    /// Runtime program used for objective proof rejection.
+    /// Current block program authenticated by the consuming admission anchor.
     pub block_guest_vk_digest: [u32; 8],
+    /// Optional reward account committed into the proven statement.
+    pub reporter: Option<[u8; 32]>,
 }
 
 /// Derive the public statement or fail closed. A resource failure never
@@ -68,7 +70,7 @@ pub fn validate_evidence_using(
                 spec,
                 source,
                 evidence,
-                &input.block_guest_vk_digest,
+                &source.block_guest_vk_digest,
                 verifier,
             )?;
             (validator, id, SanctionKind::Slash)
@@ -110,6 +112,7 @@ pub fn validate_evidence_using(
         kind,
         offence_id,
         facts_commitment: commitment(&input.claim),
+        reporter: input.reporter,
     })
 }
 

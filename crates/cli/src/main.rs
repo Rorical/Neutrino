@@ -72,7 +72,8 @@ fn print_usage() {
     eprintln!("      Derive the genesis state root, validator-set root and chain-spec hash.");
     eprintln!("      --write pins genesis_state_root_hex into the spec file.");
     eprintln!("  node-config --spec <chain-spec.toml> --out <config.toml>");
-    eprintln!("      [--role validator|full|archive|light-client] [--data-dir <dir>]");
+    eprintln!("      [--role validator|full|archive|light-client|reporter] [--data-dir <dir>]");
+    eprintln!("      [--reporter-reward-address <32-byte hex>]  # required for reporter");
     eprintln!("      [--ikm-path <file>] [--proposer-index <n>] [--listen <multiaddr>]...");
     eprintln!("      [--bootnode <multiaddr>]... [--rpc <host:port>] [--metrics <host:port>]");
     eprintln!("      [--proving cpu|cuda]");
@@ -274,7 +275,10 @@ fn node_config(opts: &Options) -> Result<(), String> {
     let out = PathBuf::from(opts.require("out")?);
     let file = ChainSpecFile::load_from_path(&spec_path).map_err(|err| err.to_string())?;
     let role = opts.get("role").unwrap_or("validator");
-    if !matches!(role, "validator" | "full" | "archive" | "light-client") {
+    if !matches!(
+        role,
+        "validator" | "full" | "archive" | "light-client" | "reporter"
+    ) {
         return Err(format!("unknown --role `{role}`"));
     }
     let proving = opts.get("proving").unwrap_or("cpu");
@@ -315,6 +319,7 @@ fn node_config(opts: &Options) -> Result<(), String> {
             .map_err(|_| format!("--proposer-index must be an integer, got `{index}`"))?;
         let _ = writeln!(text, "proposer_index = {index}");
     }
+    append_reporter_config(&mut text, role, opts)?;
     text.push_str("\n[proving]\n");
     let _ = writeln!(text, "backend = \"{proving}\"");
     text.push_str("concurrency = 2\ncapacity = 16\n");
@@ -336,6 +341,31 @@ fn node_config(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
+fn append_reporter_config(text: &mut String, role: &str, opts: &Options) -> Result<(), String> {
+    let address = opts.get("reporter-reward-address");
+    if role != "reporter" {
+        if address.is_some() {
+            return Err("--reporter-reward-address requires --role reporter".into());
+        }
+        return Ok(());
+    }
+    let address =
+        address.ok_or("--role reporter requires --reporter-reward-address <32-byte hex>")?;
+    let config = neutrino_node::NodeConfig {
+        role: neutrino_node::NodeRole::Reporter,
+        reporter: Some(neutrino_node::ReporterConfig {
+            reward_address_hex: address.to_owned(),
+        }),
+        ..neutrino_node::NodeConfig::default()
+    };
+    let recipient = config
+        .reporter_reward_address()?
+        .ok_or("reporter reward address missing")?;
+    text.push_str("\n[reporter]\n");
+    let _ = writeln!(text, "reward_address_hex = \"{}\"", hex::encode(recipient));
+    Ok(())
+}
+
 fn toml_string_array(items: &[&str]) -> String {
     let quoted: Vec<String> = items.iter().map(|item| format!("\"{item}\"")).collect();
     format!("[{}]", quoted.join(", "))
@@ -344,6 +374,22 @@ fn toml_string_array(items: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reporter_template_binds_recipient_without_validator_key() {
+        let args = vec!["--reporter-reward-address".into(), "ab".repeat(32)];
+        let options = Options::parse(&args).unwrap();
+        let mut text = "chain_id = 1\nrole = 'reporter'\n".to_owned();
+        append_reporter_config(&mut text, "reporter", &options).unwrap();
+        let config: neutrino_node::NodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.reporter_reward_address().unwrap(), Some([0xab; 32]));
+        assert!(config.proposer_ikm_path.is_none());
+        assert!(append_reporter_config(&mut String::new(), "full", &options).is_err());
+        let missing = Options::parse(&[]).unwrap();
+        assert!(append_reporter_config(&mut String::new(), "reporter", &missing).is_err());
+        let zero = Options::parse(&["--reporter-reward-address".into(), "00".repeat(32)]).unwrap();
+        assert!(append_reporter_config(&mut String::new(), "reporter", &zero).is_err());
+    }
 
     #[test]
     fn options_parse_flags_values_and_repeats() {

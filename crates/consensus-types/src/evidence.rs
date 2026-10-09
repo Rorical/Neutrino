@@ -20,6 +20,10 @@ pub struct EvidenceContext {
     pub validators_root: Hash,
     /// Randomness effective during the source chunk.
     pub seed: Hash,
+    /// Block program authenticated at the source chunk's start boundary.
+    pub source_block_guest_vk_digest: [u32; 8],
+    /// WASM runtime authenticated at the same historical boundary.
+    pub source_runtime_code_hash: Hash,
 }
 
 /// Proven sanction class. Inactivity does not imply Byzantine behaviour.
@@ -38,7 +42,7 @@ pub struct EvidenceStatement {
     pub chain_id: u64,
     /// Full rule configuration used to decide the offence.
     pub chain_spec_hash: Hash,
-    /// Accepted block program used for objective proof rejection.
+    /// Current block program required by the consuming admission anchor.
     pub block_guest_vk_digest: [u32; 8],
     /// Historical context whose inclusion the block authenticates.
     pub context: EvidenceContext,
@@ -50,6 +54,8 @@ pub struct EvidenceStatement {
     pub offence_id: Hash,
     /// Commitment to the exact signed evidence used by the prover.
     pub facts_commitment: Hash,
+    /// Optional reward account, bound by the evidence receipt and its membership.
+    pub reporter: Option<[u8; 32]>,
 }
 
 /// Opening in the counted, odd-leaf-promoting evidence batch Merkle tree.
@@ -434,10 +440,13 @@ mod tests {
             membership: EvidenceMembership::default(),
             evidence_guest_vk_digest: [2; 8],
             statement: EvidenceStatement {
+                reporter: None,
                 chain_id: 7,
                 chain_spec_hash: [3; 32],
                 block_guest_vk_digest: [1; 8],
                 context: EvidenceContext {
+                    source_runtime_code_hash: [0; 32],
+                    source_block_guest_vk_digest: [1; 8],
                     chunk_id: 0,
                     chunk_hash: [4; 32],
                     end_height: 1,
@@ -478,6 +487,18 @@ mod tests {
             &original.evidence_guest_vk_digest,
             &[3; 8]
         ));
+        alternate = original.clone();
+        alternate.statement.reporter = Some([42; 32]);
+        assert_eq!(
+            alternate.statement.offence_id,
+            original.statement.offence_id
+        );
+        assert_eq!(
+            alternate.statement.facts_commitment,
+            original.statement.facts_commitment
+        );
+        assert_ne!(alternate.statement_id(), original.statement_id());
+        assert!(!alternate.membership.binds(&alternate.statement, &[3; 8]));
         alternate = original.clone();
         alternate.statement.facts_commitment[0] ^= 1;
         assert_ne!(original.statement_id(), alternate.statement_id());

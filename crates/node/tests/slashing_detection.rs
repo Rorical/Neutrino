@@ -698,6 +698,8 @@ fn historical_record_fixture(
         validators: validators(2),
         seed: TEST_GENESIS_SEED,
         finality,
+        block_guest_vk_digest: [1; 8],
+        runtime_code_hash: spec(2).runtime_code_hash,
     }
 }
 

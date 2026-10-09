@@ -24,6 +24,7 @@ pub mod produce;
 pub mod programs;
 pub mod proposer;
 pub mod prove;
+mod reporter;
 pub mod retention;
 pub mod signature;
 pub mod signing;
@@ -67,4 +68,5 @@ pub enum EngineState {
 
 pub use history::{HistoryImportOutcome, PreparedHistoryFold};
 
+pub use reporter::ReporterIdentity;
 pub use retention::{RetentionInfo, RetentionPolicy};

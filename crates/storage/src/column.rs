@@ -81,10 +81,22 @@ pub enum Column {
     SignedArtifacts,
     /// Bounded metadata index for exact signed sources and proof dependencies.
     SignedArtifactIndex,
+    /// Selectively retained historical contexts and continuously refreshed openings.
+    ReporterHistory,
+    /// Exact accountability sources owned by slashable tracked identities.
+    ReporterSources,
+    /// Signed headers and compact proof-input dependencies for reporter discovery.
+    ReporterHeaders,
+    /// Compact historical program boundaries used to authenticate retained proof sources.
+    ReporterBoundaries,
+    /// Finalized-runtime-authorized slashable identities and withdrawal addresses.
+    ReporterValidators,
+    /// Compact exact-identity indexes into selective reporter sources and headers.
+    ReporterIndex,
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 36] = [
+pub const ALL_COLUMNS: [Column; 42] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -121,6 +133,12 @@ pub const ALL_COLUMNS: [Column; 36] = [
     Column::BftSessions,
     Column::SignedArtifacts,
     Column::SignedArtifactIndex,
+    Column::ReporterHistory,
+    Column::ReporterSources,
+    Column::ReporterHeaders,
+    Column::ReporterBoundaries,
+    Column::ReporterValidators,
+    Column::ReporterIndex,
 ];
 
 impl Column {
@@ -164,6 +182,12 @@ impl Column {
             Self::BftSessions => "bft_sessions",
             Self::SignedArtifacts => "signed_artifacts",
             Self::SignedArtifactIndex => "signed_artifact_index",
+            Self::ReporterHistory => "reporter_history",
+            Self::ReporterSources => "reporter_sources",
+            Self::ReporterHeaders => "reporter_headers",
+            Self::ReporterBoundaries => "reporter_boundaries",
+            Self::ReporterValidators => "reporter_validators",
+            Self::ReporterIndex => "reporter_index",
         }
     }
 }
@@ -174,7 +198,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 36);
+        assert_eq!(ALL_COLUMNS.len(), 42);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -184,7 +208,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 36] = [
+        let names: [&str; 42] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -221,6 +245,12 @@ mod tests {
             "bft_sessions",
             "signed_artifacts",
             "signed_artifact_index",
+            "reporter_history",
+            "reporter_sources",
+            "reporter_headers",
+            "reporter_boundaries",
+            "reporter_validators",
+            "reporter_index",
         ];
         for (column, expected) in ALL_COLUMNS.iter().zip(names) {
             assert_eq!(column.name(), expected);

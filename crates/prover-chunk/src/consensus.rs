@@ -232,6 +232,8 @@ pub fn validate_consensus_using(
         end_height: chunk.end_height,
         validators_root: chunk.active_validator_set_root,
         seed: input.seed,
+        source_block_guest_vk_digest: context.programs.execution.block,
+        source_runtime_code_hash: context.programs.runtime_code_hash,
     };
     let mut frontier = input.history.frontier.clone();
     let history_root = frontier
@@ -376,12 +378,20 @@ fn validate_candidate_using(
     }
     let mut previous_validators = context.active_validators.clone();
     for offender in &offenders {
+        let mut seated = false;
         for validator in &mut previous_validators {
-            if validator.pubkey == offender.pubkey
-                && validator.withdrawal_credentials == offender.withdrawal_credentials
-            {
+            if validator.pubkey == offender.pubkey {
                 validator.slashed = true;
+                seated = true;
             }
+        }
+        if !seated {
+            // A historical identity may have retired or moved accounts. Keep a
+            // permanent consensus tombstone even when it is no longer seated.
+            let mut tombstone = offender.clone();
+            tombstone.slashed = true;
+            tombstone.effective_stake = 0;
+            previous_validators.push(tombstone);
         }
     }
     let next_validators = rotate_from_witness(

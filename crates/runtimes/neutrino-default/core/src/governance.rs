@@ -945,6 +945,7 @@ mod tests {
         let policy = RuntimePolicy {
             gas_price: 5,
             evidence_max_age_blocks: 777,
+            reporter_reward_bps: 2_500,
             ..RuntimePolicy::default()
         };
         assert!(policy.is_valid_for(&anchor));
@@ -959,6 +960,10 @@ mod tests {
             evidence_max_pending: 0,
             ..policy
         };
+        let excessive_reward = RuntimePolicy {
+            reporter_reward_bps: 10_001,
+            ..policy
+        };
         let (applied, failed, pending) = run(
             &live,
             &block(
@@ -966,10 +971,11 @@ mod tests {
                 vec![
                     propose_policy(&a, too_old, 0),
                     propose_policy(&a, no_queue, 0),
+                    propose_policy(&a, excessive_reward, 0),
                 ],
             ),
         );
-        assert_eq!((applied, failed), (0, 2));
+        assert_eq!((applied, failed), (0, 3));
         assert_eq!(pending.proposal, None);
 
         // A valid proposal waits for quorum like a program upgrade and does
@@ -1043,6 +1049,8 @@ mod tests {
                     kind: neutrino_consensus_types::evidence::SanctionKind::Slash,
                 },
                 amount: 1,
+                reporter: None,
+                reporter_reward_bps: 1_000,
             })
             .collect();
         let queue = borsh::to_vec(&backlog).unwrap();

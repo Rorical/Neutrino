@@ -33,6 +33,7 @@ where
     /// Triggered by evidence arrival, finalization and block-production events.
     /// Proving never holds the engine lock or blocks the BFT message task.
     pub(super) fn start_evidence_jobs(&self) {
+        self.refresh_reporter_tracking();
         if self.block_program().is_none() {
             return;
         }
@@ -135,6 +136,7 @@ where
         &self,
         engine: &neutrino_consensus_engine::Engine<DB>,
         pooled: &[EvidenceArtifact],
+        block_key: [u32; 8],
     ) -> Vec<EvidenceWitness> {
         let anchor_program = engine
             .head_height()
@@ -157,9 +159,13 @@ where
             if witnesses.len() >= 8 {
                 break;
             }
-            let Ok(witness) = engine.evidence_witness(evidence) else {
+            let Ok(mut witness) = engine.evidence_witness(evidence) else {
                 continue;
             };
+            witness.reporter = self.reporter_recipient();
+            // Re-proving an old offence uses the admission chunk's execution
+            // program. Its source record separately binds the historical key.
+            witness.block_guest_vk_digest = block_key;
             let Some(accused) = witness
                 .source
                 .validators
@@ -202,7 +208,7 @@ where
                 tracing::warn!(?error, "evidence pool pruning failed");
             }
             let existing = ready_artifacts(engine).unwrap_or_default();
-            let mut witnesses = self.raw_report_jobs(engine, &existing);
+            let mut witnesses = self.raw_report_jobs(engine, &existing, block_key);
             let known = |id: &[u8; 32]| {
                 existing.iter().any(|item| item.statement.offence_id == *id)
                     || engine.state().get(&offence_key(id)).is_some()
@@ -242,6 +248,7 @@ where
                             certificate: source.finality.clone(),
                         },
                         block_guest_vk_digest: block_key,
+                        reporter: self.reporter_recipient(),
                     });
                 }
             }

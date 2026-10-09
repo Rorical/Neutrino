@@ -33,6 +33,8 @@ use sp1_sdk::{
     blocking::{Prover, ProverClient},
 };
 
+const REPORTER: [u8; 32] = [55; 32];
+
 fn double_vote(domain: ConsensusDomain) -> SlashingEvidence {
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
     let sign = |hash| {
@@ -58,8 +60,11 @@ fn double_vote(domain: ConsensusDomain) -> SlashingEvidence {
 fn evidence(witness: &ConsensusWitness) -> EvidenceWitness {
     let previous = validate_consensus(witness).unwrap();
     EvidenceWitness {
+        reporter: Some(REPORTER),
         chain_spec: witness.chain_spec.clone(),
         source: HistoricalChunk {
+            runtime_code_hash: witness.context.programs.runtime_code_hash,
+            block_guest_vk_digest: witness.context.programs.execution.block,
             chunk: as_chunk(&previous.chunk),
             validators: witness.context.active_validators.clone(),
             seed: witness.seed,
@@ -165,6 +170,9 @@ fn attachment_count_order_program_and_statement_are_checked_before_proof_decode(
     let mut wrong = artifact.clone();
     wrong.statement.facts_commitment[0] ^= 1;
     rejected_before_decode(&input, &[wrong]);
+    let mut wrong = artifact.clone();
+    wrong.statement.reporter = Some([99; 32]);
+    rejected_before_decode(&input, &[wrong]);
     let mut second = input.transactions[0].clone();
     let Transaction::SubmitEvidence(submission) = &mut second else {
         unreachable!()
@@ -216,6 +224,7 @@ fn evidence_guest_matches_native_statement_and_rejects_forgery() {
     let mut recorder = neutrino_prover_chunk::facts::FactRecorder::default();
     let statement =
         neutrino_prover_chunk::evidence::validate_evidence_using(&witness, &mut recorder).unwrap();
+    assert_eq!(statement.reporter, Some(REPORTER));
     let checks = recorder.finish().unwrap();
     let fact_input = neutrino_prover_chunk::facts::FactWitness {
         requests: checks.iter().map(|(request, _)| request.clone()).collect(),
@@ -416,9 +425,30 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
         dry.output
     );
     assert_eq!(dry.output.accountability.executed.len(), 1);
+    let rewarded = LiveTrie::from_trie(dry.post_state.clone());
+    let reward = WasmRuntime::default_runtime()
+        .unwrap()
+        .query(
+            &neutrino_runtime_abi::QueryRequest {
+                method: neutrino_default_runtime_core::QUERY_METHOD_ACCOUNT_GET.into(),
+                args: REPORTER.to_vec(),
+            },
+            &rewarded,
+        )
+        .unwrap();
+    let account: Option<neutrino_default_runtime_core::Account> =
+        borsh::from_slice(&reward.payload).unwrap();
+    assert_eq!(account.unwrap().balance, 10);
     assert_eq!(
         dry.output.validator_set_root,
-        neutrino_default_runtime_core::ValidatorSet::default().root()
+        neutrino_default_runtime_core::ConsensusCandidates {
+            entries: vec![neutrino_default_runtime_core::ConsensusCandidate {
+                address: [8; 32],
+                stake: 0,
+                identity: None,
+            }],
+        }
+        .root()
     );
     let mut next = successor_fixture(&first, &input, &dry.output, &live);
     let execution =
@@ -766,6 +796,15 @@ fn block_proven_sanction_changes_consensus_without_rechecking_raw_evidence() {
     let mut trace = TracingState::new(&live);
     let output = neutrino_default_runtime_core::apply_block(&input, &mut trace);
     assert_eq!(output.accountability.executed.len(), 1);
+    let account = neutrino_default_runtime_core::decode_account(
+        &neutrino_runtime_core::StateBackend::read(
+            &mut trace,
+            &neutrino_default_runtime_core::account_key(&REPORTER),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(account.balance, 10);
     let next = successor_fixture(&first, &input, &output, &live);
     let previous = validate_consensus(&first).unwrap();
     let statement = validate_successor(&previous, &next).unwrap();
@@ -776,4 +815,64 @@ fn block_proven_sanction_changes_consensus_without_rechecking_raw_evidence() {
     let mut forged = next;
     forged.blocks[0].output.accountability.anchor.history_root[0] ^= 1;
     assert!(validate_successor(&previous, &forged).is_err());
+}
+
+#[test]
+fn pending_reporter_reward_matches_native_wasm_and_block_guest() {
+    use neutrino_default_runtime_core::{
+        Account,
+        accountability::{PendingSanction, QUEUE_KEY, Sanction, slashed_key},
+        encode_validator, validator_key,
+    };
+    // A queued obligation is authenticated pre-state. This ordinary empty
+    // block exercises reward execution without substituting a mock evidence
+    // receipt for the separately tested compressed-proof acceptance gate.
+    let (first, mut input, _) =
+        support::fixture([1; 8], neutrino_runtime_host::default_runtime_code_hash());
+    let statement = validate_evidence(&evidence(&first)).unwrap();
+    input.transactions.clear();
+    input.block_height = 2;
+    let obligation = PendingSanction {
+        sanction: Sanction {
+            offence_id: statement.offence_id,
+            offender: statement.offender,
+            kind: statement.kind,
+        },
+        amount: 1_000,
+        reporter: statement.reporter,
+        reporter_reward_bps: 1_000,
+    };
+    let mut live = LiveTrie::default();
+    live.insert(
+        &validator_key(&[8; 32]),
+        encode_validator(&neutrino_default_runtime_core::Validator {
+            stake: 73,
+            active: true,
+        }),
+    );
+    live.insert(QUEUE_KEY, borsh::to_vec(&vec![obligation.clone()]).unwrap());
+    live.insert(&slashed_key(&obligation.sanction.offender.pubkey), vec![0]);
+    let runtime = WasmRuntime::default_runtime().unwrap();
+    let wasm = runtime.dry_run(&input, &live, &[]).unwrap();
+    let native = neutrino_runtime_host::dry_run(&input, &live, &[]);
+    assert_eq!(wasm.output, native.output);
+    assert_eq!(wasm.output.accountability.executed.len(), 1);
+    let post = LiveTrie::from_trie(wasm.post_state);
+    let response = runtime
+        .query(
+            &neutrino_runtime_abi::QueryRequest {
+                method: neutrino_default_runtime_core::QUERY_METHOD_ACCOUNT_GET.into(),
+                args: REPORTER.to_vec(),
+            },
+            &post,
+        )
+        .unwrap();
+    let account: Option<Account> = borsh::from_slice(&response.payload).unwrap();
+    assert_eq!(account.unwrap().balance, 7);
+    let execution =
+        neutrino_runtime_host::ProverCtx::new_cached(ProverClient::builder().mock().build())
+            .unwrap();
+    let (values, report) = execution.execute(&input, &wasm.witness, &[]).unwrap();
+    assert_eq!(report.exit_code, 0);
+    assert_eq!(values.as_slice(), borsh::to_vec(&wasm.output).unwrap());
 }

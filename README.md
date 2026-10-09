@@ -1,7 +1,9 @@
 # Neutrino
 
 Shared WASM/SP1 execution, complete chunk consensus proofs, EvidenceProof
-accountability and recursive history proofs are implemented. Real compressed composition has passed on an NVIDIA A100; see the
+accountability and recursive history proofs are implemented. Real compressed
+composition passed for the preceding programs on an NVIDIA A100; the reporter and
+reward programs require a fresh acceptance run. See the
 [CUDA acceptance record](docs/gpu-proving.md#cuda-acceptance-record) and
 [evidence proofs](docs/design/20-evidence-proofs.md).
 
@@ -58,6 +60,13 @@ Neutrino separates the chain into two cleanly decoupled layers:
   remains bounded by the protocol window; safety evidence has no source age limit
   and its reporter supplies the historical opening. See
   [design 23](docs/design/23-evidence-availability.md).
+- **Reporter nodes.** `role = "reporter"` preserves signed offence inputs and
+  historical openings for identities with slashable collateral, releases their
+  private material after finalized exit or sanction, and broadcasts proven
+  offences. The runtime pays the proof-bound reporter account 10% of the actual
+  safety deduction by default, with the percentage governed in runtime state.
+  Reporters need no complete history tree or old transaction bodies. See
+  [design 25](docs/design/25-reporter-nodes.md).
 - **Program sets travel in consensus boundaries.** Every boundary names the runtime
   code hash and the five Guest keys in force from it on; a scheduled upgrade read
   from authenticated state switches them at a chunk boundary, and history recursion
@@ -113,6 +122,7 @@ latency histograms per stage and the fact coverage of the last chunk proof.
 | [BFT protocol](docs/design/22-bft-candidate-replacement.md) | Fair leaders, nil phases, certified round changes, locks and durable recovery |
 | [evidence availability](docs/design/23-evidence-availability.md) | Authenticated signed artifacts, bounded discovery, retrieval and pruning |
 | [runtime upgrades](docs/design/24-runtime-upgrades.md) | Program sets in boundaries, validator-stake governance, on-chain program distribution, recursion across upgrades |
+| [reporter nodes](docs/design/25-reporter-nodes.md) | Selective accountable-history retention, objective offence discovery and runtime-funded rewards |
 
 ## Prerequisites
 

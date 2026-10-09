@@ -18,6 +18,7 @@ mod error;
 mod history;
 pub mod keys;
 pub mod pointers;
+mod reporter;
 mod retention;
 mod snapshot;
 

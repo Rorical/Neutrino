@@ -19,7 +19,7 @@ chain_spec_hash || payload`. Fact requests include these exact bytes; a verdict
 or signed source from another specification cannot establish a local offence,
 even if both specifications reuse the numeric chain ID and validator keys.
 Its statement binds chain ID and complete chain-spec hash, the historical context, stable offender
-identity and the existing evidence-independent penalty ID. The runtime block
+identity, optional reporter account and the existing evidence-independent penalty ID. The runtime block
 guest recursively verifies this proof and authenticates the historical opening
 against its incoming consensus anchor. The block STF owns replay protection,
 the bounded mandatory FIFO, withdrawal holds and deductions. Chunk proofs
@@ -53,9 +53,13 @@ retaining the full tree. The private disk format wraps that report in
 `StoredEvidenceReport` with its locally authenticated 32-byte `history_root`, so
 an old opening remains verifiable after a snapshot replaces the local history
 cache. This stored root is local verification metadata, not a peer-selected anchor.
-The existing `EvidenceArtifact` attachment,
-`EvidenceSubmission` transaction and Guest history-root semantics are unchanged;
-the P2P and pool encoding is replaced directly, with no legacy decoder.
+The reporter account is bound by the evidence statement and its proof; changing
+it invalidates the attachment. Historical-path refresh preserves the recipient.
+The P2P, statement and pool encoding is replaced directly, with no legacy decoder.
+The append-only history format additionally commits the Block Guest identity and
+runtime artifact hash effective during the source chunk. This authenticates old proof-rejection verdicts
+under their historical program after upgrades; the statement's separate Block
+Guest identity still binds its current admission context.
 
 The ordinary-execution host must verify every evidence receipt before WASM
 execution. Guest recursion independently checks the same receipts; no supplied
@@ -66,11 +70,17 @@ statement too, without treating certificate non-inclusion as proof of silence.
 ## Execution and liveness
 
 Only objectively proven, unexpired offences enter the authenticated queue.
-Admission fixes the identity, amount and offence ID; pending deductions hold
+Admission fixes the identity, amount, offence ID and any reporter reward obligation; pending deductions hold
 the offender's withdrawal funds. Every block processes the deterministic FIFO
 prefix before ordinary transactions, with a reserved execution budget. Duplicate
 submissions cannot duplicate a penalty or block queue progress. Empty-balance
 outcomes remain explicit and do not erase the consensus sanction.
+
+For safety evidence with a reporter account, the runtime credits a governed share
+of the actual deduction to that account, defaulting to 10%. It fixes the percentage
+at admission, pays no reward for a zero deduction or inactivity, and destroys the
+rest. The rule and the reporter's finalized-state eligibility query are runtime
+economic interfaces; see [reporter nodes](25-reporter-nodes.md).
 
 The protocol guarantees processing of admitted evidence under chain progress.
 It does not claim discovery of hidden signatures or unconditional inclusion of
@@ -209,7 +219,7 @@ Admissibility is selected by `SanctionKind`:
   claims) has **no age window**. A safety claim may cite any finalized chunk and
   is admitted once per identity, whenever it arrives. The mandatory deduction
   takes whatever slashable balance the offender's address still holds, active
-  stake or queued unbonding that has not matured, possibly nothing; consensus
+  stake or queued unbonding not yet withdrawn, possibly nothing; consensus
   ejects the identity regardless, so a seated validator without a runtime
   balance is still removed. The fixed 64-level history opening costs the same
   at any age, and the `EvidenceAnchor` carries only the genesis-fixed unbonding
@@ -297,8 +307,9 @@ prevent live BFT admission. Availability therefore improves discovery of
 published, retained offences without claiming recovery of hidden signatures or
 unlimited round history on finite storage.
 
-Historical context commits the chunk, membership and seed, independently of a
-certificate's signer subset. Different valid certificates must produce the same
+Historical context commits the chunk, membership, seed, historical Block Guest and
+runtime artifact hash, independently of a certificate's signer subset. Different
+valid certificates must produce the same
 incoming historical root. Inactivity retains the protocol's narrow meaning:
 non-inclusion in the submitted valid certificate, not proof that a validator
 never voted. The exact submitted certificate is checked by Evidence Guest using

@@ -15,6 +15,15 @@ use neutrino_storage::Database;
 use neutrino_trie::Trie;
 
 impl<DB: Database> Engine<DB> {
+    fn verify_reporter_bootstrap(&self) -> Result<(), StoreError<DB::Error>> {
+        if self.reporter_has_history()? {
+            return Err(StoreError::Corrupt(
+                "bootstrap would skip tracked reporter append data",
+            ));
+        }
+        Ok(())
+    }
+
     /// Install a full-node bootstrap only after receipt and trust-policy verification.
     ///
     /// `trusted_start` comes from local trust configuration, or the existing local
@@ -39,6 +48,7 @@ impl<DB: Database> Engine<DB> {
         let end = statement.end;
         let count = end.next_chunk_id;
         let local_count = self.finalized_next_chunk_id();
+        self.verify_reporter_bootstrap()?;
         if self.retention_info()?.policy == RetentionPolicy::Archive
             || count == 0
             || count < local_count

@@ -35,6 +35,9 @@ mod light;
 mod metrics_source;
 mod p2p_queries;
 mod programs;
+#[cfg(test)]
+mod raw_pool_tests;
+mod reporter;
 mod rpc_queries;
 mod state_sync;
 #[cfg(test)]
@@ -65,7 +68,7 @@ use neutrino_network::sync::LocalProgress;
 use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot, blake3_256};
 use neutrino_proof_system::{ErasedBlockExecutor, ProofSystem};
 use neutrino_runtime_abi::{TxValidationCode, TxValidity};
-use neutrino_storage::{Column, Database};
+use neutrino_storage::{Batch, Column, Database};
 use neutrino_sync::SyncStatus;
 use neutrino_sync::{
     CheckpointsImported, ChunkProofImported, HeadersImported, ProofsImported, StateProgress,
@@ -111,6 +114,7 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     history: Arc<history::HistoryRuntime>,
     light: Mutex<Option<light::LightRuntime>>,
     bootstrap: Mutex<Option<bootstrap::BootstrapRuntime>>,
+    reporter: Mutex<Option<reporter::ReporterRuntime>>,
     evidence_job_running: Arc<std::sync::atomic::AtomicBool>,
     evidence_job_cursor: std::sync::atomic::AtomicUsize,
     proof_system: Arc<P>,
@@ -169,27 +173,6 @@ type ConsensusProofTask<P> = (
     >,
 );
 
-/// Outcome of a single `SlashingPool::insert`. Returned to the
-/// caller (a `ChainBackend` helper) so the on-disk
-/// [`Column::SlashingPool`] can be kept in lockstep with the
-/// in-memory pool.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum SlashingInsert {
-    /// Already pooled. Caller does nothing.
-    Duplicate,
-    /// Borsh encoding failed. Caller does nothing.
-    EncodingFailed,
-    /// Newly added. Caller persists `key`.
-    Inserted {
-        /// BLAKE3 of `borsh(evidence)`. Stable canonical key under
-        /// [`Column::SlashingPool`].
-        key: Hash,
-        /// If the pool was full, the FIFO-oldest entry that was
-        /// evicted to make room. Caller deletes this key from disk.
-        evicted_key: Option<Hash>,
-    },
-}
-
 /// FIFO pool of [`SlashingEvidence`] with dedup-by-content and a
 /// hard `SLASHING_POOL_MAX_ENTRIES` cap. Two detectors that observe
 /// the same equivocation produce byte-identical evidence, so the
@@ -205,27 +188,6 @@ struct SlashingPool {
 }
 
 impl SlashingPool {
-    fn insert(&mut self, evidence: SlashingEvidence) -> SlashingInsert {
-        let Ok(encoded) = borsh::to_vec(&evidence) else {
-            return SlashingInsert::EncodingFailed;
-        };
-        let key = blake3_256(&encoded);
-        if !self.seen.insert(key) {
-            return SlashingInsert::Duplicate;
-        }
-        self.evidence.push((key, evidence));
-        let evicted_key = if self.evidence.len() > SLASHING_POOL_MAX_ENTRIES {
-            // FIFO eviction: pop the oldest entry. `len() == MAX + 1`
-            // here because we just pushed one item past the cap.
-            let (evicted_key, _) = self.evidence.remove(0);
-            self.seen.remove(&evicted_key);
-            Some(evicted_key)
-        } else {
-            None
-        };
-        SlashingInsert::Inserted { key, evicted_key }
-    }
-
     const fn len(&self) -> usize {
         self.evidence.len()
     }
@@ -309,6 +271,7 @@ where
             history: Arc::new(history::HistoryRuntime::default()),
             light: Mutex::new(None),
             bootstrap: Mutex::new(None),
+            reporter: Mutex::new(None),
             evidence_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             evidence_job_cursor: std::sync::atomic::AtomicUsize::new(0),
             proof_system: Arc::new(proof_system),
@@ -434,11 +397,7 @@ where
         if let Some(verdict) = self.cached_block_verdict_at(token) {
             return matches!(verdict, availability::ProofVerdict::Rejected(_));
         }
-        let Ok(expected) = self.with_engine(|engine| {
-            engine
-                .programs_for_height(proof.height)
-                .map(|programs| programs.execution.block)
-        }) else {
+        let Some(expected) = self.accountability_block_program(proof.height) else {
             return false;
         };
         let Ok(verdict) = self.proof_system.classify_block_rejection(proof, &expected) else {
@@ -610,11 +569,11 @@ where
     /// block (the disk row will be overwritten / deleted on the
     /// next drain), and removes them from persistent storage.
     pub fn drain_slashing_pool(&self, max: usize) -> Vec<SlashingEvidence> {
-        let drained = self
+        let mut pool = self
             .slashing_pool
             .lock()
-            .expect("ChainBackend slashing_pool poisoned")
-            .drain(max);
+            .expect("ChainBackend slashing_pool poisoned");
+        let drained = pool.drain(max);
         if !drained.is_empty() {
             self.with_engine_mut(|engine| {
                 for (key, _) in &drained {
@@ -624,6 +583,7 @@ where
                 }
             });
         }
+        drop(pool);
         drained.into_iter().map(|(_, evidence)| evidence).collect()
     }
 
@@ -638,33 +598,83 @@ where
     /// `slashing_pool → engine` across the file, so this never
     /// deadlocks.
     fn insert_persistent(&self, evidence: &SlashingEvidence) -> bool {
-        let outcome = {
-            let mut pool = self
-                .slashing_pool
-                .lock()
-                .expect("ChainBackend slashing_pool poisoned");
-            pool.insert(evidence.clone())
+        let Ok(bytes) = borsh::to_vec(evidence) else {
+            return false;
         };
-        match outcome {
-            SlashingInsert::Duplicate | SlashingInsert::EncodingFailed => false,
-            SlashingInsert::Inserted { key, evicted_key } => {
-                self.with_engine_mut(|engine| {
-                    if let Err(err) = engine.store_mut().put_slashing_evidence(evidence) {
-                        warn!(?err, ?key, "failed to persist slashing evidence");
-                    }
-                    if let Some(evicted_key) = evicted_key
-                        && let Err(err) = engine.store_mut().delete_slashing_evidence(&evicted_key)
-                    {
-                        warn!(
-                            ?err,
-                            ?evicted_key,
-                            "failed to delete FIFO-evicted slashing evidence"
-                        );
-                    }
-                });
-                true
-            }
+        let key = blake3_256(&bytes);
+        let mut pool = self
+            .slashing_pool
+            .lock()
+            .expect("ChainBackend slashing_pool poisoned");
+        if pool.seen.contains(&key) {
+            return false;
         }
+        let installed = self.with_engine_mut(|engine| {
+            if self.bootstrap_pending() {
+                return false;
+            }
+            if engine.retention_info().is_ok_and(|info| {
+                info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
+            }) {
+                let Ok(source) = neutrino_prover_chunk::history::evidence_chunk_id(
+                    engine.chain_spec(),
+                    evidence,
+                ) else {
+                    return false;
+                };
+                let accused = if source == engine.finalized_next_chunk_id() {
+                    engine
+                        .active_validator_set()
+                        .get(evidence.offender_index() as usize)
+                        .map(|validator| validator.pubkey)
+                } else {
+                    engine
+                        .store()
+                        .historical_chunk(source)
+                        .ok()
+                        .flatten()
+                        .and_then(|record| {
+                            record
+                                .validators
+                                .get(evidence.offender_index() as usize)
+                                .map(|validator| validator.pubkey)
+                        })
+                };
+                let Some(accused) = accused else {
+                    return false;
+                };
+                if engine.store().is_identity_slashed(&accused).unwrap_or(true)
+                    || !engine
+                        .store()
+                        .reporter_tracked_validators()
+                        .is_ok_and(|identities| {
+                            identities.iter().any(|(pubkey, _)| *pubkey == accused)
+                        })
+                {
+                    return false;
+                }
+            }
+            let mut batch = Batch::new();
+            batch.put(Column::SlashingPool, key, bytes);
+            if pool.evidence.len() >= SLASHING_POOL_MAX_ENTRIES {
+                batch.delete(Column::SlashingPool, pool.evidence[0].0);
+            }
+            match engine.store_mut().db_mut().write_batch_durable(batch) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ?key,
+                        "failed to persist slashing evidence; input remains eligible for retry"
+                    );
+                    false
+                }
+            }
+        });
+        if installed {
+            pool.load_from_disk(vec![(key, evidence.clone())]);
+        }
+        installed
     }
 
     /// Add an [`SlashingEvidence`] to the local pool and, when a
@@ -686,6 +696,11 @@ where
         }
         self.start_evidence_jobs();
         self.start_history_jobs();
+        if self.reporter_recipient().is_some() {
+            // The reporter advertises its completed proof with the reward
+            // recipient already bound, while raw inputs remain durable for retry.
+            return;
+        }
         let Some(publisher) = self.publisher_snapshot() else {
             return;
         };
@@ -1117,6 +1132,7 @@ where
             }
             e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter)
         })?;
+        self.refresh_reporter_tracking();
         self.start_history_jobs();
         Ok(outcome)
     }
@@ -1992,6 +2008,13 @@ where
         let executor = self.block_executor_snapshot();
         let mut last: Option<HeadersImported> = None;
         for block in blocks {
+            if let Ok(Some(evidence)) = self.with_live_engine_mut(|engine| {
+                engine
+                    .observe_header_for_slashing(&block.header)
+                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+            }) {
+                self.pool_and_gossip_slashing(evidence).await;
+            }
             self.authorize_incoming_consensus_body(&block)?;
             let block_ref = &block;
             let outcome = self.with_live_engine_mut(|e| {
@@ -2116,7 +2139,6 @@ where
         if self.light_checkpoint().is_some() {
             return Err(SyncBackendError::NotAvailable("proof-only node".into()));
         }
-        self.authorize_incoming_consensus_body(&block)?;
         // Slashing detection runs first: a peer that gossips a
         // validly-signed but non-extending header (e.g. an
         // equivocating block we already reorg'd past) must still be
@@ -2125,11 +2147,15 @@ where
         // fail signature verification are silently dropped — they
         // are not authentic so there is no slashable signer to
         // attribute.
-        if let Ok(Some(evidence)) =
-            self.with_engine_mut(|e| e.observe_header_for_slashing(&block.header))
-        {
+        if let Ok(Some(evidence)) = self.with_live_engine_mut(|engine| {
+            engine
+                .observe_header_for_slashing(&block.header)
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+        }) {
             self.pool_and_gossip_slashing(evidence).await;
         }
+
+        self.authorize_incoming_consensus_body(&block)?;
 
         // Pending-fix #7: when a dynamic-runtime executor is
         // installed, route the import through
@@ -2193,8 +2219,10 @@ where
             let certificate = &proof.finality_cert;
             let chunk = neutrino_prover_chunk::consensus::as_chunk(&proof.public_inputs);
             let evidence = self
-                .with_engine_mut(|engine| {
-                    engine.observe_certificate_for_slashing(&chunk, certificate)
+                .with_live_engine_mut(|engine| {
+                    engine
+                        .observe_certificate_for_slashing(&chunk, certificate)
+                        .map_err(|error| SyncBackendError::Rejected(error.to_string()))
                 })
                 .unwrap_or_default();
             for item in evidence {
@@ -2241,6 +2269,7 @@ where
             }
             .map_err(Self::map_import_err)
         })?;
+        self.refresh_reporter_tracking();
         if self.block_program().is_some() {
             let certificate = &proof.finality_cert;
             self.retain_availability_vote(&certificate.prevote_vote())

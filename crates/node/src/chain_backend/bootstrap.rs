@@ -221,7 +221,11 @@ where
         &self,
         config: &crate::config::BootstrapConfig,
     ) -> Result<(), String> {
-        if !config.enabled {
+        if !config.enabled
+            || self
+                .with_engine(neutrino_consensus_engine::Engine::reporter_has_history)
+                .map_err(|error| error.to_string())?
+        {
             return self.discard_bootstrap_download();
         }
         let (spec, domain) = self.history_profile()?;
@@ -362,6 +366,12 @@ where
     }
 
     pub(super) fn bootstrap_origin(&self) -> Option<Checkpoint> {
+        if self
+            .with_engine(neutrino_consensus_engine::Engine::reporter_has_history)
+            .unwrap_or(true)
+        {
+            return None;
+        }
         let origin = self
             .bootstrap
             .lock()
@@ -387,17 +397,33 @@ where
             .is_some_and(|runtime| runtime.fetching || runtime.pending.is_some())
     }
     pub(super) async fn bootstrap_fetch(&self, active: bool) {
+        if let Err(error) = self.try_bootstrap_fetch(active).await {
+            tracing::warn!(%error, "cannot enter checkpoint bootstrap");
+        }
+    }
+
+    async fn try_bootstrap_fetch(&self, active: bool) -> Result<(), SyncBackendError> {
         // Serialize admission with every chain mutation. A caller that passed an
         // earlier optimistic check must recheck after acquiring this same lock.
-        let pending = self.with_engine_mut(|_| {
+        let pending = self.with_engine_mut(|engine| {
+            if active
+                && engine
+                    .reporter_has_history()
+                    .map_err(p2p_queries::storage_error)?
+            {
+                return Err(SyncBackendError::NotAvailable(
+                    "reporter must follow every append while retained evidence needs path updates"
+                        .into(),
+                ));
+            }
             let mut guard = self.bootstrap.lock().expect("bootstrap runtime");
             let pending = guard.as_mut().is_some_and(|runtime| {
                 runtime.fetching = active || runtime.pending.is_some();
                 runtime.fetching
             });
             drop(guard);
-            pending
-        });
+            Ok(pending)
+        })?;
         if pending {
             if let Err(error) = self.pause_history_jobs().await {
                 tracing::warn!(%error, "cannot quiesce history worker for bootstrap");
@@ -405,6 +431,7 @@ where
         } else {
             self.resume_history_jobs();
         }
+        Ok(())
     }
 
     pub(super) fn bootstrap_state(
@@ -447,7 +474,7 @@ where
         bridge: Option<HistoryProof>,
         data: BootstrapData,
     ) -> Result<StateProgress, SyncBackendError> {
-        self.bootstrap_fetch(true).await;
+        self.try_bootstrap_fetch(true).await?;
         let (origin, trusted_at, future) = {
             let guard = self.bootstrap.lock().expect("bootstrap runtime");
             let runtime = guard
@@ -606,6 +633,7 @@ where
             *self.bootstrap.lock().expect("bootstrap runtime") = None;
             Ok(())
         })?;
+        self.refresh_reporter_tracking();
         self.resume_history_jobs();
         Ok(())
     }

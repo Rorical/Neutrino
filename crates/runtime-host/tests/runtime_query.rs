@@ -17,7 +17,7 @@ use neutrino_default_runtime_core::{
 };
 use neutrino_primitives::RuntimeInfo;
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, QueryStatus};
-use neutrino_runtime_core::host::LiveTrie;
+use neutrino_runtime_core::{StateBackend, host::LiveTrie};
 use neutrino_runtime_host::wasm::WasmRuntime;
 
 const ADDR_A: Address = [0xA1; 32];
@@ -275,4 +275,166 @@ fn args_serialised_as_borsh_address_also_works() {
     assert_ok(&response);
     let decoded: Option<Account> = borsh::from_slice(&response.payload).expect("decode payload");
     assert_eq!(decoded, Some(account));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Explicit shared-account and FIFO state fixtures test both query engines.
+fn reporter_status_matches_native_and_tracks_shared_accounts_and_pending_slashes() {
+    use neutrino_default_runtime_core::{
+        QUERY_METHOD_REPORTER_STATUS, ReporterIdentity, ReporterStatus, ReporterStatusRequest,
+        Withdrawal, WithdrawalQueue,
+        accountability::{PendingSanction, QUEUE_KEY, Sanction, slashed_key},
+        withdrawal_key,
+    };
+    use neutrino_runtime_core::host::TracingState;
+
+    let runtime = WasmRuntime::default_runtime().unwrap();
+    let identities = vec![
+        ReporterIdentity {
+            pubkey: [1; 48],
+            withdrawal_credentials: ADDR_A,
+        },
+        ReporterIdentity {
+            pubkey: [2; 48],
+            withdrawal_credentials: ADDR_A,
+        },
+        ReporterIdentity {
+            pubkey: [3; 48],
+            withdrawal_credentials: ADDR_B,
+        },
+    ];
+    let obligation = PendingSanction {
+        sanction: Sanction {
+            offence_id: [9; 32],
+            offender: neutrino_primitives::Validator {
+                pubkey: identities[1].pubkey,
+                withdrawal_credentials: ADDR_A,
+                effective_stake: 100,
+                slashed: false,
+                activation_epoch: 0,
+                exit_epoch: u64::MAX,
+                last_active_chunk: 0,
+            },
+            kind: neutrino_consensus_types::evidence::SanctionKind::Slash,
+        },
+        amount: 20,
+        reporter: None,
+        reporter_reward_bps: 1_000,
+    };
+    let live = live_with(&[
+        (
+            validator_key(&ADDR_A),
+            encode_validator(&Validator {
+                stake: 40,
+                active: true,
+            }),
+        ),
+        (
+            withdrawal_key(&ADDR_A),
+            borsh::to_vec(&WithdrawalQueue {
+                entries: vec![
+                    Withdrawal {
+                        amount: 60,
+                        mature_at_height: 1,
+                    },
+                    Withdrawal {
+                        amount: 20,
+                        mature_at_height: 100,
+                    },
+                ],
+            })
+            .unwrap(),
+        ),
+        (slashed_key(&identities[1].pubkey), vec![0]),
+        (
+            QUEUE_KEY.to_vec(),
+            borsh::to_vec(&vec![obligation]).unwrap(),
+        ),
+    ]);
+    let req = request(
+        QUERY_METHOD_REPORTER_STATUS,
+        borsh::to_vec(&ReporterStatusRequest {
+            identities: identities.clone(),
+        })
+        .unwrap(),
+    );
+    let root = live.state_root();
+    let response = run(&runtime, &live, &req);
+    assert_ok(&response);
+    let mut native = TracingState::new(&live);
+    assert_eq!(
+        response,
+        neutrino_default_runtime_core::query(&req, &mut native)
+    );
+    assert_eq!(native.post_state_root(), root);
+    assert_eq!(live.state_root(), root);
+    let statuses: Vec<ReporterStatus> = borsh::from_slice(&response.payload).unwrap();
+    assert_eq!(
+        statuses,
+        vec![
+            ReporterStatus {
+                identity: identities[0],
+                slashable_balance: 120,
+                tombstoned: false,
+                pending: false
+            },
+            ReporterStatus {
+                identity: identities[1],
+                slashable_balance: 120,
+                tombstoned: true,
+                pending: true
+            },
+            ReporterStatus {
+                identity: identities[2],
+                slashable_balance: 0,
+                tombstoned: false,
+                pending: false
+            },
+        ]
+    );
+    // Spendable balances are outside liability. Once stake/withdrawal funds
+    // have left runtime staking, historical signatures may be cleaned even
+    // if the account still holds tokens.
+    let exited = live_with(&[(
+        account_key(&ADDR_A),
+        encode_account(&Account {
+            balance: 120,
+            nonce: 1,
+        }),
+    )]);
+    let response = run(&runtime, &exited, &req);
+    let statuses: Vec<ReporterStatus> = borsh::from_slice(&response.payload).unwrap();
+    assert!(statuses.iter().all(|status| status.slashable_balance == 0));
+}
+
+#[test]
+fn reporter_status_rejects_unbounded_or_malformed_identity_batches() {
+    use neutrino_default_runtime_core::{
+        MAX_REPORTER_STATUS_IDENTITIES, QUERY_METHOD_REPORTER_STATUS, ReporterIdentity,
+        ReporterStatusRequest,
+    };
+    let (runtime, live) = empty_runtime_and_trie();
+    let request_args = borsh::to_vec(&ReporterStatusRequest {
+        identities: vec![
+            ReporterIdentity {
+                pubkey: [1; 48],
+                withdrawal_credentials: ADDR_A
+            };
+            MAX_REPORTER_STATUS_IDENTITIES + 1
+        ],
+    })
+    .unwrap();
+    for args in [
+        vec![],
+        vec![1, 0, 0, 0],
+        u32::MAX.to_le_bytes().to_vec(),
+        request_args,
+    ] {
+        let response = run(
+            &runtime,
+            &live,
+            &request(QUERY_METHOD_REPORTER_STATUS, args),
+        );
+        assert_eq!(response.code, QueryStatus::InvalidArguments.as_u32());
+    }
 }

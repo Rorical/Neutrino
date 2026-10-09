@@ -3,6 +3,8 @@
 mod bft_proof_notifications;
 #[path = "complete_chunk/evidence_report_races.rs"]
 mod evidence_report_races;
+#[path = "complete_chunk/reporter_mode.rs"]
+mod reporter_mode;
 #[path = "../../prover-chunk/tests/support/mod.rs"]
 pub mod support;
 
@@ -170,10 +172,16 @@ fn genesis_engine(spec: neutrino_primitives::ChainSpec) -> Engine<MemoryDatabase
 }
 
 fn engine() -> (Engine<MemoryDatabase>, ConsensusWitness) {
-    let live = seeded_genesis_state();
-    let (mut witness, _, _) =
-        support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, &live);
-    let mut engine = genesis_engine(witness.chain_spec.clone());
+    engine_with_live(&seeded_genesis_state())
+}
+
+fn engine_with_live(
+    live: &neutrino_runtime_core::host::LiveTrie,
+) -> (Engine<MemoryDatabase>, ConsensusWitness) {
+    let (mut witness, _, _) = support::fixture_with_live([1; 8], [4; 32], vec![], 30_000_000, live);
+    let mut engine = Engine::genesis(witness.chain_spec.clone(), MemoryDatabase::new()).unwrap();
+    engine.replace_state_with_reconstructed(live.trie().clone());
+    engine.flush_trie_to_store().unwrap();
     engine.set_programs(support::guests([1; 8], [4; 32]));
     let block = &witness.blocks[0];
     let hash = block.header.hash();

@@ -25,6 +25,10 @@ pub struct HistoricalChunk {
     pub validators: Vec<Validator>,
     /// Randomness used to verify this chunk's proposer claims.
     pub seed: Seed,
+    /// Block Guest authenticated at this chunk's start boundary.
+    pub block_guest_vk_digest: [u32; 8],
+    /// Runtime artifact authenticated at this chunk's start boundary.
+    pub runtime_code_hash: Hash,
     /// Proven participation, used to authorize inactivity deductions.
     pub finality: FinalityCert,
 }
@@ -51,6 +55,8 @@ impl HistoricalChunk {
             end_height: self.chunk.end_height,
             validators_root: commitment(&self.validators),
             seed: self.seed,
+            source_block_guest_vk_digest: self.block_guest_vk_digest,
+            source_runtime_code_hash: self.runtime_code_hash,
         }
     }
 }

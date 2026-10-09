@@ -206,10 +206,12 @@ pub struct RuntimePolicy {
     pub evidence_admissions_per_block: u32,
     /// Mandatory FIFO executions reserved at the start of each block.
     pub evidence_executions_per_block: u32,
-    /// Per-offence stake deduction; `u128::MAX` burns whatever remains.
+    /// Per-offence stake deduction; `u128::MAX` deducts whatever remains.
     pub slash_amount: u128,
     /// Stake deduction for proven precommit certificate non-inclusion.
     pub inactivity_leak_amount: u128,
+    /// Reporter share of actual safety deductions, in basis points (0 to 10,000).
+    pub reporter_reward_bps: u16,
 }
 
 impl Default for RuntimePolicy {
@@ -230,6 +232,7 @@ impl RuntimePolicy {
             evidence_executions_per_block: params.evidence_executions_per_block,
             slash_amount: params.slash_amount,
             inactivity_leak_amount: params.inactivity_leak_amount,
+            reporter_reward_bps: 1_000,
         }
     }
 
@@ -243,6 +246,7 @@ impl RuntimePolicy {
             && self.evidence_admissions_per_block <= self.evidence_max_pending
             && self.evidence_executions_per_block > 0
             && self.evidence_executions_per_block <= self.evidence_max_pending
+            && self.reporter_reward_bps <= 10_000
     }
 
     /// Full validity against the genesis-fixed facts carried by the anchor:
@@ -2324,7 +2328,7 @@ fn apply_deduction<B: StateBackend>(
     state: &mut B,
     address: &Address,
     amount: u128,
-) -> Result<(), ReceiptStatus> {
+) -> Result<u128, ReceiptStatus> {
     let mut validator = load_validator(state, address);
     let mut queue = load_withdrawal_queue(state, address);
 
@@ -2405,7 +2409,7 @@ fn apply_deduction<B: StateBackend>(
             store_withdrawal_queue(state, address, &queue);
         }
     }
-    Ok(())
+    Ok(burn)
 }
 
 // ---------------------------------------------------------------------------
@@ -2483,6 +2487,45 @@ pub const QUERY_METHOD_CONSENSUS_CANDIDATES: &str = "consensus_candidates";
 /// Args: none. Returns a borsh `Option<ParticipationReport>`.
 pub const QUERY_METHOD_PARTICIPATION: &str = "participation";
 
+/// Query method: remaining runtime liability for tracked consensus identities.
+///
+/// Args: borsh [`ReporterStatusRequest`]. Returns borsh `Vec<ReporterStatus>`
+/// in request order. Reporters should query an authenticated finalized state
+/// before deleting historical sources.
+pub const QUERY_METHOD_REPORTER_STATUS: &str = "reporter_status";
+/// Maximum identities accepted in one reporter status query.
+pub const MAX_REPORTER_STATUS_IDENTITIES: usize = 256;
+
+/// Historical consensus identity and its authenticated runtime account.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReporterIdentity {
+    /// Stable consensus signing identity.
+    pub pubkey: neutrino_primitives::BlsPublicKey,
+    /// Runtime account the historical identity's sanctions deduct from.
+    pub withdrawal_credentials: Address,
+}
+
+/// Bounded batch of identities whose local sources a reporter retains.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+pub struct ReporterStatusRequest {
+    /// Identities obtained from authenticated historical validator sets.
+    pub identities: Vec<ReporterIdentity>,
+}
+
+/// Runtime-owned economic lifecycle of one tracked consensus identity.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReporterStatus {
+    /// Exact identity supplied by the reporter.
+    pub identity: ReporterIdentity,
+    /// Remaining deductible stake plus funds still in the withdrawal queue.
+    /// Mature but unclaimed withdrawals remain deductible in this runtime.
+    pub slashable_balance: u128,
+    /// A permanent safety admission already covers this identity.
+    pub tombstoned: bool,
+    /// A mandatory queue entry against this identity remains unexecuted.
+    pub pending: bool,
+}
+
 /// Dispatch a [`neutrino_runtime_abi::QueryRequest`] against `state`.
 ///
 /// Returns a [`neutrino_runtime_abi::QueryResponse`] carrying the
@@ -2506,6 +2549,7 @@ pub fn query<B: neutrino_runtime_core::StateBackend>(
         QUERY_METHOD_VALIDATOR_SET => query_validator_set(state),
         QUERY_METHOD_RUNTIME_INFO => query_runtime_info(),
         QUERY_METHOD_PENDING_WITHDRAWALS => query_pending_withdrawals(&request.args, state),
+        QUERY_METHOD_REPORTER_STATUS => query_reporter_status(&request.args, state),
         QUERY_METHOD_VALIDATOR_REGISTRATIONS => query_validator_registrations(state),
         QUERY_METHOD_CONSENSUS_CANDIDATES => {
             let payload = borsh::to_vec(&load_consensus_candidates(state))
@@ -2592,6 +2636,45 @@ fn query_pending_withdrawals<B: neutrino_runtime_core::StateBackend>(
         .unwrap_or_default();
     let payload = borsh::to_vec(&queue).expect("borsh encode WithdrawalQueue never fails");
     QueryResponse::ok(payload)
+}
+
+fn query_reporter_status<B: neutrino_runtime_core::StateBackend>(
+    args: &[u8],
+    state: &mut B,
+) -> neutrino_runtime_abi::QueryResponse {
+    use neutrino_runtime_abi::{QueryResponse, QueryStatus};
+
+    let Some(count_bytes) = args.first_chunk::<4>() else {
+        return QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]);
+    };
+    if u32::from_le_bytes(*count_bytes) > 256
+        || args.len() > 4 + MAX_REPORTER_STATUS_IDENTITIES * (48 + 32)
+    {
+        return QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]);
+    }
+    let Ok(request) = ReporterStatusRequest::try_from_slice(args) else {
+        return QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]);
+    };
+    let queue = accountability::load_queue(state);
+    let statuses: Vec<ReporterStatus> = request
+        .identities
+        .into_iter()
+        .map(|identity| ReporterStatus {
+            slashable_balance: load_validator(state, &identity.withdrawal_credentials)
+                .stake
+                .saturating_add(
+                    load_withdrawal_queue(state, &identity.withdrawal_credentials).total(),
+                ),
+            tombstoned: state
+                .read(&accountability::slashed_key(&identity.pubkey))
+                .is_some(),
+            pending: queue
+                .iter()
+                .any(|item| item.sanction.offender.pubkey == identity.pubkey),
+            identity,
+        })
+        .collect();
+    QueryResponse::ok(borsh::to_vec(&statuses).expect("canonical reporter statuses"))
 }
 
 fn query_validator_registrations<B: neutrino_runtime_core::StateBackend>(

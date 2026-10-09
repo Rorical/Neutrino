@@ -106,6 +106,9 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         .proving
         .validate()
         .map_err(|error| NodeError::ProofSystem(error.into()))?;
+    config
+        .reporter_reward_address()
+        .map_err(NodeError::Engine)?;
     if config.role == NodeRole::LightClient {
         return Box::pin(run_with_prover(config, || {
             Ok(sp1_sdk::blocking::ProverClient::builder().light().build())
@@ -269,6 +272,14 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
             })?;
             concrete_backend.set_program_store(store);
             concrete_backend.restore_programs();
+        }
+        if let Some(address) = config
+            .reporter_reward_address()
+            .map_err(NodeError::Engine)?
+        {
+            concrete_backend
+                .initialize_reporter(address)
+                .map_err(NodeError::Engine)?;
         }
         if config.role == NodeRole::Archive {
             concrete_backend

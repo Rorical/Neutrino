@@ -72,6 +72,8 @@ const MAX_MONITOR_BYTES: usize = 64 * 1024 * 1024;
 /// authenticated finality; peer-declared slots and chunk ids never evict evidence.
 #[derive(Debug)]
 pub struct SlashingMonitor {
+    /// Durable reporter replay uses its provisioned storage instead of forensic cache quotas.
+    reporter: bool,
     /// `(source_chunk, proposer_index, slot) → header` previously accepted.
     seen_headers: BTreeMap<(ChunkId, ValidatorIndex, Slot), Header>,
     /// `(validator_index, chunk_id, round, phase) → vote` previously
@@ -106,6 +108,7 @@ impl SlashingMonitor {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            reporter: false,
             seen_headers: BTreeMap::new(),
             seen_votes: BTreeMap::new(),
             seen_nil_votes: BTreeMap::new(),
@@ -115,6 +118,13 @@ impl SlashingMonitor {
             quorum_bytes: 0,
             observed_prevote_quorums: BTreeMap::new(),
             attestations: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn for_reporter() -> Self {
+        Self {
+            reporter: true,
+            ..Self::new()
         }
     }
 
@@ -190,7 +200,7 @@ impl SlashingMonitor {
             }
             Some(_) => None,
             None => {
-                if self.seen_headers.len() >= MAX_MONITOR_ENTRIES {
+                if !self.reporter && self.seen_headers.len() >= MAX_MONITOR_ENTRIES {
                     return None;
                 }
                 self.seen_headers.insert(key, header.clone());
@@ -261,7 +271,7 @@ impl SlashingMonitor {
             // as a duplicate with no new attribution information.
             return self.try_synthesize_lock_violation(validator_index, vote);
         }
-        if self.seen_votes.len() >= MAX_MONITOR_ENTRIES {
+        if !self.reporter && self.seen_votes.len() >= MAX_MONITOR_ENTRIES {
             return None;
         }
         self.seen_votes.insert(key, vote.clone());
@@ -291,7 +301,8 @@ impl SlashingMonitor {
                     nil_vote: nil_vote.clone(),
                 });
             }
-            if self.seen_nil_votes.len() < MAX_MONITOR_ENTRIES
+            if self.reporter
+                || self.seen_nil_votes.len() < MAX_MONITOR_ENTRIES
                 || self.seen_nil_votes.contains_key(&key)
             {
                 self.seen_nil_votes.entry(key).or_insert(nil_vote);
@@ -318,8 +329,9 @@ impl SlashingMonitor {
             Some(_) => None,
             None => {
                 let size = borsh::object_length(proposal).unwrap_or(usize::MAX);
-                if self.seen_bft_proposals.len() >= MAX_MONITOR_ENTRIES
-                    || size > MAX_MONITOR_BYTES.saturating_sub(self.proposal_bytes)
+                if !self.reporter
+                    && (self.seen_bft_proposals.len() >= MAX_MONITOR_ENTRIES
+                        || size > MAX_MONITOR_BYTES.saturating_sub(self.proposal_bytes))
                 {
                     return None;
                 }
@@ -352,8 +364,9 @@ impl SlashingMonitor {
             return;
         }
         let size = borsh::object_length(&quorum).unwrap_or(usize::MAX);
-        if self.observed_prevote_quorums.len() >= MAX_MONITOR_ENTRIES
-            || size > MAX_MONITOR_BYTES.saturating_sub(self.quorum_bytes)
+        if !self.reporter
+            && (self.observed_prevote_quorums.len() >= MAX_MONITOR_ENTRIES
+                || size > MAX_MONITOR_BYTES.saturating_sub(self.quorum_bytes))
         {
             return;
         }
@@ -388,9 +401,10 @@ impl SlashingMonitor {
             return;
         };
         let retained_size = self.attestation_bytes.saturating_sub(old_size);
-        if size > MAX_MONITOR_BYTES.saturating_sub(retained_size)
-            || (self.attestations.len() >= MAX_MONITOR_ENTRIES
-                && !self.attestations.contains_key(&key))
+        if !self.reporter
+            && (size > MAX_MONITOR_BYTES.saturating_sub(retained_size)
+                || (self.attestations.len() >= MAX_MONITOR_ENTRIES
+                    && !self.attestations.contains_key(&key)))
         {
             return;
         }

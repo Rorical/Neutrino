@@ -12,6 +12,9 @@ mod bootstrap_checkpoint_retention_tests;
 #[path = "evidence_path_retention_tests.rs"]
 mod evidence_path_retention_tests;
 
+#[path = "reporter_retention_tests.rs"]
+mod reporter_retention_tests;
+
 use super::*;
 use crate::full_chunk::ConsensusState;
 use crate::test_db::{FaultDb, header};
@@ -174,6 +177,8 @@ where
         precommit_attestations: Vec::new(),
     };
     let record = HistoricalChunk {
+        runtime_code_hash: start.programs.runtime_code_hash,
+        block_guest_vk_digest: start.programs.execution.block,
         chunk: chunk.clone(),
         validators: spec.initial_validators.clone(),
         seed: start.seed,

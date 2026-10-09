@@ -75,7 +75,21 @@ impl<DB: Database> ChainStore<DB> {
         }
         info.policy = policy;
         let mut batch = Batch::new();
-        if archive && policy == RetentionPolicy::Pruned {
+        if policy != RetentionPolicy::Reporter {
+            for column in [
+                Column::ReporterHistory,
+                Column::ReporterSources,
+                Column::ReporterHeaders,
+                Column::ReporterBoundaries,
+                Column::ReporterValidators,
+                Column::ReporterIndex,
+            ] {
+                for (key, _) in self.db.iter_column(column).map_err(StoreError::Database)? {
+                    batch.delete(column, key);
+                }
+            }
+        }
+        if archive && policy != RetentionPolicy::Archive {
             for (key, _) in self
                 .db
                 .iter_column(Column::HistoryNodes)

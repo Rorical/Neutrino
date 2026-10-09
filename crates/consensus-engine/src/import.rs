@@ -559,6 +559,14 @@ impl<DB: Database> Engine<DB> {
             self.chain_spec().consensus_domain(),
         )
         .map_err(ImportError::HeaderSignature)?;
+        let reporter_validators = self.active_validator_set().to_vec();
+        let reporter_chunk =
+            block.header.height.saturating_sub(1) / self.chain_spec().consensus.chunk_size;
+        self.store_mut().retain_reporter_header(
+            reporter_chunk,
+            &block.header,
+            &reporter_validators,
+        )?;
         consensus_vrf::verify_header_proposer(
             &block.header,
             self.active_validator_set(),

@@ -24,6 +24,15 @@ as the new root. Archives retain the full immutable tree. Reporters supply an
 opening for older evidence, so its verification does not require the receiver to
 retain the corresponding record or tree.
 
+Reporter nodes use the same bounded frontier and proof-backed pruning, with six
+private columns: `ReporterHistory`, `ReporterSources`, `ReporterHeaders`,
+`ReporterBoundaries`, `ReporterValidators` and `ReporterIndex`. They retain only
+the watched identities' signed sources and required context, updating their
+openings atomically at finalization. Runtime eligibility from finalized state
+controls release of identity ownership and shared dependencies. They retain no
+complete historical tree or old transaction bodies; see
+[reporter storage and rewards](25-reporter-nodes.md).
+
 The private disk report wrapper also keeps the path's locally authenticated root.
 A snapshot jump refreshes reports with matching supplied recent openings, removes
 reports covered by its finalized state, and preserves other reports as dormant

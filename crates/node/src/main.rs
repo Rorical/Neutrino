@@ -79,7 +79,11 @@ fn print_usage() {
     eprintln!("    chain_id = <u64>");
     eprintln!();
     eprintln!("Optional keys:");
-    eprintln!("    role             = \"validator\" | \"full\" | \"light-client\" | \"archive\"");
+    eprintln!(
+        "    role             = \"validator\" | \"full\" | \"light-client\" | \"archive\" | \"reporter\""
+    );
+    eprintln!("    [reporter]       # required for role = reporter");
+    eprintln!("    reward_address_hex = \"<nonzero 32-byte account address>\"");
     eprintln!("    listen           = [\"<multiaddr>\"]      # defaults to /ip4/0.0.0.0/tcp/0");
     eprintln!("    bootnodes        = [\"<multiaddr>\"]");
     eprintln!("    data_dir         = \"/path/to/data\"");

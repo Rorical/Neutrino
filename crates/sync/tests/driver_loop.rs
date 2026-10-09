@@ -1734,10 +1734,13 @@ fn sample_evidence_report() -> neutrino_consensus_types::evidence::EvidenceRepor
     };
     use neutrino_primitives::Validator;
     let statement = EvidenceStatement {
+        reporter: None,
         chain_id: 1,
         chain_spec_hash: [1; 32],
         block_guest_vk_digest: [2; 8],
         context: EvidenceContext {
+            source_runtime_code_hash: [0; 32],
+            source_block_guest_vk_digest: [2; 8],
             chunk_id: 0,
             chunk_hash: [3; 32],
             end_height: 1,

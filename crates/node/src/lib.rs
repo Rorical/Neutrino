@@ -27,7 +27,7 @@ pub use chain_backend::ChainBackend;
 pub use chain_spec::{AccountEntry, ChainSpecError, ChainSpecFile, ValidatorEntry};
 pub use config::{
     BacklogPolicy, ExecutionLimitsConfig, NodeConfig, NodeRole, PROPOSER_IKM_ENV, ProposerIkmError,
-    ProposerIkmSource,
+    ProposerIkmSource, ReporterConfig,
 };
 pub use db::{NodeDb, NodeDbError};
 pub use genesis::{GenesisState, build_genesis_state};

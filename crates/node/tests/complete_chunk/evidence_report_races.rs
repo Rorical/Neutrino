@@ -111,7 +111,14 @@ fn report(
     }
 }
 
-fn finalize_next_empty(engine: &mut Engine<MemoryDatabase>, template: &ConsensusWitness) {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "shared by sibling integration-test modules"
+)]
+pub(super) fn finalize_next_empty(
+    engine: &mut Engine<MemoryDatabase>,
+    template: &ConsensusWitness,
+) {
     let height = engine.head_height() + 1;
     let input = StfInput {
         evidence_anchor: engine.evidence_anchor(height).unwrap(),

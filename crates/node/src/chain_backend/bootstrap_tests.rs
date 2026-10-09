@@ -194,6 +194,8 @@ impl Fixture {
             validators: witness.context.active_validators,
             seed: witness.seed,
             finality: witness.finality_cert,
+            block_guest_vk_digest: validated.statement.start.programs.execution.block,
+            runtime_code_hash: validated.statement.start.programs.runtime_code_hash,
         };
         let leaf = commitment(&record.evidence_context());
         let frontier = HistoryFrontier::from_leaves(&[leaf]).unwrap();

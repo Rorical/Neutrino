@@ -28,6 +28,11 @@ block sweeps the markers admitted one delay before it. Pending sanctions hold
 withdrawal collateral. Each block
 executes the mandatory FIFO prefix before ordinary transactions, reserving gas.
 Deductions are internal operations, not unsigned user transaction variants.
+Safety evidence can bind a reporter account in its proven statement. Runtime
+policy fixes a reward percentage at admission and pays that share of the actual
+deduction during FIFO execution, defaulting to 10%. A bounded `reporter_status`
+query exposes deductible balance and sanction status to local reporter retention;
+nodes use finalized state for cleanup. Consensus Guests contain no reward rule.
 
 Genesis runtime state is derived by every node from the chain-spec file: each
 `[[accounts]]` entry seeds a balance and each validator with non-zero withdrawal

@@ -23,6 +23,7 @@ where
 {
     let record = engine.store().historical_chunk(source).unwrap().unwrap();
     let statement = EvidenceStatement {
+        reporter: None,
         chain_id: engine.chain_spec().chain_id,
         chain_spec_hash: engine.chain_spec().hash(),
         block_guest_vk_digest: [3; 8],

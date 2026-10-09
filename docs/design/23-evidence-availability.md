@@ -127,6 +127,14 @@ client or bridge it was presented to; an archive or reporter supplies old canoni
 material. The history commitment authenticates that material but cannot recover it
 after every retaining party deletes it.
 
+`role = "reporter"` retains observed signed sources, signed headers, proof
+dependencies and authenticated historical contexts for economically accountable
+identities. It keeps their paths current without a complete tree or old transaction
+bodies. Runtime queries against finalized state release identities after complete
+withdrawal or safety admission, preserving shared dependencies until no retained
+identity needs them. Its forensic historical observations do not extend the live
+BFT reference window. See [reporter nodes and rewards](25-reporter-nodes.md).
+
 An `EvidenceReport` packages the proven offence with its 64-level history path.
 The path targets the current finalized root or one of the preceding eight roots,
 which an ordinary node can advance using its bounded append suffix. Older anchors

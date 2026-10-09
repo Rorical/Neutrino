@@ -1,7 +1,7 @@
 //! Atomic checkpoint installation and bounded authenticated historical openings.
 
 use super::{ChainStore, StoreError, keys, pointers};
-use crate::{BlockState, RetentionInfo, RetentionPolicy, full_chunk::ConsensusState};
+use crate::{BlockState, RetentionInfo, full_chunk::ConsensusState};
 use neutrino_consensus_types::history_proof::ConsensusBoundary;
 use neutrino_consensus_types::{Header, HistoryProof};
 use neutrino_prover_chunk::{execution::commitment, history::HistoricalOpening};
@@ -39,6 +39,11 @@ impl<DB: Database> ChainStore<DB> {
         recent: &[HistoricalOpening],
         state: &Trie,
     ) -> Result<(), StoreError<DB::Error>> {
+        if self.reporter_has_history()? {
+            return Err(StoreError::Corrupt(
+                "bootstrap would skip tracked reporter append data",
+            ));
+        }
         let mut batch = Batch::new();
         for (key, _) in self
             .db()
@@ -193,7 +198,7 @@ impl<DB: Database> ChainStore<DB> {
             keys::chunk_id_key(count),
         );
         let info = RetentionInfo {
-            policy: RetentionPolicy::Pruned,
+            policy: self.retention_info()?.policy,
             pruned_before_chunk: count,
             first_retained_height: end
                 .height
@@ -247,6 +252,7 @@ impl<DB: Database> ChainStore<DB> {
                 borsh::to_vec(&opening.record)?,
             );
         }
+        self.retain_reporter_bootstrap_batch(&mut batch, recent)?;
         self.db_mut()
             .write_batch_durable(batch)
             .map_err(StoreError::Database)

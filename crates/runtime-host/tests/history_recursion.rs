@@ -194,6 +194,8 @@ fn empty_successor(
         .frontier
         .append(neutrino_prover_chunk::execution::commitment(
             &neutrino_consensus_types::evidence::EvidenceContext {
+                source_runtime_code_hash: validated.statement.start.programs.runtime_code_hash,
+                source_block_guest_vk_digest: validated.statement.start.programs.execution.block,
                 chunk_id: validated.statement.chunk.chunk_id,
                 chunk_hash: as_chunk(&validated.statement.chunk).hash(),
                 end_height: validated.statement.end.height,

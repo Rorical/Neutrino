@@ -238,6 +238,10 @@ its Chunk receipts/statements/boundaries and progress receipt; it never requires
 transaction bodies or old execution state and does not lower the raw-data watermark.
 Cached historical paths and the append frontier remain sufficient to open recent
 records and append the next leaf.
+Reporter nodes additionally retain source contexts and continuously updated paths
+for slashable identities. They apply the ordinary raw-block deletion watermark,
+store no complete tree, and release private history from finalized runtime
+eligibility. See [reporter nodes](25-reporter-nodes.md).
 Persistent deletions and the watermark commit atomically before changing in-memory
 state. Restart validates the retained canonical suffix against its boundary. Before
 enabling history jobs or pruning, node startup cryptographically verifies the saved

@@ -383,7 +383,7 @@ where
                 });
             }
             if cached.is_none()
-                && retention.policy == neutrino_consensus_engine::RetentionPolicy::Pruned
+                && retention.policy != neutrino_consensus_engine::RetentionPolicy::Archive
                 && range.covered_chunks().is_none_or(|count| {
                     count > neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS
                 })
@@ -1028,7 +1028,7 @@ where
         .retention_info()
         .map_err(|error| error.to_string())?
         .policy
-        == neutrino_consensus_engine::RetentionPolicy::Pruned;
+        != neutrino_consensus_engine::RetentionPolicy::Archive;
     for mut job in jobs(engine)? {
         if let Some(reason) = cancellation_reason(&job, pruned) {
             job.state = 4;
@@ -1067,7 +1067,7 @@ where
         .retention_info()
         .map_err(|error| error.to_string())?
         .policy
-        == neutrino_consensus_engine::RetentionPolicy::Pruned;
+        != neutrino_consensus_engine::RetentionPolicy::Archive;
     for job in &mut records {
         if job.state == 1 {
             job.state = 0;

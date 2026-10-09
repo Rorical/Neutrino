@@ -4,7 +4,8 @@ pub mod support;
 
 use neutrino_consensus_engine::store::ChainStore;
 use neutrino_consensus_types::evidence::{
-    EvidenceArtifact, EvidenceContext, EvidenceStatement, MAX_EVIDENCE_PROOF_BYTES, SanctionKind,
+    EvidenceArtifact, EvidenceContext, EvidenceReport, EvidenceStatement, MAX_EVIDENCE_PROOF_BYTES,
+    SanctionKind,
 };
 use neutrino_storage::{Column, Database, MemoryDatabase};
 
@@ -35,15 +36,23 @@ fn artifact(id: u64) -> EvidenceArtifact {
     }
 }
 
+fn report(artifact: &EvidenceArtifact) -> EvidenceReport {
+    let leaf = neutrino_consensus_types::evidence::commitment(&artifact.statement.context);
+    EvidenceReport {
+        artifact: artifact.clone(),
+        history: neutrino_consensus_types::history::HistoryPath::build(&[leaf], 0).unwrap(),
+    }
+}
+
 #[test]
 fn verified_pool_survives_restart_preserves_first_receipt_and_expires_at_finality() {
     let mut store = ChainStore::new(MemoryDatabase::new());
     let mut original = artifact(1);
     original.statement.kind = SanctionKind::Inactivity;
-    store.put_evidence_artifact(&original).unwrap();
+    store.put_evidence_report(&report(&original)).unwrap();
     let mut alternate = original.clone();
     alternate.proof_bytes.push(2);
-    store.put_evidence_artifact(&alternate).unwrap();
+    store.put_evidence_report(&report(&alternate)).unwrap();
     let mut restarted = ChainStore::new(store.into_db());
     assert_eq!(
         restarted.evidence_artifacts().unwrap(),
@@ -62,7 +71,7 @@ fn verified_pool_survives_restart_preserves_first_receipt_and_expires_at_finalit
 fn safety_receipts_never_age_out_but_leave_once_their_identity_is_finalized_slashed() {
     let mut store = ChainStore::new(MemoryDatabase::new());
     let safety = artifact(1);
-    store.put_evidence_artifact(&safety).unwrap();
+    store.put_evidence_report(&report(&safety)).unwrap();
     // A million blocks past the source chunk the receipt is still pooled: a
     // safety claim has no age window.
     store.prune_evidence_artifacts(1_000_000, 10).unwrap();
@@ -87,21 +96,21 @@ fn persistent_pool_enforces_receipt_and_entry_bounds() {
     let mut store = ChainStore::new(MemoryDatabase::new());
     let mut item = artifact(0);
     item.proof_bytes = vec![0; MAX_EVIDENCE_PROOF_BYTES + 1];
-    assert!(store.put_evidence_artifact(&item).is_err());
+    assert!(store.put_evidence_report(&report(&item)).is_err());
     item.proof_bytes = vec![1];
     for id in 0_u64..256 {
         item.statement.offence_id[..8].copy_from_slice(&id.to_le_bytes());
-        store.put_evidence_artifact(&item).unwrap();
+        store.put_evidence_report(&report(&item)).unwrap();
     }
     item.statement.offence_id[..8].copy_from_slice(&256_u64.to_le_bytes());
-    assert!(store.put_evidence_artifact(&item).is_err());
+    assert!(store.put_evidence_report(&report(&item)).is_err());
     assert_eq!(store.evidence_artifacts().unwrap().len(), 256);
     store
         .db_mut()
         .put(Column::FinalizedOffences, &[0; 32], &1_u64.to_be_bytes())
         .unwrap();
     store.prune_evidence_artifacts(1, 1024).unwrap();
-    store.put_evidence_artifact(&item).unwrap();
+    store.put_evidence_report(&report(&item)).unwrap();
     assert_eq!(store.evidence_artifacts().unwrap().len(), 256);
 }
 
@@ -110,8 +119,8 @@ fn finalization_releases_cache_capacity_without_discarding_reorg_candidates() {
     let mut store = ChainStore::new(MemoryDatabase::new());
     let original = artifact(1);
     let pending = artifact(2);
-    store.put_evidence_artifact(&original).unwrap();
-    store.put_evidence_artifact(&pending).unwrap();
+    store.put_evidence_report(&report(&original)).unwrap();
+    store.put_evidence_report(&report(&pending)).unwrap();
     // The index receives admissions only in the proof-gated finalization batch.
     // A receipt consumed merely on the materialized head remains recoverable.
     store
@@ -136,7 +145,7 @@ fn finalized_safety_sanction_releases_every_receipt_against_the_identity() {
     let mut liveness = artifact(3);
     liveness.statement.kind = SanctionKind::Inactivity;
     for item in [&first, &second, &liveness] {
-        store.put_evidence_artifact(item).unwrap();
+        store.put_evidence_report(&report(item)).unwrap();
     }
     let identity = first.statement.offender.pubkey;
     assert!(!store.is_identity_slashed(&identity).unwrap());
@@ -164,7 +173,7 @@ fn pool_identity_is_scoped_to_program_and_exact_statement() {
     let mut other_statement = original.clone();
     other_statement.statement.facts_commitment[0] ^= 1;
     for item in [&original, &other_program, &other_statement] {
-        store.put_evidence_artifact(item).unwrap();
+        store.put_evidence_report(&report(item)).unwrap();
     }
     assert_eq!(store.evidence_artifacts().unwrap().len(), 3);
     store

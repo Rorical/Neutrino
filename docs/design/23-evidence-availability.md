@@ -93,8 +93,9 @@ metadata and original signed artifacts before resuming signing. The replay
 feeds discovered offences into the normal persistent evidence pool; it does
 not discard generated evidence during engine construction. Raw reports and
 receipts against an identity that is tombstoned, finalized as slashed or already
-covered by a pooled safety receipt are skipped before proving or verification
-(see design 20). Steady-state
+covered by a ready pooled safety receipt under the current program are skipped
+before proving or verification, except that the exact pooled statement can refresh
+its authenticated path (see design 20). Steady-state
 observation uses dependency metadata and cached exact receipt verdicts rather
 than scanning or re-verifying every receipt after each vote.
 
@@ -116,14 +117,33 @@ saved recursive coverage. Archive nodes can retain and serve older sources, but 
 sources do not extend the protocol's offence-admission windows.
 
 Safety evidence has no age window: it remains admissible once per identity at
-any time, far beyond the eight-chunk source cache.
-The canonical side of such a claim comes from the historical records, which keep
-each finalized certificate's individual attestations for one unbonding delay on
-full nodes and indefinitely on archives; the conflicting side comes from whoever
-observed the signed fork, typically the light client or bridge it was presented
-to. This layer therefore guarantees that a late fork can be *attributed* against
-the canonical history, not that every ephemeral unfinalized-round message from
-weeks ago is still cached.
+any time, far beyond the eight-chunk source cache. Historical records retain each
+finalized certificate's individual attestations for one unbonding delay on ordinary
+nodes and indefinitely on archives. This is a local service horizon; a validator
+that remains staked can have signed much older offences. A complete late report
+requires whoever retained the relevant sources, historical validator context and
+history opening. The conflicting side of a fork claim often comes from the light
+client or bridge it was presented to; an archive or reporter supplies old canonical
+material. The history commitment authenticates that material but cannot recover it
+after every retaining party deletes it.
+
+An `EvidenceReport` packages the proven offence with its 64-level history path.
+The path targets the current finalized root or one of the preceding eight roots,
+which an ordinary node can advance using its bounded append suffix. Older anchors
+are deferred for reporter refresh without expiring safety evidence. Once accepted,
+active pooled paths advance atomically at every finalized append and survive restart;
+ordinary nodes need no complete historical tree to admit old safety claims.
+Archives preserve that tree for arbitrary opening service. This transport/storage
+package does not change block proof attachments or on-chain evidence semantics.
+
+The private disk pool adds a locally authenticated 32-byte root to each report.
+After a snapshot jump, reports covered by finalized snapshot state leave the pool,
+matching recent openings refresh their reports, and the rest remain dormant under
+their saved roots. A holder must refresh a dormant path before admission because
+the skipped append data may be absent. Dormant reports do not block finalization
+or suppress another ready safety report for that identity. Active and dormant
+entries share the same 256-report and 32 MiB budget, including paths and saved roots;
+path refresh preserves the statement's first verified proof attachment.
 
 The current-plus-eight-chunk full/validator source cache is bounded by 4,096
 records and 512 MiB of source storage. Peer-origin admission stops at 3,840

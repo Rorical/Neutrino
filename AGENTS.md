@@ -61,21 +61,34 @@ have passed.
   age window: it cites any finalized chunk and is admitted once per identity at
   any time; the deduction takes whatever slashable balance remains (active stake
   or unmatured unbonding, possibly nothing) and consensus ejects the identity
-  regardless. The unbonding delay is therefore the economic accountability
-  horizon: `evidence_max_age_blocks < unbonding_delay_blocks > chunk_size`, and
-  weak subjectivity may not exceed it. The history tree is never pruned, so any
-  record's path stays openable; full/validator nodes keep complete historical
-  records for `history_record_window_chunks` (one unbonding delay) and everything
-  else prunes below saved recursive coverage past the eight-chunk window; archive
-  nodes preserve history. Proof jobs pin receipts and boundaries, not old
-  transaction bodies or execution state. Current sanctions remain live state: a
+  regardless. The unbonding delay bounds the withdrawal accountability horizon:
+  `evidence_max_age_blocks < unbonding_delay_blocks > chunk_size`, and weak
+  subjectivity may not exceed it. Full/validator nodes store no historical tree
+  nodes: a bounded frontier appends each leaf, and bounded cached paths cover
+  retained records, recent boundaries and the latest recursive prefix's preceding
+  eight records. They keep complete historical records for
+  `history_record_window_chunks` (one unbonding delay); this local service horizon
+  does not cover every signature of a validator that remains bonded indefinitely.
+  `EvidenceReport` carries its own path at the current or preceding-eight
+  authenticated root. Finalization atomically advances cached and active pooled
+  paths; older report anchors require reporter refresh without expiring the safety claim.
+  The private disk pool saves each report's locally authenticated root. Snapshot
+  installation drops reports covered by finalized state, refreshes matching recent
+  openings and keeps the rest dormant until a holder supplies a current path.
+  Dormant entries neither block finality nor suppress a usable safety report;
+  both active and dormant entries share the 256-report/32 MiB pool budget.
+  Archives preserve the full tree and old source material. Everything else prunes
+  below saved recursive coverage past the eight-chunk window. Proof jobs pin
+  receipts and boundaries, not old transaction bodies or execution state. Current
+  sanctions remain live state: a
   safety admission writes a permanent BLS-identity tombstone (consensus never seats
   the identity again), a liveness admission marks the offence and that marker is
   swept one unbonding delay after admission. A safety identity is accountable once
-  end to end: the node pools at most one safety receipt per identity under the
-  current program, does not verify, store or prove reports against a tombstoned or
-  pooled identity, drops nothing on unfinalized head state, and a finalized safety
-  admission (`FinalizedSlashes`) releases every pooled receipt and raw report
+  end to end: the node pools at most one ready safety receipt per identity under the
+  current program, skips further offences against a tombstoned identity or one
+  covered by a ready pooled receipt, permits refreshing the exact pooled statement,
+  drops nothing on unfinalized head state, and a finalized safety admission
+  (`FinalizedSlashes`) releases every pooled receipt and raw report
   against that key.
 - Full/validator snapshot bootstrap verifies a genesis History prefix and an exact
   bridge from local trust, then authenticates validators, recent history and the

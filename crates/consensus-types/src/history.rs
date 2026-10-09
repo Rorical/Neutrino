@@ -31,11 +31,10 @@ pub const fn is_history_index_within(index: u64, count: u64, window: u64) -> boo
 /// evidence can still be constructed locally.
 ///
 /// Safety claims have no age window, so this is a local service horizon, not
-/// an admissibility bound: one unbonding delay of records lets a node build
-/// evidence against anything signed by a validator that has not yet fully
-/// withdrawn, and the eight-chunk liveness window is never shrunk. Older
-/// records come from archive nodes. The history tree itself is never pruned,
-/// so a retained path can be opened for any record a node still has.
+/// an admissibility bound. A still-bonded validator may have signed outside
+/// this window. Older records and their openings require a retaining reporter
+/// or archive node; ordinary nodes keep bounded cached openings. The
+/// eight-chunk liveness window is never shrunk.
 #[must_use]
 pub const fn history_record_window_chunks(unbonding_delay_blocks: u64, chunk_size: u64) -> u64 {
     if chunk_size == 0 {
@@ -181,6 +180,33 @@ impl HistoryFrontier {
         self.peaks = peaks;
         self.root()
     }
+
+    /// Open the next appended leaf using only this bounded frontier.
+    /// Invalid shape or exhausted indexes return no path; the frontier is unchanged.
+    #[must_use]
+    pub fn append_path(&self, leaf: Hash) -> Option<HistoryPath> {
+        let count = self.count.checked_add(1)?;
+        if self.peaks.len() != self.count.count_ones() as usize {
+            return None;
+        }
+        let empty = empty_history_hashes();
+        let mut peaks = self.peaks.iter();
+        let mut siblings = Vec::with_capacity(HISTORY_DEPTH);
+        for (level, empty_subtree) in empty.iter().enumerate().take(HISTORY_DEPTH) {
+            siblings.push(if (self.count >> level) & 1 == 1 {
+                *peaks.next()?
+            } else {
+                *empty_subtree
+            });
+        }
+        let path = HistoryPath {
+            index: self.count,
+            count,
+            siblings,
+        };
+        let mut next = self.clone();
+        path.verify(leaf, next.append(leaf)?).then_some(path)
+    }
 }
 
 /// Membership of one exact occupied historical index under a counted root.
@@ -217,7 +243,7 @@ impl BorshDeserialize for HistoryPath {
 }
 
 impl HistoryPath {
-    /// Build an opening from archived contexts; production stores tree nodes.
+    /// Build an opening from archived contexts.
     #[must_use]
     pub fn build(leaves: &[Hash], index: usize) -> Option<Self> {
         if index >= leaves.len() {
@@ -267,6 +293,41 @@ impl HistoryPath {
             };
         }
         counted_history_root(self.count, node) == expected
+    }
+
+    /// Authenticate and advance this opening over one finalized append.
+    /// Only the sibling shared with the appended leaf changes. Returns the new
+    /// counted root; invalid inputs or exhausted indexes leave the path unchanged.
+    pub fn advance(
+        &mut self,
+        leaf: Hash,
+        frontier: &HistoryFrontier,
+        appended_leaf: Hash,
+    ) -> Option<Hash> {
+        if self.count != frontier.count || !self.verify(leaf, frontier.root()?) {
+            return None;
+        }
+        let insertion = frontier.append_path(appended_leaf)?;
+        // Membership above guarantees index < count, so the xor is nonzero.
+        let changed_level = usize::try_from((self.index ^ frontier.count).ilog2()).ok()?;
+        let mut sibling = history_leaf_hash(Some(appended_leaf));
+        for (level, other) in insertion.siblings.iter().take(changed_level).enumerate() {
+            sibling = if (frontier.count >> level) & 1 == 0 {
+                history_node_hash(level, sibling, *other)
+            } else {
+                history_node_hash(level, *other, sibling)
+            };
+        }
+        let mut next_frontier = frontier.clone();
+        let root = next_frontier.append(appended_leaf)?;
+        let mut next_path = self.clone();
+        next_path.siblings[changed_level] = sibling;
+        next_path.count = insertion.count;
+        if !next_path.verify(leaf, root) {
+            return None;
+        }
+        *self = next_path;
+        Some(root)
     }
 }
 
@@ -321,9 +382,44 @@ mod tests {
         let mut leaves = Vec::new();
         let mut frontier = HistoryFrontier::empty();
         assert_eq!(frontier.root(), Some(empty_history_root()));
-        for index in 0_u64..130 {
+        for index in 0_u64..260 {
+            let positions = [
+                0,
+                leaves.len() / 3,
+                leaves.len() / 2,
+                leaves.len().saturating_sub(1),
+            ];
+            let paths: Vec<_> = positions
+                .into_iter()
+                .filter_map(|position| {
+                    HistoryPath::build(&leaves, position).map(|path| (position, path))
+                })
+                .collect();
+            let before = frontier.clone();
             leaves.push(blake3_256(&index.to_le_bytes()));
-            let root = frontier.append(*leaves.last().unwrap()).unwrap();
+            let appended_leaf = *leaves.last().unwrap();
+            let insertion = frontier.append_path(appended_leaf).unwrap();
+            assert_eq!(frontier, before);
+            let root = frontier.append(appended_leaf).unwrap();
+            assert_eq!(
+                insertion,
+                HistoryPath::build(&leaves, leaves.len() - 1).unwrap()
+            );
+            assert!(insertion.verify(appended_leaf, root));
+            for (position, mut path) in paths {
+                let prior_siblings = path.siblings.clone();
+                let changed_level = usize::try_from((path.index ^ before.count).ilog2()).unwrap();
+                assert_eq!(
+                    path.advance(leaves[position], &before, appended_leaf),
+                    Some(root)
+                );
+                assert_eq!(path, HistoryPath::build(&leaves, position).unwrap());
+                for (level, sibling) in prior_siblings.iter().enumerate() {
+                    if level != changed_level {
+                        assert_eq!(path.siblings[level], *sibling);
+                    }
+                }
+            }
             for position in [0, leaves.len() / 2, leaves.len() - 1] {
                 let path = HistoryPath::build(&leaves, position).unwrap();
                 assert!(path.verify(leaves[position], root));
@@ -331,6 +427,28 @@ mod tests {
             }
             assert!(frontier.peaks.len() <= HISTORY_DEPTH);
         }
+    }
+
+    #[test]
+    fn cached_old_paths_advance_without_archived_leaves() {
+        let mut frontier = HistoryFrontier::empty();
+        let mut retained = Vec::new();
+        for index in 0_u64..260 {
+            let leaf = blake3_256(&index.to_le_bytes());
+            let insertion = frontier.append_path(leaf).unwrap();
+            for (retained_leaf, path) in &mut retained {
+                assert!(HistoryPath::advance(path, *retained_leaf, &frontier, leaf).is_some());
+            }
+            let root = frontier.append(leaf).unwrap();
+            if index == 0 || index.is_power_of_two() || index == 259 {
+                retained.push((leaf, insertion));
+            }
+            for (retained_leaf, path) in &retained {
+                assert!(path.verify(*retained_leaf, root));
+            }
+        }
+        assert_eq!(retained.first().unwrap().1.index, 0);
+        assert_eq!(retained.first().unwrap().1.count, 260);
     }
 
     #[test]
@@ -362,6 +480,60 @@ mod tests {
     }
 
     #[test]
+    fn invalid_path_advancement_never_mutates() {
+        let leaves = [[7; 32], [8; 32], [9; 32]];
+        let frontier = HistoryFrontier::from_leaves(&leaves).unwrap();
+        let path = HistoryPath::build(&leaves, 1).unwrap();
+        let mut malformed_paths = Vec::new();
+        let mut wrong = path.clone();
+        wrong.count += 1;
+        malformed_paths.push(wrong);
+        let mut wrong = path.clone();
+        wrong.index = wrong.count;
+        malformed_paths.push(wrong);
+        let mut wrong = path.clone();
+        wrong.index = 0;
+        malformed_paths.push(wrong);
+        let mut wrong = path.clone();
+        wrong.siblings.pop();
+        malformed_paths.push(wrong);
+        let mut wrong = path.clone();
+        wrong.siblings.push([0; 32]);
+        malformed_paths.push(wrong);
+        let mut wrong = path.clone();
+        wrong.siblings[63][0] ^= 1;
+        malformed_paths.push(wrong);
+        for mut malformed in malformed_paths {
+            let before = malformed.clone();
+            assert!(malformed.advance(leaves[1], &frontier, [10; 32]).is_none());
+            assert_eq!(malformed, before);
+        }
+        let mut wrong_leaf = path.clone();
+        assert!(wrong_leaf.advance([0; 32], &frontier, [10; 32]).is_none());
+        assert_eq!(wrong_leaf, path);
+        let mut malformed_frontiers = Vec::new();
+        let mut wrong = frontier.clone();
+        wrong.peaks.pop();
+        malformed_frontiers.push(wrong);
+        let mut wrong = frontier.clone();
+        wrong.peaks[0][0] ^= 1;
+        malformed_frontiers.push(wrong);
+        let mut wrong = frontier;
+        wrong.count += 1;
+        malformed_frontiers.push(wrong);
+        for malformed in malformed_frontiers {
+            let mut unchanged = path.clone();
+            assert!(unchanged.advance(leaves[1], &malformed, [10; 32]).is_none());
+            assert_eq!(unchanged, path);
+        }
+        let malformed = HistoryFrontier {
+            count: 3,
+            peaks: Vec::new(),
+        };
+        assert!(malformed.append_path([10; 32]).is_none());
+    }
+
+    #[test]
     fn high_counts_keep_bounded_shape_and_overflow_does_not_mutate() {
         let empty = empty_history_hashes();
         for count in [1 << 32, (1 << 63) - 1, 1 << 63, u64::MAX - 1] {
@@ -372,8 +544,21 @@ mod tests {
                     .map(|level| empty[level])
                     .collect(),
             };
+            let before = frontier.clone();
+            let mut path = frontier.append_path([1; 32]).unwrap();
+            assert_eq!(frontier, before);
             assert!(frontier.root().is_some());
-            assert!(frontier.append([1; 32]).is_some());
+            let root = frontier.append([1; 32]).unwrap();
+            assert!(path.verify([1; 32], root));
+            let path_before = path.clone();
+            if frontier.count == u64::MAX {
+                assert!(path.advance([1; 32], &frontier, [2; 32]).is_none());
+                assert_eq!(path, path_before);
+            } else {
+                let next_root = path.advance([1; 32], &frontier, [2; 32]).unwrap();
+                assert_eq!(frontier.append([2; 32]), Some(next_root));
+                assert!(path.verify([1; 32], next_root));
+            }
             assert!(frontier.peaks.len() <= HISTORY_DEPTH);
         }
         let mut full = HistoryFrontier {
@@ -381,6 +566,7 @@ mod tests {
             peaks: alloc::vec![[1; 32]; 64],
         };
         let before = full.clone();
+        assert!(full.append_path([2; 32]).is_none());
         assert!(full.append([2; 32]).is_none());
         assert_eq!(full, before);
         assert_ne!(history_leaf_hash(None), history_leaf_hash(Some([0; 32])));

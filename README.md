@@ -33,11 +33,12 @@ Neutrino separates the chain into two cleanly decoupled layers:
   A history proof connects compact authenticated boundaries without replaying the chain.
 - **Proof-backed pruning.** Full and validator nodes retain the recent eight-chunk
   window once a persisted recursive prefix covers older data, the compact historical
-  validator records for one unbonding delay, and the history tree forever, so a
-  signed fork is attributable at any age and punishable for as long as its signers
-  hold stake. `role = "archive"`
-  keeps complete source history voluntarily. Old transactions may become globally
-  unavailable when no archive retains them; proof lag delays deletion.
+  validator records for one unbonding delay, and bounded historical paths and an
+  append frontier. Reporters supply older evidence with its authenticated path;
+  nodes can admit a safety claim at any age while retaining no complete history
+  tree. `role = "archive"` keeps the full tree and complete source history
+  voluntarily. Old sources may become globally unavailable when no reporter or
+  archive retains them; proof lag delays deletion of uncovered sources.
 - **Authenticated snapshot bootstrap.** Full/validator nodes verify a recursive
   checkpoint and its locally trusted bridge, download bounded state fragments,
   and atomically install execution and consensus state before resuming sync.
@@ -53,8 +54,9 @@ Neutrino separates the chain into two cleanly decoupled layers:
   [design 20](docs/design/20-evidence-proofs.md).
 - **Authenticated evidence retrieval.** Nodes retain signed consensus artifacts
   in the current and recent eight-chunk window, discover peer records and retrieve
-  exact offence inputs. Archive nodes may keep older sources; admissible evidence
-  remains bounded by the protocol window. See
+  exact offence inputs. Archive nodes may keep older sources. Liveness evidence
+  remains bounded by the protocol window; safety evidence has no source age limit
+  and its reporter supplies the historical opening. See
   [design 23](docs/design/23-evidence-availability.md).
 - **Program sets travel in consensus boundaries.** Every boundary names the runtime
   code hash and the five Guest keys in force from it on; a scheduled upgrade read

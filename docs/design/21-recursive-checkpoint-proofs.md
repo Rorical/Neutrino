@@ -117,9 +117,18 @@ same canonical empty tree.
 
 Chunk carries only the records actually referenced by its embedded votes and their
 membership paths. Limits are eight historical reads and 8 MiB of encoded record
-data, enforced during decoding. The archive may hold full historical records, but
-witness construction uses indexed reads: an opening needs at most 64 sibling-node
-lookups plus its record/root metadata. It never scans all prior chunks.
+data, enforced during decoding. Ordinary nodes construct witnesses from retained
+records and cached fixed-depth paths. An archive can open arbitrary records using
+at most 64 sibling-node lookups plus its record/root metadata. Neither approach
+scans all prior chunks.
+
+For each appended context commitment, the frontier yields the new leaf's complete
+path without a tree lookup. An existing path changes only the sibling at the
+highest differing bit of its index and the append index. This permits bounded
+path caches and pooled reporter paths to advance with each finalized leaf, without
+retaining all historical nodes. Chunk Guest already authenticates the old frontier
+against its start boundary and derives the appended root in its end boundary;
+validators do not need the full tree to produce this transition.
 
 For incoming Chunk `n`, historical source indices read by the chunk witness must
 be in `[n.saturating_sub(8), n)`. Chunk 10,000 can reference Chunk 9,992, but
@@ -148,8 +157,9 @@ Those runtime markers are live state and are not made constant-size by recursion
 ## Persistence and background work
 
 Chunk finalization atomically retains its verified compact statement, receipt,
-full next context, immutable boundary and history-tree append. A full-node history
-commit accepts an authenticated `VerifiedHistory` token and rechecks both endpoints
+full next context, immutable boundary and appended frontier, together with updated
+cached and active pooled history paths. Archives also persist the full tree append. A
+full-node history commit accepts an authenticated `VerifiedHistory` token and rechecks both endpoints
 against local canonical finalized boundaries under the pinned chain binding. Artifact,
 range index, checkpoint and coverage writes are atomic. Importing an old range
 never rewinds the live seed, validator set or execution state.
@@ -204,22 +214,30 @@ work. The boundary immediately before Chunk 9,992 remains authenticated.
 
 The pruning batch removes old raw blocks, headers and their indices, execution
 witnesses, block/chunk receipts and certificates, obsolete historical records,
-frontiers, tree nodes, range proofs and checkpoint metadata. It retains the latest
-genesis-prefix receipt, current consensus boundary, the recent window, active proof
-dependencies and state reachable from retained roots. Two things outlive the
-eight-chunk window. The history tree's nodes are never pruned, so the path opening
-any finalized record stays available and a safety receipt about any chunk can be
-rebound by a proposer that never kept the record; the filled part of the tree holds
-about two nodes per chunk. Complete historical records (validator vector, seed,
-certificate) stay for `history_record_window_chunks`, one unbonding delay, so safety
-evidence can still be built here from raw reports (see
-[evidence proofs](20-evidence-proofs.md)); older records come from archives. A
-path to a record inside a 64-level tree costs about 64 nodes regardless of its age.
-A history job leases only
+range proofs and checkpoint metadata. It retains the latest genesis-prefix receipt,
+current consensus boundary, the recent window, active proof dependencies and state
+reachable from retained roots. Ordinary nodes keep no `HistoryNodes`. Frontiers
+and cached paths are bounded by the current record window, the preceding eight
+replay boundaries, and the latest recursive prefix's independent eight-record
+bootstrap window. Active and dormant evidence paths and their saved authenticated
+roots share the evidence pool's 256-report and 32 MiB limits. Finalization updates
+active paths in the same durable batch as the root; dormant paths await holder
+refresh and cannot block appends. Their storage does not grow with chain age.
+
+Complete historical records (validator vector, seed, certificate) stay for
+`history_record_window_chunks`, one unbonding delay, so safety evidence can be
+built locally from available raw reports within that service horizon (see
+[evidence proofs](20-evidence-proofs.md)). A validator can remain staked beyond
+that horizon; old evidence then requires a retaining reporter or archive. Reports
+carry an opening under a current or preceding-eight authenticated root. Ordinary
+nodes advance it over the bounded append suffix, deferring older anchors for
+refresh without expiring the safety source. Archives retain the full immutable
+tree and can open any finalized record. A path has exactly 64 sibling hashes
+regardless of its source age. A history job leases only
 its Chunk receipts/statements/boundaries and progress receipt; it never requires old
 transaction bodies or old execution state and does not lower the raw-data watermark.
-Historical tree paths and the
-append frontier remain sufficient to open recent records and append the next leaf.
+Cached historical paths and the append frontier remain sufficient to open recent
+records and append the next leaf.
 Persistent deletions and the watermark commit atomically before changing in-memory
 state. Restart validates the retained canonical suffix against its boundary. Before
 enabling history jobs or pruning, node startup cryptographically verifies the saved
@@ -292,10 +310,20 @@ or another suitably capable provider is required.
 The snapshot manifest binds the endpoint header, ordered active validators,
 history frontier and exactly the preceding `min(F, 8)` historical records and
 64-level openings to the proven boundary at count `F`. Each record certificate
-and the endpoint proposer signature are checked independently. Historical paths
-and the frontier's right spine restore future indexed reads and appends without
-older records or a full-tree download. Durable consensus state stores the boundary
-directly; an unauthenticated last Chunk statement is never installed as finality.
+and the endpoint proposer signature are checked independently. Ordinary nodes
+install the supplied paths directly in their bounded cache; the frontier supports
+future appends without restoring tree nodes or downloading older records. Durable
+consensus state stores the boundary directly; an unauthenticated last Chunk
+statement is never installed as finality.
+
+Snapshot installation may skip the append data needed to update pooled paths for
+arbitrary old sources. Reports already covered by authenticated finalized state
+are removed, and matching recent manifest openings refresh their reports. Other
+reports remain dormant under the locally authenticated 32-byte root stored with
+each private disk entry, preserving the verified offence across restart. They
+cannot be selected for admission until their holder supplies a current opening;
+they neither block finality nor suppress a usable report against the same identity.
+Active and dormant entries remain under the combined bounded pool budget.
 
 Execution state downloads use typed content hashes and offsets, with bounded
 fragments and durable progress. Hash checks authorize following children; complete

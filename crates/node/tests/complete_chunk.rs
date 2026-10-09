@@ -1,6 +1,8 @@
 //! Native consensus backend tests for asynchronous proof scheduling, not SP1 soundness.
 #[path = "complete_chunk/bft_proof_notifications.rs"]
 mod bft_proof_notifications;
+#[path = "complete_chunk/evidence_report_races.rs"]
+mod evidence_report_races;
 #[path = "../../prover-chunk/tests/support/mod.rs"]
 pub mod support;
 
@@ -279,7 +281,7 @@ async fn proof_job_keeps_network_responsive_and_retries_without_advancing_on_fai
 async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     use neutrino_consensus_types::{
         FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
-        evidence::EvidenceArtifact,
+        evidence::EvidenceReport,
     };
     use neutrino_network::{Topic, service::NetworkCommand};
     use neutrino_sync::SyncBackend;
@@ -316,14 +318,14 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     let (publisher, mut messages) = tokio::sync::mpsc::channel(8);
     backend.set_network_publisher(publisher);
     backend.ingest_slashing_evidence(offence).await;
-    let artifact = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if let NetworkCommand::Publish {
                 topic: Topic::EvidenceProofs,
                 data,
             } = messages.recv().await.unwrap()
             {
-                break borsh::from_slice::<EvidenceArtifact>(&data).unwrap();
+                break borsh::from_slice::<EvidenceReport>(&data).unwrap();
             }
         }
     })
@@ -331,8 +333,8 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
     .expect("background evidence completion notification");
     let database = backend.with_engine_mut_for_test(|engine| {
         assert_eq!(
-            engine.store().evidence_artifacts().unwrap(),
-            vec![artifact.clone()]
+            engine.store().evidence_reports().unwrap(),
+            vec![report.clone()]
         );
         engine.store().db().clone()
     });
@@ -346,29 +348,29 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
         },
     );
     assert_eq!(
-        restarted.ingest_evidence_proof(artifact.clone()).await,
+        restarted.ingest_evidence_proof(report.clone()).await,
         neutrino_sync::EvidenceProofAcceptance::Accepted
     );
-    let mut forged = artifact.clone();
-    forged.statement.offender.withdrawal_credentials[0] ^= 1;
+    let mut forged = report.clone();
+    forged.artifact.statement.offender.withdrawal_credentials[0] ^= 1;
     assert_eq!(
         restarted.ingest_evidence_proof(forged).await,
         neutrino_sync::EvidenceProofAcceptance::Rejected
     );
-    let mut corrupt = artifact.clone();
-    corrupt.proof_bytes.push(0);
+    let mut corrupt = report.clone();
+    corrupt.artifact.proof_bytes.push(0);
     assert_eq!(
         restarted.ingest_evidence_proof(corrupt).await,
         neutrino_sync::EvidenceProofAcceptance::Rejected
     );
-    let mut wrong_program = artifact.clone();
-    wrong_program.evidence_guest_vk_digest[0] ^= 1;
+    let mut wrong_program = report.clone();
+    wrong_program.artifact.evidence_guest_vk_digest[0] ^= 1;
     assert_eq!(
         restarted.ingest_evidence_proof(wrong_program).await,
         neutrino_sync::EvidenceProofAcceptance::Rejected
     );
     restarted.with_engine_mut_for_test(|engine| {
-        assert_eq!(engine.store().evidence_artifacts().unwrap(), vec![artifact]);
+        assert_eq!(engine.store().evidence_reports().unwrap(), vec![report]);
     });
 }
 
@@ -376,7 +378,7 @@ async fn evidence_worker_persists_gossips_and_rehydrates_verified_receipts() {
 async fn one_safety_receipt_per_identity_is_pooled_and_redundant_reports_are_skipped() {
     use neutrino_consensus_types::{
         FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
-        evidence::EvidenceArtifact,
+        evidence::EvidenceReport,
     };
     use neutrino_network::{Topic, service::NetworkCommand};
     use neutrino_sync::{EvidenceProofAcceptance, SyncBackend};
@@ -416,13 +418,7 @@ async fn one_safety_receipt_per_identity_is_pooled_and_redundant_reports_are_ski
         vote_a: sign(3, 3),
         vote_b: sign(3, 4),
     };
-    let second_receipt = prover
-        .prove_evidence_batch(
-            &[engine.evidence_witness(&second).unwrap()],
-            &support::guests([1; 8], [4; 32]).execution,
-        )
-        .unwrap()
-        .remove(0);
+    let second_receipt = prove_local_report(&engine, &prover, &second);
     let backend = ChainBackend::new(engine, prover);
     let (publisher, mut messages) = tokio::sync::mpsc::channel(8);
     backend.set_network_publisher(publisher);
@@ -434,19 +430,19 @@ async fn one_safety_receipt_per_identity_is_pooled_and_redundant_reports_are_ski
                 data,
             } = messages.recv().await.unwrap()
             {
-                break borsh::from_slice::<EvidenceArtifact>(&data).unwrap();
+                break borsh::from_slice::<EvidenceReport>(&data).unwrap();
             }
         }
     })
     .await
     .expect("first receipt is proven and published");
     assert_ne!(
-        pooled.statement.offence_id,
-        second_receipt.statement.offence_id
+        pooled.artifact.statement.offence_id,
+        second_receipt.artifact.statement.offence_id
     );
     assert_eq!(
-        pooled.statement.offender.pubkey,
-        second_receipt.statement.offender.pubkey
+        pooled.artifact.statement.offender.pubkey,
+        second_receipt.artifact.statement.offender.pubkey
     );
     // A different safety receipt against the pooled identity is redundant: it
     // is neither verified nor stored, and relaying it is not penalised.
@@ -479,8 +475,29 @@ async fn one_safety_receipt_per_identity_is_pooled_and_redundant_reports_are_ski
         );
     }
     backend.with_engine_mut_for_test(|engine| {
-        assert_eq!(engine.store().evidence_artifacts().unwrap(), vec![pooled]);
+        assert_eq!(engine.store().evidence_reports().unwrap(), vec![pooled]);
     });
+}
+
+fn prove_local_report(
+    engine: &Engine<MemoryDatabase>,
+    prover: &NativeConsensusBackend,
+    evidence: &neutrino_consensus_types::SlashingEvidence,
+) -> neutrino_consensus_types::evidence::EvidenceReport {
+    let artifact = prover
+        .prove_evidence_batch(
+            &[engine.evidence_witness(evidence).unwrap()],
+            &support::guests([1; 8], [4; 32]).execution,
+        )
+        .unwrap()
+        .remove(0);
+    neutrino_consensus_types::evidence::EvidenceReport {
+        history: engine
+            .evidence_submission(artifact.statement.clone())
+            .unwrap()
+            .history,
+        artifact,
+    }
 }
 
 fn ready_prover() -> NativeConsensusBackend {

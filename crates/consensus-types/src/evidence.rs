@@ -167,7 +167,7 @@ impl EvidenceMembership {
     }
 }
 
-/// Reusable network/storage receipt, independent of today's Merkle opening.
+/// Reusable proof attachment, independent of today's Merkle opening.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct EvidenceArtifact {
     /// Membership in the recursively authenticated batch.
@@ -178,6 +178,46 @@ pub struct EvidenceArtifact {
     pub statement: EvidenceStatement,
     /// Canonical compressed SP1 receipt bytes.
     pub proof_bytes: Vec<u8>,
+}
+
+/// Self-contained offence report for network relay and the durable evidence pool.
+///
+/// The reporter supplies the historical opening; a receiving node needs only
+/// a trusted history root and the bounded append suffix to refresh this path.
+/// Blocks keep the receipt as an independent [`EvidenceArtifact`] attachment
+/// and commit the refreshed opening in their [`EvidenceSubmission`].
+#[derive(Clone, Debug, Eq, PartialEq, BorshSerialize)]
+pub struct EvidenceReport {
+    /// Reusable independently proven offence.
+    pub artifact: EvidenceArtifact,
+    /// Historical context inclusion under an authenticated finalized root.
+    pub history: crate::history::HistoryPath,
+}
+
+impl BorshDeserialize for EvidenceReport {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let membership = EvidenceMembership::deserialize_reader(reader)?;
+        let evidence_guest_vk_digest = <[u32; 8]>::deserialize_reader(reader)?;
+        let statement = EvidenceStatement::deserialize_reader(reader)?;
+        let length = u32::deserialize_reader(reader)?;
+        if length == 0 || length as usize > MAX_EVIDENCE_PROOF_BYTES {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                "evidence report proof length",
+            ));
+        }
+        let mut proof_bytes = alloc::vec![0; length as usize];
+        reader.read_exact(&mut proof_bytes)?;
+        Ok(Self {
+            artifact: EvidenceArtifact {
+                membership,
+                evidence_guest_vk_digest,
+                statement,
+                proof_bytes,
+            },
+            history: crate::history::HistoryPath::deserialize_reader(reader)?,
+        })
+    }
 }
 
 impl EvidenceArtifact {
@@ -446,6 +486,47 @@ mod tests {
             &original.evidence_guest_vk_digest,
             &[3; 8]
         ));
+    }
+
+    #[test]
+    fn reports_roundtrip_with_bounded_proof_and_history_decoding() {
+        let artifact = artifact();
+        let report = EvidenceReport {
+            history: crate::history::HistoryPath::build(
+                &[commitment(&artifact.statement.context)],
+                0,
+            )
+            .unwrap(),
+            artifact,
+        };
+        let bytes = borsh::to_vec(&report).unwrap();
+        assert_eq!(borsh::from_slice::<EvidenceReport>(&bytes).unwrap(), report);
+        let mut no_history = borsh::to_vec(&report.artifact).unwrap();
+        assert!(borsh::from_slice::<EvidenceReport>(&no_history).is_err());
+        no_history.extend_from_slice(&0_u64.to_le_bytes());
+        no_history.extend_from_slice(&1_u64.to_le_bytes());
+        no_history.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            borsh::from_slice::<EvidenceReport>(&no_history)
+                .unwrap_err()
+                .kind(),
+            borsh::io::ErrorKind::InvalidData
+        );
+        for length in [
+            0,
+            u32::try_from(MAX_EVIDENCE_PROOF_BYTES).unwrap() + 1,
+            u32::MAX,
+        ] {
+            let prefix = borsh::to_vec(&(
+                &report.artifact.membership,
+                report.artifact.evidence_guest_vk_digest,
+                &report.artifact.statement,
+                length,
+            ))
+            .unwrap();
+            let error = borsh::from_slice::<EvidenceReport>(&prefix).unwrap_err();
+            assert_eq!(error.kind(), borsh::io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]

@@ -15,6 +15,21 @@ Complete chunk finalization stores its proof, certificate, history and next cont
 in an atomic batch, then installs the verified validator/seed boundary. Restart
 reloads this boundary and persistent reports/receipts.
 
+Full/validator nodes keep no `HistoryNodes`. A fixed-depth append frontier and
+bounded `HistoryPaths` authenticate retained records and recent replay boundaries;
+a separate eight-record path window keeps the latest recursive checkpoint's
+bootstrap manifest available when coverage lags finality. Each finalized append
+updates cached paths and active pooled `EvidenceReport` paths in the same durable batch
+as the new root. Archives retain the full immutable tree. Reporters supply an
+opening for older evidence, so its verification does not require the receiver to
+retain the corresponding record or tree.
+
+The private disk report wrapper also keeps the path's locally authenticated root.
+A snapshot jump refreshes reports with matching supplied recent openings, removes
+reports covered by its finalized state, and preserves other reports as dormant
+until their holder supplies a current opening. Dormant paths do not block appends
+and remain subject to the same bounded pool budget.
+
 Storage has one current format. Opening authenticates the chain-spec hash and
 decodes its canonical objects; incompatible development data must be recreated.
 Proof-only light clients verify recursive history proofs. Full/validator nodes

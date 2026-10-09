@@ -151,16 +151,19 @@ impl<DB: Database> Engine<DB> {
             .checked_sub(1)
             .and_then(|h| h.checked_div(spec.consensus.chunk_size))
             .ok_or_else(|| alloc::string::String::from("invalid evidence anchor height"))?;
-        let frontier = self
-            .store()
-            .history_frontier(chunk_id)
-            .map_err(|_| alloc::string::String::from(crate::import::HISTORY_UNAVAILABLE))?;
+        let history_root = if chunk_id == 0 {
+            neutrino_consensus_types::history::empty_history_root()
+        } else {
+            self.store()
+                .consensus_boundary(chunk_id)
+                .map_err(|_| alloc::string::String::from(crate::import::HISTORY_UNAVAILABLE))?
+                .ok_or_else(|| alloc::string::String::from(crate::import::HISTORY_UNAVAILABLE))?
+                .history_root
+        };
         Ok(neutrino_consensus_types::evidence::EvidenceAnchor {
             chain_spec_hash: spec.hash(),
             chunk_id,
-            history_root: frontier
-                .root()
-                .ok_or_else(|| alloc::string::String::from("invalid historical boundary"))?,
+            history_root,
             block_guest_vk_digest: programs.execution.block,
             evidence_guest_vk_digest: programs.execution.evidence,
             fact_guest_vk_digest: programs.execution.fact,
@@ -183,8 +186,8 @@ impl<DB: Database> Engine<DB> {
     }
 
     /// Whether this node still keeps the complete historical record of a
-    /// finalized chunk. Receipts about older chunks stay admissible; rebinding
-    /// them needs only the never-pruned history tree.
+    /// finalized chunk. Receipts about older chunks stay admissible when a
+    /// reporter supplies an opening authenticated at a recent boundary.
     #[must_use]
     pub fn in_history_record_window(&self, chunk_id: u64) -> bool {
         neutrino_consensus_types::history::is_history_index_within(
@@ -230,7 +233,7 @@ impl<DB: Database> Engine<DB> {
         })
     }
 
-    /// Rebind a reusable receipt to the current canonical historical root.
+    /// Open a locally retained record, or an archived record, for a new report.
     pub fn evidence_submission(
         &self,
         statement: neutrino_consensus_types::evidence::EvidenceStatement,
@@ -239,9 +242,8 @@ impl<DB: Database> Engine<DB> {
         let count = self.finalized_next_chunk_id();
         let source = statement.context.chunk_id;
         let in_window = match statement.kind {
-            // Any finalized chunk: the opening needs only the history tree,
-            // which is never pruned, so a receipt about a chunk whose record
-            // this node dropped long ago still rebinds here.
+            // Safety has no source age limit. Pruned nodes can open only their
+            // finite cache; external reporters supply older openings.
             neutrino_consensus_types::evidence::SanctionKind::Slash => source < count,
             neutrino_consensus_types::evidence::SanctionKind::Inactivity => {
                 is_recent_history_index(source, count)
@@ -259,6 +261,82 @@ impl<DB: Database> Engine<DB> {
             neutrino_consensus_types::evidence::commitment(&statement.context),
         )?;
         Ok(neutrino_consensus_types::evidence::EvidenceSubmission { statement, history })
+    }
+
+    /// Authenticate a reporter's opening and advance it over a bounded finalized suffix.
+    /// Old source chunks remain admissible; only the opening's anchor must be recent.
+    /// Unknown old anchors are unavailable, while forged openings at known anchors
+    /// are invalid witnesses. This lets callers defer refresh requests without
+    /// misclassifying an old safety offence as expired.
+    pub fn evidence_submission_with_path(
+        &self,
+        statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+        path: &neutrino_consensus_types::history::HistoryPath,
+    ) -> Result<neutrino_consensus_types::evidence::EvidenceSubmission, FinalizeError<DB::Error>>
+    {
+        let count = self.finalized_next_chunk_id();
+        let source = statement.context.chunk_id;
+        if path.index != source
+            || source >= path.count
+            || (statement.kind == neutrino_consensus_types::evidence::SanctionKind::Inactivity
+                && !is_recent_history_index(source, count))
+        {
+            return Err(ProofError::InvalidWitness.into());
+        }
+        if path.count > count {
+            return Err(crate::StoreError::Corrupt(
+                "evidence history anchor is not finalized locally",
+            )
+            .into());
+        }
+        if path.count
+            < count.saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS)
+        {
+            return Err(
+                crate::StoreError::Corrupt("evidence history anchor requires refresh").into(),
+            );
+        }
+        let mut frontier = self.store().history_frontier(path.count)?;
+        let root = frontier.root().ok_or(ProofError::InvalidWitness)?;
+        let boundary =
+            self.store()
+                .consensus_boundary(path.count)?
+                .ok_or(crate::StoreError::Corrupt(
+                    "evidence history boundary is unavailable",
+                ))?;
+        if boundary.history_root != root {
+            return Err(crate::StoreError::Corrupt(
+                "evidence history frontier differs from boundary",
+            )
+            .into());
+        }
+        let leaf = neutrino_consensus_types::evidence::commitment(&statement.context);
+        if !path.verify(leaf, root) {
+            return Err(ProofError::InvalidWitness.into());
+        }
+        let mut history = path.clone();
+        for index in path.count..count {
+            let record =
+                self.store()
+                    .historical_chunk(index)?
+                    .ok_or(crate::StoreError::Corrupt(
+                        "evidence history append is unavailable",
+                    ))?;
+            let appended_leaf = commitment(&record.evidence_context());
+            history
+                .advance(leaf, &frontier, appended_leaf)
+                .ok_or(ProofError::InvalidWitness)?;
+            frontier
+                .append(appended_leaf)
+                .ok_or(ProofError::InvalidWitness)?;
+        }
+        if frontier != self.store().history_frontier(count)? {
+            return Err(ProofError::InvalidWitness.into());
+        }
+        Ok(neutrino_consensus_types::evidence::EvidenceSubmission {
+            statement: statement.clone(),
+            history,
+        })
     }
 
     /// Bind a candidate to its finalized boundary and complete parent ancestry.

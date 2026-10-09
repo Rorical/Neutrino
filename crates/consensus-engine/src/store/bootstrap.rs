@@ -1,14 +1,9 @@
-//! Atomic checkpoint installation and sparse historical tree restoration.
+//! Atomic checkpoint installation and bounded authenticated historical openings.
 
 use super::{ChainStore, StoreError, keys, pointers};
 use crate::{BlockState, RetentionInfo, RetentionPolicy, full_chunk::ConsensusState};
-use neutrino_consensus_types::history::{
-    HISTORY_DEPTH, HistoryFrontier, counted_history_root, empty_history_hashes, history_leaf_hash,
-    history_node_hash,
-};
 use neutrino_consensus_types::history_proof::ConsensusBoundary;
 use neutrino_consensus_types::{Header, HistoryProof};
-use neutrino_primitives::Hash;
 use neutrino_prover_chunk::{execution::commitment, history::HistoricalOpening};
 use neutrino_storage::{Batch, Column, Database};
 use neutrino_trie::Trie;
@@ -80,6 +75,7 @@ impl<DB: Database> ChainStore<DB> {
             Column::HistoricalChunks,
             Column::HistoryNodes,
             Column::HistoryFrontiers,
+            Column::HistoryPaths,
             Column::HistoryRangeIndex,
             Column::HistoryRangeCache,
             Column::HistoryJobs,
@@ -97,6 +93,37 @@ impl<DB: Database> ChainStore<DB> {
         }
         let end = consensus.boundary;
         let count = end.next_chunk_id;
+        for mut report in self.evidence_reports()? {
+            let statement = &report.artifact.statement;
+            if state
+                .get(&neutrino_default_runtime_core::accountability::marker_key(
+                    statement,
+                ))
+                .is_some()
+                || self.is_identity_slashed(&statement.offender.pubkey)?
+            {
+                batch.delete(Column::EvidenceProofs, report.artifact.statement_id());
+                continue;
+            }
+            if report.history.count > count {
+                return Err(StoreError::Corrupt(
+                    "bootstrap precedes pooled evidence anchor",
+                ));
+            }
+            let leaf = commitment(&statement.context);
+            if let Some(opening) = recent.iter().find(|opening| {
+                opening.record.chunk.chunk_id == statement.context.chunk_id
+                    && commitment(&opening.record.evidence_context()) == leaf
+            }) {
+                if !opening.path.verify(leaf, end.history_root) {
+                    return Err(StoreError::Corrupt("bootstrap evidence opening"));
+                }
+                report.history = opening.path.clone();
+                Self::put_evidence_report_batch(&mut batch, &report)?;
+            }
+            // Reports beyond the supplied snapshot window remain durable and
+            // dormant until their holder supplies a fresh authenticated path.
+        }
         for (hash, bytes) in state.node_entries() {
             batch.put(Column::TrieNodes, hash, bytes);
         }
@@ -205,9 +232,14 @@ impl<DB: Database> ChainStore<DB> {
         let mut range = [0; 16];
         range[8..].copy_from_slice(&count.to_be_bytes());
         batch.put(Column::HistoryRangeIndex, range, borsh::to_vec(&id)?);
-        append_frontier_nodes(&mut batch, &consensus.frontier)?;
+        super::history::put_history_frontier(&mut batch, &consensus.frontier)?;
         for opening in recent {
-            append_opening_nodes(&mut batch, opening, end.history_root)?;
+            super::history::put_history_path(
+                &mut batch,
+                &opening.path,
+                commitment(&opening.record.evidence_context()),
+                end.history_root,
+            )?;
             let key = keys::chunk_id_key(opening.record.chunk.chunk_id);
             batch.put(
                 Column::HistoricalChunks,
@@ -219,60 +251,4 @@ impl<DB: Database> ChainStore<DB> {
             .write_batch_durable(batch)
             .map_err(StoreError::Database)
     }
-}
-
-/// Restore the prefix's right spine, including every node required for next append.
-fn append_frontier_nodes<E>(
-    batch: &mut Batch,
-    frontier: &HistoryFrontier,
-) -> Result<(), StoreError<E>> {
-    let empty = empty_history_hashes();
-    let mut right = empty[0];
-    let mut peaks = frontier.peaks.iter();
-    for (level, empty_subtree) in empty.iter().enumerate().take(HISTORY_DEPTH) {
-        let children = if (frontier.count >> level) & 1 == 1 {
-            (
-                *peaks
-                    .next()
-                    .ok_or(StoreError::Corrupt("bootstrap frontier shape"))?,
-                right,
-            )
-        } else {
-            (right, *empty_subtree)
-        };
-        right = history_node_hash(level, children.0, children.1);
-        batch.put(Column::HistoryNodes, right, borsh::to_vec(&children)?);
-    }
-    if frontier.root() != Some(counted_history_root(frontier.count, right)) {
-        return Err(StoreError::Corrupt("bootstrap frontier root"));
-    }
-    batch.put(
-        Column::HistoryFrontiers,
-        keys::chunk_id_key(frontier.count),
-        borsh::to_vec(&(frontier, right))?,
-    );
-    Ok(())
-}
-
-fn append_opening_nodes<E>(
-    batch: &mut Batch,
-    opening: &HistoricalOpening,
-    expected: Hash,
-) -> Result<(), StoreError<E>> {
-    let path = &opening.path;
-    let leaf = commitment(&opening.record.evidence_context());
-    if !path.verify(leaf, expected) {
-        return Err(StoreError::Corrupt("bootstrap historical opening"));
-    }
-    let mut root = history_leaf_hash(Some(leaf));
-    for (level, sibling) in path.siblings.iter().enumerate() {
-        let children = if (path.index >> level) & 1 == 0 {
-            (root, *sibling)
-        } else {
-            (*sibling, root)
-        };
-        root = history_node_hash(level, children.0, children.1);
-        batch.put(Column::HistoryNodes, root, borsh::to_vec(&children)?);
-    }
-    Ok(())
 }

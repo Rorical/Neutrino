@@ -133,6 +133,12 @@ impl<DB: Database> Engine<DB> {
         chain_spec.validate()?;
 
         let mut store = ChainStore::new(db);
+        store.configure_history_window(
+            neutrino_consensus_types::history::history_record_window_chunks(
+                chain_spec.runtime.unbonding_delay_blocks,
+                chain_spec.consensus.chunk_size,
+            ),
+        );
         if store.get_chain_spec_hash()?.is_some() {
             return Err(EngineError::AlreadyInitialised);
         }
@@ -194,7 +200,13 @@ impl<DB: Database> Engine<DB> {
     )]
     pub fn open(chain_spec: ChainSpec, db: DB) -> Result<Self, EngineError<DB::Error>> {
         chain_spec.validate()?;
-        let store = ChainStore::new(db);
+        let mut store = ChainStore::new(db);
+        store.configure_history_window(
+            neutrino_consensus_types::history::history_record_window_chunks(
+                chain_spec.runtime.unbonding_delay_blocks,
+                chain_spec.consensus.chunk_size,
+            ),
+        );
         let stored_spec_hash = store
             .get_chain_spec_hash()?
             .ok_or(EngineError::NotInitialised)?;
@@ -207,6 +219,8 @@ impl<DB: Database> Engine<DB> {
         }
 
         store.retention_info_for_spec(&chain_spec)?;
+        store.validate_history_cache()?;
+        store.validate_evidence_reports()?;
         store.validate_canonical_index(chain_spec.genesis_block_hash)?;
 
         let head_hash = store.get_tip()?.ok_or(EngineError::NotInitialised)?;

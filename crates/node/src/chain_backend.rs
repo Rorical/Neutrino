@@ -2386,12 +2386,12 @@ where
 
     async fn ingest_evidence_proof(
         &self,
-        artifact: neutrino_consensus_types::evidence::EvidenceArtifact,
+        report: neutrino_consensus_types::evidence::EvidenceReport,
     ) -> neutrino_sync::EvidenceProofAcceptance {
         if self.light_checkpoint().is_some() {
             return neutrino_sync::EvidenceProofAcceptance::Deferred;
         }
-        self.accept_evidence_artifact(artifact).await
+        self.accept_evidence_report(report).await
     }
 
     async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {

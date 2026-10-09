@@ -444,12 +444,15 @@ impl SyncDriver {
                 .await;
         }
         if topic == Topic::EvidenceProofs {
-            let Ok(artifact) =
-                borsh::from_slice::<neutrino_consensus_types::evidence::EvidenceArtifact>(&data)
+            if data.len() > topic.max_transmit_size() {
+                return MessageAcceptance::Reject;
+            }
+            let Ok(report) =
+                borsh::from_slice::<neutrino_consensus_types::evidence::EvidenceReport>(&data)
             else {
                 return MessageAcceptance::Reject;
             };
-            return match self.backend.ingest_evidence_proof(artifact).await {
+            return match self.backend.ingest_evidence_proof(report).await {
                 crate::EvidenceProofAcceptance::Accepted => MessageAcceptance::Accept,
                 crate::EvidenceProofAcceptance::Deferred => MessageAcceptance::Ignore,
                 crate::EvidenceProofAcceptance::Rejected => MessageAcceptance::Reject,

@@ -254,3 +254,71 @@ fn bootstrap_publication_preserves_the_local_signing_journal() {
         Some(b"signing-intent".to_vec())
     );
 }
+
+#[test]
+fn bootstrap_preserves_old_reports_dormant_until_a_holder_refreshes_the_path() {
+    let snapshot = snapshot(20);
+    let mut target = fixture(MemoryDatabase::new(), 2);
+    let original = super::evidence_path_retention_tests::report(&target, 0);
+    target.store_mut().put_evidence_report(&original).unwrap();
+    commit(&mut target, &snapshot);
+    let mut restarted =
+        Engine::open(target.chain_spec().clone(), target.store().db().clone()).unwrap();
+    assert_eq!(
+        restarted.store().evidence_reports().unwrap(),
+        vec![original.clone()]
+    );
+    append(&mut restarted);
+    assert_eq!(
+        restarted.store().evidence_reports().unwrap(),
+        vec![original.clone()]
+    );
+    assert!(
+        restarted
+            .evidence_submission_with_path(&original.artifact.statement, &original.history)
+            .is_err()
+    );
+    let holder = super::evidence_path_retention_tests::archive(21);
+    let refreshed = super::evidence_path_retention_tests::report(&holder, 0);
+    restarted
+        .store_mut()
+        .put_evidence_report(&refreshed)
+        .unwrap();
+    let stored = restarted.store().evidence_reports().unwrap().remove(0);
+    assert_eq!(stored.artifact, original.artifact);
+    assert_eq!(stored.history, refreshed.history);
+    append(&mut restarted);
+    assert_eq!(
+        restarted.store().evidence_reports().unwrap()[0]
+            .history
+            .count,
+        22
+    );
+    Engine::open(
+        restarted.chain_spec().clone(),
+        restarted.store().db().clone(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn bootstrap_refreshes_reports_covered_by_its_authenticated_recent_openings() {
+    let snapshot = snapshot(20);
+    let mut target = fixture(MemoryDatabase::new(), 15);
+    let original = super::evidence_path_retention_tests::report(&target, 14);
+    target.store_mut().put_evidence_report(&original).unwrap();
+    commit(&mut target, &snapshot);
+    let stored = target.store().evidence_reports().unwrap().remove(0);
+    assert_eq!(stored.artifact, original.artifact);
+    assert_eq!(stored.history.count, 20);
+    assert_eq!(
+        stored.history,
+        snapshot
+            .recent
+            .iter()
+            .find(|opening| opening.path.index == 14)
+            .unwrap()
+            .path
+    );
+    Engine::open(target.chain_spec().clone(), target.store().db().clone()).unwrap();
+}

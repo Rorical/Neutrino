@@ -46,6 +46,17 @@ openings. The root is authenticated from the previous finalized chunk, never
 from the current chunk's future certificate. Fact, evidence and block program identities are pinned by
 the verifier and bound in the composed public statements.
 
+Network relay uses `EvidenceReport { artifact, history }`.
+The reporter supplies the context's 64-level history path alongside the reusable
+receipt. Ordinary nodes verify this opening without looking up the old record or
+retaining the full tree. The private disk format wraps that report in
+`StoredEvidenceReport` with its locally authenticated 32-byte `history_root`, so
+an old opening remains verifiable after a snapshot replaces the local history
+cache. This stored root is local verification metadata, not a peer-selected anchor.
+The existing `EvidenceArtifact` attachment,
+`EvidenceSubmission` transaction and Guest history-root semantics are unchanged;
+the P2P and pool encoding is replaced directly, with no legacy decoder.
+
 The ordinary-execution host must verify every evidence receipt before WASM
 execution. Guest recursion independently checks the same receipts; no supplied
 boolean authorizes state changes. Sanction deductions are internal STF operations; the transaction format has no
@@ -115,6 +126,17 @@ and admission boundaries. An attachment carries the evidence program identity;
 its cache key is BLAKE3 of the domain-separated evidence/fact programs and
 canonical statement.
 Alternative valid proofs for that statement have the same transaction identity.
+
+An incoming report path may target the current finalized history root or one of
+the preceding eight authenticated roots. The receiver verifies the opening before
+expensive receipt verification, then advances it over the bounded finalized append
+suffix using the frontier and each appended context commitment. It rechecks and
+refreshes the path before storing the verified report, so concurrent finalization
+cannot install a path bound to an obsolete root. An older anchor is deferred for
+reporter refresh; the offence's source chunk can still be arbitrarily old for a
+safety claim. Statement identity excludes the path, so path refresh does not create
+another offence receipt. A newer authenticated path updates the stored path and
+root while preserving the first verified proof attachment for that statement.
 
 The ordinary host verifies each actual attachment before WASM execution. The
 proving host decodes and verifies it once, then supplies the compressed proof and
@@ -191,8 +213,10 @@ Admissibility is selected by `SanctionKind`:
   ejects the identity regardless, so a seated validator without a runtime
   balance is still removed. The fixed 64-level history opening costs the same
   at any age, and the `EvidenceAnchor` carries only the genesis-fixed unbonding
-  delay and chunk size. Economically, accountability therefore lasts exactly as
-  long as the unbonding delay keeps stake slashable.
+  delay and chunk size. A continuously staked identity remains economically
+  accountable for an arbitrarily old safety offence when someone preserves its
+  evidence. The unbonding delay bounds the withdrawal exposure after exit, rather
+  than the age of admissible safety signatures.
 
 The chain spec requires `evidence_max_age_blocks < unbonding_delay_blocks`,
 `unbonding_delay_blocks > chunk_size`, `weak_subjectivity_period_secs <=
@@ -213,30 +237,51 @@ of tombstones is bounded by the identities ever sanctioned, not by how many
 offences they signed. Pruning never expires an admitted FIFO obligation or removes
 its current-state withdrawal hold.
 
-Full and validator nodes never prune the history tree: the filled part holds about
-two nodes per finalized chunk, and with it a proposer can open the path for any
-record and rebind a safety receipt about any chunk, including chunks whose
-complete record it dropped long ago. Complete historical records (chunk, validator
-vector, seed and certificate) are needed only to construct evidence from raw
-reports and to verify incoming raw reports; they stay for
+Full and validator nodes keep no full history tree. The fixed-depth frontier
+authenticates append transitions, and cached paths cover a finite set of historical
+records and recent replay boundaries. An independent eight-record window targets
+the latest recursive prefix for bootstrap, even when that prefix lags finality.
+Older safety reports carry their own opening. Each finalized append atomically
+rebases cached and active pooled paths with the new consensus root. Restart checks
+active paths against that root and dormant paths against their saved locally
+authenticated root. Archives retain the complete immutable tree and can open any
+finalized index.
+
+A snapshot jump can omit the intervening append data needed to refresh an arbitrary
+old leaf. Installation removes receipts already covered by the authenticated
+finalized snapshot state and refreshes reports whose contexts match supplied recent
+openings. Other reports keep their proven offence and authenticated old opening as
+dormant pool entries. They do not enter block selection or block finalization;
+their holder must supply a fresh path before admission. Normal appends skip these
+dormant entries. A dormant receipt does not suppress another usable safety report
+against the same identity.
+
+Complete historical records (chunk, validator vector, seed and certificate) are
+needed to construct evidence from raw reports and to verify incoming raw reports;
+they stay for
 `history_record_window_chunks = max(8, ceil(unbonding_delay_blocks / chunk_size))`
-preceding chunks, and older ones come from archives. Raw blocks, proofs and
-signed-source caches keep the eight-chunk window. Pooled liveness receipts expire
-at the liveness floor; pooled safety receipts have no age floor and leave only
-when a finalized block has sanctioned their identity. Nothing is dropped on the
-strength of unfinalized head state, so a reorg cannot lose evidence.
+preceding chunks. This is a local service horizon, not a guarantee that ordinary
+nodes retain every signature from an identity that remains bonded indefinitely.
+Older sources, records and current openings come from a retaining reporter or
+archive. Raw blocks, proofs and signed-source caches keep the eight-chunk window
+subject to saved recursive coverage. Pooled liveness receipts expire at the
+liveness floor; pooled safety receipts have no age floor and leave only when a
+finalized block has sanctioned their identity. Nothing is dropped on the strength
+of unfinalized head state, so a reorg cannot lose evidence.
 
 A safety identity is accountable once, and the node applies that rule before any
-expensive work. A receipt or raw report against a key the head state has
+expensive work. A distinct receipt or raw report against a key the head state has
 tombstoned, that finalized history has sanctioned, or that a pooled safety
-receipt under the current Evidence program already covers is neither verified,
-stored nor proven; a receipt under a superseded program shields nothing; a
-network receipt in that position is deferred, not rejected, because it is
-redundant rather than wrong. Finalizing a safety admission records the identity in `FinalizedSlashes`
+receipt with a current path under the current Evidence program already covers is
+neither verified, stored nor proven; a dormant receipt or one under a superseded
+program shields nothing; a network receipt in that position is deferred, not
+rejected, because it is
+redundant rather than wrong. The exact pooled statement may still receive a newer
+authenticated path. Finalizing a safety admission records the identity in `FinalizedSlashes`
 next to the offence in `FinalizedOffences`, and the next pruning pass releases
 every pooled receipt and raw report against that key. The pool therefore holds at
-most one admissible safety receipt per identity; without this rule a validator
-that had already been sanctioned could fill the bounded cache with further proven
+most one ready safety receipt per identity under the current program; without this
+rule a validator that had already been sanctioned could fill the bounded cache with further proven
 offences indefinitely and keep every other receipt out.
 
 Signed-source storage observes the current chunk and those eight preceding
@@ -260,8 +305,10 @@ never voted. The exact submitted certificate is checked by Evidence Guest using
 recursively authenticated cryptographic facts and committed by the claim; its resulting transaction is ordered by consensus.
 Every claim binds the complete chain-spec hash and block program identity.
 
-Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 receipts
-and 32 MiB, never overwrites an existing verified statement, and prunes when its
+Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 reports
+and 32 MiB including active and dormant entries, history paths and the private
+32-byte root metadata per report. It preserves the first verified attachment while
+allowing its path and root to refresh, and prunes when its
 admission is finalized, when a finalized block has sanctioned its safety identity,
 or (liveness only) when its admission window is behind finalized history.
 Receipts executed on an unfinalized branch remain available across reorgs. The block builder reserves

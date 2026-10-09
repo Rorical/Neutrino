@@ -9,6 +9,9 @@ mod snapshot_tests;
 #[path = "bootstrap_checkpoint_retention_tests.rs"]
 mod bootstrap_checkpoint_retention_tests;
 
+#[path = "evidence_path_retention_tests.rs"]
+mod evidence_path_retention_tests;
+
 use super::*;
 use crate::full_chunk::ConsensusState;
 use crate::test_db::{FaultDb, header};
@@ -374,8 +377,8 @@ fn covered_pruning_retains_eight_chunks_and_supports_restart_and_append() {
             .len(),
         8
     );
-    // The history tree is never pruned: a safety receipt about any finalized
-    // chunk must stay openable here, whatever happened to the raw data.
+    // Ordinary nodes retain bounded paths and never write binary history nodes.
+    assert_eq!(nodes_before, 0);
     assert_eq!(
         engine
             .store()
@@ -397,7 +400,8 @@ fn covered_pruning_retains_eight_chunks_and_supports_restart_and_append() {
         Some(70u64.to_be_bytes().to_vec())
     );
     append(&mut reopened);
-    for id in [62, 69, 70] {
+    reopened.store().historical_opening(62, 70).unwrap();
+    for id in [63, 69, 70] {
         reopened.store().historical_opening(id, 71).unwrap();
     }
     assert_eq!(
@@ -425,7 +429,7 @@ fn covered_pruning_retains_eight_chunks_and_supports_restart_and_append() {
 }
 
 #[test]
-fn record_window_keeps_historical_records_and_every_path_outlives_the_record() {
+fn record_window_keeps_records_and_bounded_paths_without_a_permanent_tree() {
     let mut spec = spec();
     // A 21-block unbonding delay over one-block chunks: complete records stay
     // for 21 chunks while raw blocks keep the eight-chunk window.
@@ -464,16 +468,15 @@ fn record_window_keeps_historical_records_and_every_path_outlives_the_record() {
             .len(),
         21
     );
-    // A record this node dropped long ago still opens through the tree: a
-    // safety receipt about chunk 10 rebinds here without its record.
-    engine.store().history_path(10, 70, oldest_leaf).unwrap();
+    // Older claims require a path supplied by their holder; the local cache expires.
+    assert!(engine.store().history_path(10, 70, oldest_leaf).is_err());
     assert!(engine.store().historical_opening(10, 70).is_err());
     // The retained paths survive restart and a further append.
     let mut reopened =
         Engine::open(engine.chain_spec().clone(), engine.store().db().clone()).unwrap();
     append(&mut reopened);
-    reopened.store().historical_opening(49, 71).unwrap();
-    reopened.store().history_path(10, 71, oldest_leaf).unwrap();
+    assert!(reopened.store().historical_opening(49, 71).is_err());
+    assert!(reopened.store().history_path(10, 71, oldest_leaf).is_err());
     reopened.prune_history_covered().unwrap();
     assert!(reopened.store().historical_chunk(49).unwrap().is_none());
     reopened.store().historical_opening(50, 71).unwrap();
@@ -543,6 +546,12 @@ fn leases_keep_fold_sources_and_progress_without_retaining_raw_history() {
 #[test]
 fn archive_and_uncovered_history_are_preserved_and_switching_cannot_restore_data() {
     let mut engine = fixture(MemoryDatabase::new(), 12);
+    // Even before recursive pruning, ordinary appends did not retain archive nodes.
+    assert!(
+        engine
+            .set_retention_policy(RetentionPolicy::Archive)
+            .is_err()
+    );
     assert_eq!(
         engine.prune_history_covered().unwrap().pruned_before_chunk,
         0
@@ -557,10 +566,14 @@ fn archive_and_uncovered_history_are_preserved_and_switching_cannot_restore_data
             .set_retention_policy(RetentionPolicy::Archive)
             .is_err()
     );
-    let mut archive = fixture(MemoryDatabase::new(), 12);
+    let mut archive = fixture(MemoryDatabase::new(), 0);
     archive
         .set_retention_policy(RetentionPolicy::Archive)
         .unwrap();
+    for _ in 0..12 {
+        append(&mut archive);
+    }
+    archive.store().historical_opening(0, 12).unwrap();
     artifact(&mut archive, 0, 12, true);
     assert_eq!(
         archive.prune_history_covered().unwrap().pruned_before_chunk,
@@ -578,6 +591,28 @@ fn archive_and_uncovered_history_are_preserved_and_switching_cannot_restore_data
     archive
         .set_retention_policy(RetentionPolicy::Pruned)
         .unwrap();
+    assert_eq!(
+        archive
+            .store()
+            .db()
+            .iter_column(Column::HistoryNodes)
+            .unwrap(),
+        [] as [(Vec<u8>, Vec<u8>); 0]
+    );
+    assert!(
+        archive
+            .store()
+            .db()
+            .iter_column(Column::HistoryFrontiers)
+            .unwrap()
+            .len()
+            <= 9
+    );
+    assert!(
+        archive
+            .set_retention_policy(RetentionPolicy::Archive)
+            .is_err()
+    );
     assert_eq!(
         archive.prune_history_covered().unwrap().pruned_before_chunk,
         4

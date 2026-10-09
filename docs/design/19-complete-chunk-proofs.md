@@ -95,8 +95,10 @@ boundaries with the Chunk and certificate bindings. Chunk history witnesses cont
 only actually referenced records, fixed 64-level membership paths and an append
 frontier. They never enumerate all earlier chunks. For incoming chunk `n`, only
 indices `[n.saturating_sub(8), n)` are admissible. Reads are capped at eight records
-and 8 MiB of encoded record data, with bounds enforced during decoding. Node opening
-generation uses indexed tree nodes; it does not scan the chain history.
+and 8 MiB of encoded record data, with bounds enforced during decoding. Ordinary
+nodes retrieve bounded cached paths; archives can open indexed tree nodes. Neither
+path scans the chain history. The frontier proves the old-root to new-root append
+inside the Chunk Guest without requiring a complete historical tree.
 
 
 ## Guest signature work

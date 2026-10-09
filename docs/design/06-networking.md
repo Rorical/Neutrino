@@ -8,10 +8,16 @@ limits are enforced per topic/request. The exact names and caps are defined by
 Gossip topics use `/neutrino/<topic>/borsh`; request paths use
 `/neutrino/req/<name>`. Identify and Kademlia likewise have one unversioned path.
 
-Raw slashing reports trigger bounded background evidence jobs. Verified receipts
-are cached, persisted and gossiped by offence ID, then selected into block evidence
-transactions. Proof generation runs outside the chain mutex. Exact receipt bytes,
-signatures, historical anchors and admission windows are verified at import.
+Raw slashing reports trigger bounded background evidence jobs. Verified
+`EvidenceReport { artifact, history }` packages are cached, persisted and gossiped
+by statement identity. A reporter supplies the historical context's fixed-depth
+path; the receiver authenticates it under the current or preceding-eight finalized
+root and advances it to the current root. Older path anchors are deferred for
+refresh, without imposing a source age limit on safety evidence. Blocks commit
+the refreshed opening in `EvidenceSubmission` and keep `EvidenceArtifact` as the
+independent proof attachment. Proof generation runs outside the chain mutex.
+Exact receipt bytes, signatures, historical anchors and admission windows are
+verified at import. The P2P and pool package has one current unversioned format.
 
 Sequential full sync fetches and executes blocks, verifies block proofs, and imports
 the complete chunk proof before crossing into the next validator/seed boundary.

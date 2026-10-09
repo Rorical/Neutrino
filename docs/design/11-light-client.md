@@ -51,10 +51,11 @@ lengthen the unbonding delay. Peer advertisements are
 hints; requests pin both endpoint hashes and reject mismatched replies. Missing
 suffixes remain unavailable until a provider can supply or construct them.
 
-A compact proof cannot reconstruct deleted votes, transactions or state. Full and
-archive nodes retain the records and tree nodes needed for current accountability
-and historical service. State/header/transaction query-proof APIs, browser/mobile
-verifier distribution and cross-upgrade recursion are separate work.
+A compact proof cannot reconstruct deleted votes, transactions or state. Full nodes
+retain bounded records and openings for local accountability service; reporters or
+archives preserve older signed sources and paths. Archives retain the complete
+history tree for historical service. State/header/transaction query-proof APIs,
+browser/mobile verifier distribution and cross-upgrade recursion are separate work.
 
 See [recursive history proofs](21-recursive-checkpoint-proofs.md). Real compressed
 composition is an opt-in acceptance gate; native and execution-only tests cannot

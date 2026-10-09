@@ -52,10 +52,12 @@ pub enum Column {
     ConsensusBoundaries,
     /// Finalized historical records, keyed by chunk ID.
     HistoricalChunks,
-    /// Content-addressed immutable binary history nodes.
+    /// Archive-only content-addressed immutable binary history nodes.
     HistoryNodes,
     /// Bounded append frontiers, keyed by covered chunk count.
     HistoryFrontiers,
+    /// Bounded authenticated history openings, keyed by count and leaf index.
+    HistoryPaths,
     /// Verified history range IDs, keyed by boundary count pair.
     HistoryRangeIndex,
     /// Bounded metadata for cached noncanonical arbitrary proof intervals.
@@ -68,7 +70,8 @@ pub enum Column {
     FinalizedOffences,
     /// BLS identities whose safety sanction finalized blocks have admitted.
     FinalizedSlashes,
-    /// Reusable objective-evidence receipts keyed by offence ID.
+    /// Verified offence reports and locally authenticated path anchors,
+    /// keyed by program-scoped statement ID.
     EvidenceProofs,
     /// Durable local signing intents and monotonic signing watermarks.
     SigningJournal,
@@ -81,7 +84,7 @@ pub enum Column {
 }
 
 /// Every storage column in deterministic order.
-pub const ALL_COLUMNS: [Column; 35] = [
+pub const ALL_COLUMNS: [Column; 36] = [
     Column::TrieNodes,
     Column::StateValues,
     Column::Blocks,
@@ -106,6 +109,7 @@ pub const ALL_COLUMNS: [Column; 35] = [
     Column::HistoricalChunks,
     Column::HistoryNodes,
     Column::HistoryFrontiers,
+    Column::HistoryPaths,
     Column::HistoryRangeIndex,
     Column::HistoryRangeCache,
     Column::HistoryJobs,
@@ -148,6 +152,7 @@ impl Column {
             Self::HistoricalChunks => "historical_chunks",
             Self::HistoryNodes => "history_nodes",
             Self::HistoryFrontiers => "history_frontiers",
+            Self::HistoryPaths => "history_paths",
             Self::HistoryRangeIndex => "history_range_index",
             Self::HistoryRangeCache => "history_range_cache",
             Self::HistoryJobs => "history_jobs",
@@ -169,7 +174,7 @@ mod tests {
 
     #[test]
     fn all_columns_has_every_variant_once() {
-        assert_eq!(ALL_COLUMNS.len(), 35);
+        assert_eq!(ALL_COLUMNS.len(), 36);
         for (index, left) in ALL_COLUMNS.iter().enumerate() {
             for right in &ALL_COLUMNS[index + 1..] {
                 assert_ne!(left, right, "duplicate column {left:?}");
@@ -179,7 +184,7 @@ mod tests {
 
     #[test]
     fn column_names_match_design_doc() {
-        let names: [&str; 35] = [
+        let names: [&str; 36] = [
             "trie_nodes",
             "state_values",
             "blocks",
@@ -204,6 +209,7 @@ mod tests {
             "historical_chunks",
             "history_nodes",
             "history_frontiers",
+            "history_paths",
             "history_range_index",
             "history_range_cache",
             "history_jobs",

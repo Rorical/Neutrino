@@ -34,6 +34,38 @@ pub type ValidatorSetSnapshot = Vec<Validator>;
 /// clippy::type_complexity.
 pub type ContentAddressedEntries = Vec<(Hash, Vec<u8>)>;
 
+/// A locally authenticated anchor remains available for dormant reports after bootstrap.
+#[derive(BorshSerialize, BorshDeserialize)]
+struct StoredEvidenceReport {
+    report: neutrino_consensus_types::evidence::EvidenceReport,
+    history_root: Hash,
+}
+
+fn evidence_report_root(
+    report: &neutrino_consensus_types::evidence::EvidenceReport,
+) -> Option<Hash> {
+    use neutrino_consensus_types::history::{
+        HISTORY_DEPTH, counted_history_root, history_leaf_hash, history_node_hash,
+    };
+    let path = &report.history;
+    if path.index != report.artifact.statement.context.chunk_id
+        || path.index >= path.count
+        || path.siblings.len() != HISTORY_DEPTH
+    {
+        return None;
+    }
+    let leaf = neutrino_consensus_types::evidence::commitment(&report.artifact.statement.context);
+    let mut root = history_leaf_hash(Some(leaf));
+    for (level, sibling) in path.siblings.iter().enumerate() {
+        root = if (path.index >> level) & 1 == 0 {
+            history_node_hash(level, root, *sibling)
+        } else {
+            history_node_hash(level, *sibling, root)
+        };
+    }
+    Some(counted_history_root(path.count, root))
+}
+
 /// Typed access layer over a column-family
 /// [`Database`](neutrino_storage::Database) for the consensus engine.
 ///
@@ -44,13 +76,23 @@ pub type ContentAddressedEntries = Vec<(Hash, Vec<u8>)>;
 #[derive(Debug)]
 pub struct ChainStore<DB> {
     pub(super) db: DB,
+    pub(super) history_record_window: u64,
 }
 
 impl<DB> ChainStore<DB> {
     /// Wrap a database.
     #[must_use]
     pub const fn new(db: DB) -> Self {
-        Self { db }
+        Self {
+            db,
+            history_record_window: neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS,
+        }
+    }
+
+    /// Configure the local record service horizon from the authenticated specification.
+    pub(crate) fn configure_history_window(&mut self, window: u64) {
+        self.history_record_window =
+            window.max(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
     }
 
     /// Borrow the wrapped database.
@@ -71,12 +113,13 @@ impl<DB> ChainStore<DB> {
 }
 
 impl<DB: Database> ChainStore<DB> {
-    /// Persist a reusable evidence receipt after native verification.
-    pub fn put_evidence_artifact(
+    /// Persist a verified receipt together with its authenticated current history path.
+    pub fn put_evidence_report(
         &mut self,
-        artifact: &neutrino_consensus_types::evidence::EvidenceArtifact,
+        report: &neutrino_consensus_types::evidence::EvidenceReport,
     ) -> Result<(), StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES;
+        let artifact = &report.artifact;
         let invalid = |message| {
             StoreError::Codec(borsh::io::Error::new(
                 borsh::io::ErrorKind::InvalidData,
@@ -87,18 +130,45 @@ impl<DB: Database> ChainStore<DB> {
         {
             return Err(invalid("evidence receipt size"));
         }
+        if report.history.index != artifact.statement.context.chunk_id
+            || report.history.index >= report.history.count
+            || report.history.siblings.len() != neutrino_consensus_types::history::HISTORY_DEPTH
+        {
+            return Err(invalid("evidence history path shape"));
+        }
+        let history_root = evidence_report_root(report)
+            .ok_or(StoreError::Corrupt("evidence history path shape"))?;
+        if let Some(state) = self.get_consensus_state()?
+            && (report.history.count != state.boundary.next_chunk_id
+                || history_root != state.boundary.history_root)
+        {
+            return Err(StoreError::Corrupt("evidence history path is not current"));
+        }
         let entries = self
             .db
             .iter_column(Column::EvidenceProofs)
             .map_err(StoreError::Database)?;
-        // Do not overwrite an already verified receipt with alternate encoding.
-        if entries
+        // Preserve the first verified receipt; a holder may refresh its dormant opening.
+        if let Some((_, bytes)) = entries
             .iter()
-            .any(|(key, _)| key.as_slice() == artifact.statement_id())
+            .find(|(key, _)| key.as_slice() == artifact.statement_id())
         {
+            let mut stored: StoredEvidenceReport = borsh::from_slice(bytes)?;
+            if report.history.count > stored.report.history.count {
+                stored.report.history = report.history.clone();
+                stored.history_root = history_root;
+                return self.put_raw(
+                    Column::EvidenceProofs,
+                    &artifact.statement_id(),
+                    &borsh::to_vec(&stored)?,
+                );
+            }
             return Ok(());
         }
-        let bytes = borsh::to_vec(artifact)?;
+        let bytes = borsh::to_vec(&StoredEvidenceReport {
+            report: report.clone(),
+            history_root,
+        })?;
         if entries.len() >= 256
             || entries.iter().map(|(_, value)| value.len()).sum::<usize>() + bytes.len()
                 > 32 * 1024 * 1024
@@ -106,6 +176,25 @@ impl<DB: Database> ChainStore<DB> {
             return Err(invalid("evidence pool capacity"));
         }
         self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)
+    }
+
+    /// Stage a path refresh without replacing its already verified proof attachment.
+    pub(super) fn put_evidence_report_batch(
+        batch: &mut neutrino_storage::Batch,
+        report: &neutrino_consensus_types::evidence::EvidenceReport,
+    ) -> Result<(), StoreError<DB::Error>> {
+        let history_root = evidence_report_root(report)
+            .ok_or(StoreError::Corrupt("evidence history path shape"))?;
+        let stored = StoredEvidenceReport {
+            report: report.clone(),
+            history_root,
+        };
+        batch.put(
+            Column::EvidenceProofs,
+            report.artifact.statement_id(),
+            borsh::to_vec(&stored)?,
+        );
+        Ok(())
     }
 
     /// Drop expired liveness receipts and receipts whose offence or safety
@@ -152,27 +241,104 @@ impl<DB: Database> ChainStore<DB> {
                 && self.is_identity_slashed(&statement.offender.pubkey)?))
     }
 
-    /// Load evidence receipts for restart recovery and re-admission after reorg.
+    /// Load the receipt view of pooled reports for identity and offence selection.
     pub fn evidence_artifacts(
         &self,
     ) -> Result<Vec<neutrino_consensus_types::evidence::EvidenceArtifact>, StoreError<DB::Error>>
     {
-        self.db
+        Ok(self
+            .evidence_reports()?
+            .into_iter()
+            .map(|report| report.artifact)
+            .collect())
+    }
+
+    /// Load complete reports, including paths, for restart recovery and re-admission.
+    pub fn evidence_reports(
+        &self,
+    ) -> Result<Vec<neutrino_consensus_types::evidence::EvidenceReport>, StoreError<DB::Error>>
+    {
+        Ok(self
+            .stored_evidence_reports()?
+            .into_iter()
+            .map(|stored| stored.report)
+            .collect())
+    }
+
+    fn stored_evidence_reports(&self) -> Result<Vec<StoredEvidenceReport>, StoreError<DB::Error>> {
+        let entries = self
+            .db
             .iter_column(Column::EvidenceProofs)
-            .map_err(StoreError::Database)?
+            .map_err(StoreError::Database)?;
+        if entries.len() > 256
+            || entries.iter().map(|(_, value)| value.len()).sum::<usize>() > 32 * 1024 * 1024
+        {
+            return Err(StoreError::Corrupt("evidence pool capacity"));
+        }
+        entries
             .into_iter()
             .map(|(key, bytes)| {
-                let artifact: neutrino_consensus_types::evidence::EvidenceArtifact =
-                    borsh::from_slice(&bytes)?;
-                if key.as_slice() != artifact.statement_id() {
-                    return Err(StoreError::Codec(borsh::io::Error::new(
-                        borsh::io::ErrorKind::InvalidData,
-                        "evidence key mismatch",
-                    )));
+                let stored: StoredEvidenceReport = borsh::from_slice(&bytes)?;
+                if key.as_slice() != stored.report.artifact.statement_id() {
+                    return Err(StoreError::Corrupt("evidence key mismatch"));
                 }
-                Ok(artifact)
+                if evidence_report_root(&stored.report) != Some(stored.history_root) {
+                    return Err(StoreError::Corrupt("pooled evidence history path mismatch"));
+                }
+                Ok(stored)
             })
             .collect()
+    }
+
+    /// Check active openings against the current boundary and dormant ones against
+    /// the locally authenticated root saved before a snapshot jump.
+    pub(crate) fn validate_evidence_reports(&self) -> Result<(), StoreError<DB::Error>> {
+        let reports = self.stored_evidence_reports()?;
+        if reports.is_empty() {
+            return Ok(());
+        }
+        let count = self
+            .get_latest_finalized_chunk_id()?
+            .and_then(|id| id.checked_add(1))
+            .ok_or(StoreError::Corrupt(
+                "evidence pool has no finalized boundary",
+            ))?;
+        let root = self
+            .history_frontier(count)?
+            .root()
+            .ok_or(StoreError::Corrupt("invalid evidence history frontier"))?;
+        for stored in reports {
+            if stored.report.history.count > count
+                || (stored.report.history.count == count && stored.history_root != root)
+            {
+                return Err(StoreError::Corrupt("pooled evidence history path mismatch"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebase pooled paths in the same durable batch as the finalized history append.
+    pub(super) fn advance_evidence_reports_batch(
+        &self,
+        batch: &mut neutrino_storage::Batch,
+        frontier: &neutrino_consensus_types::history::HistoryFrontier,
+        appended_leaf: Hash,
+    ) -> Result<(), StoreError<DB::Error>> {
+        for mut report in self.evidence_reports()? {
+            if report.history.count < frontier.count {
+                // A snapshot can skip append material. Keep the verified offence
+                // and its old authenticated anchor until its holder refreshes it.
+                continue;
+            }
+            let leaf =
+                neutrino_consensus_types::evidence::commitment(&report.artifact.statement.context);
+            report
+                .history
+                .advance(leaf, frontier, appended_leaf)
+                .ok_or(StoreError::Corrupt("pooled evidence history path mismatch"))?;
+            Self::put_evidence_report_batch(batch, &report)?;
+        }
+        Ok(())
     }
     /// Load the last proof-gated consensus boundary and replay ledger.
     pub fn get_consensus_state(
@@ -1222,7 +1388,9 @@ mod tests {
             },
             receipt: neutrino_primitives::BoundedBytes::new(vec![0xAB, 0xCD]).unwrap(),
         };
-        store.commit_history_artifact(&proof, true).unwrap();
+        // This codec fixture has no finalized source records or openings.
+        // Prefix advancement is covered by the finalized-history fixtures.
+        store.commit_history_artifact(&proof, false).unwrap();
         assert_eq!(
             store.history_proof_for_range(0, 3).unwrap(),
             Some(proof.clone())
@@ -1233,7 +1401,7 @@ mod tests {
         );
         assert_eq!(store.get_checkpoint(3).unwrap(), Some(end));
         assert_eq!(store.checkpoint_by_hash(&end.hash()).unwrap(), Some(end));
-        assert_eq!(store.get_recursive_covered_chunks().unwrap(), Some(3));
+        assert_eq!(store.get_recursive_covered_chunks().unwrap(), None);
     }
 
     #[test]

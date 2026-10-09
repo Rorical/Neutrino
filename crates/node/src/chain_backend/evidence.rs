@@ -4,7 +4,9 @@ use super::ChainBackend;
 use neutrino_consensus_types::history::{HISTORY_RETENTION_CHUNKS, is_recent_history_index};
 use neutrino_consensus_types::{
     Body,
-    evidence::{EvidenceArtifact, SanctionKind},
+    evidence::{
+        EvidenceAnchor, EvidenceArtifact, EvidenceReport, EvidenceSubmission, SanctionKind,
+    },
 };
 use neutrino_default_runtime_core::{
     Transaction,
@@ -87,19 +89,14 @@ where
                         if artifact.evidence_guest_vk_digest != execution.evidence {
                             continue;
                         }
-                        let stored = {
+                        let report = {
                             let mut engine = engine.lock().expect("engine mutex");
-                            // A receipt whose identity or offence the head state
-                            // already sanctioned can never be admitted again.
-                            engine
-                                .state()
-                                .get(&marker_key(&artifact.statement))
-                                .is_none()
-                                && engine.store_mut().put_evidence_artifact(&artifact).is_ok()
+                            let Some(report) = install_local_artifact(&mut engine, artifact) else {
+                                continue;
+                            };
+                            report
                         };
-                        if stored {
-                            produced.push(artifact);
-                        }
+                        produced.push(report);
                     }
                 }
                 produced
@@ -107,10 +104,10 @@ where
             .await;
             running.store(false, Ordering::Release);
             match result {
-                Ok(artifacts) => {
+                Ok(reports) => {
                     if let Some(publisher) = publisher {
-                        for artifact in artifacts {
-                            if let Ok(data) = borsh::to_vec(&artifact) {
+                        for report in reports {
+                            if let Ok(data) = borsh::to_vec(&report) {
                                 let _ = publisher
                                     .send(NetworkCommand::Publish {
                                         topic: Topic::EvidenceProofs,
@@ -204,7 +201,7 @@ where
             {
                 tracing::warn!(?error, "evidence pool pruning failed");
             }
-            let existing = engine.store().evidence_artifacts().unwrap_or_default();
+            let existing = ready_artifacts(engine).unwrap_or_default();
             let mut witnesses = self.raw_report_jobs(engine, &existing);
             let known = |id: &[u8; 32]| {
                 existing.iter().any(|item| item.statement.offence_id == *id)
@@ -252,90 +249,46 @@ where
         })
     }
 
-    /// Proof verification runs outside engine locks. Receipt persistence survives
-    /// restart; the block builder supplies a fresh canonical history opening.
-    pub(super) async fn accept_evidence_artifact(
+    /// Authenticate the supplied history path before verifying the receipt
+    /// outside engine locks, then refresh it again before durable installation.
+    pub(super) async fn accept_evidence_report(
         &self,
-        artifact: EvidenceArtifact,
+        report: EvidenceReport,
     ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
-        if artifact.proof_bytes.is_empty()
-            || artifact.proof_bytes.len()
+        if report.artifact.proof_bytes.is_empty()
+            || report.artifact.proof_bytes.len()
                 > neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES
         {
             return Rejected;
         }
-        // Program identities come from the anchor of the block that would
-        // admit the artifact, never from the artifact itself.
-        let readiness = self.with_engine(|engine| {
-            if artifact.statement.chain_id != engine.chain_spec().chain_id
-                || artifact.statement.chain_spec_hash != engine.chain_spec().hash()
-            {
-                return Err(Rejected);
-            }
-            let Some(height) = engine.head_height().checked_add(1) else {
-                return Err(Deferred);
-            };
-            let Ok(anchor) = engine.evidence_anchor(height) else {
-                return Err(Deferred);
-            };
-            if artifact.membership.batch.fact_guest_vk_digest != anchor.fact_guest_vk_digest
-                || !artifact
-                    .membership
-                    .binds(&artifact.statement, &anchor.fact_guest_vk_digest)
-                || artifact.evidence_guest_vk_digest != anchor.evidence_guest_vk_digest
-            {
-                return Err(Rejected);
-            }
-            let max_age = engine.runtime_policy().evidence_max_age_blocks;
-            receipt_window(&anchor, &artifact.statement, height, max_age)?;
-            // A redundant receipt is not wrong, so relaying peers are not
-            // penalised; it is simply not verified or stored.
-            let pooled = engine.store().evidence_artifacts().unwrap_or_default();
-            if redundant_receipt(
-                engine,
-                &pooled,
-                Some(anchor.evidence_guest_vk_digest),
-                &artifact.statement,
-            ) {
-                return Err(Deferred);
-            }
-            match engine.evidence_submission(artifact.statement.clone()) {
-                Ok(submission)
-                    if submission.binds(engine.chain_spec().chain_id, height, &anchor)
-                        && submission.within_age(height, max_age) =>
-                {
-                    Ok(anchor.evidence_guest_vk_digest)
-                }
-                Ok(_) => Err(Rejected),
-                // A path this node cannot open yet (for example right after a
-                // snapshot bootstrap that installed only the recent tree) is a
-                // local gap, not a verdict on the artifact.
-                Err(_) => Err(Deferred),
-            }
-        });
-        let evidence_program = match readiness {
-            Ok(program) => program,
+        let evidence_program = match self.with_engine(|engine| ready_report(engine, &report)) {
+            Ok((_, anchor)) => anchor.evidence_guest_vk_digest,
             Err(outcome) => return outcome,
         };
         let prover = Arc::clone(&self.proof_system);
         let result = tokio::task::spawn_blocking(move || {
             prover
                 .verify_evidence(
-                    &artifact.proof_bytes,
-                    &artifact.membership.batch,
+                    &report.artifact.proof_bytes,
+                    &report.artifact.membership.batch,
                     &evidence_program,
                 )
-                .map(|()| artifact)
+                .map(|()| report)
         })
         .await;
-        let artifact = match result {
-            Ok(Ok(artifact)) => artifact,
+        let mut report = match result {
+            Ok(Ok(report)) => report,
             Ok(Err(_)) => return Rejected,
             Err(_) => return Deferred,
         };
         self.with_engine_mut(|engine| {
-            if engine.store_mut().put_evidence_artifact(&artifact).is_ok() {
+            let (submission, _) = match ready_report(engine, &report) {
+                Ok(ready) => ready,
+                Err(outcome) => return outcome,
+            };
+            report.history = submission.history;
+            if engine.store_mut().put_evidence_report(&report).is_ok() {
                 Accepted
             } else {
                 Deferred
@@ -362,7 +315,11 @@ where
             let policy = engine.runtime_policy();
             let mut selected = 0_usize;
             let mut bytes = 0_usize;
-            for artifact in engine.store().evidence_artifacts().unwrap_or_default() {
+            for report in engine.store().evidence_reports().unwrap_or_default() {
+                if report.history.count != engine.finalized_next_chunk_id() {
+                    continue;
+                }
+                let artifact = report.artifact;
                 if selected >= policy.evidence_admissions_per_block as usize {
                     break;
                 }
@@ -382,7 +339,9 @@ where
                 {
                     continue;
                 }
-                let Ok(submission) = engine.evidence_submission(artifact.statement.clone()) else {
+                let Ok(submission) =
+                    engine.evidence_submission_with_path(&artifact.statement, &report.history)
+                else {
                     continue;
                 };
                 if !submission.binds(engine.chain_spec().chain_id, height, &anchor)
@@ -434,6 +393,102 @@ where
             (body, ordinary_count)
         })
     }
+}
+
+/// Attach a local opening and check the tip again after background proving.
+fn install_local_artifact<DB: Database>(
+    engine: &mut neutrino_consensus_engine::Engine<DB>,
+    artifact: EvidenceArtifact,
+) -> Option<EvidenceReport> {
+    let submission = engine
+        .evidence_submission(artifact.statement.clone())
+        .ok()?;
+    let mut report = EvidenceReport {
+        artifact,
+        history: submission.history,
+    };
+    // Proving may span finalization or a program switch. Check admission and
+    // pool coverage before attaching the path and receipt to durable storage.
+    let (submission, _) = ready_report(engine, &report).ok()?;
+    report.history = submission.history;
+    engine.store_mut().put_evidence_report(&report).ok()?;
+    Some(report)
+}
+
+/// Snapshot jumps may leave verified receipts awaiting a reporter's refreshed
+/// path. Those bounded dormant entries cannot suppress a usable safety report.
+fn ready_artifacts<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+) -> Result<Vec<EvidenceArtifact>, neutrino_consensus_engine::FinalizeError<DB::Error>> {
+    let count = engine.finalized_next_chunk_id();
+    let height = engine
+        .head_height()
+        .checked_add(1)
+        .ok_or(neutrino_proof_system::ProofError::InvalidWitness)?;
+    let execution = engine.programs_for_height(height)?.execution;
+    Ok(engine
+        .store()
+        .evidence_reports()?
+        .into_iter()
+        .filter(|report| {
+            report.history.count == count
+                && report.artifact.evidence_guest_vk_digest == execution.evidence
+                && report.artifact.membership.batch.fact_guest_vk_digest == execution.fact
+                && report.artifact.statement.block_guest_vk_digest == execution.block
+        })
+        .map(|report| report.artifact)
+        .collect())
+}
+
+/// Authenticate admission from locally trusted programs and roots without
+/// opening the source record in the receiver's historical tree.
+fn ready_report<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+    report: &EvidenceReport,
+) -> Result<(EvidenceSubmission, EvidenceAnchor), EvidenceProofAcceptance> {
+    use EvidenceProofAcceptance::{Deferred, Rejected};
+    let artifact = &report.artifact;
+    if artifact.statement.chain_id != engine.chain_spec().chain_id
+        || artifact.statement.chain_spec_hash != engine.chain_spec().hash()
+    {
+        return Err(Rejected);
+    }
+    let height = engine.head_height().checked_add(1).ok_or(Deferred)?;
+    let anchor = engine.evidence_anchor(height).map_err(|_| Deferred)?;
+    if !artifact.binds(
+        &artifact.statement,
+        &anchor.evidence_guest_vk_digest,
+        &anchor.fact_guest_vk_digest,
+    ) {
+        return Err(Rejected);
+    }
+    let max_age = engine.runtime_policy().evidence_max_age_blocks;
+    receipt_window(&anchor, &artifact.statement, height, max_age)?;
+    // A redundant receipt is valid but cannot add an admission. Preserve
+    // the exact pooled statement so restarted reporters can refresh its path.
+    let pooled = ready_artifacts(engine).map_err(|_| Deferred)?;
+    if redundant_receipt(
+        engine,
+        &pooled,
+        Some(anchor.evidence_guest_vk_digest),
+        &artifact.statement,
+    ) {
+        return Err(Deferred);
+    }
+    let submission = engine
+        .evidence_submission_with_path(&artifact.statement, &report.history)
+        .map_err(|error| match error {
+            neutrino_consensus_engine::FinalizeError::Backend(
+                neutrino_proof_system::ProofError::InvalidWitness,
+            ) => Rejected,
+            _ => Deferred,
+        })?;
+    if !submission.binds(engine.chain_spec().chain_id, height, &anchor)
+        || !submission.within_age(height, max_age)
+    {
+        return Err(Rejected);
+    }
+    Ok((submission, anchor))
 }
 
 /// Whether a receipt could be admitted at `height` as far as windows go. A

@@ -65,6 +65,7 @@ struct MockState {
     finality_vote_count: u32,
     aggregate_finality_vote_count: u32,
     slashing_evidence_count: u32,
+    evidence_reports: Vec<neutrino_consensus_types::evidence::EvidenceReport>,
     availability_enabled: bool,
     availability_deferred: bool,
     availability_sources: Vec<neutrino_consensus_types::signed_artifacts::SignedArtifact>,
@@ -557,6 +558,14 @@ impl SyncBackend for MockBackend {
 
     async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {
         self.inner.lock().unwrap().slashing_evidence_count += 1;
+    }
+
+    async fn ingest_evidence_proof(
+        &self,
+        report: neutrino_consensus_types::evidence::EvidenceReport,
+    ) -> neutrino_sync::EvidenceProofAcceptance {
+        self.inner.lock().unwrap().evidence_reports.push(report);
+        neutrino_sync::EvidenceProofAcceptance::Accepted
     }
 
     fn supports_signed_artifact_sync(&self) -> bool {
@@ -1711,6 +1720,109 @@ async fn gossipped_slashing_evidence_is_routed_to_backend() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(backend_handle.slashing_evidence_count(), 1);
 
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
+fn sample_evidence_report() -> neutrino_consensus_types::evidence::EvidenceReport {
+    use neutrino_consensus_types::{
+        evidence::{
+            EvidenceArtifact, EvidenceContext, EvidenceMembership, EvidenceReport,
+            EvidenceStatement, SanctionKind, commitment,
+        },
+        history::HistoryPath,
+    };
+    use neutrino_primitives::Validator;
+    let statement = EvidenceStatement {
+        chain_id: 1,
+        chain_spec_hash: [1; 32],
+        block_guest_vk_digest: [2; 8],
+        context: EvidenceContext {
+            chunk_id: 0,
+            chunk_hash: [3; 32],
+            end_height: 1,
+            validators_root: [4; 32],
+            seed: [5; 32],
+        },
+        offender: Validator {
+            pubkey: [6; 48],
+            withdrawal_credentials: [7; 32],
+            effective_stake: 100,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        },
+        kind: SanctionKind::Slash,
+        offence_id: [8; 32],
+        facts_commitment: [9; 32],
+    };
+    EvidenceReport {
+        history: HistoryPath::build(&[commitment(&statement.context)], 0).unwrap(),
+        artifact: EvidenceArtifact {
+            membership: EvidenceMembership::build(core::slice::from_ref(&statement), 0, [10; 8])
+                .unwrap(),
+            evidence_guest_vk_digest: [11; 8],
+            statement,
+            proof_bytes: vec![12],
+        },
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn evidence_gossip_requires_and_forwards_the_reporters_history_path() {
+    let report = sample_evidence_report();
+    let backend = MockBackend::default();
+    let backend_handle = backend.clone();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress::default(),
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+    for (id, data) in [
+        (b"report".to_vec(), borsh::to_vec(&report).unwrap()),
+        (
+            b"missing-path".to_vec(),
+            borsh::to_vec(&report.artifact).unwrap(),
+        ),
+    ] {
+        event_tx
+            .send(NetworkEvent::GossipMessage {
+                propagation_source: random_peer(),
+                topic: neutrino_network::Topic::EvidenceProofs,
+                data,
+                message_id: neutrino_network::libp2p::gossipsub::MessageId::from(id),
+            })
+            .await
+            .unwrap();
+    }
+    let mut verdicts = Vec::new();
+    while verdicts.len() < 2 {
+        if let NetworkCommand::ReportGossipValidation { acceptance, .. } =
+            timeout(Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        {
+            verdicts.push(acceptance);
+        }
+    }
+    assert_eq!(
+        verdicts,
+        vec![
+            neutrino_network::libp2p::gossipsub::MessageAcceptance::Accept,
+            neutrino_network::libp2p::gossipsub::MessageAcceptance::Reject,
+        ]
+    );
+    assert_eq!(
+        backend_handle.inner.lock().unwrap().evidence_reports,
+        vec![report]
+    );
     drop(event_tx);
     handle.await.unwrap().unwrap();
 }

@@ -59,13 +59,41 @@ impl<DB: Database> ChainStore<DB> {
         policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
         let mut info = self.retention_info()?;
-        if policy == RetentionPolicy::Archive && info.pruned_before_chunk != 0 {
+        let archive = info.policy == RetentionPolicy::Archive;
+        if policy == RetentionPolicy::Archive
+            && !archive
+            && (info.pruned_before_chunk != 0
+                || !self
+                    .db
+                    .iter_column(Column::HistoryFrontiers)
+                    .map_err(StoreError::Database)?
+                    .is_empty())
+        {
             return Err(StoreError::Corrupt(
-                "archive mode requires restoring deleted history",
+                "archive mode requires restoring complete history",
             ));
         }
         info.policy = policy;
-        self.put_encoded(Column::Meta, RETENTION_KEY, &info)
+        let mut batch = Batch::new();
+        if archive && policy == RetentionPolicy::Pruned {
+            for (key, _) in self
+                .db
+                .iter_column(Column::HistoryNodes)
+                .map_err(StoreError::Database)?
+            {
+                batch.delete(Column::HistoryNodes, key);
+            }
+            let current = self
+                .get_latest_finalized_chunk_id()?
+                .map_or(0, |id| id.saturating_add(1));
+            let prefix = self.get_recursive_covered_chunks()?.unwrap_or(0);
+            self.prune_history_cache_batch(&mut batch, current, prefix)?;
+            self.prune_history_frontiers_batch(&mut batch, current, prefix)?;
+        }
+        batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
+        self.db
+            .write_batch_durable(batch)
+            .map_err(StoreError::Database)
     }
 
     pub(crate) fn history_dependencies(
@@ -116,9 +144,9 @@ impl<DB: Database> ChainStore<DB> {
             prefix.statement.range_id(),
         )?;
         // Complete historical records outlive raw blocks for one unbonding
-        // delay so safety evidence can still be built here; the history tree
-        // itself is never pruned, so any record's path stays openable and a
-        // safety receipt about any finalized chunk can be rebound.
+        // delay so recent safety evidence can still be built here. Older
+        // reports bring their authenticated opening; pooled paths advance
+        // atomically with finalization independently of the bounded cache.
         let record_window = neutrino_consensus_types::history::history_record_window_chunks(
             spec.runtime.unbonding_delay_blocks,
             spec.consensus.chunk_size,
@@ -133,6 +161,7 @@ impl<DB: Database> ChainStore<DB> {
         let finalized_count = self
             .get_latest_finalized_chunk_id()?
             .map_or(0, |id| id.saturating_add(1));
+        self.prune_history_cache_batch(&mut batch, finalized_count, coverage)?;
         self.prune_evidence(
             &mut batch,
             spec,
@@ -215,7 +244,6 @@ impl<DB: Database> ChainStore<DB> {
             Column::FinalityCerts,
             Column::ChunkStatements,
             Column::HistoricalChunks,
-            Column::HistoryFrontiers,
             Column::ValidatorSetSnapshots,
             Column::ConsensusBoundaries,
         ] {
@@ -382,8 +410,7 @@ impl<DB: Database> ChainStore<DB> {
     }
 
     /// Release evidence no retaining node can still use: liveness receipts and
-    /// finalized-offence records below `liveness_floor`, raw reports whose
-    /// complete record this node no longer keeps (below `record_floor`), and
+    /// finalized-offence records below `liveness_floor`, and
     /// every receipt or report against an identity a finalized block has
     /// already sanctioned. Safety receipts have no age floor and leave only
     /// through those finalized facts, never on unfinalized head state.
@@ -418,7 +445,7 @@ impl<DB: Database> ChainStore<DB> {
             } else {
                 false
             };
-            if chunk_id < record_floor || accused_slashed {
+            if accused_slashed {
                 batch.delete(Column::SlashingPool, key);
             }
         }
@@ -443,7 +470,7 @@ impl<DB: Database> ChainStore<DB> {
     }
 }
 
-fn decode_count<E>(key: &[u8]) -> Result<u64, StoreError<E>> {
+pub(super) fn decode_count<E>(key: &[u8]) -> Result<u64, StoreError<E>> {
     key.try_into()
         .map(u64::from_be_bytes)
         .map_err(|_| StoreError::Corrupt("invalid retained count key"))

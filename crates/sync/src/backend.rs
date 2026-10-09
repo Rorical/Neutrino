@@ -429,10 +429,10 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// override this to buffer evidence for runtime application.
     async fn ingest_slashing_evidence(&self, _evidence: SlashingEvidence) {}
 
-    /// Ingest an independently proven offence, available for later block admission.
+    /// Ingest an independently proven offence with its reporter-supplied history path.
     async fn ingest_evidence_proof(
         &self,
-        _proof: neutrino_consensus_types::evidence::EvidenceArtifact,
+        _report: neutrino_consensus_types::evidence::EvidenceReport,
     ) -> EvidenceProofAcceptance {
         EvidenceProofAcceptance::Deferred
     }

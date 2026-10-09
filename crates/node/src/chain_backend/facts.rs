@@ -27,15 +27,15 @@ where
         }) else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         let mut guard = self.fact_jobs.lock().expect("fact queue mutex");
         if guard.as_ref().is_none_or(mpsc::Sender::is_closed) {
             let (tx, mut rx) = mpsc::channel::<(VkDigest, Vec<FactRequest>)>(8);
             let prover = Arc::clone(&self.proof_system);
             let budget = Arc::clone(&self.proving_budget);
-            runtime.spawn(async move {
+            self.spawn_background_worker("facts", async move {
                 let mut carried: Option<(VkDigest, Vec<FactRequest>)> = None;
                 while let Some((program, mut requests)) = match carried.take() {
                     Some(group) => Some(group),
@@ -65,7 +65,8 @@ where
                     }).await {
                         Ok(Ok(())) => {},
                         Ok(Err(error)) => tracing::debug!(%error, "early fact proof unavailable; evidence will prove on demand"),
-                        Err(error) => tracing::warn!(%error, "early fact worker panicked"),
+                        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                        Err(error) => tracing::warn!(%error, "early fact worker cancelled"),
                     }
                 }
             });

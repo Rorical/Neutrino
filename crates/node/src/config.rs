@@ -90,6 +90,16 @@ pub struct NodeConfig {
     /// test containers).
     #[serde(default)]
     pub data_dir: Option<std::path::PathBuf>,
+    /// File containing the persistent libp2p private identity, in protobuf form.
+    ///
+    /// Overrides `data_dir/p2p-key`. When both paths are absent the node uses a
+    /// temporary identity, so its PeerID changes on restart. Unix key files
+    /// must have mode `0600`; existing invalid files are never replaced.
+    #[serde(default)]
+    pub network_key_path: Option<PathBuf>,
+    /// Peer connectivity and finalized-progress requirements for readiness.
+    #[serde(default)]
+    pub health: HealthConfig,
     /// Inline hex-encoded BLS IKM (32 bytes). Convenient for tests only:
     /// the runner warns when a validator key is read from the config
     /// file itself. Prefer [`PROPOSER_IKM_ENV`] or `proposer_ikm_path`.
@@ -161,6 +171,40 @@ impl NodeConfig {
 pub struct MetricsConfigToml {
     /// `host:port` to bind on, e.g. `"127.0.0.1:9615"`.
     pub listen: String,
+}
+
+/// `[health]` section: operational readiness requirements.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Minimum connected peers required for readiness; zero permits isolation.
+    pub min_peers: usize,
+    /// Maximum seconds without new finality before readiness fails.
+    ///
+    /// When absent the runner derives a threshold from the chain specification.
+    pub finality_stall_timeout_secs: Option<u64>,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            min_peers: 1,
+            finality_stall_timeout_secs: None,
+        }
+    }
+}
+
+impl HealthConfig {
+    /// Reject an explicitly configured zero finality-stall timeout.
+    ///
+    /// # Errors
+    /// Returns an error when `finality_stall_timeout_secs = 0`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.finality_stall_timeout_secs == Some(0) {
+            return Err("health.finality_stall_timeout_secs must be nonzero".into());
+        }
+        Ok(())
+    }
 }
 
 /// Local weak-subjectivity trust configuration. Peers cannot supply this anchor.
@@ -445,6 +489,29 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_identity_and_health_configuration_parse_with_defaults() {
+        let minimal: NodeConfig = toml::from_str("chain_id = 1").unwrap();
+        assert!(minimal.network_key_path.is_none());
+        assert_eq!(minimal.health, HealthConfig::default());
+        assert!(minimal.health.validate().is_ok());
+        let explicit: NodeConfig = toml::from_str(
+            "chain_id = 1\nnetwork_key_path = 'keys/network'\n[health]\nmin_peers = 0\nfinality_stall_timeout_secs = 120\n",
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.network_key_path,
+            Some(PathBuf::from("keys/network"))
+        );
+        assert_eq!(explicit.health.min_peers, 0);
+        assert_eq!(explicit.health.finality_stall_timeout_secs, Some(120));
+        assert!(explicit.health.validate().is_ok());
+        let invalid: NodeConfig =
+            toml::from_str("chain_id = 1\n[health]\nfinality_stall_timeout_secs = 0\n").unwrap();
+        assert!(invalid.health.validate().is_err());
+        assert!(toml::from_str::<NodeConfig>("chain_id = 1\n[health]\nmin_peer = 1").is_err());
+    }
 
     #[test]
     fn reporter_config_requires_nonzero_recipient_and_pruned_nonvalidator_mode() {

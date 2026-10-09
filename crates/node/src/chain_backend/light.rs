@@ -238,6 +238,20 @@ where
             .map(|state| *state.client.checkpoint())
     }
 
+    /// Read the authenticated endpoint and its local trust expiry together.
+    /// A failed local clock check is unhealthy; observing health never renews trust.
+    pub(super) fn light_health(&self) -> Option<(Checkpoint, bool)> {
+        self.light
+            .lock()
+            .expect("light state")
+            .as_ref()
+            .map(|state| {
+                let expired =
+                    timestamp().map_or(true, |now| now >= state.client.anchor_expires_at());
+                (*state.client.checkpoint(), expired)
+            })
+    }
+
     pub(super) fn light_latest_proof(&self) -> Result<Option<HistoryProof>, String> {
         let state = self.light.lock().map_err(|error| error.to_string())?;
         Ok(state.as_ref().and_then(|state| state.latest.clone()))
@@ -642,6 +656,28 @@ mod tests {
     }
     fn database(backend: &TestBackend) -> FaultDatabase {
         backend.with_engine(|engine| engine.store().db().clone())
+    }
+
+    #[test]
+    fn light_health_reports_current_and_expired_anchors_without_renewing_trust() {
+        let now = timestamp().unwrap();
+        let spec = chain_spec(now);
+        let (current, current_origin) = backend(&spec, spec.genesis_time);
+        let before = snapshot(&current);
+        assert_eq!(current.light_health(), Some((current_origin, false)));
+        assert_eq!(snapshot(&current), before);
+
+        let expired_spec = chain_spec(now - spec.light_client.weak_subjectivity_period_secs - 20);
+        let (expired, expired_origin) = backend(&expired_spec, expired_spec.genesis_time);
+        let before = snapshot(&expired);
+        assert!(before.anchor_expires_at < now);
+        assert_eq!(expired.light_health(), Some((expired_origin, true)));
+        assert_eq!(snapshot(&expired), before);
+
+        let engine =
+            neutrino_consensus_engine::Engine::genesis(spec, FaultDatabase::default()).unwrap();
+        let ordinary = ChainBackend::new(engine, FixtureVerifier);
+        assert_eq!(ordinary.light_health(), None);
     }
 
     #[tokio::test]

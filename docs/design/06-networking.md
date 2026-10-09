@@ -8,6 +8,28 @@ limits are enforced per topic/request. The exact names and caps are defined by
 Gossip topics use `/neutrino/<topic>/borsh`; request paths use
 `/neutrino/req/<name>`. Identify and Kademlia likewise have one unversioned path.
 
+The host persists its libp2p identity at the explicit `network_key_path`, or
+`data_dir/p2p-key`. Creation publishes a complete, synced key without replacing an
+existing file; malformed keys and unsafe Unix permissions fail startup. An
+in-memory node without either path uses an ephemeral identity. Configured
+bootnodes remain retry targets across failed dials and disconnects, with bounded
+exponential backoff and jitter. Retry state is bounded by the configured addresses;
+learned peers do not create permanent retry entries. Connected and pending attempts
+suppress redundant dials, and one closed connection does not disconnect a peer
+while another connection remains established.
+
+Host task supervision treats critical worker termination as node failure, including
+the actual history and fact workers behind their notification adapters. Startup
+and shutdown share cleanup, and cancellation prevents new work from spawning.
+The metrics listener exposes `/health` and `/ready` for local readiness and `/live`
+for process liveness. A supervised one-second sampler tracks connected peers,
+sync/bootstrap completion, proof-only trust-anchor expiry, configured history backlog and time since finality
+progress. Readiness defaults to at least one peer and a finality timeout of
+`max(1800, 3 * chunk_size * slot_duration_secs)` seconds, with `[health]` overrides.
+Head movement and HTTP scrapes cannot reset the finality timer; a stale sampler
+cannot continue reporting healthy cached state. These are operational probes and
+do not establish consensus trust or change finalization rules.
+
 Raw slashing reports trigger bounded background evidence jobs. Verified
 `EvidenceReport { artifact, history }` packages are cached, persisted and gossiped
 by statement identity. A reporter supplies the historical context's fixed-depth

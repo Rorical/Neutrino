@@ -437,7 +437,13 @@ async fn sixteen_validators_finalise_chunk_zero_over_real_sp1_envelopes() {
     }
     let network_handles: Vec<_> = services
         .into_iter()
-        .map(|service| tokio::spawn(service.run()))
+        .map(|service| {
+            tokio::spawn(async move {
+                Box::pin(service.run())
+                    .await
+                    .expect("network service failed");
+            })
+        })
         .collect();
 
     // Capture each node's listen address.

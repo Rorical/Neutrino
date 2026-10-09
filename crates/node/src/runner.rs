@@ -5,12 +5,12 @@
 //! shutting down. The backend is selected at startup based on
 //! [`NodeConfig::chain_spec_path`].
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_network::Topic;
-use neutrino_network::libp2p::identity::Keypair;
 use neutrino_network::service::{NetworkCommand, NetworkError, NetworkEvent, NetworkService};
 use neutrino_primitives::ChainSpec;
 use neutrino_rpc::{RpcBackend, RpcStartError};
@@ -28,6 +28,7 @@ use crate::chain_spec::{ChainSpecError, ChainSpecFile, decode_hex_exact};
 use crate::config::{NodeConfig, NodeRole, ProvingBackend};
 use crate::db::{NodeDb, NodeDbError};
 use crate::producer::{BlockProducerConfig, run_block_producer};
+use crate::supervision::{TaskFailure, TaskSupervisor};
 
 /// Errors returned by [`run`].
 #[derive(Debug, Error)]
@@ -44,6 +45,17 @@ pub enum NodeError {
     /// Network service construction failed.
     #[error("network service error: {0}")]
     Network(#[from] NetworkError),
+    /// The persisted P2P identity could not be loaded or created.
+    #[error("network identity error: {0}")]
+    NetworkIdentity(String),
+    /// A worker required for the node lifetime stopped unexpectedly.
+    #[error("critical task `{task}` stopped: {reason}")]
+    CriticalTask {
+        /// Name registered by the runner or backend.
+        task: &'static str,
+        /// Failure or unexpected completion.
+        reason: String,
+    },
     /// Chain spec loading or validation failed.
     #[error("chain spec error: {0}")]
     ChainSpec(#[from] ChainSpecError),
@@ -106,6 +118,7 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         .proving
         .validate()
         .map_err(|error| NodeError::ProofSystem(error.into()))?;
+    config.health.validate().map_err(NodeError::Engine)?;
     config
         .reporter_reward_address()
         .map_err(NodeError::Engine)?;
@@ -182,288 +195,310 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
         )));
     }
     let production_config = build_block_producer_config(&config, &chain_spec)?;
-    let db = open_node_db(&config)?;
-    let engine = open_or_initialise_engine(db, chain_spec, &spec_file)?;
-    // SP1's blocking prover clients drive their own runtime while they
-    // initialise, which must not happen on an async worker thread.
-    let proof_system = tokio::task::spawn_blocking(move || {
-        let prover = build_prover()?;
-        Sp1ProofSystem::new(prover)
-    })
-    .await
-    .map_err(|error| NodeError::ProofSystem(format!("prover setup task failed: {error}")))?
-    .map_err(|error| NodeError::ProofSystem(error.to_string()))?;
-    info!(backend = ?config.proving.backend, cuda_device = ?config.proving.cuda_device,
-        concurrency = config.proving.concurrency, "SP1 proving backend initialized");
-    info!(
-        chain_id = config.chain_id,
-        backend = "ChainBackend",
-        head_height = engine.head_height(),
-        "using real engine backend"
-    );
-    let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
-    concrete_backend.set_proving_concurrency(config.proving.concurrency);
-    concrete_backend.set_backlog_policy(config.proving.backlog_policy());
-    if config.role == NodeRole::LightClient {
-        let (spec, domain) = concrete_backend
-            .history_profile()
-            .map_err(NodeError::ProofSystem)?;
-        let (anchor, trusted_at) = match (
-            &config.light_client.trusted_checkpoint_path,
-            config.light_client.trusted_at,
-        ) {
-            (Some(path), Some(trusted_at)) => {
-                let bytes = std::fs::read(path)?;
-                if bytes.len() > 1024 {
-                    return Err(NodeError::ProofSystem(
-                        "trusted checkpoint exceeds size limit".into(),
-                    ));
-                }
-                let anchor = borsh::from_slice(&bytes).map_err(|error| {
-                    NodeError::ProofSystem(format!("trusted checkpoint: {error}"))
-                })?;
-                (anchor, trusted_at)
-            }
-            (None, None) => (
-                neutrino_consensus_types::history_proof::Checkpoint {
-                    chain: domain.chain,
-                    boundary: domain.genesis_boundary(&spec),
-                },
-                spec.genesis_time,
-            ),
-            _ => {
-                return Err(NodeError::ProofSystem(
-                    "trusted_checkpoint_path and trusted_at must be configured together".into(),
-                ));
-            }
-        };
-        concrete_backend
-            .initialize_light(
-                anchor,
-                trusted_at,
-                config.light_client.max_future_drift_secs,
-            )
-            .map_err(NodeError::ProofSystem)?;
-    } else {
-        concrete_backend
-            .set_retention_policy(config.role.retention_policy())
-            .map_err(NodeError::ProofSystem)?;
-        concrete_backend
-            .initialize_history()
-            .map_err(NodeError::ProofSystem)?;
-        // Install the WASM block executor so the producer loop's
-        // dry-run path can build SP1 witnesses. The embedded default-
-        // runtime master cdylib is the only runtime today; on-chain
-        // upgrades will install a different `WasmExecutor` per
-        // activation epoch.
-        let block_executor =
-            WasmExecutor::default_runtime_with_limits(config.execution.to_wasm_limits())
-                .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
-        concrete_backend.set_block_executor(block_executor);
-        // On-chain program artifacts (design 24): accepted artifacts persist
-        // under the data directory and are reinstalled on every start.
-        if let Some(data_dir) = &config.data_dir {
-            let programs_dir = data_dir.join("programs");
-            let store = crate::programs::ProgramStore::open(&programs_dir).map_err(|source| {
-                NodeError::DataDir {
-                    path: programs_dir.display().to_string(),
+    // Validate addresses before starting any worker, including backend workers.
+    let listen_addrs = parse_multiaddrs(&config.effective_listen())?;
+    let bootnodes = parse_multiaddrs(&config.bootnodes)?;
+    let rpc_config = config
+        .rpc
+        .as_ref()
+        .map(|rpc| {
+            rpc.to_runtime_config()
+                .map_err(|source| NodeError::RpcListen {
+                    addr: rpc.listen.clone(),
                     source,
-                }
-            })?;
-            concrete_backend.set_program_store(store);
-            concrete_backend.restore_programs();
-        }
-        if let Some(address) = config
-            .reporter_reward_address()
-            .map_err(NodeError::Engine)?
-        {
-            concrete_backend
-                .initialize_reporter(address)
-                .map_err(NodeError::Engine)?;
-        }
-        if config.role == NodeRole::Archive {
-            concrete_backend
-                .discard_bootstrap_download()
-                .map_err(NodeError::ProofSystem)?;
-        } else {
-            concrete_backend
-                .initialize_bootstrap(&config.bootstrap)
-                .map_err(NodeError::ProofSystem)?;
-        }
-    }
-    let local_key = Keypair::generate_ed25519();
-    let local_peer_id = neutrino_network::PeerId::from(local_key.public());
-    info!(%local_peer_id, role = ?config.role, chain_id = config.chain_id, "starting node");
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(256);
-    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(256);
-
-    let mut svc = NetworkService::new(local_key, cmd_rx, event_tx)?;
-
-    // Bind every configured listener.
-    for addr in config.effective_listen() {
-        let parsed = addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
-            addr: addr.clone(),
-            source,
-        })?;
-        match svc.listen_on(parsed) {
-            Ok(id) => info!(%addr, ?id, "listening"),
-            Err(err) => warn!(%addr, ?err, "listen failed"),
-        }
-    }
-
-    // Own every runner task from its first spawn. Dropping the set aborts
-    // them on startup errors, signal errors or cancellation of this future.
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(svc.run());
-
-    // Dial bootnodes if any.
-    for addr in &config.bootnodes {
-        let parsed = addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
-            addr: addr.clone(),
-            source,
-        })?;
-        if cmd_tx.send(NetworkCommand::Dial(parsed)).await.is_err() {
-            warn!(%addr, "network command channel closed while dialing bootnode");
-        }
-    }
-
-    // Subscribe to gossip topics: caller-overridable, but Stage 5 just
-    // subscribes to every canonical topic.
-    let topics_to_subscribe: Vec<Topic> = config.subscribe_topics.as_ref().map_or_else(
-        || {
-            if config.role == NodeRole::LightClient {
-                vec![Topic::Checkpoints]
-            } else {
-                Topic::all_default().collect()
-            }
-        },
-        |names| {
-            names
-                .iter()
-                .filter_map(|name| {
-                    topic_from_name(name).or_else(|| {
-                        warn!(topic = %name, "unknown topic name; ignoring");
-                        None
-                    })
                 })
-                .collect()
-        },
-    );
-    for topic in topics_to_subscribe {
-        if cmd_tx.send(NetworkCommand::Subscribe(topic)).await.is_err() {
-            warn!(?topic, "network command channel closed before subscribe");
-        }
-    }
-
-    // Enable the multi-validator chunk-BFT loop. Every node installs
-    // the network publisher so peer-detected slashing evidence and
-    // aggregator emissions can broadcast; validator nodes
-    // additionally install their local voter so the engine signs
-    // prevotes / precommits and routes through `QuorumReached`.
-    // Non-validator nodes leave `local_voter` unset; the engine
-    // still ingests peer votes but emits nothing.
-    concrete_backend.set_network_publisher(cmd_tx.clone());
-    if let Some(cfg) = production_config.as_ref() {
-        concrete_backend.set_local_voter(cfg.proposer.clone());
-    }
-    concrete_backend
-        .resume_bft_sessions()
-        .await
-        .map_err(NodeError::Engine)?;
-    tasks.spawn(Arc::clone(&concrete_backend).run_consensus_proof_notifications());
-    if concrete_backend.local_voter().is_some() {
-        tasks.spawn(Arc::clone(&concrete_backend).run_bft_round_timeouts());
-    }
-    let producer_job = production_config.map(|cfg| (Arc::clone(&concrete_backend), cfg));
-    if let Some(metrics_cfg) = config.metrics.as_ref() {
-        let addr: std::net::SocketAddr =
-            metrics_cfg
+        })
+        .transpose()?;
+    let metrics_addr = config
+        .metrics
+        .as_ref()
+        .map(|metrics| {
+            metrics
                 .listen
-                .parse()
-                .map_err(|err: std::net::AddrParseError| NodeError::MetricsListen {
-                    addr: metrics_cfg.listen.clone(),
-                    reason: err.to_string(),
-                })?;
-        let listener =
-            crate::metrics::bind(addr)
+                .parse::<std::net::SocketAddr>()
+                .map_err(|error| NodeError::MetricsListen {
+                    addr: metrics.listen.clone(),
+                    reason: error.to_string(),
+                })
+        })
+        .transpose()?;
+    let local_key = crate::identity::load_network_identity(&config)
+        .map_err(|error| NodeError::NetworkIdentity(error.to_string()))?;
+    let health = Arc::new(crate::health::NodeHealth::new(
+        &config.health,
+        chain_spec.consensus.slot_duration_secs,
+        chain_spec.consensus.chunk_size,
+    ));
+    let tasks = TaskSupervisor::new();
+    let mut rpc_handle = None;
+    let shutdown = wait_for_shutdown();
+    tokio::pin!(shutdown);
+
+    // Startup and steady-state share one owner. An early error or signal also
+    // stops workers created while restoring programs or BFT sessions.
+    let outcome = supervise_lifecycle(
+        &tasks,
+        &mut shutdown,
+        async {
+            let db = open_node_db(&config)?;
+            let engine = open_or_initialise_engine(db, chain_spec, &spec_file)?;
+            // SP1's blocking prover clients drive their own runtime while they
+            // initialise, which must not happen on an async worker thread.
+            let proof_system = tokio::task::spawn_blocking(move || {
+                let prover = build_prover()?;
+                Sp1ProofSystem::new(prover)
+            })
+            .await
+            .map_err(|error| NodeError::ProofSystem(format!("prover setup task failed: {error}")))?
+            .map_err(|error| NodeError::ProofSystem(error.to_string()))?;
+            info!(backend = ?config.proving.backend, cuda_device = ?config.proving.cuda_device,
+                    concurrency = config.proving.concurrency, "SP1 proving backend initialized");
+            info!(
+                chain_id = config.chain_id,
+                backend = "ChainBackend",
+                head_height = engine.head_height(),
+                "using real engine backend"
+            );
+            let concrete_backend = Arc::new(ChainBackend::new(engine, proof_system));
+            concrete_backend.set_task_spawner(tasks.spawner());
+            concrete_backend.set_proving_concurrency(config.proving.concurrency);
+            concrete_backend.set_backlog_policy(config.proving.backlog_policy());
+            if config.role == NodeRole::LightClient {
+                let (spec, domain) = concrete_backend
+                    .history_profile()
+                    .map_err(NodeError::ProofSystem)?;
+                let (anchor, trusted_at) = match (
+                    &config.light_client.trusted_checkpoint_path,
+                    config.light_client.trusted_at,
+                ) {
+                    (Some(path), Some(trusted_at)) => {
+                        let bytes = std::fs::read(path)?;
+                        if bytes.len() > 1024 {
+                            return Err(NodeError::ProofSystem(
+                                "trusted checkpoint exceeds size limit".into(),
+                            ));
+                        }
+                        let anchor = borsh::from_slice(&bytes).map_err(|error| {
+                            NodeError::ProofSystem(format!("trusted checkpoint: {error}"))
+                        })?;
+                        (anchor, trusted_at)
+                    }
+                    (None, None) => (
+                        neutrino_consensus_types::history_proof::Checkpoint {
+                            chain: domain.chain,
+                            boundary: domain.genesis_boundary(&spec),
+                        },
+                        spec.genesis_time,
+                    ),
+                    _ => {
+                        return Err(NodeError::ProofSystem(
+                            "trusted_checkpoint_path and trusted_at must be configured together"
+                                .into(),
+                        ));
+                    }
+                };
+                concrete_backend
+                    .initialize_light(
+                        anchor,
+                        trusted_at,
+                        config.light_client.max_future_drift_secs,
+                    )
+                    .map_err(NodeError::ProofSystem)?;
+            } else {
+                concrete_backend
+                    .set_retention_policy(config.role.retention_policy())
+                    .map_err(NodeError::ProofSystem)?;
+                concrete_backend
+                    .initialize_history()
+                    .map_err(NodeError::ProofSystem)?;
+                // Install the WASM block executor so the producer loop's
+                // dry-run path can build SP1 witnesses. The embedded default-
+                // runtime master cdylib is the only runtime today; on-chain
+                // upgrades will install a different `WasmExecutor` per
+                // activation epoch.
+                let block_executor =
+                    WasmExecutor::default_runtime_with_limits(config.execution.to_wasm_limits())
+                        .map_err(|err| NodeError::ProofSystem(err.to_string()))?;
+                concrete_backend.set_block_executor(block_executor);
+                // On-chain program artifacts (design 24): accepted artifacts persist
+                // under the data directory and are reinstalled on every start.
+                if let Some(data_dir) = &config.data_dir {
+                    let programs_dir = data_dir.join("programs");
+                    let store =
+                        crate::programs::ProgramStore::open(&programs_dir).map_err(|source| {
+                            NodeError::DataDir {
+                                path: programs_dir.display().to_string(),
+                                source,
+                            }
+                        })?;
+                    concrete_backend.set_program_store(store);
+                    concrete_backend.restore_programs();
+                }
+                if let Some(address) = config
+                    .reporter_reward_address()
+                    .map_err(NodeError::Engine)?
+                {
+                    concrete_backend
+                        .initialize_reporter(address)
+                        .map_err(NodeError::Engine)?;
+                }
+                if config.role == NodeRole::Archive {
+                    concrete_backend
+                        .discard_bootstrap_download()
+                        .map_err(NodeError::ProofSystem)?;
+                } else {
+                    concrete_backend
+                        .initialize_bootstrap(&config.bootstrap)
+                        .map_err(NodeError::ProofSystem)?;
+                }
+            }
+            let local_peer_id = neutrino_network::PeerId::from(local_key.public());
+            info!(%local_peer_id, role = ?config.role, chain_id = config.chain_id, "starting node");
+            let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(256);
+            let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(256);
+            let mut svc = NetworkService::new(local_key, cmd_rx, event_tx)?;
+            for addr in listen_addrs {
+                let id = svc.listen_on(addr.clone()).map_err(NetworkError::from)?;
+                info!(%addr, ?id, "listening");
+            }
+            svc.configure_bootnodes(bootnodes)?;
+            let _ = tasks.spawner().spawn_critical("network", async move {
+                Box::pin(svc.run()).await.map_err(|error| error.to_string())
+            });
+
+            let topics_to_subscribe: Vec<Topic> = config.subscribe_topics.as_ref().map_or_else(
+                || {
+                    if config.role == NodeRole::LightClient {
+                        vec![Topic::Checkpoints]
+                    } else {
+                        Topic::all_default().collect()
+                    }
+                },
+                |names| {
+                    names
+                        .iter()
+                        .filter_map(|name| {
+                            topic_from_name(name).or_else(|| {
+                                warn!(topic = %name, "unknown topic name; ignoring");
+                                None
+                            })
+                        })
+                        .collect()
+                },
+            );
+            for topic in topics_to_subscribe {
+                cmd_tx
+                    .send(NetworkCommand::Subscribe(topic))
+                    .await
+                    .map_err(|_| NodeError::CriticalTask {
+                        task: "network",
+                        reason: "command channel closed during startup".into(),
+                    })?;
+            }
+            concrete_backend.set_network_publisher(cmd_tx.clone());
+            if let Some(production) = production_config.as_ref() {
+                concrete_backend.set_local_voter(production.proposer.clone());
+            }
+            concrete_backend
+                .resume_bft_sessions()
                 .await
-                .map_err(|err| NodeError::MetricsListen {
-                    addr: metrics_cfg.listen.clone(),
-                    reason: err.to_string(),
-                })?;
-        let source = Arc::clone(&concrete_backend) as Arc<dyn crate::metrics::MetricsSource>;
-        tasks.spawn(crate::metrics::serve(listener, source));
-        info!(listen = %addr, "metrics endpoint listening");
-    }
-    let rpc_backend: Arc<dyn RpcBackend> = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
-    let backend: Arc<dyn SyncBackend> = Arc::clone(&concrete_backend) as Arc<dyn SyncBackend>;
-
-    let local_progress = backend
-        .local_progress()
-        .await
-        .map_err(|error| NodeError::Engine(error.to_string()))?;
-    let driver_cfg = SyncDriverConfig {
-        mode: config.role.sync_mode(),
-        ..SyncDriverConfig::default()
-    };
-    let driver = SyncDriver::new(
-        driver_cfg,
-        backend,
-        local_progress,
-        cmd_tx.clone(),
-        event_rx,
-    );
-    concrete_backend.set_sync_status(driver.status());
-    drop(concrete_backend);
-    tasks.spawn(async move {
-        if let Err(error) = driver.run().await {
-            warn!(%error, "sync driver stopped with an error");
-        }
-    });
-    if let Some((backend, production_config)) = producer_job {
-        tasks.spawn(run_block_producer(
-            backend,
-            cmd_tx.clone(),
-            production_config,
-        ));
-    }
-    // Optional JSON-RPC server. Started after the engine is open so
-    // the very first request observes a consistent head.
-    let rpc_handle = if let Some(rpc_cfg) = config.rpc.as_ref() {
-        let runtime_cfg = rpc_cfg
-            .to_runtime_config()
-            .map_err(|source| NodeError::RpcListen {
-                addr: rpc_cfg.listen.clone(),
-                source,
-            })?;
-        let listen = runtime_cfg.listen;
-        let handle = neutrino_rpc::serve(Arc::clone(&rpc_backend), runtime_cfg).await?;
-        info!(%listen, "rpc server listening");
-        Some(handle)
-    } else {
-        info!("rpc disabled (no [rpc] section in node config)");
-        None
-    };
-    // Suppress the "unused" warning for nodes that never request RPC.
-    let _ = &rpc_backend;
-
-    // Clean up even when installing a signal handler fails. ServerHandle's
-    // final drop also stops RPC if the caller cancels this whole future.
-    let shutdown = wait_for_shutdown().await;
-    if shutdown.is_ok() {
+                .map_err(NodeError::Engine)?;
+            let worker = Arc::clone(&concrete_backend);
+            let _ = tasks
+                .spawner()
+                .spawn_critical("consensus-notifications", async move {
+                    worker.run_consensus_proof_notifications().await;
+                    Ok(())
+                });
+            if concrete_backend.local_voter().is_some() {
+                let worker = Arc::clone(&concrete_backend);
+                let _ = tasks.spawner().spawn_critical("bft-clock", async move {
+                    worker.run_bft_round_timeouts().await;
+                    Ok(())
+                });
+            }
+            let source = Arc::clone(&concrete_backend) as Arc<dyn crate::metrics::MetricsSource>;
+            let monitor_health = Arc::clone(&health);
+            let monitor_source = Arc::clone(&source);
+            let _ = tasks
+                .spawner()
+                .spawn_critical("health-monitor", async move {
+                    monitor_health.monitor(monitor_source).await;
+                    Ok(())
+                });
+            if let Some(addr) = metrics_addr {
+                let listener =
+                    crate::metrics::bind(addr)
+                        .await
+                        .map_err(|error| NodeError::MetricsListen {
+                            addr: addr.to_string(),
+                            reason: error.to_string(),
+                        })?;
+                let metrics_health = Arc::clone(&health);
+                let _ = tasks.spawner().spawn_critical("metrics", async move {
+                    crate::metrics::serve(listener, source, metrics_health)
+                        .await
+                        .map_err(|error| error.to_string())
+                });
+                info!(listen = %addr, "metrics endpoint listening");
+            }
+            let rpc_backend = Arc::clone(&concrete_backend) as Arc<dyn RpcBackend>;
+            let backend = Arc::clone(&concrete_backend) as Arc<dyn SyncBackend>;
+            let local_progress = backend
+                .local_progress()
+                .await
+                .map_err(|error| NodeError::Engine(error.to_string()))?;
+            let driver_cfg = SyncDriverConfig {
+                mode: config.role.sync_mode(),
+                ..SyncDriverConfig::default()
+            };
+            let driver = SyncDriver::new(
+                driver_cfg,
+                backend,
+                local_progress,
+                cmd_tx.clone(),
+                event_rx,
+            );
+            concrete_backend.set_sync_status(driver.status());
+            let _ = tasks.spawner().spawn_critical("sync", async move {
+                driver.run().await.map_err(|error| error.to_string())
+            });
+            if let Some(production) = production_config {
+                let worker = Arc::clone(&concrete_backend);
+                let _ = tasks.spawner().spawn_critical("producer", async move {
+                    run_block_producer(worker, cmd_tx, production).await;
+                    Ok(())
+                });
+            }
+            if let Some(runtime_cfg) = rpc_config {
+                let listen = runtime_cfg.listen;
+                let handle = neutrino_rpc::serve(rpc_backend, runtime_cfg).await?;
+                let stop_handle = handle.clone();
+                tasks.on_shutdown(move || {
+                    let _ = stop_handle.stop();
+                });
+                let monitor_handle = handle.clone();
+                let _ = tasks.spawner().spawn_critical("rpc", async move {
+                    monitor_handle.stopped().await;
+                    Ok(())
+                });
+                rpc_handle = Some(handle);
+                info!(%listen, "rpc server listening");
+            } else {
+                info!("rpc disabled (no [rpc] section in node config)");
+            }
+            Ok::<(), NodeError>(())
+        },
+        || health.mark_running(),
+    )
+    .await;
+    if outcome.is_ok() {
+        health.mark_stopping();
         info!("shutdown signal received");
+    } else {
+        health.mark_failed();
     }
-
-    // Abort the driver too: it owns command senders and backend/DB references,
-    // so dropping only our sender cannot shut down the network task.
-    tasks.abort_all();
-    if let Some(handle) = rpc_handle.as_ref() {
-        let _ = handle.stop();
-    }
-    drop(cmd_tx);
-
-    // Give tasks a brief grace period to flush logs.
+    tasks.close();
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         tasks.shutdown().await;
         if let Some(handle) = rpc_handle {
@@ -471,10 +506,48 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
         }
     })
     .await;
-
     info!("node stopped");
-    shutdown?;
-    Ok(())
+    outcome
+}
+
+async fn supervise_lifecycle(
+    tasks: &TaskSupervisor,
+    shutdown: impl Future<Output = Result<(), std::io::Error>>,
+    startup: impl Future<Output = Result<(), NodeError>>,
+    on_started: impl FnOnce(),
+) -> Result<(), NodeError> {
+    tokio::pin!(shutdown);
+    tokio::select! {
+        biased;
+        failure = tasks.next_failure() => return Err(task_error(failure)),
+        result = &mut shutdown => return result.map_err(NodeError::Io),
+        result = startup => result?,
+    }
+    on_started();
+    tokio::select! {
+        biased;
+        failure = tasks.next_failure() => Err(task_error(failure)),
+        result = &mut shutdown => result.map_err(NodeError::Io),
+    }
+}
+
+fn task_error(failure: TaskFailure) -> NodeError {
+    NodeError::CriticalTask {
+        task: failure.name,
+        reason: failure.reason,
+    }
+}
+
+fn parse_multiaddrs(addresses: &[String]) -> Result<Vec<neutrino_network::Multiaddr>, NodeError> {
+    addresses
+        .iter()
+        .map(|addr| {
+            addr.parse().map_err(|source| NodeError::InvalidMultiaddr {
+                addr: addr.clone(),
+                source,
+            })
+        })
+        .collect()
 }
 
 fn topic_from_name(name: &str) -> Option<Topic> {
@@ -543,17 +616,11 @@ fn build_block_producer_config(
     if config.role != NodeRole::Validator {
         return Ok(None);
     }
-    let Some((ikm_hex, source)) = config
-        .resolve_proposer_ikm_hex()
-        .map_err(|err| NodeError::ProposerKey(err.to_string()))?
-    else {
-        warn!(
-            "validator role configured without a proposer key ({} / proposer_ikm_path); \
-             block production disabled",
-            crate::config::PROPOSER_IKM_ENV
-        );
-        return Ok(None);
-    };
+    let (ikm_hex, source) = required_proposer_key(
+        config
+            .resolve_proposer_ikm_hex()
+            .map_err(|err| NodeError::ProposerKey(err.to_string()))?,
+    )?;
     match source {
         crate::config::ProposerIkmSource::Inline => warn!(
             "proposer key read inline from the config file; prefer {} or proposer_ikm_path",
@@ -575,6 +642,15 @@ fn build_block_producer_config(
         genesis_time_secs: chain_spec.genesis_time,
         slot_duration_secs: chain_spec.consensus.slot_duration_secs,
     }))
+}
+
+fn required_proposer_key(
+    resolved: Option<(String, crate::config::ProposerIkmSource)>,
+) -> Result<(String, crate::config::ProposerIkmSource), NodeError> {
+    resolved.ok_or_else(|| NodeError::ProposerKey(format!(
+        "validator role requires a proposer key ({} / proposer_ikm_path); use role=full for a non-validator node",
+        crate::config::PROPOSER_IKM_ENV
+    )))
 }
 
 /// Short hex preview for log lines / error messages. Truncates to
@@ -627,3 +703,7 @@ mod tests {
         assert_eq!(topic_from_name("/unknown/topic"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "runner_lifecycle_tests.rs"]
+mod lifecycle_tests;

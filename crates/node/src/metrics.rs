@@ -1,7 +1,7 @@
 //! Prometheus text-format metrics over a minimal HTTP listener.
 //!
 //! The node records proving outcomes and latencies as they happen and samples
-//! chain, sync and BFT state once per scrape. The exposition is rendered by
+//! chain, sync and BFT state once per second. The exposition is rendered by
 //! hand and served by a tiny HTTP/1.1 responder so the metrics surface adds no
 //! dependencies and shares nothing with the JSON-RPC server.
 
@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::health::NodeHealth;
 
 /// Histogram bucket upper bounds in seconds, chosen for proof latencies that
 /// range from a few seconds (blocks) to many minutes (chunks on CPU).
@@ -131,6 +133,10 @@ pub struct BftSessionGauge {
 
 /// Chain, sync and consensus state sampled at scrape time.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent operational conditions exported as gauges"
+)]
 pub struct MetricsSnapshot {
     /// Unfinalised head height.
     pub head_height: u64,
@@ -140,12 +146,18 @@ pub struct MetricsSnapshot {
     pub recursive_covered_chunks: u64,
     /// Chunks whose raw data may have been pruned.
     pub pruned_before_chunk: u64,
-    /// Size of the active consensus validator set.
+    /// Size of the active consensus validator set; zero when unavailable in proof-only mode.
     pub active_validators: u64,
     /// Connected peers, if a sync driver is attached.
     pub peers: u64,
     /// Sync driver has not reached the live-following state.
     pub syncing: bool,
+    /// Sync FSM has not yet had a first peer handshake.
+    pub sync_awaiting_peer: bool,
+    /// Full-node snapshot bootstrap has not installed authenticated state yet.
+    pub bootstrap_pending: bool,
+    /// Proof-only node's locally authenticated weak-subjectivity anchor expired.
+    pub trust_anchor_expired: bool,
     /// Buffered mempool transactions.
     pub mempool: u64,
     /// Live BFT sessions.
@@ -160,7 +172,7 @@ pub struct MetricsSnapshot {
 pub trait MetricsSource: Send + Sync {
     /// Counters updated by the node's workers.
     fn metrics(&self) -> &NodeMetrics;
-    /// Sample live state. Called once per scrape.
+    /// Sample live state. Called by the supervised health monitor once per second.
     fn snapshot(&self) -> MetricsSnapshot;
 }
 
@@ -348,6 +360,7 @@ pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 /// Shared scrape state: the source plus the last rendered exposition.
 struct Scraper {
     source: Arc<dyn MetricsSource>,
+    health: Arc<NodeHealth>,
     cached: Mutex<Option<(Instant, Arc<String>)>>,
 }
 
@@ -359,8 +372,52 @@ impl Scraper {
         {
             return Arc::clone(body);
         }
-        let snapshot = self.source.snapshot();
-        let body = Arc::new(render(self.source.metrics(), &snapshot));
+        let snapshot = self.health.snapshot();
+        let mut body = render(self.source.metrics(), &snapshot);
+        let health = self.health.status();
+        gauge(
+            &mut body,
+            "neutrino_live",
+            "Critical workers and health sampler are live.",
+            u8::from(health.live),
+        );
+        gauge(
+            &mut body,
+            "neutrino_ready",
+            "Node satisfies configured readiness requirements.",
+            u8::from(health.ready),
+        );
+        gauge(
+            &mut body,
+            "neutrino_finality_progress_age_seconds",
+            "Seconds since the last locally observed finality progress.",
+            health.finality_age.as_secs(),
+        );
+        gauge(
+            &mut body,
+            "neutrino_finality_stall_timeout_seconds",
+            "Configured finality progress timeout.",
+            health.stall_timeout.as_secs(),
+        );
+        gauge(
+            &mut body,
+            "neutrino_bootstrap_pending",
+            "Authenticated snapshot installation is pending.",
+            u8::from(snapshot.bootstrap_pending),
+        );
+        gauge(
+            &mut body,
+            "neutrino_trust_anchor_expired",
+            "Proof-only weak-subjectivity anchor has expired.",
+            u8::from(snapshot.trust_anchor_expired),
+        );
+        gauge(
+            &mut body,
+            "neutrino_sync_awaiting_peer",
+            "Sync FSM is waiting for its first peer handshake.",
+            u8::from(snapshot.sync_awaiting_peer),
+        );
+        let body = Arc::new(body);
         *cached = Some((Instant::now(), Arc::clone(&body)));
         body
     }
@@ -372,17 +429,22 @@ impl Scraper {
 /// bounds slow or idle clients, at most [`MAX_CONNECTIONS`] are served at
 /// once, and state is sampled at most once per [`SNAPSHOT_INTERVAL`]. Bodies
 /// and other paths are ignored.
-pub async fn serve(listener: TcpListener, source: Arc<dyn MetricsSource>) {
+///
+/// # Errors
+/// Returns a listener accept error so supervision can terminate the node.
+pub(crate) async fn serve(
+    listener: TcpListener,
+    source: Arc<dyn MetricsSource>,
+    health: Arc<NodeHealth>,
+) -> std::io::Result<()> {
     let scraper = Arc::new(Scraper {
         source,
+        health,
         cached: Mutex::new(None),
     });
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
+        let (stream, _) = listener.accept().await?;
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             // Over capacity: close immediately rather than queue work.
             drop(stream);
@@ -420,8 +482,22 @@ async fn respond(mut stream: TcpStream, scraper: Arc<Scraper>) -> std::io::Resul
     let (status, body): (&str, Arc<String>) =
         if method == "GET" && (path == "/metrics" || path == "/") {
             ("200 OK", scraper.exposition())
-        } else if method == "GET" && path == "/health" {
-            ("200 OK", Arc::new("ok\n".to_owned()))
+        } else if method == "GET" && matches!(path, "/health" | "/ready" | "/live") {
+            let health = scraper.health.status();
+            let healthy = if path == "/live" {
+                health.live
+            } else {
+                health.ready
+            };
+            let reason = if healthy { "ok" } else { health.reason };
+            (
+                if healthy {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                },
+                Arc::new(format!("{reason}\n")),
+            )
         } else {
             ("404 Not Found", Arc::new("not found\n".to_owned()))
         };
@@ -437,6 +513,7 @@ async fn respond(mut stream: TcpStream, scraper: Arc<Scraper>) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HealthConfig;
 
     struct Stub(NodeMetrics, MetricsSnapshot, AtomicU64);
 
@@ -456,22 +533,35 @@ mod tests {
         }
     }
 
+    fn health(snapshot: MetricsSnapshot) -> Arc<NodeHealth> {
+        let health = Arc::new(NodeHealth::new(&HealthConfig::default(), 4, 128));
+        health.mark_running();
+        health.sample_for_test(snapshot);
+        health
+    }
+
     #[test]
     fn scrapes_inside_the_interval_reuse_one_snapshot() {
         let stub = Arc::new(Stub::new(MetricsSnapshot::default()));
         let scraper = Scraper {
             source: Arc::clone(&stub) as Arc<dyn MetricsSource>,
+            health: health(MetricsSnapshot::default()),
             cached: Mutex::new(None),
         };
         let first = scraper.exposition();
         let second = scraper.exposition();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(stub.2.load(Ordering::Relaxed), 1);
-        // Expire the cache and the source is sampled again.
+        assert_eq!(stub.2.load(Ordering::Relaxed), 0);
+        // Expire the cache and render the monitor's latest sample.
+        scraper.health.sample_for_test(MetricsSnapshot {
+            head_height: 7,
+            ..MetricsSnapshot::default()
+        });
         scraper.cached.lock().unwrap().as_mut().unwrap().0 -= SNAPSHOT_INTERVAL * 2;
         let third = scraper.exposition();
         assert!(!Arc::ptr_eq(&first, &third));
-        assert_eq!(stub.2.load(Ordering::Relaxed), 2);
+        assert!(third.contains("neutrino_head_height 7"));
+        assert_eq!(stub.2.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -479,7 +569,7 @@ mod tests {
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let source: Arc<dyn MetricsSource> = Arc::new(Stub::new(MetricsSnapshot::default()));
-        tokio::spawn(serve(listener, source));
+        tokio::spawn(serve(listener, source, health(MetricsSnapshot::default())));
         // Fill every slot with connections that never send a request.
         let mut idle = Vec::new();
         for _ in 0..MAX_CONNECTIONS {
@@ -550,14 +640,18 @@ mod tests {
     async fn http_endpoint_serves_metrics_and_rejects_other_paths() {
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let source: Arc<dyn MetricsSource> = Arc::new(Stub::new(MetricsSnapshot {
+        let snapshot = MetricsSnapshot {
             head_height: 9,
             ..MetricsSnapshot::default()
-        }));
-        tokio::spawn(serve(listener, source));
+        };
+        let source: Arc<dyn MetricsSource> = Arc::new(Stub::new(snapshot.clone()));
+        let health = health(snapshot);
+        tokio::spawn(serve(listener, source, Arc::clone(&health)));
         for (path, expect_status, expect_body) in [
             ("/metrics", "200 OK", "neutrino_head_height 9"),
-            ("/health", "200 OK", "ok"),
+            ("/health", "503 Service Unavailable", "insufficient_peers"),
+            ("/ready", "503 Service Unavailable", "insufficient_peers"),
+            ("/live", "200 OK", "ok"),
             ("/nope", "404 Not Found", "not found"),
         ] {
             let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -573,5 +667,44 @@ mod tests {
             );
             assert!(response.contains(expect_body), "{response}");
         }
+        health.sample_for_test(MetricsSnapshot {
+            peers: 1,
+            ..MetricsSnapshot::default()
+        });
+        for path in ["/health", "/ready"] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert!(response.ends_with("ok\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn health_monitor_samples_without_any_http_scrapes() {
+        let stub = Arc::new(Stub::new(MetricsSnapshot {
+            peers: 1,
+            finalized_chunks: 3,
+            ..MetricsSnapshot::default()
+        }));
+        let health = Arc::new(NodeHealth::new(&HealthConfig::default(), 4, 128));
+        health.mark_running();
+        let monitor =
+            tokio::spawn(Arc::clone(&health).monitor(Arc::clone(&stub) as Arc<dyn MetricsSource>));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !health.status().ready {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(health.snapshot().finalized_chunks, 3);
+        assert_eq!(stub.2.load(Ordering::Relaxed), 1);
+        monitor.abort();
+        let _ = monitor.await;
     }
 }

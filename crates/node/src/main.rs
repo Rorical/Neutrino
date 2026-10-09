@@ -77,21 +77,28 @@ fn print_usage() {
     eprintln!();
     eprintln!("Run a Neutrino full node. The config file must contain at least:");
     eprintln!("    chain_id = <u64>");
+    eprintln!("    chain_spec_path = \"/path/to/chain-spec.toml\"");
+    eprintln!(
+        "The default validator role also requires a proposer key; use role = \"full\" for a non-validator."
+    );
     eprintln!();
     eprintln!("Optional keys:");
     eprintln!(
         "    role             = \"validator\" | \"full\" | \"light-client\" | \"archive\" | \"reporter\""
     );
-    eprintln!("    [reporter]       # required for role = reporter");
-    eprintln!("    reward_address_hex = \"<nonzero 32-byte account address>\"");
     eprintln!("    listen           = [\"<multiaddr>\"]      # defaults to /ip4/0.0.0.0/tcp/0");
     eprintln!("    bootnodes        = [\"<multiaddr>\"]");
     eprintln!("    data_dir         = \"/path/to/data\"");
-    eprintln!("    chain_spec_path  = \"/path/to/chain-spec.toml\"");
+    eprintln!(
+        "    network_key_path = \"/path/to/p2p-key\"   # defaults to data_dir/p2p-key, mode 0600"
+    );
     eprintln!("    proposer_ikm_path = \"/path/to/validator.ikm\"  # validator only, mode 0600");
     eprintln!("    proposer_index   = 0                    # validator only");
     eprintln!("    # or export NEUTRINO_PROPOSER_IKM_HEX=<64 hex chars> (takes precedence)");
     eprintln!("    subscribe_topics = [\"/neutrino/blocks/borsh\", ...]");
+    eprintln!();
+    eprintln!("    [reporter]       # required for role = reporter");
+    eprintln!("    reward_address_hex = \"<nonzero 32-byte account address>\"");
     eprintln!();
     eprintln!("    [proving]");
     eprintln!(
@@ -113,6 +120,14 @@ fn print_usage() {
         "    [metrics]                                # Prometheus text format at GET /metrics"
     );
     eprintln!("    listen           = \"127.0.0.1:9615\"");
+    eprintln!();
+    eprintln!(
+        "    [health]                                 # /health, /ready and /live on metrics listener"
+    );
+    eprintln!("    min_peers        = 1                     # 0 permits intentional isolation");
+    eprintln!(
+        "    # finality_stall_timeout_secs = 1800      # default max(1800, three nominal chunks)"
+    );
     eprintln!();
     eprintln!("    [execution]                              # WASM fuel/memory caps");
     eprintln!("    query_fuel       = 50000000");

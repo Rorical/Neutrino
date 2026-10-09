@@ -78,6 +78,7 @@ pub struct SyncStatus(Arc<SyncStatusInner>);
 struct SyncStatusInner {
     peers: AtomicU64,
     syncing: AtomicBool,
+    awaiting_first_peer: AtomicBool,
 }
 
 impl Default for SyncStatus {
@@ -87,6 +88,7 @@ impl Default for SyncStatus {
         Self(Arc::new(SyncStatusInner {
             peers: AtomicU64::new(0),
             syncing: AtomicBool::new(true),
+            awaiting_first_peer: AtomicBool::new(true),
         }))
     }
 }
@@ -106,7 +108,21 @@ impl SyncStatus {
         self.0.syncing.load(Ordering::Relaxed)
     }
 
+    /// `true` while the sync FSM is in [`SyncState::Init`], waiting for a
+    /// useful peer handshake rather than working on a known backfill target.
+    /// The value is initially `true` and may become `true` again after a reset;
+    /// it does not record whether this process has ever had a connected peer.
+    /// Operators can use this with a zero-peer policy for an intentionally
+    /// isolated development network without exempting backfill or stalled sync.
+    #[must_use]
+    pub fn awaiting_first_peer(&self) -> bool {
+        self.0.awaiting_first_peer.load(Ordering::Relaxed)
+    }
+
     fn publish(&self, peers: usize, state: &SyncState) {
+        self.0
+            .awaiting_first_peer
+            .store(matches!(state, SyncState::Init), Ordering::Relaxed);
         self.0
             .peers
             .store(u64::try_from(peers).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -1633,6 +1649,7 @@ mod status_tests {
         let status = SyncStatus::default();
         assert_eq!(status.peer_count(), 0);
         assert!(status.is_syncing());
+        assert!(status.awaiting_first_peer());
     }
 
     #[test]
@@ -1642,9 +1659,48 @@ mod status_tests {
         status.publish(3, &SyncState::Following);
         assert_eq!(observer.peer_count(), 3);
         assert!(!observer.is_syncing());
+        assert!(!observer.awaiting_first_peer());
 
         status.publish(0, &SyncState::Init);
         assert_eq!(observer.peer_count(), 0);
         assert!(observer.is_syncing());
+        assert!(observer.awaiting_first_peer());
+    }
+
+    #[test]
+    fn known_backfill_or_stalled_state_is_not_awaiting_first_peer() {
+        let status = SyncStatus::default();
+        for state in [
+            SyncState::CheckpointBackfill {
+                local_finalized_index: 0,
+                target_index: 9,
+                in_flight: false,
+            },
+            SyncState::HeaderBackfill {
+                local_head_height: 1,
+                target_height: 9,
+                in_flight: true,
+            },
+            SyncState::StateFetch {
+                target_state_root: [1; 32],
+            },
+            SyncState::ProofBackfill {
+                from_height: 1,
+                target_height: 9,
+                in_flight: false,
+            },
+            SyncState::BodyBackfill {
+                from_height: 1,
+                target_height: 9,
+                in_flight: true,
+            },
+            SyncState::Stalled {
+                reason: neutrino_network::sync::SyncStallReason::NoUsefulPeer,
+            },
+        ] {
+            status.publish(0, &state);
+            assert!(status.is_syncing());
+            assert!(!status.awaiting_first_peer());
+        }
     }
 }

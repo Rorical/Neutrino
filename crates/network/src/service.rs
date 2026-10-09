@@ -23,6 +23,7 @@
 //! public constructor for `InboundRequestId`.
 
 use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
+use crate::bootnodes::Bootnodes;
 use crate::rpc::{
     self, BftRoundByChunkCodec, BftRoundByChunkResponse, BlockProofByHashCodec,
     BlockProofByHashResponse, BlockProofByHeightCodec, BlockProofByHeightResponse,
@@ -47,7 +48,7 @@ use libp2p::{
     request_response::{
         self, OutboundFailure, OutboundRequestId, ProtocolSupport, ResponseChannel,
     },
-    swarm::SwarmEvent,
+    swarm::{DialError, SwarmEvent, dial_opts::DialOpts},
     tcp, yamux,
 };
 use neutrino_primitives::blake3_256;
@@ -73,6 +74,15 @@ pub enum NetworkError {
     /// System DNS resolver initialisation failed.
     #[error("dns transport error: {0}")]
     Dns(io::Error),
+    /// Operator-supplied bootnodes exceed bounds or name this node.
+    #[error("invalid bootnode configuration: {0}")]
+    Bootnodes(String),
+    /// A bound listener failed or stopped unexpectedly.
+    #[error("network listener failed: {0}")]
+    Listener(String),
+    /// The host stopped consuming events while network commands remain live.
+    #[error("network event receiver closed")]
+    EventReceiverClosed,
 }
 
 /// Events emitted by [`NetworkService`] for the host to consume.
@@ -370,6 +380,7 @@ pub struct NetworkService {
     command_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
     rpc: RpcDispatch,
+    bootnodes: Bootnodes,
 }
 
 impl NetworkService {
@@ -410,7 +421,35 @@ impl NetworkService {
             command_rx,
             event_tx,
             rpc: RpcDispatch::default(),
+            bootnodes: Bootnodes::default(),
         })
+    }
+
+    /// Configure persistent reconnects for at most 64 bootstrap addresses.
+    ///
+    /// Call before [`Self::run`]. Only these operator-supplied addresses are
+    /// retried: peer discovery cannot grow this set. Each address has one dial
+    /// in flight, known peer aliases share that restriction, and failures use
+    /// exponential backoff with identity/address-specific jitter (1–60 seconds).
+    /// A successful connection resets backoff; retries resume only when its last
+    /// connection closes. Bare addresses permit a changed remote identity, while
+    /// an explicit `/p2p/` suffix continues to authenticate the configured peer.
+    ///
+    /// # Errors
+    /// Rejects empty/oversized addresses, more than 64 entries and the local
+    /// peer identity. Validation leaves the previous configuration intact.
+    pub fn configure_bootnodes(&mut self, addresses: Vec<Multiaddr>) -> Result<(), NetworkError> {
+        let mut bootnodes = Bootnodes::configured(
+            *self.swarm.local_peer_id(),
+            addresses,
+            tokio::time::Instant::now(),
+        )
+        .map_err(NetworkError::Bootnodes)?;
+        for address in self.swarm.listeners() {
+            bootnodes.local_address(address);
+        }
+        self.bootnodes = bootnodes;
+        Ok(())
     }
 
     /// Begin listening on the given multiaddress.
@@ -429,17 +468,66 @@ impl NetworkService {
     }
 
     /// Drive the swarm and command queue until the command channel closes.
-    pub async fn run(mut self) {
+    ///
+    /// # Errors
+    /// Returns an error when a listener fails or the host event receiver closes.
+    pub async fn run(mut self) -> Result<(), NetworkError> {
         loop {
+            let retry_at = self.bootnodes.next_deadline();
             tokio::select! {
-                event = self.swarm.select_next_some() => self.handle_swarm_event(event).await,
+                event = self.swarm.select_next_some() => {
+                    match &event {
+                        SwarmEvent::ListenerError { listener_id, error } => {
+                            return Err(NetworkError::Listener(format!("{listener_id:?}: {error}")));
+                        }
+                        SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                            return Err(NetworkError::Listener(format!("{listener_id:?} closed: {reason:?}")));
+                        }
+                        _ => {}
+                    }
+                    self.handle_swarm_event(event).await;
+                },
+                () = wait_for_bootnode_retry(retry_at) => self.dial_due_bootnodes(),
+                () = self.event_tx.closed() => return Err(NetworkError::EventReceiverClosed),
                 command = self.command_rx.recv() => if let Some(cmd) = command {
                     self.handle_command(cmd);
                 } else {
                     debug!("command channel closed, network service shutting down");
-                    break;
+                    return Ok(());
                 }
             }
+        }
+    }
+
+    fn dial_due_bootnodes(&mut self) {
+        let now = tokio::time::Instant::now();
+        while let Some(index) = self.bootnodes.next_due(now) {
+            let address = self.bootnodes.address(index).clone();
+            let options = self.bootnodes.expected_peer(index).map_or_else(
+                || DialOpts::unknown_peer_id().address(address.clone()).build(),
+                |peer| {
+                    DialOpts::peer_id(peer)
+                        .addresses(vec![address.clone()])
+                        .build()
+                },
+            );
+            self.dial_bootnode(index, options);
+        }
+    }
+
+    fn dial_bootnode(&mut self, index: usize, options: DialOpts) {
+        let connection = options.connection_id();
+        if !self.bootnodes.start(index, connection) {
+            return;
+        }
+        info!(address = %self.bootnodes.address(index), "dialing configured bootnode");
+        if let Err(error) = self.swarm.dial(options) {
+            self.bootnodes.failed(
+                connection,
+                tokio::time::Instant::now(),
+                matches!(error, DialError::LocalPeerId { .. }),
+            );
+            debug!(%error, "bootnode dial deferred");
         }
     }
 
@@ -447,6 +535,7 @@ impl NetworkService {
     async fn handle_swarm_event(&mut self, event: SwarmEvent<NeutrinoBehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
+                self.bootnodes.local_address(&address);
                 info!(%address, "listening on new address");
                 let _ = self
                     .event_tx
@@ -454,20 +543,49 @@ impl NetworkService {
                     .await;
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                ..
             } => {
+                self.bootnodes
+                    .connected(peer_id, connection_id, endpoint.get_remote_address());
                 info!(%peer_id, ?endpoint, "connection established");
-                let _ = self
-                    .event_tx
-                    .send(NetworkEvent::PeerConnected(peer_id))
-                    .await;
+                if num_established.get() == 1 {
+                    let _ = self
+                        .event_tx
+                        .send(NetworkEvent::PeerConnected(peer_id))
+                        .await;
+                }
             }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                cause,
+                ..
+            } => {
+                self.bootnodes
+                    .disconnected(peer_id, num_established, tokio::time::Instant::now());
                 info!(%peer_id, ?cause, "connection closed");
-                let _ = self
-                    .event_tx
-                    .send(NetworkEvent::PeerDisconnected(peer_id))
-                    .await;
+                if num_established == 0 {
+                    let _ = self
+                        .event_tx
+                        .send(NetworkEvent::PeerDisconnected(peer_id))
+                        .await;
+                }
+            }
+            SwarmEvent::OutgoingConnectionError {
+                connection_id,
+                peer_id,
+                error,
+            } => {
+                self.bootnodes.failed(
+                    connection_id,
+                    tokio::time::Instant::now(),
+                    matches!(error, DialError::LocalPeerId { .. }),
+                );
+                debug!(?peer_id, %error, "outgoing connection failed");
             }
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
@@ -594,6 +712,10 @@ impl NetworkService {
     fn handle_command(&mut self, command: NetworkCommand) {
         match command {
             NetworkCommand::Dial(addr) => {
+                if let Some(index) = self.bootnodes.manual_target(&addr) {
+                    self.dial_bootnode(index, DialOpts::from(addr));
+                    return;
+                }
                 info!(%addr, "dialing peer");
                 if let Err(err) = self.swarm.dial(addr) {
                     error!(?err, "dial failed");
@@ -2052,6 +2174,18 @@ impl NetworkService {
         }
     }
 }
+
+async fn wait_for_bootnode_retry(at: Option<tokio::time::Instant>) {
+    if let Some(at) = at {
+        tokio::time::sleep_until(at).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+#[path = "service_bootnode_tests.rs"]
+mod bootnode_tests;
 
 /// Build the composed Neutrino behaviour.
 fn build_behaviour(

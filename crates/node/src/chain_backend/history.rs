@@ -304,9 +304,9 @@ where
         {
             return;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         if self
             .with_engine(|engine| engine.store().history_domain().ok().flatten())
             .is_none()
@@ -325,7 +325,7 @@ where
             publisher: self.publisher_snapshot(),
             metrics: Arc::clone(&self.metrics),
         };
-        runtime.spawn(actor.run());
+        self.spawn_background_worker("history", actor.run());
     }
 
     /// Stop admission and drain a running proof before releasing its dependencies.
@@ -594,6 +594,14 @@ where
             run_job(&engine, prover.as_ref(), &budget, &state, &metrics, work)
         })
         .await;
+        let result = match result {
+            Err(error) if error.is_panic() => {
+                self.state.running.store(false, Ordering::Release);
+                self.state.idle.notify_waiters();
+                std::panic::resume_unwind(error.into_panic());
+            }
+            result => result,
+        };
         let completed = self.finish(job, result);
         self.state.running.store(false, Ordering::Release);
         self.state.idle.notify_waiters();
@@ -984,7 +992,7 @@ where
                 let right = self.prove_range(split, end, false);
                 let left = left
                     .join()
-                    .map_err(|_| "history worker panicked".to_owned())?;
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 Ok((left?, right?))
             })
         } else {

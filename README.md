@@ -95,9 +95,39 @@ the spec file is distributed. The validator key is read from `NEUTRINO_PROPOSER_
 or an owner-only key file, never from the config. The RPC server caps concurrent
 requests, per-connection request rate, batch size and `runtime_call` wall time, and
 WASM queries run under fuel and memory budgets (`[rpc]` and `[execution]` in the config).
+The `validator` role requires a proposer key; use `role = "full"` for a node
+that participates without signing or producing blocks.
 A `[metrics]` listener exposes Prometheus text at `GET /metrics`: head and finality
 heights, history-proof lag, peers, mempool, BFT session flags, proof queue depth, proving
 latency histograms per stage and the fact coverage of the last chunk proof.
+
+P2P identities persist in `data_dir/p2p-key`, or in the explicit
+`network_key_path` file. The node creates an owner-only key atomically on first
+startup and reuses it on restart; a corrupt or incorrectly permissioned key fails
+startup. With neither path configured the identity is temporary. Configured
+`bootnodes` are retried with bounded exponential backoff and jitter, including
+after disconnection; use fixed listening ports and `/p2p/<PeerId>` addresses for
+private validators. The node logs its public Peer ID at startup.
+
+The metrics listener also serves `GET /health` and `/ready`: HTTP 200 means
+startup completed, authenticated bootstrap and sync completed, any proof-only
+trust anchor remains valid, enough peers are
+connected, any configured history backlog limit is satisfied, and finality has
+not stalled. Otherwise they return HTTP 503 and a short reason. `GET /live`
+checks lifecycle and the sampler heartbeat, independently of peer connectivity
+or chain progress. Health is sampled once per second even without HTTP requests.
+The `[health]` configuration defaults to `min_peers = 1`; set it to zero for an
+intentionally isolated node. Zero also permits the initial wait for a first peer,
+while a known unfinished backfill still fails readiness.
+`finality_stall_timeout_secs` overrides the default
+of the larger of 1800 seconds or three nominal chunk durations; configure it to
+cover the measured proving latency of the staging machines. These checks report
+local operational state, not global agreement among validators.
+
+Critical networking, synchronization, consensus and proving workers are supervised.
+Unexpected return, failure or panic terminates the node with a nonzero exit status
+and the worker name in its error, allowing a service manager to restart it. Startup
+listener failures are fatal. SIGINT and SIGTERM perform bounded normal shutdown.
 
 ## Design Documents
 

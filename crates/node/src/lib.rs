@@ -18,6 +18,8 @@ pub mod chain_spec;
 pub mod config;
 pub mod db;
 pub mod genesis;
+pub(crate) mod health;
+pub(crate) mod identity;
 pub mod metrics;
 pub(crate) mod producer;
 pub mod programs;
@@ -36,3 +38,4 @@ pub use runner::{NodeError, run};
 
 mod proof_queue;
 mod proving_budget;
+pub(crate) mod supervision;

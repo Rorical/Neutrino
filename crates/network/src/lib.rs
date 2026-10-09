@@ -13,6 +13,7 @@
 
 /// Core libp2p behaviour composition for Neutrino.
 pub mod behaviour;
+mod bootnodes;
 /// Request/response RPC wire types and codec.
 pub mod rpc;
 /// The main networking service driving the swarm event loop.

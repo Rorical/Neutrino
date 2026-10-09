@@ -46,9 +46,9 @@ where
         }) else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         if self.evidence_job_running.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -62,7 +62,7 @@ where
         let budget = Arc::clone(&self.proving_budget);
         let running = Arc::clone(&self.evidence_job_running);
         let publisher = self.publisher_snapshot();
-        runtime.spawn(async move {
+        self.spawn_background_job("evidence", async move {
             let result = tokio::task::spawn_blocking(move || {
                 let mut produced = Vec::new();
                 let mut batches = vec![witnesses];
@@ -119,6 +119,7 @@ where
                         }
                     }
                 }
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
                 Err(error) => tracing::warn!(
                     ?error,
                     "evidence worker failed; raw evidence retained for retry"
@@ -287,6 +288,7 @@ where
         let mut report = match result {
             Ok(Ok(report)) => report,
             Ok(Err(_)) => return Rejected,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
             Err(_) => return Deferred,
         };
         self.with_engine_mut(|engine| {

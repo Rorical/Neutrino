@@ -79,7 +79,7 @@ where
         let notify = Arc::clone(&self.consensus_proof_notify);
         let metrics = Arc::clone(&self.metrics);
         let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
+        self.spawn_background_job("consensus-proof", async move {
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Critical);
                 if engine
@@ -106,7 +106,12 @@ where
                 Ok((prepared.witness, proof?))
             })
             .await
-            .unwrap_or(Err(ProofError::InvalidWitness));
+            .unwrap_or_else(|error| {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                Err(ProofError::InvalidWitness)
+            });
             let _ = tx.send(result);
             notify.notify_one();
         });

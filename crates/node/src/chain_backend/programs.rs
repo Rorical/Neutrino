@@ -203,7 +203,11 @@ where
             }
         };
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::spawn_blocking(install);
+            self.spawn_background_job("program-restore", async move {
+                tokio::task::spawn_blocking(install)
+                    .await
+                    .expect("program restore worker panicked");
+            });
         } else {
             install();
         }
@@ -255,7 +259,11 @@ where
                 };
                 // SP1 setup is slow; keep it off async workers when possible.
                 if tokio::runtime::Handle::try_current().is_ok() {
-                    tokio::task::spawn_blocking(install);
+                    self.spawn_background_job("program-install", async move {
+                        tokio::task::spawn_blocking(install)
+                            .await
+                            .expect("program installation worker panicked");
+                    });
                 } else {
                     install();
                 }

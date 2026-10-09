@@ -87,7 +87,8 @@ pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
                         info!(height = proven.public_inputs.height, ?hash, "proved and published block");
                     }
                     Ok(Err(error)) => { failed.insert(hash); warn!(%error, ?hash, "block proof failed; retry on next slot"); }
-                    Err(error) => { failed.insert(hash); warn!(%error, ?hash, "block prover panicked; retry on next slot"); }
+                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                    Err(error) => { failed.insert(hash); warn!(%error, ?hash, "block prover cancelled; retry on next slot"); }
                 }
             }
             () = tokio::time::sleep_until(tick) => {
@@ -130,7 +131,8 @@ async fn attempt_slot<P: ProgramProver + 'static>(
             debug!(slot, parent_slot, "slot already covered by local head");
         }
         Ok(Err(error)) => warn!(slot, %error, "block production failed"),
-        Err(error) => warn!(slot, %error, "block production task panicked"),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => warn!(slot, %error, "block production task cancelled"),
     }
 }
 

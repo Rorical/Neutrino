@@ -16,23 +16,47 @@ where
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
-        let (peers, syncing) = self.sync_status().map_or((0, false), |status| {
-            (status.peer_count(), status.is_syncing())
-        });
+        let (peers, syncing, sync_awaiting_peer) =
+            self.sync_status().map_or((0, true, false), |status| {
+                (
+                    status.peer_count(),
+                    status.is_syncing(),
+                    status.awaiting_first_peer(),
+                )
+            });
         let mempool = u64::try_from(self.mempool_len()).unwrap_or(u64::MAX);
         let policy = self.backlog_policy();
         let history_lag_exceeded = self.history_lag_exceeded().is_some();
+        let bootstrap_pending = self.bootstrap_pending();
+        let (checkpoint, trust_anchor_expired) = self
+            .light_health()
+            .map_or((None, false), |(checkpoint, expired)| {
+                (Some(checkpoint), expired)
+            });
         self.with_engine(|engine| MetricsSnapshot {
-            head_height: engine.head_height(),
-            finalized_chunks: engine.finalized_next_chunk_id(),
-            recursive_covered_chunks: engine.recursive_covered_chunks(),
+            head_height: checkpoint.map_or_else(|| engine.head_height(), |c| c.boundary.height),
+            finalized_chunks: checkpoint.map_or_else(
+                || engine.finalized_next_chunk_id(),
+                |c| c.boundary.next_chunk_id,
+            ),
+            recursive_covered_chunks: checkpoint.map_or_else(
+                || engine.recursive_covered_chunks(),
+                |c| c.boundary.next_chunk_id,
+            ),
             pruned_before_chunk: engine
                 .retention_info()
                 .map_or(0, |info| info.pruned_before_chunk),
-            active_validators: u64::try_from(engine.active_validator_set().len())
-                .unwrap_or(u64::MAX),
+            // A proof-only checkpoint commits to the validator root, not a
+            // validator list. Do not expose the unrelated genesis engine set.
+            active_validators: checkpoint.map_or_else(
+                || u64::try_from(engine.active_validator_set().len()).unwrap_or(u64::MAX),
+                |_| 0,
+            ),
             peers,
             syncing,
+            sync_awaiting_peer,
+            bootstrap_pending,
+            trust_anchor_expired,
             mempool,
             bft_sessions: engine
                 .bft_session_overview()

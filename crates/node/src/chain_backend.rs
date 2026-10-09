@@ -158,6 +158,8 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     /// Content hashes governance named at the last program sync; served to
     /// the status RPC so an unauthenticated call never runs a runtime query.
     wanted_programs: Mutex<Vec<Hash>>,
+    /// Runner ownership for workers that would otherwise outlive its task.
+    background_tasks: Mutex<Option<crate::supervision::TaskSpawner>>,
 }
 
 type ConsensusProofTask<P> = (
@@ -293,6 +295,54 @@ where
             programs: Mutex::new(Arc::new(crate::programs::ProgramStore::in_memory())),
             installing_programs: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wanted_programs: Mutex::new(Vec::new()),
+            background_tasks: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_task_spawner(&self, spawner: crate::supervision::TaskSpawner) {
+        *self
+            .background_tasks
+            .lock()
+            .expect("background tasks mutex") = Some(spawner);
+    }
+
+    fn spawn_background_worker(
+        &self,
+        name: &'static str,
+        future: impl core::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let spawner = self
+            .background_tasks
+            .lock()
+            .expect("background tasks mutex")
+            .clone();
+        if let Some(spawner) = spawner {
+            let _ = spawner.spawn_critical(name, async move {
+                future.await;
+                Ok(())
+            });
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(future);
+        }
+    }
+
+    fn spawn_background_job(
+        &self,
+        name: &'static str,
+        future: impl core::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let spawner = self
+            .background_tasks
+            .lock()
+            .expect("background tasks mutex")
+            .clone();
+        if let Some(spawner) = spawner {
+            let _ = spawner.spawn_job(name, async move {
+                future.await;
+                Ok(())
+            });
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(future);
         }
     }
 

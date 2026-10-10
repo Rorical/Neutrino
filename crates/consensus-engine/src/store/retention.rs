@@ -6,7 +6,7 @@ use neutrino_primitives::{ChainSpec, Hash};
 use neutrino_storage::{Batch, Column, Database};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{ChainStore, StoreError};
+use super::{ChainStore, StoreError, keys};
 use crate::{RetentionInfo, RetentionPolicy};
 
 pub(super) const RETENTION_KEY: &[u8] = b"history_retention";
@@ -59,7 +59,8 @@ impl<DB: Database> ChainStore<DB> {
         policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
         let mut info = self.retention_info()?;
-        let archive = info.policy == RetentionPolicy::Archive;
+        let stored = info.policy;
+        let archive = stored == RetentionPolicy::Archive;
         if policy == RetentionPolicy::Archive
             && !archive
             && (info.pruned_before_chunk != 0
@@ -97,11 +98,10 @@ impl<DB: Database> ChainStore<DB> {
             {
                 batch.delete(Column::HistoryNodes, key);
             }
-            let current = self
-                .get_latest_finalized_chunk_id()?
-                .map_or(0, |id| id.saturating_add(1));
+            let current = self.finalized_count()?;
             let prefix = self.get_recursive_covered_chunks()?.unwrap_or(0);
-            self.prune_history_cache_batch(&mut batch, current, prefix)?;
+            // Until this batch commits, the stored policy is still the old one.
+            self.prune_history_cache_batch(&mut batch, current, prefix, stored)?;
             self.prune_history_frontiers_batch(&mut batch, current, prefix)?;
         }
         batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
@@ -150,8 +150,10 @@ impl<DB: Database> ChainStore<DB> {
             return Err(StoreError::Corrupt("retention coverage is inconsistent"));
         }
         let mut batch = Batch::new();
+        let pins = self.history_dependencies()?;
         let boundaries = self.prune_history_artifacts(
             &mut batch,
+            &pins,
             info.pruned_before_chunk,
             prefix.statement.range_id(),
         )?;
@@ -163,17 +165,18 @@ impl<DB: Database> ChainStore<DB> {
             spec.runtime.unbonding_delay_blocks,
             spec.consensus.chunk_size,
         );
+        let finalized_count = self.finalized_count()?;
+        let record_floor = finalized_count.saturating_sub(record_window);
         self.prune_count_columns(
             &mut batch,
+            &pins,
             info.pruned_before_chunk,
             &boundaries,
-            record_window,
+            record_floor,
         )?;
         let roots = self.prune_blocks(&mut batch, info)?;
-        let finalized_count = self
-            .get_latest_finalized_chunk_id()?
-            .map_or(0, |id| id.saturating_add(1));
-        self.prune_history_cache_batch(&mut batch, finalized_count, coverage)?;
+        let policy = self.retention_info()?.policy;
+        self.prune_history_cache_batch(&mut batch, finalized_count, coverage, policy)?;
         self.prune_evidence(
             &mut batch,
             spec,
@@ -181,8 +184,7 @@ impl<DB: Database> ChainStore<DB> {
                 finalized_count
                     .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS),
             ),
-            info.pruned_before_chunk
-                .min(finalized_count.saturating_sub(record_window)),
+            info.pruned_before_chunk.min(record_floor),
         )?;
         batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
         Ok((batch, roots))
@@ -191,13 +193,14 @@ impl<DB: Database> ChainStore<DB> {
     fn prune_history_artifacts(
         &self,
         batch: &mut Batch,
+        pins: &[HistoryDependencies],
         floor: u64,
         latest: Hash,
     ) -> Result<BTreeSet<u64>, StoreError<DB::Error>> {
-        let pins = self.history_dependencies()?;
         let progress: BTreeSet<Hash> = pins.iter().filter_map(|pin| pin.progress).collect();
+        let mut missing = progress.clone();
         let mut boundaries = BTreeSet::from([0, floor]);
-        for pin in &pins {
+        for pin in pins {
             boundaries.insert(pin.start);
             boundaries.insert(pin.end);
         }
@@ -211,6 +214,7 @@ impl<DB: Database> ChainStore<DB> {
             if key.as_slice() != id {
                 return Err(StoreError::Corrupt("history receipt key mismatch"));
             }
+            missing.remove(&id);
             let start = proof.statement.start.next_chunk_id;
             let end = proof.statement.end.next_chunk_id;
             let pinned = progress.contains(&id)
@@ -221,17 +225,13 @@ impl<DB: Database> ChainStore<DB> {
             } else {
                 batch.delete(Column::HistoryProofs, key);
                 batch.delete(Column::HistoryRangeCache, id);
-                let mut range = [0; 16];
-                range[..8].copy_from_slice(&start.to_be_bytes());
-                range[8..].copy_from_slice(&end.to_be_bytes());
-                batch.delete(Column::HistoryRangeIndex, range);
+                batch.delete(Column::HistoryRangeIndex, keys::pair_key(start, end));
             }
         }
         // A missing progress artifact is a violated durable pin, never grounds for deletion.
-        for id in progress {
-            if self.history_proof(&id)?.is_none() {
-                return Err(StoreError::Corrupt("pinned progress receipt is missing"));
-            }
+        // The scan above decoded every key-checked receipt, so absence from it is final.
+        if !missing.is_empty() {
+            return Err(StoreError::Corrupt("pinned progress receipt is missing"));
         }
         Ok(boundaries)
     }
@@ -239,14 +239,11 @@ impl<DB: Database> ChainStore<DB> {
     fn prune_count_columns(
         &self,
         batch: &mut Batch,
+        pins: &[HistoryDependencies],
         floor: u64,
         boundaries: &BTreeSet<u64>,
-        record_window: u64,
+        record_floor: u64,
     ) -> Result<(), StoreError<DB::Error>> {
-        let pins = self.history_dependencies()?;
-        let record_floor = self
-            .get_latest_finalized_chunk_id()?
-            .map_or(0, |id| id.saturating_add(1).saturating_sub(record_window));
         let checkpoint_count = self.get_recursive_covered_chunks()?.unwrap_or(0);
         let checkpoint_floor = checkpoint_count
             .saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
@@ -434,13 +431,10 @@ impl<DB: Database> ChainStore<DB> {
         record_floor: u64,
     ) -> Result<(), StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::SanctionKind;
-        for artifact in self.evidence_artifacts()? {
-            let expired = artifact.statement.kind == SanctionKind::Inactivity
-                && artifact.statement.context.chunk_id < liveness_floor;
-            if expired || self.is_receipt_finalized(&artifact.statement)? {
-                batch.delete(Column::EvidenceProofs, artifact.statement_id());
-            }
-        }
+        self.drop_stale_evidence_batch(batch, |statement| {
+            statement.kind == SanctionKind::Inactivity
+                && statement.context.chunk_id < liveness_floor
+        })?;
         for (key, evidence) in self.iter_slashing_evidence()? {
             let Ok(chunk_id) = neutrino_prover_chunk::history::evidence_chunk_id(spec, &evidence)
             else {

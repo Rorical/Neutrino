@@ -1,5 +1,6 @@
 //! Selective, durable forensic discovery without widening live BFT history admission.
 
+use crate::availability::carried_quorums;
 use crate::{Engine, RetentionPolicy, SlashingError, SlashingMonitor, StoreError};
 use neutrino_consensus_types::signed_artifacts::SignedArtifact;
 use neutrino_consensus_types::{
@@ -56,17 +57,8 @@ impl<DB: Database> Engine<DB> {
         &self,
         chunk: u64,
     ) -> Result<(Vec<Validator>, Seed), SlashingError> {
-        if let Ok(validators) = self.accountability_validators(chunk) {
-            let seed = if chunk == self.finalized_next_chunk_id() {
-                self.finalized_seed()
-            } else {
-                self.store()
-                    .historical_chunk(chunk)
-                    .map_err(|_| SlashingError::NotYetFinalizedLocally)?
-                    .ok_or(SlashingError::NotYetFinalizedLocally)?
-                    .seed
-            };
-            return Ok((validators, seed));
+        if let Ok(context) = self.accountability_context(chunk) {
+            return Ok(context);
         }
         if self
             .retention_info()
@@ -98,10 +90,8 @@ impl<DB: Database> Engine<DB> {
         &self,
         header: &Header,
     ) -> Result<(Vec<Validator>, Seed), SlashingError> {
-        let chunk = header
-            .height
-            .checked_sub(1)
-            .and_then(|h| h.checked_div(self.chain_spec().consensus.chunk_size))
+        let chunk = self
+            .chunk_of_height(header.height)
             .ok_or(SlashingError::EvidenceFieldsInconsistent)?;
         let context = self.forensic_context(chunk)?;
         let validator = context
@@ -166,19 +156,14 @@ impl<DB: Database> Engine<DB> {
         let mut headers = self.store().reporter_headers_for_chunk(chunk)?;
         headers.sort_by_key(|header| (header.slot, header.hash()));
         for header in headers {
-            if header
-                .height
-                .checked_sub(1)
-                .and_then(|h| h.checked_div(self.chain_spec().consensus.chunk_size))
-                != Some(chunk)
-            {
+            if self.chunk_of_height(header.height) != Some(chunk) {
                 continue;
             }
             if let Ok((validators, seed)) = self.forensic_header_context(&header)
                 && crate::signature::verify_header_signature(
                     &header,
                     &validators,
-                    self.chain_spec().consensus_domain(),
+                    self.consensus_domain(),
                 )
                 .is_ok()
             {
@@ -186,7 +171,7 @@ impl<DB: Database> Engine<DB> {
                 if let Err(error) = neutrino_consensus_vrf::verify_header_proposer(
                     &header,
                     &validators,
-                    self.chain_spec().consensus_domain(),
+                    self.consensus_domain(),
                     &seed,
                     self.chain_spec().consensus.expected_proposers_per_slot,
                 ) && let Some(reason) = crate::vrf_rejection_reason(&error)
@@ -220,7 +205,7 @@ impl<DB: Database> Engine<DB> {
                 .unwrap_or_default();
             let params = &self.chain_spec().consensus;
             if neutrino_prover_chunk::slashing::verify_quorum_using(
-                self.chain_spec().consensus_domain(),
+                self.consensus_domain(),
                 &validators,
                 quorum,
                 (
@@ -234,37 +219,8 @@ impl<DB: Database> Engine<DB> {
                 monitor.record_prevote_quorum(quorum.clone());
             }
         };
-        match artifact {
-            SignedArtifact::Quorum(quorum) => record(quorum),
-            SignedArtifact::Vote(vote) => {
-                for quorum in vote
-                    .attestations
-                    .iter()
-                    .filter_map(|claim| claim.unlock_quorum.as_ref())
-                {
-                    record(quorum);
-                }
-            }
-            SignedArtifact::Proposal(value) => {
-                if let Some(quorum) = &value.valid_quorum {
-                    record(quorum);
-                }
-            }
-            SignedArtifact::RoundChange(value) => {
-                if let Some(quorum) = &value.highest_quorum {
-                    record(quorum);
-                }
-            }
-            SignedArtifact::RoundChangeCertificate(value) => {
-                for quorum in value
-                    .reports
-                    .iter()
-                    .filter_map(|report| report.highest_quorum.as_ref())
-                {
-                    record(quorum);
-                }
-            }
-            _ => {}
+        for quorum in carried_quorums(artifact) {
+            record(quorum);
         }
         if let SignedArtifact::Vote(vote) = artifact
             && vote.data.phase == FinalityVotePhase::Prevote

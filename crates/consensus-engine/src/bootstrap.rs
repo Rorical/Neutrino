@@ -4,7 +4,7 @@ use crate::{Engine, FinalizeError, RetentionPolicy, StoreError};
 use neutrino_consensus_types::history::{HISTORY_RETENTION_CHUNKS, HistoryFrontier};
 use neutrino_consensus_types::history_proof::ConsensusBoundary;
 use neutrino_consensus_types::{Checkpoint, Header};
-use neutrino_primitives::{ChainSpec, Validator};
+use neutrino_primitives::{ConsensusDomain, ConsensusParams, Validator};
 use neutrino_proof_system::{ProofError, VerifiedHistory};
 use neutrino_prover_chunk::{
     consensus::{context_boundary, genesis_context},
@@ -20,6 +20,29 @@ impl<DB: Database> Engine<DB> {
             return Err(StoreError::Corrupt(
                 "bootstrap would skip tracked reporter append data",
             ));
+        }
+        Ok(())
+    }
+
+    /// Reject a bootstrap to `count` while a persisted BFT session at or past
+    /// it still holds a lock that installation would discard.
+    fn ensure_no_unfinalized_lock(&self, count: u64) -> Result<(), FinalizeError<DB::Error>> {
+        for (key, _) in self
+            .store()
+            .db()
+            .iter_column(neutrino_storage::Column::BftSessions)
+            .map_err(StoreError::Database)?
+        {
+            let id = u64::from_be_bytes(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Corrupt("invalid BFT session key"))?,
+            );
+            if id >= count {
+                return Err(
+                    StoreError::Corrupt("bootstrap would discard an unfinalized lock").into(),
+                );
+            }
         }
         Ok(())
     }
@@ -80,23 +103,7 @@ impl<DB: Database> Engine<DB> {
         {
             return Err(ProofError::PublicInputMismatch.into());
         }
-        for (key, _) in self
-            .store()
-            .db()
-            .iter_column(neutrino_storage::Column::BftSessions)
-            .map_err(StoreError::Database)?
-        {
-            let id = u64::from_be_bytes(
-                key.as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Corrupt("invalid BFT session key"))?,
-            );
-            if id >= count {
-                return Err(
-                    StoreError::Corrupt("bootstrap would discard an unfinalized lock").into(),
-                );
-            }
-        }
+        self.ensure_no_unfinalized_lock(count)?;
         if !self
             .store()
             .history_dependencies_for_bootstrap()?
@@ -113,7 +120,14 @@ impl<DB: Database> Engine<DB> {
         }) {
             return Err(ProofError::InvalidWitness.into());
         }
-        authenticate_history(spec, &end, header, frontier, recent)?;
+        authenticate_history(
+            self.consensus_domain(),
+            &spec.consensus,
+            &end,
+            header,
+            frontier,
+            recent,
+        )?;
         let before = (state.node_count(), state.value_count());
         state
             .retain_roots(&[])
@@ -147,7 +161,8 @@ impl<DB: Database> Engine<DB> {
 }
 
 fn authenticate_history(
-    spec: &ChainSpec,
+    domain: ConsensusDomain,
+    params: &ConsensusParams,
     end: &ConsensusBoundary,
     header: &Header,
     frontier: &HistoryFrontier,
@@ -162,8 +177,8 @@ fn authenticate_history(
         .map_err(|_| ProofError::InvalidWitness)?;
     for opening in recent {
         neutrino_prover_chunk::finality::verify_finality(
-            spec.consensus_domain(),
-            &spec.consensus,
+            domain,
+            params,
             &opening.record.validators,
             &opening.record.chunk,
             &opening.record.finality,
@@ -178,7 +193,7 @@ fn authenticate_history(
     {
         return Err(ProofError::PublicInputMismatch);
     }
-    crate::verify_header_signature(header, &last.record.validators, spec.consensus_domain())
+    crate::verify_header_signature(header, &last.record.validators, domain)
         .map_err(|_| ProofError::InvalidWitness)?;
     Ok(())
 }

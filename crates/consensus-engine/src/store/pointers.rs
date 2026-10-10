@@ -30,6 +30,9 @@ pub const LATEST_VALIDATOR_SET_INDEX: &[u8] = b"latest_vs_idx";
 /// BLAKE3 hash of the borsh-encoded chain spec.
 pub const CHAIN_SPEC_HASH: &[u8] = b"chain_spec_hash";
 
+/// Trusted history proof profile, persisted independently of peer proof envelopes.
+pub const HISTORY_PROOF_DOMAIN: &[u8] = b"history_proof_domain";
+
 /// Authenticated consensus boundary and the full next execution context.
 pub const CONSENSUS_STATE: &[u8] = b"full_consensus_state";
 

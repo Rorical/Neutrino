@@ -3,6 +3,7 @@
 use super::{ChainStore, StoreError};
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::signed_artifacts::SignedArtifact;
+use neutrino_primitives::BlsPublicKey;
 use neutrino_prover_chunk::history::HistoricalOpening;
 use neutrino_storage::{Batch, BatchOp, Column, Database};
 use std::collections::BTreeMap;
@@ -103,12 +104,21 @@ impl ReporterStorageStats {
         change(self.inventory(column), key.len() + bytes.len(), add)?;
         if column == Column::ReporterSources {
             let owned: super::reporter::Owned<SignedArtifact> = borsh::from_slice(bytes)?;
+            // `Owned` encodes a u32 owner count and the owner keys before the
+            // value, and decoding consumed every byte: the rest is the value.
+            let value_bytes = owned
+                .owners
+                .len()
+                .checked_mul(size_of::<BlsPublicKey>())
+                .and_then(|owners| owners.checked_add(size_of::<u32>()))
+                .and_then(|prefix| bytes.len().checked_sub(prefix))
+                .ok_or(StoreError::Corrupt("retention metric bytes"))?;
             let target = if matches!(owned.value, SignedArtifact::BlockProof(_)) {
                 &mut self.proof_dependencies
             } else {
                 &mut self.signed_artifacts
             };
-            change(target, borsh::object_length(&owned.value)?, add)?;
+            change(target, value_bytes, add)?;
             change_signatures(&mut self.signatures, source_signatures(&owned.value), add)?;
         } else if column == Column::ReporterHistory {
             let owned: super::reporter::Owned<HistoricalOpening> = borsh::from_slice(bytes)?;

@@ -34,11 +34,39 @@ pub type ValidatorSetSnapshot = Vec<Validator>;
 /// clippy::type_complexity.
 pub type ContentAddressedEntries = Vec<(Hash, Vec<u8>)>;
 
+/// Maximum pooled evidence reports, active and dormant together.
+const MAX_POOLED_REPORTS: usize = 256;
+/// Maximum stored bytes of pooled evidence reports, active and dormant together.
+const MAX_POOLED_REPORT_BYTES: usize = 32 * 1024 * 1024;
+
 /// A locally authenticated anchor remains available for dormant reports after bootstrap.
 #[derive(BorshSerialize, BorshDeserialize)]
 struct StoredEvidenceReport {
     report: neutrino_consensus_types::evidence::EvidenceReport,
     history_root: Hash,
+}
+
+/// Serialize-only borrowed twin of [`StoredEvidenceReport`] with an identical encoding.
+#[derive(BorshSerialize)]
+struct StoredEvidenceReportRef<'a> {
+    report: &'a neutrino_consensus_types::evidence::EvidenceReport,
+    history_root: Hash,
+}
+
+/// Stage both checkpoint index entries, by covered count and by semantic hash,
+/// from one encoding.
+pub(super) fn put_checkpoint_batch<E>(
+    batch: &mut neutrino_storage::Batch,
+    checkpoint: &Checkpoint,
+) -> Result<(), StoreError<E>> {
+    let bytes = borsh::to_vec(checkpoint)?;
+    batch.put(
+        Column::Checkpoints,
+        keys::chunk_id_key(checkpoint.boundary.next_chunk_id),
+        bytes.as_slice(),
+    );
+    batch.put(Column::Checkpoints, checkpoint.hash(), bytes);
+    Ok(())
 }
 
 fn evidence_report_root(
@@ -136,52 +164,41 @@ impl<DB: Database> ChainStore<DB> {
         {
             return Err(invalid("evidence receipt size"));
         }
-        if report.history.index != artifact.statement.context.chunk_id
-            || report.history.index >= report.history.count
-            || report.history.siblings.len() != neutrino_consensus_types::history::HISTORY_DEPTH
-        {
-            return Err(invalid("evidence history path shape"));
-        }
-        let history_root = evidence_report_root(report)
-            .ok_or(StoreError::Corrupt("evidence history path shape"))?;
+        // The root exists exactly when the path has the canonical shape.
+        let history_root =
+            evidence_report_root(report).ok_or_else(|| invalid("evidence history path shape"))?;
         if let Some(state) = self.get_consensus_state()?
             && (report.history.count != state.boundary.next_chunk_id
                 || history_root != state.boundary.history_root)
         {
             return Err(StoreError::Corrupt("evidence history path is not current"));
         }
+        let id = artifact.statement_id();
+        // Preserve the first verified receipt; a holder may refresh its dormant opening.
+        if let Some(bytes) = self.get_raw(Column::EvidenceProofs, &id)? {
+            let mut stored: StoredEvidenceReport = borsh::from_slice(&bytes)?;
+            if report.history.count > stored.report.history.count {
+                stored.report.history = report.history.clone();
+                stored.history_root = history_root;
+                self.put_raw(Column::EvidenceProofs, &id, &borsh::to_vec(&stored)?)?;
+            }
+            return Ok(false);
+        }
+        let bytes = borsh::to_vec(&StoredEvidenceReportRef {
+            report,
+            history_root,
+        })?;
         let entries = self
             .db
             .iter_column(Column::EvidenceProofs)
             .map_err(StoreError::Database)?;
-        // Preserve the first verified receipt; a holder may refresh its dormant opening.
-        if let Some((_, bytes)) = entries
-            .iter()
-            .find(|(key, _)| key.as_slice() == artifact.statement_id())
-        {
-            let mut stored: StoredEvidenceReport = borsh::from_slice(bytes)?;
-            if report.history.count > stored.report.history.count {
-                stored.report.history = report.history.clone();
-                stored.history_root = history_root;
-                self.put_raw(
-                    Column::EvidenceProofs,
-                    &artifact.statement_id(),
-                    &borsh::to_vec(&stored)?,
-                )?;
-            }
-            return Ok(false);
-        }
-        let bytes = borsh::to_vec(&StoredEvidenceReport {
-            report: report.clone(),
-            history_root,
-        })?;
-        if entries.len() >= 256
+        if entries.len() >= MAX_POOLED_REPORTS
             || entries.iter().map(|(_, value)| value.len()).sum::<usize>() + bytes.len()
-                > 32 * 1024 * 1024
+                > MAX_POOLED_REPORT_BYTES
         {
             return Err(invalid("evidence pool capacity"));
         }
-        self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)?;
+        self.put_raw(Column::EvidenceProofs, &id, &bytes)?;
         Ok(true)
     }
 
@@ -192,14 +209,13 @@ impl<DB: Database> ChainStore<DB> {
     ) -> Result<(), StoreError<DB::Error>> {
         let history_root = evidence_report_root(report)
             .ok_or(StoreError::Corrupt("evidence history path shape"))?;
-        let stored = StoredEvidenceReport {
-            report: report.clone(),
-            history_root,
-        };
         batch.put(
             Column::EvidenceProofs,
             report.artifact.statement_id(),
-            borsh::to_vec(&stored)?,
+            borsh::to_vec(&StoredEvidenceReportRef {
+                report,
+                history_root,
+            })?,
         );
         Ok(())
     }
@@ -214,25 +230,34 @@ impl<DB: Database> ChainStore<DB> {
     ) -> Result<(), StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::SanctionKind;
         let mut batch = neutrino_storage::Batch::new();
-        for artifact in self.evidence_artifacts()? {
-            // Liveness receipts expire with their window. Safety receipts have
-            // no age window: they leave only when finalized blocks consumed
-            // their offence or sanctioned their identity.
-            let expired = match artifact.statement.kind {
-                SanctionKind::Slash => false,
-                SanctionKind::Inactivity => {
-                    finalized_height.saturating_sub(artifact.statement.context.end_height)
-                        >= liveness_max_age
-                }
-            };
-            if expired || self.is_receipt_finalized(&artifact.statement)? {
-                batch.delete(Column::EvidenceProofs, artifact.statement_id());
+        // Liveness receipts expire with their window. Safety receipts have
+        // no age window: they leave only when finalized blocks consumed
+        // their offence or sanctioned their identity.
+        self.drop_stale_evidence_batch(&mut batch, |statement| match statement.kind {
+            SanctionKind::Slash => false,
+            SanctionKind::Inactivity => {
+                finalized_height.saturating_sub(statement.context.end_height) >= liveness_max_age
             }
-        }
+        })?;
         if batch.is_empty() {
             return Ok(());
         }
         self.write_observed_batch(batch, false)
+    }
+
+    /// Stage deletion of pooled receipts that are `expired` or whose offence or
+    /// safety identity finalized blocks already consumed.
+    pub(super) fn drop_stale_evidence_batch(
+        &self,
+        batch: &mut neutrino_storage::Batch,
+        expired: impl Fn(&neutrino_consensus_types::evidence::EvidenceStatement) -> bool,
+    ) -> Result<(), StoreError<DB::Error>> {
+        for artifact in self.evidence_artifacts()? {
+            if expired(&artifact.statement) || self.is_receipt_finalized(&artifact.statement)? {
+                batch.delete(Column::EvidenceProofs, artifact.statement_id());
+            }
+        }
+        Ok(())
     }
 
     /// Whether finalized blocks already consumed everything this receipt could
@@ -302,9 +327,8 @@ impl<DB: Database> ChainStore<DB> {
             .db
             .iter_column(Column::EvidenceProofs)
             .map_err(StoreError::Database)?;
-        if entries.len() > 256
-            || entries.iter().map(|(_, value)| value.len()).sum::<usize>() > 32 * 1024 * 1024
-        {
+        let total: usize = entries.iter().map(|(_, value)| value.len()).sum();
+        if entries.len() > MAX_POOLED_REPORTS || total > MAX_POOLED_REPORT_BYTES {
             return Err(StoreError::Corrupt("evidence pool capacity"));
         }
         entries
@@ -426,16 +450,7 @@ impl<DB: Database> ChainStore<DB> {
                     chain: domain.chain,
                     boundary,
                 };
-                batch.put(
-                    Column::Checkpoints,
-                    keys::chunk_id_key(boundary.next_chunk_id),
-                    borsh::to_vec(&checkpoint)?,
-                );
-                batch.put(
-                    Column::Checkpoints,
-                    checkpoint.hash(),
-                    borsh::to_vec(&checkpoint)?,
-                );
+                put_checkpoint_batch(&mut batch, &checkpoint)?;
             }
         }
         batch.put(Column::ChunkStatements, key, borsh::to_vec(statement)?);
@@ -507,16 +522,14 @@ impl<DB: Database> ChainStore<DB> {
 
     // ---------- Generic helpers ----------
 
+    /// Encode and write one value; observed columns stay counted via [`Self::put_raw`].
     pub(super) fn put_encoded<T: BorshSerialize>(
         &mut self,
         column: Column,
         key: &[u8],
         value: &T,
     ) -> Result<(), StoreError<DB::Error>> {
-        let bytes = borsh::to_vec(value)?;
-        self.db
-            .put(column, key, &bytes)
-            .map_err(StoreError::Database)
+        self.put_raw(column, key, &borsh::to_vec(value)?)
     }
 
     pub(super) fn get_decoded<T: BorshDeserialize>(
@@ -532,6 +545,51 @@ impl<DB: Database> ChainStore<DB> {
             }
             None => Ok(None),
         }
+    }
+
+    /// Decode a value whose embedded identity must agree with its key. A
+    /// disagreement reports `mismatch` as corruption.
+    pub(super) fn get_checked<T: BorshDeserialize>(
+        &self,
+        column: Column,
+        key: &[u8],
+        matches_key: impl FnOnce(&T) -> bool,
+        mismatch: &'static str,
+    ) -> Result<Option<T>, StoreError<DB::Error>> {
+        let value: Option<T> = self.get_decoded(column, key)?;
+        if value.as_ref().is_some_and(|value| !matches_key(value)) {
+            return Err(StoreError::Corrupt(mismatch));
+        }
+        Ok(value)
+    }
+
+    /// Read a fixed-width raw value. A stored value of another length reports
+    /// `invalid` as corruption.
+    fn get_fixed<const N: usize>(
+        &self,
+        column: Column,
+        key: &[u8],
+        invalid: &'static str,
+    ) -> Result<Option<[u8; N]>, StoreError<DB::Error>> {
+        self.get_raw(column, key)?
+            .map(|bytes| {
+                <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| StoreError::Corrupt(invalid))
+            })
+            .transpose()
+    }
+
+    /// Read a big-endian integer pointer from the `Finalized` column.
+    fn get_integer_pointer(&self, key: &[u8]) -> Result<Option<u64>, StoreError<DB::Error>> {
+        Ok(self
+            .get_fixed::<8>(Column::Finalized, key, "invalid integer pointer")?
+            .map(u64::from_be_bytes))
+    }
+
+    /// Number of finalized chunks, which is also the next chunk to finalize.
+    pub(super) fn finalized_count(&self) -> Result<u64, StoreError<DB::Error>> {
+        Ok(self
+            .get_latest_finalized_chunk_id()?
+            .map_or(0, |id| id.saturating_add(1)))
     }
 
     pub(super) fn put_raw(
@@ -608,12 +666,11 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         height: Height,
     ) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::HeaderByHeight, &keys::height_key(height))?;
-        raw.map(|bytes| {
-            BlockHash::try_from(bytes.as_slice())
-                .map_err(|_| StoreError::Corrupt("invalid canonical height hash"))
-        })
-        .transpose()
+        self.get_fixed(
+            Column::HeaderByHeight,
+            &keys::height_key(height),
+            "invalid canonical height hash",
+        )
     }
 
     /// Read the canonical header at a height, following the height
@@ -640,12 +697,11 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         slot: Slot,
     ) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::HeaderBySlot, &keys::slot_key(slot))?;
-        raw.map(|bytes| {
-            BlockHash::try_from(bytes.as_slice())
-                .map_err(|_| StoreError::Corrupt("invalid block hash pointer"))
-        })
-        .transpose()
+        self.get_fixed(
+            Column::HeaderBySlot,
+            &keys::slot_key(slot),
+            "invalid block hash pointer",
+        )
     }
 
     // ---------- Bodies ----------
@@ -822,15 +878,12 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         index: CheckpointIndex,
     ) -> Result<Option<Checkpoint>, StoreError<DB::Error>> {
-        let checkpoint: Option<Checkpoint> =
-            self.get_decoded(Column::Checkpoints, &keys::checkpoint_index_key(index))?;
-        if checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.boundary.next_chunk_id != index)
-        {
-            return Err(StoreError::Corrupt("checkpoint count index mismatch"));
-        }
-        Ok(checkpoint)
+        self.get_checked(
+            Column::Checkpoints,
+            &keys::checkpoint_index_key(index),
+            |checkpoint: &Checkpoint| checkpoint.boundary.next_chunk_id == index,
+            "checkpoint count index mismatch",
+        )
     }
 
     /// Persist a validator-set snapshot keyed by checkpoint index.
@@ -861,12 +914,7 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Read the tip pointer.
     pub fn get_tip(&self) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::TIP)?;
-        raw.map(|bytes| {
-            BlockHash::try_from(bytes.as_slice())
-                .map_err(|_| StoreError::Corrupt("invalid tip hash"))
-        })
-        .transpose()
+        self.get_fixed(Column::Finalized, pointers::TIP, "invalid tip hash")
     }
 
     /// Write the finalized-head pointer to `hash`.
@@ -876,12 +924,11 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Read the finalized-head pointer.
     pub fn get_finalized_head(&self) -> Result<Option<BlockHash>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::FINALIZED_HEAD)?;
-        raw.map(|bytes| {
-            BlockHash::try_from(bytes.as_slice())
-                .map_err(|_| StoreError::Corrupt("invalid block hash pointer"))
-        })
-        .transpose()
+        self.get_fixed(
+            Column::Finalized,
+            pointers::FINALIZED_HEAD,
+            "invalid block hash pointer",
+        )
     }
 
     /// Write the latest finalized chunk id.
@@ -898,13 +945,7 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Read the latest finalized chunk id.
     pub fn get_latest_finalized_chunk_id(&self) -> Result<Option<ChunkId>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::LATEST_FINALIZED_CHUNK_ID)?;
-        raw.map(|bytes| {
-            <[u8; 8]>::try_from(bytes.as_slice())
-                .map(u64::from_be_bytes)
-                .map_err(|_| StoreError::Corrupt("invalid integer pointer"))
-        })
-        .transpose()
+        self.get_integer_pointer(pointers::LATEST_FINALIZED_CHUNK_ID)
     }
 
     /// Write the latest checkpoint index.
@@ -923,13 +964,7 @@ impl<DB: Database> ChainStore<DB> {
     pub fn get_recursive_covered_chunks(
         &self,
     ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::RECURSIVE_COVERED_CHUNKS)?;
-        raw.map(|bytes| {
-            <[u8; 8]>::try_from(bytes.as_slice())
-                .map(u64::from_be_bytes)
-                .map_err(|_| StoreError::Corrupt("invalid integer pointer"))
-        })
-        .transpose()
+        self.get_integer_pointer(pointers::RECURSIVE_COVERED_CHUNKS)
     }
 
     /// Write the latest validator-set snapshot index.
@@ -948,13 +983,7 @@ impl<DB: Database> ChainStore<DB> {
     pub fn get_latest_validator_set_index(
         &self,
     ) -> Result<Option<CheckpointIndex>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::LATEST_VALIDATOR_SET_INDEX)?;
-        raw.map(|bytes| {
-            <[u8; 8]>::try_from(bytes.as_slice())
-                .map(u64::from_be_bytes)
-                .map_err(|_| StoreError::Corrupt("invalid integer pointer"))
-        })
-        .transpose()
+        self.get_integer_pointer(pointers::LATEST_VALIDATOR_SET_INDEX)
     }
 
     /// Write the currently active VRF seed.
@@ -968,12 +997,11 @@ impl<DB: Database> ChainStore<DB> {
 
     /// Read the currently active VRF seed.
     pub fn get_finalized_seed(&self) -> Result<Option<Seed>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Finalized, pointers::FINALIZED_SEED)?;
-        raw.map(|bytes| {
-            Seed::try_from(bytes.as_slice())
-                .map_err(|_| StoreError::Corrupt("invalid seed pointer"))
-        })
-        .transpose()
+        self.get_fixed(
+            Column::Finalized,
+            pointers::FINALIZED_SEED,
+            "invalid seed pointer",
+        )
     }
 
     /// Iterate every persisted `(hash, bytes)` pair in
@@ -1107,9 +1135,9 @@ impl<DB: Database> ChainStore<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_db::header;
     use neutrino_consensus_types::{
         AggregatedVote, Body, FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase,
-        Header,
     };
     use neutrino_primitives::{BitVec, BlsSignature, Hash, ZERO_HASH};
     use neutrino_storage::MemoryDatabase;
@@ -1120,26 +1148,6 @@ mod tests {
 
     fn sig(b: u8) -> BlsSignature {
         [b; 96]
-    }
-
-    fn header(height: u64, slot: u64, parent: Hash) -> Header {
-        Header {
-            height,
-            slot,
-            parent_hash: parent,
-            proposer_index: 0,
-            vrf_proof: sig(1),
-            state_root: h(2),
-            transactions_root: ZERO_HASH,
-            votes_root: ZERO_HASH,
-            da_root: ZERO_HASH,
-            runtime_extra: ZERO_HASH,
-            receipts_root: ZERO_HASH,
-            gas_used: 0,
-            gas_limit: 1_000_000,
-            timestamp: slot * 4,
-            signature: sig(3),
-        }
     }
 
     fn aggregated(b: u8) -> AggregatedVote {
@@ -1208,7 +1216,7 @@ mod tests {
     #[test]
     fn header_archival_preserves_canonical_index() {
         let mut store = ChainStore::new(MemoryDatabase::new());
-        let hdr = header(7, 9, h(99));
+        let hdr = header(7, 9, h(99), h(2));
         let hash = store.put_header(&hdr).expect("put");
         assert_eq!(hash, hdr.hash());
         assert_eq!(store.get_header(&hash).expect("get"), Some(hdr.clone()));
@@ -1508,7 +1516,7 @@ mod tests {
         store
             .commit_tip(h(1), h(1), neutrino_storage::Batch::new())
             .expect("put");
-        let hash = store.put_header(&header(1, 1, h(1))).unwrap();
+        let hash = store.put_header(&header(1, 1, h(1), h(2))).unwrap();
         store
             .commit_tip(hash, h(1), neutrino_storage::Batch::new())
             .expect("put");
@@ -1520,13 +1528,13 @@ mod tests {
         let mut store = ChainStore::new(MemoryDatabase::new());
         let a = SlashingEvidence::DoubleProposal {
             proposer_index: 1,
-            header_a: header(7, 9, h(0xAA)),
-            header_b: header(7, 9, h(0xBB)),
+            header_a: header(7, 9, h(0xAA), h(2)),
+            header_b: header(7, 9, h(0xBB), h(2)),
         };
         let b = SlashingEvidence::DoubleProposal {
             proposer_index: 2,
-            header_a: header(8, 10, h(0xCC)),
-            header_b: header(8, 10, h(0xDD)),
+            header_a: header(8, 10, h(0xCC), h(2)),
+            header_b: header(8, 10, h(0xDD), h(2)),
         };
         let key_a = store
             .put_slashing_evidence(&a)

@@ -7,14 +7,16 @@ use core::fmt;
 extern crate alloc;
 use alloc::vec::Vec;
 
+use neutrino_consensus_types::history_proof::VkDigest;
 use neutrino_consensus_types::{BlockProof as WireBlockProof, BlockProofPublicInputs, Header};
-use neutrino_primitives::{BlockHash, StateRoot};
+use neutrino_primitives::{BlockHash, ChainId, Hash, StateRoot, ValidatorIndex, ZERO_HASH};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
 use crate::block_state::BlockState;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::finalize::FinalizeError;
 use crate::store::StoreError;
 
 /// Failures while proving a single block.
@@ -172,8 +174,14 @@ impl<DB: Database> Engine<DB> {
         if header.hash() != *block_hash {
             return Err(ProofError::PublicInputMismatch.into());
         }
-        let state_root_before = self.parent_state_root(&header)?;
-        let public_inputs = self.public_inputs_for(&header, state_root_before, block_hash)?;
+        let Some(state_root_before) = self.state_root_before(&header)? else {
+            return Err(ProveError::MissingParentHeader {
+                parent_hash: header.parent_hash,
+            });
+        };
+        let public_inputs = self
+            .block_public_inputs(&header, state_root_before, *block_hash)
+            .map_err(|_| ProveError::Backend(ProofError::InvalidWitness))?;
 
         let witness_bytes = self
             .store()
@@ -246,45 +254,37 @@ impl<DB: Database> Engine<DB> {
         self.commit_block_proof(completed)
     }
 
-    /// Returns the state root that preceded `header.state_root`.
-    fn parent_state_root(&self, header: &Header) -> Result<StateRoot, ProveError<DB::Error>> {
+    /// State root preceding `header`, or `None` when its parent header is not
+    /// stored. The genesis block's parent state is the chain spec's root.
+    pub(crate) fn state_root_before(
+        &self,
+        header: &Header,
+    ) -> Result<Option<StateRoot>, StoreError<DB::Error>> {
         if header.parent_hash == self.chain_spec().genesis_block_hash {
-            return Ok(self.chain_spec().genesis_state_root);
+            return Ok(Some(self.chain_spec().genesis_state_root));
         }
-        let parent = self.store().get_header(&header.parent_hash)?.ok_or(
-            ProveError::MissingParentHeader {
-                parent_hash: header.parent_hash,
-            },
-        )?;
-        Ok(parent.state_root)
+        let parent = self.store().get_header(&header.parent_hash)?;
+        Ok(parent.map(|parent| parent.state_root))
     }
 
-    fn public_inputs_for(
+    /// Canonical block-proof public inputs for `header` under the program set
+    /// of its chunk and the proposer account in the active validator set.
+    pub(crate) fn block_public_inputs(
         &self,
         header: &Header,
         state_root_before: StateRoot,
-        block_hash: &BlockHash,
-    ) -> Result<BlockProofPublicInputs, ProveError<DB::Error>> {
-        let programs = self
-            .programs_for_height(header.height)
-            .map_err(|_| ProveError::Backend(ProofError::InvalidWitness))?;
-        Ok(BlockProofPublicInputs {
-            chain_id: self.chain_spec().chain_id,
-            height: header.height,
-            parent_block_hash: header.parent_hash,
-            block_hash: *block_hash,
+        block_hash: BlockHash,
+    ) -> Result<BlockProofPublicInputs, FinalizeError<DB::Error>> {
+        let programs = self.programs_for_height(header.height)?;
+        Ok(header_public_inputs(
+            self.chain_spec().chain_id,
+            header,
             state_root_before,
-            state_root_after: header.state_root,
-            transactions_root: header.transactions_root,
-            receipt_root: header.receipts_root,
-            da_root: header.da_root,
-            vm_code_hash: programs.runtime_code_hash,
-            block_program: programs.execution.block,
-            gas_used: header.gas_used,
-            gas_limit: header.gas_limit,
-            proposer_address: self.proposer_runtime_address(header.proposer_index),
-            runtime_extra: header.runtime_extra,
-        })
+            block_hash,
+            programs.runtime_code_hash,
+            programs.execution.block,
+            self.proposer_runtime_address(header.proposer_index),
+        ))
     }
 
     /// Look up the runtime account address (withdrawal credentials)
@@ -292,13 +292,40 @@ impl<DB: Database> Engine<DB> {
     /// set. Returns `ZERO_HASH` if the index is out of range — the
     /// proof verifier will treat that as a public-input mismatch
     /// and reject the block.
-    fn proposer_runtime_address(
-        &self,
-        proposer_index: neutrino_primitives::ValidatorIndex,
-    ) -> neutrino_primitives::Hash {
+    pub(crate) fn proposer_runtime_address(&self, proposer_index: ValidatorIndex) -> Hash {
         usize::try_from(proposer_index)
             .ok()
             .and_then(|i| self.active_validator_set().get(i))
-            .map_or(neutrino_primitives::ZERO_HASH, |v| v.withdrawal_credentials)
+            .map_or(ZERO_HASH, |v| v.withdrawal_credentials)
+    }
+}
+
+/// Block-proof public inputs binding `header` to an exact runtime artifact,
+/// Block Guest and proposer account.
+pub(crate) const fn header_public_inputs(
+    chain_id: ChainId,
+    header: &Header,
+    state_root_before: StateRoot,
+    block_hash: BlockHash,
+    vm_code_hash: Hash,
+    block_program: VkDigest,
+    proposer_address: Hash,
+) -> BlockProofPublicInputs {
+    BlockProofPublicInputs {
+        chain_id,
+        height: header.height,
+        parent_block_hash: header.parent_hash,
+        block_hash,
+        state_root_before,
+        state_root_after: header.state_root,
+        transactions_root: header.transactions_root,
+        receipt_root: header.receipts_root,
+        da_root: header.da_root,
+        vm_code_hash,
+        block_program,
+        gas_used: header.gas_used,
+        gas_limit: header.gas_limit,
+        proposer_address,
+        runtime_extra: header.runtime_extra,
     }
 }

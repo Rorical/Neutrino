@@ -7,14 +7,15 @@ use core::fmt;
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use neutrino_consensus_fork_choice::{ForkChoiceError, ProofStatus};
+use neutrino_consensus_fork_choice::ProofStatus;
 use neutrino_consensus_types::history::is_recent_history_index;
-use neutrino_consensus_types::{Block, BlockProof, BlockProofPublicInputs, ChunkProof};
+use neutrino_consensus_types::{Block, BlockProof, Body, ChunkProof, Header};
 use neutrino_consensus_vrf::{self as consensus_vrf, VrfError};
-use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Height, Slot, StateRoot};
+use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Height, Slot, StateRoot, ValidatorIndex};
 use neutrino_proof_system::{
     BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome, ProofError, ProofSystem,
 };
+use neutrino_prover_chunk::consensus::validate_consensus_with_context;
 
 use neutrino_storage::Database;
 use neutrino_trie::Trie;
@@ -23,7 +24,7 @@ extern crate alloc;
 
 use crate::block_state::BlockState;
 use crate::body::{BodyRoots, compute_body_roots};
-use crate::engine::Engine;
+use crate::engine::{Engine, stage_trie_delta};
 use crate::signature::{SignatureError, verify_header_signature};
 use crate::store::StoreError;
 
@@ -556,21 +557,15 @@ impl<DB: Database> Engine<DB> {
         verify_header_signature(
             &block.header,
             self.active_validator_set(),
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
         )
         .map_err(ImportError::HeaderSignature)?;
-        let reporter_validators = self.active_validator_set().to_vec();
-        let reporter_chunk =
-            block.header.height.saturating_sub(1) / self.chain_spec().consensus.chunk_size;
-        self.store_mut().retain_reporter_header(
-            reporter_chunk,
-            &block.header,
-            &reporter_validators,
-        )?;
+        let chunk_id = self.chunk_of_height(block.header.height).unwrap_or(0);
+        self.retain_active_reporter_header(chunk_id, &block.header)?;
         consensus_vrf::verify_header_proposer(
             &block.header,
             self.active_validator_set(),
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &self.finalized_seed(),
             self.chain_spec().consensus.expected_proposers_per_slot,
         )
@@ -591,8 +586,6 @@ impl<DB: Database> Engine<DB> {
                 computed: Box::new(computed_roots),
             });
         }
-        let chunk_id =
-            block.header.height.saturating_sub(1) / self.chain_spec().consensus.chunk_size;
         if let Some(vote) = block
             .body
             .finality_votes
@@ -655,21 +648,16 @@ impl<DB: Database> Engine<DB> {
             (None, _) => None,
         };
 
-        let hash = block.hash();
-
-        let mut next_fork_choice = self.fork_choice.clone();
-        next_fork_choice
-            .add_block(&block.header)
-            .map_err(|err| match err {
-                ForkChoiceError::UnknownParent(parent) => ImportError::ParentMismatch {
-                    expected: self.head_hash(),
-                    actual: parent,
-                },
-                _ => ImportError::ParentMismatch {
-                    expected: self.head_hash(),
-                    actual: parent_hash,
-                },
-            })?;
+        // Fork choice records a block only under a known parent (its only
+        // insertion failure). Check first so a rejection leaves no store residue.
+        if parent_hash != self.fork_choice.finalized()
+            && self.fork_choice.block(&parent_hash).is_none()
+        {
+            return Err(ImportError::ParentMismatch {
+                expected: self.head_hash(),
+                actual: parent_hash,
+            });
+        }
         let mut batch = crate::store::ChainStore::<DB>::block_archive_batch(block, None)?;
         if extends_materialised_head {
             self.commit_materialized_head_with_batch(
@@ -681,16 +669,12 @@ impl<DB: Database> Engine<DB> {
             )?;
         } else {
             if let Some(mut archived_state) = post_state {
-                for (key, bytes) in archived_state.drain_pending_nodes() {
-                    batch.put(neutrino_storage::Column::TrieNodes, key, bytes);
-                }
-                for (key, bytes) in archived_state.drain_pending_values() {
-                    batch.put(neutrino_storage::Column::StateValues, key, bytes);
-                }
+                stage_trie_delta(&mut batch, &mut archived_state);
             }
             self.store_mut().write_observed_batch(batch, false)?;
         }
-        self.fork_choice = next_fork_choice;
+        // Cannot fail: the parent was checked above and commits leave fork choice untouched.
+        let _ = self.fork_choice.add_block(&block.header);
 
         // Pending-fix #12: the import may have shifted the
         // fork-choice head off the linearly-materialised tip
@@ -727,28 +711,7 @@ impl<DB: Database> Engine<DB> {
         executor: &dyn ErasedBlockExecutor,
         block: &Block,
     ) -> Result<Trie, ImportError<DB::Error>> {
-        let proposer_position = usize::try_from(block.header.proposer_index)
-            .expect("u32 validator index fits usize on supported targets");
-        let proposer_address = self
-            .active_validator_set()
-            .get(proposer_position)
-            .map(|v| v.withdrawal_credentials)
-            .unwrap_or_default();
-        let ctx = BlockExecutionContext {
-            evidence_anchor: self
-                .evidence_anchor(block.header.height)
-                .map_err(ImportError::DryRunFailed)?,
-            runtime_code_hash: self
-                .runtime_code_hash_for(block.header.height)
-                .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?,
-            chain_id: self.chain_spec().chain_id,
-            block_height: block.header.height,
-            gas_limit: block.header.gas_limit,
-            proposer_address,
-            participation: self
-                .participation_for_height(block.header.height)
-                .map_err(ImportError::DryRunFailed)?,
-        };
+        let ctx = self.import_execution_context(&block.header)?;
 
         // Snapshot the engine's state trie into a scratch buffer.
         // The executor advances the scratch on success; on every
@@ -759,41 +722,7 @@ impl<DB: Database> Engine<DB> {
         let mut scratch = self.state().clone();
         scratch.drain_pending_nodes();
         scratch.drain_pending_values();
-
-        let ExecutionOutcome {
-            state_root_after,
-            runtime_extra,
-            receipts_root,
-            gas_used,
-            witness_bytes: _,
-        } = executor
-            .execute_block(&ctx, &block.body, &mut scratch)
-            .map_err(ImportError::DryRunFailed)?;
-
-        if state_root_after != block.header.state_root {
-            return Err(ImportError::StateRootMismatch {
-                expected: block.header.state_root,
-                computed: state_root_after,
-            });
-        }
-        if runtime_extra != block.header.runtime_extra {
-            return Err(ImportError::HeaderRuntimeExtraMismatch {
-                expected: block.header.runtime_extra,
-                actual: runtime_extra,
-            });
-        }
-        if receipts_root != block.header.receipts_root {
-            return Err(ImportError::ReceiptsRootMismatch {
-                expected: block.header.receipts_root,
-                computed: receipts_root,
-            });
-        }
-        if gas_used != block.header.gas_used {
-            return Err(ImportError::GasUsedMismatch {
-                expected: block.header.gas_used,
-                computed: gas_used,
-            });
-        }
+        Self::execute_checked(executor, &ctx, &block.header, &block.body, &mut scratch)?;
         Ok(scratch)
     }
 
@@ -820,36 +749,58 @@ impl<DB: Database> Engine<DB> {
         block: &Block,
         parent_state_root: StateRoot,
     ) -> Result<Trie, ImportError<DB::Error>> {
-        let proposer_position = usize::try_from(block.header.proposer_index)
-            .expect("u32 validator index fits usize on supported targets");
-        let proposer_address = self
-            .active_validator_set()
-            .get(proposer_position)
-            .map(|v| v.withdrawal_credentials)
-            .unwrap_or_default();
-        let ctx = BlockExecutionContext {
-            evidence_anchor: self
-                .evidence_anchor(block.header.height)
-                .map_err(ImportError::DryRunFailed)?,
-            runtime_code_hash: self
-                .runtime_code_hash_for(block.header.height)
-                .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?,
-            chain_id: self.chain_spec().chain_id,
-            block_height: block.header.height,
-            gas_limit: block.header.gas_limit,
-            proposer_address,
-            participation: self
-                .participation_for_height(block.header.height)
-                .map_err(ImportError::DryRunFailed)?,
-        };
+        let ctx = self.import_execution_context(&block.header)?;
 
         // Content-addressed storage: loading every persisted node /
         // value is correct because the trie only navigates entries
         // reachable from `parent_state_root`.
-        let trie_nodes = self.store().iter_trie_nodes()?;
-        let state_values = self.store().iter_state_values()?;
-        let mut scratch = Trie::from_persisted(parent_state_root, trie_nodes, state_values);
+        let mut scratch = self.persisted_trie(parent_state_root)?;
+        Self::execute_checked(executor, &ctx, &block.header, &block.body, &mut scratch)?;
+        Ok(scratch)
+    }
 
+    /// Execution context a header's block runs under, with import failures.
+    fn import_execution_context(
+        &self,
+        header: &Header,
+    ) -> Result<BlockExecutionContext, ImportError<DB::Error>> {
+        self.execution_context(header.height, header.gas_limit, header.proposer_index)
+            .map_err(ImportError::DryRunFailed)
+    }
+
+    /// Execution context for the block at `height`: its evidence anchor,
+    /// runtime artifact, gas limit, proposer account and participation report.
+    ///
+    /// # Errors
+    /// Returns the evidence-anchor failure text, [`PROGRAMS_UNAVAILABLE`] or the
+    /// participation failure text, checked in that order.
+    pub(crate) fn execution_context(
+        &self,
+        height: Height,
+        gas_limit: u64,
+        proposer_index: ValidatorIndex,
+    ) -> Result<BlockExecutionContext, String> {
+        Ok(BlockExecutionContext {
+            evidence_anchor: self.evidence_anchor(height)?,
+            runtime_code_hash: self
+                .runtime_code_hash_for(height)
+                .map_err(|_| PROGRAMS_UNAVAILABLE.to_owned())?,
+            chain_id: self.chain_spec().chain_id,
+            block_height: height,
+            gas_limit,
+            proposer_address: self.proposer_runtime_address(proposer_index),
+            participation: self.participation_for_height(height)?,
+        })
+    }
+
+    /// Execute `body` on `state` and require exactly the results `header` commits.
+    fn execute_checked(
+        executor: &dyn ErasedBlockExecutor,
+        ctx: &BlockExecutionContext,
+        header: &Header,
+        body: &Body,
+        state: &mut Trie,
+    ) -> Result<(), ImportError<DB::Error>> {
         let ExecutionOutcome {
             state_root_after,
             runtime_extra,
@@ -857,34 +808,34 @@ impl<DB: Database> Engine<DB> {
             gas_used,
             witness_bytes: _,
         } = executor
-            .execute_block(&ctx, &block.body, &mut scratch)
+            .execute_block(ctx, body, state)
             .map_err(ImportError::DryRunFailed)?;
 
-        if state_root_after != block.header.state_root {
+        if state_root_after != header.state_root {
             return Err(ImportError::StateRootMismatch {
-                expected: block.header.state_root,
+                expected: header.state_root,
                 computed: state_root_after,
             });
         }
-        if runtime_extra != block.header.runtime_extra {
+        if runtime_extra != header.runtime_extra {
             return Err(ImportError::HeaderRuntimeExtraMismatch {
-                expected: block.header.runtime_extra,
+                expected: header.runtime_extra,
                 actual: runtime_extra,
             });
         }
-        if receipts_root != block.header.receipts_root {
+        if receipts_root != header.receipts_root {
             return Err(ImportError::ReceiptsRootMismatch {
-                expected: block.header.receipts_root,
+                expected: header.receipts_root,
                 computed: receipts_root,
             });
         }
-        if gas_used != block.header.gas_used {
+        if gas_used != header.gas_used {
             return Err(ImportError::GasUsedMismatch {
-                expected: block.header.gas_used,
+                expected: header.gas_used,
                 computed: gas_used,
             });
         }
-        Ok(scratch)
+        Ok(())
     }
 
     /// Pending-fix #12: if the fork-choice DAG's head has diverged
@@ -956,11 +907,9 @@ impl<DB: Database> Engine<DB> {
         // Also enforce the finalized floor while staging a proof-selected branch.
         // No state, head or height index changes until replay fully succeeds.
         if let Some(finalized_chunk_id) = self.latest_finalized_chunk_id() {
-            let chunk_size = self.chain_spec().consensus.chunk_size;
-            let finalized_height = finalized_chunk_id
-                .checked_add(1)
-                .and_then(|n| n.checked_mul(chunk_size))
-                .unwrap_or(Height::MAX);
+            let finalized_height = self
+                .chunk_heights(finalized_chunk_id)
+                .map_or(Height::MAX, |(_, end)| end);
             if lca_height < finalized_height {
                 return Err(ImportError::ReorgPastFinalized {
                     lca_height,
@@ -976,9 +925,7 @@ impl<DB: Database> Engine<DB> {
         // reachable from `lca_state_root`. Bigger working set than
         // a per-root index would yield; accepted here because
         // reorgs are rare.
-        let trie_nodes = self.store().iter_trie_nodes()?;
-        let state_values = self.store().iter_state_values()?;
-        let mut state = Trie::from_persisted(lca_state_root, trie_nodes, state_values);
+        let mut state = self.persisted_trie(lca_state_root)?;
 
         // Replay forward through `new_branch`. On any cross-check
         // mismatch we abandon the reorg — the materialised head
@@ -1001,67 +948,12 @@ impl<DB: Database> Engine<DB> {
                         parent_hash: block_hash,
                     })?;
 
-            let proposer_position = usize::try_from(header.proposer_index)
-                .expect("u32 validator index fits usize on supported targets");
-            let proposer_address = self
-                .active_validator_set()
-                .get(proposer_position)
-                .map(|v| v.withdrawal_credentials)
-                .unwrap_or_default();
-            let ctx = BlockExecutionContext {
-                evidence_anchor: self
-                    .evidence_anchor(header.height)
-                    .map_err(ImportError::DryRunFailed)?,
-                runtime_code_hash: self
-                    .runtime_code_hash_for(header.height)
-                    .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?,
-                chain_id: self.chain_spec().chain_id,
-                block_height: header.height,
-                gas_limit: header.gas_limit,
-                proposer_address,
-                participation: self
-                    .participation_for_height(header.height)
-                    .map_err(ImportError::DryRunFailed)?,
-            };
-
-            let ExecutionOutcome {
-                state_root_after,
-                runtime_extra,
-                receipts_root,
-                gas_used,
-                witness_bytes: _,
-            } = executor
-                .execute_block(&ctx, &body, &mut state)
-                .map_err(ImportError::DryRunFailed)?;
-
-            if state_root_after != header.state_root {
-                return Err(ImportError::StateRootMismatch {
-                    expected: header.state_root,
-                    computed: state_root_after,
-                });
-            }
-            if runtime_extra != header.runtime_extra {
-                return Err(ImportError::HeaderRuntimeExtraMismatch {
-                    expected: header.runtime_extra,
-                    actual: runtime_extra,
-                });
-            }
-            if receipts_root != header.receipts_root {
-                return Err(ImportError::ReceiptsRootMismatch {
-                    expected: header.receipts_root,
-                    computed: receipts_root,
-                });
-            }
-            if gas_used != header.gas_used {
-                return Err(ImportError::GasUsedMismatch {
-                    expected: header.gas_used,
-                    computed: gas_used,
-                });
-            }
+            let ctx = self.import_execution_context(&header)?;
+            Self::execute_checked(executor, &ctx, &header, &body, &mut state)?;
 
             current_height = header.height;
             current_hash = block_hash;
-            current_state_root = state_root_after;
+            current_state_root = header.state_root;
         }
 
         Ok(ReplayedHead {
@@ -1214,9 +1106,14 @@ impl<DB: Database> Engine<DB> {
             });
         }
 
-        let state_root_before = self.block_proof_state_root_before(&header)?;
-        let expected_public_inputs =
-            self.block_proof_public_inputs(&header, state_root_before, canonical_hash)?;
+        let Some(state_root_before) = self.state_root_before(&header)? else {
+            return Err(ImportError::MissingParentHeader {
+                parent_hash: header.parent_hash,
+            });
+        };
+        let expected_public_inputs = self
+            .block_public_inputs(&header, state_root_before, canonical_hash)
+            .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?;
         if proof.public_inputs != expected_public_inputs {
             return Err(ImportError::BlockProofPublicInputsMismatch {
                 hash: canonical_hash,
@@ -1368,10 +1265,9 @@ impl<DB: Database> Engine<DB> {
                 ImportError::InvalidChunkProof(neutrino_proof_system::ProofError::InvalidWitness)
             })?;
         prepared.witness.finality_cert = proof.finality_cert.clone();
-        let statement = neutrino_prover_chunk::consensus::validate_consensus(&prepared.witness)
-            .map_err(|_| {
-                ImportError::InvalidChunkProof(neutrino_proof_system::ProofError::InvalidWitness)
-            })?;
+        let validated = validate_consensus_with_context(&prepared.witness)
+            .map_err(|_| ImportError::InvalidChunkProof(ProofError::InvalidWitness))?;
+        let statement = &validated.statement;
         if proof.chunk_id != statement.chunk.chunk_id
             || proof.public_inputs != statement.chunk
             || proof.chunk_hash
@@ -1388,6 +1284,7 @@ impl<DB: Database> Engine<DB> {
                 &backend_proof,
                 proof_system,
                 executor,
+                validated,
             )
             .map_err(|error| match error {
                 crate::FinalizeError::Replay(error) => error,
@@ -1405,74 +1302,14 @@ impl<DB: Database> Engine<DB> {
             chunk_hash: finalized.chunk_hash,
         })
     }
-
-    fn block_proof_state_root_before(
-        &self,
-        header: &neutrino_consensus_types::Header,
-    ) -> Result<StateRoot, ImportError<DB::Error>> {
-        if header.parent_hash == self.chain_spec().genesis_block_hash {
-            return Ok(self.chain_spec().genesis_state_root);
-        }
-        let parent = self.store().get_header(&header.parent_hash)?.ok_or(
-            ImportError::MissingParentHeader {
-                parent_hash: header.parent_hash,
-            },
-        )?;
-        Ok(parent.state_root)
-    }
-
-    pub(crate) fn block_proof_public_inputs(
-        &self,
-        header: &neutrino_consensus_types::Header,
-        state_root_before: StateRoot,
-        block_hash: BlockHash,
-    ) -> Result<BlockProofPublicInputs, ImportError<DB::Error>> {
-        let programs = self
-            .programs_for_height(header.height)
-            .map_err(|_| ImportError::DryRunFailed(PROGRAMS_UNAVAILABLE.to_owned()))?;
-        Ok(BlockProofPublicInputs {
-            chain_id: self.chain_spec().chain_id,
-            height: header.height,
-            parent_block_hash: header.parent_hash,
-            block_hash,
-            state_root_before,
-            state_root_after: header.state_root,
-            transactions_root: header.transactions_root,
-            receipt_root: header.receipts_root,
-            da_root: header.da_root,
-            vm_code_hash: programs.runtime_code_hash,
-            block_program: programs.execution.block,
-            gas_used: header.gas_used,
-            gas_limit: header.gas_limit,
-            proposer_address: self.proposer_runtime_address_for_import(header.proposer_index),
-            runtime_extra: header.runtime_extra,
-        })
-    }
-
-    /// Equivalent of `Engine::proposer_runtime_address` available
-    /// inside the import path; kept as a method on `Engine` rather
-    /// than a free function so the active validator set lookup
-    /// observes the same in-memory state as the rest of import.
-    fn proposer_runtime_address_for_import(
-        &self,
-        proposer_index: neutrino_primitives::ValidatorIndex,
-    ) -> neutrino_primitives::Hash {
-        usize::try_from(proposer_index)
-            .ok()
-            .and_then(|i| self.active_validator_set().get(i))
-            .map_or(neutrino_primitives::ZERO_HASH, |v| v.withdrawal_credentials)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProposerKey, validator_set_root};
-    use neutrino_consensus_types::{Body, Header};
-    use neutrino_primitives::{
-        BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
-        RuntimeParams, StateParams, Validator, ZERO_HASH,
-    };
+    use crate::ProposerKey;
+    use neutrino_consensus_types::BlockProofPublicInputs;
+    use neutrino_primitives::{ChainSpec, Validator, ZERO_HASH};
     use neutrino_storage::MemoryDatabase;
 
     const TEST_CHAIN_ID: u64 = 7;
@@ -1500,28 +1337,11 @@ mod tests {
     }
 
     fn spec() -> ChainSpec {
-        let proof = ProofParams::default();
-        let vs_root = validator_set_root(&validators());
-        let genesis_block_hash: BlockHash = [0xAA; 32];
-
         ChainSpec {
-            name: BoundedBytes::new(b"m6-import-test".to_vec()).expect("name fits"),
-            chain_id: TEST_CHAIN_ID,
             genesis_time: TEST_GENESIS_TIME,
-            genesis_gas_limit: 30_000_000,
-            runtime_info: RuntimeInfo::default(),
             runtime_code_hash: [0xCC; 32],
             genesis_seed: TEST_GENESIS_SEED,
-            genesis_state_root: ZERO_HASH,
-            genesis_block_hash,
-            genesis_validator_set_root: vs_root,
-            consensus: ConsensusParams::default(),
-            proof,
-            state: StateParams::default(),
-            light_client: LightClientParams::default(),
-            runtime: RuntimeParams::default(),
-            initial_validators: validators(),
-            metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
+            ..crate::test_db::spec(b"m6-import-test", TEST_CHAIN_ID, validators())
         }
     }
 
@@ -1631,7 +1451,7 @@ mod tests {
         engine.import_block(&block).unwrap();
         let hash = block.hash();
         let inputs = engine
-            .block_proof_public_inputs(&block.header, ZERO_HASH, hash)
+            .block_public_inputs(&block.header, ZERO_HASH, hash)
             .unwrap();
         let backend = AlternateMockBlockProofSystem;
         let mut decoded = backend.prove_block(&[], &inputs).unwrap();

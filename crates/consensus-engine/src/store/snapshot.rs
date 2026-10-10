@@ -80,7 +80,7 @@ impl<DB: Database> ChainStore<DB> {
         let mut roots = Vec::new();
         for (key, bytes) in self
             .db()
-            .iter_column(Column::Meta)
+            .iter_prefix(Column::Meta, SNAPSHOT_PREFIX)
             .map_err(StoreError::Database)?
         {
             let Some(hash) = key.strip_prefix(SNAPSHOT_PREFIX) else {

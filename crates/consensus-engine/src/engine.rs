@@ -8,12 +8,16 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use core::cell::RefCell;
 
+use neutrino_consensus_types::history_proof::{ConsensusPrograms, ProgramSet};
 use neutrino_consensus_types::{
-    FinalityVote, FinalityVotePhase, Header, SlashingEvidence, VrfRejectionReason,
+    BlockProof, FinalityCert, FinalityVote, FinalityVoteData, FinalityVotePhase, Header,
+    ProofRejectionReason, QuorumCertificate, SlashingEvidence, VrfRejectionReason,
 };
 use neutrino_primitives::{
-    BlockHash, ChainSpec, CheckpointIndex, ChunkId, Hash, Height, Seed, StateRoot, Validator,
+    BlockHash, ChainSpec, CheckpointIndex, ChunkId, ConsensusDomain, Hash, Height, Seed, StateRoot,
+    Validator,
 };
+use neutrino_prover_chunk::execution::commitment;
 use neutrino_storage::{Batch, Column, Database};
 use neutrino_trie::Trie;
 
@@ -41,11 +45,14 @@ extern crate alloc;
 #[derive(Debug)]
 pub struct Engine<DB: Database> {
     chain_spec: ChainSpec,
-    pub(crate) programs: Option<neutrino_consensus_types::history_proof::ProgramSet>,
+    /// Canonical hash of the immutable `chain_spec`, computed once at boot.
+    chain_spec_hash: Hash,
+    /// Signing domain of the immutable `chain_spec`, computed once at boot.
+    consensus_domain: ConsensusDomain,
+    pub(crate) programs: Option<ProgramSet>,
     /// The chunk and checkpoint Guests pinned for this chain by the proof
     /// backend; part of the chain binding, never governable.
-    pub(crate) consensus_programs:
-        Option<neutrino_consensus_types::history_proof::ConsensusPrograms>,
+    pub(crate) consensus_programs: Option<ConsensusPrograms>,
     /// Upgrade records observed at unfinalized chunk boundaries, by block hash.
     pub(crate) program_switches: RefCell<
         BTreeMap<BlockHash, Option<neutrino_consensus_types::history_proof::ScheduledUpgrade>>,
@@ -60,6 +67,9 @@ pub struct Engine<DB: Database> {
     latest_finalized_chunk_id: Option<ChunkId>,
     recursive_covered_chunks: CheckpointIndex,
     active_validator_set: Vec<Validator>,
+    /// Validator-set root committed by the stored consensus state, or the
+    /// genesis root before any chunk finalizes. Updated with every install.
+    previous_validator_set_root: Hash,
     /// Live chunk-BFT sessions keyed by chunk id, used by the
     /// multi-validator finality loop. See [`crate::bft_loop`].
     pub(crate) bft_sessions: BTreeMap<ChunkId, BftSession>,
@@ -82,22 +92,11 @@ pub struct Engine<DB: Database> {
     /// the rejected `BlockProof` so any replayer can independently
     /// re-verify the rejection.
     ///
-    /// Bounded by [`MAX_REJECTED_PROOFS_CACHED`]: once the map is
+    /// Bounded by [`MAX_REJECTED_PROOFS_CACHED`]: once the cache is
     /// full, the oldest insertion is evicted to make room. An accepted alternate
     /// envelope for the same block does not erase an exact rejected envelope's
     /// verdict; the signer's attestation identifies the proof bytes it accepted.
-    pub(crate) rejected_proofs: BTreeMap<
-        BlockHash,
-        (
-            neutrino_consensus_types::BlockProof,
-            neutrino_consensus_types::ProofRejectionReason,
-        ),
-    >,
-    /// FIFO companion to `rejected_proofs`. Carries the BlockHash of
-    /// each cached entry in insertion order so the cache evicts the
-    /// oldest entry when it fills up. Strictly bounded by
-    /// [`MAX_REJECTED_PROOFS_CACHED`].
-    pub(crate) rejected_proofs_order: VecDeque<BlockHash>,
+    pub(crate) rejected_proofs: RejectedProofCache,
     /// Vote-weighted heaviest-proven-chain fork choice.
     ///
     /// Records every imported block — including non-extending
@@ -121,6 +120,122 @@ pub struct Engine<DB: Database> {
 /// FIFO.
 pub const MAX_REJECTED_PROOFS_CACHED: usize = 512;
 
+/// Bounded FIFO cache of rejected block-proof envelopes.
+///
+/// The latest rejected envelope per block is retained independently of
+/// successful alternate envelopes. At most [`MAX_REJECTED_PROOFS_CACHED`]
+/// blocks are cached; the oldest insertion is evicted first.
+#[derive(Debug, Default)]
+pub(crate) struct RejectedProofCache {
+    entries: BTreeMap<BlockHash, (BlockProof, ProofRejectionReason)>,
+    /// Cached block hashes in insertion order.
+    order: VecDeque<BlockHash>,
+}
+
+impl RejectedProofCache {
+    fn record(&mut self, block_hash: BlockHash, proof: BlockProof, reason: ProofRejectionReason) {
+        use alloc::collections::btree_map::Entry;
+        // Eviction step first: drop the oldest cached entry until
+        // there's headroom for the new insertion (or the FIFO is
+        // already empty). The bound applies to both the map and the
+        // FIFO companion.
+        while self.order.len() >= MAX_REJECTED_PROOFS_CACHED
+            && !self.entries.contains_key(&block_hash)
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                let _ = self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        // Same block hash arrived again: refresh the entry in place
+        // but keep the FIFO position so a flood of duplicates cannot
+        // starve genuine newcomers out of the cache.
+        match self.entries.entry(block_hash) {
+            Entry::Occupied(mut existing) => {
+                existing.insert((proof, reason));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert((proof, reason));
+                self.order.push_back(block_hash);
+            }
+        }
+    }
+
+    /// The rejected envelope cached for `block_hash` and its rejection reason.
+    pub(crate) fn get(
+        &self,
+        block_hash: &BlockHash,
+    ) -> Option<&(BlockProof, ProofRejectionReason)> {
+        self.entries.get(block_hash)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.entries.len(), self.order.len());
+        self.entries.len()
+    }
+
+    /// Drop envelopes for blocks below `first_height`.
+    pub(crate) fn retain_from_height(&mut self, first_height: Height) {
+        self.entries
+            .retain(|_, (proof, _)| proof.public_inputs.height >= first_height);
+        self.order.retain(|hash| self.entries.contains_key(hash));
+    }
+}
+
+/// Durable head, finality and trust-profile pointers an engine starts from.
+struct EngineParts {
+    state: Trie,
+    head_height: Height,
+    head_hash: BlockHash,
+    head_state_root: StateRoot,
+    finalized_seed: Seed,
+    latest_finalized_chunk_id: Option<ChunkId>,
+    recursive_covered_chunks: CheckpointIndex,
+    active_validator_set: Vec<Validator>,
+    previous_validator_set_root: Hash,
+    programs: Option<ProgramSet>,
+    consensus_programs: Option<ConsensusPrograms>,
+    fork_choice: ForkChoice,
+}
+
+/// Move a trie's unflushed nodes and values into `batch`.
+pub(crate) fn stage_trie_delta(batch: &mut Batch, state: &mut Trie) {
+    for (hash, bytes) in state.drain_pending_nodes() {
+        batch.put(Column::TrieNodes, hash, bytes);
+    }
+    for (hash, bytes) in state.drain_pending_values() {
+        batch.put(Column::StateValues, hash, bytes);
+    }
+}
+
+/// Rebuild the trie rooted at `root` from the content-addressed state columns.
+fn load_persisted_trie<DB: Database>(
+    store: &ChainStore<DB>,
+    root: StateRoot,
+) -> Result<Trie, StoreError<DB::Error>> {
+    let nodes = store.iter_trie_nodes()?;
+    let values = store.iter_state_values()?;
+    Ok(Trie::from_persisted(root, nodes, values))
+}
+
+/// The prevote quorum a finality certificate locked on.
+pub(crate) fn prevote_quorum(certificate: &FinalityCert) -> QuorumCertificate {
+    QuorumCertificate {
+        data: FinalityVoteData {
+            chunk_id: certificate.chunk_id,
+            round: certificate.round,
+            chunk_hash: certificate.chunk_hash,
+            phase: FinalityVotePhase::Prevote,
+        },
+        aggregate: certificate.prevote.clone(),
+    }
+}
+
 impl<DB: Database> Engine<DB> {
     /// Initialise a brand new engine on an empty `db`.
     ///
@@ -132,19 +247,13 @@ impl<DB: Database> Engine<DB> {
     pub fn genesis(chain_spec: ChainSpec, db: DB) -> Result<Self, EngineError<DB::Error>> {
         chain_spec.validate()?;
 
-        let mut store = ChainStore::new(db);
-        store.configure_history_window(
-            neutrino_consensus_types::history::history_record_window_chunks(
-                chain_spec.runtime.unbonding_delay_blocks,
-                chain_spec.consensus.chunk_size,
-            ),
-        );
+        let mut store = Self::spec_store(&chain_spec, db);
         if store.get_chain_spec_hash()?.is_some() {
             return Err(EngineError::AlreadyInitialised);
         }
 
-        let spec_hash = chain_spec.hash();
-        store.put_chain_spec_hash(spec_hash)?;
+        let chain_spec_hash = chain_spec.hash();
+        store.put_chain_spec_hash(chain_spec_hash)?;
         store.put_validator_set_snapshot(0, &chain_spec.initial_validators)?;
         store.commit_tip(
             chain_spec.genesis_block_hash,
@@ -155,38 +264,75 @@ impl<DB: Database> Engine<DB> {
         store.put_recursive_covered_chunks(0)?;
         store.put_finalized_seed(chain_spec.genesis_seed)?;
 
+        let parts = EngineParts {
+            state: Trie::new(),
+            head_height: 0,
+            head_hash: chain_spec.genesis_block_hash,
+            head_state_root: chain_spec.genesis_state_root,
+            finalized_seed: chain_spec.genesis_seed,
+            latest_finalized_chunk_id: None,
+            recursive_covered_chunks: 0,
+            active_validator_set: chain_spec.initial_validators.clone(),
+            previous_validator_set_root: chain_spec.genesis_validator_set_root,
+            programs: None,
+            consensus_programs: None,
+            fork_choice: ForkChoice::new(chain_spec.genesis_block_hash),
+        };
+        Ok(Self::assemble(chain_spec, chain_spec_hash, store, parts))
+    }
+
+    /// Wrap `db` in a store bounded by the spec's historical record window.
+    fn spec_store(chain_spec: &ChainSpec, db: DB) -> ChainStore<DB> {
+        let mut store = ChainStore::new(db);
+        store.configure_history_window(
+            neutrino_consensus_types::history::history_record_window_chunks(
+                chain_spec.runtime.unbonding_delay_blocks,
+                chain_spec.consensus.chunk_size,
+            ),
+        );
+        store
+    }
+
+    /// Build an engine with empty live caches over durable `parts`.
+    fn assemble(
+        chain_spec: ChainSpec,
+        chain_spec_hash: Hash,
+        store: ChainStore<DB>,
+        parts: EngineParts,
+    ) -> Self {
         let clock = SlotClock::new(
             chain_spec.genesis_time,
             chain_spec.consensus.slot_duration_secs,
         );
-
-        let genesis_block_hash = chain_spec.genesis_block_hash;
-        let genesis_state_root = chain_spec.genesis_state_root;
-        let genesis_seed = chain_spec.genesis_seed;
-        let active_validator_set = chain_spec.initial_validators.clone();
-        Ok(Self {
+        let consensus_domain = ConsensusDomain {
+            chain_id: chain_spec.chain_id,
+            chain_spec_hash,
+        };
+        Self {
             chain_spec,
+            chain_spec_hash,
+            consensus_domain,
             store,
             clock,
-            state: Trie::new(),
-            head_height: 0,
-            head_hash: genesis_block_hash,
-            head_state_root: genesis_state_root,
-            finalized_seed: genesis_seed,
-            latest_finalized_chunk_id: None,
-            recursive_covered_chunks: 0,
-            active_validator_set,
+            state: parts.state,
+            head_height: parts.head_height,
+            head_hash: parts.head_hash,
+            head_state_root: parts.head_state_root,
+            finalized_seed: parts.finalized_seed,
+            latest_finalized_chunk_id: parts.latest_finalized_chunk_id,
+            recursive_covered_chunks: parts.recursive_covered_chunks,
+            active_validator_set: parts.active_validator_set,
+            previous_validator_set_root: parts.previous_validator_set_root,
             bft_sessions: BTreeMap::new(),
             local_voter: None,
-            programs: None,
-            consensus_programs: None,
+            programs: parts.programs,
+            consensus_programs: parts.consensus_programs,
             program_switches: Self::new_program_switch_cache(),
             slashing_monitor: SlashingMonitor::new(),
             bls_verifier: RefCell::default(),
-            rejected_proofs: BTreeMap::new(),
-            rejected_proofs_order: VecDeque::new(),
-            fork_choice: ForkChoice::new(genesis_block_hash),
-        })
+            rejected_proofs: RejectedProofCache::default(),
+            fork_choice: parts.fork_choice,
+        }
     }
 
     /// Re-open an already-initialised database.
@@ -200,21 +346,15 @@ impl<DB: Database> Engine<DB> {
     )]
     pub fn open(chain_spec: ChainSpec, db: DB) -> Result<Self, EngineError<DB::Error>> {
         chain_spec.validate()?;
-        let mut store = ChainStore::new(db);
-        store.configure_history_window(
-            neutrino_consensus_types::history::history_record_window_chunks(
-                chain_spec.runtime.unbonding_delay_blocks,
-                chain_spec.consensus.chunk_size,
-            ),
-        );
+        let store = Self::spec_store(&chain_spec, db);
         let stored_spec_hash = store
             .get_chain_spec_hash()?
             .ok_or(EngineError::NotInitialised)?;
-        let provided = chain_spec.hash();
-        if stored_spec_hash != provided {
+        let chain_spec_hash = chain_spec.hash();
+        if stored_spec_hash != chain_spec_hash {
             return Err(EngineError::ChainSpecMismatch {
                 stored: stored_spec_hash,
-                provided,
+                provided: chain_spec_hash,
             });
         }
 
@@ -251,20 +391,13 @@ impl<DB: Database> Engine<DB> {
             .get_finalized_seed()?
             .unwrap_or(chain_spec.genesis_seed);
 
-        let clock = SlotClock::new(
-            chain_spec.genesis_time,
-            chain_spec.consensus.slot_duration_secs,
-        );
-
         // Rehydrate the state trie from the persisted content-
         // addressed columns so producers resume with the same root
         // their head header committed to. Followers that never ran
         // the runtime have empty `TrieNodes` / `StateValues` columns
         // and end up with an empty trie, which matches the behaviour
         // of `Engine::import_block` (which does not yet re-execute).
-        let trie_nodes = store.iter_trie_nodes()?;
-        let state_values = store.iter_state_values()?;
-        let state = Trie::from_persisted(head_state_root, trie_nodes, state_values);
+        let state = load_persisted_trie(&store, head_state_root)?;
 
         // Rehydrate the latest validator-set snapshot so producers
         // resume with the correct active set for eligibility and BFT
@@ -275,7 +408,7 @@ impl<DB: Database> Engine<DB> {
             .get_validator_set_snapshot(active_index)?
             .unwrap_or_else(|| chain_spec.initial_validators.clone());
 
-        if let Some(consensus) = store.get_consensus_state()? {
+        let previous_validator_set_root = if let Some(consensus) = store.get_consensus_state()? {
             let boundary = neutrino_prover_chunk::consensus::context_boundary(
                 &consensus.next_context,
                 consensus.next_seed,
@@ -283,7 +416,7 @@ impl<DB: Database> Engine<DB> {
             .map_err(|_| StoreError::Corrupt("stored consensus context is invalid"))?;
             if boundary != consensus.boundary
                 || consensus.next_context.chain_id != chain_spec.chain_id
-                || consensus.next_context.chain_spec_hash != chain_spec.hash()
+                || consensus.next_context.chain_spec_hash != chain_spec_hash
                 || consensus.next_context.chunk_size != chain_spec.consensus.chunk_size
                 || consensus.next_context.vm_code_hash
                     != consensus.next_context.programs.runtime_code_hash
@@ -300,9 +433,12 @@ impl<DB: Database> Engine<DB> {
                     StoreError::Corrupt("stored consensus boundary pointers disagree").into(),
                 );
             }
+            commitment(&consensus.next_context.active_validators)
         } else if latest_finalized_chunk_id.is_some() {
             return Err(StoreError::Corrupt("finalized chunk has no consensus context").into());
-        }
+        } else {
+            chain_spec.genesis_validator_set_root
+        };
         Self::validate_history_coverage(
             &store,
             &chain_spec,
@@ -318,10 +454,7 @@ impl<DB: Database> Engine<DB> {
         let programs = domain.map(|domain| domain.programs);
         let consensus_programs = domain.map(|domain| domain.chain.consensus);
 
-        let mut engine = Self {
-            chain_spec,
-            store,
-            clock,
+        let parts = EngineParts {
             state,
             head_height,
             head_hash,
@@ -330,17 +463,12 @@ impl<DB: Database> Engine<DB> {
             latest_finalized_chunk_id,
             recursive_covered_chunks,
             active_validator_set,
-            bft_sessions: BTreeMap::new(),
-            local_voter: None,
+            previous_validator_set_root,
             programs,
             consensus_programs,
-            program_switches: Self::new_program_switch_cache(),
-            slashing_monitor: SlashingMonitor::new(),
-            bls_verifier: RefCell::default(),
-            rejected_proofs: BTreeMap::new(),
-            rejected_proofs_order: VecDeque::new(),
             fork_choice,
         };
+        let mut engine = Self::assemble(chain_spec, chain_spec_hash, store, parts);
         engine.restore_bft_sessions()?;
         Ok(engine)
     }
@@ -453,35 +581,10 @@ impl<DB: Database> Engine<DB> {
     pub(crate) fn record_rejected_proof(
         &mut self,
         block_hash: BlockHash,
-        proof: neutrino_consensus_types::BlockProof,
-        reason: neutrino_consensus_types::ProofRejectionReason,
+        proof: BlockProof,
+        reason: ProofRejectionReason,
     ) {
-        use alloc::collections::btree_map::Entry;
-        // Eviction step first: drop the oldest cached entry until
-        // there's headroom for the new insertion (or the FIFO is
-        // already empty). The bound applies to both the map and the
-        // FIFO companion.
-        while self.rejected_proofs_order.len() >= MAX_REJECTED_PROOFS_CACHED
-            && !self.rejected_proofs.contains_key(&block_hash)
-        {
-            if let Some(oldest) = self.rejected_proofs_order.pop_front() {
-                let _ = self.rejected_proofs.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        // Same block hash arrived again: refresh the entry in place
-        // but keep the FIFO position so a flood of duplicates cannot
-        // starve genuine newcomers out of the cache.
-        match self.rejected_proofs.entry(block_hash) {
-            Entry::Occupied(mut existing) => {
-                existing.insert((proof, reason));
-            }
-            Entry::Vacant(slot) => {
-                slot.insert((proof, reason));
-                self.rejected_proofs_order.push_back(block_hash);
-            }
-        }
+        self.rejected_proofs.record(block_hash, proof, reason);
     }
 
     /// Number of rejected `BlockProof` envelopes currently cached.
@@ -489,7 +592,6 @@ impl<DB: Database> Engine<DB> {
     /// FIFO order.
     #[must_use]
     pub fn rejected_proof_cache_len(&self) -> usize {
-        debug_assert_eq!(self.rejected_proofs.len(), self.rejected_proofs_order.len());
         self.rejected_proofs.len()
     }
 
@@ -517,6 +619,44 @@ impl<DB: Database> Engine<DB> {
         &self.chain_spec
     }
 
+    /// Consensus signing domain of the active chain spec.
+    #[must_use]
+    pub const fn consensus_domain(&self) -> ConsensusDomain {
+        self.consensus_domain
+    }
+
+    /// Blocks per chunk under the active chain spec.
+    pub(crate) const fn chunk_size(&self) -> u64 {
+        self.chain_spec.consensus.chunk_size
+    }
+
+    /// Chunk containing block `height`; `None` for the genesis height.
+    pub(crate) fn chunk_of_height(&self, height: Height) -> Option<ChunkId> {
+        height.checked_sub(1)?.checked_div(self.chunk_size())
+    }
+
+    /// First and last block heights of `chunk_id`; `None` when either overflows.
+    pub(crate) fn chunk_heights(&self, chunk_id: ChunkId) -> Option<(Height, Height)> {
+        let chunk_size = self.chunk_size();
+        let start = chunk_id.checked_mul(chunk_size)?.checked_add(1)?;
+        let end = chunk_id.checked_add(1)?.checked_mul(chunk_size)?;
+        Some((start, end))
+    }
+
+    /// Validator-set root committed by the previous complete chunk, or the
+    /// chain spec's genesis root before any chunk is finalized. Every BFT
+    /// session binds this root so equivocations across a validator-set
+    /// rotation cannot finalize.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "BFT callers keep the fallible signature of the former store read."
+    )]
+    pub(crate) const fn previous_validator_set_root(
+        &self,
+    ) -> Result<Hash, crate::BftLoopError<DB::Error>> {
+        Ok(self.previous_validator_set_root)
+    }
+
     /// Borrow the chain store.
     #[must_use]
     pub const fn store(&self) -> &ChainStore<DB> {
@@ -532,11 +672,6 @@ impl<DB: Database> Engine<DB> {
     #[must_use]
     pub const fn clock(&self) -> &SlotClock {
         &self.clock
-    }
-
-    /// Mutably borrow the slot clock.
-    pub const fn clock_mut(&mut self) -> &mut SlotClock {
-        &mut self.clock
     }
 
     /// Height of the current local head.
@@ -647,8 +782,8 @@ impl<DB: Database> Engine<DB> {
 
     /// Chain-spec hash recorded at boot.
     #[must_use]
-    pub fn chain_spec_hash(&self) -> Hash {
-        self.chain_spec.hash()
+    pub const fn chain_spec_hash(&self) -> Hash {
+        self.chain_spec_hash
     }
 
     /// Read-only view of the in-memory state trie. Primarily a test
@@ -776,12 +911,7 @@ impl<DB: Database> Engine<DB> {
             return Err(StoreError::Corrupt("staged state root disagrees with head"));
         }
         let mut state = next_state.unwrap_or_else(|| self.state.clone());
-        for (hash, bytes) in state.drain_pending_nodes() {
-            batch.put(Column::TrieNodes, hash, bytes);
-        }
-        for (hash, bytes) in state.drain_pending_values() {
-            batch.put(Column::StateValues, hash, bytes);
-        }
+        stage_trie_delta(&mut batch, &mut state);
         self.store
             .commit_tip(hash, self.chain_spec.genesis_block_hash, batch)?;
         self.state = state;
@@ -791,12 +921,28 @@ impl<DB: Database> Engine<DB> {
         Ok(())
     }
 
+    /// Rebuild the trie rooted at `root` from the persisted state columns.
+    pub(crate) fn persisted_trie(&self, root: StateRoot) -> Result<Trie, StoreError<DB::Error>> {
+        load_persisted_trie(&self.store, root)
+    }
+
+    /// Retain a reporter header authenticated against the active validator set.
+    pub(crate) fn retain_active_reporter_header(
+        &mut self,
+        chunk: ChunkId,
+        header: &Header,
+    ) -> Result<(), StoreError<DB::Error>> {
+        self.store
+            .retain_reporter_header(chunk, header, &self.active_validator_set)
+    }
+
     /// Install only after the complete finalization batch has committed.
     pub(crate) fn install_consensus_state(&mut self, state: &crate::full_chunk::ConsensusState) {
         self.latest_finalized_chunk_id = state.boundary.next_chunk_id.checked_sub(1);
         self.finalized_seed = state.next_seed;
         self.active_validator_set
             .clone_from(&state.next_context.active_validators);
+        self.previous_validator_set_root = commitment(&state.next_context.active_validators);
         self.rebind_local_voter();
         self.retain_accountability_observations();
     }
@@ -815,10 +961,9 @@ impl<DB: Database> Engine<DB> {
         self.state = state;
         self.fork_choice = ForkChoice::new(consensus.boundary.block_hash);
         self.bft_sessions.clear();
-        self.slashing_monitor = SlashingMonitor::new();
+        self.slashing_monitor = SlashingMonitor::default();
         self.bls_verifier = RefCell::default();
-        self.rejected_proofs.clear();
-        self.rejected_proofs_order.clear();
+        self.rejected_proofs = RejectedProofCache::default();
     }
 
     /// Update prefix coverage after verification and atomic artifact persistence.
@@ -848,12 +993,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<Option<SlashingEvidence>, SlashingError> {
         let source_chunk = self.accountability_chunk_for_height(header.height)?;
         let (validators, _) = self.forensic_header_context(header)?;
-        crate::signature::verify_header_signature(
-            header,
-            &validators,
-            self.chain_spec().consensus_domain(),
-        )
-        .map_err(slashing_signature_to_slashing_err)?;
+        crate::signature::verify_header_signature(header, &validators, self.consensus_domain())?;
         if self
             .retention_info()
             .map_err(|_| SlashingError::NotYetFinalizedLocally)?
@@ -981,7 +1121,7 @@ impl<DB: Database> Engine<DB> {
             .any(|selection| selection.validator_index == local_idx)
     }
 
-    fn accountability_context(
+    pub(crate) fn accountability_context(
         &self,
         chunk_id: ChunkId,
     ) -> Result<(alloc::vec::Vec<Validator>, Seed), SlashingError> {
@@ -1009,7 +1149,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<(), neutrino_prover_chunk::slashing::EvidenceError> {
         let params = &self.chain_spec().consensus;
         neutrino_prover_chunk::slashing::verify_unlock_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             validators,
             vote,
             quorum,
@@ -1030,9 +1170,7 @@ impl<DB: Database> Engine<DB> {
     }
 
     fn accountability_chunk_for_height(&self, height: Height) -> Result<ChunkId, SlashingError> {
-        height
-            .checked_sub(1)
-            .and_then(|offset| offset.checked_div(self.chain_spec().consensus.chunk_size))
+        self.chunk_of_height(height)
             .ok_or(SlashingError::EvidenceFieldsInconsistent)
     }
 
@@ -1067,7 +1205,7 @@ impl<DB: Database> Engine<DB> {
             return Ok(alloc::vec![vote.clone()]);
         }
         neutrino_prover_chunk::finality::verify_vote_signatures_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &validators,
             vote,
             &self.chain_spec().consensus,
@@ -1100,7 +1238,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<alloc::vec::Vec<SlashingEvidence>, SlashingError> {
         let validators = self.accountability_validators(chunk.chunk_id)?;
         neutrino_prover_chunk::finality::verify_finality_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &self.chain_spec().consensus,
             &validators,
             chunk,
@@ -1118,31 +1256,22 @@ impl<DB: Database> Engine<DB> {
         {
             let prior_prevote = record.finality.prevote_vote();
             let prior = record.finality.precommit_vote();
-            self.slashing_monitor.record_prevote_quorum(
-                neutrino_consensus_types::QuorumCertificate {
-                    data: neutrino_consensus_types::FinalityVoteData {
-                        phase: FinalityVotePhase::Prevote,
-                        ..prior.data.clone()
-                    },
-                    aggregate: record.finality.prevote,
-                },
-            );
+            self.slashing_monitor
+                .record_prevote_quorum(prevote_quorum(&record.finality));
             self.observe_votes_for_slashing(&prior_prevote)?;
             self.observe_votes_for_slashing(&prior)?;
         }
         let prevote = certificate.prevote_vote();
         let vote = certificate.precommit_vote();
         self.slashing_monitor
-            .record_prevote_quorum(neutrino_consensus_types::QuorumCertificate {
-                data: neutrino_consensus_types::FinalityVoteData {
-                    phase: neutrino_consensus_types::FinalityVotePhase::Prevote,
-                    ..vote.data.clone()
-                },
-                aggregate: certificate.prevote.clone(),
-            });
+            .record_prevote_quorum(prevote_quorum(certificate));
         let mut evidence = self.observe_votes_for_slashing(&prevote)?;
         evidence.extend(self.observe_votes_for_slashing(&vote)?);
-        evidence.extend(self.observe_vote_for_invalid_proof_signing(&vote)?);
+        // The precommit's signers were just authenticated; without a cached
+        // rejected envelope there is no proof acceptance left to attribute.
+        if !self.rejected_proofs.is_empty() {
+            evidence.extend(self.observe_vote_for_invalid_proof_signing(&vote)?);
+        }
         Ok(evidence)
     }
 
@@ -1178,7 +1307,7 @@ impl<DB: Database> Engine<DB> {
             signer,
             &indexed,
             &validators,
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
         )?;
         self.retain_accountability_observations();
         for attestation in &vote.attestations {
@@ -1187,7 +1316,7 @@ impl<DB: Database> Engine<DB> {
                 signer,
                 &indexed.data,
                 &validators,
-                self.chain_spec().consensus_domain(),
+                self.consensus_domain(),
                 &mut *self.bls_verifier.borrow_mut(),
             )
             .is_ok()
@@ -1196,7 +1325,7 @@ impl<DB: Database> Engine<DB> {
                     && quorum.data.chunk_id == indexed.data.chunk_id
                     && quorum.data.round <= indexed.data.round
                     && neutrino_prover_chunk::slashing::verify_quorum_using(
-                        self.chain_spec().consensus_domain(),
+                        self.consensus_domain(),
                         &validators,
                         quorum,
                         (
@@ -1262,7 +1391,7 @@ impl<DB: Database> Engine<DB> {
             signer,
             &indexed,
             &validators,
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
         )?;
 
         // Explicit proof-acceptance detection only applies to precommit phase
@@ -1277,19 +1406,9 @@ impl<DB: Database> Engine<DB> {
             return Ok(alloc::vec::Vec::new());
         }
 
-        let chunk_size = self.chain_spec().consensus.chunk_size;
-        let chunk_id = indexed.data.chunk_id;
+        let chunk_size = self.chunk_size();
         // chunk_id covers heights [chunk_id*chunk_size + 1, (chunk_id+1)*chunk_size].
-        let Some(start) = chunk_id
-            .checked_mul(chunk_size)
-            .and_then(|v| v.checked_add(1))
-        else {
-            return Ok(alloc::vec::Vec::new());
-        };
-        let Some(end) = chunk_id
-            .checked_add(1)
-            .and_then(|v| v.checked_mul(chunk_size))
-        else {
+        let Some((start, end)) = self.chunk_heights(indexed.data.chunk_id) else {
             return Ok(alloc::vec::Vec::new());
         };
 
@@ -1305,7 +1424,7 @@ impl<DB: Database> Engine<DB> {
                         signer,
                         &indexed.data,
                         &validators,
-                        self.chain_spec().consensus_domain(),
+                        self.consensus_domain(),
                         &mut *self.bls_verifier.borrow_mut(),
                     )
                     .is_ok()
@@ -1391,7 +1510,7 @@ impl<DB: Database> Engine<DB> {
                     vote_a,
                     vote_b,
                     &self.forensic_validators(vote_a.data.chunk_id)?,
-                    self.chain_spec().consensus_domain(),
+                    self.consensus_domain(),
                 )
             }
             SlashingEvidence::InvalidVrfClaim {
@@ -1420,7 +1539,7 @@ impl<DB: Database> Engine<DB> {
                 vote_b,
                 lock_evidence,
                 &self.forensic_validators(vote_a.data.chunk_id)?,
-                self.chain_spec().consensus_domain(),
+                self.consensus_domain(),
                 (
                     self.chain_spec().consensus.bft_prevote_quorum_numerator,
                     self.chain_spec().consensus.bft_prevote_quorum_denominator,
@@ -1438,8 +1557,8 @@ impl<DB: Database> Engine<DB> {
                 attestation,
                 rejected_proof,
                 &self.forensic_validators(vote.data.chunk_id)?,
-                self.chain_spec().consensus_domain(),
-                self.chain_spec().consensus.chunk_size,
+                self.consensus_domain(),
+                self.chunk_size(),
             ),
             SlashingEvidence::LongRangeForkParticipation {
                 validator_index,
@@ -1469,7 +1588,7 @@ impl<DB: Database> Engine<DB> {
             header_a,
             header_b,
             &self.forensic_header_context(header_a)?.0,
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
         )
     }
 
@@ -1485,7 +1604,7 @@ impl<DB: Database> Engine<DB> {
             header,
             reason,
             &validators,
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &seed,
             self.chain_spec().consensus.expected_proposers_per_slot,
         )
@@ -1501,7 +1620,7 @@ impl<DB: Database> Engine<DB> {
             return Err(SlashingError::EvidenceFieldsInconsistent);
         }
         neutrino_prover_chunk::slashing::verify_da_fraud(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &self.forensic_header_context(header)?.0,
             header,
             fraud,
@@ -1530,24 +1649,8 @@ impl<DB: Database> Engine<DB> {
             canonical_vote,
             Some(&record.chunk),
             &record.validators,
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
         )
-    }
-}
-
-/// Map [`crate::signature::SignatureError`] onto the slashing
-/// error enum so callers handle a single failure type.
-const fn slashing_signature_to_slashing_err(
-    err: crate::signature::SignatureError,
-) -> SlashingError {
-    use crate::signature::SignatureError as Sig;
-    match err {
-        Sig::ValidatorIndexOutOfBounds { index, len } => {
-            SlashingError::ValidatorIndexOutOfBounds { index, len }
-        }
-        Sig::InvalidPublicKey { index } => SlashingError::InvalidPublicKey { index },
-        Sig::InvalidSignatureBytes => SlashingError::InvalidSignatureBytes,
-        Sig::BadSignature => SlashingError::BadSignature,
     }
 }
 
@@ -1555,10 +1658,6 @@ const fn slashing_signature_to_slashing_err(
 mod tests {
     use super::*;
     use crate::validator_set::validator_set_root;
-    use neutrino_primitives::{
-        BoundedBytes, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo, RuntimeParams,
-        StateParams, Validator, ZERO_HASH,
-    };
     use neutrino_storage::MemoryDatabase;
 
     fn validators() -> Vec<Validator> {
@@ -1574,30 +1673,7 @@ mod tests {
     }
 
     fn chain_spec() -> ChainSpec {
-        let proof = ProofParams::default();
-        let vs_root = validator_set_root(&validators());
-        let genesis_block_hash: BlockHash = [0xAA; 32];
-        let genesis_state_root: StateRoot = ZERO_HASH;
-
-        ChainSpec {
-            name: BoundedBytes::new(b"m5-local".to_vec()).expect("name fits"),
-            chain_id: 1,
-            genesis_time: 1_700_000_000,
-            genesis_gas_limit: 30_000_000,
-            runtime_info: RuntimeInfo::default(),
-            runtime_code_hash: [0xBB; 32],
-            genesis_seed: [0xCC; 32],
-            genesis_state_root,
-            genesis_block_hash,
-            genesis_validator_set_root: vs_root,
-            consensus: ConsensusParams::default(),
-            proof,
-            state: StateParams::default(),
-            light_client: LightClientParams::default(),
-            runtime: RuntimeParams::default(),
-            initial_validators: validators(),
-            metadata: BoundedBytes::new(Vec::new()).expect("empty metadata fits"),
-        }
+        crate::test_db::spec(b"m5-local", 1, validators())
     }
 
     #[test]
@@ -1683,7 +1759,7 @@ mod tests {
         assert_eq!(engine.latest_finalized_chunk_id(), None);
         assert_eq!(engine.recursive_covered_chunks(), 0);
         assert_eq!(engine.chain_spec_hash(), spec.hash());
-        assert_eq!(engine.clock().current_slot(), 0);
+        assert_eq!(engine.consensus_domain(), spec.consensus_domain());
         assert_eq!(
             engine.clock().slot_duration_secs(),
             spec.consensus.slot_duration_secs,

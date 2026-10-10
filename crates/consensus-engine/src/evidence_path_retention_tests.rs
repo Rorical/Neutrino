@@ -25,7 +25,7 @@ where
     let statement = EvidenceStatement {
         reporter: None,
         chain_id: engine.chain_spec().chain_id,
-        chain_spec_hash: engine.chain_spec().hash(),
+        chain_spec_hash: engine.chain_spec_hash(),
         block_guest_vk_digest: [3; 8],
         context: record.evidence_context(),
         offender: record.validators[0].clone(),

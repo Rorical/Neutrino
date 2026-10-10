@@ -5,6 +5,10 @@
 )]
 
 use neutrino_consensus_types::Header;
+use neutrino_primitives::{
+    BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
+    RuntimeParams, StateParams, Validator, ZERO_HASH,
+};
 use neutrino_storage::{Batch, Column, ColumnSnapshot, Database, MemoryDatabase};
 
 #[derive(Clone, Debug, Default)]
@@ -70,5 +74,29 @@ pub(crate) fn header(height: u64, slot: u64, parent: [u8; 32], root: [u8; 32]) -
         gas_limit: 1_000_000,
         timestamp: slot * 4,
         signature: [0; 96],
+    }
+}
+
+/// Chain specification fixture over `validators` with default parameters.
+/// Callers override the fields their scenario depends on.
+pub(crate) fn spec(name: &[u8], chain_id: u64, validators: Vec<Validator>) -> ChainSpec {
+    ChainSpec {
+        name: BoundedBytes::new(name.to_vec()).expect("name fits"),
+        chain_id,
+        genesis_time: 1_700_000_000,
+        genesis_gas_limit: 30_000_000,
+        runtime_info: RuntimeInfo::default(),
+        runtime_code_hash: [0xBB; 32],
+        genesis_seed: [0xCC; 32],
+        genesis_state_root: ZERO_HASH,
+        genesis_block_hash: [0xAA; 32],
+        genesis_validator_set_root: crate::validator_set_root(&validators),
+        consensus: ConsensusParams::default(),
+        proof: ProofParams::default(),
+        state: StateParams::default(),
+        light_client: LightClientParams::default(),
+        runtime: RuntimeParams::default(),
+        initial_validators: validators,
+        metadata: BoundedBytes::new(Vec::new()).expect("empty metadata fits"),
     }
 }

@@ -7,14 +7,10 @@ use neutrino_proof_system::ProofSystem;
 use neutrino_prover_chunk::consensus::{as_chunk, validate_candidate};
 use neutrino_storage::Database;
 
-use super::{BftAction, BftLoopError, BftQuorumIdentity, BftSession};
-use crate::{Engine, EngineError, signing::SigningViolation};
+use super::{BftAction, BftLoopError, BftQuorumIdentity, BftSession, conflict};
+use crate::Engine;
 
 extern crate alloc;
-
-fn conflict<E>() -> BftLoopError<E> {
-    EngineError::Signing(SigningViolation::Conflict).into()
-}
 
 impl<DB: Database> Engine<DB> {
     /// Offer a currently available proven branch and its independent valid QC.
@@ -103,12 +99,7 @@ impl<DB: Database> Engine<DB> {
         &self,
         session: &BftSession,
     ) -> Result<(), BftLoopError<DB::Error>> {
-        let data = FinalityVoteData {
-            chunk_id: session.chunk_id,
-            chunk_hash: session.chunk_hash,
-            round: session.round(),
-            phase: FinalityVotePhase::Prevote,
-        };
+        let data = session.vote_data(FinalityVotePhase::Prevote);
         if let Some(quorum) = &session.prevote_justification {
             self.verify_bft_unlock_quorum(self.active_validator_set(), &data, quorum)
                 .map_err(|_| conflict())?;

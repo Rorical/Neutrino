@@ -2,7 +2,10 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 use neutrino_consensus_types::history::{
     HISTORY_DEPTH, HistoryFrontier, HistoryPath, counted_history_root, empty_history_hashes,
     history_leaf_hash, history_node_hash,
@@ -20,12 +23,8 @@ use neutrino_storage::{Batch, Column, Database};
 use super::{ChainStore, StoreError, keys};
 use crate::RetentionPolicy;
 
-fn history_path_key(count: u64, index: u64) -> [u8; 16] {
-    let mut key = [0; 16];
-    key[..8].copy_from_slice(&count.to_be_bytes());
-    key[8..].copy_from_slice(&index.to_be_bytes());
-    key
-}
+/// Largest durable history scheduler record.
+const MAX_HISTORY_JOB_BYTES: usize = 64 * 1024;
 
 fn decode_history_path_key<E>(key: &[u8]) -> Result<(u64, u64), StoreError<E>> {
     let bytes: [u8; 16] = key
@@ -86,7 +85,7 @@ pub(super) fn put_history_path<E>(
     }
     batch.put(
         Column::HistoryPaths,
-        history_path_key(path.count, path.index),
+        keys::pair_key(path.count, path.index),
         borsh::to_vec(&(leaf, path))?,
     );
     Ok(())
@@ -136,6 +135,21 @@ impl<DB: Database> ChainStore<DB> {
         self.history_snapshot(count).map(|(frontier, _)| frontier)
     }
 
+    /// Root of the retained frontier at `count`, read once per validation pass.
+    /// Lookup failures are returned and never memoized.
+    pub(super) fn cached_history_root(
+        &self,
+        count: u64,
+        roots: &mut BTreeMap<u64, Option<Hash>>,
+    ) -> Result<Option<Hash>, StoreError<DB::Error>> {
+        if let Some(root) = roots.get(&count) {
+            return Ok(*root);
+        }
+        let root = self.history_frontier(count)?.root();
+        roots.insert(count, root);
+        Ok(root)
+    }
+
     fn history_children(
         &self,
         root: Hash,
@@ -171,7 +185,8 @@ impl<DB: Database> ChainStore<DB> {
         let expected = frontier
             .append(leaf)
             .ok_or(StoreError::Corrupt("invalid history append"))?;
-        if self.retention_info()?.policy == RetentionPolicy::Archive {
+        let policy = self.retention_info()?.policy;
+        if policy == RetentionPolicy::Archive {
             let mut root = history_leaf_hash(Some(leaf));
             for (level, sibling) in path.siblings.iter().enumerate() {
                 let children = if (index >> level) & 1 == 0 {
@@ -208,11 +223,12 @@ impl<DB: Database> ChainStore<DB> {
             borsh::to_vec(record)?,
         );
         self.advance_evidence_reports_batch(batch, &old_frontier, leaf)?;
-        self.advance_reporter_history_batch(batch, record, &old_frontier, &path)?;
+        self.advance_reporter_history_batch(batch, record, &old_frontier, &path, policy)?;
         self.prune_history_cache_batch(
             batch,
             frontier.count,
             self.get_recursive_covered_chunks()?.unwrap_or(0),
+            policy,
         )?;
         Ok(frontier)
     }
@@ -234,7 +250,7 @@ impl<DB: Database> ChainStore<DB> {
             .ok_or(StoreError::Corrupt("invalid frontier"))?;
         if let Some((cached_leaf, path)) = self.get_decoded::<(Hash, HistoryPath)>(
             Column::HistoryPaths,
-            &history_path_key(count, index),
+            &keys::pair_key(count, index),
         )? {
             if cached_leaf != leaf
                 || path.index != index
@@ -281,6 +297,7 @@ impl<DB: Database> ChainStore<DB> {
     /// Recheck every retained opening and frontier before resuming from disk.
     pub(crate) fn validate_history_cache(&self) -> Result<(), StoreError<DB::Error>> {
         self.validate_reporter_history()?;
+        let mut roots = BTreeMap::new();
         for (key, bytes) in self
             .db
             .iter_column(Column::HistoryFrontiers)
@@ -308,8 +325,7 @@ impl<DB: Database> ChainStore<DB> {
             let (count, index) = decode_history_path_key(&key)?;
             let (leaf, path): (Hash, HistoryPath) = borsh::from_slice(&bytes)?;
             let expected = self
-                .history_frontier(count)?
-                .root()
+                .cached_history_root(count, &mut roots)?
                 .ok_or(StoreError::Corrupt("invalid frontier"))?;
             if path.count != count || path.index != index || !path.verify(leaf, expected) {
                 return Err(StoreError::Corrupt("history opening mismatch"));
@@ -343,11 +359,13 @@ impl<DB: Database> ChainStore<DB> {
         Ok(())
     }
 
+    /// `policy` is the stored retention policy, read once by the caller.
     pub(super) fn prune_history_cache_batch(
         &self,
         batch: &mut Batch,
         current: u64,
         prefix: u64,
+        policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
         let recent =
             current.saturating_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS);
@@ -369,7 +387,7 @@ impl<DB: Database> ChainStore<DB> {
                 batch.delete(Column::HistoryPaths, key);
             }
         }
-        if self.retention_info()?.policy != RetentionPolicy::Archive {
+        if policy != RetentionPolicy::Archive {
             self.prune_history_frontiers_batch(batch, current, prefix)?;
         }
         Ok(())
@@ -404,9 +422,7 @@ impl<DB: Database> ChainStore<DB> {
         new_count: u64,
     ) -> Result<(), StoreError<DB::Error>> {
         let old_count = self.get_recursive_covered_chunks()?.unwrap_or(0);
-        let current = self
-            .get_latest_finalized_chunk_id()?
-            .map_or(0, |id| id.saturating_add(1));
+        let current = self.finalized_count()?;
         if new_count < old_count || new_count > current {
             return Err(StoreError::Corrupt(
                 "history checkpoint count outside finality",
@@ -461,7 +477,8 @@ impl<DB: Database> ChainStore<DB> {
         for (leaf, path) in paths {
             put_history_path(batch, &path, leaf, expected)?;
         }
-        self.prune_history_cache_batch(batch, current, new_count)
+        let policy = self.retention_info()?.policy;
+        self.prune_history_cache_batch(batch, current, new_count, policy)
     }
 
     /// Open a retained historical record together with its tree path under
@@ -529,7 +546,7 @@ impl<DB: Database> ChainStore<DB> {
         id: &Hash,
         bytes: &[u8],
     ) -> Result<(), StoreError<DB::Error>> {
-        if bytes.len() > 64 * 1024 {
+        if bytes.len() > MAX_HISTORY_JOB_BYTES {
             return Err(StoreError::Corrupt("history job exceeds budget"));
         }
         self.put_raw(Column::HistoryJobs, id, bytes)
@@ -551,7 +568,7 @@ impl<DB: Database> ChainStore<DB> {
             .map(|(key, value)| {
                 let id = Hash::try_from(key.as_slice())
                     .map_err(|_| StoreError::Corrupt("invalid history job key"))?;
-                if value.len() > 64 * 1024 {
+                if value.len() > MAX_HISTORY_JOB_BYTES {
                     return Err(StoreError::Corrupt("history job exceeds budget"));
                 }
                 Ok((id, value))
@@ -569,15 +586,14 @@ impl<DB: Database> ChainStore<DB> {
         Option<neutrino_consensus_types::history_proof::ConsensusStatement>,
         StoreError<DB::Error>,
     > {
-        let statement: Option<neutrino_consensus_types::history_proof::ConsensusStatement> =
-            self.get_decoded(Column::ChunkStatements, &keys::chunk_id_key(id))?;
-        if statement
-            .as_ref()
-            .is_some_and(|statement| statement.chunk.chunk_id != id)
-        {
-            return Err(StoreError::Corrupt("chunk statement key mismatch"));
-        }
-        Ok(statement)
+        self.get_checked(
+            Column::ChunkStatements,
+            &keys::chunk_id_key(id),
+            |statement: &neutrino_consensus_types::history_proof::ConsensusStatement| {
+                statement.chunk.chunk_id == id
+            },
+            "chunk statement key mismatch",
+        )
     }
 
     /// Immutable compact canonical boundary at a covered chunk count.
@@ -588,15 +604,14 @@ impl<DB: Database> ChainStore<DB> {
         Option<neutrino_consensus_types::history_proof::ConsensusBoundary>,
         StoreError<DB::Error>,
     > {
-        let boundary: Option<neutrino_consensus_types::history_proof::ConsensusBoundary> =
-            self.get_decoded(Column::ConsensusBoundaries, &keys::chunk_id_key(count))?;
-        if boundary
-            .as_ref()
-            .is_some_and(|boundary| boundary.next_chunk_id != count)
-        {
-            return Err(StoreError::Corrupt("consensus boundary key mismatch"));
-        }
-        Ok(boundary)
+        self.get_checked(
+            Column::ConsensusBoundaries,
+            &keys::chunk_id_key(count),
+            |boundary: &neutrino_consensus_types::history_proof::ConsensusBoundary| {
+                boundary.next_chunk_id == count
+            },
+            "consensus boundary key mismatch",
+        )
     }
 
     /// Read a verified artifact by semantic conditional range ID.
@@ -604,15 +619,12 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         id: &Hash,
     ) -> Result<Option<neutrino_consensus_types::HistoryProof>, StoreError<DB::Error>> {
-        let proof: Option<neutrino_consensus_types::HistoryProof> =
-            self.get_decoded(Column::HistoryProofs, id)?;
-        if proof
-            .as_ref()
-            .is_some_and(|proof| proof.statement.range_id() != *id)
-        {
-            return Err(StoreError::Corrupt("history proof key mismatch"));
-        }
-        Ok(proof)
+        self.get_checked(
+            Column::HistoryProofs,
+            id,
+            |proof: &neutrino_consensus_types::HistoryProof| proof.statement.range_id() == *id,
+            "history proof key mismatch",
+        )
     }
 
     /// Look up a retained proof for an exact canonical range.
@@ -621,10 +633,9 @@ impl<DB: Database> ChainStore<DB> {
         start: u64,
         end: u64,
     ) -> Result<Option<neutrino_consensus_types::HistoryProof>, StoreError<DB::Error>> {
-        let mut key = [0; 16];
-        key[..8].copy_from_slice(&start.to_be_bytes());
-        key[8..].copy_from_slice(&end.to_be_bytes());
-        let Some(id): Option<Hash> = self.get_decoded(Column::HistoryRangeIndex, &key)? else {
+        let Some(id): Option<Hash> =
+            self.get_decoded(Column::HistoryRangeIndex, &keys::pair_key(start, end))?
+        else {
             return Ok(None);
         };
         let proof = self
@@ -642,15 +653,12 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         hash: &Hash,
     ) -> Result<Option<neutrino_consensus_types::Checkpoint>, StoreError<DB::Error>> {
-        let checkpoint: Option<neutrino_consensus_types::Checkpoint> =
-            self.get_decoded(Column::Checkpoints, hash)?;
-        if checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.hash() != *hash)
-        {
-            return Err(StoreError::Corrupt("checkpoint hash index mismatch"));
-        }
-        Ok(checkpoint)
+        self.get_checked(
+            Column::Checkpoints,
+            hash,
+            |checkpoint: &neutrino_consensus_types::Checkpoint| checkpoint.hash() == *hash,
+            "checkpoint hash index mismatch",
+        )
     }
 
     /// Atomically archive a verified, canonically bound range and monotonic prefix cursor.
@@ -677,23 +685,18 @@ impl<DB: Database> ChainStore<DB> {
             )?;
             batch.put(Column::HistoryProofs, id, bytes);
         }
-        let mut key = [0; 16];
-        key[..8].copy_from_slice(&statement.start.next_chunk_id.to_be_bytes());
-        key[8..].copy_from_slice(&statement.end.next_chunk_id.to_be_bytes());
-        batch.put(Column::HistoryRangeIndex, key, borsh::to_vec(&id)?);
+        batch.put(
+            Column::HistoryRangeIndex,
+            keys::pair_key(statement.start.next_chunk_id, statement.end.next_chunk_id),
+            borsh::to_vec(&id)?,
+        );
         for checkpoint in [statement.start_checkpoint(), statement.end_checkpoint()] {
-            let key = keys::chunk_id_key(checkpoint.boundary.next_chunk_id);
             if let Some(existing) = self.get_checkpoint(checkpoint.boundary.next_chunk_id)?
                 && existing != checkpoint
             {
                 return Err(StoreError::Corrupt("conflicting checkpoint boundary"));
             }
-            batch.put(Column::Checkpoints, key, borsh::to_vec(&checkpoint)?);
-            batch.put(
-                Column::Checkpoints,
-                checkpoint.hash(),
-                borsh::to_vec(&checkpoint)?,
-            );
+            super::chain_store::put_checkpoint_batch(&mut batch, &checkpoint)?;
         }
         if advance_prefix {
             self.prepare_history_checkpoint_paths(&mut batch, statement.end.next_chunk_id)?;
@@ -747,25 +750,29 @@ impl<DB: Database> ChainStore<DB> {
                 .ok_or(StoreError::Corrupt("history cache size overflow"))?;
             parsed.push((range_id, a, b, size));
         }
+        let fits = |remaining: usize, total: usize| {
+            remaining < MAX_ENTRIES && total.checked_add(bytes).is_some_and(|sum| sum <= MAX_BYTES)
+        };
+        // Leases are read once, exactly when the first eviction candidate is examined.
+        let pins = if parsed.is_empty() || fits(remaining, total) {
+            Vec::new()
+        } else {
+            self.history_dependencies()?
+        };
         for (range_id, a, b, size) in parsed {
-            if remaining < MAX_ENTRIES
-                && total.checked_add(bytes).is_some_and(|sum| sum <= MAX_BYTES)
-            {
+            if fits(remaining, total) {
                 break;
             }
-            if self.history_range_is_pinned(a, b)? {
+            if self.history_range_pinned_by(&pins, a, b)? {
                 continue;
             }
-            let mut key = [0; 16];
-            key[..8].copy_from_slice(&a.to_be_bytes());
-            key[8..].copy_from_slice(&b.to_be_bytes());
             batch.delete(Column::HistoryProofs, range_id);
-            batch.delete(Column::HistoryRangeIndex, key);
+            batch.delete(Column::HistoryRangeIndex, keys::pair_key(a, b));
             batch.delete(Column::HistoryRangeCache, range_id);
             remaining -= 1;
             total -= size;
         }
-        if remaining >= MAX_ENTRIES || total.checked_add(bytes).is_none_or(|sum| sum > MAX_BYTES) {
+        if !fits(remaining, total) {
             return Err(StoreError::Corrupt(
                 "history cache capacity is pinned by active jobs",
             ));
@@ -785,7 +792,7 @@ impl<DB: Database> ChainStore<DB> {
         &self,
     ) -> Result<Option<neutrino_consensus_types::history_proof::ProofDomain>, StoreError<DB::Error>>
     {
-        self.get_decoded(Column::Meta, b"history_proof_domain")
+        self.get_decoded(Column::Meta, super::pointers::HISTORY_PROOF_DOMAIN)
     }
 
     /// Register the active program profile and index existing canonical boundaries once.
@@ -804,7 +811,7 @@ impl<DB: Database> ChainStore<DB> {
         let mut batch = Batch::new();
         batch.put(
             Column::Meta,
-            b"history_proof_domain",
+            super::pointers::HISTORY_PROOF_DOMAIN,
             borsh::to_vec(domain)?,
         );
         let mut boundaries = vec![*genesis];
@@ -820,16 +827,7 @@ impl<DB: Database> ChainStore<DB> {
                 chain: domain.chain,
                 boundary,
             };
-            batch.put(
-                Column::Checkpoints,
-                keys::chunk_id_key(boundary.next_chunk_id),
-                borsh::to_vec(&checkpoint)?,
-            );
-            batch.put(
-                Column::Checkpoints,
-                checkpoint.hash(),
-                borsh::to_vec(&checkpoint)?,
-            );
+            super::chain_store::put_checkpoint_batch(&mut batch, &checkpoint)?;
         }
         self.write_observed_batch(batch, false)
     }
@@ -907,7 +905,17 @@ impl<DB: Database> ChainStore<DB> {
         start: u64,
         end: u64,
     ) -> Result<bool, StoreError<DB::Error>> {
-        for pin in self.history_dependencies()? {
+        self.history_range_pinned_by(&self.history_dependencies()?, start, end)
+    }
+
+    /// [`Self::history_range_is_pinned`] against already loaded leases.
+    fn history_range_pinned_by(
+        &self,
+        pins: &[super::retention::HistoryDependencies],
+        start: u64,
+        end: u64,
+    ) -> Result<bool, StoreError<DB::Error>> {
+        for pin in pins {
             if pin.start <= start && end <= pin.end && start < end {
                 return Ok(true);
             }
@@ -942,7 +950,10 @@ impl<DB: Database> ChainStore<DB> {
         end: u64,
         progress: Option<Hash>,
     ) -> Result<(), StoreError<DB::Error>> {
-        if start > end || (start == end && progress.is_none()) || bytes.len() > 64 * 1024 {
+        if start > end
+            || (start == end && progress.is_none())
+            || bytes.len() > MAX_HISTORY_JOB_BYTES
+        {
             return Err(StoreError::Corrupt("invalid history job"));
         }
         let dependencies = super::retention::HistoryDependencies {
@@ -962,7 +973,7 @@ impl<DB: Database> ChainStore<DB> {
         id: &Hash,
         bytes: &[u8],
     ) -> Result<(), StoreError<DB::Error>> {
-        if bytes.len() > 64 * 1024 {
+        if bytes.len() > MAX_HISTORY_JOB_BYTES {
             return Err(StoreError::Corrupt("history job exceeds budget"));
         }
         let mut batch = Batch::new();
@@ -1204,7 +1215,7 @@ pub(super) mod tests {
         store.db.write_batch(batch).unwrap();
         store
             .db
-            .delete(Column::HistoryPaths, &history_path_key(1, 0))
+            .delete(Column::HistoryPaths, &keys::pair_key(1, 0))
             .unwrap();
         let (_, root) = store.history_snapshot(1).unwrap();
         store

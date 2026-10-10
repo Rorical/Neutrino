@@ -500,9 +500,9 @@ fn proof_claim(engine: &Engine<MemoryDatabase>, proof: &SignedArtifact) -> Signe
         chunk_hash: [84; 32],
     };
     SignedArtifact::Vote(FinalityVote {
-        signature: key.sign_finality_vote(engine.chain_spec().consensus_domain(), &data),
+        signature: key.sign_finality_vote(engine.consensus_domain(), &data),
         attestations: vec![key.attest_vote(
-            engine.chain_spec().consensus_domain(),
+            engine.consensus_domain(),
             data.clone(),
             vec![proof.id()],
             None,

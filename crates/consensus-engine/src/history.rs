@@ -2,7 +2,7 @@
 
 use crate::{Engine, FinalizeError};
 use neutrino_consensus_types::history_proof::{
-    ChainBinding, Checkpoint, ConsensusBoundary, ConsensusStatement, MAX_FOLD_CHUNKS, ProofDomain,
+    Checkpoint, ConsensusBoundary, ConsensusStatement, MAX_FOLD_CHUNKS, ProofDomain,
 };
 use neutrino_consensus_types::{ChunkProof, HistoryProof};
 use neutrino_primitives::Hash;
@@ -76,7 +76,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<(), FinalizeError<DB::Error>> {
         // The domain's chain must be this specification under consensus
         // Guests that are complete and, if already pinned, identical.
-        if domain.chain != ChainBinding::new(self.chain_spec(), domain.chain.consensus)
+        if domain.chain != self.chain_binding_with(domain.chain.consensus)
             || !domain.chain.is_complete()
             || self
                 .consensus_programs

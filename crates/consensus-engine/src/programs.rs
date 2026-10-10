@@ -15,7 +15,6 @@ use neutrino_consensus_types::history_proof::{ProgramSet, ScheduledUpgrade};
 use neutrino_primitives::Hash;
 use neutrino_proof_system::ProofError;
 use neutrino_storage::Database;
-use neutrino_trie::{Poseidon2Hasher, Trie};
 
 use crate::{Engine, FinalizeError};
 
@@ -25,8 +24,7 @@ const MAX_CACHED_SWITCHES: usize = 64;
 impl<DB: Database> Engine<DB> {
     /// Program set the block at `height` executes under.
     pub fn programs_for_height(&self, height: u64) -> Result<ProgramSet, FinalizeError<DB::Error>> {
-        let chunk_size = self.chain_spec().consensus.chunk_size;
-        self.programs_at_chunk(height.saturating_sub(1) / chunk_size)
+        self.programs_at_chunk(self.chunk_of_height(height).unwrap_or(0))
     }
 
     /// Program set of chunk `chunk_id`, finalized or not.
@@ -35,11 +33,10 @@ impl<DB: Database> Engine<DB> {
         if chunk_id <= finalized {
             return Ok(self.canonical_boundary(chunk_id)?.programs);
         }
-        let chunk_size = self.chain_spec().consensus.chunk_size;
         let mut programs = self.canonical_boundary(finalized)?.programs;
         for next in finalized + 1..=chunk_id {
             let boundary_height = next
-                .checked_mul(chunk_size)
+                .checked_mul(self.chunk_size())
                 .ok_or(ProofError::InvalidWitness)?;
             if let Some(scheduled) = self.scheduled_switch_at(boundary_height)?
                 && scheduled.activate_at_chunk == next
@@ -67,12 +64,8 @@ impl<DB: Database> Engine<DB> {
         let scheduled = if header.state_root == self.head_state_root() {
             self.state().get(neutrino_default_runtime_core::UPGRADE_KEY)
         } else {
-            Trie::<Poseidon2Hasher>::from_persisted(
-                header.state_root,
-                self.store().iter_trie_nodes()?,
-                self.store().iter_state_values()?,
-            )
-            .get(neutrino_default_runtime_core::UPGRADE_KEY)
+            self.persisted_trie(header.state_root)?
+                .get(neutrino_default_runtime_core::UPGRADE_KEY)
         }
         .and_then(|bytes| borsh::from_slice::<ScheduledUpgrade>(&bytes).ok());
         let mut cache = self.program_switches.borrow_mut();

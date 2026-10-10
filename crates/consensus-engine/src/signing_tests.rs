@@ -86,6 +86,17 @@ fn quorum_for(spec: &ChainSpec, mut data: FinalityVoteData) -> QuorumCertificate
     }
 }
 
+/// Durable lock retained by `key(0)` for chunk zero.
+fn reserved_lock<DB: Database>(engine: &Engine<DB>) -> Option<QuorumCertificate>
+where
+    DB::Error: fmt::Debug,
+{
+    engine
+        .reserved_signing_progress(&key(0), 0)
+        .unwrap()
+        .and_then(|progress| progress.locked)
+}
+
 fn chunk(spec: &ChainSpec) -> Chunk {
     Chunk {
         chunk_id: 0,
@@ -261,7 +272,7 @@ fn same_id_and_key_cannot_replay_foreign_spec_bft_messages_or_artifacts() {
             .is_err()
     );
     assert_eq!(local.bft_session(0).unwrap().round(), 0);
-    assert_eq!(local.slashing_monitor.vote_entry_count(), 0);
+    assert_eq!(local.slashing_monitor.votes_tracked(), 0);
     assert!(local.store().signed_artifact_metadata().unwrap().is_empty());
 }
 
@@ -304,7 +315,7 @@ fn foreign_spec_nil_signature_cannot_fabricate_a_local_value_offence() {
     };
     value_vote.signature = key(0).sign_finality_vote(foreign_domain, &value_vote.data);
     assert!(local.verify_slashing_evidence(&evidence).is_err());
-    assert_eq!(local.slashing_monitor.vote_entry_count(), 0);
+    assert_eq!(local.slashing_monitor.votes_tracked(), 0);
 }
 
 #[test]
@@ -324,7 +335,7 @@ fn reserved_round_report_recovery_rejects_a_changed_spec_domain_prefix() {
             },
         )
         .unwrap();
-    let storage_key = round_message_key(5, voter.public_key_bytes(), 0, 1);
+    let storage_key = round_message_key(ROUND_CHANGE_MESSAGE_TAG, voter.public_key_bytes(), 0, 1);
     let bytes = engine
         .store()
         .db()
@@ -332,7 +343,8 @@ fn reserved_round_report_recovery_rejects_a_changed_spec_domain_prefix() {
         .unwrap()
         .unwrap();
     let mut intent: MessageIntent = borsh::from_slice(&bytes).unwrap();
-    intent.message[24..56].copy_from_slice(&distinct_spec_with_the_same_id().hash());
+    intent.message[SPEC_HASH_OFFSET..DOMAIN_PREFIX_LEN]
+        .copy_from_slice(&distinct_spec_with_the_same_id().hash());
     let mut batch = Batch::new();
     batch.put(
         Column::SigningJournal,
@@ -1012,10 +1024,7 @@ fn durable_lock_rejects_circular_prevotes_and_survives_an_unsigned_new_round() {
         Some(justification.clone())
     );
     let mut restored = Engine::open(spec, engine.store().db().clone()).unwrap();
-    assert_eq!(
-        restored.reserved_signing_lock(&key(0), 0).unwrap(),
-        Some(locked)
-    );
+    assert_eq!(reserved_lock(&restored), Some(locked));
     assert_eq!(
         restored
             .sign_vote_durable(&key(0), target.clone(), vec![], Some(justification))
@@ -1104,10 +1113,7 @@ fn repeated_nil_rounds_compact_intents_and_preserve_the_exact_retained_lock() {
     assert_eq!(retained.proof_hashes, original.attestations[0].proof_hashes);
     assert_eq!(retained.unlock_quorum, Some(locked.clone()));
     let mut restarted = Engine::open(spec.clone(), engine.store().db().clone()).unwrap();
-    assert_eq!(
-        restarted.reserved_signing_lock(&key(0), 0).unwrap(),
-        Some(locked)
-    );
+    assert_eq!(reserved_lock(&restarted), Some(locked));
     assert!(matches!(
         restarted.sign_nil_vote_durable(
             &key(0),
@@ -1136,10 +1142,7 @@ fn repeated_nil_rounds_compact_intents_and_preserve_the_exact_retained_lock() {
             .is_none()
     );
     let restored = Engine::open(spec, restarted.store().db().clone()).unwrap();
-    assert_eq!(
-        restored.reserved_signing_lock(&key(0), 0).unwrap(),
-        Some(latest)
-    );
+    assert_eq!(reserved_lock(&restored), Some(latest));
 }
 
 #[test]
@@ -1186,10 +1189,7 @@ fn failed_compaction_atomically_preserves_the_previous_reservation_and_lock() {
         original
     );
     restarted.sign_nil_vote_durable(&key(0), nil).unwrap();
-    assert_eq!(
-        restarted.reserved_signing_lock(&key(0), 0).unwrap(),
-        Some(locked)
-    );
+    assert_eq!(reserved_lock(&restarted), Some(locked));
 }
 
 #[test]

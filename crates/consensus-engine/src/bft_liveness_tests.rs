@@ -1,9 +1,11 @@
 //! Real-signature phase/leader/pacemaker simulations, independent of proving cost.
 
 use super::*;
+use crate::EngineError;
 use crate::bft_loop::tests::{chain_spec_with, dummy_chunk, proposer, test_engine};
+use crate::signing::SigningViolation;
 use alloc::collections::VecDeque;
-use neutrino_consensus_types::FinalityVote;
+use neutrino_consensus_types::{FinalityVote, FinalityVoteData};
 use neutrino_storage::MemoryDatabase;
 
 #[test]
@@ -78,11 +80,17 @@ fn candidate_cache_keeps_every_live_quorum_dependency_within_its_bound() {
     higher_quorum.data.round = 1;
     higher_quorum.aggregate.signature =
         key.sign_finality_vote(spec.consensus_domain(), &higher_quorum.data);
-    Engine::<MemoryDatabase>::remember_bft_valid_value(
+    assert!(Engine::<MemoryDatabase>::remember_bft_valid_value(
+        &mut session,
+        replacement.clone(),
+        higher_quorum.clone(),
+    ));
+    // An equal-ranked repetition is not a new valid value.
+    assert!(!Engine::<MemoryDatabase>::remember_bft_valid_value(
         &mut session,
         replacement.clone(),
         higher_quorum,
-    );
+    ));
     assert_eq!(session.candidates.len(), 8);
     assert_eq!(
         session.candidate_by_hash(&replacement.hash()),

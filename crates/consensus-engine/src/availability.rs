@@ -2,10 +2,34 @@
 
 use crate::{Engine, StoreError};
 use neutrino_consensus_types::signed_artifacts::SignedArtifact;
-use neutrino_consensus_types::{BlockProof, FinalityVote, QuorumCertificate, SlashingEvidence};
-use neutrino_primitives::Hash;
+use neutrino_consensus_types::{
+    BlockProof, FinalityVote, QuorumCertificate, RoundChange, SlashingEvidence, VoteAttestation,
+};
+use neutrino_primitives::{ChunkId, Hash};
 use neutrino_prover_chunk::bls::Verifier as _;
 use neutrino_storage::Database;
+
+/// Every prevote quorum `artifact` carries, including a standalone quorum, in
+/// declaration order.
+pub(crate) fn carried_quorums(
+    artifact: &SignedArtifact,
+) -> impl Iterator<Item = &QuorumCertificate> {
+    let (own, attestations, reports): (_, &[VoteAttestation], &[RoundChange]) = match artifact {
+        SignedArtifact::Quorum(quorum) => (Some(quorum), &[], &[]),
+        SignedArtifact::Vote(vote) => (None, &vote.attestations, &[]),
+        SignedArtifact::Proposal(proposal) => (proposal.valid_quorum.as_ref(), &[], &[]),
+        SignedArtifact::RoundChange(report) => (report.highest_quorum.as_ref(), &[], &[]),
+        SignedArtifact::RoundChangeCertificate(certificate) => (None, &[], &certificate.reports),
+        SignedArtifact::BlockProof(_) | SignedArtifact::NilVote(_) => (None, &[], &[]),
+    };
+    let unlocks = attestations
+        .iter()
+        .filter_map(|claim| claim.unlock_quorum.as_ref());
+    let highest = reports
+        .iter()
+        .filter_map(|report| report.highest_quorum.as_ref());
+    own.into_iter().chain(unlocks).chain(highest)
+}
 
 impl<DB: Database> Engine<DB> {
     pub(crate) fn verify_bft_nil_conflict(
@@ -15,7 +39,7 @@ impl<DB: Database> Engine<DB> {
         nil: &neutrino_consensus_types::IndexedNilVote,
     ) -> Result<(), crate::SlashingError> {
         neutrino_prover_chunk::slashing::verify_conflicting_nil_vote_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &self.forensic_validators(value.data.chunk_id)?,
             index,
             value,
@@ -32,7 +56,7 @@ impl<DB: Database> Engine<DB> {
         second: &neutrino_consensus_types::BftProposal,
     ) -> Result<(), crate::SlashingError> {
         neutrino_prover_chunk::slashing::verify_double_bft_proposal_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &self.forensic_validators(first.chunk.chunk_id)?,
             index,
             first,
@@ -49,9 +73,8 @@ impl<DB: Database> Engine<DB> {
         vote: &FinalityVote,
     ) -> Result<Hash, StoreError<DB::Error>> {
         self.authenticate_artifact_vote(vote)?;
-        self.prune_availability_sources()?;
-        self.store_mut()
-            .put_signed_artifact(vote.data.chunk_id, &SignedArtifact::Vote(vote.clone()))
+        let artifact = SignedArtifact::Vote(vote.clone());
+        self.publish_signed_artifact(vote.data.chunk_id, &artifact, false)
     }
 
     /// Persist the local completed vote in capacity reserved from peer artifacts.
@@ -60,8 +83,8 @@ impl<DB: Database> Engine<DB> {
         vote: &FinalityVote,
     ) -> Result<Hash, StoreError<DB::Error>> {
         self.authenticate_artifact_vote(vote)?;
-        self.prune_availability_sources()?;
-        self.retain_signed_artifact(&SignedArtifact::Vote(vote.clone()), true)
+        let artifact = SignedArtifact::Vote(vote.clone());
+        self.publish_signed_artifact(vote.data.chunk_id, &artifact, true)
     }
 
     fn authenticate_artifact_vote(&self, vote: &FinalityVote) -> Result<(), StoreError<DB::Error>> {
@@ -69,7 +92,7 @@ impl<DB: Database> Engine<DB> {
             .forensic_validators(vote.data.chunk_id)
             .map_err(|_| StoreError::Corrupt("artifact source outside authenticated context"))?;
         neutrino_prover_chunk::finality::verify_vote_signatures_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &validators,
             vote,
             &self.chain_spec().consensus,
@@ -84,11 +107,8 @@ impl<DB: Database> Engine<DB> {
         quorum: &QuorumCertificate,
     ) -> Result<Hash, StoreError<DB::Error>> {
         self.authenticate_artifact_quorum(quorum)?;
-        self.prune_availability_sources()?;
-        self.store_mut().put_signed_artifact(
-            quorum.data.chunk_id,
-            &SignedArtifact::Quorum(quorum.clone()),
-        )
+        let artifact = SignedArtifact::Quorum(quorum.clone());
+        self.publish_signed_artifact(quorum.data.chunk_id, &artifact, false)
     }
 
     fn authenticate_artifact_quorum(
@@ -100,7 +120,7 @@ impl<DB: Database> Engine<DB> {
             .map_err(|_| StoreError::Corrupt("quorum source outside authenticated context"))?;
         let params = &self.chain_spec().consensus;
         neutrino_prover_chunk::slashing::verify_quorum_using(
-            self.chain_spec().consensus_domain(),
+            self.consensus_domain(),
             &validators,
             quorum,
             (
@@ -121,8 +141,7 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<Hash, StoreError<DB::Error>> {
         let source = self.authenticate_artifact_proof(proof)?;
         let artifact = SignedArtifact::BlockProof(proof.clone());
-        self.prune_availability_sources()?;
-        self.store_mut().put_signed_artifact(source, &artifact)
+        self.publish_signed_artifact(source, &artifact, false)
     }
 
     /// Recheck source context and signatures before admitting an availability hint.
@@ -146,8 +165,20 @@ impl<DB: Database> Engine<DB> {
             return Err(StoreError::Corrupt("signed source authentication"));
         }
         let chunk = artifact
-            .chunk_id(self.chain_spec().consensus.chunk_size)
+            .chunk_id(self.chunk_size())
             .ok_or(StoreError::Corrupt("signed source range"))?;
+        self.publish_signed_artifact(chunk, artifact, local)
+    }
+
+    /// Prune expired sources, then persist an authenticated `artifact` of
+    /// `chunk`. A local artifact and its carried unlock quorums use capacity
+    /// reserved from peer artifacts.
+    fn publish_signed_artifact(
+        &mut self,
+        chunk: ChunkId,
+        artifact: &SignedArtifact,
+        local: bool,
+    ) -> Result<Hash, StoreError<DB::Error>> {
         self.prune_availability_sources()?;
         if local {
             let mut protected = self.protected_local_artifacts(chunk)?;
@@ -202,7 +233,7 @@ impl<DB: Database> Engine<DB> {
     }
 
     fn authenticate_bft_source(&self, artifact: &SignedArtifact) -> bool {
-        let Some(chunk) = artifact.chunk_id(self.chain_spec().consensus.chunk_size) else {
+        let Some(chunk) = artifact.chunk_id(self.chunk_size()) else {
             return false;
         };
         let Ok(validators) = self.forensic_validators(chunk) else {
@@ -214,7 +245,7 @@ impl<DB: Database> Engine<DB> {
             params.bft_prevote_quorum_denominator,
         );
         let mut verifier = self.bls_verifier.borrow_mut();
-        let domain = self.chain_spec().consensus_domain();
+        let domain = self.consensus_domain();
         match artifact {
             SignedArtifact::Proposal(value) => {
                 neutrino_consensus_types::bft_leader(
@@ -270,9 +301,8 @@ impl<DB: Database> Engine<DB> {
         &self,
         proof: &BlockProof,
     ) -> Result<u64, StoreError<DB::Error>> {
-        let artifact = SignedArtifact::BlockProof(proof.clone());
-        let source = artifact
-            .chunk_id(self.chain_spec().consensus.chunk_size)
+        let source = self
+            .chunk_of_height(proof.height)
             .ok_or(StoreError::Corrupt("artifact proof range"))?;
         let validators = self
             .forensic_validators(source)
@@ -294,32 +324,28 @@ impl<DB: Database> Engine<DB> {
                 .ok_or(StoreError::Corrupt("artifact proof parent unavailable"))?
                 .state_root
         };
-        let mut expected = if let Some(record) = self.store().historical_chunk(source)? {
-            neutrino_consensus_types::BlockProofPublicInputs {
-                chain_id: self.chain_spec().chain_id,
-                height: header.height,
-                parent_block_hash: header.parent_hash,
-                block_hash: proof.block_hash,
-                state_root_before: before,
-                state_root_after: header.state_root,
-                transactions_root: header.transactions_root,
-                receipt_root: header.receipts_root,
-                da_root: header.da_root,
-                vm_code_hash: record.runtime_code_hash,
-                block_program: record.block_guest_vk_digest,
-                gas_used: header.gas_used,
-                gas_limit: header.gas_limit,
-                proposer_address: [0; 32],
-                runtime_extra: header.runtime_extra,
-            }
+        let record = self.store().historical_chunk(source)?;
+        let (vm_code_hash, block_program) = if let Some(record) = record {
+            (record.runtime_code_hash, record.block_guest_vk_digest)
         } else {
-            self.block_proof_public_inputs(&header, before, proof.block_hash)
-                .map_err(|_| StoreError::Corrupt("artifact proof program unavailable"))?
+            let programs = self
+                .programs_for_height(header.height)
+                .map_err(|_| StoreError::Corrupt("artifact proof program unavailable"))?;
+            (programs.runtime_code_hash, programs.execution.block)
         };
-        expected.proposer_address = validators
+        let proposer_address = validators
             .get(header.proposer_index as usize)
             .ok_or(StoreError::Corrupt("artifact proof proposer"))?
             .withdrawal_credentials;
+        let expected = crate::prove::header_public_inputs(
+            self.chain_spec().chain_id,
+            &header,
+            before,
+            proof.block_hash,
+            vm_code_hash,
+            block_program,
+            proposer_address,
+        );
         if proof.public_inputs != expected {
             return Err(StoreError::Corrupt("artifact proof public inputs mismatch"));
         }
@@ -337,7 +363,7 @@ impl<DB: Database> Engine<DB> {
         }
         if self.retention_info()?.policy == crate::RetentionPolicy::Reporter {
             let chunk = artifact
-                .chunk_id(self.chain_spec().consensus.chunk_size)
+                .chunk_id(self.chunk_size())
                 .ok_or(StoreError::Corrupt("reporter source range"))?;
             self.store_mut().retain_reporter_source(chunk, artifact)?;
             return self.observe_reporter_artifact(chunk, Some(artifact));
@@ -373,133 +399,68 @@ impl<DB: Database> Engine<DB> {
     }
 
     fn introduces_quorum(&self, artifact: &SignedArtifact) -> bool {
-        match artifact {
-            SignedArtifact::Vote(value) => value
-                .attestations
-                .iter()
-                .filter_map(|claim| claim.unlock_quorum.as_ref())
-                .any(|quorum| !self.slashing_monitor.prevote_quorum_is_observed(quorum)),
-            SignedArtifact::Quorum(value) => {
-                !self.slashing_monitor.prevote_quorum_is_observed(value)
-            }
-            SignedArtifact::Proposal(value) => value
-                .valid_quorum
-                .as_ref()
-                .is_some_and(|quorum| !self.slashing_monitor.prevote_quorum_is_observed(quorum)),
-            SignedArtifact::RoundChange(value) => value
-                .highest_quorum
-                .as_ref()
-                .is_some_and(|quorum| !self.slashing_monitor.prevote_quorum_is_observed(quorum)),
-            SignedArtifact::RoundChangeCertificate(value) => value
-                .reports
-                .iter()
-                .filter_map(|report| report.highest_quorum.as_ref())
-                .any(|quorum| !self.slashing_monitor.prevote_quorum_is_observed(quorum)),
-            _ => false,
-        }
+        carried_quorums(artifact)
+            .any(|quorum| !self.slashing_monitor.prevote_quorum_is_observed(quorum))
     }
 
     fn replay_dependency(artifact: &SignedArtifact) -> Option<(u64, u32, Vec<u32>)> {
-        Some(match artifact {
+        let carried = carried_quorums(artifact)
+            .map(|quorum| quorum.data.round)
+            .min();
+        let chunk = match artifact {
             SignedArtifact::Vote(value) => {
-                let carried = value
-                    .attestations
-                    .iter()
-                    .filter_map(|claim| {
-                        claim.unlock_quorum.as_ref().map(|quorum| quorum.data.round)
-                    })
-                    .min();
                 if value.data.phase == neutrino_consensus_types::FinalityVotePhase::Prevote
                     && carried.is_none()
                 {
                     return None;
                 }
                 let round = carried.map_or(value.data.round, |round| round.min(value.data.round));
-                (
-                    value.data.chunk_id,
-                    round,
-                    if carried.is_some() {
-                        Vec::new()
-                    } else {
-                        value
-                            .attestations
-                            .iter()
-                            .map(|claim| claim.validator_index)
-                            .collect()
-                    },
-                )
+                let signers = if carried.is_some() {
+                    Vec::new()
+                } else {
+                    value
+                        .attestations
+                        .iter()
+                        .map(|claim| claim.validator_index)
+                        .collect()
+                };
+                return Some((value.data.chunk_id, round, signers));
             }
-            SignedArtifact::Quorum(value) => (value.data.chunk_id, value.data.round, Vec::new()),
-            SignedArtifact::RoundChange(value) => (
-                value.chunk_id,
-                value.highest_quorum.as_ref()?.data.round,
-                Vec::new(),
-            ),
-            SignedArtifact::RoundChangeCertificate(value) => {
-                let round = value
-                    .reports
-                    .iter()
-                    .filter_map(|report| {
-                        report
-                            .highest_quorum
-                            .as_ref()
-                            .map(|quorum| quorum.data.round)
-                    })
-                    .min()?;
-                (value.chunk_id, round, Vec::new())
-            }
-            SignedArtifact::Proposal(value) => (
-                value.chunk.chunk_id,
-                value.valid_quorum.as_ref()?.data.round,
-                Vec::new(),
-            ),
-            _ => return None,
-        })
+            SignedArtifact::Quorum(value) => value.data.chunk_id,
+            SignedArtifact::RoundChange(value) => value.chunk_id,
+            SignedArtifact::RoundChangeCertificate(value) => value.chunk_id,
+            SignedArtifact::Proposal(value) => value.chunk.chunk_id,
+            SignedArtifact::BlockProof(_) | SignedArtifact::NilVote(_) => return None,
+        };
+        Some((chunk, carried?, Vec::new()))
     }
 
     fn observe_source(&mut self, artifact: &SignedArtifact) -> Vec<SlashingEvidence> {
+        // Quorums carried by votes and proposals are checked individually; the
+        // other carriers were authenticated together with their quorums.
+        let check = matches!(
+            artifact,
+            SignedArtifact::Vote(_) | SignedArtifact::Proposal(_)
+        );
+        for quorum in carried_quorums(artifact) {
+            if !check || self.authenticate_artifact_quorum(quorum).is_ok() {
+                self.slashing_monitor.record_prevote_quorum(quorum.clone());
+            }
+        }
         match artifact {
             SignedArtifact::Vote(value) => {
-                for claim in &value.attestations {
-                    if let Some(quorum) = &claim.unlock_quorum
-                        && self.authenticate_artifact_quorum(quorum).is_ok()
-                    {
-                        self.slashing_monitor.record_prevote_quorum(quorum.clone());
-                    }
-                }
                 self.observe_votes_for_slashing(value).unwrap_or_default()
             }
-            SignedArtifact::Quorum(value) => {
-                self.slashing_monitor.record_prevote_quorum(value.clone());
-                Vec::new()
-            }
             SignedArtifact::NilVote(value) => self.slashing_monitor.record_nil_vote(value),
-            SignedArtifact::Proposal(value) => {
-                if let Some(quorum) = &value.valid_quorum
-                    && self.authenticate_artifact_quorum(quorum).is_ok()
-                {
-                    self.slashing_monitor.record_prevote_quorum(quorum.clone());
-                }
-                self.slashing_monitor
-                    .record_bft_proposal(value)
-                    .into_iter()
-                    .collect()
-            }
-            SignedArtifact::RoundChange(value) => {
-                if let Some(quorum) = &value.highest_quorum {
-                    self.slashing_monitor.record_prevote_quorum(quorum.clone());
-                }
-                Vec::new()
-            }
-            SignedArtifact::RoundChangeCertificate(value) => {
-                for report in &value.reports {
-                    if let Some(quorum) = &report.highest_quorum {
-                        self.slashing_monitor.record_prevote_quorum(quorum.clone());
-                    }
-                }
-                Vec::new()
-            }
-            SignedArtifact::BlockProof(_) => Vec::new(),
+            SignedArtifact::Proposal(value) => self
+                .slashing_monitor
+                .record_bft_proposal(value)
+                .into_iter()
+                .collect(),
+            SignedArtifact::Quorum(_)
+            | SignedArtifact::RoundChange(_)
+            | SignedArtifact::RoundChangeCertificate(_)
+            | SignedArtifact::BlockProof(_) => Vec::new(),
         }
     }
 

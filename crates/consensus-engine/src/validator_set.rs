@@ -9,18 +9,16 @@
 //! Future milestones can swap in an incremental Merkle tree without
 //! changing the call sites.
 
-use neutrino_primitives::{Hash, Validator, blake3_256};
+use neutrino_primitives::{Hash, Validator};
 
 /// Compute the canonical validator-set commitment for `validators`.
 ///
 /// The commitment is `BLAKE3(borsh(validators))`. The empty set commits
 /// to `BLAKE3(borsh(Vec::<Validator>::new()))`, which is non-zero by
-/// construction.
+/// construction. A slice encodes exactly like the vector it borrows from.
 #[must_use]
 pub fn validator_set_root(validators: &[Validator]) -> Hash {
-    let bytes = borsh::to_vec(&validators.to_vec())
-        .expect("borsh serialization of Vec<Validator> is infallible");
-    blake3_256(&bytes)
+    neutrino_prover_chunk::execution::commitment(validators)
 }
 
 #[cfg(test)]
@@ -67,6 +65,15 @@ mod tests {
         let ab = validator_set_root(&[v1.clone(), v2.clone()]);
         let ba = validator_set_root(&[v2, v1]);
         assert_ne!(ab, ba);
+    }
+
+    #[test]
+    fn root_commits_to_the_borsh_vector_encoding() {
+        let set = vec![validator(1, 1_000_000), validator(2, 2)];
+        assert_eq!(
+            validator_set_root(&set),
+            neutrino_primitives::blake3_256(&borsh::to_vec(&set).unwrap())
+        );
     }
 
     #[test]

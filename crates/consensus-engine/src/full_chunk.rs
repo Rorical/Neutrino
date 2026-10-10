@@ -5,21 +5,21 @@ extern crate alloc;
 use alloc::{collections::BTreeMap, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::history::is_recent_history_index;
+use neutrino_consensus_types::history_proof::{ChainBinding, ConsensusPrograms};
 use neutrino_consensus_types::{AggregatedVote, Chunk, ChunkProof, FinalityCert};
 use neutrino_primitives::{ChunkId, Hash};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::{
     body::ConsensusBody,
     consensus::{
-        ConsensusWitness, as_chunk, context_boundary, genesis_context, validate_candidate,
-        validate_consensus, validate_consensus_with_context,
+        ConsensusWitness, ValidatedCandidate, ValidatedConsensus, as_chunk, context_boundary,
+        genesis_context, validate_candidate, validate_consensus_with_context,
     },
     execution::{ExecutionContext, ProvenBlock, commitment},
     history::{HistoricalChunk, HistoryWitness},
 };
 use neutrino_runtime_abi::{StateWitness, TrieNodeBytes, TrieValueBytes};
-use neutrino_storage::Database;
-use neutrino_trie::Trie;
+use neutrino_storage::{Column, Database};
 
 use crate::{BlockState, Engine, FinalizeError, FinalizeOutcome, ProposerKey};
 
@@ -40,6 +40,9 @@ pub struct ConsensusState {
 pub struct PreparedConsensusChunk<P: ProofSystem> {
     /// Fully bound candidate, with certificate filled before proving.
     pub witness: ConsensusWitness,
+    /// Candidate validation of `witness` at preparation. Candidate validation
+    /// never reads the certificate, the only field filled afterwards.
+    pub candidate: ValidatedCandidate,
     /// Inner proofs in exact canonical height order.
     pub proofs: Vec<P::BlockProof>,
 }
@@ -61,16 +64,22 @@ impl<DB: Database> Engine<DB> {
     /// Guests pinned by [`Self::set_programs`]. Without a proof backend the
     /// Guests are zero and no statement can verify.
     #[must_use]
-    pub fn chain_binding(&self) -> neutrino_consensus_types::history_proof::ChainBinding {
-        neutrino_consensus_types::history_proof::ChainBinding::new(
-            self.chain_spec(),
-            self.consensus_programs.unwrap_or(
-                neutrino_consensus_types::history_proof::ConsensusPrograms {
-                    chunk: [0; 8],
-                    checkpoint: [0; 8],
-                },
-            ),
-        )
+    pub fn chain_binding(&self) -> ChainBinding {
+        let consensus = self.consensus_programs.unwrap_or(ConsensusPrograms {
+            chunk: [0; 8],
+            checkpoint: [0; 8],
+        });
+        self.chain_binding_with(consensus)
+    }
+
+    /// This specification bound to `consensus`, using the cached spec hash.
+    pub(crate) const fn chain_binding_with(&self, consensus: ConsensusPrograms) -> ChainBinding {
+        ChainBinding {
+            chain_id: self.chain_spec().chain_id,
+            chain_spec_hash: self.chain_spec_hash(),
+            chunk_size: self.chunk_size(),
+            consensus,
+        }
     }
 
     /// The certified participation report every block of `height`'s chunk
@@ -91,10 +100,8 @@ impl<DB: Database> Engine<DB> {
         if self.programs.is_none() {
             return Ok(None);
         }
-        let chunk_size = self.chain_spec().consensus.chunk_size;
-        let chunk_id = height
-            .checked_sub(1)
-            .and_then(|h| h.checked_div(chunk_size))
+        let chunk_id = self
+            .chunk_of_height(height)
             .ok_or_else(|| alloc::string::String::from("invalid participation height"))?;
         let Some(previous) = chunk_id.checked_sub(1) else {
             return Ok(None);
@@ -147,9 +154,8 @@ impl<DB: Database> Engine<DB> {
             .programs_for_height(height)
             .map_err(|_| alloc::string::String::from(crate::import::PROGRAMS_UNAVAILABLE))?;
         let spec = self.chain_spec();
-        let chunk_id = height
-            .checked_sub(1)
-            .and_then(|h| h.checked_div(spec.consensus.chunk_size))
+        let chunk_id = self
+            .chunk_of_height(height)
             .ok_or_else(|| alloc::string::String::from("invalid evidence anchor height"))?;
         let history_root = if chunk_id == 0 {
             neutrino_consensus_types::history::empty_history_root()
@@ -161,7 +167,7 @@ impl<DB: Database> Engine<DB> {
                 .history_root
         };
         Ok(neutrino_consensus_types::evidence::EvidenceAnchor {
-            chain_spec_hash: spec.hash(),
+            chain_spec_hash: self.chain_spec_hash(),
             chunk_id,
             history_root,
             block_guest_vk_digest: programs.execution.block,
@@ -350,9 +356,8 @@ impl<DB: Database> Engine<DB> {
         gas_limit: u64,
         block_key: &[u32; 8],
     ) -> Result<(), FinalizeError<DB::Error>> {
-        let chunk_id = height
-            .checked_sub(1)
-            .and_then(|h| h.checked_div(self.chain_spec().consensus.chunk_size))
+        let chunk_id = self
+            .chunk_of_height(height)
             .ok_or(ProofError::InvalidWitness)?;
         if body
             .finality_votes
@@ -363,7 +368,7 @@ impl<DB: Database> Engine<DB> {
         }
         let (context, _, _) = self.consensus_boundary(chunk_id)?;
         let boundary_height = chunk_id
-            .checked_mul(self.chain_spec().consensus.chunk_size)
+            .checked_mul(self.chunk_size())
             .ok_or(ProofError::InvalidWitness)?;
         let mut ancestor = parent_hash;
         for expected_height in (boundary_height + 1..height).rev() {
@@ -373,7 +378,7 @@ impl<DB: Database> Engine<DB> {
                 .ok_or(ProofError::InvalidWitness)?;
             if header.height != expected_height
                 || header.hash() != ancestor
-                || self.store().get_body(&ancestor)?.is_none()
+                || !self.has_body(&ancestor)?
             {
                 return Err(ProofError::InvalidWitness.into());
             }
@@ -425,6 +430,16 @@ impl<DB: Database> Engine<DB> {
             return Err(ProofError::InvalidWitness.into());
         }
         Ok(())
+    }
+
+    /// Whether a block body is archived under `hash`, read without decoding it.
+    fn has_body(&self, hash: &Hash) -> Result<bool, crate::StoreError<DB::Error>> {
+        let body = self
+            .store()
+            .db()
+            .get(Column::Blocks, &crate::store::keys::hash_key(hash))
+            .map_err(crate::StoreError::Database)?;
+        Ok(body.is_some())
     }
 
     /// Validate a raw report against historical membership before pooling it.
@@ -498,9 +513,8 @@ impl<DB: Database> Engine<DB> {
         chunk_id: ChunkId,
         proof_system: &P,
     ) -> Result<PreparedConsensusChunk<P>, FinalizeError<DB::Error>> {
-        let end = chunk_id
-            .checked_add(1)
-            .and_then(|id| id.checked_mul(self.chain_spec().consensus.chunk_size))
+        let (_, end) = self
+            .chunk_heights(chunk_id)
             .ok_or(FinalizeError::HeightRangeOverflow)?;
         let end_hash = self
             .store()
@@ -525,9 +539,7 @@ impl<DB: Database> Engine<DB> {
             session.end_block_hash(),
             proof_system,
         )?;
-        let candidate =
-            validate_candidate(&prepared.witness).map_err(|_| ProofError::InvalidWitness)?;
-        if as_chunk(&candidate.execution.chunk).hash() != session.chunk_hash() {
+        if as_chunk(&prepared.candidate.execution.chunk).hash() != session.chunk_hash() {
             return Err(ProofError::PublicInputMismatch.into());
         }
         Ok(prepared)
@@ -562,17 +574,9 @@ impl<DB: Database> Engine<DB> {
         {
             return Err(ProofError::Unsupported.into());
         }
-        let start = chunk_id
-            .checked_mul(context.chunk_size)
-            .and_then(|height| height.checked_add(1))
-            .ok_or(FinalizeError::HeightRangeOverflow)?;
-        let end = start
-            .checked_add(
-                context
-                    .chunk_size
-                    .checked_sub(1)
-                    .ok_or(FinalizeError::HeightRangeOverflow)?,
-            )
+        // The trusted context's chunk size is the specification's.
+        let (start, end) = self
+            .chunk_heights(chunk_id)
             .ok_or(FinalizeError::HeightRangeOverflow)?;
         let mut blocks = Vec::new();
         let mut bodies = Vec::new();
@@ -686,19 +690,19 @@ impl<DB: Database> Engine<DB> {
             block_guest_vk_digest: key,
             facts: Vec::new(),
         };
-        validate_candidate(&witness).map_err(|_| ProofError::InvalidWitness)?;
-        Ok(PreparedConsensusChunk { witness, proofs })
+        let candidate = validate_candidate(&witness).map_err(|_| ProofError::InvalidWitness)?;
+        Ok(PreparedConsensusChunk {
+            witness,
+            candidate,
+            proofs,
+        })
     }
 
     fn consensus_rotation_witness(
         &self,
         root: Hash,
     ) -> Result<StateWitness, FinalizeError<DB::Error>> {
-        let trie: Trie = Trie::from_persisted(
-            root,
-            self.store().iter_trie_nodes()?,
-            self.store().iter_state_values()?,
-        );
+        let trie = self.persisted_trie(root)?;
         let keys = neutrino_prover_chunk::rotation::witness_keys();
         let mut nodes = BTreeMap::new();
         let mut values = BTreeMap::new();
@@ -726,13 +730,22 @@ impl<DB: Database> Engine<DB> {
         prepared: &mut PreparedConsensusChunk<P>,
         voter: &ProposerKey,
     ) -> Result<(), FinalizeError<DB::Error>> {
-        let candidate =
-            validate_candidate(&prepared.witness).map_err(|_| ProofError::InvalidWitness)?;
-        let chunk = as_chunk(&candidate.execution.chunk);
+        self.certify_validated_consensus_chunk(prepared, voter)
+            .map(|_| ())
+    }
+
+    /// Certify `prepared` and return the complete consensus validation of the
+    /// certified witness.
+    pub(crate) fn certify_validated_consensus_chunk<P: ProofSystem>(
+        &mut self,
+        prepared: &mut PreparedConsensusChunk<P>,
+        voter: &ProposerKey,
+    ) -> Result<ValidatedConsensus, FinalizeError<DB::Error>> {
+        let chunk = as_chunk(&prepared.candidate.execution.chunk);
         prepared.witness.finality_cert =
             self.run_chunk_bft(&chunk, chunk.hash(), voter, chunk.active_validator_set_root)?;
-        validate_consensus(&prepared.witness).map_err(|_| ProofError::InvalidWitness)?;
-        Ok(())
+        validate_consensus_with_context(&prepared.witness)
+            .map_err(|_| ProofError::InvalidWitness.into())
     }
 
     /// Verify a complete proof, recheck its still-current anchor and persist
@@ -743,7 +756,26 @@ impl<DB: Database> Engine<DB> {
         proof: &P::ChunkProof,
         proof_system: &P,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        self.commit_consensus_chunk_inner(witness, proof, proof_system, false, None)
+        self.commit_consensus_chunk_inner(witness, proof, proof_system, false, None, None)
+    }
+
+    /// [`Self::commit_consensus_chunk`] for a witness whose complete
+    /// consensus validation the caller already holds.
+    pub(crate) fn commit_validated_consensus_chunk<P: ProofSystem>(
+        &mut self,
+        witness: &ConsensusWitness,
+        proof: &P::ChunkProof,
+        proof_system: &P,
+        validated: ValidatedConsensus,
+    ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
+        self.commit_consensus_chunk_inner(
+            witness,
+            proof,
+            proof_system,
+            false,
+            None,
+            Some(validated),
+        )
     }
 
     pub(crate) fn commit_imported_consensus_chunk<P: ProofSystem>(
@@ -752,8 +784,16 @@ impl<DB: Database> Engine<DB> {
         proof: &P::ChunkProof,
         proof_system: &P,
         executor: Option<&dyn neutrino_proof_system::ErasedBlockExecutor>,
+        validated: ValidatedConsensus,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
-        self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor)
+        self.commit_consensus_chunk_inner(
+            witness,
+            proof,
+            proof_system,
+            true,
+            executor,
+            Some(validated),
+        )
     }
 
     /// Commit complete consensus for the saved BFT target. When that target
@@ -780,9 +820,11 @@ impl<DB: Database> Engine<DB> {
         {
             return Err(ProofError::PublicInputMismatch.into());
         }
-        self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor)
+        self.commit_consensus_chunk_inner(witness, proof, proof_system, true, executor, None)
     }
 
+    /// `validated`, when present, is the complete consensus validation of this
+    /// exact `witness`; it replaces the otherwise identical revalidation.
     fn commit_consensus_chunk_inner<P: ProofSystem>(
         &mut self,
         witness: &ConsensusWitness,
@@ -790,6 +832,7 @@ impl<DB: Database> Engine<DB> {
         proof_system: &P,
         imported: bool,
         executor: Option<&dyn neutrino_proof_system::ErasedBlockExecutor>,
+        validated: Option<ValidatedConsensus>,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
         let (context, seed, _) = self.consensus_boundary(witness.context.chunk_id)?;
         if witness.context != context
@@ -812,8 +855,11 @@ impl<DB: Database> Engine<DB> {
                 return Err(ProofError::PublicInputMismatch.into());
             }
         }
-        let validated =
-            validate_consensus_with_context(witness).map_err(|_| ProofError::InvalidWitness)?;
+        let validated = if let Some(validated) = validated {
+            validated
+        } else {
+            validate_consensus_with_context(witness).map_err(|_| ProofError::InvalidWitness)?
+        };
         let statement = validated.statement;
         proof_system.verify_consensus_chunk(proof, &statement)?;
         let chunk = as_chunk(&statement.chunk);

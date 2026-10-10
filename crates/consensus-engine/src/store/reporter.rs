@@ -16,10 +16,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{ChainStore, StoreError};
 use crate::{ReporterIdentity, RetentionPolicy};
 
+/// `ReporterIndex` tag: source identity to its authenticated chunk.
+const SOURCE_LOOKUP: u8 = 0;
+/// `ReporterIndex` tag: header hash to every chunk retaining it.
+const HEADER_LOOKUP: u8 = 1;
+/// `ReporterIndex` tag: per-chunk source inventory entry.
+const SOURCE_INVENTORY: u8 = 2;
+/// `ReporterIndex` tag: watched historical chunk.
+const CHUNK_LOOKUP: u8 = 3;
+
 #[derive(BorshSerialize, BorshDeserialize)]
 pub(super) struct Owned<T> {
-    owners: Vec<BlsPublicKey>,
+    pub(super) owners: Vec<BlsPublicKey>,
     pub(super) value: T,
+}
+
+/// Serialize-only borrowed twin of [`Owned`] with an identical encoding.
+#[derive(BorshSerialize)]
+struct OwnedRef<'a, T> {
+    owners: &'a [BlsPublicKey],
+    value: &'a T,
 }
 
 struct ReporterContext {
@@ -43,13 +59,13 @@ fn lookup_key(kind: u8, hash: &Hash) -> [u8; 33] {
 
 fn inventory_key(chunk: u64, hash: Hash) -> [u8; 41] {
     let mut key = [0; 41];
-    key[0] = 2;
+    key[0] = SOURCE_INVENTORY;
     key[1..].copy_from_slice(&source_key(chunk, hash));
     key
 }
 
 fn chunk_lookup_key(chunk: u64) -> [u8; 9] {
-    let mut key = [3; 9];
+    let mut key = [CHUNK_LOOKUP; 9];
     key[1..].copy_from_slice(&chunk.to_be_bytes());
     key
 }
@@ -63,17 +79,83 @@ fn validate_addresses<E>(addresses: &[[u8; 32]]) -> Result<(), StoreError<E>> {
     Ok(())
 }
 
+/// Stage one owned entry without cloning its owners or value.
+fn put_owned<E, T: BorshSerialize>(
+    batch: &mut Batch,
+    column: Column,
+    key: impl Into<Vec<u8>>,
+    owners: &[BlsPublicKey],
+    value: &T,
+) -> Result<(), StoreError<E>> {
+    batch.put(column, key, borsh::to_vec(&OwnedRef { owners, value })?);
+    Ok(())
+}
+
+/// Stage a watched chunk's lookup entry together with its owned opening.
+fn put_reporter_opening_batch<E>(
+    batch: &mut Batch,
+    opening: &HistoricalOpening,
+    owners: &[BlsPublicKey],
+) -> Result<(), StoreError<E>> {
+    let chunk = opening.record.chunk.chunk_id;
+    batch.put(Column::ReporterIndex, chunk_lookup_key(chunk), [0]);
+    put_owned(
+        batch,
+        Column::ReporterHistory,
+        chunk.to_be_bytes(),
+        owners,
+        opening,
+    )
+}
+
+/// Save a historical program boundary needed by retained exact proof envelopes.
+fn put_reporter_boundary_batch<E>(
+    batch: &mut Batch,
+    record: &HistoricalChunk,
+    boundary: &ConsensusBoundary,
+) -> Result<(), StoreError<E>> {
+    let owners: Vec<_> = record
+        .validators
+        .iter()
+        .filter(|v| !v.slashed && v.effective_stake > 0)
+        .map(|v| v.pubkey)
+        .collect();
+    put_owned(
+        batch,
+        Column::ReporterBoundaries,
+        boundary.next_chunk_id.to_be_bytes(),
+        &owners,
+        boundary,
+    )
+}
+
 impl<DB: Database> ChainStore<DB> {
     pub(crate) fn retain_reporter_source(
         &mut self,
         chunk: u64,
         artifact: &SignedArtifact,
     ) -> Result<(), StoreError<DB::Error>> {
-        if self.retention_info()?.policy != RetentionPolicy::Reporter {
+        let policy = self.retention_info()?.policy;
+        if policy != RetentionPolicy::Reporter {
+            return Ok(());
+        }
+        self.retain_reporter_source_with(chunk, artifact.id(), artifact, policy)
+    }
+
+    /// Durably retain one source whose identity and stored retention policy the
+    /// caller already read.
+    pub(super) fn retain_reporter_source_with(
+        &mut self,
+        chunk: u64,
+        id: Hash,
+        artifact: &SignedArtifact,
+        policy: RetentionPolicy,
+    ) -> Result<(), StoreError<DB::Error>> {
+        if policy != RetentionPolicy::Reporter {
             return Ok(());
         }
         let mut batch = Batch::new();
-        self.retain_reporter_source_batch(&mut batch, chunk, artifact)?;
+        self.retain_reporter_source_batch(&mut batch, chunk, id, artifact, policy)?;
         self.write_observed_batch(batch, true)
     }
 
@@ -128,6 +210,24 @@ impl<DB: Database> ChainStore<DB> {
             batch.put(Column::ReporterValidators, key, borsh::to_vec(&addresses)?);
         }
         Ok(())
+    }
+
+    /// Bonded, unslashed memberships that remain accountable for their
+    /// signatures, each with the withdrawal account its balance is queried under.
+    fn accountable_identities(
+        &self,
+        validators: &[Validator],
+    ) -> Result<Vec<ReporterIdentity>, StoreError<DB::Error>> {
+        let mut identities = Vec::new();
+        for validator in validators {
+            if !validator.slashed
+                && validator.effective_stake > 0
+                && !self.is_identity_slashed(&validator.pubkey)?
+            {
+                identities.push((validator.pubkey, validator.withdrawal_credentials));
+            }
+        }
+        Ok(identities)
     }
 
     /// Whether switching to a snapshot would skip append data needed by watched openings.
@@ -196,11 +296,7 @@ impl<DB: Database> ChainStore<DB> {
             };
             let validators = if let Some(record) = self.historical_chunk(chunk)? {
                 record.validators
-            } else if chunk
-                == self
-                    .get_latest_finalized_chunk_id()?
-                    .map_or(0, |id| id.saturating_add(1))
-            {
+            } else if chunk == self.finalized_count()? {
                 self.get_validator_set_snapshot(
                     self.get_latest_validator_set_index()?.unwrap_or(0),
                 )?
@@ -259,6 +355,7 @@ impl<DB: Database> ChainStore<DB> {
         let mut removed_headers: BTreeMap<Hash, Vec<u64>> = BTreeMap::new();
         for (key, bytes) in self.db.iter_column(column).map_err(StoreError::Database)? {
             let mut entry: Owned<T> = borsh::from_slice(&bytes)?;
+            let before = entry.owners.len();
             entry.owners.retain(|owner| eligible.contains(owner));
             if entry.owners.is_empty() {
                 if column == Column::ReporterHistory {
@@ -269,7 +366,7 @@ impl<DB: Database> ChainStore<DB> {
                     let hash: Hash = key[8..]
                         .try_into()
                         .map_err(|_| StoreError::Corrupt("reporter source key"))?;
-                    batch.delete(Column::ReporterIndex, lookup_key(0, &hash));
+                    batch.delete(Column::ReporterIndex, lookup_key(SOURCE_LOOKUP, &hash));
                     let chunk = u64::from_be_bytes(key[..8].try_into().expect("eight bytes"));
                     batch.delete(Column::ReporterIndex, inventory_key(chunk, hash));
                 } else if column == Column::ReporterHeaders {
@@ -280,21 +377,22 @@ impl<DB: Database> ChainStore<DB> {
                     removed_headers.entry(hash).or_default().push(chunk);
                 }
                 batch.delete(column, key);
-            } else {
+            } else if entry.owners.len() != before {
+                // An entry that kept every owner is already stored exactly.
                 batch.put(column, key, borsh::to_vec(&entry)?);
             }
         }
         for (hash, removed) in removed_headers {
             let mut chunks: Vec<u64> = self
-                .get_decoded(Column::ReporterIndex, &lookup_key(1, &hash))?
+                .get_decoded(Column::ReporterIndex, &lookup_key(HEADER_LOOKUP, &hash))?
                 .ok_or(StoreError::Corrupt("reporter header lookup missing"))?;
             chunks.retain(|chunk| !removed.contains(chunk));
             if chunks.is_empty() {
-                batch.delete(Column::ReporterIndex, lookup_key(1, &hash));
+                batch.delete(Column::ReporterIndex, lookup_key(HEADER_LOOKUP, &hash));
             } else {
                 batch.put(
                     Column::ReporterIndex,
-                    lookup_key(1, &hash),
+                    lookup_key(HEADER_LOOKUP, &hash),
                     borsh::to_vec(&chunks)?,
                 );
             }
@@ -332,10 +430,7 @@ impl<DB: Database> ChainStore<DB> {
         }
         let state = self.get_consensus_state()?;
         let count = state.as_ref().map_or_else(
-            || {
-                self.get_latest_finalized_chunk_id()
-                    .map(|id| id.map_or(0, |id| id.saturating_add(1)))
-            },
+            || self.finalized_count(),
             |state| Ok(state.boundary.next_chunk_id),
         )?;
         if chunk < count {
@@ -364,40 +459,22 @@ impl<DB: Database> ChainStore<DB> {
         opening: &HistoricalOpening,
         boundary: Option<&ConsensusBoundary>,
     ) -> Result<ReporterContext, StoreError<DB::Error>> {
-        let chunk = opening.record.chunk.chunk_id;
-        let mut identities = Vec::new();
         let mut owners = self.reporter_owners(&opening.record.validators)?;
-        for validator in &opening.record.validators {
-            if !validator.slashed
-                && validator.effective_stake > 0
-                && !self.is_identity_slashed(&validator.pubkey)?
-            {
-                identities.push((validator.pubkey, validator.withdrawal_credentials));
-                owners.push(validator.pubkey);
-            }
-        }
+        let identities = self.accountable_identities(&opening.record.validators)?;
+        owners.extend(identities.iter().map(|(key, _)| *key));
         owners.sort_unstable();
         owners.dedup();
         self.merge_reporter_identities_batch(batch, &identities)?;
         if !owners.is_empty() {
-            batch.put(Column::ReporterIndex, chunk_lookup_key(chunk), [0]);
-            batch.put(
-                Column::ReporterHistory,
-                chunk.to_be_bytes(),
-                borsh::to_vec(&Owned {
-                    owners: owners.clone(),
-                    value: opening.clone(),
-                })?,
-            );
+            put_reporter_opening_batch(batch, opening, &owners)?;
             if let Some(boundary) = boundary {
-                batch.put(
+                put_owned(
+                    batch,
                     Column::ReporterBoundaries,
-                    chunk.to_be_bytes(),
-                    borsh::to_vec(&Owned {
-                        owners: owners.clone(),
-                        value: *boundary,
-                    })?,
-                );
+                    opening.record.chunk.chunk_id.to_be_bytes(),
+                    &owners,
+                    boundary,
+                )?;
             }
         }
         Ok(ReporterContext {
@@ -410,21 +487,15 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         batch: &mut Batch,
         recent: &[HistoricalOpening],
+        policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
-        if self.retention_info()?.policy != RetentionPolicy::Reporter {
+        if policy != RetentionPolicy::Reporter {
             return Ok(());
         }
         let mut identities = Vec::new();
         for opening in recent {
             self.promote_reporter_opening_batch(batch, opening, None)?;
-            for validator in &opening.record.validators {
-                if !validator.slashed
-                    && validator.effective_stake > 0
-                    && !self.is_identity_slashed(&validator.pubkey)?
-                {
-                    identities.push((validator.pubkey, validator.withdrawal_credentials));
-                }
-            }
+            identities.extend(self.accountable_identities(&opening.record.validators)?);
         }
         // Each opening can contain a different account for the same BLS key.
         // Publish their complete union after the individual context writes.
@@ -437,8 +508,9 @@ impl<DB: Database> ChainStore<DB> {
         record: &HistoricalChunk,
         old: &HistoryFrontier,
         path: &HistoryPath,
+        policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
-        if self.retention_info()?.policy != RetentionPolicy::Reporter {
+        if policy != RetentionPolicy::Reporter {
             return Ok(());
         }
         let leaf = commitment(&record.evidence_context());
@@ -456,35 +528,15 @@ impl<DB: Database> ChainStore<DB> {
         }
         // New memberships are retained immediately. The finalized runtime query
         // following this append decides whether they remain economically accountable.
-        let mut owners = Vec::new();
-        let mut identities = Vec::new();
-        for validator in &record.validators {
-            if !validator.slashed
-                && validator.effective_stake > 0
-                && !self.is_identity_slashed(&validator.pubkey)?
-            {
-                owners.push(validator.pubkey);
-                identities.push((validator.pubkey, validator.withdrawal_credentials));
-            }
-        }
+        let identities = self.accountable_identities(&record.validators)?;
+        let owners: Vec<_> = identities.iter().map(|(key, _)| *key).collect();
         self.merge_reporter_identities_batch(batch, &identities)?;
         if !owners.is_empty() {
-            batch.put(
-                Column::ReporterIndex,
-                chunk_lookup_key(record.chunk.chunk_id),
-                [0],
-            );
-            batch.put(
-                Column::ReporterHistory,
-                record.chunk.chunk_id.to_be_bytes(),
-                borsh::to_vec(&Owned {
-                    owners,
-                    value: HistoricalOpening {
-                        record: record.clone(),
-                        path: path.clone(),
-                    },
-                })?,
-            );
+            let opening = HistoricalOpening {
+                record: record.clone(),
+                path: path.clone(),
+            };
+            put_reporter_opening_batch(batch, &opening, &owners)?;
         }
         Ok(())
     }
@@ -494,6 +546,15 @@ impl<DB: Database> ChainStore<DB> {
         &self,
         chunk: u64,
     ) -> Result<Option<HistoricalOpening>, StoreError<DB::Error>> {
+        self.verified_reporter_opening(chunk, &mut BTreeMap::new())
+    }
+
+    /// [`Self::reporter_opening`] reusing frontier roots already read in one pass.
+    fn verified_reporter_opening(
+        &self,
+        chunk: u64,
+        roots: &mut BTreeMap<u64, Option<Hash>>,
+    ) -> Result<Option<HistoricalOpening>, StoreError<DB::Error>> {
         let Some(entry) = self.get_decoded::<Owned<HistoricalOpening>>(
             Column::ReporterHistory,
             &chunk.to_be_bytes(),
@@ -502,9 +563,8 @@ impl<DB: Database> ChainStore<DB> {
             return Ok(None);
         };
         let opening = entry.value;
-        let frontier = self.history_frontier(opening.path.count)?;
-        let root = frontier
-            .root()
+        let root = self
+            .cached_history_root(opening.path.count, roots)?
             .ok_or(StoreError::Corrupt("reporter frontier"))?;
         if entry.owners.is_empty()
             || opening.record.chunk.chunk_id != chunk
@@ -521,7 +581,7 @@ impl<DB: Database> ChainStore<DB> {
     /// Watched finalized chunk IDs for restart and delayed dependency discovery.
     pub fn reporter_history_chunks(&self) -> Result<Vec<u64>, StoreError<DB::Error>> {
         self.db
-            .iter_prefix(Column::ReporterIndex, &[3])
+            .iter_prefix(Column::ReporterIndex, &[CHUNK_LOOKUP])
             .map_err(StoreError::Database)?
             .into_iter()
             .map(|(key, _)| {
@@ -578,13 +638,17 @@ impl<DB: Database> ChainStore<DB> {
             .collect()
     }
 
+    /// Stage `artifact`, whose identity is `id`, and its dependencies for
+    /// accountable owners. `policy` is the stored retention policy.
     pub(super) fn retain_reporter_source_batch(
         &self,
         batch: &mut Batch,
         chunk: u64,
+        id: Hash,
         artifact: &SignedArtifact,
+        policy: RetentionPolicy,
     ) -> Result<(), StoreError<DB::Error>> {
-        if self.retention_info()?.policy != RetentionPolicy::Reporter {
+        if policy != RetentionPolicy::Reporter {
             return Ok(());
         }
         let ReporterContext { validators, owners } = self.reporter_context_batch(batch, chunk)?;
@@ -609,7 +673,7 @@ impl<DB: Database> ChainStore<DB> {
         let source_owners: Vec<_> = match artifact {
             SignedArtifact::Quorum(_) => owners.clone(),
             SignedArtifact::BlockProof(_) => {
-                self.reporter_proof_claim_owners(chunk, artifact.id(), &validators, &owners)?
+                self.reporter_proof_claim_owners(chunk, id, &validators, &owners)?
             }
             _ => signers
                 .iter()
@@ -636,13 +700,19 @@ impl<DB: Database> ChainStore<DB> {
         if !owners.is_empty() {
             for quorum in quorums {
                 let dependency = SignedArtifact::Quorum(quorum.clone());
-                self.put_reporter_source_batch(batch, chunk, &dependency, &owners)?;
+                self.put_reporter_source_batch(
+                    batch,
+                    chunk,
+                    dependency.id(),
+                    &dependency,
+                    &owners,
+                )?;
             }
         }
         if !source_owners.is_empty() {
             // Copy envelopes: accepted receipt references would dangle after ordinary pruning.
             // Quorums and other signers remain dependencies of a tracked signer's lock claim.
-            self.put_reporter_source_batch(batch, chunk, artifact, &source_owners)?;
+            self.put_reporter_source_batch(batch, chunk, id, artifact, &source_owners)?;
         }
         if let SignedArtifact::Vote(vote) = artifact {
             let mut dependencies: BTreeMap<Hash, Vec<BlsPublicKey>> = BTreeMap::new();
@@ -654,16 +724,17 @@ impl<DB: Database> ChainStore<DB> {
                 else {
                     continue;
                 };
-                for id in &claim.proof_hashes {
-                    dependencies.entry(*id).or_default().push(owner);
+                for proof_id in &claim.proof_hashes {
+                    dependencies.entry(*proof_id).or_default().push(owner);
                 }
             }
-            for (id, users) in dependencies {
+            for (proof_id, users) in dependencies {
+                // `signed_artifact` verifies that the source has exactly this identity.
                 if let Some((source, dependency @ SignedArtifact::BlockProof(_))) =
-                    self.signed_artifact(&id)?
+                    self.signed_artifact(&proof_id)?
                     && source == chunk
                 {
-                    self.put_reporter_source_batch(batch, chunk, &dependency, &users)?;
+                    self.put_reporter_source_batch(batch, chunk, proof_id, &dependency, &users)?;
                 }
             }
         }
@@ -698,14 +769,16 @@ impl<DB: Database> ChainStore<DB> {
         Ok(owners)
     }
 
+    /// Stage `artifact`, whose identity is `id`, merging its prior owners.
     fn put_reporter_source_batch(
         &self,
         batch: &mut Batch,
         chunk: u64,
+        id: Hash,
         artifact: &SignedArtifact,
         owners: &[BlsPublicKey],
     ) -> Result<(), StoreError<DB::Error>> {
-        let key = source_key(chunk, artifact.id());
+        let key = source_key(chunk, id);
         let mut all = owners.to_vec();
         if let Some(prior) =
             self.get_decoded::<Owned<SignedArtifact>>(Column::ReporterSources, &key)?
@@ -714,22 +787,15 @@ impl<DB: Database> ChainStore<DB> {
         }
         all.sort_unstable();
         all.dedup();
-        batch.put(
-            Column::ReporterSources,
-            key,
-            borsh::to_vec(&Owned {
-                owners: all.clone(),
-                value: artifact.clone(),
-            })?,
-        );
+        put_owned(batch, Column::ReporterSources, key, &all, artifact)?;
         batch.put(
             Column::ReporterIndex,
-            lookup_key(0, &artifact.id()),
+            lookup_key(SOURCE_LOOKUP, &id),
             borsh::to_vec(&chunk)?,
         );
         batch.put(
             Column::ReporterIndex,
-            inventory_key(chunk, artifact.id()),
+            inventory_key(chunk, id),
             borsh::to_vec(&artifact.kind())?,
         );
         if let SignedArtifact::BlockProof(proof) = artifact
@@ -755,7 +821,8 @@ impl<DB: Database> ChainStore<DB> {
         header: &Header,
         owners: &[BlsPublicKey],
     ) -> Result<(), StoreError<DB::Error>> {
-        let key = source_key(chunk, header.hash());
+        let hash = header.hash();
+        let key = source_key(chunk, hash);
         let mut all = owners.to_vec();
         if let Some(prior) = self.get_decoded::<Owned<Header>>(Column::ReporterHeaders, &key)? {
             all.extend(prior.owners);
@@ -763,50 +830,17 @@ impl<DB: Database> ChainStore<DB> {
         all.sort_unstable();
         all.dedup();
         if !all.is_empty() {
-            batch.put(
-                Column::ReporterHeaders,
-                key,
-                borsh::to_vec(&Owned {
-                    owners: all,
-                    value: header.clone(),
-                })?,
-            );
+            put_owned(batch, Column::ReporterHeaders, key, &all, header)?;
             let mut chunks: Vec<u64> = self
-                .get_decoded(Column::ReporterIndex, &lookup_key(1, &header.hash()))?
+                .get_decoded(Column::ReporterIndex, &lookup_key(HEADER_LOOKUP, &hash))?
                 .unwrap_or_default();
             chunks.push(chunk);
             chunks.sort_unstable();
             chunks.dedup();
             batch.put(
                 Column::ReporterIndex,
-                lookup_key(1, &header.hash()),
+                lookup_key(HEADER_LOOKUP, &hash),
                 borsh::to_vec(&chunks)?,
-            );
-        }
-        Ok(())
-    }
-
-    /// Save a historical program boundary needed by retained exact proof envelopes.
-    pub(super) fn retain_reporter_boundary_batch(
-        &self,
-        batch: &mut Batch,
-        record: &HistoricalChunk,
-        boundary: &ConsensusBoundary,
-    ) -> Result<(), StoreError<DB::Error>> {
-        if self.retention_info()?.policy == RetentionPolicy::Reporter {
-            let owners: Vec<_> = record
-                .validators
-                .iter()
-                .filter(|v| !v.slashed && v.effective_stake > 0)
-                .map(|v| v.pubkey)
-                .collect();
-            batch.put(
-                Column::ReporterBoundaries,
-                boundary.next_chunk_id.to_be_bytes(),
-                borsh::to_vec(&Owned {
-                    owners,
-                    value: *boundary,
-                })?,
             );
         }
         Ok(())
@@ -834,9 +868,7 @@ impl<DB: Database> ChainStore<DB> {
         if self.retention_info()?.policy != RetentionPolicy::Reporter {
             return Ok(());
         }
-        let count = self
-            .get_latest_finalized_chunk_id()?
-            .map_or(0, |id| id.saturating_add(1));
+        let count = self.finalized_count()?;
         if chunk > count {
             return Ok(());
         }
@@ -866,12 +898,13 @@ impl<DB: Database> ChainStore<DB> {
         boundary: &ConsensusBoundary,
         headers: impl Iterator<Item = Header>,
     ) -> Result<(), StoreError<DB::Error>> {
-        self.retain_reporter_boundary_batch(batch, record, boundary)?;
         if self.retention_info()?.policy != RetentionPolicy::Reporter {
             return Ok(());
         }
+        put_reporter_boundary_batch(batch, record, boundary)?;
         let mut retained: BTreeMap<Hash, (Header, Vec<BlsPublicKey>)> = BTreeMap::new();
         for header in headers {
+            let hash = header.hash();
             let owners: Vec<_> = record
                 .validators
                 .get(header.proposer_index as usize)
@@ -879,24 +912,31 @@ impl<DB: Database> ChainStore<DB> {
                 .into_iter()
                 .collect();
             retained
-                .entry(header.hash())
+                .entry(hash)
                 .or_insert_with(|| (header.clone(), Vec::new()))
                 .1
                 .extend(owners);
-            if let Some(proof) = self.get_block_proof(&header.hash())? {
+            if let Some(proof) = self.get_block_proof(&hash)? {
                 let source = SignedArtifact::BlockProof(proof);
+                let id = source.id();
                 let users: Vec<_> = record
                     .finality
                     .precommit_attestations
                     .iter()
-                    .filter(|claim| claim.proof_hashes.contains(&source.id()))
+                    .filter(|claim| claim.proof_hashes.contains(&id))
                     .filter_map(|claim| record.validators.get(claim.validator_index as usize))
                     .map(|v| v.pubkey)
                     .collect();
                 if !users.is_empty() {
-                    self.put_reporter_source_batch(batch, record.chunk.chunk_id, &source, &users)?;
+                    self.put_reporter_source_batch(
+                        batch,
+                        record.chunk.chunk_id,
+                        id,
+                        &source,
+                        &users,
+                    )?;
                     retained
-                        .entry(header.hash())
+                        .entry(hash)
                         .or_insert_with(|| (header.clone(), Vec::new()))
                         .1
                         .extend_from_slice(&users);
@@ -922,7 +962,7 @@ impl<DB: Database> ChainStore<DB> {
     /// Saved compact header dependency for exact historical block proof authentication.
     pub fn reporter_header(&self, hash: &Hash) -> Result<Option<Header>, StoreError<DB::Error>> {
         let Some(chunks): Option<Vec<u64>> =
-            self.get_decoded(Column::ReporterIndex, &lookup_key(1, hash))?
+            self.get_decoded(Column::ReporterIndex, &lookup_key(HEADER_LOOKUP, hash))?
         else {
             return Ok(None);
         };
@@ -959,7 +999,7 @@ impl<DB: Database> ChainStore<DB> {
         id: &Hash,
     ) -> Result<Option<(u64, SignedArtifact)>, StoreError<DB::Error>> {
         let Some(chunk): Option<u64> =
-            self.get_decoded(Column::ReporterIndex, &lookup_key(0, id))?
+            self.get_decoded(Column::ReporterIndex, &lookup_key(SOURCE_LOOKUP, id))?
         else {
             return Ok(None);
         };
@@ -973,14 +1013,17 @@ impl<DB: Database> ChainStore<DB> {
     }
 
     pub(super) fn validate_reporter_history(&self) -> Result<(), StoreError<DB::Error>> {
+        let mut roots = BTreeMap::new();
+        let mut openings = BTreeSet::new();
         for (key, _) in self
             .db
             .iter_column(Column::ReporterHistory)
             .map_err(StoreError::Database)?
         {
             let chunk = super::retention::decode_count(&key)?;
-            self.reporter_opening(chunk)?
+            self.verified_reporter_opening(chunk, &mut roots)?
                 .ok_or(StoreError::Corrupt("reporter context missing"))?;
+            openings.insert(chunk);
         }
         for (key, bytes) in self
             .db
@@ -990,8 +1033,8 @@ impl<DB: Database> ChainStore<DB> {
             let Some(tag) = key.first() else {
                 return Err(StoreError::Corrupt("reporter index empty key"));
             };
-            match tag {
-                0 => {
+            match *tag {
+                SOURCE_LOOKUP => {
                     let hash: Hash = key
                         .get(1..)
                         .and_then(|hash| hash.try_into().ok())
@@ -1004,7 +1047,7 @@ impl<DB: Database> ChainStore<DB> {
                         return Err(StoreError::Corrupt("reporter source lookup count"));
                     }
                 }
-                1 => {
+                HEADER_LOOKUP => {
                     let hash: Hash = key
                         .get(1..)
                         .and_then(|hash| hash.try_into().ok())
@@ -1021,7 +1064,7 @@ impl<DB: Database> ChainStore<DB> {
                     self.reporter_header(&hash)?
                         .ok_or(StoreError::Corrupt("reporter header lookup unavailable"))?;
                 }
-                2 => {
+                SOURCE_INVENTORY => {
                     let chunk = key
                         .get(1..9)
                         .and_then(|c| c.try_into().ok())
@@ -1031,19 +1074,21 @@ impl<DB: Database> ChainStore<DB> {
                         .get(9..)
                         .and_then(|h| h.try_into().ok())
                         .ok_or(StoreError::Corrupt("reporter inventory hash"))?;
-                    if self.get_decoded::<u64>(Column::ReporterIndex, &lookup_key(0, &hash))?
-                        != Some(chunk)
-                    {
+                    let lookup = lookup_key(SOURCE_LOOKUP, &hash);
+                    if self.get_decoded::<u64>(Column::ReporterIndex, &lookup)? != Some(chunk) {
                         return Err(StoreError::Corrupt("reporter inventory lookup mismatch"));
                     }
                 }
-                3 => {
+                CHUNK_LOOKUP => {
                     let chunk = key
                         .get(1..)
                         .ok_or(StoreError::Corrupt("reporter chunk lookup key"))
                         .and_then(super::retention::decode_count)?;
-                    self.reporter_opening(chunk)?
-                        .ok_or(StoreError::Corrupt("reporter chunk lookup unavailable"))?;
+                    // Every saved opening was already reverified above.
+                    if !openings.contains(&chunk) {
+                        self.verified_reporter_opening(chunk, &mut roots)?
+                            .ok_or(StoreError::Corrupt("reporter chunk lookup unavailable"))?;
+                    }
                 }
                 _ => return Err(StoreError::Corrupt("reporter index kind")),
             }
@@ -1062,6 +1107,18 @@ mod tests {
     use neutrino_primitives::ConsensusDomain;
     use neutrino_storage::MemoryDatabase;
 
+    fn bonded(pubkey: BlsPublicKey, withdrawal_credentials: [u8; 32]) -> Validator {
+        Validator {
+            pubkey,
+            withdrawal_credentials,
+            effective_stake: 100,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }
+    }
+
     #[test]
     fn unobserved_multiblock_finalization_preserves_proposer_and_shared_parent_owners() {
         let mut store = ChainStore::new(MemoryDatabase::new());
@@ -1071,15 +1128,7 @@ mod tests {
         let mut record = super::super::history::tests::record(0);
         record.validators = [1u8, 2]
             .into_iter()
-            .map(|tag| Validator {
-                pubkey: [tag; 48],
-                withdrawal_credentials: [tag; 32],
-                effective_stake: 100,
-                slashed: false,
-                activation_epoch: 0,
-                exit_epoch: u64::MAX,
-                last_active_chunk: 0,
-            })
+            .map(|tag| bonded([tag; 48], [tag; 32]))
             .collect();
         let identities: Vec<_> = record
             .validators
@@ -1175,15 +1224,7 @@ mod tests {
         store.set_reporter_eligible(&[(key, original)]).unwrap();
         for (id, address) in [(0, original), (1, replacement)] {
             let mut record = super::super::history::tests::record(id);
-            record.validators = vec![Validator {
-                pubkey: key,
-                withdrawal_credentials: address,
-                effective_stake: 100,
-                slashed: false,
-                activation_epoch: 0,
-                exit_epoch: u64::MAX,
-                last_active_chunk: 0,
-            }];
+            record.validators = vec![bonded(key, address)];
             let mut batch = Batch::new();
             store.append_history_batch(&mut batch, &record).unwrap();
             store.db_mut().write_batch_durable(batch).unwrap();

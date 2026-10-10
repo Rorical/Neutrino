@@ -28,7 +28,7 @@ use neutrino_consensus_types::{
 };
 use neutrino_primitives::{
     BitVec, BoundedBytes, ChainSpec, ConsensusParams, Hash, LightClientParams, ProofParams,
-    RuntimeInfo, RuntimeParams, StateParams, Validator,
+    RuntimeParams, Validator,
 };
 use neutrino_prover_chunk::consensus::{as_chunk, genesis_context};
 use neutrino_prover_chunk::execution::commitment;
@@ -46,16 +46,11 @@ fn spec() -> ChainSpec {
         last_active_chunk: 0,
     }];
     ChainSpec {
-        name: BoundedBytes::new(b"retention-test".to_vec()).unwrap(),
-        chain_id: 7,
         genesis_time: 0,
         genesis_gas_limit: 1_000_000,
-        runtime_info: RuntimeInfo::default(),
         runtime_code_hash: [3; 32],
         genesis_seed: [4; 32],
-        genesis_state_root: ZERO_HASH,
         genesis_block_hash: [5; 32],
-        genesis_validator_set_root: commitment(&validators),
         consensus: ConsensusParams {
             chunk_size: 1,
             ..ConsensusParams::default()
@@ -64,7 +59,6 @@ fn spec() -> ChainSpec {
             slot_budget_per_chunk: 1,
             ..ProofParams::default()
         },
-        state: StateParams::default(),
         light_client: LightClientParams {
             weak_subjectivity_period_secs: 7 * neutrino_primitives::DEFAULT_SLOT_DURATION_SECS,
             ..LightClientParams::default()
@@ -77,8 +71,7 @@ fn spec() -> ChainSpec {
             unbonding_delay_blocks: 8,
             ..RuntimeParams::default()
         },
-        initial_validators: validators,
-        metadata: BoundedBytes::new(Vec::new()).unwrap(),
+        ..crate::test_db::spec(b"retention-test", 7, validators)
     }
 }
 

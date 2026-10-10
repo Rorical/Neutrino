@@ -11,15 +11,21 @@ use neutrino_storage::{Batch, Column, Database};
 const MAX_SIGNED_ARTIFACTS: usize = 4096;
 const MAX_SIGNED_ARTIFACT_STORAGE_BYTES: usize = 512 * 1024 * 1024;
 const PRUNED_FLOOR_KEY: &[u8] = b"signed_artifact_pruned_floor";
+/// `SignedArtifactIndex` tag of metadata rows keyed by source identity.
+const METADATA_BY_ID: u8 = 0;
+/// `SignedArtifactIndex` tag of metadata rows keyed by source chunk, then identity.
+const METADATA_BY_CHUNK: u8 = 1;
 
 fn metadata_id_key(id: Hash) -> [u8; 33] {
     let mut key = [0; 33];
+    key[0] = METADATA_BY_ID;
     key[1..].copy_from_slice(&id);
     key
 }
 
 fn metadata_chunk_prefix(chunk: ChunkId) -> [u8; 9] {
-    let mut key = [1; 9];
+    let mut key = [0; 9];
+    key[0] = METADATA_BY_CHUNK;
     key[1..].copy_from_slice(&chunk.to_be_bytes());
     key
 }
@@ -89,7 +95,8 @@ pub struct SignedArtifactMetadata {
 }
 
 impl SignedArtifactMetadata {
-    fn for_artifact(chunk_id: ChunkId, artifact: &SignedArtifact) -> Self {
+    /// Metadata for `artifact`, whose identity the caller already computed as `id`.
+    fn for_artifact(chunk_id: ChunkId, id: Hash, artifact: &SignedArtifact) -> Self {
         let (round, signers, mut proof_hashes) = match artifact {
             SignedArtifact::Vote(vote) => (
                 Some(vote.data.round),
@@ -133,7 +140,7 @@ impl SignedArtifactMetadata {
         proof_hashes.dedup();
         Self {
             chunk_id,
-            id: artifact.id(),
+            id,
             kind: artifact.kind(),
             round,
             signers,
@@ -194,7 +201,8 @@ impl<DB: Database> ChainStore<DB> {
             if source != chunk_id || prior != *artifact {
                 return Err(StoreError::Corrupt("signed artifact identity conflict"));
             }
-            self.retain_reporter_source(chunk_id, artifact)?;
+            let policy = self.retention_info()?.policy;
+            self.retain_reporter_source_with(chunk_id, id, artifact, policy)?;
             if local
                 && let Some(mut metadata) = self.signed_artifact_metadata_by_id(&id)?
                 && !metadata.local
@@ -216,8 +224,9 @@ impl<DB: Database> ChainStore<DB> {
             StoredPayload::Source(Box::new(artifact.clone()))
         };
         let bytes = borsh::to_vec(&StoredArtifact { chunk_id, payload })?;
-        let archive = self.retention_info()?.policy == RetentionPolicy::Archive;
-        let incoming = SignedArtifactMetadata::for_artifact(chunk_id, artifact);
+        let policy = self.retention_info()?.policy;
+        let archive = policy == RetentionPolicy::Archive;
+        let incoming = SignedArtifactMetadata::for_artifact(chunk_id, id, artifact);
         let mut removed = Vec::new();
         let mut count = 0_usize;
         let mut size = bytes.len();
@@ -259,8 +268,8 @@ impl<DB: Database> ChainStore<DB> {
             MAX_SIGNED_ARTIFACT_STORAGE_BYTES - 128 * 1024 * 1024
         };
         if count >= count_limit || size > size_limit {
-            if self.retention_info()?.policy == RetentionPolicy::Reporter {
-                self.retain_reporter_source(chunk_id, artifact)?;
+            if policy == RetentionPolicy::Reporter {
+                self.retain_reporter_source_with(chunk_id, id, artifact, policy)?;
                 if self.reporter_source(&id)?.is_some() {
                     return Ok(id);
                 }
@@ -274,7 +283,7 @@ impl<DB: Database> ChainStore<DB> {
         metadata.storage_bytes =
             u64::try_from(bytes.len()).map_err(|_| StoreError::Corrupt("source size overflow"))?;
         let mut batch = Batch::new();
-        self.retain_reporter_source_batch(&mut batch, chunk_id, artifact)?;
+        self.retain_reporter_source_batch(&mut batch, chunk_id, id, artifact, policy)?;
         for removed_id in removed {
             batch.delete(Column::SignedArtifacts, removed_id);
             delete_metadata(&mut batch, chunk_id, removed_id);
@@ -372,7 +381,7 @@ impl<DB: Database> ChainStore<DB> {
         &self,
     ) -> Result<Vec<SignedArtifactMetadata>, StoreError<DB::Error>> {
         self.db
-            .iter_prefix(Column::SignedArtifactIndex, &[0])
+            .iter_prefix(Column::SignedArtifactIndex, &[METADATA_BY_ID])
             .map_err(StoreError::Database)?
             .into_iter()
             .map(|(key, bytes)| {
@@ -616,7 +625,7 @@ mod tests {
                 payload: StoredPayload::Source(Box::new(artifact.clone())),
             })
             .unwrap();
-            let mut metadata = SignedArtifactMetadata::for_artifact(0, &artifact);
+            let mut metadata = SignedArtifactMetadata::for_artifact(0, id, &artifact);
             metadata.storage_bytes = u64::try_from(bytes.len()).unwrap();
             batch.put(Column::SignedArtifacts, id, bytes);
             put_metadata(&mut batch, &metadata).unwrap();
@@ -672,7 +681,7 @@ mod tests {
                     payload: StoredPayload::Source(Box::new(artifact.clone())),
                 })
                 .unwrap();
-                let mut metadata = SignedArtifactMetadata::for_artifact(chunk, &artifact);
+                let mut metadata = SignedArtifactMetadata::for_artifact(chunk, id, &artifact);
                 metadata.storage_bytes = u64::try_from(bytes.len()).unwrap();
                 batch.put(Column::SignedArtifacts, id, bytes);
                 put_metadata(&mut batch, &metadata).unwrap();

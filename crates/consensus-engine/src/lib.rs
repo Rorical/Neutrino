@@ -35,7 +35,7 @@ mod test_db;
 pub mod validator_set;
 
 pub use bft_loop::{BftAction, BftLoopError, BftQuorumIdentity, BftSession, BftSessionOverview};
-pub use block_state::{BlockState, InvalidTransition};
+pub use block_state::BlockState;
 pub use body::{BodyRoots, apply_body_roots, compute_body_roots};
 pub use clock::SlotClock;
 pub use engine::Engine;
@@ -54,17 +54,6 @@ pub use store::{
     ChainStore, ContentAddressedEntries, StoreError, ValidatorSetSnapshot, keys, pointers,
 };
 pub use validator_set::validator_set_root;
-
-/// Engine lifecycle state.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EngineState {
-    /// Node is syncing historical data.
-    Syncing,
-    /// Node is following the live head.
-    Following,
-    /// Node has stopped due to a fatal error.
-    Stopped,
-}
 
 pub use history::{HistoryImportOutcome, PreparedHistoryFold};
 

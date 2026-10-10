@@ -2,7 +2,7 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS;
-use neutrino_primitives::ZERO_HASH;
+use neutrino_primitives::{Hash, ZERO_HASH};
 use neutrino_storage::{Column, Database};
 use neutrino_trie::Trie;
 
@@ -79,7 +79,7 @@ impl<DB: Database> Engine<DB> {
         }
         info.pruned_before_chunk = floor;
         info.first_retained_height = floor
-            .checked_mul(self.chain_spec().consensus.chunk_size)
+            .checked_mul(self.chunk_size())
             .and_then(|height| height.checked_add(1))
             .ok_or(StoreError::Corrupt("retention height overflow"))?;
         let (mut batch, mut roots) = self.store().retention_batch(self.chain_spec(), info)?;
@@ -93,18 +93,19 @@ impl<DB: Database> Engine<DB> {
         // is conservative and cannot erase a partially downloaded or corrupt state.
         let stored_nodes = self.store().iter_trie_nodes()?;
         let stored_values = self.store().iter_state_values()?;
+        // Keep only stored hashes; their bytes move into the candidate trie.
+        let stored_node_hashes: Vec<Hash> = stored_nodes.iter().map(|(hash, _)| *hash).collect();
+        let stored_value_hashes: Vec<Hash> = stored_values.iter().map(|(hash, _)| *hash).collect();
         let mut live = self.state().clone();
         let pending_nodes = live.drain_pending_nodes();
         let pending_values = live.drain_pending_values();
         let mut candidate = Trie::from_persisted(
             live.root(),
             stored_nodes
-                .iter()
-                .cloned()
+                .into_iter()
                 .chain(pending_nodes.iter().cloned()),
             stored_values
-                .iter()
-                .cloned()
+                .into_iter()
                 .chain(pending_values.iter().cloned()),
         );
         let state_available = roots
@@ -115,18 +116,16 @@ impl<DB: Database> Engine<DB> {
             candidate
                 .retain_roots(&roots)
                 .map_err(|_| StoreError::Corrupt("retained state is incomplete or corrupt"))?;
-            for (hash, _) in &stored_nodes {
+            for hash in &stored_node_hashes {
                 if candidate.node_bytes(hash).is_none() {
                     batch.delete(Column::TrieNodes, hash);
                 }
             }
-            for (hash, _) in &stored_values {
+            for hash in &stored_value_hashes {
                 if candidate.value_bytes(hash).is_none() {
                     batch.delete(Column::StateValues, hash);
                 }
             }
-        }
-        if state_available {
             for (hash, bytes) in pending_nodes {
                 if candidate.node_bytes(&hash).is_some() {
                     batch.put(Column::TrieNodes, hash, bytes);
@@ -145,9 +144,7 @@ impl<DB: Database> Engine<DB> {
         self.fork_choice.retain_finalized_subtree();
         self.bft_sessions.retain(|id, _| *id >= count);
         self.rejected_proofs
-            .retain(|_, (proof, _)| proof.public_inputs.height >= info.first_retained_height);
-        self.rejected_proofs_order
-            .retain(|hash| self.rejected_proofs.contains_key(hash));
+            .retain_from_height(info.first_retained_height);
         self.slashing_monitor
             .retain_history_window(count.saturating_sub(HISTORY_RETENTION_CHUNKS));
         Ok(info)

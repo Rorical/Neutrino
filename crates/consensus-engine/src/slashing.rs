@@ -139,41 +139,21 @@ impl SlashingMonitor {
             .retain(|(_, chunk, _, _), _| *chunk >= first_chunk);
         self.seen_nil_votes
             .retain(|(_, chunk, _, _), _| *chunk >= first_chunk);
-        self.seen_bft_proposals
-            .retain(|(chunk, _, _), _| *chunk >= first_chunk);
-        self.observed_prevote_quorums
-            .retain(|(chunk, _, _), _| *chunk >= first_chunk);
-        self.attestations
-            .retain(|(_, chunk, _, _, _), _| *chunk >= first_chunk);
-        self.proposal_bytes = self
-            .seen_bft_proposals
-            .values()
-            .filter_map(|item| borsh::object_length(item).ok())
-            .sum();
-        self.attestation_bytes = self
-            .attestations
-            .values()
-            .filter_map(|item| borsh::object_length(item).ok())
-            .sum();
-        self.quorum_bytes = self
-            .observed_prevote_quorums
-            .values()
-            .filter_map(|item| borsh::object_length(item).ok())
-            .sum();
-    }
-
-    /// Number of header entries currently retained. Exposed for
-    /// tests; production code should not depend on this.
-    #[must_use]
-    pub fn header_entry_count(&self) -> usize {
-        self.seen_headers.len()
-    }
-
-    /// Number of vote entries currently retained. Exposed for
-    /// tests; production code should not depend on this.
-    #[must_use]
-    pub fn vote_entry_count(&self) -> usize {
-        self.seen_votes.len()
+        retain_sized(
+            &mut self.seen_bft_proposals,
+            &mut self.proposal_bytes,
+            |(chunk, _, _)| *chunk >= first_chunk,
+        );
+        retain_sized(
+            &mut self.observed_prevote_quorums,
+            &mut self.quorum_bytes,
+            |(chunk, _, _)| *chunk >= first_chunk,
+        );
+        retain_sized(
+            &mut self.attestations,
+            &mut self.attestation_bytes,
+            |(_, chunk, _, _, _)| *chunk >= first_chunk,
+        );
     }
 
     /// Record a signed header. If the same proposer has previously
@@ -424,17 +404,22 @@ impl SlashingMonitor {
         new_round: u32,
         new_chunk_hash: ChunkHash,
     ) -> Option<(u32, IndexedVote)> {
+        // Keys order by (validator, chunk, round, phase) and `Prevote` is the
+        // least phase, so this range is exactly the signer's earlier rounds.
+        let earlier = (validator_index, chunk_id, 0, FinalityVotePhase::Prevote)
+            ..(
+                validator_index,
+                chunk_id,
+                new_round,
+                FinalityVotePhase::Prevote,
+            );
         self.seen_votes
-            .iter()
+            .range(earlier)
             .rev()
-            .find_map(|((v, c, r, p), vote)| {
-                if *v == validator_index
-                    && *c == chunk_id
-                    && *r < new_round
-                    && *p == FinalityVotePhase::Precommit
-                    && vote.data.chunk_hash != new_chunk_hash
+            .find_map(|((_, _, round, phase), vote)| {
+                if *phase == FinalityVotePhase::Precommit && vote.data.chunk_hash != new_chunk_hash
                 {
-                    Some((*r, vote.clone()))
+                    Some((*round, vote.clone()))
                 } else {
                     None
                 }
@@ -451,6 +436,14 @@ impl SlashingMonitor {
         validator_index: ValidatorIndex,
         new_vote: &IndexedVote,
     ) -> Option<SlashingEvidence> {
+        // The direct claim lookup precedes the range scan; all three are required.
+        let attestation = self.attestations.get(&(
+            validator_index,
+            new_vote.data.chunk_id,
+            new_vote.data.round,
+            new_vote.data.chunk_hash,
+            new_vote.data.phase,
+        ))?;
         let (prior_round, prior_vote) = self.find_prior_conflicting_precommit(
             validator_index,
             new_vote.data.chunk_id,
@@ -463,13 +456,6 @@ impl SlashingMonitor {
             prior_vote.data.chunk_hash,
         );
         let lock_quorum = self.observed_prevote_quorums.get(&lock_key)?;
-        let attestation = self.attestations.get(&(
-            validator_index,
-            new_vote.data.chunk_id,
-            new_vote.data.round,
-            new_vote.data.chunk_hash,
-            new_vote.data.phase,
-        ))?;
         Some(SlashingEvidence::LockViolation {
             validator_index,
             vote_a: prior_vote,
@@ -492,6 +478,22 @@ impl SlashingMonitor {
     pub fn votes_tracked(&self) -> usize {
         self.seen_votes.len()
     }
+}
+
+/// Retain `map` entries whose key satisfies `keep`, subtracting each removed
+/// entry's encoded length from its running byte total `bytes`.
+fn retain_sized<K: Ord, V: borsh::BorshSerialize>(
+    map: &mut BTreeMap<K, V>,
+    bytes: &mut usize,
+    mut keep: impl FnMut(&K) -> bool,
+) {
+    map.retain(|key, value| {
+        let retained = keep(key);
+        if !retained {
+            *bytes = bytes.saturating_sub(borsh::object_length(value).unwrap_or(0));
+        }
+        retained
+    });
 }
 
 /// Build the canonical message bound by a finality-vote BLS
@@ -732,8 +734,8 @@ pub fn verify_double_proposal_evidence(
     if header_a.hash() == header_b.hash() {
         return Err(SlashingError::NotEquivocating);
     }
-    verify_header_signature(header_a, active_set, domain).map_err(map_signature_error)?;
-    verify_header_signature(header_b, active_set, domain).map_err(map_signature_error)?;
+    verify_header_signature(header_a, active_set, domain)?;
+    verify_header_signature(header_b, active_set, domain)?;
     Ok(())
 }
 
@@ -869,7 +871,7 @@ pub fn verify_invalid_vrf_claim_evidence(
     if header.proposer_index != proposer_index {
         return Err(SlashingError::EvidenceFieldsInconsistent);
     }
-    verify_header_signature(header, active_set, domain).map_err(map_signature_error)?;
+    verify_header_signature(header, active_set, domain)?;
     match consensus_vrf::verify_header_proposer(
         header,
         active_set,
@@ -932,14 +934,16 @@ fn active_vote_validator(
     Ok(validator)
 }
 
-const fn map_signature_error(err: SignatureError) -> SlashingError {
-    match err {
-        SignatureError::ValidatorIndexOutOfBounds { index, len } => {
-            SlashingError::ValidatorIndexOutOfBounds { index, len }
+impl From<SignatureError> for SlashingError {
+    fn from(error: SignatureError) -> Self {
+        match error {
+            SignatureError::ValidatorIndexOutOfBounds { index, len } => {
+                Self::ValidatorIndexOutOfBounds { index, len }
+            }
+            SignatureError::InvalidPublicKey { index } => Self::InvalidPublicKey { index },
+            SignatureError::InvalidSignatureBytes => Self::InvalidSignatureBytes,
+            SignatureError::BadSignature => Self::BadSignature,
         }
-        SignatureError::InvalidPublicKey { index } => SlashingError::InvalidPublicKey { index },
-        SignatureError::InvalidSignatureBytes => SlashingError::InvalidSignatureBytes,
-        SignatureError::BadSignature => SlashingError::BadSignature,
     }
 }
 
@@ -1098,6 +1102,21 @@ mod tests {
         assert!(monitor.record_header(0, &header_b).is_none());
     }
 
+    /// Incrementally maintained byte totals equal a full recount.
+    fn assert_byte_totals(monitor: &SlashingMonitor) {
+        fn recount<K, V: borsh::BorshSerialize>(map: &BTreeMap<K, V>) -> usize {
+            map.values()
+                .map(|value| borsh::object_length(value).unwrap())
+                .sum()
+        }
+        assert_eq!(monitor.proposal_bytes, recount(&monitor.seen_bft_proposals));
+        assert_eq!(monitor.attestation_bytes, recount(&monitor.attestations));
+        assert_eq!(
+            monitor.quorum_bytes,
+            recount(&monitor.observed_prevote_quorums)
+        );
+    }
+
     #[test]
     fn authenticated_source_floor_prunes_all_observations_without_peer_watermarks() {
         let signer = proposer(0);
@@ -1117,11 +1136,14 @@ mod tests {
         }
         assert_eq!(monitor.headers_tracked(), 2);
         assert_eq!(monitor.votes_tracked(), 2);
+        assert_byte_totals(&monitor);
         monitor.retain_history_window(1);
         assert_eq!(monitor.headers_tracked(), 1);
         assert_eq!(monitor.votes_tracked(), 1);
         assert_eq!(monitor.observed_prevote_quorums.len(), 1);
         assert_eq!(monitor.attestations.len(), 1);
+        assert_byte_totals(&monitor);
+        assert!(monitor.quorum_bytes > 0 && monitor.attestation_bytes > 0);
         let later = signed_indexed_vote(1, 2, FinalityVotePhase::Prevote, 0xBB, &signer);
         monitor.record_attestation(signer.attest_vote(
             DOMAIN,
@@ -1138,6 +1160,8 @@ mod tests {
         assert_eq!(monitor.votes_tracked(), 0);
         assert!(monitor.observed_prevote_quorums.is_empty());
         assert!(monitor.attestations.is_empty());
+        assert_byte_totals(&monitor);
+        assert_eq!(monitor.quorum_bytes + monitor.attestation_bytes, 0);
     }
 
     #[test]

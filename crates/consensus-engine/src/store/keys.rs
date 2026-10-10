@@ -37,6 +37,24 @@ pub const fn hash_key(hash: &BlockHash) -> [u8; 32] {
     *hash
 }
 
+/// Big-endian 16-byte key for an ordered pair `(a, b)`.
+///
+/// Used for history ranges and `(count, index)` openings, so lexicographic
+/// iteration matches numeric order on `a`, then `b`.
+#[must_use]
+pub const fn pair_key(a: u64, b: u64) -> [u8; 16] {
+    let a = a.to_be_bytes();
+    let b = b.to_be_bytes();
+    let mut key = [0; 16];
+    let mut i = 0;
+    while i < 8 {
+        key[i] = a[i];
+        key[i + 8] = b[i];
+        i += 1;
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +81,14 @@ mod tests {
         assert_eq!(height_key(0xDEAD_BEEF), slot_key(0xDEAD_BEEF));
         assert_eq!(slot_key(0xDEAD_BEEF), chunk_id_key(0xDEAD_BEEF));
         assert_eq!(chunk_id_key(0xDEAD_BEEF), checkpoint_index_key(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn pair_key_concatenates_big_endian_halves() {
+        let key = pair_key(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
+        assert_eq!(key[..8], 0x0102_0304_0506_0708_u64.to_be_bytes());
+        assert_eq!(key[8..], 0x1112_1314_1516_1718_u64.to_be_bytes());
+        assert!(pair_key(1, u64::MAX) < pair_key(2, 0));
     }
 
     #[test]

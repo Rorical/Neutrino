@@ -28,7 +28,7 @@ use core::fmt;
 use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_consensus_vrf::{VrfError, total_active_stake};
 use neutrino_primitives::{BlockHash, BlsSignature, Slot, StateRoot, Validator, ZERO_HASH};
-use neutrino_proof_system::{BlockExecutionContext, ErasedBlockExecutor, ExecutionOutcome};
+use neutrino_proof_system::{ErasedBlockExecutor, ExecutionOutcome};
 use neutrino_storage::Database;
 use neutrino_vrf::eval;
 
@@ -204,7 +204,6 @@ impl<DB: Database> Engine<DB> {
         // Cloning the trie is a BTreeMap clone — cheap and
         // deterministic. Future optimisation can swap to a
         // copy-on-write snapshot if blocks grow large.
-        let chain_id = self.chain_spec().chain_id;
         let mut next_state = self.state().clone();
         next_state.drain_pending_nodes();
         next_state.drain_pending_values();
@@ -213,28 +212,9 @@ impl<DB: Database> Engine<DB> {
         // the chain spec's initial set so on-chain validator changes
         // (deposits, exits) propagate to fee routing automatically.
         let proposer_index = proposer.validator_index();
-        let proposer_position = usize::try_from(proposer_index)
-            .expect("u32 validator index fits usize on supported targets");
-        let proposer_address = self
-            .active_validator_set()
-            .get(proposer_position)
-            .map(|v| v.withdrawal_credentials)
-            .unwrap_or_default();
-        let ctx = BlockExecutionContext {
-            evidence_anchor: self
-                .evidence_anchor(height)
-                .map_err(ProductionError::Executor)?,
-            runtime_code_hash: self.runtime_code_hash_for(height).map_err(|_| {
-                ProductionError::Executor(crate::import::PROGRAMS_UNAVAILABLE.to_owned())
-            })?,
-            chain_id,
-            block_height: height,
-            gas_limit,
-            proposer_address,
-            participation: self
-                .participation_for_height(height)
-                .map_err(ProductionError::Executor)?,
-        };
+        let ctx = self
+            .execution_context(height, gas_limit, proposer_index)
+            .map_err(ProductionError::Executor)?;
         let ExecutionOutcome {
             state_root_after,
             runtime_extra,
@@ -293,8 +273,6 @@ impl<DB: Database> Engine<DB> {
 
         let batch =
             crate::store::ChainStore::<DB>::block_archive_batch(&block, Some(&witness_bytes))?;
-        let mut next_fork_choice = self.fork_choice.clone();
-        let _ = next_fork_choice.add_block(&block.header);
         self.commit_materialized_head_with_batch(
             height,
             block_hash,
@@ -302,7 +280,9 @@ impl<DB: Database> Engine<DB> {
             Some(next_state),
             batch,
         )?;
-        self.fork_choice = next_fork_choice;
+        // Commits leave fork choice untouched, so recording the block after a
+        // successful commit matches recording it before.
+        let _ = self.fork_choice.add_block(&block.header);
 
         Ok(Some(ProductionOutcome {
             block,
@@ -335,7 +315,7 @@ impl<DB: Database> Engine<DB> {
         let total_stake = total_active_stake(active_set).map_err(ProductionError::NotEligible)?;
 
         let seed = self.finalized_seed();
-        let domain = self.chain_spec().consensus_domain();
+        let domain = self.consensus_domain();
         let expected = self.chain_spec().consensus.expected_proposers_per_slot;
 
         let (vrf_proof, vrf_output) = eval(proposer.secret_key(), domain, &seed, slot);

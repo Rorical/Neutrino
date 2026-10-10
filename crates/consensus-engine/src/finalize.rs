@@ -13,7 +13,7 @@ use neutrino_consensus_types::{
     BlockProof as WireBlockProof, Chunk, ChunkProof as WireChunkProof, ChunkProofPublicInputs,
     FinalityCert, Header,
 };
-use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Hash, Height, StateRoot, ZERO_HASH};
+use neutrino_primitives::{BlockHash, ChunkHash, ChunkId, Hash, Height, ZERO_HASH};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 
@@ -197,9 +197,10 @@ impl<DB: Database> Engine<DB> {
         voter: &ProposerKey,
     ) -> Result<FinalizeOutcome, FinalizeError<DB::Error>> {
         let mut prepared = self.prepare_bft_consensus_chunk(chunk_id, proof_system)?;
-        self.certify_consensus_chunk(&mut prepared, voter)?;
+        let validated = self.certify_validated_consensus_chunk(&mut prepared, voter)?;
         let proof = proof_system.prove_consensus_chunk(&prepared.proofs, &prepared.witness)?;
-        self.commit_consensus_chunk(&prepared.witness, &proof, proof_system)
+        // Proving reads the certified witness without changing it.
+        self.commit_validated_consensus_chunk(&prepared.witness, &proof, proof_system, validated)
     }
 
     pub(crate) fn validate_chunk_id_sequence(
@@ -220,22 +221,6 @@ impl<DB: Database> Engine<DB> {
             });
         }
         Ok(())
-    }
-
-    /// Returns the state root that preceded `header.state_root`.
-    fn chunk_parent_state_root(
-        &self,
-        header: &Header,
-    ) -> Result<StateRoot, FinalizeError<DB::Error>> {
-        if header.parent_hash == self.chain_spec().genesis_block_hash {
-            return Ok(self.chain_spec().genesis_state_root);
-        }
-        let parent = self.store().get_header(&header.parent_hash)?.ok_or(
-            FinalizeError::MissingParentHeader {
-                parent_hash: header.parent_hash,
-            },
-        )?;
-        Ok(parent.state_root)
     }
 
     /// Drive the chunk-BFT module through one round, either by
@@ -296,8 +281,9 @@ impl<DB: Database> Engine<DB> {
         &self,
         chunk_id: ChunkId,
     ) -> Result<Option<Chunk>, FinalizeError<DB::Error>> {
-        let chunk_size = self.chain_spec().consensus.chunk_size;
-        let (start_height, end_height) = chunk_range(chunk_id, chunk_size)?;
+        let (start_height, end_height) = self
+            .chunk_heights(chunk_id)
+            .ok_or(FinalizeError::HeightRangeOverflow)?;
 
         let mut headers: Vec<Header> = Vec::new();
         let mut block_hashes: Vec<BlockHash> = Vec::new();
@@ -340,7 +326,11 @@ impl<DB: Database> Engine<DB> {
 
         let first_header = headers.first().expect("at least one header in chunk range");
         let last_header = headers.last().expect("at least one header in chunk range");
-        let start_state_root = self.chunk_parent_state_root(first_header)?;
+        let Some(start_state_root) = self.state_root_before(first_header)? else {
+            return Err(FinalizeError::MissingParentHeader {
+                parent_hash: first_header.parent_hash,
+            });
+        };
         let start_block_hash = *block_hashes.first().expect("non-empty block hashes");
         let end_block_hash = *block_hashes.last().expect("non-empty block hashes");
 
@@ -386,24 +376,6 @@ fn finalize_from_session<E>(
         .try_finalize(true, active_validator_set_root)?
         .ok_or(FinalizeError::FinalizationStalled)?;
     Ok(cert)
-}
-
-/// Compute `(start_height, end_height)` covered by `chunk_id`. Height
-/// numbering starts at 1 (height 0 is genesis), so chunk 0 covers
-/// heights `[1, chunk_size]`.
-fn chunk_range<E>(
-    chunk_id: ChunkId,
-    chunk_size: u64,
-) -> Result<(Height, Height), FinalizeError<E>> {
-    let start = chunk_id
-        .checked_mul(chunk_size)
-        .and_then(|v| v.checked_add(1))
-        .ok_or(FinalizeError::HeightRangeOverflow)?;
-    let end = chunk_id
-        .checked_add(1)
-        .and_then(|v| v.checked_mul(chunk_size))
-        .ok_or(FinalizeError::HeightRangeOverflow)?;
-    Ok((start, end))
 }
 
 /// Canonical leaf bytes for a wire block proof: the borsh-encoded

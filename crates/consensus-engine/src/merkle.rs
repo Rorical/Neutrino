@@ -6,58 +6,18 @@
 //! odd leaf at any level is promoted unchanged to the next level. The
 //! commitment for an empty list is [`EMPTY_MERKLE_ROOT`].
 
-use alloc::vec::Vec;
-
 use borsh::BorshSerialize;
-use neutrino_primitives::{Hash, ZERO_HASH, blake3_256};
+use neutrino_primitives::{Hash, blake3_256, merkle_root_from_hashes};
+use neutrino_prover_chunk::execution::commitment;
 
-extern crate alloc;
-
-/// Sentinel root for an empty leaf list.
-///
-/// Chosen as `ZERO_HASH` so that an empty body lane root is
-/// distinguishable from a populated one only by the lane's contents
-/// (matching the convention `consensus-types::Header` uses for empty
-/// roots).
-pub const EMPTY_MERKLE_ROOT: Hash = ZERO_HASH;
+// The chain's canonical empty root and Merkle root over pre-hashed leaves.
+pub use neutrino_primitives::{EMPTY_MERKLE_ROOT, merkle_root_of_hashes};
 
 /// Compute the Merkle root over `items`. Each item is first
 /// borsh-serialised and BLAKE3-hashed to a leaf.
 #[must_use]
 pub fn merkle_root<T: BorshSerialize>(items: &[T]) -> Hash {
-    let leaves: Vec<Hash> = items
-        .iter()
-        .map(|item| {
-            blake3_256(
-                &borsh::to_vec(item).expect("borsh serialization of merkle leaf is infallible"),
-            )
-        })
-        .collect();
-    merkle_root_of_hashes(&leaves)
-}
-
-/// Compute the Merkle root over pre-hashed `leaves`.
-#[must_use]
-pub fn merkle_root_of_hashes(leaves: &[Hash]) -> Hash {
-    if leaves.is_empty() {
-        return EMPTY_MERKLE_ROOT;
-    }
-    let mut current: Vec<Hash> = leaves.to_vec();
-    while current.len() > 1 {
-        let mut next = Vec::with_capacity(current.len().div_ceil(2));
-        let (pairs, remainder) = current.as_chunks::<2>();
-        for pair in pairs {
-            let mut concat = [0_u8; 64];
-            concat[..32].copy_from_slice(&pair[0]);
-            concat[32..].copy_from_slice(&pair[1]);
-            next.push(blake3_256(&concat));
-        }
-        if let Some(odd) = remainder.first() {
-            next.push(*odd);
-        }
-        current = next;
-    }
-    current[0]
+    merkle_root_from_hashes(items.iter().map(commitment).collect())
 }
 
 /// Hash a single byte slice as a Merkle leaf, useful for callers that

@@ -45,15 +45,18 @@ impl<DB: Database> ChainStore<DB> {
             ));
         }
         let mut batch = Batch::new();
-        for (key, _) in self
-            .db()
-            .iter_column(Column::Meta)
-            .map_err(StoreError::Database)?
-        {
-            if key == pointers::BOOTSTRAP_PENDING
-                || key == pointers::STATE_DOWNLOAD
-                || key.starts_with(pointers::STATE_DOWNLOAD_ENTRY_PREFIX)
-                || key.starts_with(super::snapshot::SNAPSHOT_PREFIX)
+        // Deleting an absent fixed key is a no-op; staged downloads and leases
+        // are found by prefix without reading the rest of the metadata column.
+        batch.delete(Column::Meta, pointers::BOOTSTRAP_PENDING);
+        batch.delete(Column::Meta, pointers::STATE_DOWNLOAD);
+        for prefix in [
+            pointers::STATE_DOWNLOAD_ENTRY_PREFIX,
+            super::snapshot::SNAPSHOT_PREFIX,
+        ] {
+            for (key, _) in self
+                .db()
+                .iter_prefix(Column::Meta, prefix)
+                .map_err(StoreError::Database)?
             {
                 batch.delete(Column::Meta, key);
             }
@@ -197,8 +200,9 @@ impl<DB: Database> ChainStore<DB> {
             pointers::LATEST_VALIDATOR_SET_INDEX,
             keys::chunk_id_key(count),
         );
+        let policy = self.retention_info()?.policy;
         let info = RetentionInfo {
-            policy: self.retention_info()?.policy,
+            policy,
             pruned_before_chunk: count,
             first_retained_height: end
                 .height
@@ -221,22 +225,15 @@ impl<DB: Database> ChainStore<DB> {
                 keys::chunk_id_key(boundary.next_chunk_id),
                 borsh::to_vec(&boundary)?,
             );
-            batch.put(
-                Column::Checkpoints,
-                keys::chunk_id_key(boundary.next_chunk_id),
-                borsh::to_vec(&checkpoint)?,
-            );
-            batch.put(
-                Column::Checkpoints,
-                checkpoint.hash(),
-                borsh::to_vec(&checkpoint)?,
-            );
+            super::chain_store::put_checkpoint_batch(&mut batch, &checkpoint)?;
         }
         let id = prefix.statement.range_id();
         batch.put(Column::HistoryProofs, id, borsh::to_vec(prefix)?);
-        let mut range = [0; 16];
-        range[8..].copy_from_slice(&count.to_be_bytes());
-        batch.put(Column::HistoryRangeIndex, range, borsh::to_vec(&id)?);
+        batch.put(
+            Column::HistoryRangeIndex,
+            keys::pair_key(0, count),
+            borsh::to_vec(&id)?,
+        );
         super::history::put_history_frontier(&mut batch, &consensus.frontier)?;
         for opening in recent {
             super::history::put_history_path(
@@ -252,7 +249,7 @@ impl<DB: Database> ChainStore<DB> {
                 borsh::to_vec(&opening.record)?,
             );
         }
-        self.retain_reporter_bootstrap_batch(&mut batch, recent)?;
+        self.retain_reporter_bootstrap_batch(&mut batch, recent, policy)?;
         self.write_observed_batch(batch, true)
     }
 }

@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_consensus_chunk_bft::{ChunkBft, Pacemaker};
+use neutrino_consensus_chunk_bft::Pacemaker;
 use neutrino_consensus_types::{
     BftProposal, Chunk, FinalityVote, FinalityVoteData, FinalityVotePhase, NilVote,
     QuorumCertificate, RoundChange, RoundChangeCertificate,
@@ -12,8 +12,8 @@ use neutrino_primitives::{BlsPublicKey, Hash, Validator};
 use neutrino_storage::{Batch, Column, Database};
 
 use super::{
-    BftAction, BftLoopError, BftSession, LocalVoteProgress, PeerQuorumProgress,
-    emit_aggregator_actions,
+    BftAction, BftLoopError, BftSession, LocalVoteProgress, MAX_BFT_CANDIDATES, PeerQuorumProgress,
+    conflict, emit_aggregator_actions,
 };
 use crate::{Engine, EngineError, StoreError};
 
@@ -21,6 +21,11 @@ extern crate alloc;
 
 const MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
 
+/// One value or nil signature per phase: prevote and precommit.
+const MAX_LOCAL_PHASE_VOTES: usize = 2;
+
+/// Owned durable session, used to decode. [`SavedSessionRef`] writes the same
+/// fields in the same order; borsh encodes `&T` as `T` and `&[T]` as `Vec<T>`.
 #[derive(BorshSerialize, BorshDeserialize)]
 struct SavedSession {
     spec: Hash,
@@ -47,19 +52,31 @@ struct SavedSession {
     local_round_report: Option<RoundChange>,
 }
 
-fn current_vote(session: &BftSession, phase: FinalityVotePhase) -> Option<FinalityVote> {
-    let aggregate = session.bft.current_aggregate(phase)?;
-    Some(FinalityVote {
-        attestations: session.bft.current_attestations(phase),
-        aggregation_bits: aggregate.aggregation_bits,
-        signature: aggregate.signature,
-        data: FinalityVoteData {
-            chunk_id: session.chunk_id,
-            chunk_hash: session.chunk_hash,
-            round: session.round(),
-            phase,
-        },
-    })
+/// Borrowed encoding of [`SavedSession`]; field order and wire types must match.
+#[derive(BorshSerialize)]
+struct SavedSessionRef<'a> {
+    spec: Hash,
+    chunk: &'a Chunk,
+    validators: &'a [Validator],
+    validator_root: Hash,
+    proof_hashes: &'a [Hash],
+    round: u32,
+    round_started_at_secs: u64,
+    prevote: Option<FinalityVote>,
+    precommit: Option<FinalityVote>,
+    local_identity: Option<BlsPublicKey>,
+    local_votes: &'a [FinalityVote],
+    highest_lock: Option<&'a QuorumCertificate>,
+    prevote_justification: Option<&'a QuorumCertificate>,
+    pacemaker: &'a Pacemaker,
+    proposal: Option<&'a BftProposal>,
+    valid_value: Option<&'a (Chunk, QuorumCertificate)>,
+    candidates: &'a BTreeMap<Hash, Chunk>,
+    local_nil_votes: &'a [NilVote],
+    nil_prevote: Option<NilVote>,
+    nil_precommit: Option<NilVote>,
+    round_certificate: Option<&'a RoundChangeCertificate>,
+    local_round_report: Option<&'a RoundChange>,
 }
 
 /// Restore a reserved precommit only with its durable exact receipts and complete
@@ -73,7 +90,7 @@ fn recover_reserved_precommit<E>(
         .first()
         .expect("durable signer attaches claim");
     if claim.proof_hashes != session.proof_hashes {
-        return Err(EngineError::Signing(crate::signing::SigningViolation::Conflict).into());
+        return Err(conflict());
     }
     if let Some(lock) = &claim.unlock_quorum {
         let retained = session
@@ -91,7 +108,6 @@ fn recover_reserved_precommit<E>(
         session.highest_lock = Some(lock.clone());
     }
     session.bft.add_precommit(vote.clone())?;
-    session.local = LocalVoteProgress::Precommitted;
     Ok(())
 }
 
@@ -100,7 +116,7 @@ fn recover_reserved_value_vote<E>(
     vote: &FinalityVote,
 ) -> Result<(), BftLoopError<E>> {
     if vote.data.chunk_hash != session.chunk_hash || vote.data.round != session.round() {
-        return Err(EngineError::Signing(crate::signing::SigningViolation::Conflict).into());
+        return Err(conflict());
     }
     match vote.data.phase {
         FinalityVotePhase::Prevote => {
@@ -109,12 +125,9 @@ fn recover_reserved_value_vote<E>(
                 .first()
                 .is_none_or(|claim| claim.unlock_quorum != session.prevote_justification)
             {
-                return Err(
-                    EngineError::Signing(crate::signing::SigningViolation::Conflict).into(),
-                );
+                return Err(conflict());
             }
             session.bft.add_prevote(vote.clone())?;
-            session.local = LocalVoteProgress::Prevoted;
         }
         FinalityVotePhase::Precommit => recover_reserved_precommit(session, vote)?,
     }
@@ -133,35 +146,7 @@ impl<DB: Database> Engine<DB> {
         &mut self,
         session: &BftSession,
     ) -> Result<(), BftLoopError<DB::Error>> {
-        let saved = SavedSession {
-            spec: self.chain_spec().hash(),
-            chunk: session.chunk.clone(),
-            validators: self.active_validator_set().to_vec(),
-            validator_root: self.previous_validator_set_root()?,
-            proof_hashes: session.proof_hashes.clone(),
-            round: session.round(),
-            round_started_at_secs: session.round_started_at_secs,
-            prevote: current_vote(session, FinalityVotePhase::Prevote),
-            precommit: current_vote(session, FinalityVotePhase::Precommit),
-            local_identity: session.local_identity,
-            local_votes: session.local_votes.clone(),
-            highest_lock: session.highest_lock.clone(),
-            prevote_justification: session.prevote_justification.clone(),
-            pacemaker: session.pacemaker.clone(),
-            proposal: session.proposal.clone(),
-            valid_value: session.valid_value.clone(),
-            candidates: session.candidates.clone(),
-            local_nil_votes: session.local_nil_votes.clone(),
-            nil_prevote: session
-                .bft
-                .current_nil_aggregate(FinalityVotePhase::Prevote),
-            nil_precommit: session
-                .bft
-                .current_nil_aggregate(FinalityVotePhase::Precommit),
-            round_certificate: session.round_certificate.clone(),
-            local_round_report: session.local_round_report.clone(),
-        };
-        let bytes = borsh::to_vec(&saved).map_err(StoreError::Codec)?;
+        let bytes = self.encode_bft_session(session)?;
         if bytes.len() > MAX_SESSION_BYTES {
             return Err(StoreError::Corrupt("BFT session exceeds local storage bound").into());
         }
@@ -169,6 +154,39 @@ impl<DB: Database> Engine<DB> {
         batch.put(Column::BftSessions, session.chunk_id.to_be_bytes(), bytes);
         self.store_mut().write_observed_batch(batch, true)?;
         Ok(())
+    }
+
+    /// Encode `session` with the current boundary context without cloning it.
+    fn encode_bft_session(&self, session: &BftSession) -> Result<Vec<u8>, BftLoopError<DB::Error>> {
+        let saved = SavedSessionRef {
+            spec: self.chain_spec_hash(),
+            chunk: &session.chunk,
+            validators: self.active_validator_set(),
+            validator_root: self.previous_validator_set_root()?,
+            proof_hashes: &session.proof_hashes,
+            round: session.round(),
+            round_started_at_secs: session.round_started_at_secs,
+            prevote: session.current_vote(FinalityVotePhase::Prevote),
+            precommit: session.current_vote(FinalityVotePhase::Precommit),
+            local_identity: session.local_identity,
+            local_votes: &session.local_votes,
+            highest_lock: session.highest_lock.as_ref(),
+            prevote_justification: session.prevote_justification.as_ref(),
+            pacemaker: &session.pacemaker,
+            proposal: session.proposal.as_ref(),
+            valid_value: session.valid_value.as_ref(),
+            candidates: &session.candidates,
+            local_nil_votes: &session.local_nil_votes,
+            nil_prevote: session
+                .bft
+                .current_nil_aggregate(FinalityVotePhase::Prevote),
+            nil_precommit: session
+                .bft
+                .current_nil_aggregate(FinalityVotePhase::Precommit),
+            round_certificate: session.round_certificate.as_ref(),
+            local_round_report: session.local_round_report.as_ref(),
+        };
+        Ok(borsh::to_vec(&saved).map_err(StoreError::Codec)?)
     }
 
     /// Reconstruct only live sessions; signatures, quorums and local journals
@@ -218,38 +236,32 @@ impl<DB: Database> Engine<DB> {
         id: u64,
         saved: SavedSession,
     ) -> Result<BftSession, EngineError<DB::Error>> {
-        let spec = self.chain_spec();
-        let params = &spec.consensus;
+        let params = &self.chain_spec().consensus;
+        let domain = self.consensus_domain();
+        let prevote_quorum = self.bft_prevote_quorum();
         let root = self
             .previous_validator_set_root()
             .map_err(|_| StoreError::Corrupt("cannot restore BFT validator root"))?;
-        if saved.spec != spec.hash()
+        if saved.spec != self.chain_spec_hash()
             || saved.chunk.chunk_id != id
             || saved.validators != self.active_validator_set()
             || saved.validator_root != root
             || saved.chunk.active_validator_set_root != root
-            || saved.local_votes.len() + saved.local_nil_votes.len() > 2
+            || saved.local_votes.len() + saved.local_nil_votes.len() > MAX_LOCAL_PHASE_VOTES
             || !saved.pacemaker.context_matches(
                 id,
                 saved.round,
                 params.bft_round_timeout_base_secs,
                 params.bft_round_timeout_step_secs,
             )
-            || saved.candidates.len() > 8
+            || saved.candidates.len() > MAX_BFT_CANDIDATES
             || (saved.round > 0 && saved.round_certificate.is_none())
         {
             return Err(StoreError::Corrupt("saved BFT context mismatch").into());
         }
         saved
             .pacemaker
-            .validate_saved_reports(
-                spec.consensus_domain(),
-                &saved.validators,
-                (
-                    params.bft_prevote_quorum_numerator,
-                    params.bft_prevote_quorum_denominator,
-                ),
-            )
+            .validate_saved_reports(domain, &saved.validators, prevote_quorum)
             .map_err(|_| StoreError::Corrupt("invalid saved pacemaker reports"))?;
         if let Some(report) = &saved.local_round_report {
             let identity = saved
@@ -259,13 +271,10 @@ impl<DB: Database> Engine<DB> {
             if report.chunk_id != id
                 || saved.round.checked_add(1) != Some(report.round)
                 || neutrino_prover_chunk::bft::verify_round_change_using(
-                    spec.consensus_domain(),
+                    domain,
                     &saved.validators,
                     report,
-                    (
-                        params.bft_prevote_quorum_numerator,
-                        params.bft_prevote_quorum_denominator,
-                    ),
+                    prevote_quorum,
                     &mut *self.bls_verifier.borrow_mut(),
                 )
                 .is_err()
@@ -282,22 +291,10 @@ impl<DB: Database> Engine<DB> {
             }
             _ => {}
         }
-        let mut bft = ChunkBft::with_quorum(
-            spec.consensus_domain(),
-            saved.chunk.clone(),
-            saved.round,
-            saved.validators.clone(),
-            root,
-            (
-                params.bft_prevote_quorum_numerator,
-                params.bft_prevote_quorum_denominator,
-            ),
-            (
-                params.bft_precommit_quorum_numerator,
-                params.bft_precommit_quorum_denominator,
-            ),
-        )
-        .map_err(|_| StoreError::Corrupt("invalid saved BFT context"))?;
+        // The saved validators equal the authenticated active set checked above.
+        let mut bft = self
+            .new_chunk_bft(saved.chunk.clone(), saved.round, root)
+            .map_err(|_| StoreError::Corrupt("invalid saved BFT context"))?;
         if let Some(proposal) = &saved.proposal {
             bft.set_proposal(proposal.clone())
                 .map_err(|_| StoreError::Corrupt("invalid saved leader proposal"))?;
@@ -330,13 +327,10 @@ impl<DB: Database> Engine<DB> {
                 || quorum.data.round > saved.round
                 || !saved.candidates.contains_key(&chunk.hash())
                 || neutrino_prover_chunk::slashing::verify_quorum_using(
-                    spec.consensus_domain(),
+                    domain,
                     &saved.validators,
                     quorum,
-                    (
-                        params.bft_prevote_quorum_numerator,
-                        params.bft_prevote_quorum_denominator,
-                    ),
+                    prevote_quorum,
                     &mut *self.bls_verifier.borrow_mut(),
                 )
                 .is_err())
@@ -347,13 +341,10 @@ impl<DB: Database> Engine<DB> {
             && (certificate.chunk_id != id
                 || certificate.round != saved.round
                 || neutrino_prover_chunk::bft::verify_round_change_certificate_using(
-                    spec.consensus_domain(),
+                    domain,
                     &saved.validators,
                     certificate,
-                    (
-                        params.bft_prevote_quorum_numerator,
-                        params.bft_prevote_quorum_denominator,
-                    ),
+                    prevote_quorum,
                     &mut *self.bls_verifier.borrow_mut(),
                 )
                 .is_err())
@@ -372,13 +363,10 @@ impl<DB: Database> Engine<DB> {
             && (lock.data.chunk_id != id
                 || lock.data.round > saved.round
                 || neutrino_prover_chunk::slashing::verify_quorum_using(
-                    spec.consensus_domain(),
+                    domain,
                     &saved.validators,
                     lock,
-                    (
-                        params.bft_prevote_quorum_numerator,
-                        params.bft_prevote_quorum_denominator,
-                    ),
+                    prevote_quorum,
                     &mut *self.bls_verifier.borrow_mut(),
                 )
                 .is_err())
@@ -399,7 +387,6 @@ impl<DB: Database> Engine<DB> {
                 return Err(StoreError::Corrupt("invalid saved prevote justification").into());
             }
         }
-        let mut local = LocalVoteProgress::Idle;
         let mut prevoted = false;
         let mut precommitted = false;
         for vote in &saved.local_nil_votes {
@@ -461,34 +448,21 @@ impl<DB: Database> Engine<DB> {
                 _ => return Err(StoreError::Corrupt("saved local vote ordering mismatch").into()),
             }
         }
-        if precommitted {
-            local = LocalVoteProgress::Precommitted;
-        } else if prevoted {
-            local = LocalVoteProgress::Prevoted;
-        }
-        let peer_quorum = if bft.prevote_quorum_reached() && bft.precommit_quorum_reached() {
-            PeerQuorumProgress::PrecommitQuorumObserved
-        } else if bft.prevote_quorum_reached() {
-            PeerQuorumProgress::PrevoteQuorumObserved
-        } else {
-            PeerQuorumProgress::BelowPrevote
-        };
         Ok(BftSession {
             chunk_id: id,
             chunk_hash: saved.chunk.hash(),
             chunk: saved.chunk,
             proof_hashes: saved.proof_hashes,
+            local: LocalVoteProgress::from_flags(prevoted, precommitted),
+            peer_quorum: PeerQuorumProgress::observed(&bft),
             bft,
-            local,
-            peer_quorum,
             local_identity: saved.local_identity,
             local_votes: saved.local_votes,
             highest_lock: saved.highest_lock,
             prevote_justification: saved.prevote_justification,
             is_local_aggregator: false,
             subnet: self.subnet_for_chunk(id),
-            last_published_aggregate_prevote_stake: 0,
-            last_published_aggregate_precommit_stake: 0,
+            last_published_aggregate_stake: [0; 2],
             round_started_at_secs: saved.round_started_at_secs,
             pacemaker: saved.pacemaker,
             proposal: saved.proposal,
@@ -557,20 +531,10 @@ impl<DB: Database> Engine<DB> {
             self.start_bft_leader_proposal(&mut session, now_secs)?;
         }
         // Publication below includes every original local message exactly once.
-        self.recompute_quorum_transitions(
-            &mut session,
-            self.previous_validator_set_root()?,
-            &mut Vec::new(),
-        )?;
-        if let Some(voter) = &self.local_voter {
-            if session
-                .local_identity
-                .is_some_and(|identity| identity != *voter.public_key_bytes())
-            {
-                return Err(
-                    EngineError::Signing(crate::signing::SigningViolation::Conflict).into(),
-                );
-            }
+        self.recompute_quorum_transitions(&mut session, &mut Vec::new())?;
+        // Recovery above refused a different saved identity, and every later
+        // local signature is made by the configured key.
+        if self.local_voter.is_some() {
             session.is_local_aggregator = self.local_is_aggregator_for(id, session.round());
             if let Some(proposal) = &session.proposal
                 && proposal.proposer_index
@@ -592,10 +556,7 @@ impl<DB: Database> Engine<DB> {
                 ));
             }
             for vote in &session.local_votes {
-                actions.push(match vote.data.phase {
-                    FinalityVotePhase::Prevote => BftAction::BroadcastPrevote(vote.clone()),
-                    FinalityVotePhase::Precommit => BftAction::BroadcastPrecommit(vote.clone()),
-                });
+                actions.push(BftAction::local_vote(vote));
             }
         }
         if session.precommit_quorum_observed() {
@@ -617,49 +578,52 @@ impl<DB: Database> Engine<DB> {
 
     /// A crash may occur after reserving a signature but before saving the new
     /// session. Recover that reservation before any timer or publication resumes.
+    /// Returns whether `session` changed and so must be persisted.
     pub(super) fn recover_session_signing(
         &mut self,
         session: &mut BftSession,
-    ) -> Result<(), BftLoopError<DB::Error>> {
+    ) -> Result<bool, BftLoopError<DB::Error>> {
         let Some(configured) = self.local_voter.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         if session
             .local_identity
             .is_some_and(|identity| identity != *configured.public_key_bytes())
         {
-            return Err(EngineError::Signing(crate::signing::SigningViolation::Conflict).into());
+            return Err(conflict());
         }
         let Some(voter) = self.active_local_voter() else {
-            return Ok(());
+            return Ok(false);
         };
-        if let Some(lock) = self.reserved_signing_lock(&voter, session.chunk_id)?
-            && session
+        // One authenticated journal read supplies the retained lock and position.
+        let Some(progress) = self.reserved_signing_progress(&voter, session.chunk_id)? else {
+            return Ok(false);
+        };
+        let lock_advanced = progress.locked.as_ref().is_some_and(|lock| {
+            session
                 .highest_lock
                 .as_ref()
                 .is_none_or(|prior| prior.data.round < lock.data.round)
-        {
-            session.highest_lock = Some(lock);
+        });
+        if lock_advanced {
+            session.highest_lock.clone_from(&progress.locked);
         }
-        let Some(progress) = self.reserved_signing_progress(&voter, session.chunk_id)? else {
-            return Ok(());
-        };
         // A replacement target is committed before its first signature. A
         // crash in that window leaves only the previous round's journal.
         if progress.round < session.round() && session.local == LocalVoteProgress::Idle {
-            return Ok(());
+            return Ok(lock_advanced);
         }
         if progress.round == session.round()
             && progress.prevoted == session.local_prevoted()
             && progress.precommitted == session.local_precommitted()
         {
-            return Ok(());
+            return Ok(lock_advanced);
         }
-        let messages = self.reserved_local_votes(&voter, session.chunk_id)?;
+        let messages = self.reserved_local_votes(&voter, &progress)?;
         let round = progress.round;
         let nil_messages = self.reserved_local_nil_votes(&voter, session.chunk_id, round)?;
         if messages.is_empty() && nil_messages.is_empty() {
-            return Ok(());
+            return Ok(lock_advanced);
         }
         if round < session.round() {
             return Err(EngineError::Signing(crate::signing::SigningViolation::Regression).into());
@@ -671,12 +635,9 @@ impl<DB: Database> Engine<DB> {
                 StoreError::Corrupt("reserved higher round lost authenticated entry").into(),
             );
         }
+        // Local progress is rederived from the journal once every message is restored.
         for vote in nil_messages {
             session.bft.add_nil_vote(vote.clone())?;
-            session.local = match vote.data.phase {
-                FinalityVotePhase::Prevote => LocalVoteProgress::Prevoted,
-                FinalityVotePhase::Precommit => LocalVoteProgress::Precommitted,
-            };
             if !session.local_nil_votes.contains(&vote) {
                 session.local_nil_votes.push(vote);
             }
@@ -684,22 +645,101 @@ impl<DB: Database> Engine<DB> {
         for vote in messages {
             recover_reserved_value_vote(session, &vote)?;
         }
-        session.local = if progress.precommitted {
-            LocalVoteProgress::Precommitted
-        } else if progress.prevoted {
-            LocalVoteProgress::Prevoted
-        } else {
-            LocalVoteProgress::Idle
-        };
+        session.local = LocalVoteProgress::from_flags(progress.prevoted, progress.precommitted);
         session.local_identity = Some(*voter.public_key_bytes());
-        session.peer_quorum =
-            if session.bft.prevote_quorum_reached() && session.bft.precommit_quorum_reached() {
-                PeerQuorumProgress::PrecommitQuorumObserved
-            } else if session.bft.prevote_quorum_reached() {
-                PeerQuorumProgress::PrevoteQuorumObserved
-            } else {
-                PeerQuorumProgress::BelowPrevote
-            };
-        Ok(())
+        session.peer_quorum = PeerQuorumProgress::observed(&session.bft);
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bft_loop::tests::{chain_spec_with, dummy_chunk, proposer, test_engine};
+    use neutrino_storage::MemoryDatabase;
+
+    /// The owned encoder previously used for every write, kept as wire reference.
+    fn owned_saved_session(engine: &Engine<MemoryDatabase>, session: &BftSession) -> SavedSession {
+        SavedSession {
+            spec: engine.chain_spec().hash(),
+            chunk: session.chunk.clone(),
+            validators: engine.active_validator_set().to_vec(),
+            validator_root: engine.previous_validator_set_root().unwrap(),
+            proof_hashes: session.proof_hashes.clone(),
+            round: session.round(),
+            round_started_at_secs: session.round_started_at_secs,
+            prevote: session.current_vote(FinalityVotePhase::Prevote),
+            precommit: session.current_vote(FinalityVotePhase::Precommit),
+            local_identity: session.local_identity,
+            local_votes: session.local_votes.clone(),
+            highest_lock: session.highest_lock.clone(),
+            prevote_justification: session.prevote_justification.clone(),
+            pacemaker: session.pacemaker.clone(),
+            proposal: session.proposal.clone(),
+            valid_value: session.valid_value.clone(),
+            candidates: session.candidates.clone(),
+            local_nil_votes: session.local_nil_votes.clone(),
+            nil_prevote: session
+                .bft
+                .current_nil_aggregate(FinalityVotePhase::Prevote),
+            nil_precommit: session
+                .bft
+                .current_nil_aggregate(FinalityVotePhase::Precommit),
+            round_certificate: session.round_certificate.clone(),
+            local_round_report: session.local_round_report.clone(),
+        }
+    }
+
+    #[test]
+    fn borrowed_session_encoding_is_the_owned_wire_format() {
+        let spec = chain_spec_with(3);
+        let base = spec.consensus.bft_round_timeout_base_secs;
+        let mut engine = test_engine(spec.clone());
+        engine.set_local_voter(proposer(0));
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
+        engine
+            .open_authorized_bft_session_at(chunk.clone(), 0)
+            .unwrap();
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            round: 0,
+            chunk_hash: chunk.hash(),
+            phase: FinalityVotePhase::Prevote,
+        };
+        let peer = proposer(1);
+        let vote = FinalityVote {
+            aggregation_bits: neutrino_primitives::BitVec::from_bytes(3, vec![2]).unwrap(),
+            signature: peer.sign_finality_vote(spec.consensus_domain(), &data),
+            attestations: vec![peer.attest_vote(
+                spec.consensus_domain(),
+                data.clone(),
+                Vec::new(),
+                None,
+            )],
+            data,
+        };
+        engine.observe_finality_vote_at(vote, base - 1).unwrap();
+        engine.tick_bft_round_timeouts(2 * base - 1).unwrap();
+        let session = engine.bft_session(0).unwrap();
+        assert!(session.proposal.is_some());
+        assert!(session.highest_lock.is_some());
+        assert!(session.valid_value.is_some());
+        assert!(session.local_round_report.is_some());
+        assert_eq!(session.local_votes.len(), 2);
+
+        let owned = owned_saved_session(&engine, session);
+        let owned = borsh::to_vec(&owned).unwrap();
+        let borrowed = engine.encode_bft_session(session).unwrap();
+        assert_eq!(borrowed, owned);
+        let decoded: SavedSession = borsh::from_slice(&borrowed).unwrap();
+        assert_eq!(borsh::to_vec(&decoded).unwrap(), owned);
+        assert_eq!(
+            engine
+                .store()
+                .db()
+                .get(Column::BftSessions, &0_u64.to_be_bytes())
+                .unwrap(),
+            Some(borrowed)
+        );
     }
 }

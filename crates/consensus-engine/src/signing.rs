@@ -11,16 +11,48 @@
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use core::fmt;
+use neutrino_consensus_types::signed_artifacts::SignedArtifact;
 use neutrino_consensus_types::{
     BftProposal, FinalityVote, FinalityVoteData, FinalityVotePhase, NilVote, NilVoteAttestation,
     NilVoteData, QuorumCertificate, RoundChange,
 };
-use neutrino_primitives::{BitVec, BlsPublicKey, BlsSignature, Hash, Slot};
+use neutrino_primitives::{BitVec, BlsPublicKey, BlsSignature, DomainTag, Hash, Slot};
 use neutrino_storage::{Batch, Column, Database};
 
 use crate::{Engine, EngineError, ProposerKey, StoreError};
 
 extern crate alloc;
+
+// Journal key tags. Every tag except the proposer watermark is followed by the
+// BLS identity and the big-endian chunk id, then any round/phase suffix.
+/// Per-identity, per-chunk value-vote watermark.
+const VOTE_WATERMARK_TAG: u8 = 0;
+/// Per-identity proposer slot watermark; never expires with finality.
+const PROPOSER_WATERMARK_TAG: u8 = 1;
+/// Exact value-vote intent at one round and phase.
+const VOTE_INTENT_TAG: u8 = 2;
+/// Exact nil-vote intent at one round and phase.
+const NIL_INTENT_TAG: u8 = 3;
+/// Exact leader-proposal signing message at one round.
+const PROPOSAL_MESSAGE_TAG: u8 = 4;
+/// Exact round-change report signing message at one round.
+const ROUND_CHANGE_MESSAGE_TAG: u8 = 5;
+/// A message kind's watermark tag follows its message tag by this distance.
+const MESSAGE_WATERMARK_OFFSET: u8 = 2;
+/// Highest chunk-scoped tag: the round-change message watermark.
+const LAST_CHUNK_TAG: u8 = ROUND_CHANGE_MESSAGE_TAG + MESSAGE_WATERMARK_OFFSET;
+/// Tag byte plus BLS identity; a chunk-scoped key's chunk id starts here.
+const IDENTITY_KEY_LEN: usize = 1 + size_of::<BlsPublicKey>();
+/// Tag, identity and big-endian chunk id.
+const CHUNK_KEY_LEN: usize = IDENTITY_KEY_LEN + size_of::<u64>();
+
+/// Offset of the little-endian chain id in a consensus signing message,
+/// after its domain tag.
+const CHAIN_ID_OFFSET: usize = size_of::<DomainTag>();
+/// Offset of the chain-spec hash in a consensus signing message.
+const SPEC_HASH_OFFSET: usize = CHAIN_ID_OFFSET + size_of::<u64>();
+/// Length of the `tag || chain_id LE8 || chain_spec_hash` signing prefix.
+const DOMAIN_PREFIX_LEN: usize = SPEC_HASH_OFFSET + size_of::<Hash>();
 
 /// A requested signature would violate local signing safety.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +97,22 @@ struct VoteWatermark {
     locked: Option<QuorumCertificate>,
 }
 
+impl VoteWatermark {
+    /// Move to `round`, clearing superseded phase intents; earlier rounds are refused.
+    /// The retained lock is unaffected.
+    fn advance(&mut self, round: u32) -> Result<(), SigningViolation> {
+        if round < self.round {
+            return Err(SigningViolation::Regression);
+        }
+        if round > self.round {
+            self.round = round;
+            self.prevote = None;
+            self.precommit = None;
+        }
+        Ok(())
+    }
+}
+
 #[derive(BorshSerialize, BorshDeserialize)]
 struct ProposalWatermark {
     spec: Hash,
@@ -98,7 +146,7 @@ struct MessageWatermark {
 
 fn nil_key(identity: &BlsPublicKey, data: &NilVoteData) -> Vec<u8> {
     let mut key = vote_key(identity, data.chunk_id);
-    key[0] = 3;
+    key[0] = NIL_INTENT_TAG;
     key.extend_from_slice(&data.round.to_be_bytes());
     key.push(u8::from(data.phase == FinalityVotePhase::Precommit));
     key
@@ -113,7 +161,7 @@ fn round_message_key(tag: u8, identity: &BlsPublicKey, chunk_id: u64, round: u32
 
 fn message_watermark_key(tag: u8, identity: &BlsPublicKey, chunk_id: u64) -> Vec<u8> {
     let mut key = vote_key(identity, chunk_id);
-    key[0] = tag + 2;
+    key[0] = tag + MESSAGE_WATERMARK_OFFSET;
     key
 }
 
@@ -125,26 +173,30 @@ pub(crate) struct SigningProgress {
     pub prevoted: bool,
     /// A complete precommit attestation intent is present at that round.
     pub precommitted: bool,
+    /// Lock retained from the original precommit establishing it.
+    pub locked: Option<QuorumCertificate>,
+    /// Value intents reserved at `round`, prevote first.
+    intents: [Option<VoteIntent>; 2],
 }
 
 fn vote_key(identity: &BlsPublicKey, chunk_id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(57);
-    key.push(0);
+    let mut key = Vec::with_capacity(CHUNK_KEY_LEN);
+    key.push(VOTE_WATERMARK_TAG);
     key.extend_from_slice(identity);
     key.extend_from_slice(&chunk_id.to_be_bytes());
     key
 }
 
 fn proposal_key(identity: &BlsPublicKey) -> Vec<u8> {
-    let mut key = Vec::with_capacity(49);
-    key.push(1);
+    let mut key = Vec::with_capacity(IDENTITY_KEY_LEN);
+    key.push(PROPOSER_WATERMARK_TAG);
     key.extend_from_slice(identity);
     key
 }
 
 fn intent_key(identity: &BlsPublicKey, data: &FinalityVoteData) -> Vec<u8> {
     let mut key = vote_key(identity, data.chunk_id);
-    key[0] = 2;
+    key[0] = VOTE_INTENT_TAG;
     key.extend_from_slice(&data.round.to_be_bytes());
     key.push(u8::from(data.phase == FinalityVotePhase::Precommit));
     key
@@ -189,18 +241,28 @@ fn compact_round_intents(
     }
     batch.delete(
         Column::SigningJournal,
-        round_message_key(4, identity, chunk_id, old_round),
+        round_message_key(PROPOSAL_MESSAGE_TAG, identity, chunk_id, old_round),
     );
     batch.delete(
         Column::SigningJournal,
-        round_message_key(5, identity, chunk_id, old_round),
+        round_message_key(ROUND_CHANGE_MESSAGE_TAG, identity, chunk_id, old_round),
     );
     if let Some(reported) = old_round.checked_add(1).filter(|round| *round < new_round) {
         batch.delete(
             Column::SigningJournal,
-            round_message_key(5, identity, chunk_id, reported),
+            round_message_key(ROUND_CHANGE_MESSAGE_TAG, identity, chunk_id, reported),
         );
     }
+}
+
+/// Aggregation bits naming exactly `signer` within an active set of `len`.
+fn single_signer_bits(len: usize, signer: u32) -> BitVec {
+    let signer = usize::try_from(signer).expect("u32 fits usize");
+    let mut bits = BitVec::default();
+    for index in 0..len {
+        bits.push(index == signer);
+    }
+    bits
 }
 
 impl<DB: Database> Engine<DB> {
@@ -208,7 +270,7 @@ impl<DB: Database> Engine<DB> {
         &self,
         watermark: &VoteWatermark,
     ) -> Result<(), EngineError<DB::Error>> {
-        if watermark.spec != self.chain_spec().hash() {
+        if watermark.spec != self.chain_spec_hash() {
             return Err(StoreError::Corrupt("invalid signing watermark context").into());
         }
         for (phase, intent) in [
@@ -271,6 +333,36 @@ impl<DB: Database> Engine<DB> {
         }
         Ok(())
     }
+
+    /// Read and revalidate the vote watermark of `identity` for `chunk_id`.
+    /// A watermark bound to another identity or chunk, or with `bind_spec` to
+    /// another specification, fails with the caller's `mismatch` diagnostic.
+    fn read_vote_watermark(
+        &self,
+        identity: &BlsPublicKey,
+        chunk_id: u64,
+        mismatch: &'static str,
+        bind_spec: bool,
+    ) -> Result<Option<VoteWatermark>, EngineError<DB::Error>> {
+        let Some(bytes) = self
+            .store()
+            .db()
+            .get(Column::SigningJournal, &vote_key(identity, chunk_id))
+            .map_err(StoreError::Database)?
+        else {
+            return Ok(None);
+        };
+        let watermark: VoteWatermark = borsh::from_slice(&bytes)?;
+        if (bind_spec && watermark.spec != self.chain_spec_hash())
+            || watermark.identity != *identity
+            || watermark.chunk_id != chunk_id
+        {
+            return Err(StoreError::Corrupt(mismatch).into());
+        }
+        self.validate_vote_watermark(&watermark)?;
+        Ok(Some(watermark))
+    }
+
     fn validate_signing_key(&self, voter: &ProposerKey) -> Result<(), EngineError<DB::Error>> {
         let index = usize::try_from(voter.validator_index()).expect("u32 fits usize");
         if !self
@@ -287,36 +379,41 @@ impl<DB: Database> Engine<DB> {
         Ok(())
     }
 
+    /// Refuse inactive signing keys and chunks already covered by local finality.
+    fn ensure_signable(
+        &self,
+        voter: &ProposerKey,
+        chunk_id: u64,
+    ) -> Result<(), EngineError<DB::Error>> {
+        self.validate_signing_key(voter)?;
+        if chunk_id < self.signing_finalized_floor()? {
+            return Err(EngineError::Signing(SigningViolation::FinalizedChunk));
+        }
+        Ok(())
+    }
+
     fn load_vote_watermark(
         &self,
         voter: &ProposerKey,
         chunk_id: u64,
         round: u32,
     ) -> Result<VoteWatermark, EngineError<DB::Error>> {
-        let watermark = self
-            .store()
-            .db()
-            .get(
-                Column::SigningJournal,
-                &vote_key(voter.public_key_bytes(), chunk_id),
-            )
-            .map_err(StoreError::Database)?
-            .map(|bytes| borsh::from_slice::<VoteWatermark>(&bytes))
-            .transpose()?
-            .unwrap_or_else(|| VoteWatermark {
-                spec: self.chain_spec().hash(),
-                identity: *voter.public_key_bytes(),
-                chunk_id,
-                round,
-                prevote: None,
-                precommit: None,
-                locked: None,
-            });
-        if watermark.identity != *voter.public_key_bytes() || watermark.chunk_id != chunk_id {
-            return Err(StoreError::Corrupt("signing journal identity mismatch").into());
-        }
-        self.validate_vote_watermark(&watermark)?;
-        Ok(watermark)
+        let identity = voter.public_key_bytes();
+        let saved = self.read_vote_watermark(
+            identity,
+            chunk_id,
+            "signing journal identity mismatch",
+            false,
+        )?;
+        Ok(saved.unwrap_or_else(|| VoteWatermark {
+            spec: self.chain_spec_hash(),
+            identity: *identity,
+            chunk_id,
+            round,
+            prevote: None,
+            precommit: None,
+            locked: None,
+        }))
     }
 
     /// Reserve an exact vote and attestation before producing either signature.
@@ -327,10 +424,7 @@ impl<DB: Database> Engine<DB> {
         proof_hashes: Vec<Hash>,
         unlock_quorum: Option<QuorumCertificate>,
     ) -> Result<FinalityVote, EngineError<DB::Error>> {
-        self.validate_signing_key(voter)?;
-        if data.chunk_id < self.signing_finalized_floor()? {
-            return Err(EngineError::Signing(SigningViolation::FinalizedChunk));
-        }
+        self.ensure_signable(voter, data.chunk_id)?;
         if self
             .store()
             .db()
@@ -361,14 +455,9 @@ impl<DB: Database> Engine<DB> {
         let prior_round = watermark.round;
         let prior_lock = watermark.locked.clone();
         self.validate_vote_unlock(&intent, watermark.locked.as_ref())?;
-        if data.round < watermark.round {
-            return Err(EngineError::Signing(SigningViolation::Regression));
-        }
-        if data.round > watermark.round {
-            watermark.round = data.round;
-            watermark.prevote = None;
-            watermark.precommit = None;
-        }
+        watermark
+            .advance(data.round)
+            .map_err(EngineError::Signing)?;
         let entry = match data.phase {
             FinalityVotePhase::Prevote => &mut watermark.prevote,
             FinalityVotePhase::Precommit => &mut watermark.precommit,
@@ -412,7 +501,8 @@ impl<DB: Database> Engine<DB> {
         self.store_mut().write_observed_batch(batch, true)?;
 
         let vote = self.sign_reserved_value_vote(voter, data, intent);
-        self.retain_local_signed_vote(&vote)?;
+        // Local publication has capacity reserved from peer artifacts.
+        self.retain_signed_artifact(&SignedArtifact::Vote(vote.clone()), true)?;
         Ok(vote)
     }
 
@@ -422,18 +512,18 @@ impl<DB: Database> Engine<DB> {
         data: FinalityVoteData,
         intent: VoteIntent,
     ) -> FinalityVote {
-        let mut bits = BitVec::default();
-        for index in 0..self.active_validator_set().len() {
-            bits.push(index == usize::try_from(voter.validator_index()).expect("u32 fits usize"));
-        }
+        let domain = self.consensus_domain();
         let mut vote = FinalityVote {
-            aggregation_bits: bits,
-            signature: voter.sign_finality_vote(self.chain_spec().consensus_domain(), &data),
+            aggregation_bits: single_signer_bits(
+                self.active_validator_set().len(),
+                voter.validator_index(),
+            ),
+            signature: voter.sign_finality_vote(domain, &data),
             data,
             attestations: Vec::new(),
         };
         vote.attestations.push(voter.attest_vote(
-            self.chain_spec().consensus_domain(),
+            domain,
             vote.data.clone(),
             intent.proof_hashes,
             intent.unlock_quorum,
@@ -484,130 +574,71 @@ impl<DB: Database> Engine<DB> {
         identity: &BlsPublicKey,
         chunk_id: u64,
     ) -> Result<Option<u32>, EngineError<DB::Error>> {
-        let bytes = self
-            .store()
-            .db()
-            .get(Column::SigningJournal, &vote_key(identity, chunk_id))
-            .map_err(StoreError::Database)?;
-        bytes
-            .map(|bytes| {
-                let watermark: VoteWatermark = borsh::from_slice(&bytes)?;
-                if watermark.spec != self.chain_spec().hash()
-                    || watermark.identity != *identity
-                    || watermark.chunk_id != chunk_id
-                {
-                    return Err(StoreError::Corrupt("signing watermark identity mismatch").into());
-                }
-                self.validate_vote_watermark(&watermark)?;
-                Ok(watermark.round)
-            })
-            .transpose()
+        Ok(self
+            .read_vote_watermark(
+                identity,
+                chunk_id,
+                "signing watermark identity mismatch",
+                true,
+            )?
+            .map(|watermark| watermark.round))
     }
 
-    /// Finish interrupted reservations using their original authenticated inputs.
+    /// Finish interrupted value reservations using their original authenticated
+    /// inputs, as read with `progress`.
     pub(crate) fn reserved_local_votes(
         &mut self,
         voter: &ProposerKey,
-        chunk_id: u64,
+        progress: &SigningProgress,
     ) -> Result<Vec<FinalityVote>, EngineError<DB::Error>> {
-        let bytes = self
-            .store()
-            .db()
-            .get(
-                Column::SigningJournal,
-                &vote_key(voter.public_key_bytes(), chunk_id),
-            )
-            .map_err(StoreError::Database)?;
-        let Some(bytes) = bytes else {
-            return Ok(Vec::new());
-        };
-        let watermark: VoteWatermark = borsh::from_slice(&bytes)?;
-        self.validate_vote_watermark(&watermark)?;
         let mut messages = Vec::new();
-        for intent in [watermark.prevote, watermark.precommit]
-            .into_iter()
-            .flatten()
-        {
+        for intent in progress.intents.iter().flatten() {
             messages.push(self.sign_vote_durable(
                 voter,
-                intent.data,
-                intent.proof_hashes,
-                intent.unlock_quorum,
+                intent.data.clone(),
+                intent.proof_hashes.clone(),
+                intent.unlock_quorum.clone(),
             )?);
         }
         Ok(messages)
     }
 
+    /// Authenticated journal position, retained lock and value intents of
+    /// `voter` for `chunk_id`, read with a single watermark lookup.
     pub(crate) fn reserved_signing_progress(
         &self,
         voter: &ProposerKey,
         chunk_id: u64,
     ) -> Result<Option<SigningProgress>, EngineError<DB::Error>> {
-        let bytes = self
-            .store()
-            .db()
-            .get(
-                Column::SigningJournal,
-                &vote_key(voter.public_key_bytes(), chunk_id),
-            )
-            .map_err(StoreError::Database)?;
-        bytes
-            .map(|bytes| {
-                let watermark: VoteWatermark = borsh::from_slice(&bytes)?;
-                if watermark.spec != self.chain_spec().hash()
-                    || watermark.identity != *voter.public_key_bytes()
-                    || watermark.chunk_id != chunk_id
-                {
-                    return Err(StoreError::Corrupt("signing progress identity mismatch").into());
-                }
-                self.validate_vote_watermark(&watermark)?;
-                Ok(SigningProgress {
-                    round: watermark.round,
-                    prevoted: watermark.prevote.is_some()
-                        || self
-                            .reserved_nil_intent(
-                                voter,
-                                chunk_id,
-                                watermark.round,
-                                FinalityVotePhase::Prevote,
-                            )?
-                            .is_some(),
-                    precommitted: watermark.precommit.is_some()
-                        || self
-                            .reserved_nil_intent(
-                                voter,
-                                chunk_id,
-                                watermark.round,
-                                FinalityVotePhase::Precommit,
-                            )?
-                            .is_some(),
-                })
-            })
-            .transpose()
-    }
-
-    pub(crate) fn reserved_signing_lock(
-        &self,
-        voter: &ProposerKey,
-        chunk_id: u64,
-    ) -> Result<Option<QuorumCertificate>, EngineError<DB::Error>> {
-        let bytes = self
-            .store()
-            .db()
-            .get(
-                Column::SigningJournal,
-                &vote_key(voter.public_key_bytes(), chunk_id),
-            )
-            .map_err(StoreError::Database)?;
-        let Some(bytes) = bytes else {
+        let Some(watermark) = self.read_vote_watermark(
+            voter.public_key_bytes(),
+            chunk_id,
+            "signing lock identity mismatch",
+            false,
+        )?
+        else {
             return Ok(None);
         };
-        let watermark: VoteWatermark = borsh::from_slice(&bytes)?;
-        if watermark.identity != *voter.public_key_bytes() || watermark.chunk_id != chunk_id {
-            return Err(StoreError::Corrupt("signing lock identity mismatch").into());
-        }
-        self.validate_vote_watermark(&watermark)?;
-        Ok(watermark.locked)
+        let prevoted = watermark.prevote.is_some()
+            || self
+                .reserved_nil_intent(voter, chunk_id, watermark.round, FinalityVotePhase::Prevote)?
+                .is_some();
+        let precommitted = watermark.precommit.is_some()
+            || self
+                .reserved_nil_intent(
+                    voter,
+                    chunk_id,
+                    watermark.round,
+                    FinalityVotePhase::Precommit,
+                )?
+                .is_some();
+        Ok(Some(SigningProgress {
+            round: watermark.round,
+            prevoted,
+            precommitted,
+            locked: watermark.locked,
+            intents: [watermark.prevote, watermark.precommit],
+        }))
     }
 
     pub(crate) fn verify_saved_local_vote(
@@ -630,21 +661,18 @@ impl<DB: Database> Engine<DB> {
         let [claim] = vote.attestations.as_slice() else {
             return Err(StoreError::Corrupt("saved local attestation coverage changed").into());
         };
-        let (proof_hashes, unlock_quorum) =
-            (claim.proof_hashes.clone(), claim.unlock_quorum.clone());
-        let expected = VoteIntent {
-            data: vote.data.clone(),
-            validator_index: index,
-            proof_hashes,
-            unlock_quorum,
-        };
         let bytes = self
             .store()
             .db()
             .get(Column::SigningJournal, &intent_key(&identity, &vote.data))
             .map_err(StoreError::Database)?
             .ok_or(StoreError::Corrupt("saved local vote reservation missing"))?;
-        if borsh::from_slice::<VoteIntent>(&bytes)? != expected {
+        let intent: VoteIntent = borsh::from_slice(&bytes)?;
+        if intent.data != vote.data
+            || intent.validator_index != index
+            || intent.proof_hashes != claim.proof_hashes
+            || intent.unlock_quorum != claim.unlock_quorum
+        {
             return Err(StoreError::Corrupt("saved local vote reservation mismatch").into());
         }
         Ok(())
@@ -678,13 +706,22 @@ impl<DB: Database> Engine<DB> {
             .iter_column(Column::SigningJournal)
             .map_err(StoreError::Database)?
         {
-            if key.first() == Some(&1) {
+            if key.first() == Some(&PROPOSER_WATERMARK_TAG) {
                 continue;
             }
-            if key.len() < 57 || !matches!(key[0], 0 | 2..=7) {
+            if key.len() < CHUNK_KEY_LEN
+                || !matches!(
+                    key[0],
+                    VOTE_WATERMARK_TAG | VOTE_INTENT_TAG..=LAST_CHUNK_TAG
+                )
+            {
                 return Err(StoreError::Corrupt("invalid signing journal key").into());
             }
-            let id = u64::from_be_bytes(key[49..57].try_into().expect("eight bytes"));
+            let id = u64::from_be_bytes(
+                key[IDENTITY_KEY_LEN..CHUNK_KEY_LEN]
+                    .try_into()
+                    .expect("eight bytes"),
+            );
             if id < floor {
                 batch.delete(Column::SigningJournal, key);
             }
@@ -712,10 +749,7 @@ impl<DB: Database> Engine<DB> {
         voter: &ProposerKey,
         data: NilVoteData,
     ) -> Result<NilVote, EngineError<DB::Error>> {
-        self.validate_signing_key(voter)?;
-        if data.chunk_id < self.signing_finalized_floor()? {
-            return Err(EngineError::Signing(SigningViolation::FinalizedChunk));
-        }
+        self.ensure_signable(voter, data.chunk_id)?;
         let value_data = FinalityVoteData {
             chunk_id: data.chunk_id,
             round: data.round,
@@ -737,16 +771,11 @@ impl<DB: Database> Engine<DB> {
         let key = vote_key(voter.public_key_bytes(), data.chunk_id);
         let mut watermark = self.load_vote_watermark(voter, data.chunk_id, data.round)?;
         let prior_round = watermark.round;
-        if data.round < watermark.round {
-            return Err(EngineError::Signing(SigningViolation::Regression));
-        }
-        if data.round > watermark.round {
-            watermark.round = data.round;
-            watermark.prevote = None;
-            watermark.precommit = None;
-        }
+        watermark
+            .advance(data.round)
+            .map_err(EngineError::Signing)?;
         let intent = NilIntent {
-            spec: self.chain_spec().hash(),
+            spec: self.chain_spec_hash(),
             identity: *voter.public_key_bytes(),
             data: data.clone(),
             validator_index: voter.validator_index(),
@@ -774,33 +803,25 @@ impl<DB: Database> Engine<DB> {
         batch.put(Column::SigningJournal, key, borsh::to_vec(&watermark)?);
         batch.put(Column::SigningJournal, nil_key, bytes);
         self.store_mut().write_observed_batch(batch, true)?;
-        let signature = voter
-            .sign_raw(&data.signing_message(self.chain_spec().consensus_domain()))
-            .to_bytes();
+        let domain = self.consensus_domain();
+        let signature = voter.sign_raw(&data.signing_message(domain)).to_bytes();
         let mut claim = NilVoteAttestation {
             validator_index: voter.validator_index(),
             vote: data.clone(),
             vote_signature: signature,
             signature: [0; 96],
         };
-        claim.signature = voter
-            .sign_raw(&claim.signing_message(self.chain_spec().consensus_domain()))
-            .to_bytes();
-        let mut aggregation_bits = BitVec::default();
-        for index in 0..self.active_validator_set().len() {
-            aggregation_bits
-                .push(index == usize::try_from(voter.validator_index()).expect("u32 fits usize"));
-        }
+        claim.signature = voter.sign_raw(&claim.signing_message(domain)).to_bytes();
         let vote = NilVote {
             data,
-            aggregation_bits,
+            aggregation_bits: single_signer_bits(
+                self.active_validator_set().len(),
+                voter.validator_index(),
+            ),
             signature,
             attestations: vec![claim],
         };
-        self.retain_signed_artifact(
-            &neutrino_consensus_types::signed_artifacts::SignedArtifact::NilVote(vote.clone()),
-            true,
-        )?;
+        self.retain_signed_artifact(&SignedArtifact::NilVote(vote.clone()), true)?;
         Ok(vote)
     }
 
@@ -825,7 +846,7 @@ impl<DB: Database> Engine<DB> {
             .map_err(StoreError::Database)?
             .map(|bytes| {
                 let intent: NilIntent = borsh::from_slice(&bytes)?;
-                if intent.spec != self.chain_spec().hash()
+                if intent.spec != self.chain_spec_hash()
                     || intent.identity != *voter.public_key_bytes()
                     || intent.data != data
                     || intent.validator_index != voter.validator_index()
@@ -874,7 +895,7 @@ impl<DB: Database> Engine<DB> {
             .map_err(StoreError::Database)?
             .ok_or(StoreError::Corrupt("saved nil reservation missing"))?;
         let intent: NilIntent = borsh::from_slice(&bytes)?;
-        if intent.spec != self.chain_spec().hash()
+        if intent.spec != self.chain_spec_hash()
             || intent.identity != identity
             || intent.data != vote.data
             || intent.validator_index != claim.validator_index
@@ -892,10 +913,7 @@ impl<DB: Database> Engine<DB> {
         round: u32,
         message: &[u8],
     ) -> Result<BlsSignature, EngineError<DB::Error>> {
-        self.validate_signing_key(voter)?;
-        if chunk_id < self.signing_finalized_floor()? {
-            return Err(EngineError::Signing(SigningViolation::FinalizedChunk));
-        }
+        self.ensure_signable(voter, chunk_id)?;
         if self
             .signing_round_for(voter.public_key_bytes(), chunk_id)?
             .is_some_and(|signed_round| signed_round > round)
@@ -904,7 +922,7 @@ impl<DB: Database> Engine<DB> {
         }
         let key = round_message_key(tag, voter.public_key_bytes(), chunk_id, round);
         let intent = MessageIntent {
-            spec: self.chain_spec().hash(),
+            spec: self.chain_spec_hash(),
             identity: *voter.public_key_bytes(),
             message: message.to_vec(),
         };
@@ -943,7 +961,7 @@ impl<DB: Database> Engine<DB> {
             .map_err(StoreError::Database)?
         {
             let prior: MessageWatermark = borsh::from_slice(&bytes)?;
-            if prior.spec != self.chain_spec().hash()
+            if prior.spec != self.chain_spec_hash()
                 || prior.identity != *identity
                 || prior.chunk_id != chunk_id
             {
@@ -965,7 +983,7 @@ impl<DB: Database> Engine<DB> {
             Column::SigningJournal,
             key,
             borsh::to_vec(&MessageWatermark {
-                spec: self.chain_spec().hash(),
+                spec: self.chain_spec_hash(),
                 identity: *identity,
                 chunk_id,
                 round,
@@ -990,11 +1008,12 @@ impl<DB: Database> Engine<DB> {
             .map_err(StoreError::Database)?
             .map(|bytes| {
                 let intent: MessageIntent = borsh::from_slice(&bytes)?;
-                if intent.spec != self.chain_spec().hash()
+                if intent.spec != self.chain_spec_hash()
                     || intent.identity != *identity
-                    || intent.message.len() < 56
-                    || intent.message[16..24] != self.chain_spec().chain_id.to_le_bytes()
-                    || intent.message[24..56] != self.chain_spec().hash()
+                    || intent.message.len() < DOMAIN_PREFIX_LEN
+                    || intent.message[CHAIN_ID_OFFSET..SPEC_HASH_OFFSET]
+                        != self.chain_spec().chain_id.to_le_bytes()
+                    || intent.message[SPEC_HASH_OFFSET..DOMAIN_PREFIX_LEN] != self.chain_spec_hash()
                 {
                     return Err(StoreError::Corrupt("round message reservation changed").into());
                 }
@@ -1009,8 +1028,12 @@ impl<DB: Database> Engine<DB> {
         chunk_id: u64,
         round: u32,
     ) -> Result<Option<BftProposal>, EngineError<DB::Error>> {
-        let Some(message) =
-            self.reserved_round_message(4, voter.public_key_bytes(), chunk_id, round)?
+        let Some(message) = self.reserved_round_message(
+            PROPOSAL_MESSAGE_TAG,
+            voter.public_key_bytes(),
+            chunk_id,
+            round,
+        )?
         else {
             return Ok(None);
         };
@@ -1020,7 +1043,7 @@ impl<DB: Database> Engine<DB> {
             u32,
             Option<QuorumCertificate>,
             Option<neutrino_consensus_types::RoundChangeCertificate>,
-        ) = borsh::from_slice(&message[56..])?;
+        ) = borsh::from_slice(&message[DOMAIN_PREFIX_LEN..])?;
         let proposal = BftProposal {
             chunk,
             round: reserved_round,
@@ -1032,7 +1055,7 @@ impl<DB: Database> Engine<DB> {
         if proposal.chunk.chunk_id != chunk_id
             || proposal.round != round
             || proposal.proposer_index != voter.validator_index()
-            || proposal.signing_message(self.chain_spec().consensus_domain()) != message
+            || proposal.signing_message(self.consensus_domain()) != message
         {
             return Err(StoreError::Corrupt("reserved proposal tuple changed").into());
         }
@@ -1045,8 +1068,12 @@ impl<DB: Database> Engine<DB> {
         chunk_id: u64,
         round: u32,
     ) -> Result<Option<RoundChange>, EngineError<DB::Error>> {
-        let Some(message) =
-            self.reserved_round_message(5, voter.public_key_bytes(), chunk_id, round)?
+        let Some(message) = self.reserved_round_message(
+            ROUND_CHANGE_MESSAGE_TAG,
+            voter.public_key_bytes(),
+            chunk_id,
+            round,
+        )?
         else {
             return Ok(None);
         };
@@ -1055,7 +1082,7 @@ impl<DB: Database> Engine<DB> {
             u32,
             u32,
             Option<QuorumCertificate>,
-        ) = borsh::from_slice(&message[56..])?;
+        ) = borsh::from_slice(&message[DOMAIN_PREFIX_LEN..])?;
         let report = RoundChange {
             chunk_id: reserved_chunk,
             round: reserved_round,
@@ -1066,7 +1093,7 @@ impl<DB: Database> Engine<DB> {
         if report.chunk_id != chunk_id
             || report.round != round
             || report.validator_index != voter.validator_index()
-            || report.signing_message(self.chain_spec().consensus_domain()) != message
+            || report.signing_message(self.consensus_domain()) != message
         {
             return Err(StoreError::Corrupt("reserved round report tuple changed").into());
         }
@@ -1078,9 +1105,13 @@ impl<DB: Database> Engine<DB> {
         identity: BlsPublicKey,
         report: &RoundChange,
     ) -> Result<(), EngineError<DB::Error>> {
-        if self.reserved_round_message(5, &identity, report.chunk_id, report.round)?
-            != Some(report.signing_message(self.chain_spec().consensus_domain()))
-        {
+        let reserved = self.reserved_round_message(
+            ROUND_CHANGE_MESSAGE_TAG,
+            &identity,
+            report.chunk_id,
+            report.round,
+        )?;
+        if reserved != Some(report.signing_message(self.consensus_domain())) {
             return Err(StoreError::Corrupt("saved round report reservation missing").into());
         }
         Ok(())
@@ -1093,17 +1124,12 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<BftProposal, EngineError<DB::Error>> {
         proposal.signature = self.reserve_round_message(
             voter,
-            4,
+            PROPOSAL_MESSAGE_TAG,
             proposal.chunk.chunk_id,
             proposal.round,
-            &proposal.signing_message(self.chain_spec().consensus_domain()),
+            &proposal.signing_message(self.consensus_domain()),
         )?;
-        self.retain_signed_artifact(
-            &neutrino_consensus_types::signed_artifacts::SignedArtifact::Proposal(Box::new(
-                proposal.clone(),
-            )),
-            true,
-        )?;
+        self.retain_signed_artifact(&SignedArtifact::Proposal(Box::new(proposal.clone())), true)?;
         Ok(proposal)
     }
 
@@ -1114,17 +1140,12 @@ impl<DB: Database> Engine<DB> {
     ) -> Result<RoundChange, EngineError<DB::Error>> {
         report.signature = self.reserve_round_message(
             voter,
-            5,
+            ROUND_CHANGE_MESSAGE_TAG,
             report.chunk_id,
             report.round,
-            &report.signing_message(self.chain_spec().consensus_domain()),
+            &report.signing_message(self.consensus_domain()),
         )?;
-        self.retain_signed_artifact(
-            &neutrino_consensus_types::signed_artifacts::SignedArtifact::RoundChange(
-                report.clone(),
-            ),
-            true,
-        )?;
+        self.retain_signed_artifact(&SignedArtifact::RoundChange(report.clone()), true)?;
         Ok(report)
     }
 
@@ -1144,8 +1165,7 @@ impl<DB: Database> Engine<DB> {
             .map_err(StoreError::Database)?
         {
             let prior: ProposalWatermark = borsh::from_slice(&bytes)?;
-            if prior.spec != self.chain_spec().hash() || prior.identity != *voter.public_key_bytes()
-            {
+            if prior.spec != self.chain_spec_hash() || prior.identity != *voter.public_key_bytes() {
                 return Err(StoreError::Corrupt("proposal journal identity mismatch").into());
             }
             if slot < prior.slot {
@@ -1160,14 +1180,14 @@ impl<DB: Database> Engine<DB> {
             Column::SigningJournal,
             key,
             borsh::to_vec(&ProposalWatermark {
-                spec: self.chain_spec().hash(),
+                spec: self.chain_spec_hash(),
                 identity: *voter.public_key_bytes(),
                 slot,
                 hash,
             })?,
         );
         self.store_mut().write_observed_batch(batch, true)?;
-        Ok(voter.sign_proposer_message(self.chain_spec().consensus_domain(), &hash))
+        Ok(voter.sign_proposer_message(self.consensus_domain(), &hash))
     }
 }
 

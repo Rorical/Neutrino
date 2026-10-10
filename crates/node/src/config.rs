@@ -231,6 +231,27 @@ impl Default for LightClientConfig {
     }
 }
 
+/// Largest accepted trusted checkpoint file; a Borsh `Checkpoint` is far smaller.
+pub(crate) const MAX_TRUSTED_CHECKPOINT_BYTES: u64 = 1024;
+
+/// Read a locally configured trusted checkpoint file, buffering at most one
+/// byte beyond [`MAX_TRUSTED_CHECKPOINT_BYTES`], so a misconfigured large or
+/// unbounded file (such as `/dev/zero`) is refused without reading it into
+/// memory. Returns `Ok(None)` when the file exceeds the limit.
+///
+/// # Errors
+/// Returns the I/O error of opening or reading the file.
+pub(crate) fn read_trusted_checkpoint(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_TRUSTED_CHECKPOINT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let within_limit =
+        u64::try_from(bytes.len()).is_ok_and(|len| len <= MAX_TRUSTED_CHECKPOINT_BYTES);
+    Ok(within_limit.then_some(bytes))
+}
+
 /// Full-node state bootstrap. Archive nodes always replay complete source history.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -495,6 +516,31 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_checkpoint_reads_are_bounded() {
+        let path = std::env::temp_dir().join(format!(
+            "neutrino-trusted-checkpoint-{}.borsh",
+            std::process::id()
+        ));
+        let limit = usize::try_from(MAX_TRUSTED_CHECKPOINT_BYTES).unwrap();
+        std::fs::write(&path, vec![7; limit]).unwrap();
+        assert_eq!(
+            read_trusted_checkpoint(&path).unwrap(),
+            Some(vec![7; limit])
+        );
+        std::fs::write(&path, vec![7; limit + 1]).unwrap();
+        assert_eq!(read_trusted_checkpoint(&path).unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_trusted_checkpoint(&path).is_err());
+        // An unbounded source is refused after reading only the limit; an
+        // unbounded `fs::read` would never return here.
+        #[cfg(unix)]
+        assert_eq!(
+            read_trusted_checkpoint(Path::new("/dev/zero")).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn network_identity_and_health_configuration_parse_with_defaults() {

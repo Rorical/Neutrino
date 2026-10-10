@@ -1,6 +1,6 @@
 //! Durable raw evidence insertion and finalized reporter cleanup races.
 
-use super::{ChainBackend, state_sync_tests};
+use super::{ChainBackend, SLASHING_POOL_MAX_ENTRIES, state_sync_tests};
 use neutrino_consensus_engine::{Engine, ProposerKey, RetentionPolicy};
 use neutrino_consensus_types::{
     FinalityVoteData, FinalityVotePhase, IndexedVote, SlashingEvidence,
@@ -217,13 +217,9 @@ fn finalized_cleanup_cannot_be_undone_by_a_stale_computed_offence() {
     assert!(backend.slashing_pool.try_lock().is_err());
     let cleaning = Arc::clone(&backend);
     let cleanup = std::thread::spawn(move || {
-        let mut pool = cleaning.slashing_pool.lock().unwrap();
-        cleaning.with_engine_mut(|engine| {
+        cleaning.with_raw_pool(|pool, engine| {
             let removed = engine.set_reporter_eligible(&[]).unwrap();
-            pool.evidence.retain(|(key, _)| !removed.contains(key));
-            for key in removed {
-                pool.seen.remove(&key);
-            }
+            pool.forget(&removed);
         });
     });
     resume.send(()).unwrap();
@@ -260,4 +256,123 @@ fn drain_keeps_pool_locked_until_the_old_disk_row_is_deleted() {
             .len(),
         1
     );
+}
+
+/// Delete raw rows the way finalized retention does: one engine-side observed
+/// batch that never passes through the node's pool.
+fn delete_raw_rows_outside_the_pool<DB, P>(backend: &ChainBackend<DB, P>, keys: &[[u8; 32]])
+where
+    DB: Database + Send + 'static,
+    DB::Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static,
+    P: neutrino_proof_system::ProofSystem + Send + Sync + 'static,
+{
+    backend.with_engine_mut(|engine| {
+        let mut batch = Batch::new();
+        for key in keys {
+            batch.delete(Column::SlashingPool, *key);
+        }
+        engine
+            .store_mut()
+            .write_observed_batch(batch, false)
+            .unwrap();
+    });
+}
+
+fn raw_key(evidence: &SlashingEvidence) -> [u8; 32] {
+    neutrino_primitives::blake3_256(&borsh::to_vec(evidence).unwrap())
+}
+
+#[test]
+fn relays_never_pool_reports_against_a_tombstoned_identity() {
+    // Non-reporters relay reports they can attribute, but once retention has
+    // released a report whose offender consensus already ejected forever, the
+    // same report must not be pooled and gossiped again.
+    let relay = |tombstoned: bool| {
+        let mut engine = Engine::genesis(
+            state_sync_tests::spec(),
+            FaultDatabase {
+                inner: MemoryDatabase::new(),
+                hooks: Arc::new(Hooks::default()),
+            },
+        )
+        .unwrap();
+        if tombstoned {
+            let accused = engine.active_validator_set()[0].pubkey;
+            engine
+                .store_mut()
+                .db_mut()
+                .put(Column::FinalizedSlashes, &accused, &[1])
+                .unwrap();
+        }
+        ChainBackend::new(engine, MockProofSystem)
+    };
+    assert!(relay(false).insert_persistent(&offence()));
+    assert!(!relay(true).insert_persistent(&offence()));
+}
+
+#[test]
+fn engine_side_raw_deletion_releases_pool_membership() {
+    let backend = backend(Arc::new(Hooks::default()));
+    let evidence = offence();
+    assert!(backend.insert_persistent(&evidence));
+    assert_eq!(backend.slashing_pool_len(), 1);
+    delete_raw_rows_outside_the_pool(&backend, &[raw_key(&evidence)]);
+    assert_eq!(backend.slashing_pool_len(), 0);
+    // A stale key no longer deduplicates the released report.
+    assert!(backend.insert_persistent(&evidence));
+    assert_eq!(backend.slashing_pool_len(), 1);
+}
+
+/// Distinct raw reports; insertion pools them without verifying signatures.
+fn numbered_offence(number: u16) -> SlashingEvidence {
+    let vote = |chunk_hash| IndexedVote {
+        signature: [0; 96],
+        data: FinalityVoteData {
+            chunk_id: 0,
+            round: 0,
+            phase: FinalityVotePhase::Prevote,
+            chunk_hash,
+        },
+    };
+    let mut conflicting = [0; 32];
+    conflicting[..2].copy_from_slice(&number.to_be_bytes());
+    SlashingEvidence::DoublePrevote {
+        validator_index: 0,
+        vote_a: vote([0xFF; 32]),
+        vote_b: vote(conflicting),
+    }
+}
+
+#[test]
+fn engine_side_raw_deletion_does_not_cause_a_premature_cap_eviction() {
+    let backend = ChainBackend::new(
+        Engine::genesis(state_sync_tests::spec(), MemoryDatabase::new()).unwrap(),
+        MockProofSystem,
+    );
+    let full = u16::try_from(SLASHING_POOL_MAX_ENTRIES).unwrap();
+    for number in 0..full {
+        assert!(backend.insert_persistent(&numbered_offence(number)));
+    }
+    // Retention releases one report, which leaves room for another.
+    delete_raw_rows_outside_the_pool(&backend, &[raw_key(&numbered_offence(1))]);
+    assert!(backend.insert_persistent(&numbered_offence(full)));
+    let rows = backend.with_engine(|engine| {
+        engine
+            .store()
+            .db()
+            .iter_column(Column::SlashingPool)
+            .unwrap()
+    });
+    assert_eq!(rows.len(), SLASHING_POOL_MAX_ENTRIES);
+    let oldest = raw_key(&numbered_offence(0));
+    assert!(rows.iter().any(|(key, _)| key.as_slice() == oldest));
+    assert_eq!(
+        backend
+            .metrics
+            .reporter
+            .pool_evictions
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(backend.slashing_pool_len(), SLASHING_POOL_MAX_ENTRIES);
 }

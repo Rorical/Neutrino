@@ -212,10 +212,9 @@ where
         let saved_pending = self.recover_bootstrap_download(&spec)?;
         let (origin, trusted_at) = match (&config.trusted_checkpoint_path, config.trusted_at) {
             (Some(path), Some(time)) => {
-                let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-                if bytes.len() > 1024 {
-                    return Err("bootstrap trusted checkpoint exceeds size limit".into());
-                }
+                let bytes = crate::config::read_trusted_checkpoint(path)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("bootstrap trusted checkpoint exceeds size limit")?;
                 (
                     borsh::from_slice::<Checkpoint>(&bytes).map_err(|error| error.to_string())?,
                     time,

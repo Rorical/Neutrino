@@ -460,6 +460,25 @@ impl Drop for TrustedFile {
     }
 }
 
+/// An unbounded trusted checkpoint source is refused after the size limit;
+/// reading the whole file first never returned.
+#[cfg(unix)]
+#[test]
+fn unbounded_trusted_checkpoint_file_is_refused_within_its_limit() {
+    let fixture = Fixture::new(None);
+    let target = fixture.backend(MemoryDatabase::new());
+    let config = BootstrapConfig {
+        trusted_checkpoint_path: Some("/dev/zero".into()),
+        trusted_at: Some(super::now().unwrap()),
+        ..BootstrapConfig::default()
+    };
+    assert_eq!(
+        target.initialize_bootstrap(&config),
+        Err("bootstrap trusted checkpoint exceeds size limit".to_owned())
+    );
+    assert!(!target.bootstrap_pending());
+}
+
 #[tokio::test]
 async fn explicit_latest_anchor_bootstraps_without_an_empty_bridge_receipt() {
     let fixture = Fixture::new(None);

@@ -276,6 +276,78 @@ async fn bootstrap_rechecks_reporter_history_created_by_an_admitted_source_write
     });
 }
 
+/// A source accepted before fetching began but observed afterwards must not
+/// create reporter history that the checkpoint installation would discard.
+#[tokio::test]
+async fn signed_source_observation_rechecks_the_bootstrap_barrier() {
+    let backend = backend(MockProofSystem);
+    backend.with_engine_mut(|engine| {
+        engine
+            .set_retention_policy(RetentionPolicy::Reporter)
+            .unwrap();
+    });
+    let source = nil_source();
+    backend.bootstrap_fetch(true).await;
+    assert!(backend.bootstrap_pending());
+    backend
+        .observe_signed_source_accountability(&source, source.id(), Some(0))
+        .await;
+    backend.with_engine(|engine| {
+        assert!(!engine.reporter_has_history().unwrap());
+        assert_eq!(
+            engine
+                .store()
+                .db()
+                .iter_column(Column::ReporterSources)
+                .unwrap(),
+            [] as [(Vec<u8>, Vec<u8>); 0]
+        );
+    });
+    // Outside the barrier the same observation is retained.
+    backend.bootstrap_fetch(false).await;
+    backend
+        .observe_signed_source_accountability(&source, source.id(), Some(0))
+        .await;
+    assert!(backend.with_engine(|engine| engine.reporter_has_history().unwrap()));
+}
+
+fn prevote(tag: u8) -> neutrino_consensus_types::FinalityVote {
+    let signer = ProposerKey::from_ikm(&[6; 32], 0).unwrap();
+    let domain = state_sync_tests::spec().consensus_domain();
+    let data = neutrino_consensus_types::FinalityVoteData {
+        chunk_id: 0,
+        round: 0,
+        phase: FinalityVotePhase::Prevote,
+        chunk_hash: [tag; 32],
+    };
+    neutrino_consensus_types::FinalityVote {
+        attestations: vec![signer.attest_vote(domain, data.clone(), Vec::new(), None)],
+        aggregation_bits: neutrino_primitives::BitVec::from_bytes(1, vec![1]).unwrap(),
+        signature: signer.sign_finality_vote(domain, &data),
+        data,
+    }
+}
+
+/// A vote that passed the optimistic entry check but is observed after
+/// fetching began records nothing in the slashing monitor.
+#[tokio::test]
+async fn vote_observation_rechecks_the_bootstrap_barrier() {
+    let backend = backend(MockProofSystem);
+    backend.bootstrap_fetch(true).await;
+    assert_eq!(backend.observe_value_vote_offences(&prevote(1)), Vec::new());
+    backend.bootstrap_fetch(false).await;
+    // Nothing was recorded, so the conflicting vote establishes no offence.
+    assert_eq!(backend.observe_value_vote_offences(&prevote(2)), Vec::new());
+    // Observed outside the barrier, the first vote now conflicts.
+    assert!(matches!(
+        backend.observe_value_vote_offences(&prevote(1)).as_slice(),
+        [neutrino_consensus_types::SlashingEvidence::DoublePrevote {
+            validator_index: 0,
+            ..
+        }]
+    ));
+}
+
 struct PausedVerdictProofSystem {
     entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     resume: Mutex<mpsc::Receiver<()>>,

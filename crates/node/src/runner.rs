@@ -265,18 +265,7 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
                     &config.light_client.trusted_checkpoint_path,
                     config.light_client.trusted_at,
                 ) {
-                    (Some(path), Some(trusted_at)) => {
-                        let bytes = std::fs::read(path)?;
-                        if bytes.len() > 1024 {
-                            return Err(NodeError::ProofSystem(
-                                "trusted checkpoint exceeds size limit".into(),
-                            ));
-                        }
-                        let anchor = borsh::from_slice(&bytes).map_err(|error| {
-                            NodeError::ProofSystem(format!("trusted checkpoint: {error}"))
-                        })?;
-                        (anchor, trusted_at)
-                    }
+                    (Some(path), Some(trusted_at)) => (load_trusted_checkpoint(path)?, trusted_at),
                     (None, None) => (
                         neutrino_consensus_types::history_proof::Checkpoint {
                             chain: domain.chain,
@@ -570,6 +559,20 @@ fn open_node_db(config: &NodeConfig) -> Result<NodeDb, NodeError> {
     Ok(NodeDb::open_rocks(path)?)
 }
 
+/// Decode the light client's locally trusted checkpoint file. Peers never
+/// supply this anchor; the read is bounded before any byte is decoded.
+fn load_trusted_checkpoint(
+    path: &std::path::Path,
+) -> Result<neutrino_consensus_types::history_proof::Checkpoint, NodeError> {
+    let Some(bytes) = crate::config::read_trusted_checkpoint(path)? else {
+        return Err(NodeError::ProofSystem(
+            "trusted checkpoint exceeds size limit".into(),
+        ));
+    };
+    borsh::from_slice(&bytes)
+        .map_err(|error| NodeError::ProofSystem(format!("trusted checkpoint: {error}")))
+}
+
 fn open_or_initialise_engine(
     db: NodeDb,
     chain_spec: ChainSpec,
@@ -678,7 +681,27 @@ async fn wait_for_shutdown() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Topic, topic_from_name};
+    use super::{NodeError, Topic, load_trusted_checkpoint, topic_from_name};
+
+    #[test]
+    fn light_client_trusted_checkpoint_is_read_within_its_limit() {
+        const REFUSED: &str = "trusted checkpoint exceeds size limit";
+        let path = std::env::temp_dir().join(format!(
+            "neutrino-light-checkpoint-{}.borsh",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![0; 1025]).unwrap();
+        let oversized = load_trusted_checkpoint(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(oversized, Err(NodeError::ProofSystem(message)) if message == REFUSED));
+        // `fs::read` of an unbounded source never returned; the bounded
+        // read refuses it after the limit.
+        #[cfg(unix)]
+        assert!(matches!(
+            load_trusted_checkpoint(std::path::Path::new("/dev/zero")),
+            Err(NodeError::ProofSystem(message)) if message == REFUSED
+        ));
+    }
 
     #[test]
     fn configured_topics_include_valid_aggregate_subnets() {

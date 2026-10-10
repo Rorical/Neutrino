@@ -86,11 +86,12 @@ const DEFAULT_MEMPOOL_CAPACITY_BYTES: usize = 256 * 1024;
 const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 256 * 1024;
 
 /// Maximum number of slashing-evidence items the pool retains at any
-/// time. Once exceeded, the oldest entry (FIFO) is evicted both
-/// in-memory and from `Column::SlashingPool`. Sized to comfortably
+/// time. Once exceeded, the oldest entry (FIFO) is evicted from
+/// `Column::SlashingPool` and the in-memory key index. Sized to comfortably
 /// cover even an adversarial network where every validator
 /// equivocates every chunk: 1024 entries at ~16 KiB worst-case
-/// gossip size caps retention. Verified receipts have a separate byte-bounded cache.
+/// gossip size caps durable retention; memory holds only their keys.
+/// Verified receipts have a separate byte-bounded cache.
 const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 
 /// Fact pre-proving requests queued for one fact program.
@@ -247,61 +248,169 @@ type ConsensusProofTask<P> = (
     >,
 );
 
-/// FIFO pool of [`SlashingEvidence`] with dedup-by-content and a
-/// hard `SLASHING_POOL_MAX_ENTRIES` cap. Two detectors that observe
-/// the same equivocation produce byte-identical evidence, so the
-/// BLAKE3 of the borsh encoding is a safe canonical key.
+/// FIFO key index of the durable raw-report pool in
+/// [`Column::SlashingPool`], with dedup-by-content and a hard
+/// `SLASHING_POOL_MAX_ENTRIES` cap. Two detectors that observe the same
+/// equivocation produce byte-identical evidence, so the BLAKE3 of the
+/// borsh encoding is a safe canonical key.
 ///
-/// `evidence` is `(key, evidence)` rather than just `evidence` so
-/// the drain path can hand the keys to the on-disk delete without
-/// re-hashing every item.
+/// Report bodies stay on disk: the evidence worker proves them from the
+/// column, so memory holds only membership and insertion order. Engine
+/// paths such as retention also delete rows, so every access first
+/// reconciles the index with the column (see [`Self::reconcile`]).
 #[derive(Default)]
 struct SlashingPool {
-    evidence: VecDeque<(Hash, SlashingEvidence)>,
+    /// Keys in insertion order, oldest first.
+    order: VecDeque<Hash>,
     seen: BTreeSet<Hash>,
+    /// Durable `(records, removals)` raw-report counters observed when the
+    /// index last mirrored the column. Another writer changes at least one.
+    synced: Option<(u64, u64)>,
 }
 
 impl SlashingPool {
     fn len(&self) -> usize {
-        self.evidence.len()
+        self.order.len()
     }
 
-    /// Drain up to `max` entries in FIFO order. Returns each as
-    /// `(key, evidence)` so the caller can delete the persisted
-    /// copy under `Column::SlashingPool` without re-hashing.
-    fn drain(&mut self, max: usize) -> Vec<(Hash, SlashingEvidence)> {
-        let take = max.min(self.evidence.len());
-        let drained: Vec<_> = self.evidence.drain(..take).collect();
-        for (key, _) in &drained {
+    /// Oldest key, which a new insertion evicts once the pool is full.
+    fn eviction_candidate(&self) -> Option<Hash> {
+        if self.order.len() < SLASHING_POOL_MAX_ENTRIES {
+            return None;
+        }
+        self.order.front().copied()
+    }
+
+    /// Append a key just persisted, dropping keys beyond the cap oldest
+    /// first; an insertion deletes the evicted row in the same batch.
+    fn push(&mut self, key: Hash) {
+        if self.seen.insert(key) {
+            self.order.push_back(key);
+        }
+        while self.order.len() > SLASHING_POOL_MAX_ENTRIES {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.seen.remove(&evicted);
+        }
+    }
+
+    /// Remove up to `max` keys in FIFO order.
+    fn drain(&mut self, max: usize) -> Vec<Hash> {
+        let take = max.min(self.order.len());
+        let drained: Vec<Hash> = self.order.drain(..take).collect();
+        for key in &drained {
             self.seen.remove(key);
         }
         drained
     }
 
-    /// Bulk-append loaded-from-disk entries at the FIFO tail. Used
-    /// by [`ChainBackend::new`] to rehydrate the pool from
-    /// [`Column::SlashingPool`] on restart.
-    ///
-    /// Skips items whose key is already in `seen` (defensive against
-    /// a malformed on-disk state with two rows hashing the same
-    /// key). The cap is enforced post-load — if disk somehow holds
-    /// more rows than `SLASHING_POOL_MAX_ENTRIES`, the oldest
-    /// (front-of-queue) entries are dropped from memory only; the
-    /// next drain cycle re-syncs the on-disk view.
-    fn load_from_disk(&mut self, entries: Vec<(Hash, SlashingEvidence)>) {
-        for (key, evidence) in entries {
-            if !self.seen.insert(key) {
-                continue;
-            }
-            self.evidence.push_back((key, evidence));
+    /// Forget keys whose rows another path deleted.
+    fn forget(&mut self, removed: &[Hash]) {
+        for key in removed {
+            self.seen.remove(key);
         }
-        while self.evidence.len() > SLASHING_POOL_MAX_ENTRIES {
-            let Some((evicted_key, _)) = self.evidence.pop_front() else {
-                break;
-            };
-            self.seen.remove(&evicted_key);
+        self.order.retain(|key| !removed.contains(key));
+    }
+
+    /// The column's durable `(records, removals)` raw-report counters.
+    fn disk_marker<DB: Database>(engine: &mut Engine<DB>) -> Option<(u64, u64)> {
+        engine
+            .store_mut()
+            .reporter_storage_stats()
+            .ok()
+            .map(|stats| (stats.raw_reports.records, stats.raw_report_removals))
+    }
+
+    /// Mirror the column when another writer changed it since the last
+    /// sync: keys whose rows are gone are dropped, rows not yet indexed
+    /// are appended in key order, and the cap trims memory oldest first.
+    /// The counters are maintained atomically with every observed write,
+    /// so an unchanged column costs one metadata read.
+    fn reconcile<DB: Database>(&mut self, engine: &mut Engine<DB>)
+    where
+        DB::Error: core::fmt::Display,
+    {
+        let marker = Self::disk_marker(engine);
+        if marker.is_some() && marker == self.synced {
+            return;
+        }
+        let rows = match engine.store().db().iter_column(Column::SlashingPool) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(%error, "raw evidence pool unreadable; keeping the in-memory index");
+                self.synced = None;
+                return;
+            }
+        };
+        let on_disk: BTreeSet<Hash> = rows
+            .into_iter()
+            .filter_map(|(key, _)| Hash::try_from(key.as_slice()).ok())
+            .collect();
+        self.order.retain(|key| on_disk.contains(key));
+        self.seen.retain(|key| on_disk.contains(key));
+        for key in on_disk {
+            self.push(key);
+        }
+        self.synced = marker;
+    }
+
+    /// Record that the index mirrors the column after this pool's own
+    /// writes. An index already out of sync stays marked for reconciliation.
+    fn observe<DB: Database>(&mut self, engine: &mut Engine<DB>) {
+        if self.synced.is_some() {
+            self.synced = Self::disk_marker(engine);
         }
     }
+}
+
+/// Whether reporter retention admits a raw report: its accused identity
+/// must still be tracked and not already sanctioned. Other roles pool
+/// every report.
+fn raw_report_admissible<DB: Database>(engine: &Engine<DB>, evidence: &SlashingEvidence) -> bool {
+    // Reporters must resolve the accused identity; other roles relay a
+    // report they cannot resolve, but never one against a tombstoned identity,
+    // so reports retention released are not pooled and gossiped again.
+    let reporter = reporter_retention(engine);
+    let Ok(source) =
+        neutrino_prover_chunk::history::evidence_chunk_id(engine.chain_spec(), evidence)
+    else {
+        return !reporter;
+    };
+    let accused = if source == engine.finalized_next_chunk_id() {
+        engine
+            .active_validator_set()
+            .get(evidence.offender_index() as usize)
+            .map(|validator| validator.pubkey)
+    } else {
+        engine
+            .store()
+            .historical_chunk(source)
+            .ok()
+            .flatten()
+            .and_then(|record| {
+                record
+                    .validators
+                    .get(evidence.offender_index() as usize)
+                    .map(|validator| validator.pubkey)
+            })
+    };
+    let Some(accused) = accused else {
+        return !reporter;
+    };
+    // An unreadable tombstone fails closed for reporters and open for relays.
+    if engine
+        .store()
+        .is_identity_slashed(&accused)
+        .unwrap_or(reporter)
+    {
+        return false;
+    }
+    !reporter
+        || engine
+            .store()
+            .reporter_tracked_validators()
+            .is_ok_and(|identities| identities.iter().any(|(pubkey, _)| *pubkey == accused))
 }
 
 impl<DB, P> ChainBackend<DB, P>
@@ -312,14 +421,10 @@ where
 {
     /// Wrap an already-initialised [`Engine`].
     ///
-    /// Pending-fix #5: rehydrates the in-memory slashing pool from
-    /// any [`Column::SlashingPool`] rows persisted by a prior node
-    /// session, so locally-detected equivocation survives a
-    /// restart and reaches the next produced block.
-    ///
-    /// Items that fail to borsh-decode (e.g. the on-disk format
-    /// pre-dates a node upgrade) are silently skipped. The
-    /// in-memory pool is rebuilt in disk-iteration order; the
+    /// Pending-fix #5: [`Column::SlashingPool`] rows persisted by a
+    /// prior node session stay pooled, so locally-detected
+    /// equivocation survives a restart. The in-memory key index is
+    /// rebuilt from the column on first use, in key order; the
     /// original FIFO order is not preserved across restart, which
     /// is semantically fine because slashing outcomes do not depend
     /// on the order evidence is observed.
@@ -329,18 +434,6 @@ where
         } else {
             warn!("proof backend reports no Guest identities; chunk consensus is disabled");
         }
-        let mut slashing_pool = SlashingPool::default();
-        let persisted = engine
-            .store()
-            .iter_slashing_evidence()
-            .unwrap_or_else(|err| {
-                warn!(
-                    ?err,
-                    "failed to load persisted slashing pool; continuing with empty pool"
-                );
-                Vec::new()
-            });
-        slashing_pool.load_from_disk(persisted);
         let metrics = Arc::new(crate::metrics::NodeMetrics::default());
         // The engine never replaces its chain specification after construction.
         let chain_spec_hash = engine.chain_spec().hash();
@@ -375,7 +468,7 @@ where
             backlog_policy: Mutex::new(crate::config::BacklogPolicy::default()),
             history_lag_exceeded: std::sync::atomic::AtomicBool::new(false),
             local_voter: Mutex::new(None),
-            slashing_pool: Mutex::new(slashing_pool),
+            slashing_pool: Mutex::default(),
             block_executor: Mutex::new(None),
             programs: Mutex::new(Arc::new(crate::programs::ProgramStore::in_memory())),
             installing_programs: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -748,43 +841,67 @@ where
         send_publication(&publisher, topic, data).await
     }
 
-    /// Number of distinct slashing-evidence items currently pooled.
-    #[must_use]
-    pub fn slashing_pool_len(&self) -> usize {
-        self.slashing_pool
-            .lock()
-            .expect("ChainBackend slashing_pool poisoned")
-            .len()
-    }
-
-    /// Drain up to `max` pooled slashing evidence items in FIFO
-    /// insertion order. Used by the producer when assembling a
-    /// block body's `slashings` field.
-    ///
-    /// Mirrors the in-memory drain on disk: every drained item is
-    /// removed from [`Column::SlashingPool`] so the persisted view
-    /// matches the in-memory view. Disk-delete failures are logged
-    /// and swallowed — the in-memory drain has already happened, so
-    /// the producer either commits the drained items in the next
-    /// block (the disk row will be overwritten / deleted on the
-    /// next drain), and removes them from persistent storage.
-    pub fn drain_slashing_pool(&self, max: usize) -> Vec<SlashingEvidence> {
-        let mut pool = self
+    /// Run `f` on the raw-report index and the engine, holding both locks
+    /// in the file-wide `slashing_pool → engine` order. The index first
+    /// adopts any change other engine paths (retention, reporter cleanup)
+    /// made to [`Column::SlashingPool`], so membership, cap and eviction
+    /// decisions follow the durable pool; afterwards it records the
+    /// column state its own writes produced.
+    fn with_raw_pool<R>(&self, f: impl FnOnce(&mut SlashingPool, &mut Engine<DB>) -> R) -> R {
+        let mut guard = self
             .slashing_pool
             .lock()
             .expect("ChainBackend slashing_pool poisoned");
-        let drained = pool.drain(max);
-        if !drained.is_empty() {
-            self.with_engine_mut(|engine| {
-                for (key, _) in &drained {
-                    if let Err(err) = engine.store_mut().delete_slashing_evidence(key) {
-                        warn!(?err, ?key, "failed to delete drained slashing evidence");
-                    }
+        let pool: &mut SlashingPool = &mut guard;
+        let result = self.with_engine_mut(|engine| {
+            pool.reconcile(engine);
+            let result = f(pool, engine);
+            pool.observe(engine);
+            result
+        });
+        drop(guard);
+        result
+    }
+
+    /// Number of distinct slashing-evidence items currently pooled.
+    #[must_use]
+    pub fn slashing_pool_len(&self) -> usize {
+        self.with_raw_pool(|pool, _| pool.len())
+    }
+
+    /// Drain up to `max` pooled slashing evidence items in FIFO
+    /// insertion order, removing them from [`Column::SlashingPool`].
+    /// The evidence worker proves raw reports straight from the
+    /// column; this explicit drain serves tests and tooling.
+    ///
+    /// Bodies are read from disk; the in-memory index holds only
+    /// keys. A failed delete is logged and leaves the index marked
+    /// for reconciliation, so rows still on disk are indexed again.
+    pub fn drain_slashing_pool(&self, max: usize) -> Vec<SlashingEvidence> {
+        self.with_raw_pool(|pool, engine| {
+            let keys = pool.drain(max);
+            if keys.is_empty() {
+                return Vec::new();
+            }
+            let mut drained = Vec::with_capacity(keys.len());
+            let mut batch = Batch::new();
+            for key in keys {
+                match engine.store().db().get(Column::SlashingPool, &key) {
+                    Ok(Some(bytes)) => match borsh::from_slice::<SlashingEvidence>(&bytes) {
+                        Ok(evidence) => drained.push(evidence),
+                        Err(error) => warn!(%error, ?key, "dropping undecodable raw evidence"),
+                    },
+                    Ok(None) => {}
+                    Err(error) => warn!(%error, ?key, "failed to read drained slashing evidence"),
                 }
-            });
-        }
-        drop(pool);
-        drained.into_iter().map(|(_, evidence)| evidence).collect()
+                batch.delete(Column::SlashingPool, key);
+            }
+            if let Err(error) = engine.store_mut().write_observed_batch(batch, false) {
+                warn!(%error, "failed to delete drained slashing evidence");
+                pool.synced = None;
+            }
+            drained
+        })
     }
 
     /// Insert one evidence item into the in-memory pool and persist
@@ -802,87 +919,48 @@ where
             return false;
         };
         let key = blake3_256(&bytes);
-        let mut pool = self
-            .slashing_pool
-            .lock()
-            .expect("ChainBackend slashing_pool poisoned");
-        if pool.seen.contains(&key) {
-            return false;
-        }
-        let installed = self.with_engine_mut(|engine| {
-            if self.bootstrap_pending() {
-                return false;
+        let installed = self.with_raw_pool(|pool, engine| {
+            if pool.seen.contains(&key)
+                || self.bootstrap_pending()
+                || !raw_report_admissible(engine, evidence)
+            {
+                return None;
             }
-            if reporter_retention(engine) {
-                let Ok(source) = neutrino_prover_chunk::history::evidence_chunk_id(
-                    engine.chain_spec(),
-                    evidence,
-                ) else {
-                    return false;
-                };
-                let accused = if source == engine.finalized_next_chunk_id() {
-                    engine
-                        .active_validator_set()
-                        .get(evidence.offender_index() as usize)
-                        .map(|validator| validator.pubkey)
-                } else {
-                    engine
-                        .store()
-                        .historical_chunk(source)
-                        .ok()
-                        .flatten()
-                        .and_then(|record| {
-                            record
-                                .validators
-                                .get(evidence.offender_index() as usize)
-                                .map(|validator| validator.pubkey)
-                        })
-                };
-                let Some(accused) = accused else {
-                    return false;
-                };
-                if engine.store().is_identity_slashed(&accused).unwrap_or(true)
-                    || !engine
-                        .store()
-                        .reporter_tracked_validators()
-                        .is_ok_and(|identities| {
-                            identities.iter().any(|(pubkey, _)| *pubkey == accused)
-                        })
-                {
-                    return false;
-                }
-            }
+            let evicted = pool.eviction_candidate();
             let mut batch = Batch::new();
             batch.put(Column::SlashingPool, key, bytes);
-            if pool.evidence.len() >= SLASHING_POOL_MAX_ENTRIES {
-                batch.delete(Column::SlashingPool, pool.evidence[0].0);
+            if let Some(oldest) = evicted {
+                batch.delete(Column::SlashingPool, oldest);
             }
             match engine.store_mut().write_observed_batch(batch, true) {
-                Ok(()) => true,
+                Ok(()) => {
+                    pool.push(key);
+                    Some(evicted.is_some())
+                }
                 Err(error) => {
                     warn!(
                         ?error,
                         ?key,
                         "failed to persist slashing evidence; input remains eligible for retry"
                     );
-                    false
+                    None
                 }
             }
         });
-        if installed {
+        let Some(evicted) = installed else {
+            return false;
+        };
+        self.metrics
+            .reporter
+            .detected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if evicted {
             self.metrics
                 .reporter
-                .detected
+                .pool_evictions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if pool.evidence.len() >= SLASHING_POOL_MAX_ENTRIES {
-                self.metrics
-                    .reporter
-                    .pool_evictions
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            pool.load_from_disk(vec![(key, evidence.clone())]);
         }
-        installed
+        true
     }
 
     /// Add an [`SlashingEvidence`] to the local pool and, when a
@@ -1106,6 +1184,33 @@ where
         })
     }
 
+    /// Authorize and import one peer block, re-executing it when an executor
+    /// is installed. Sync batches and gossip share this path, so an
+    /// authentically signed header whose VRF claim fails is reported as
+    /// `InvalidVrfClaim` evidence however the block arrived.
+    async fn import_peer_block(
+        &self,
+        block: &Block,
+        executor: Option<&dyn ErasedBlockExecutor>,
+    ) -> Result<HeadersImported, SyncBackendError> {
+        self.observe_and_authorize(block).await?;
+        match self.import_block_raw(block, executor)? {
+            Ok(outcome) => Ok(self.after_block_import(block, &outcome)),
+            Err(ImportError::HeaderVrf(vrf_err)) => {
+                // Import authenticates the header signature before its VRF
+                // claim, so this rejection attributes a genuine
+                // InvalidVrfClaim to the signer. Report it before bouncing.
+                if let Some(reason) = vrf_rejection_reason(&vrf_err) {
+                    let evidence =
+                        self.with_engine(|e| e.invalid_vrf_evidence(&block.header, reason));
+                    self.pool_and_gossip_slashing(evidence).await;
+                }
+                Err(Self::map_import_err(ImportError::HeaderVrf(vrf_err)))
+            }
+            Err(other) => Err(Self::map_import_err(other)),
+        }
+    }
+
     /// Local effects of an imported block, and the head it produced.
     fn after_block_import(&self, block: &Block, outcome: &ImportBlockOutcome) -> HeadersImported {
         self.queue_header_facts(&block.header);
@@ -1113,7 +1218,7 @@ where
         self.absorb_programs(&block.body.programs);
         HeadersImported {
             new_head_height: outcome.new_head_height,
-            new_head_hash: outcome.block_hash,
+            new_head_hash: outcome.new_head_hash,
             new_head_slot: outcome.new_head_slot,
         }
     }
@@ -1891,10 +1996,8 @@ where
         // Forensic-cache pressure cannot suppress independently verified live BFT.
         self.retain_availability_vote(&vote).await;
         // Signed attestations preserve individual attribution through aggregation.
-        if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
-            for item in evidence {
-                self.pool_and_gossip_slashing(item).await;
-            }
+        for item in self.observe_value_vote_offences(&vote) {
+            self.pool_and_gossip_slashing(item).await;
         }
         // The mandatory precommit attestation binds exact proof envelopes.
         // Invalid-proof evidence retains the rejected original BlockProof so
@@ -1927,6 +2030,17 @@ where
         };
         self.queue_vote_facts(&vote);
         self.handle_bft_actions(actions).await;
+    }
+
+    /// Offences an authenticated value vote establishes. The observation
+    /// mutates the engine, so it rechecks the bootstrap barrier under the
+    /// engine lock: a vote that passed the optimistic entry check records
+    /// nothing once checkpoint fetching has begun.
+    fn observe_value_vote_offences(&self, vote: &FinalityVote) -> Vec<SlashingEvidence> {
+        self.with_live_engine_mut(|engine| {
+            engine.observe_votes_for_slashing(vote).map_err(rejected)
+        })
+        .unwrap_or_default()
     }
 
     fn map_import_err(err: ImportError<DB::Error>) -> SyncBackendError {
@@ -2306,11 +2420,7 @@ where
         let executor = self.block_executor_snapshot();
         let mut last: Option<HeadersImported> = None;
         for block in blocks {
-            self.observe_and_authorize(&block).await?;
-            let outcome = self
-                .import_block_raw(&block, executor.as_deref())?
-                .map_err(Self::map_import_err)?;
-            last = Some(self.after_block_import(&block, &outcome));
+            last = Some(self.import_peer_block(&block, executor.as_deref()).await?);
         }
         let result = last.ok_or_else(|| SyncBackendError::Rejected("empty block batch".to_owned()));
         metric_timer.finish(result.is_ok());
@@ -2412,8 +2522,6 @@ where
     ) -> Result<HeadersImported, SyncBackendError> {
         let metric_timer = self.metrics.execution.block_imports.timer();
         self.ensure_full_import()?;
-        self.observe_and_authorize(&block).await?;
-
         // Pending-fix #7: when a dynamic-runtime executor is
         // installed, route the import through
         // `import_block_with_dry_run` so the header's `state_root`
@@ -2422,24 +2530,7 @@ where
         // parent state. Tests / RPC-only nodes that leave the
         // executor unset fall back to the no-dry-run path.
         let executor = self.block_executor_snapshot();
-        let outcome = match self.import_block_raw(&block, executor.as_deref())? {
-            Ok(outcome) => outcome,
-            Err(ImportError::HeaderVrf(vrf_err)) => {
-                // The header signature already verified above (the
-                // observe call would have surfaced its own error
-                // otherwise), so this rejection is a genuine
-                // InvalidVrfClaim. Emit slashing evidence before
-                // bouncing the import.
-                if let Some(reason) = vrf_rejection_reason(&vrf_err) {
-                    let evidence =
-                        self.with_engine(|e| e.invalid_vrf_evidence(&block.header, reason));
-                    self.pool_and_gossip_slashing(evidence).await;
-                }
-                return Err(Self::map_import_err(ImportError::HeaderVrf(vrf_err)));
-            }
-            Err(other) => return Err(Self::map_import_err(other)),
-        };
-        let imported = self.after_block_import(&block, &outcome);
+        let imported = self.import_peer_block(&block, executor.as_deref()).await?;
         metric_timer.finish(true);
         Ok(imported)
     }

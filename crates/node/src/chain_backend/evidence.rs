@@ -184,14 +184,24 @@ where
                 .and_then(|id| id.checked_add(1))
                 .and_then(|n| n.checked_mul(engine.chain_spec().consensus.chunk_size))
                 .unwrap_or(0);
-            let max_age = engine.runtime_policy().evidence_max_age_blocks;
-            // Only finalized facts release pooled receipts: a reorg of the
-            // head must never lose evidence.
-            if let Err(error) = engine
-                .store_mut()
-                .prune_evidence_artifacts(finalized_height, max_age)
-            {
-                tracing::warn!(?error, "evidence pool pruning failed");
+            // Only finalized facts release pooled receipts, including the
+            // governed age window: a reorg of the head must never lose
+            // evidence, so an unreadable finalized policy prunes nothing.
+            match engine.finalized_runtime_policy() {
+                Ok(policy) => {
+                    if let Err(error) = engine
+                        .store_mut()
+                        .prune_evidence_artifacts(finalized_height, policy.evidence_max_age_blocks)
+                    {
+                        tracing::warn!(?error, "evidence pool pruning failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "finalized evidence policy unavailable; pruning skipped"
+                    );
+                }
             }
             let existing = ready_artifacts(engine).unwrap_or_default();
             let mut witnesses = self.raw_report_jobs(engine, &existing, block_key);

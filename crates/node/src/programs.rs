@@ -13,7 +13,7 @@
 //! digest before any proof is attempted under it.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -145,11 +145,65 @@ pub struct ProgramStoreStatus {
     pub publish_queue: Vec<String>,
 }
 
+/// Complete, verified artifacts awaiting installation, evicted in completion
+/// order so a fresh artifact is never the first to go.
+struct Completed {
+    artifacts: BTreeMap<Hash, Arc<Vec<u8>>>,
+    /// Content hashes in completion order, oldest first.
+    order: VecDeque<Hash>,
+    /// Total length of `artifacts`.
+    bytes: usize,
+}
+
+impl Completed {
+    const fn empty() -> Self {
+        Self {
+            artifacts: BTreeMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn remove(&mut self, hash: &Hash) {
+        if let Some(bytes) = self.artifacts.remove(hash) {
+            self.bytes -= bytes.len();
+            self.order.retain(|entry| entry != hash);
+        }
+    }
+
+    /// Keep a verified artifact, evicting the oldest completions until the
+    /// memory bounds hold again. Artifacts in `reported` were completed by
+    /// the same absorption, which hands them to the installer, so they are
+    /// never evicted; when they alone fill the bounds the new artifact is
+    /// refused instead and `false` is returned.
+    fn insert(&mut self, hash: Hash, bytes: Vec<u8>, reported: &[Hash]) -> bool {
+        if self.artifacts.contains_key(&hash) {
+            return true;
+        }
+        self.bytes += bytes.len();
+        self.artifacts.insert(hash, Arc::new(bytes));
+        self.order.push_back(hash);
+        while self.artifacts.len() > MAX_COMPLETE_ARTIFACTS || self.bytes > MAX_COMPLETE_BYTES {
+            let victim = self
+                .order
+                .iter()
+                .copied()
+                .find(|entry| *entry != hash && !reported.contains(entry))
+                .unwrap_or(hash);
+            self.remove(&victim);
+            if victim == hash {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Reassembly, persistence and publication of program artifacts.
 pub struct ProgramStore {
     dir: Option<PathBuf>,
     partial: Mutex<BTreeMap<Hash, Partial>>,
-    complete: Mutex<BTreeMap<Hash, Arc<Vec<u8>>>>,
+    complete: Mutex<Completed>,
     publishing: Mutex<Option<Publishing>>,
 }
 
@@ -160,7 +214,7 @@ impl ProgramStore {
         Self {
             dir: None,
             partial: Mutex::new(BTreeMap::new()),
-            complete: Mutex::new(BTreeMap::new()),
+            complete: Mutex::new(Completed::empty()),
             publishing: Mutex::new(None),
         }
     }
@@ -177,7 +231,7 @@ impl ProgramStore {
         Ok(Self {
             dir: Some(dir.to_path_buf()),
             partial: Mutex::new(BTreeMap::new()),
-            complete: Mutex::new(BTreeMap::new()),
+            complete: Mutex::new(Completed::empty()),
             publishing: Mutex::new(None),
         })
     }
@@ -269,6 +323,7 @@ impl ProgramStore {
                 .complete
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .artifacts
                 .contains_key(&hash)
                 || self.is_persisted(&hash)
             {
@@ -301,8 +356,7 @@ impl ProgramStore {
                 partial.remove(&hash);
                 // Every piece authenticated against the root, so the whole
                 // artifact does too; recomputing is a cheap final check.
-                if content_hash(&bytes) == Some(hash) {
-                    self.accept(hash, bytes);
+                if content_hash(&bytes) == Some(hash) && self.accept(hash, bytes, &completed) {
                     completed.push(hash);
                 }
             }
@@ -327,19 +381,16 @@ impl ProgramStore {
     }
 
     /// Keep a verified artifact in memory until the installer decides.
-    fn accept(&self, hash: Hash, bytes: Vec<u8>) {
+    /// `reported` lists artifacts this absorption already completed; they
+    /// keep their bytes. Returns `false` when the artifact was not kept.
+    fn accept(&self, hash: Hash, bytes: Vec<u8>, reported: &[Hash]) -> bool {
         let mut complete = self
             .complete
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        complete.insert(hash, Arc::new(bytes));
-        while complete.len() > MAX_COMPLETE_ARTIFACTS
-            || complete.values().map(|bytes| bytes.len()).sum::<usize>() > MAX_COMPLETE_BYTES
-        {
-            let oldest = *complete.keys().next().expect("nonempty");
-            complete.remove(&oldest);
-        }
+        let kept = complete.insert(hash, bytes, reported);
         drop(complete);
+        kept
     }
 
     fn is_persisted(&self, hash: &Hash) -> bool {
@@ -354,6 +405,7 @@ impl ProgramStore {
         self.complete
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .artifacts
             .iter()
             .map(|(hash, bytes)| (*hash, Arc::clone(bytes)))
             .collect()
@@ -395,6 +447,7 @@ impl ProgramStore {
             .complete
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .artifacts
             .get(hash)
         {
             return Some(Arc::clone(bytes));
@@ -485,6 +538,7 @@ impl ProgramStore {
             .complete
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .artifacts
             .keys()
             .copied()
             .collect();
@@ -574,6 +628,57 @@ mod tests {
         }
         assert_eq!(store.absorb(&firsts, &wanted), Vec::<Hash>::new());
         assert_eq!(store.status().assembling.len(), 8);
+    }
+
+    /// Small single-piece artifacts with their content hashes.
+    fn small_artifacts(count: usize, salt: u8) -> Vec<(Hash, Vec<u8>)> {
+        (0..count)
+            .map(|index| {
+                let bytes = vec![salt ^ u8::try_from(index).expect("few artifacts"); 64];
+                (content_hash(&bytes).unwrap(), bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completed_artifacts_are_evicted_oldest_first() {
+        let store = ProgramStore::in_memory();
+        let mut artifacts = small_artifacts(MAX_COMPLETE_ARTIFACTS + 1, 0);
+        // Complete in descending hash order, so the newest completion has the
+        // smallest hash: evicting by hash would drop it as soon as it arrives.
+        artifacts.sort_by_key(|(hash, _)| std::cmp::Reverse(*hash));
+        for (hash, bytes) in &artifacts {
+            let pieces = split_into_pieces(bytes).unwrap();
+            let named = BTreeSet::from([*hash]);
+            assert_eq!(store.absorb(&pieces, &named), vec![*hash]);
+            // Every reported completion still has bytes for the installer.
+            assert_eq!(store.artifact(hash).as_deref(), Some(bytes));
+        }
+        let complete = store.status().complete;
+        assert_eq!(complete.len(), MAX_COMPLETE_ARTIFACTS);
+        assert!(!complete.contains(&artifacts[0].0), "oldest is evicted");
+        for (hash, _) in &artifacts[1..] {
+            assert!(complete.contains(hash));
+        }
+    }
+
+    #[test]
+    fn an_absorption_never_evicts_an_artifact_it_reports() {
+        let store = ProgramStore::in_memory();
+        let artifacts = small_artifacts(MAX_COMPLETE_ARTIFACTS + 1, 0x80);
+        let named: BTreeSet<Hash> = artifacts.iter().map(|(hash, _)| *hash).collect();
+        let pieces: Vec<ProgramPiece> = artifacts
+            .iter()
+            .flat_map(|(_, bytes)| split_into_pieces(bytes).unwrap())
+            .collect();
+        let completed = store.absorb(&pieces, &named);
+        // The bounds hold the first completions; the excess one is refused
+        // rather than reported without bytes.
+        assert_eq!(completed.len(), MAX_COMPLETE_ARTIFACTS);
+        for hash in &completed {
+            assert!(store.artifact(hash).is_some());
+        }
+        assert_eq!(store.status().complete.len(), MAX_COMPLETE_ARTIFACTS);
     }
 
     #[test]

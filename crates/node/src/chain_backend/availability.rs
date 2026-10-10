@@ -326,6 +326,12 @@ where
         }
         let own = self.local_voter().map(|key| key.validator_index());
         self.with_engine_mut(|engine| {
+            // The bootstrap barrier is rechecked under the engine lock, as in
+            // `with_live_engine_mut`: once fetching begins nothing is retained
+            // and the vote is not published.
+            if self.bootstrap_pending() {
+                return false;
+            }
             let branch = Self::publication_candidate_hashes(engine, vote);
             for claim in vote
                 .attestations
@@ -540,14 +546,20 @@ where
 
     /// Report offences an accepted source establishes. `id` is the artifact's
     /// identity and `chunk` its source chunk, both already derived by the caller.
-    async fn observe_signed_source_accountability(
+    /// Observation records sources (durably on reporters), so it rechecks the
+    /// bootstrap barrier under the engine lock like the retention before it.
+    pub(super) async fn observe_signed_source_accountability(
         &self,
         artifact: &SignedArtifact,
         id: Hash,
         chunk: Option<ChunkId>,
     ) {
         let mut evidence = self
-            .with_engine_mut(|engine| engine.observe_signed_artifact(artifact))
+            .with_live_engine_mut(|engine| {
+                engine
+                    .observe_signed_artifact(artifact)
+                    .map_err(storage_error)
+            })
             .unwrap_or_default();
         let votes = match (artifact, chunk) {
             (SignedArtifact::Vote(vote), _) => vec![vote.clone()],
@@ -588,7 +600,7 @@ where
     /// retained dependency-complete offence through ordinary pool verification.
     pub(super) async fn replay_signed_artifact_accountability(&self) {
         let mut evidence = self
-            .with_engine_mut(neutrino_consensus_engine::Engine::replay_signed_artifacts)
+            .with_live_engine_mut(|engine| engine.replay_signed_artifacts().map_err(storage_error))
             .unwrap_or_default();
         let metadata = self
             .with_engine(|engine| engine.store().active_signed_artifact_metadata())
@@ -665,7 +677,12 @@ where
     /// Exact pointer replacement after accepted receipt import avoids duplicating
     /// valid compressed proofs in the detached accountability source store.
     pub(super) fn compact_available_proof(&self, proof: &BlockProof) {
-        let _ = self.with_engine_mut(|engine| engine.store_mut().compact_accepted_artifact(proof));
+        let _ = self.with_live_engine_mut(|engine| {
+            engine
+                .store_mut()
+                .compact_accepted_artifact(proof)
+                .map_err(storage_error)
+        });
     }
 
     /// Exact missing proof identities from authenticated declarations, bounded before

@@ -854,6 +854,39 @@ async fn invalid_vrf_evidence_construction_round_trips() {
     );
 }
 
+/// Sync batches and gossip share one import path, so an authentically signed
+/// header with an invalid VRF claim is reported whichever way it arrives.
+#[tokio::test]
+async fn invalid_vrf_claim_is_reported_from_gossip_and_sync_batches() {
+    for sync_batch in [false, true] {
+        let backend = fresh_backend();
+        let v0 = proposer(0);
+        let genesis_hash = backend.local_status().await.unwrap().head_block_hash;
+        // An all-zero VRF proof never decodes: the import authenticates the
+        // signature, then rejects the claim with `BadSignature`.
+        let mut block = signed_block(1, genesis_hash, 1, 0x77, &v0);
+        block.header.vrf_proof = [0; 96];
+        let hash = block.header.hash();
+        block.header.signature = v0.sign_proposer_message(spec(2).consensus_domain(), &hash);
+        let imported = if sync_batch {
+            let batch = vec![block.clone()];
+            backend.verify_and_import_headers(batch).await
+        } else {
+            backend.verify_and_import_gossip_block(block.clone()).await
+        };
+        assert!(imported.is_err(), "an invalid VRF claim never imports");
+        assert_eq!(
+            backend.drain_slashing_pool(10),
+            vec![SlashingEvidence::InvalidVrfClaim {
+                proposer_index: 0,
+                header: block.header,
+                reason: VrfRejectionReason::BadSignature,
+            }],
+            "sync_batch = {sync_batch}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn future_signed_votes_and_candidates_cannot_evict_current_accountability() {
     let backend = fresh_backend();

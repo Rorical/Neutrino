@@ -226,8 +226,7 @@ where
         snapshot: &ReporterTrackingSnapshot,
         eligible: &[(neutrino_primitives::BlsPublicKey, Address)],
     ) -> Result<(), String> {
-        let mut raw_pool = self.slashing_pool.lock().expect("reporter raw pool");
-        self.with_engine_mut(|engine| {
+        self.with_raw_pool(|raw_pool, engine| {
             if engine
                 .canonical_boundary(engine.finalized_next_chunk_id())
                 .map_err(|error| error.to_string())?
@@ -257,15 +256,12 @@ where
             let removed = engine
                 .set_reporter_eligible(eligible)
                 .map_err(|error| error.to_string())?;
+            raw_pool.forget(&removed);
             let after_revision = tracked_revision(engine)?;
             self.metrics.reporter.cleaned.fetch_add(
                 u64::try_from(removed.len()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            raw_pool.evidence.retain(|(key, _)| !removed.contains(key));
-            for key in removed {
-                raw_pool.seen.remove(&key);
-            }
             if let Some(reporter) = self.reporter.lock().expect("reporter runtime").as_mut() {
                 reporter.last_finalized = Some(snapshot.boundary.block_hash);
                 reporter.last_tracked_revision = Some(after_revision);

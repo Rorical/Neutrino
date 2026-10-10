@@ -65,9 +65,9 @@ witness may give the end boundary a different program set.
 Full next-context vectors are node-side results, not public values. Wire Chunk
 metadata and the supplied certificate must match the committed statement exactly.
 
-`HistoryStatement { chain, start, end }` is exactly **816 Borsh bytes**, independent
+`HistoryStatement { chain, start, end }` is exactly **800 Borsh bytes**, independent
 of chain age and composition grouping. A receipt is separately bounded to 2 MiB.
-The semantic range ID hashes the whole statement with `DOMAIN_HISTORY`.
+The semantic range ID hashes the whole statement with `DOMAIN_HISTORY_STATEMENT`.
 `Checkpoint { chain, boundary }` uses `DOMAIN_CHECKPOINT`; its identity excludes
 proof bytes and the range start. Two valid composition groupings therefore produce
 the same endpoint identity, while different starting anchors have different range IDs.

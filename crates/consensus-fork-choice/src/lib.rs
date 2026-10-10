@@ -229,8 +229,9 @@ impl ForkChoice {
             return Err(ForkChoiceError::UnknownBlock(chunk.end_block_hash));
         }
 
+        let previous = self.finalized;
         self.finalized = chunk.end_block_hash;
-        self.mark_finalized_ancestors(chunk.end_block_hash);
+        self.mark_finalized_ancestors(chunk.end_block_hash, previous);
         Ok(())
     }
 
@@ -429,13 +430,23 @@ impl ForkChoice {
         false
     }
 
-    fn mark_finalized_ancestors(&mut self, mut hash: BlockHash) {
-        while let Some(node) = self.blocks.get_mut(&hash) {
+    /// Mark the newly finalized segment: `hash` and its ancestors down to, but
+    /// excluding, the previous anchor `previous`.
+    ///
+    /// Every ancestor of `previous` was marked when it became final, so the
+    /// walk is bounded by the new segment rather than the retained history.
+    /// It also stops at an `Invalid` block, an unknown block or a self-parented
+    /// node.
+    fn mark_finalized_ancestors(&mut self, mut hash: BlockHash, previous: BlockHash) {
+        while hash != previous {
+            let Some(node) = self.blocks.get_mut(&hash) else {
+                break;
+            };
             if node.proof_status == ProofStatus::Invalid {
                 break;
             }
             node.proof_status = ProofStatus::Finalized;
-            if node.parent_hash == self.finalized || node.parent_hash == hash {
+            if node.parent_hash == hash {
                 break;
             }
             hash = node.parent_hash;
@@ -656,6 +667,49 @@ mod tests {
         assert_eq!(fork_choice.finalized(), finalized_child);
         assert_eq!(fork_choice.head(), descendant);
         assert!(!fork_choice.block_extends(old_fork, fork_choice.finalized()));
+    }
+
+    fn status(tree: &ForkChoice, hash: &BlockHash) -> ProofStatus {
+        tree.block(hash).expect("known block").proof_status
+    }
+
+    #[test]
+    fn finalization_marks_only_the_segment_above_the_previous_anchor() {
+        let mut tree = ForkChoice::default();
+        let mut chain = Vec::new();
+        let mut parent = ZERO_HASH;
+        for height in 1..=4 {
+            let child = header(parent, height, 1);
+            parent = tree.add_block(&child).expect("add chain block");
+            chain.push(parent);
+        }
+        let first = chunk(chain[1], 0);
+        tree.add_finalized_chunk(&first, &cert(&first))
+            .expect("finalize first chunk");
+        for block in &chain[..2] {
+            assert_eq!(status(&tree, block), ProofStatus::Finalized);
+        }
+        // Without pruning the old anchor and its ancestors stay known. Distinct
+        // statuses on them reveal any walk past the previous anchor.
+        for block in &chain[..2] {
+            tree.on_block_proof(*block, ProofStatus::Proven).unwrap();
+        }
+        let second = chunk(chain[3], 1);
+        tree.add_finalized_chunk(&second, &cert(&second))
+            .expect("finalize second chunk");
+        assert_eq!(tree.finalized(), chain[3]);
+        for block in &chain[2..] {
+            assert_eq!(status(&tree, block), ProofStatus::Finalized);
+        }
+        for block in &chain[..2] {
+            assert_eq!(status(&tree, block), ProofStatus::Proven);
+        }
+        // Finalizing the current anchor again walks nothing.
+        let anchor = chain[3];
+        tree.on_block_proof(anchor, ProofStatus::Proven).unwrap();
+        tree.add_finalized_chunk(&second, &cert(&second))
+            .expect("refinalize anchor");
+        assert_eq!(status(&tree, &anchor), ProofStatus::Proven);
     }
 
     #[test]

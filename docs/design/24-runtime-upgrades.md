@@ -144,6 +144,19 @@ stake, delegation or registrations is invisible to consensus. Rotation rules
 staying seated) remain consensus semantics inside the chunk Guest. The block header's
 `runtime_extra` commits this record.
 
+Candidate stakes are `u128` runtime base units, while a seat's consensus weight
+(`Validator::effective_stake`) is `u64` and every consensus total (BFT and round-change
+quorums, proposer and aggregator eligibility, fork-choice weight) is a `u64` sum. The
+rotation therefore projects the whole next set at once: every weighted runtime-backed
+stake is shifted right by the smallest common shift `s` for which the set's total
+weight fits `u64`, beside the specification weights of any genesis validators the
+runtime never recorded, which are kept unscaled. While the stakes already fit (always
+at genesis, whose total `ChainSpec::validate` bounds) `s` is zero and weights equal
+stakes. Otherwise every weight is divided by the same power of two, preserving stake
+proportions up to rounding; a stake below `2^s` base units weighs nothing until the
+total shrinks, but stays seated, because exit still follows a zero runtime stake. No
+runtime balance can therefore push a set's total past `u64` and halt finality.
+
 **Consensus to runtime: the participation report.** Every block of chunk `k`
 receives, as a runtime input, the precommit participation of chunk `k − 1`:
 

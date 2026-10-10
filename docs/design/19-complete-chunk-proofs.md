@@ -51,6 +51,9 @@ identities after the retirement delay, consumes block-proven sanctions, derives 
 precommit participation report of the certificate it verified, and commits the next
 validator root, seed, history root and participation commitment in a compact
 boundary. Every block of the next chunk must hand exactly that report to the runtime.
+Runtime `u128` stakes become `u64` weights through one set-wide power-of-two scaling
+that keeps the next set's total weight within `u64`; see
+[runtime upgrades](24-runtime-upgrades.md#what-governance-can-and-cannot-change).
 Slashed identities stay seated so their key cannot re-register. The full next
 context is retained by the node. Sanction replay protection is owned by Block STF
 offence markers that live for the admission window; Chunk has no duplicate penalty ledger.

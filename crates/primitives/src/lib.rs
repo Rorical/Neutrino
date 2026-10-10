@@ -597,20 +597,6 @@ fn bytes_for_bits(bit_len: u32) -> usize {
     (bit_len as usize).div_ceil(8)
 }
 
-/// Supported state-trie hash algorithms.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum HashAlgorithm {
-    /// BLAKE3, the M0 default and reference implementation.
-    #[default]
-    Blake3,
-    /// SHA-256, useful for backends that prefer SHA-friendly trie
-    /// commitments (e.g. an alternative proof-parameter configuration).
-    Sha256,
-    /// Poseidon-style arithmetic hash, useful for in-circuit Merkle and
-    /// Fiat-Shamir economics in future proof backends.
-    Poseidon,
-}
-
 /// Runtime metadata exposed by the runtime query API.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RuntimeInfo {
@@ -633,7 +619,10 @@ pub struct Validator {
     pub pubkey: BlsPublicKey,
     /// Runtime-defined withdrawal credential commitment.
     pub withdrawal_credentials: Hash,
-    /// Effective stake in the runtime's base unit.
+    /// Consensus weight. Genesis weights are specification stakes; rotation
+    /// projects runtime stakes, in base units, shifted right by the smallest
+    /// common shift that keeps the set's total within `u64` (zero while the
+    /// stakes already fit).
     pub effective_stake: u64,
     /// True if the validator has been slashed.
     pub slashed: bool,
@@ -763,6 +752,9 @@ impl Default for ProofParams {
 }
 
 /// Storage/pruning constants covered by the chain-spec hash.
+///
+/// The state-trie hash is not a parameter: every state root is the root of the
+/// Poseidon2 trie the chunk and block Guests authenticate witnesses against.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StateParams {
     /// Recent state retained by full/pruned nodes.
@@ -773,8 +765,6 @@ pub struct StateParams {
     pub witness_retention_blocks: u64,
     /// Snapshot interval measured by covered chunk progress, independent of proof grouping.
     pub snapshot_interval_chunks: u64,
-    /// State-trie hash function.
-    pub state_trie_hash: HashAlgorithm,
 }
 
 impl Default for StateParams {
@@ -784,7 +774,6 @@ impl Default for StateParams {
             pruning_delay_chunks: DEFAULT_PRUNING_DELAY_CHUNKS,
             witness_retention_blocks: DEFAULT_WITNESS_RETENTION_BLOCKS,
             snapshot_interval_chunks: DEFAULT_SNAPSHOT_INTERVAL_CHUNKS,
-            state_trie_hash: HashAlgorithm::Blake3,
         }
     }
 }
@@ -1019,6 +1008,8 @@ impl ChainSpec {
             if validator.activation_epoch != 0 || validator.exit_epoch != u64::MAX {
                 return Err(ChainSpecError::NonGenesisInitialValidator);
             }
+            // Every consensus total is a `u64` sum; chunk rotation keeps each
+            // later set within it, and the genesis set starts there.
             total_stake = total_stake
                 .checked_add(validator.effective_stake)
                 .ok_or(ChainSpecError::ValidatorStakeOverflow)?;
@@ -1465,6 +1456,31 @@ mod tests {
         assert_eq!(spec.validate(), Ok(()));
         spec.runtime.evidence_max_age_blocks = spec.runtime.unbonding_delay_blocks;
         assert_eq!(spec.validate(), Err(ChainSpecError::InvalidEvidencePolicy));
+    }
+
+    #[test]
+    fn state_params_carry_no_trie_hash_selector() {
+        // The state root is always the Poseidon2 trie root, so the hashed spec
+        // carries only the four storage constants and cannot name another hash.
+        let encoded = borsh::to_vec(&StateParams::default()).expect("state params encode");
+        assert_eq!(encoded.len(), 4 * 8);
+    }
+
+    #[test]
+    fn chain_spec_bounds_the_genesis_weight_total_by_u64() {
+        let mut spec = test_chain_spec();
+        let mut second = spec.initial_validators[0].clone();
+        second.pubkey = [8; 48];
+        second.effective_stake = u64::MAX - spec.initial_validators[0].effective_stake;
+        spec.initial_validators.push(second);
+        spec.genesis_validator_set_root =
+            blake3_256(&borsh::to_vec(&spec.initial_validators).expect("canonical validators"));
+        assert_eq!(spec.validate(), Ok(()));
+        spec.initial_validators[1].effective_stake += 1;
+        spec.genesis_validator_set_root =
+            blake3_256(&borsh::to_vec(&spec.initial_validators).expect("canonical validators"));
+        let result = spec.validate();
+        assert_eq!(result, Err(ChainSpecError::ValidatorStakeOverflow));
     }
 
     #[test]

@@ -1002,3 +1002,152 @@ fn epoch_zero_registration_exits_even_with_zero_activation_delay() {
     assert_eq!(next[0].effective_stake, 0);
     assert_eq!(next[0].exit_epoch, params.exit_delay_epochs);
 }
+
+/// A seated genesis validator, runtime-backed when the candidate record lists it.
+const fn staked_seat(byte: u8) -> Validator {
+    Validator {
+        pubkey: [byte; 48],
+        withdrawal_credentials: [byte; 32],
+        effective_stake: 1,
+        slashed: false,
+        activation_epoch: 0,
+        exit_epoch: u64::MAX,
+        last_active_chunk: 0,
+    }
+}
+
+/// Genesis runtime records, without BLS identities, for `(address byte, stake)`.
+fn runtime_stakes(stakes: &[(u8, u128)]) -> neutrino_default_runtime_core::ConsensusCandidates {
+    let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
+    for &(byte, stake) in stakes {
+        candidates.upsert(neutrino_default_runtime_core::ConsensusCandidate {
+            address: [byte; 32],
+            stake,
+            identity: None,
+        });
+    }
+    candidates
+}
+
+fn weights(seats: &[Validator]) -> Vec<u64> {
+    seats.iter().map(|seat| seat.effective_stake).collect()
+}
+
+/// Checked `u64` total of the unslashed weights, as every consensus check sums it.
+fn total_weight(seats: &[Validator]) -> Option<u64> {
+    let mut total = 0_u64;
+    for seat in seats.iter().filter(|seat| !seat.slashed) {
+        total = total.checked_add(seat.effective_stake)?;
+    }
+    Some(total)
+}
+
+#[test]
+fn rotation_scales_runtime_stake_beyond_u64_into_a_bounded_total() {
+    let params = ConsensusParams::default();
+    let unbonding = params.chunk_size * 2;
+    let previous = [staked_seat(1), staked_seat(2), staked_seat(3)];
+    // Each large stake alone exceeds `u64`; the set needs a common shift of
+    // nine bits, under which the dust stake weighs nothing but stays seated.
+    let candidates = runtime_stakes(&[(1, 3_u128 << 70), (2, 1_u128 << 70), (3, 1)]);
+    let next = derive_next_validators(&previous, &candidates, &params, unbonding, 0).unwrap();
+    assert_eq!(weights(&next), [3_u64 << 61, 1 << 61, 0]);
+    assert_eq!(total_weight(&next), Some(1_u64 << 63));
+    assert!(next.iter().all(|seat| seat.exit_epoch == u64::MAX));
+    // A total of exactly `u64::MAX` is unscaled; one more unit halves every weight.
+    let exact = runtime_stakes(&[(1, u128::from(u64::MAX) - 5), (2, 5)]);
+    let next = derive_next_validators(&previous[..2], &exact, &params, unbonding, 0).unwrap();
+    assert_eq!(weights(&next), [u64::MAX - 5, 5]);
+    let over = runtime_stakes(&[(1, u128::from(u64::MAX) - 4), (2, 5)]);
+    let next = derive_next_validators(&previous[..2], &over, &params, unbonding, 0).unwrap();
+    assert_eq!(weights(&next), [(u64::MAX - 4) >> 1, 2]);
+    assert!(total_weight(&next).is_some());
+    // The largest runtime stake becomes the largest weight instead of an overflow.
+    let maximal = runtime_stakes(&[(1, u128::MAX)]);
+    let next = derive_next_validators(&previous[..1], &maximal, &params, unbonding, 0).unwrap();
+    assert_eq!(weights(&next), [u64::MAX]);
+}
+
+#[test]
+fn rotation_keeps_unregistered_genesis_weight_beside_scaled_runtime_stake() {
+    use neutrino_prover_chunk::rotation::RotationError;
+    let params = ConsensusParams::default();
+    let unbonding = params.chunk_size * 2;
+    // Seat 9 has no runtime record, so it keeps its specification weight and
+    // the runtime stake is scaled into the remaining room.
+    let mut genesis = staked_seat(9);
+    genesis.effective_stake = u64::MAX / 2;
+    let candidates = runtime_stakes(&[(1, 1_u128 << 100)]);
+    let previous = [staked_seat(1), genesis.clone()];
+    let next = derive_next_validators(&previous, &candidates, &params, unbonding, 0).unwrap();
+    assert_eq!(weights(&next), [1_u64 << 63, u64::MAX / 2]);
+    assert_eq!(total_weight(&next), Some(u64::MAX));
+    // Carried weights that alone exceed `u64` never come from an authenticated set.
+    genesis.effective_stake = u64::MAX;
+    let previous = [genesis, staked_seat(10)];
+    let none = runtime_stakes(&[]);
+    assert_eq!(
+        derive_next_validators(&previous, &none, &params, unbonding, 0),
+        Err(RotationError::Stake)
+    );
+}
+
+#[test]
+fn program_rotation_reads_only_the_proven_end_state() {
+    use neutrino_consensus_types::history_proof::{
+        ExecutionPrograms, ProgramArtifacts, ProgramSet, ScheduledUpgrade,
+    };
+    use neutrino_default_runtime_core::UPGRADE_KEY;
+    use neutrino_prover_chunk::rotation::{
+        RotationError, next_programs_from_witness, rotate_from_witness, witness_keys_from,
+    };
+    use neutrino_runtime_core::host::{LiveTrie, TracingState};
+    let programs = |byte: u8| ProgramSet {
+        runtime_code_hash: [byte; 32],
+        execution: ExecutionPrograms {
+            fact: [u32::from(byte); 8],
+            evidence: [u32::from(byte); 8],
+            block: [u32::from(byte); 8],
+        },
+    };
+    let witness_of = |live: &LiveTrie| {
+        let mut state = TracingState::new(live);
+        witness_keys_from(&mut state);
+        state.into_witness()
+    };
+    let current = programs(1);
+    let mut honest = LiveTrie::default();
+    honest.insert(b"unrelated", vec![1]);
+    let root = honest.state_root();
+    assert_eq!(
+        next_programs_from_witness(current, 5, root, &witness_of(&honest)),
+        Ok(current)
+    );
+    // A forged state schedules its own programs and yields a self-consistent
+    // witness, but that witness is not rooted at the proven end state.
+    let mut forged = LiveTrie::default();
+    let upgrade = ScheduledUpgrade {
+        activate_at_chunk: 5,
+        programs: programs(2),
+        artifacts: ProgramArtifacts::default(),
+    };
+    forged.insert(UPGRADE_KEY, borsh::to_vec(&upgrade).unwrap());
+    let forged_witness = witness_of(&forged);
+    let forged_root = forged_witness.pre_state_root;
+    assert_eq!(
+        next_programs_from_witness(current, 5, forged_root, &forged_witness),
+        Ok(programs(2))
+    );
+    assert_eq!(
+        next_programs_from_witness(current, 5, root, &forged_witness),
+        Err(RotationError::StateRoot)
+    );
+    // Both readers of the chunk-end witness reject it with the same error.
+    let params = ConsensusParams::default();
+    let unbonding = params.chunk_size * 2;
+    let previous = [validator()];
+    assert_eq!(
+        rotate_from_witness(&previous, &params, unbonding, 4, root, &forged_witness),
+        Err(RotationError::StateRoot)
+    );
+}

@@ -2,9 +2,7 @@
 
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{
-    Hash, Validator, blake3_256, merkle_root_from_hashes, merkle_root_of_hashes,
-};
+use neutrino_primitives::{Hash, Validator, blake3_256, merkle_root_from_hashes};
 
 /// Maximum encoded SP1 evidence receipt accepted from the network.
 pub const MAX_EVIDENCE_PROOF_BYTES: usize = 2 * 1024 * 1024;
@@ -317,11 +315,6 @@ pub fn counted_merkle_root(count: u64, root: Hash) -> Hash {
     commitment(&(b"neutrino-evidence-membership", count, root))
 }
 
-/// Build the counted evidence batch commitment from statement hashes.
-pub fn merkle_commitment(leaves: &[Hash]) -> Hash {
-    counted_merkle_root(leaves.len() as u64, merkle_root_of_hashes(leaves))
-}
-
 impl MerkleOpening {
     /// Produce an opening for an existing leaf.
     pub fn build(leaves: &[Hash], index: usize) -> Option<Self> {
@@ -579,7 +572,7 @@ mod tests {
     fn historical_openings_bind_every_shape_count_and_position() {
         for count in 1..70 {
             let leaves: Vec<_> = (0..count).map(|n| commitment(&n)).collect();
-            let root = merkle_commitment(&leaves);
+            let root = counted_merkle_root(count as u64, merkle_root_from_hashes(leaves.clone()));
             for index in 0..count {
                 let opening = MerkleOpening::build(&leaves, index).unwrap();
                 assert!(opening.verify(leaves[index], root));

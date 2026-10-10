@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::{BlockProofPublicInputs, ChunkProofPublicInputs, Header};
 use neutrino_default_runtime_core::StfPublicOutput;
-use neutrino_primitives::{Hash, Validator, blake3_256, merkle_root_of_hashes};
+use neutrino_primitives::{
+    Hash, Validator, blake3_256, merkle_root_from_hashes, merkle_root_of_hashes,
+};
 
 /// Inputs authenticated by the caller's previous checkpoint and chain spec.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -72,21 +74,46 @@ pub enum ExecutionError {
 }
 
 /// Commit canonical Borsh bytes with the chain's BLAKE3 hash.
-pub fn commitment<T: BorshSerialize + ?Sized>(value: &T) -> Hash {
-    blake3_256(&borsh::to_vec(value).expect("canonical statement serialization"))
+pub use neutrino_consensus_types::evidence::commitment;
+
+/// Whether a recursively authenticated block output commits exactly the
+/// wire public inputs' chain, height, roots, gas, proposer and runtime fields.
+#[must_use]
+#[allow(clippy::suspicious_operation_groupings)] // Wire fields deliberately differ from STF names.
+pub fn output_binds(output: &StfPublicOutput, pi: &BlockProofPublicInputs) -> bool {
+    output.chain_id == pi.chain_id
+        && output.block_height == pi.height
+        && output.pre_state_root == pi.state_root_before
+        && output.post_state_root == pi.state_root_after
+        && output.transactions_root == pi.transactions_root
+        && output.receipts_root == pi.receipt_root
+        && output.gas_used == pi.gas_used
+        && output.block_gas_limit == pi.gas_limit
+        && output.proposer_address == pi.proposer_address
+        && output.validator_set_root == pi.runtime_extra
 }
 
 /// Validate all execution bindings and derive the aggregate commitment.
 ///
 /// This function does not replace SP1 inner-proof verification, BLS signature
 /// verification or validation of the incoming context's trust anchor.
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::suspicious_operation_groupings)] // Wire fields deliberately differ from STF names.
 pub fn validate_execution(
     context: &ExecutionContext,
     blocks: &[ProvenBlock],
     block_guest_vk_digest: [u32; 8],
 ) -> Result<ExecutionStatement, ExecutionError> {
+    validate_execution_with_hashes(context, blocks, block_guest_vk_digest)
+        .map(|(statement, _)| statement)
+}
+
+/// [`validate_execution`] that also returns each block's header hash, in order.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::suspicious_operation_groupings)] // Wire fields deliberately differ from STF names.
+pub(crate) fn validate_execution_with_hashes(
+    context: &ExecutionContext,
+    blocks: &[ProvenBlock],
+    block_guest_vk_digest: [u32; 8],
+) -> Result<(ExecutionStatement, Vec<Hash>), ExecutionError> {
     let count = u64::try_from(blocks.len()).map_err(|_| ExecutionError::Range)?;
     if count == 0 || count != context.chunk_size {
         return Err(ExecutionError::Range);
@@ -122,7 +149,7 @@ pub fn validate_execution(
         let proposer = usize::try_from(header.proposer_index)
             .ok()
             .and_then(|index| context.active_validators.get(index))
-            .filter(|validator| !validator.slashed && validator.effective_stake > 0)
+            .filter(|validator| crate::finality::is_active(validator))
             .ok_or(ExecutionError::Proposer)?;
         let expected = BlockProofPublicInputs {
             chain_id: context.chain_id,
@@ -141,18 +168,7 @@ pub fn validate_execution(
             proposer_address: proposer.withdrawal_credentials,
             runtime_extra: header.runtime_extra,
         };
-        if *pi != expected
-            || output.chain_id != pi.chain_id
-            || output.block_height != pi.height
-            || output.pre_state_root != pi.state_root_before
-            || output.post_state_root != pi.state_root_after
-            || output.transactions_root != pi.transactions_root
-            || output.receipts_root != pi.receipt_root
-            || output.gas_used != pi.gas_used
-            || output.block_gas_limit != pi.gas_limit
-            || output.proposer_address != pi.proposer_address
-            || output.validator_set_root != pi.runtime_extra
-            || output.gas_used > output.block_gas_limit
+        if *pi != expected || !output_binds(output, pi) || output.gas_used > output.block_gas_limit
         {
             return Err(ExecutionError::BlockBinding);
         }
@@ -166,9 +182,9 @@ pub fn validate_execution(
         state = header.state_root;
         slot = header.slot;
     }
-    let first = blocks.first().ok_or(ExecutionError::Range)?;
+    let start_block_hash = *hashes.first().ok_or(ExecutionError::Range)?;
     let last = blocks.last().ok_or(ExecutionError::Range)?;
-    Ok(ExecutionStatement {
+    let statement = ExecutionStatement {
         block_guest_vk_digest,
         chunk: ChunkProofPublicInputs {
             chunk_id: context.chunk_id,
@@ -176,16 +192,17 @@ pub fn validate_execution(
             end_height,
             start_state_root: context.pre_state_root,
             end_state_root: state,
-            start_block_hash: first.header.hash(),
+            start_block_hash,
             end_block_hash: parent,
             block_hash_root: merkle_root_of_hashes(&hashes),
-            block_proof_root: merkle_root_of_hashes(&proof_leaves),
-            vrf_proof_root: merkle_root_of_hashes(&vrf_leaves),
+            block_proof_root: merkle_root_from_hashes(proof_leaves),
+            vrf_proof_root: merkle_root_from_hashes(vrf_leaves),
             active_validator_set_root: commitment(&context.active_validators),
             // The full consensus transition replaces this runtime commitment
             // with the derived consensus active-set root before finality.
             next_validator_set_root: last.output.validator_set_root,
-            da_root: merkle_root_of_hashes(&da_leaves),
+            da_root: merkle_root_from_hashes(da_leaves),
         },
-    })
+    };
+    Ok((statement, hashes))
 }

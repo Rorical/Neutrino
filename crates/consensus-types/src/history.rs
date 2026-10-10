@@ -51,11 +51,13 @@ pub const fn history_record_window_chunks(unbonding_delay_blocks: u64, chunk_siz
 /// Distinguish an empty slot from an occupied context commitment.
 #[must_use]
 pub fn history_leaf_hash(value: Option<Hash>) -> Hash {
-    let mut bytes = Vec::from(DOMAIN_HISTORY_LEAF);
-    bytes.push(u8::from(value.is_some()));
-    if let Some(value) = value {
-        bytes.extend_from_slice(&value);
-    }
+    let mut bytes = [0; 49];
+    bytes[..16].copy_from_slice(&DOMAIN_HISTORY_LEAF);
+    let Some(value) = value else {
+        return blake3_256(&bytes[..17]);
+    };
+    bytes[16] = 1;
+    bytes[17..].copy_from_slice(&value);
     blake3_256(&bytes)
 }
 
@@ -63,37 +65,130 @@ pub fn history_leaf_hash(value: Option<Hash>) -> Hash {
 #[must_use]
 pub fn history_node_hash(level: usize, left: Hash, right: Hash) -> Hash {
     assert!(level < HISTORY_DEPTH, "historical node level");
-    let mut bytes = Vec::from(DOMAIN_HISTORY_NODE);
-    bytes.push(u8::try_from(level).expect("bounded history depth"));
-    bytes.extend_from_slice(&left);
-    bytes.extend_from_slice(&right);
+    let mut bytes = [0; 81];
+    bytes[..16].copy_from_slice(&DOMAIN_HISTORY_NODE);
+    bytes[16] = u8::try_from(level).expect("bounded history depth");
+    bytes[17..49].copy_from_slice(&left);
+    bytes[49..].copy_from_slice(&right);
     blake3_256(&bytes)
 }
 
 /// Empty subtree hashes, indexed by height (zero is an empty leaf).
-#[must_use]
-pub fn empty_history_hashes() -> [Hash; HISTORY_DEPTH + 1] {
-    let mut empty = [[0; 32]; HISTORY_DEPTH + 1];
-    empty[0] = history_leaf_hash(None);
-    for level in 0..HISTORY_DEPTH {
-        empty[level + 1] = history_node_hash(level, empty[level], empty[level]);
+///
+/// Generated from `history_leaf_hash(None)` and
+/// `history_node_hash(level, empty[level], empty[level])`; a unit test checks
+/// every entry against that recursive definition.
+pub const EMPTY_HISTORY_HASHES: [Hash; HISTORY_DEPTH + 1] = [
+    hex32(b"8a88770f3a637fcf0f3a8cba69efd57bb9b9e3466825f3c13cb745f47b4095f1"),
+    hex32(b"46399fac029b7cc8beb8de5825766612a89b49afdd3e7ec69dad454c1421989d"),
+    hex32(b"b2fb51bcf193180e98aa0f58fa5a08823ce701d243a331e74d4790571da63dc1"),
+    hex32(b"c0d15d5210adae82fc3b45650e9122bcb2ef2f12b7fc592176cea1bf95c07f8c"),
+    hex32(b"9a703fed85d0bfc1f65a3870754cbf4160fe4680209cae4f165c844126e0897b"),
+    hex32(b"fd00f94b55baa9d1261622685cb7cd13e9cf4a7fa9998b751e4305f945a3e6f6"),
+    hex32(b"3173634146113edbed8e0579a0a8d24081321c371bafa777bd795f24572abf63"),
+    hex32(b"6c84b4be78b38adcc87aca12aa60cb1cb1fdc2a6f49220f2793098a052d1b44e"),
+    hex32(b"49ee7cdcf10d5795a07bd2cb2ece9ae698608a6158900c143e2d8deeccecaa3d"),
+    hex32(b"9f5c16b44a0876ad2105aecfd05a0a16b4c87cb8ccc1fc608ffd63be6c2c51ff"),
+    hex32(b"2b66cd0d9f5521eef16ed615c59a6bcacc1603b7418024ddf51c3cbd1543ec79"),
+    hex32(b"73f22f071efae107acbb88ffce33f3dddea9e98c32246b58dfb1be957f5820ae"),
+    hex32(b"217d7cf2fef1caa26a1247dafb02848409031cc80fec007af7cae67381aee8de"),
+    hex32(b"de59b62a3944bacfd4c98fe3e35a23905f8621e29010727aad1a5a877227361d"),
+    hex32(b"176909573b00dc653daaae498187ac286f3c94e14f367b47d54416c99516723e"),
+    hex32(b"c0a2af6119aad5ec0736af78c5a165444cdc4f92baff44f4f39f6988943b0e97"),
+    hex32(b"aa778aceeb367b41013f1bd040fe4b306a92124581503dfd409de57a23650b09"),
+    hex32(b"973893646f98fc472660df9041100d608ea2ac9e89b40a59ebb5372f9205174b"),
+    hex32(b"e392a5cc97426168b417393b8c6d0c1574917088d7bdbdf931951254fc1283df"),
+    hex32(b"20f590773357c98d7445ac3b9886ce2377ea48536793f30e2f4fb7d3137f661b"),
+    hex32(b"531c266d212bb74b0cae6b8e3036f62f32907c122576ae36dab5ccf982d4099c"),
+    hex32(b"e12935777892fc7da1cceb178c373c00d6d558848589e13309dac7d57f5be266"),
+    hex32(b"2fe7a8ae1394f7774ac6f7d6d4f511efff67b002de286592fc7a3f39a5643738"),
+    hex32(b"0ea77cf4e43d261283a228b333a091236a2905740bd025224c0d1d6e85c7dbd7"),
+    hex32(b"8e9eaf8e392372dd9b5ab50e06634c6a11bb5a4093a18afe88470bb27924967f"),
+    hex32(b"143ecf34d111f746579c38d072f64e8574b37ceb2cdf6fccce884a90f284bfc4"),
+    hex32(b"9ffeb2d95690a8d484dad31d36eafdf86abf8feed64f8757b0f1cbbc1d8869d1"),
+    hex32(b"28e3b3aae401117337d8ff650284771c8119d4cfd957f13a2ad19e889f4e15e7"),
+    hex32(b"0e9ef20b03440db4076fbaea366048f693f840f1a88b1ffc5b58107d22fe9bd4"),
+    hex32(b"b294b4c8973ebef78eee75adff26b17d4c98bec7abfe4ea3d5b5eb0e665ba82f"),
+    hex32(b"b04e8532a04ad628607f955b6cdcae1c6fcedd40d23db6df7d1d1eb23c8186e0"),
+    hex32(b"8b64973da6905eddb8611e58c7b436bdab5b3fa6983167b742c811dc9dccc622"),
+    hex32(b"d7c59733206696ba57c75aceecb13c343f2c7b0d350f894b07b906e323f1c8fa"),
+    hex32(b"9e5a5a897bac3131777d166cb639835136ad424acaf3eab02f9fc8c8c96cf367"),
+    hex32(b"13f3ee6e15d14e44739505bf2e7b78b2b0442bce963b2e1f287f4383eff1a10b"),
+    hex32(b"2beb30f43075cc540254622a54431996bd0dd3679485b64c7ac567158b760cc3"),
+    hex32(b"65fd923a6be396089d361b898eb2904d6c391a5b58740a1f227ce5ecc4c3dba2"),
+    hex32(b"5b6a4860dbf2b768ea2f452bfbb1e674dba7b72c65c2123a6d0bd6e7d182ea9c"),
+    hex32(b"117b34b97ffa239fb332b192a2bf086a9057c0ca4f140e7caba34f4af0cdcbeb"),
+    hex32(b"5b58221285f0f8e88368ec7cfbfe21c4b1f4ff45c88abbfa1088f5f442860c08"),
+    hex32(b"e7c27868ab0e6f6273a4ceb8efeea8e403e503e65afaf660158d7e993c6e84c9"),
+    hex32(b"8b67d8304289d556221f5fe459971556902d5e42cc952bf5e801c4308075116c"),
+    hex32(b"313aec27edc94e040dc4f146562fd2e249221a556653de1fef5feceda12a8f07"),
+    hex32(b"17856cd0e73d2f6ef1492a5aff4901c55de091642284704a8cbe455b5fa2384a"),
+    hex32(b"797c59239190138cb08731a7424871a745498268287d96910b21d6b9ff377c59"),
+    hex32(b"db464ec86418afffa2612bfd92055b92b93265ce08fdd3e749981940fb3b1aa3"),
+    hex32(b"66a45b821c306c8848b8fc192faedd00ae629ec1ce1a6e89db461a644fd34291"),
+    hex32(b"9fe94d15192b630254c346a127e37a452242b6dcec56d63617e8102827b7a048"),
+    hex32(b"28e984f6254d67af59a5efb0362d6cb077dcccfa1cb43e807353305a8fc73338"),
+    hex32(b"d59ea2fa8a81dff553e92dd037ddc7df1aa58a3aa26993f18056ffeb5893acd6"),
+    hex32(b"58065b90bfd299e34c30e259a0532beb41f6d9e50a87b0c88f72ff23ec9db27a"),
+    hex32(b"513cef5d3955dd484d23036b51f631270cfe06af7a81c65fb1e4bac5f26b3abf"),
+    hex32(b"dabb471e1ea2426e00748fab1cf5da34594df002f3759305778aa1a0d492b048"),
+    hex32(b"46a718d96832f0c1fadf61549b9dade7a1d6bb38ac8e7b459b2c0118e287e3be"),
+    hex32(b"98308079b9093f31056f4596fa268a0602bc9956fb6b9717d41581e2181dcc15"),
+    hex32(b"ff134800208ed5974e7500a4ffbbbdf88eb292508069c4f7aa40867a297dda74"),
+    hex32(b"eb0880e919981d5783c73b97f72cd41b4951b16b552534d3850fa50ce66f7536"),
+    hex32(b"45a33616fe6adcf7fd8a50afec9c3c77a9b93b5cd3f2e1ad7b54934012f8190d"),
+    hex32(b"d0c7eb911b67ec54a72a5c82ffba38aab0182d83cd1e577ae53f186f2ab47ec7"),
+    hex32(b"aab8fb38ed95b1bbed08ae179608a92d05836a899461d20aba5639688a872f92"),
+    hex32(b"32b41bb545e6b32988f8d78dde1d003e4939d662022f22d58d8a1dbcf3335bc1"),
+    hex32(b"bc9f002f82af0a44057d86ee772d3cbe73e39edad16b627ddb1742e7545b3315"),
+    hex32(b"231a453aa09c002be36befce24e4957c268028a2f98d3217a9437bb3ba22f7c2"),
+    hex32(b"7c898f365ccd56997df2bb1320655f6202a16b9cfccadc120747b35e9b80c6de"),
+    hex32(b"f4eac5417d194c3e3e336f4bfc9138ba8ee2a3583dce28e71ce26c70c88f7fb7"),
+];
+
+/// Canonical genesis historical commitment,
+/// `counted_history_root(0, EMPTY_HISTORY_HASHES[HISTORY_DEPTH])`.
+pub const EMPTY_HISTORY_ROOT: Hash =
+    hex32(b"1a91de02bbb65cdd75d3ca5b4d4424643aa20a0e6ce91d5e5380de072928439f");
+
+/// Decode 64 lowercase hexadecimal digits at compile time.
+const fn hex32(digits: &[u8; 64]) -> Hash {
+    const fn nibble(digit: u8) -> u8 {
+        match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'f' => digit - b'a' + 10,
+            _ => panic!("lowercase hexadecimal digit"),
+        }
     }
-    empty
+    let mut bytes = [0; 32];
+    let mut index = 0;
+    while index < 32 {
+        bytes[index] = (nibble(digits[2 * index]) << 4) | nibble(digits[2 * index + 1]);
+        index += 1;
+    }
+    bytes
+}
+
+/// Empty subtree hashes, indexed by height (zero is an empty leaf).
+#[must_use]
+pub const fn empty_history_hashes() -> [Hash; HISTORY_DEPTH + 1] {
+    EMPTY_HISTORY_HASHES
 }
 
 /// Bind the append position to the tree commitment.
 #[must_use]
 pub fn counted_history_root(count: u64, root: Hash) -> Hash {
-    let mut bytes = Vec::from(DOMAIN_HISTORY_ROOT);
-    bytes.extend_from_slice(&count.to_le_bytes());
-    bytes.extend_from_slice(&root);
+    let mut bytes = [0; 56];
+    bytes[..16].copy_from_slice(&DOMAIN_HISTORY_ROOT);
+    bytes[16..24].copy_from_slice(&count.to_le_bytes());
+    bytes[24..].copy_from_slice(&root);
     blake3_256(&bytes)
 }
 
 /// Canonical genesis historical commitment.
 #[must_use]
-pub fn empty_history_root() -> Hash {
-    counted_history_root(0, empty_history_hashes()[HISTORY_DEPTH])
+pub const fn empty_history_root() -> Hash {
+    EMPTY_HISTORY_ROOT
 }
 
 /// Bounded prefix frontier; peaks correspond to set count bits, low to high.
@@ -148,7 +243,7 @@ impl HistoryFrontier {
         if self.peaks.len() != self.count.count_ones() as usize {
             return None;
         }
-        let empty = empty_history_hashes();
+        let empty = &EMPTY_HISTORY_HASHES;
         let mut right = empty[0];
         let mut peaks = self.peaks.iter();
         for (level, empty_subtree) in empty.iter().enumerate().take(HISTORY_DEPTH) {
@@ -189,7 +284,7 @@ impl HistoryFrontier {
         if self.peaks.len() != self.count.count_ones() as usize {
             return None;
         }
-        let empty = empty_history_hashes();
+        let empty = &EMPTY_HISTORY_HASHES;
         let mut peaks = self.peaks.iter();
         let mut siblings = Vec::with_capacity(HISTORY_DEPTH);
         for (level, empty_subtree) in empty.iter().enumerate().take(HISTORY_DEPTH) {
@@ -250,7 +345,7 @@ impl HistoryPath {
             return None;
         }
         let count = u64::try_from(leaves.len()).ok()?;
-        let empty = empty_history_hashes();
+        let empty = &EMPTY_HISTORY_HASHES;
         let mut nodes: Vec<_> = leaves
             .iter()
             .map(|leaf| history_leaf_hash(Some(*leaf)))
@@ -342,6 +437,57 @@ pub fn history_root(leaves: &[Hash]) -> Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged(parts: &[&[u8]]) -> Hash {
+        blake3_256(&parts.concat())
+    }
+
+    #[test]
+    fn generated_empty_hashes_match_the_recursive_definition() {
+        let mut empty = [[0; 32]; HISTORY_DEPTH + 1];
+        empty[0] = history_leaf_hash(None);
+        for level in 0..HISTORY_DEPTH {
+            empty[level + 1] = history_node_hash(level, empty[level], empty[level]);
+        }
+        assert_eq!(EMPTY_HISTORY_HASHES, empty);
+        assert_eq!(empty_history_hashes(), empty);
+        assert_eq!(
+            EMPTY_HISTORY_ROOT,
+            counted_history_root(0, empty[HISTORY_DEPTH])
+        );
+        assert_eq!(empty_history_root(), EMPTY_HISTORY_ROOT);
+        assert_eq!(HistoryFrontier::empty().root(), Some(EMPTY_HISTORY_ROOT));
+    }
+
+    #[test]
+    fn fixed_preimages_match_tagged_concatenation() {
+        let (left, right) = ([7; 32], [9; 32]);
+        assert_eq!(
+            history_leaf_hash(None),
+            tagged(&[&DOMAIN_HISTORY_LEAF, &[0]])
+        );
+        assert_eq!(
+            history_leaf_hash(Some(left)),
+            tagged(&[&DOMAIN_HISTORY_LEAF, &[1], &left])
+        );
+        for level in [0, 1, HISTORY_DEPTH - 1] {
+            assert_eq!(
+                history_node_hash(level, left, right),
+                tagged(&[
+                    &DOMAIN_HISTORY_NODE,
+                    &[u8::try_from(level).unwrap()],
+                    &left,
+                    &right,
+                ])
+            );
+        }
+        for count in [0, 5, u64::MAX] {
+            assert_eq!(
+                counted_history_root(count, left),
+                tagged(&[&DOMAIN_HISTORY_ROOT, &count.to_le_bytes(), &left])
+            );
+        }
+    }
 
     #[test]
     fn recent_history_window_has_exact_inclusive_lower_bound() {

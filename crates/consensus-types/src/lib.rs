@@ -174,7 +174,7 @@ impl FinalityVoteData {
             FinalityVotePhase::Prevote => neutrino_primitives::DOMAIN_PREVOTE,
             FinalityVotePhase::Precommit => neutrino_primitives::DOMAIN_PRECOMMIT,
         };
-        domain.signing_message(tag, &borsh::to_vec(self).expect("canonical finality vote"))
+        domain.signing_message_borsh(tag, self)
     }
 }
 
@@ -219,16 +219,15 @@ impl VoteAttestation {
     /// Canonical bytes signed by the validator (excluding the signature itself).
     #[must_use]
     pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
-        domain.signing_message(
+        domain.signing_message_borsh(
             neutrino_primitives::DOMAIN_VOTE_ATTESTATION,
-            &borsh::to_vec(&(
+            &(
                 self.validator_index,
                 &self.vote,
                 &self.vote_signature,
                 &self.proof_hashes,
                 &self.unlock_quorum,
-            ))
-            .expect("canonical vote attestation"),
+            ),
         )
     }
 }
@@ -278,37 +277,54 @@ impl VoteAttestation {
 }
 
 impl FinalityCert {
+    /// Exact vote payload this certificate's `phase` signs.
+    #[must_use]
+    pub const fn vote_data(&self, phase: FinalityVotePhase) -> FinalityVoteData {
+        FinalityVoteData {
+            chunk_id: self.chunk_id,
+            round: self.round,
+            chunk_hash: self.chunk_hash,
+            phase,
+        }
+    }
+
+    /// Recover the accountable envelope of `phase`, including every individual
+    /// signature and signed unlock claim.
+    #[must_use]
+    pub fn vote(&self, phase: FinalityVotePhase) -> FinalityVote {
+        let (aggregate, attestations) = match phase {
+            FinalityVotePhase::Prevote => (&self.prevote, &self.prevote_attestations),
+            FinalityVotePhase::Precommit => (&self.precommit, &self.precommit_attestations),
+        };
+        FinalityVote {
+            data: self.vote_data(phase),
+            aggregation_bits: aggregate.aggregation_bits.clone(),
+            signature: aggregate.signature,
+            attestations: attestations.clone(),
+        }
+    }
+
     /// Recover the accountable prevote envelope, including signed unlock claims.
     #[must_use]
     pub fn prevote_vote(&self) -> FinalityVote {
-        FinalityVote {
-            data: FinalityVoteData {
-                chunk_id: self.chunk_id,
-                round: self.round,
-                chunk_hash: self.chunk_hash,
-                phase: FinalityVotePhase::Prevote,
-            },
-            aggregation_bits: self.prevote.aggregation_bits.clone(),
-            signature: self.prevote.signature,
-            attestations: self.prevote_attestations.clone(),
-        }
+        self.vote(FinalityVotePhase::Prevote)
     }
 
     /// Recover the accountable precommit envelope without losing individual signatures.
     #[must_use]
     pub fn precommit_vote(&self) -> FinalityVote {
-        FinalityVote {
-            data: FinalityVoteData {
-                chunk_id: self.chunk_id,
-                round: self.round,
-                chunk_hash: self.chunk_hash,
-                phase: FinalityVotePhase::Precommit,
-            },
-            aggregation_bits: self.precommit.aggregation_bits.clone(),
-            signature: self.precommit.signature,
-            attestations: self.precommit_attestations.clone(),
-        }
+        self.vote(FinalityVotePhase::Precommit)
     }
+}
+
+/// BLAKE3 of `tag || borsh(value)`, serializing the value straight after the tag.
+#[must_use]
+pub fn tagged_commitment<T: BorshSerialize + ?Sized>(tag: &[u8], value: &T) -> Hash {
+    let mut bytes = Vec::from(tag);
+    value
+        .serialize(&mut bytes)
+        .expect("canonical tagged commitment encoding");
+    blake3_256(&bytes)
 }
 
 /// Canonical transaction and embedded finality-vote body.
@@ -964,6 +980,48 @@ mod tests {
         let decoded: FinalityCert = from_slice(&encoded).expect("cert deserializes");
 
         assert_eq!(decoded, cert);
+    }
+
+    #[test]
+    fn tagged_commitment_hashes_tag_then_borsh_bytes() {
+        let value = (chunk(), Some(7_u32), vec![1_u8, 2]);
+        let mut bytes = b"neutrino/test".to_vec();
+        bytes.extend(to_vec(&value).expect("value serializes"));
+        assert_eq!(
+            tagged_commitment(b"neutrino/test", &value),
+            blake3_256(&bytes)
+        );
+        let cert_votes = FinalityCert {
+            proposal: BftProposal {
+                chunk: chunk(),
+                round: 2,
+                proposer_index: 0,
+                valid_quorum: None,
+                round_change_certificate: None,
+                signature: sig(1),
+            },
+            prevote_attestations: vec![test_attestation(None)],
+            precommit_attestations: Vec::new(),
+            chunk_id: 5,
+            round: 2,
+            chunk_hash: chunk().hash(),
+            prevote: aggregated_vote(2),
+            precommit: aggregated_vote(3),
+            active_validator_set_root: hash(4),
+        };
+        for phase in [FinalityVotePhase::Prevote, FinalityVotePhase::Precommit] {
+            let vote = cert_votes.vote(phase);
+            assert_eq!(vote.data, cert_votes.vote_data(phase));
+            assert_eq!(vote.data.phase, phase);
+        }
+        assert_eq!(
+            cert_votes.prevote_vote().attestations,
+            cert_votes.prevote_attestations
+        );
+        assert_eq!(
+            cert_votes.precommit_vote().signature,
+            cert_votes.precommit.signature
+        );
     }
 
     #[test]

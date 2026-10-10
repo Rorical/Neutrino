@@ -12,9 +12,14 @@ use neutrino_consensus_types::history::{
 use neutrino_consensus_types::{
     Chunk, FinalityCert, FinalityVote, FinalityVotePhase, SlashingEvidence, VrfRejectionReason,
 };
-use neutrino_primitives::{ChainSpec, Hash, Seed, Validator};
+use neutrino_primitives::{ChainSpec, ConsensusDomain, ConsensusParams, Hash, Seed, Validator};
 
-use crate::{execution::commitment, proposer::ProposerError, slashing};
+use crate::{
+    execution::commitment,
+    finality::is_active,
+    proposer::{ProposerError, Proposers},
+    slashing,
+};
 
 /// A previously proven finalization, including the set effective at that time.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -229,8 +234,39 @@ impl HistoryWitness {
 fn active_validator(validators: &[Validator], index: u32) -> Result<&Validator, HistoryError> {
     validators
         .get(index as usize)
-        .filter(|validator| !validator.slashed && validator.effective_stake > 0)
+        .filter(|validator| is_active(validator))
         .ok_or(HistoryError::Evidence)
+}
+
+/// [`penalty_id`] kind: two headers signed for one slot.
+pub const PENALTY_DOUBLE_PROPOSAL: u8 = 0;
+/// [`penalty_id`] kind: a header claimed invalid VRF eligibility.
+pub const PENALTY_INVALID_VRF: u8 = 1;
+/// [`penalty_id`] kind: prevote equivocation, including nil/value conflicts
+/// and long-range fork prevotes.
+pub const PENALTY_PREVOTE_EQUIVOCATION: u8 = 2;
+/// [`penalty_id`] kind: precommit equivocation, including nil/value conflicts
+/// and long-range fork precommits.
+pub const PENALTY_PRECOMMIT_EQUIVOCATION: u8 = 3;
+/// [`penalty_id`] kind: a later vote violating an earlier lock.
+pub const PENALTY_LOCK_VIOLATION: u8 = 4;
+/// [`penalty_id`] kind: signed acceptance of a rejected block proof.
+pub const PENALTY_INVALID_PROOF_SIGNING: u8 = 5;
+/// [`penalty_id`] kind: a DA commitment contradicting the published bundle.
+pub const PENALTY_DA_COMMITMENT_FRAUD: u8 = 6;
+/// [`penalty_id`] kind: absence from an authenticated finality certificate.
+pub const PENALTY_INACTIVITY: u8 = 7;
+/// [`penalty_id`] kind: a round leader signing two proposals for one round.
+pub const PENALTY_DOUBLE_BFT_PROPOSAL: u8 = 8;
+
+/// [`penalty_id`] kind of an equivocation in `phase`. Every equivocation form
+/// in one phase shares it, so one offence is never deducted twice.
+#[must_use]
+pub const fn vote_kind(phase: FinalityVotePhase) -> u8 {
+    match phase {
+        FinalityVotePhase::Prevote => PENALTY_PREVOTE_EQUIVOCATION,
+        FinalityVotePhase::Precommit => PENALTY_PRECOMMIT_EQUIVOCATION,
+    }
 }
 
 /// Evidence-independent event identifier shared by evidence guest and runtime.
@@ -312,10 +348,33 @@ pub fn authorize_evidence_at_record<'a>(
 }
 
 /// Derive guilt using immediate or recursively authenticated cryptographic facts.
-#[allow(clippy::too_many_lines)]
 pub fn authorize_evidence_using<'a>(
     spec: &ChainSpec,
     source: &'a HistoricalChunk,
+    evidence: &SlashingEvidence,
+    block_key: &[u32; 8],
+    verifier: &mut impl crate::facts::EvidenceVerifier,
+) -> Result<(&'a Validator, Hash), HistoryError> {
+    authorize_evidence_with(
+        spec,
+        spec.consensus_domain(),
+        source,
+        None,
+        evidence,
+        block_key,
+        verifier,
+    )
+}
+
+/// [`authorize_evidence_using`] with `domain == spec.consensus_domain()`
+/// already derived. A known `validators_root` must equal
+/// `commitment(&source.validators)`; `None` computes it where needed.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn authorize_evidence_with<'a>(
+    spec: &ChainSpec,
+    domain: ConsensusDomain,
+    source: &'a HistoricalChunk,
+    validators_root: Option<Hash>,
     evidence: &SlashingEvidence,
     block_key: &[u32; 8],
     verifier: &mut impl crate::facts::EvidenceVerifier,
@@ -346,9 +405,10 @@ pub fn authorize_evidence_using<'a>(
         } => {
             let record = record_at(proposal_a.chunk.chunk_id)?;
             let validator = active_validator(&record.validators, *proposer_index)?;
-            slashing::verify_double_bft_proposal_using(
-                spec.consensus_domain(),
+            slashing::verify_double_bft_proposal_with_root(
+                domain,
                 &record.validators,
+                validators_root.unwrap_or_else(|| commitment(&record.validators)),
                 *proposer_index,
                 proposal_a,
                 proposal_b,
@@ -357,7 +417,12 @@ pub fn authorize_evidence_using<'a>(
             .map_err(invalid)?;
             Ok((
                 validator,
-                penalty_id(8, validator, record.chunk.chunk_id, proposal_a.round),
+                penalty_id(
+                    PENALTY_DOUBLE_BFT_PROPOSAL,
+                    validator,
+                    record.chunk.chunk_id,
+                    proposal_a.round,
+                ),
             ))
         }
         SlashingEvidence::ConflictingNilVote {
@@ -368,7 +433,7 @@ pub fn authorize_evidence_using<'a>(
             let record = record_at(value_vote.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_conflicting_nil_vote_using(
-                spec.consensus_domain(),
+                domain,
                 &record.validators,
                 *validator_index,
                 value_vote,
@@ -376,15 +441,10 @@ pub fn authorize_evidence_using<'a>(
                 verifier,
             )
             .map_err(invalid)?;
-            let kind = if value_vote.data.phase == FinalityVotePhase::Prevote {
-                2
-            } else {
-                3
-            };
             Ok((
                 validator,
                 penalty_id(
-                    kind,
+                    vote_kind(value_vote.data.phase),
                     validator,
                     value_vote.data.chunk_id,
                     value_vote.data.round,
@@ -397,31 +457,31 @@ pub fn authorize_evidence_using<'a>(
             header_b,
         } => {
             let chunk_id = chunk_for_height(header_a.height)?;
+            let (hash_a, hash_b) = (header_a.hash(), header_b.hash());
             if chunk_for_height(header_b.height)? != chunk_id
                 || header_a.proposer_index != *proposer_index
                 || header_b.proposer_index != *proposer_index
                 || header_a.slot != header_b.slot
-                || header_a.hash() == header_b.hash()
+                || hash_a == hash_b
             {
                 return Err(HistoryError::Evidence);
             }
             let record = record_at(chunk_id)?;
             let validator = active_validator(&record.validators, *proposer_index)?;
-            crate::proposer::verify_header_signature_using(
-                header_a,
-                spec.consensus_domain(),
-                &record.validators,
-                verifier,
-            )
-            .map_err(|_| HistoryError::Evidence)?;
-            crate::proposer::verify_header_signature_using(
-                header_b,
-                spec.consensus_domain(),
-                &record.validators,
-                verifier,
-            )
-            .map_err(|_| HistoryError::Evidence)?;
-            Ok((validator, penalty_id(0, validator, header_a.slot, 0)))
+            for (header, hash) in [(header_a, &hash_a), (header_b, &hash_b)] {
+                crate::proposer::verify_header_signature_with(
+                    header,
+                    hash,
+                    domain,
+                    &record.validators,
+                    verifier,
+                )
+                .map_err(|_| HistoryError::Evidence)?;
+            }
+            Ok((
+                validator,
+                penalty_id(PENALTY_DOUBLE_PROPOSAL, validator, header_a.slot, 0),
+            ))
         }
         SlashingEvidence::InvalidVrfClaim {
             proposer_index,
@@ -433,19 +493,24 @@ pub fn authorize_evidence_using<'a>(
             if header.proposer_index != *proposer_index {
                 return Err(HistoryError::Evidence);
             }
-            crate::proposer::verify_header_signature_using(
+            let hash = header.hash();
+            crate::proposer::verify_header_signature_with(
                 header,
-                spec.consensus_domain(),
+                &hash,
+                domain,
                 &record.validators,
                 verifier,
             )
             .map_err(|_| HistoryError::Evidence)?;
-            let actual = crate::proposer::verify_proposer_using(
+            let actual = crate::proposer::verify_proposer_with(
                 header,
-                spec.consensus_domain(),
-                &record.validators,
-                &record.seed,
-                spec.consensus.expected_proposers_per_slot,
+                &hash,
+                domain,
+                Proposers::new(
+                    &record.validators,
+                    &record.seed,
+                    spec.consensus.expected_proposers_per_slot,
+                ),
                 verifier,
             );
             if !matches!(
@@ -458,7 +523,10 @@ pub fn authorize_evidence_using<'a>(
             ) {
                 return Err(HistoryError::Evidence);
             }
-            Ok((validator, penalty_id(1, validator, header.slot, 0)))
+            Ok((
+                validator,
+                penalty_id(PENALTY_INVALID_VRF, validator, header.slot, 0),
+            ))
         }
         SlashingEvidence::DoublePrevote {
             validator_index,
@@ -485,30 +553,24 @@ pub fn authorize_evidence_using<'a>(
             }
             let record = record_at(vote_a.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
-            slashing::verify_indexed_vote_using(
-                spec.consensus_domain(),
-                &record.validators,
-                *validator_index,
-                vote_a,
-                verifier,
-            )
-            .map_err(invalid)?;
-            slashing::verify_indexed_vote_using(
-                spec.consensus_domain(),
-                &record.validators,
-                *validator_index,
-                vote_b,
-                verifier,
-            )
-            .map_err(invalid)?;
-            let kind = if phase == FinalityVotePhase::Prevote {
-                2
-            } else {
-                3
-            };
+            for vote in [vote_a, vote_b] {
+                slashing::verify_indexed_vote_using(
+                    domain,
+                    &record.validators,
+                    *validator_index,
+                    vote,
+                    verifier,
+                )
+                .map_err(invalid)?;
+            }
             Ok((
                 validator,
-                penalty_id(kind, validator, vote_a.data.chunk_id, vote_a.data.round),
+                penalty_id(
+                    vote_kind(phase),
+                    validator,
+                    vote_a.data.chunk_id,
+                    vote_a.data.round,
+                ),
             ))
         }
         SlashingEvidence::LockViolation {
@@ -520,7 +582,7 @@ pub fn authorize_evidence_using<'a>(
             let record = record_at(vote_a.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_lock_violation_using(
-                spec.consensus_domain(),
+                domain,
                 &record.validators,
                 *validator_index,
                 (vote_a, vote_b),
@@ -531,7 +593,12 @@ pub fn authorize_evidence_using<'a>(
             .map_err(invalid)?;
             Ok((
                 validator,
-                penalty_id(4, validator, vote_b.data.chunk_id, vote_b.data.round),
+                penalty_id(
+                    PENALTY_LOCK_VIOLATION,
+                    validator,
+                    vote_b.data.chunk_id,
+                    vote_b.data.round,
+                ),
             ))
         }
         SlashingEvidence::InvalidProofSigning {
@@ -544,7 +611,7 @@ pub fn authorize_evidence_using<'a>(
             let record = record_at(vote.data.chunk_id)?;
             let validator = active_validator(&record.validators, *validator_index)?;
             slashing::verify_indexed_vote_using(
-                spec.consensus_domain(),
+                domain,
                 &record.validators,
                 *validator_index,
                 vote,
@@ -552,7 +619,7 @@ pub fn authorize_evidence_using<'a>(
             )
             .map_err(invalid)?;
             slashing::verify_attestation_using(
-                spec.consensus_domain(),
+                domain,
                 &record.validators,
                 *validator_index,
                 &vote.data,
@@ -571,7 +638,12 @@ pub fn authorize_evidence_using<'a>(
             }
             Ok((
                 validator,
-                penalty_id(5, validator, rejected_proof.height, 0),
+                penalty_id(
+                    PENALTY_INVALID_PROOF_SIGNING,
+                    validator,
+                    rejected_proof.height,
+                    0,
+                ),
             ))
         }
         SlashingEvidence::LongRangeForkParticipation {
@@ -590,32 +662,26 @@ pub fn authorize_evidence_using<'a>(
                 return Err(HistoryError::Evidence);
             }
             let validator = active_validator(&record.validators, *validator_index)?;
-            slashing::verify_indexed_vote_using(
-                spec.consensus_domain(),
-                &record.validators,
-                *validator_index,
-                vote,
-                verifier,
-            )
-            .map_err(invalid)?;
-            slashing::verify_indexed_vote_using(
-                spec.consensus_domain(),
-                &record.validators,
-                *validator_index,
-                canonical_vote,
-                verifier,
-            )
-            .map_err(invalid)?;
+            for signed in [vote, canonical_vote] {
+                slashing::verify_indexed_vote_using(
+                    domain,
+                    &record.validators,
+                    *validator_index,
+                    signed,
+                    verifier,
+                )
+                .map_err(invalid)?;
+            }
             // Same offence as ordinary double-voting, never a second deduction
             // under a different evidence variant.
-            let kind = if vote.data.phase == FinalityVotePhase::Prevote {
-                2
-            } else {
-                3
-            };
             Ok((
                 validator,
-                penalty_id(kind, validator, vote.data.chunk_id, vote.data.round),
+                penalty_id(
+                    vote_kind(vote.data.phase),
+                    validator,
+                    vote.data.chunk_id,
+                    vote.data.round,
+                ),
             ))
         }
         SlashingEvidence::DaCommitmentFraud {
@@ -629,14 +695,17 @@ pub fn authorize_evidence_using<'a>(
                 return Err(HistoryError::Evidence);
             }
             slashing::verify_da_fraud_using(
-                spec.consensus_domain(),
+                domain,
                 &record.validators,
                 header,
                 fraud_proof,
                 verifier,
             )
             .map_err(invalid)?;
-            Ok((validator, penalty_id(6, validator, header.slot, 0)))
+            Ok((
+                validator,
+                penalty_id(PENALTY_DA_COMMITMENT_FRAUD, validator, header.slot, 0),
+            ))
         }
     }
 }
@@ -662,13 +731,25 @@ pub fn verify_embedded_vote_using(
     vote: &FinalityVote,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), HistoryError> {
-    let record = history.record(vote.data.chunk_id)?;
-    crate::finality::verify_vote_using(
+    verify_embedded_vote_with(
         spec.consensus_domain(),
-        &record.validators,
-        vote,
         &spec.consensus,
+        history,
+        vote,
         verifier,
     )
-    .map_err(|_| HistoryError::Evidence)
+}
+
+/// [`verify_embedded_vote_using`] with `domain == spec.consensus_domain()`
+/// already derived for `params == spec.consensus`.
+pub(crate) fn verify_embedded_vote_with(
+    domain: ConsensusDomain,
+    params: &ConsensusParams,
+    history: &HistoryWitness,
+    vote: &FinalityVote,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), HistoryError> {
+    let record = history.record(vote.data.chunk_id)?;
+    crate::finality::verify_vote_using(domain, &record.validators, vote, params, verifier)
+        .map_err(|_| HistoryError::Evidence)
 }

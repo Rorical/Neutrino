@@ -4,7 +4,7 @@ use alloc::{boxed::Box, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
     BitVec, BlsSignature, ConsensusDomain, DOMAIN_BFT_NIL, DOMAIN_BFT_NIL_ATTESTATION,
-    DOMAIN_BFT_PROPOSAL, DOMAIN_BFT_ROUND_CHANGE, Validator, blake3_256,
+    DOMAIN_BFT_PROPOSAL, DOMAIN_BFT_ROUND_CHANGE, Hash, Validator, blake3_256,
 };
 
 use crate::{
@@ -33,9 +33,8 @@ impl BftProposal {
     /// Canonical chain-bound signing bytes.
     #[must_use]
     pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
-        signing_bytes(
+        domain.signing_message_borsh(
             DOMAIN_BFT_PROPOSAL,
-            domain,
             &(
                 &self.chunk,
                 self.round,
@@ -62,7 +61,7 @@ impl NilVoteData {
     /// Canonical chain-bound signing bytes, distinct from every value vote.
     #[must_use]
     pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
-        signing_bytes(DOMAIN_BFT_NIL, domain, self)
+        domain.signing_message_borsh(DOMAIN_BFT_NIL, self)
     }
 }
 
@@ -83,9 +82,8 @@ impl NilVoteAttestation {
     /// Canonical chain-bound accountability signature bytes.
     #[must_use]
     pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
-        signing_bytes(
+        domain.signing_message_borsh(
             DOMAIN_BFT_NIL_ATTESTATION,
-            domain,
             &(self.validator_index, &self.vote, &self.vote_signature),
         )
     }
@@ -141,9 +139,8 @@ impl RoundChange {
     /// Canonical chain-bound signing bytes.
     #[must_use]
     pub fn signing_message(&self, domain: ConsensusDomain) -> Vec<u8> {
-        signing_bytes(
+        domain.signing_message_borsh(
             DOMAIN_BFT_ROUND_CHANGE,
-            domain,
             &(
                 self.chunk_id,
                 self.round,
@@ -202,6 +199,20 @@ pub fn bft_leader(
     round: u32,
     validators: &[Validator],
 ) -> Option<u32> {
+    let root = blake3_256(&borsh::to_vec(validators).ok()?);
+    bft_leader_with_root(chain_id, chunk_id, round, validators, root)
+}
+
+/// [`bft_leader`] for a caller already holding `root`, the BLAKE3 of the
+/// Borsh-encoded `validators` (their canonical set commitment).
+#[must_use]
+pub fn bft_leader_with_root(
+    chain_id: u64,
+    chunk_id: u64,
+    round: u32,
+    validators: &[Validator],
+    root: Hash,
+) -> Option<u32> {
     let eligible: Vec<_> = validators
         .iter()
         .enumerate()
@@ -211,18 +222,16 @@ pub fn bft_leader(
     let count = u64::try_from(eligible.len())
         .ok()
         .filter(|count| *count > 0)?;
-    let root = blake3_256(&borsh::to_vec(validators).ok()?);
-    let mut leader_input = Vec::from(DOMAIN_BFT_PROPOSAL);
-    leader_input.extend_from_slice(&chain_id.to_le_bytes());
-    leader_input.extend_from_slice(&borsh::to_vec(&(chunk_id, root)).ok()?);
+    // `DOMAIN_BFT_PROPOSAL || chain_id LE8 || borsh((chunk_id, root))`.
+    let mut leader_input = [0; 64];
+    leader_input[..16].copy_from_slice(&DOMAIN_BFT_PROPOSAL);
+    leader_input[16..24].copy_from_slice(&chain_id.to_le_bytes());
+    leader_input[24..32].copy_from_slice(&chunk_id.to_le_bytes());
+    leader_input[32..].copy_from_slice(&root);
     let offset = blake3_256(&leader_input);
     let offset = u64::from_le_bytes(offset[..8].try_into().ok()?) % count;
     let index = (offset + u64::from(round)) % count;
     eligible.get(usize::try_from(index).ok()?).copied()
-}
-
-fn signing_bytes(tag: [u8; 16], domain: ConsensusDomain, payload: &impl BorshSerialize) -> Vec<u8> {
-    domain.signing_message(tag, &borsh::to_vec(payload).expect("canonical BFT payload"))
 }
 
 /// Local transport bound, matching candidate retrieval rather than consensus membership.
@@ -273,7 +282,7 @@ pub fn read_quorum<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Quor
     })
 }
 
-fn read_optional_quorum<R: borsh::io::Read>(
+pub(crate) fn read_optional_quorum<R: borsh::io::Read>(
     reader: &mut R,
 ) -> borsh::io::Result<Option<QuorumCertificate>> {
     match u8::deserialize_reader(reader)? {
@@ -402,5 +411,46 @@ impl BorshDeserialize for BftMessage {
             )?)),
             _ => Err(invalid_wire("invalid BFT message")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn validator(byte: u8, effective_stake: u64, slashed: bool) -> Validator {
+        Validator {
+            pubkey: [byte; 48],
+            withdrawal_credentials: [byte; 32],
+            effective_stake,
+            slashed,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }
+    }
+
+    #[test]
+    fn fixed_leader_input_matches_the_tagged_borsh_preimage() {
+        let validators = [
+            validator(1, 5, false),
+            validator(2, 0, false),
+            validator(3, 7, true),
+            validator(4, 9, false),
+        ];
+        let root = blake3_256(&borsh::to_vec(&validators[..]).unwrap());
+        for (chunk_id, round) in [(0, 0), (3, 1), (u64::MAX, u32::MAX)] {
+            let mut input = Vec::from(DOMAIN_BFT_PROPOSAL);
+            input.extend_from_slice(&7_u64.to_le_bytes());
+            input.extend_from_slice(&borsh::to_vec(&(chunk_id, root)).unwrap());
+            let offset = u64::from_le_bytes(blake3_256(&input)[..8].try_into().unwrap()) % 2;
+            let expected = [0, 3][usize::try_from((offset + u64::from(round)) % 2).unwrap()];
+            assert_eq!(bft_leader(7, chunk_id, round, &validators), Some(expected));
+            assert_eq!(
+                bft_leader_with_root(7, chunk_id, round, &validators, root),
+                Some(expected)
+            );
+        }
+        assert_eq!(bft_leader(7, 0, 0, &[validator(1, 0, false)]), None);
     }
 }

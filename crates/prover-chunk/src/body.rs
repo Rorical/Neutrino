@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::{Body, FinalityVote, Header};
 use neutrino_default_runtime_core::{Transaction, commitments::TransactionSummary};
-use neutrino_primitives::merkle_root_of_hashes;
+use neutrino_primitives::{merkle_root_from_hashes, merkle_root_of_hashes};
 
 use crate::{consensus::ConsensusError, execution::commitment, history::HistoryError};
 
@@ -44,13 +44,7 @@ impl ConsensusBody {
         header: &Header,
         summary: &TransactionSummary,
     ) -> Result<(), ConsensusError> {
-        let votes = merkle_root_of_hashes(
-            &self
-                .finality_votes
-                .iter()
-                .map(commitment)
-                .collect::<Vec<_>>(),
-        );
+        let votes = merkle_root_from_hashes(self.finality_votes.iter().map(commitment).collect());
         if self.program_leaves.len() > neutrino_consensus_types::MAX_PROGRAM_PIECES_PER_BLOCK {
             return Err(ConsensusError::Header);
         }

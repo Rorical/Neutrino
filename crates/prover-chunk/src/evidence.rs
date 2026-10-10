@@ -8,7 +8,12 @@ use neutrino_consensus_types::{
 use neutrino_primitives::ChainSpec;
 
 use crate::execution::commitment;
-use crate::history::{HistoricalChunk, HistoryError, authorize_evidence_using, penalty_id};
+use crate::history::{
+    HistoricalChunk, HistoryError, PENALTY_INACTIVITY, authorize_evidence_with, penalty_id,
+};
+
+/// Upper bound on authenticated fact statements one evidence batch may carry.
+pub const MAX_EVIDENCE_FACT_STATEMENTS: usize = 256;
 
 /// Self-contained witness classes accepted by the evidence program.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -54,7 +59,9 @@ pub fn validate_evidence_using(
     let spec = &input.chain_spec;
     let source = &input.source;
     spec.validate().map_err(|_| HistoryError::Anchor)?;
-    if source.chunk.active_validator_set_root != commitment(&source.validators)
+    // Computed once; its validator root also authenticates the claim below.
+    let context = source.evidence_context();
+    if source.chunk.active_validator_set_root != context.validators_root
         || source
             .chunk
             .chunk_id
@@ -64,11 +71,14 @@ pub fn validate_evidence_using(
     {
         return Err(HistoryError::Anchor);
     }
+    let domain = spec.consensus_domain();
     let (offender, offence_id, kind) = match &input.claim {
         EvidenceClaim::Slash(evidence) => {
-            let (validator, id) = authorize_evidence_using(
+            let (validator, id) = authorize_evidence_with(
                 spec,
+                domain,
                 source,
+                Some(context.validators_root),
                 evidence,
                 &source.block_guest_vk_digest,
                 verifier,
@@ -79,10 +89,11 @@ pub fn validate_evidence_using(
             validator_index,
             certificate,
         } => {
-            crate::finality::verify_finality_using(
-                spec.consensus_domain(),
+            crate::finality::verify_finality_with_root(
+                domain,
                 &spec.consensus,
                 &source.validators,
+                context.validators_root,
                 &source.chunk,
                 certificate,
                 verifier,
@@ -91,23 +102,23 @@ pub fn validate_evidence_using(
             let validator = source
                 .validators
                 .get(*validator_index as usize)
-                .filter(|v| !v.slashed && v.effective_stake > 0)
+                .filter(|v| crate::finality::is_active(v))
                 .ok_or(HistoryError::Evidence)?;
             if certificate.precommit.aggregation_bits.get(*validator_index) != Some(false) {
                 return Err(HistoryError::Evidence);
             }
             (
                 validator,
-                penalty_id(7, validator, source.chunk.chunk_id, 0),
+                penalty_id(PENALTY_INACTIVITY, validator, source.chunk.chunk_id, 0),
                 SanctionKind::Inactivity,
             )
         }
     };
     Ok(EvidenceStatement {
         chain_id: spec.chain_id,
-        chain_spec_hash: spec.hash(),
+        chain_spec_hash: domain.chain_spec_hash,
         block_guest_vk_digest: input.block_guest_vk_digest,
-        context: source.evidence_context(),
+        context,
         offender: offender.clone(),
         kind,
         offence_id,
@@ -141,7 +152,7 @@ pub fn validate_evidence_batch(
 > {
     if input.witnesses.is_empty()
         || input.witnesses.len() > neutrino_consensus_types::evidence::MAX_EVIDENCE_BATCH
-        || input.facts.len() > 256
+        || input.facts.len() > MAX_EVIDENCE_FACT_STATEMENTS
     {
         return Err(HistoryError::Evidence);
     }

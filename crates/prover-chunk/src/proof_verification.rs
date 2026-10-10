@@ -109,10 +109,15 @@ pub fn verify_block_artifact(
     if proof.proof_bytes.len() > MAX_PROOF_BYTES {
         return Err(ProofRejectionReason::MalformedProof);
     }
-    // Sp1BlockProof is a borsh struct containing one Vec<u8> field.
-    let bytes: Vec<u8> =
-        borsh::from_slice(&proof.proof_bytes).map_err(|_| ProofRejectionReason::MalformedProof)?;
-    let bundle: ProofBundle = receipt_codec::decode::<_, MAX_PROOF_BYTES>(&bytes)
+    // Sp1BlockProof is a borsh struct containing one Vec<u8> field: a u32
+    // length prefix that must equal the remaining byte count exactly.
+    let Some((length, bytes)) = proof.proof_bytes.split_first_chunk::<4>() else {
+        return Err(ProofRejectionReason::MalformedProof);
+    };
+    if usize::try_from(u32::from_le_bytes(*length)) != Ok(bytes.len()) {
+        return Err(ProofRejectionReason::MalformedProof);
+    }
+    let bundle: ProofBundle = receipt_codec::decode::<_, MAX_PROOF_BYTES>(bytes)
         .map_err(|_| ProofRejectionReason::MalformedProof)?;
     let SP1Proof::Compressed(inner) = &bundle.proof else {
         return Err(ProofRejectionReason::MalformedProof);
@@ -129,18 +134,7 @@ pub fn verify_block_artifact(
     }
     let output: StfPublicOutput = borsh::from_slice(bundle.public_values.as_slice())
         .map_err(|_| ProofRejectionReason::MalformedProof)?;
-    let pi = &proof.public_inputs;
-    if output.chain_id != pi.chain_id
-        || output.block_height != pi.height
-        || output.pre_state_root != pi.state_root_before
-        || output.post_state_root != pi.state_root_after
-        || output.transactions_root != pi.transactions_root
-        || output.receipts_root != pi.receipt_root
-        || output.validator_set_root != pi.runtime_extra
-        || output.gas_used != pi.gas_used
-        || output.block_gas_limit != pi.gas_limit
-        || output.proposer_address != pi.proposer_address
-    {
+    if !crate::execution::output_binds(&output, &proof.public_inputs) {
         return Err(ProofRejectionReason::PublicInputsMismatch);
     }
     verify_decoded_receipt(&bundle, block_guest_vk_digest)

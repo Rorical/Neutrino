@@ -155,8 +155,13 @@ impl Verifier for DirectVerifier {
 
 struct Equation {
     key: G1Affine,
+    /// `key.to_compressed()`, encoded once for the equation id and transcript.
+    key_bytes: BlsPublicKey,
     message: alloc::vec::Vec<u8>,
     signature: G2Affine,
+    /// Accepted compressed bytes of `signature`. Checked decompression admits
+    /// only the canonical encoding, so they equal `signature.to_compressed()`.
+    signature_bytes: BlsSignature,
     dst: &'static [u8],
 }
 
@@ -187,10 +192,12 @@ impl BatchVerifier {
             self.failed = true;
             return false;
         };
-        let id = crate::execution::commitment(&(key.to_compressed(), message, signature, dst));
+        let key_bytes = key.to_compressed();
+        let id = crate::execution::commitment(&(key_bytes, message, signature, dst));
         if !self.seen.insert(id) {
             return !self.failed;
         }
+        let signature_bytes = *signature;
         let Some(signature) = Option::<G2Affine>::from(G2Affine::from_compressed(signature)) else {
             self.failed = true;
             return false;
@@ -201,8 +208,10 @@ impl BatchVerifier {
         }
         self.equations.push(Equation {
             key,
+            key_bytes,
             message: message.to_vec(),
             signature,
+            signature_bytes,
             dst,
         });
         if self.equations.len() == 64 {
@@ -231,8 +240,8 @@ impl BatchVerifier {
         transcript.update(b"neutrino-bls-batch");
         transcript.update((self.equations.len() as u64).to_le_bytes());
         for equation in &self.equations {
-            transcript.update(equation.key.to_compressed());
-            transcript.update(equation.signature.to_compressed());
+            transcript.update(equation.key_bytes);
+            transcript.update(equation.signature_bytes);
             transcript.update((equation.dst.len() as u64).to_le_bytes());
             transcript.update(equation.dst);
             transcript.update((equation.message.len() as u64).to_le_bytes());
@@ -348,7 +357,7 @@ mod tests {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
-    use neutrino_crypto::bls::SecretKey;
+    use neutrino_crypto::bls::{SecretKey, aggregate_signatures};
 
     #[test]
     fn checked_keys_are_reused_across_bounded_batches_and_domains() {
@@ -370,6 +379,29 @@ mod batch_tests {
         let mut wrong = BatchVerifier::default();
         assert!(wrong.verify(&key, &key, &sk.prove_possession().to_bytes()));
         assert!(!wrong.finish());
+    }
+
+    #[test]
+    fn retained_encodings_match_recompressed_points() {
+        let first = SecretKey::key_gen(&[11; 32], &[]).unwrap();
+        let second = SecretKey::key_gen(&[12; 32], &[]).unwrap();
+        let keys = [
+            first.public_key().to_bytes(),
+            second.public_key().to_bytes(),
+        ];
+        let mut batch = BatchVerifier::default();
+        for message in [b"first".as_slice(), b"second"] {
+            assert!(batch.verify(&keys[0], message, &first.sign(message).to_bytes()));
+        }
+        let signatures = [first.sign(b"third"), second.sign(b"third")];
+        let aggregate = aggregate_signatures(&[&signatures[0], &signatures[1]]).unwrap();
+        assert!(batch.aggregate(&keys, b"third", &aggregate.to_bytes()));
+        assert_eq!(batch.equations.len(), 3);
+        for equation in &batch.equations {
+            assert_eq!(equation.key_bytes, equation.key.to_compressed());
+            assert_eq!(equation.signature_bytes, equation.signature.to_compressed());
+        }
+        assert!(batch.finish());
     }
 
     #[test]

@@ -7,9 +7,10 @@
 //! registrations behind that record is its own business, so the staking
 //! economics change without this Guest changing.
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeSet, vec::Vec};
 
 use neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS;
+use neutrino_consensus_types::history_proof::ProgramSet;
 use neutrino_default_runtime_core::{CONSENSUS_CANDIDATES_KEY, ConsensusCandidates, UPGRADE_KEY};
 use neutrino_primitives::{ConsensusParams, Hash, Validator};
 use neutrino_runtime_abi::StateWitness;
@@ -43,19 +44,29 @@ pub fn witness_keys_from<B: StateBackend>(state: &mut B) -> Vec<Vec<u8>> {
 /// [`RotationError::Codec`] when the record is malformed or names an
 /// incomplete program set.
 pub fn next_programs_from_witness(
-    current: neutrino_consensus_types::history_proof::ProgramSet,
+    current: ProgramSet,
     next_chunk_id: u64,
     witness: &StateWitness,
-) -> Result<neutrino_consensus_types::history_proof::ProgramSet, RotationError> {
-    if !witness
-        .witnessed_keys
-        .iter()
-        .any(|entry| entry == UPGRADE_KEY)
-    {
+) -> Result<ProgramSet, RotationError> {
+    if !witnessed(witness, UPGRADE_KEY) {
         return Err(RotationError::Witness);
     }
     let mut state = WitnessState::new(witness).map_err(|_| RotationError::Witness)?;
-    let Some(bytes) = state.read(UPGRADE_KEY) else {
+    programs_after(current, next_chunk_id, state.read(UPGRADE_KEY))
+}
+
+fn witnessed(witness: &StateWitness, key: &[u8]) -> bool {
+    witness.witnessed_keys.iter().any(|entry| entry == key)
+}
+
+/// Apply a scheduled-upgrade record, if present, at the boundary entering
+/// `next_chunk_id`.
+fn programs_after(
+    current: ProgramSet,
+    next_chunk_id: u64,
+    record: Option<Vec<u8>>,
+) -> Result<ProgramSet, RotationError> {
+    let Some(bytes) = record else {
         return Ok(current);
     };
     let upgrade: neutrino_default_runtime_core::ScheduledUpgrade =
@@ -68,6 +79,73 @@ pub fn next_programs_from_witness(
     } else {
         current
     })
+}
+
+/// The consensus records of one authenticated chunk-end state, read through a
+/// single [`WitnessState`].
+pub(crate) struct ConsensusRecords {
+    /// Trie view of the chunk-end state.
+    state: WitnessState,
+    /// Decoded candidate record; the default when the key is absent.
+    candidates: ConsensusCandidates,
+    /// Whether the scheduled-upgrade key was witnessed.
+    upgrade_witnessed: bool,
+}
+
+/// Check the witness root and the candidate key, build the witness state once
+/// and decode the candidate record.
+///
+/// Errors match [`rotate_from_witness`] in order: root, unwitnessed candidate
+/// key, malformed witness, then candidate codec. The upgrade record is read
+/// only by [`ConsensusRecords::next_programs`].
+pub(crate) fn read_consensus_records(
+    post_state_root: Hash,
+    witness: &StateWitness,
+) -> Result<ConsensusRecords, RotationError> {
+    if witness.pre_state_root != post_state_root {
+        return Err(RotationError::StateRoot);
+    }
+    if !witnessed(witness, CONSENSUS_CANDIDATES_KEY) {
+        return Err(RotationError::Witness);
+    }
+    let mut state = WitnessState::new(witness).map_err(|_| RotationError::Witness)?;
+    let candidates = decode_or_default(state.read(CONSENSUS_CANDIDATES_KEY))?;
+    Ok(ConsensusRecords {
+        state,
+        candidates,
+        upgrade_witnessed: witnessed(witness, UPGRADE_KEY),
+    })
+}
+
+impl ConsensusRecords {
+    /// [`derive_next_validators`] over the authenticated candidate record.
+    pub(crate) fn next_validators(
+        &self,
+        previous: &[Validator],
+        params: &ConsensusParams,
+        unbonding_delay_blocks: u64,
+        chunk_id: u64,
+    ) -> Result<Vec<Validator>, RotationError> {
+        derive_next_validators(
+            previous,
+            &self.candidates,
+            params,
+            unbonding_delay_blocks,
+            chunk_id,
+        )
+    }
+
+    /// [`next_programs_from_witness`] over the same witness state.
+    pub(crate) fn next_programs(
+        &mut self,
+        current: ProgramSet,
+        next_chunk_id: u64,
+    ) -> Result<ProgramSet, RotationError> {
+        if !self.upgrade_witnessed {
+            return Err(RotationError::Witness);
+        }
+        programs_after(current, next_chunk_id, self.state.read(UPGRADE_KEY))
+    }
 }
 
 /// Runtime state or epoch configuration is invalid.
@@ -115,25 +193,8 @@ pub fn rotate_from_witness(
     post_state_root: Hash,
     witness: &StateWitness,
 ) -> Result<Vec<Validator>, RotationError> {
-    if witness.pre_state_root != post_state_root {
-        return Err(RotationError::StateRoot);
-    }
-    if !witness
-        .witnessed_keys
-        .iter()
-        .any(|entry| entry == CONSENSUS_CANDIDATES_KEY)
-    {
-        return Err(RotationError::Witness);
-    }
-    let mut state = WitnessState::new(witness).map_err(|_| RotationError::Witness)?;
-    let candidates: ConsensusCandidates = decode_or_default(state.read(CONSENSUS_CANDIDATES_KEY))?;
-    derive_next_validators(
-        previous,
-        &candidates,
-        params,
-        unbonding_delay_blocks,
-        chunk_id,
-    )
+    let records = read_consensus_records(post_state_root, witness)?;
+    records.next_validators(previous, params, unbonding_delay_blocks, chunk_id)
 }
 
 fn decode_or_default<T: borsh::BorshDeserialize + Default>(
@@ -206,23 +267,25 @@ pub fn derive_next_validators(
         }
         next.push(updated);
     }
+    // Seated addresses and BLS keys, kept equal to those of `next`.
+    let mut addresses: BTreeSet<_> = next
+        .iter()
+        .map(|validator| validator.withdrawal_credentials)
+        .collect();
+    let mut keys: BTreeSet<_> = next.iter().map(|validator| validator.pubkey).collect();
     for candidate in &candidates.entries {
         let Some(identity) = candidate.identity else {
             continue;
         };
         // Neither the address nor the BLS key may already be seated.
-        let address_seated = next
-            .iter()
-            .any(|validator| validator.withdrawal_credentials == candidate.address);
-        let key_seated = next
-            .iter()
-            .any(|validator| validator.pubkey == identity.pubkey);
-        if address_seated
-            || key_seated
+        if addresses.contains(&candidate.address)
+            || keys.contains(&identity.pubkey)
             || !crate::bls::verify_pop(&identity.pubkey, &identity.pop_signature)
         {
             continue;
         }
+        addresses.insert(candidate.address);
+        keys.insert(identity.pubkey);
         let activation_epoch = epoch.saturating_add(params.activation_delay_epochs);
         next.push(Validator {
             pubkey: identity.pubkey,

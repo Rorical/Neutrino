@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{Hash, Validator, blake3_256, merkle_root_of_hashes};
+use neutrino_primitives::{
+    Hash, Validator, blake3_256, merkle_root_from_hashes, merkle_root_of_hashes,
+};
 
 /// Maximum encoded SP1 evidence receipt accepted from the network.
 pub const MAX_EVIDENCE_PROOF_BYTES: usize = 2 * 1024 * 1024;
@@ -130,7 +132,7 @@ impl EvidenceBatch {
         Some(Self {
             fact_guest_vk_digest,
             count: u32::try_from(statements.len()).ok()?,
-            root: merkle_root_of_hashes(&statements.iter().map(commitment).collect::<Vec<_>>()),
+            root: merkle_root_from_hashes(statements.iter().map(commitment).collect()),
         })
     }
 }
@@ -306,7 +308,7 @@ impl Default for EvidenceAnchor {
 }
 
 /// Canonical Borsh commitment used by evidence statements and context leaves.
-pub fn commitment<T: BorshSerialize>(value: &T) -> Hash {
+pub fn commitment<T: BorshSerialize + ?Sized>(value: &T) -> Hash {
     blake3_256(&borsh::to_vec(value).expect("canonical evidence encoding"))
 }
 

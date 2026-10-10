@@ -1,16 +1,23 @@
 //! Authenticated proposal, explicit nil and pacemaker validation.
 
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::collections::BTreeSet;
 use neutrino_consensus_types::{
-    BftProposal, NilVote, RoundChange, RoundChangeCertificate, bft_leader,
+    BftProposal, NilVote, RoundChange, RoundChangeCertificate, bft::bft_leader_with_root,
 };
-use neutrino_primitives::Validator;
+use neutrino_primitives::{
+    ConsensusDomain, Hash, Validator, quorum_fraction_valid, quorum_reached,
+};
 
-use crate::{bls::Verifier, finality::FinalityError};
+use crate::{
+    bls::Verifier,
+    execution::commitment,
+    finality::{FinalityError, active_stake_total, is_active, signers},
+    slashing::{VerifiedQuorums, verify_quorum_with},
+};
 
 /// Verify a designated leader and its exact proposal/earlier valid quorum.
 pub fn verify_proposal(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     proposal: &BftProposal,
     fraction: (u64, u64),
@@ -26,19 +33,42 @@ pub fn verify_proposal(
 
 /// Verify a proposal with shared immediate signatures or recursively proven facts.
 pub fn verify_proposal_using(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     proposal: &BftProposal,
     fraction: (u64, u64),
     verifier: &mut impl Verifier,
 ) -> Result<(), FinalityError> {
-    if bft_leader(
+    verify_proposal_with(
+        domain,
+        validators,
+        commitment(validators),
+        proposal,
+        fraction,
+        verifier,
+        &mut VerifiedQuorums::new(fraction),
+    )
+}
+
+/// [`verify_proposal_using`] for a caller already holding
+/// `root == commitment(validators)`, sharing already verified QCs.
+pub(crate) fn verify_proposal_with<'a>(
+    domain: ConsensusDomain,
+    validators: &[Validator],
+    root: Hash,
+    proposal: &'a BftProposal,
+    fraction: (u64, u64),
+    verifier: &mut impl Verifier,
+    quorums: &mut VerifiedQuorums<'a>,
+) -> Result<(), FinalityError> {
+    if bft_leader_with_root(
         domain.chain_id,
         proposal.chunk.chunk_id,
         proposal.round,
         validators,
+        root,
     ) != Some(proposal.proposer_index)
-        || proposal.chunk.active_validator_set_root != crate::execution::commitment(validators)
+        || proposal.chunk.active_validator_set_root != root
     {
         return Err(FinalityError::Target);
     }
@@ -61,12 +91,13 @@ pub fn verify_proposal_using(
             {
                 return Err(FinalityError::Target);
             }
-            verify_round_change_certificate_using(
+            verify_round_change_certificate_with(
                 domain,
                 validators,
                 certificate,
                 fraction,
                 verifier,
+                quorums,
             )?;
             if certificate.highest_quorum().is_some_and(|highest| {
                 proposal.valid_quorum.as_ref().is_none_or(|valid| {
@@ -86,7 +117,7 @@ pub fn verify_proposal_using(
         {
             return Err(FinalityError::Target);
         }
-        crate::slashing::verify_quorum_using(domain, validators, quorum, fraction, verifier)
+        verify_quorum_with(domain, validators, quorum, fraction, verifier, quorums)
             .map_err(|_| FinalityError::Quorum)?;
     }
     Ok(())
@@ -94,7 +125,7 @@ pub fn verify_proposal_using(
 
 /// Authenticate a nil aggregate and every individually retained signature.
 pub fn verify_nil_vote(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     vote: &NilVote,
 ) -> Result<(), FinalityError> {
@@ -108,7 +139,7 @@ pub fn verify_nil_vote(
 
 /// Nil authentication with cached equations or a recursively authenticated fact set.
 pub fn verify_nil_vote_using(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     vote: &NilVote,
     verifier: &mut impl Verifier,
@@ -116,16 +147,11 @@ pub fn verify_nil_vote_using(
     if usize::try_from(vote.aggregation_bits.bit_len()).ok() != Some(validators.len()) {
         return Err(FinalityError::Membership);
     }
-    let mut keys = Vec::new();
-    for (index, validator) in validators.iter().enumerate() {
-        let index = u32::try_from(index).map_err(|_| FinalityError::Membership)?;
-        if vote.aggregation_bits.get(index) == Some(true) {
-            if validator.slashed || validator.effective_stake == 0 {
-                return Err(FinalityError::Membership);
-            }
-            keys.push(validator.pubkey);
-        }
-    }
+    let Some((keys, _)) = signers(validators, &vote.aggregation_bits) else {
+        return Err(FinalityError::Membership);
+    };
+    // Every claim signs `vote.data`, as does the aggregate.
+    let message = vote.data.signing_message(domain);
     let mut seen = BTreeSet::new();
     for claim in &vote.attestations {
         if claim.vote != vote.data
@@ -137,22 +163,20 @@ pub fn verify_nil_vote_using(
         let validator = validators
             .get(claim.validator_index as usize)
             .ok_or(FinalityError::Membership)?;
-        if !verifier.verify(
-            &validator.pubkey,
-            &vote.data.signing_message(domain),
-            &claim.vote_signature,
-        ) || !verifier.verify(
-            &validator.pubkey,
-            &claim.signing_message(domain),
-            &claim.signature,
-        ) {
+        if !verifier.verify(&validator.pubkey, &message, &claim.vote_signature)
+            || !verifier.verify(
+                &validator.pubkey,
+                &claim.signing_message(domain),
+                &claim.signature,
+            )
+        {
             return Err(FinalityError::Signature);
         }
     }
     if keys.is_empty() || seen.len() != keys.len() {
         return Err(FinalityError::Membership);
     }
-    if !verifier.aggregate(&keys, &vote.data.signing_message(domain), &vote.signature) {
+    if !verifier.aggregate(&keys, &message, &vote.signature) {
         return Err(FinalityError::Signature);
     }
     Ok(())
@@ -160,7 +184,7 @@ pub fn verify_nil_vote_using(
 
 /// Verify one signed round-change report and its independently authenticated QC.
 pub fn verify_round_change(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     report: &RoundChange,
     fraction: (u64, u64),
@@ -176,15 +200,33 @@ pub fn verify_round_change(
 
 /// Round-change verification using shared keys/facts.
 pub fn verify_round_change_using(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     report: &RoundChange,
     fraction: (u64, u64),
     verifier: &mut impl Verifier,
 ) -> Result<(), FinalityError> {
+    verify_round_change_with(
+        domain,
+        validators,
+        report,
+        fraction,
+        verifier,
+        &mut VerifiedQuorums::new(fraction),
+    )
+}
+
+fn verify_round_change_with<'a>(
+    domain: ConsensusDomain,
+    validators: &[Validator],
+    report: &'a RoundChange,
+    fraction: (u64, u64),
+    verifier: &mut impl Verifier,
+    quorums: &mut VerifiedQuorums<'a>,
+) -> Result<(), FinalityError> {
     let validator = validators
         .get(report.validator_index as usize)
-        .filter(|validator| !validator.slashed && validator.effective_stake > 0)
+        .filter(|validator| is_active(validator))
         .ok_or(FinalityError::Membership)?;
     if report.round == 0 {
         return Err(FinalityError::Target);
@@ -200,7 +242,7 @@ pub fn verify_round_change_using(
         if quorum.data.chunk_id != report.chunk_id || quorum.data.round >= report.round {
             return Err(FinalityError::Target);
         }
-        crate::slashing::verify_quorum_using(domain, validators, quorum, fraction, verifier)
+        verify_quorum_with(domain, validators, quorum, fraction, verifier, quorums)
             .map_err(|_| FinalityError::Quorum)?;
     }
     Ok(())
@@ -208,7 +250,7 @@ pub fn verify_round_change_using(
 
 /// Authenticate a bounded unique active-stake quorum before advancing rounds.
 pub fn verify_round_change_certificate(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     certificate: &RoundChangeCertificate,
     fraction: (u64, u64),
@@ -224,34 +266,39 @@ pub fn verify_round_change_certificate(
 
 /// Authenticate a pacemaker certificate through a shared verifier.
 pub fn verify_round_change_certificate_using(
-    domain: neutrino_primitives::ConsensusDomain,
+    domain: ConsensusDomain,
     validators: &[Validator],
     certificate: &RoundChangeCertificate,
+    fraction: (u64, u64),
+    verifier: &mut impl Verifier,
+) -> Result<(), FinalityError> {
+    verify_round_change_certificate_with(
+        domain,
+        validators,
+        certificate,
+        fraction,
+        verifier,
+        &mut VerifiedQuorums::new(fraction),
+    )
+}
+
+fn verify_round_change_certificate_with<'a>(
+    domain: ConsensusDomain,
+    validators: &[Validator],
+    certificate: &'a RoundChangeCertificate,
     (numerator, denominator): (u64, u64),
     verifier: &mut impl Verifier,
+    quorums: &mut VerifiedQuorums<'a>,
 ) -> Result<(), FinalityError> {
     if certificate.reports.is_empty()
         || certificate.reports.len() > validators.len()
-        || numerator == 0
-        || denominator == 0
-        || numerator > denominator
-        || u128::from(numerator) * 3 < u128::from(denominator) * 2
+        || !quorum_fraction_valid(numerator, denominator)
     {
         return Err(FinalityError::Membership);
     }
     let mut seen = BTreeSet::new();
     let mut stake = 0_u64;
-    let total = validators
-        .iter()
-        .try_fold(0_u64, |total, validator| {
-            total.checked_add(if validator.slashed {
-                0
-            } else {
-                validator.effective_stake
-            })
-        })
-        .filter(|total| *total > 0)
-        .ok_or(FinalityError::Membership)?;
+    let total = active_stake_total(validators).ok_or(FinalityError::Membership)?;
     for report in &certificate.reports {
         if report.chunk_id != certificate.chunk_id
             || report.round != certificate.round
@@ -259,18 +306,19 @@ pub fn verify_round_change_certificate_using(
         {
             return Err(FinalityError::Target);
         }
-        verify_round_change_using(
+        verify_round_change_with(
             domain,
             validators,
             report,
             (numerator, denominator),
             verifier,
+            quorums,
         )?;
         stake = stake
             .checked_add(validators[report.validator_index as usize].effective_stake)
             .ok_or(FinalityError::Membership)?;
     }
-    if u128::from(stake) * u128::from(denominator) < u128::from(total) * u128::from(numerator) {
+    if !quorum_reached(stake, total, numerator, denominator) {
         return Err(FinalityError::Quorum);
     }
     Ok(())

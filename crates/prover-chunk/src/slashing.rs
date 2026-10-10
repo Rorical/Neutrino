@@ -3,13 +3,19 @@
 //! Proof rejection must additionally be established by the configured proof
 //! verifier. A local rejection cache is not a substitute for these bindings.
 
+use alloc::vec::Vec;
 use neutrino_consensus_types::{
     BlockProof, FinalityVoteData, FinalityVotePhase, IndexedVote, LockEvidence, QuorumCertificate,
     VoteAttestation,
 };
-use neutrino_primitives::{ConsensusParams, Validator};
+use neutrino_primitives::{
+    ConsensusParams, Hash, Validator, quorum_fraction_valid, quorum_reached,
+};
 
-use crate::execution::commitment;
+use crate::{
+    execution::commitment,
+    finality::{active_stake_total, is_active, signers},
+};
 
 /// Authenticate exact same-round, same-phase nil/value equivocation.
 pub fn verify_conflicting_nil_vote_using(
@@ -28,7 +34,7 @@ pub fn verify_conflicting_nil_vote_using(
     }
     let validator = validators
         .get(index as usize)
-        .filter(|validator| !validator.slashed && validator.effective_stake > 0)
+        .filter(|validator| is_active(validator))
         .ok_or(EvidenceError::Binding)?;
     verify_indexed_vote_using(domain, validators, index, value, verifier)?;
     if !verifier.verify(
@@ -51,19 +57,42 @@ pub fn verify_double_bft_proposal_using(
     second: &neutrino_consensus_types::BftProposal,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
+    verify_double_bft_proposal_with_root(
+        domain,
+        validators,
+        commitment(validators),
+        index,
+        first,
+        second,
+        verifier,
+    )
+}
+
+/// [`verify_double_bft_proposal_using`] for a caller already holding
+/// `root == commitment(validators)`.
+pub(crate) fn verify_double_bft_proposal_with_root(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    root: Hash,
+    index: u32,
+    first: &neutrino_consensus_types::BftProposal,
+    second: &neutrino_consensus_types::BftProposal,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
     if first.chunk.chunk_id != second.chunk.chunk_id
         || first.round != second.round
         || first.proposer_index != index
         || second.proposer_index != index
         || first.chunk.hash() == second.chunk.hash()
-        || neutrino_consensus_types::bft_leader(
+        || neutrino_consensus_types::bft::bft_leader_with_root(
             domain.chain_id,
             first.chunk.chunk_id,
             first.round,
             validators,
+            root,
         ) != Some(index)
-        || first.chunk.active_validator_set_root != commitment(validators)
-        || second.chunk.active_validator_set_root != commitment(validators)
+        || first.chunk.active_validator_set_root != root
+        || second.chunk.active_validator_set_root != root
     {
         return Err(EvidenceError::Binding);
     }
@@ -124,21 +153,40 @@ pub fn verify_attestation_using(
     attestation: &VoteAttestation,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
-    if attestation.validator_index != index || attestation.vote != *vote {
-        return Err(EvidenceError::Binding);
-    }
-    verify_indexed_vote_using(
+    verify_attestation_with(
         domain,
         validators,
         index,
-        &attestation.indexed_vote(),
+        vote,
+        &vote.signing_message(domain),
+        attestation,
         verifier,
-    )?;
-    let validator = validators
+    )
+}
+
+/// [`verify_attestation_using`] with `vote_message == vote.signing_message(domain)`
+/// already encoded, so every attestation of one envelope shares it.
+pub(crate) fn verify_attestation_with(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    index: u32,
+    vote: &FinalityVoteData,
+    vote_message: &[u8],
+    attestation: &VoteAttestation,
+    verifier: &mut impl crate::bls::Verifier,
+) -> Result<(), EvidenceError> {
+    if attestation.validator_index != index || attestation.vote != *vote {
+        return Err(EvidenceError::Binding);
+    }
+    // The bound vote equals `vote`, so its individual signature covers `vote_message`.
+    let key = validators
         .get(index as usize)
         .ok_or(EvidenceError::Binding)?;
+    if !verifier.verify(&key.pubkey, vote_message, &attestation.vote_signature) {
+        return Err(EvidenceError::Signature);
+    }
     if !verifier.verify(
-        &validator.pubkey,
+        &key.pubkey,
         &attestation.signing_message(domain),
         &attestation.signature,
     ) {
@@ -200,7 +248,7 @@ pub fn verify_indexed_vote_using(
         .ok_or(EvidenceError::Binding)?;
     if !verifier.verify(
         &key.pubkey,
-        &vote_message(domain, &vote.data),
+        &vote.data.signing_message(domain),
         &vote.signature,
     ) {
         return Err(EvidenceError::Signature);
@@ -234,50 +282,73 @@ pub fn verify_quorum_using(
 ) -> Result<(), EvidenceError> {
     let (numerator, denominator) = fraction;
     if quorum.data.phase != FinalityVotePhase::Prevote
-        || numerator == 0
-        || denominator == 0
-        || numerator > denominator
-        || u128::from(numerator) * 3 < u128::from(denominator) * 2
+        || !quorum_fraction_valid(numerator, denominator)
         || usize::try_from(quorum.aggregate.aggregation_bits.bit_len()).ok()
             != Some(validators.len())
     {
         return Err(EvidenceError::Quorum);
     }
-    let mut total = 0_u64;
-    let mut signed = 0_u64;
-    let mut keys = alloc::vec::Vec::new();
-    for (index, validator) in validators.iter().enumerate() {
-        let stake = if validator.slashed {
-            0
-        } else {
-            validator.effective_stake
-        };
-        total = total.checked_add(stake).ok_or(EvidenceError::Quorum)?;
-        let index = u32::try_from(index).map_err(|_| EvidenceError::Quorum)?;
-        if quorum
-            .aggregate
-            .aggregation_bits
-            .get(index)
-            .unwrap_or(false)
-        {
-            if stake == 0 {
-                return Err(EvidenceError::Quorum);
-            }
-            signed = signed.checked_add(stake).ok_or(EvidenceError::Quorum)?;
-            keys.push(validator.pubkey);
-        }
-    }
-    if total == 0
-        || u128::from(signed) * u128::from(denominator) < u128::from(total) * u128::from(numerator)
-    {
+    // Every membership, overflow, empty-set and threshold failure below is the
+    // same `Quorum` rejection, so their relative order is not observable.
+    let Some((keys, signed)) = signers(validators, &quorum.aggregate.aggregation_bits) else {
+        return Err(EvidenceError::Quorum);
+    };
+    let signed = u64::try_from(signed).map_err(|_| EvidenceError::Quorum)?;
+    let total = active_stake_total(validators).ok_or(EvidenceError::Quorum)?;
+    if !quorum_reached(signed, total, numerator, denominator) {
         return Err(EvidenceError::Quorum);
     }
     if !verifier.aggregate(
         &keys,
-        &vote_message(domain, &quorum.data),
+        &quorum.data.signing_message(domain),
         &quorum.aggregate.signature,
     ) {
         return Err(EvidenceError::Signature);
+    }
+    Ok(())
+}
+
+/// Value QCs that already passed [`verify_quorum_using`] during one finality or
+/// vote verification, under one validator set, signing domain and fraction.
+///
+/// Only successes are kept, and a QC under another fraction bypasses the cache.
+/// Every verifier returns an exact repeated request's earlier verdict (direct,
+/// fact and recording verifiers are deterministic and dedupe by request id; the
+/// batch verifier's failure is sticky and reported at the failing call), so
+/// skipping a repeat cannot change any outcome. Each carrier's own binding
+/// checks still run before the cache is consulted.
+pub(crate) struct VerifiedQuorums<'a> {
+    fraction: (u64, u64),
+    verified: Vec<&'a QuorumCertificate>,
+}
+
+impl VerifiedQuorums<'_> {
+    /// Empty cache for QCs weighed with `fraction`.
+    pub(crate) const fn new(fraction: (u64, u64)) -> Self {
+        Self {
+            fraction,
+            verified: Vec::new(),
+        }
+    }
+}
+
+/// [`verify_quorum_using`] that verifies each distinct QC at most once.
+/// `quorums` must belong to this exact `domain` and `validators`.
+pub(crate) fn verify_quorum_with<'a>(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    quorum: &'a QuorumCertificate,
+    fraction: (u64, u64),
+    verifier: &mut impl crate::bls::Verifier,
+    quorums: &mut VerifiedQuorums<'a>,
+) -> Result<(), EvidenceError> {
+    let cached = quorums.fraction == fraction;
+    if cached && quorums.verified.contains(&quorum) {
+        return Ok(());
+    }
+    verify_quorum_using(domain, validators, quorum, fraction, verifier)?;
+    if cached {
+        quorums.verified.push(quorum);
     }
     Ok(())
 }
@@ -316,6 +387,28 @@ pub fn verify_unlock_using(
     quorum: (u64, u64),
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
+    verify_unlock_with(
+        domain,
+        validators,
+        vote,
+        unlock,
+        quorum,
+        verifier,
+        &mut VerifiedQuorums::new(quorum),
+    )
+}
+
+/// [`verify_unlock_using`] sharing already verified QCs; this vote's own
+/// unlock binding is always checked.
+pub(crate) fn verify_unlock_with<'a>(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    vote: &FinalityVoteData,
+    unlock: &'a QuorumCertificate,
+    quorum: (u64, u64),
+    verifier: &mut impl crate::bls::Verifier,
+    quorums: &mut VerifiedQuorums<'a>,
+) -> Result<(), EvidenceError> {
     if unlock.data.chunk_id != vote.chunk_id
         || unlock.data.chunk_hash != vote.chunk_hash
         || match vote.phase {
@@ -325,7 +418,7 @@ pub fn verify_unlock_using(
     {
         return Err(EvidenceError::Binding);
     }
-    verify_quorum_using(domain, validators, unlock, quorum, verifier)
+    verify_quorum_with(domain, validators, unlock, quorum, verifier, quorums)
 }
 
 /// Prove a conflicting later vote has an explicitly signed invalid unlock.
@@ -394,13 +487,6 @@ pub fn verify_lock_violation_using(
     Ok(())
 }
 
-pub(crate) fn vote_message(
-    domain: neutrino_primitives::ConsensusDomain,
-    data: &FinalityVoteData,
-) -> alloc::vec::Vec<u8> {
-    data.signing_message(domain)
-}
-
 /// Message authenticating publication of an exact DA bundle for one header.
 pub fn da_publication_message(
     domain: neutrino_primitives::ConsensusDomain,
@@ -437,8 +523,15 @@ pub fn verify_da_fraud_using(
     fraud: &neutrino_consensus_types::DaFraudProof,
     verifier: &mut impl crate::bls::Verifier,
 ) -> Result<(), EvidenceError> {
-    crate::proposer::verify_header_signature_using(header, domain, validators, verifier)
-        .map_err(|_| EvidenceError::Signature)?;
+    let header_hash = header.hash();
+    crate::proposer::verify_header_signature_with(
+        header,
+        &header_hash,
+        domain,
+        validators,
+        verifier,
+    )
+    .map_err(|_| EvidenceError::Signature)?;
     let validator = validators
         .get(header.proposer_index as usize)
         .ok_or(EvidenceError::Binding)?;
@@ -448,7 +541,7 @@ pub fn verify_da_fraud_using(
     }
     if !verifier.verify(
         &validator.pubkey,
-        &da_publication_message(domain, &header.hash(), &hash),
+        &da_publication_message(domain, &header_hash, &hash),
         &fraud.publication_signature,
     ) {
         return Err(EvidenceError::Signature);
@@ -460,4 +553,100 @@ pub fn verify_da_fraud_using(
         return Err(EvidenceError::Binding);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neutrino_consensus_types::AggregatedVote;
+    use neutrino_primitives::{BitVec, BlsPublicKey, BlsSignature, ConsensusDomain};
+
+    const DOMAIN: ConsensusDomain = ConsensusDomain {
+        chain_id: 1,
+        chain_spec_hash: [4; 32],
+    };
+
+    #[derive(Default)]
+    struct Counting {
+        aggregates: usize,
+    }
+
+    impl crate::bls::Verifier for Counting {
+        fn verify(&mut self, _: &BlsPublicKey, _: &[u8], _: &BlsSignature) -> bool {
+            true
+        }
+        fn aggregate(&mut self, _: &[BlsPublicKey], _: &[u8], _: &BlsSignature) -> bool {
+            self.aggregates += 1;
+            true
+        }
+        fn pop(&mut self, _: &BlsPublicKey, _: &BlsSignature) -> bool {
+            true
+        }
+    }
+
+    const fn validators() -> [Validator; 1] {
+        [Validator {
+            pubkey: [1; 48],
+            withdrawal_credentials: [1; 32],
+            effective_stake: 1,
+            slashed: false,
+            activation_epoch: 0,
+            exit_epoch: u64::MAX,
+            last_active_chunk: 0,
+        }]
+    }
+
+    fn check<'a>(
+        quorum: &'a QuorumCertificate,
+        fraction: (u64, u64),
+        verifier: &mut Counting,
+        quorums: &mut VerifiedQuorums<'a>,
+    ) -> Result<(), EvidenceError> {
+        verify_quorum_with(DOMAIN, &validators(), quorum, fraction, verifier, quorums)
+    }
+
+    #[test]
+    fn verified_quorums_skip_only_exact_repeats_under_one_fraction() {
+        let mut bits = BitVec::default();
+        bits.push(true);
+        let data = FinalityVoteData {
+            chunk_id: 1,
+            round: 0,
+            chunk_hash: [2; 32],
+            phase: FinalityVotePhase::Prevote,
+        };
+        let quorum = QuorumCertificate {
+            data: data.clone(),
+            aggregate: AggregatedVote {
+                aggregation_bits: bits,
+                signature: [3; 96],
+            },
+        };
+        let mut later = quorum.clone();
+        later.data.round = 1;
+        let mut verifier = Counting::default();
+        let mut quorums = VerifiedQuorums::new((2, 3));
+        for _ in 0..3 {
+            check(&quorum, (2, 3), &mut verifier, &mut quorums).unwrap();
+        }
+        assert_eq!(verifier.aggregates, 1);
+        check(&later, (2, 3), &mut verifier, &mut quorums).unwrap();
+        assert_eq!(verifier.aggregates, 2);
+        // Another fraction bypasses the cache instead of reusing its verdicts.
+        check(&quorum, (3, 4), &mut verifier, &mut quorums).unwrap();
+        assert_eq!(verifier.aggregates, 3);
+        // A cached QC still fails its carrier's own unlock binding.
+        assert_eq!(
+            verify_unlock_with(
+                DOMAIN,
+                &validators(),
+                &data,
+                &quorum,
+                (2, 3),
+                &mut verifier,
+                &mut quorums,
+            ),
+            Err(EvidenceError::Binding)
+        );
+    }
 }

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_primitives::{
     BoundedBytes, ChainSpec, DOMAIN_CHECKPOINT, DOMAIN_CONTEXT, DOMAIN_HISTORY_STATEMENT, Hash,
-    Seed, blake3_256,
+    Seed,
 };
 
 /// SP1 verification-key digest, obtained with `hash_u32()`.
@@ -199,7 +199,7 @@ pub struct ProofDomain {
 impl ProofDomain {
     /// Canonical genesis boundary under this trust profile.
     #[must_use]
-    pub fn genesis_boundary(&self, spec: &ChainSpec) -> ConsensusBoundary {
+    pub const fn genesis_boundary(&self, spec: &ChainSpec) -> ConsensusBoundary {
         ConsensusBoundary::genesis(spec, self.programs)
     }
 }
@@ -234,7 +234,7 @@ pub struct ConsensusBoundary {
 impl ConsensusBoundary {
     /// Canonical genesis boundary under `programs`; callers validate the spec first.
     #[must_use]
-    pub fn genesis(spec: &ChainSpec, programs: ProgramSet) -> Self {
+    pub const fn genesis(spec: &ChainSpec, programs: ProgramSet) -> Self {
         Self {
             next_chunk_id: 0,
             height: 0,
@@ -252,7 +252,7 @@ impl ConsensusBoundary {
     /// Canonical context commitment shared by host and Guests.
     #[must_use]
     pub fn context_hash(&self, chain: &ChainBinding) -> Hash {
-        tagged_hash(&DOMAIN_CONTEXT, &(chain, self))
+        crate::tagged_commitment(&DOMAIN_CONTEXT, &(chain, self))
     }
     /// Check the height/count relation with checked arithmetic.
     #[must_use]
@@ -300,7 +300,7 @@ impl HistoryStatement {
     /// Content identity of the complete conditional range, independent of receipt bytes.
     #[must_use]
     pub fn range_id(&self) -> Hash {
-        tagged_hash(&DOMAIN_HISTORY_STATEMENT, self)
+        crate::tagged_commitment(&DOMAIN_HISTORY_STATEMENT, self)
     }
     /// Range's incoming trust anchor, which must be independently authenticated.
     #[must_use]
@@ -341,7 +341,7 @@ impl Checkpoint {
     /// Domain-separated endpoint identity.
     #[must_use]
     pub fn hash(&self) -> Hash {
-        tagged_hash(&DOMAIN_CHECKPOINT, self)
+        crate::tagged_commitment(&DOMAIN_CHECKPOINT, self)
     }
 }
 
@@ -408,10 +408,4 @@ pub enum CheckpointInput {
         /// Later range, verified second.
         right: HistoryStatement,
     },
-}
-
-fn tagged_hash(tag: &[u8; 16], value: &impl BorshSerialize) -> Hash {
-    let mut bytes = Vec::from(*tag);
-    bytes.extend_from_slice(&borsh::to_vec(value).expect("fixed canonical statement"));
-    blake3_256(&bytes)
 }

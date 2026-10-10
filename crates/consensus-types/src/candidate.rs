@@ -1,9 +1,7 @@
 //! Bounded availability hints for the next chunk BFT session.
 
-use crate::{AggregatedVote, Chunk, FinalityVoteData, QuorumCertificate};
-use alloc::vec::Vec;
+use crate::{Chunk, QuorumCertificate};
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{BitVec, BlsSignature};
 
 /// Local transport cap, rather than a consensus validator-set limit.
 pub const MAX_CANDIDATE_SIGNERS: u32 = 65_536;
@@ -26,44 +24,9 @@ impl BorshDeserialize for BftCandidate {
     fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
         let chunk = Chunk::deserialize_reader(reader)?;
         let round = u32::deserialize_reader(reader)?;
-        let justification = match u8::deserialize_reader(reader)? {
-            0 => None,
-            1 => {
-                let data = FinalityVoteData::deserialize_reader(reader)?;
-                let bit_len = u32::deserialize_reader(reader)?;
-                let byte_len = u32::deserialize_reader(reader)?;
-                if bit_len > MAX_CANDIDATE_SIGNERS || byte_len != bit_len.div_ceil(8) {
-                    return Err(borsh::io::Error::new(
-                        borsh::io::ErrorKind::InvalidData,
-                        "candidate quorum bitmap exceeds transport bound",
-                    ));
-                }
-                let mut bytes = Vec::with_capacity(byte_len as usize);
-                for _ in 0..byte_len {
-                    bytes.push(u8::deserialize_reader(reader)?);
-                }
-                let aggregation_bits = BitVec::from_bytes(bit_len, bytes).map_err(|_| {
-                    borsh::io::Error::new(
-                        borsh::io::ErrorKind::InvalidData,
-                        "invalid candidate quorum bitmap",
-                    )
-                })?;
-                let signature = BlsSignature::deserialize_reader(reader)?;
-                Some(QuorumCertificate {
-                    data,
-                    aggregate: AggregatedVote {
-                        aggregation_bits,
-                        signature,
-                    },
-                })
-            }
-            _ => {
-                return Err(borsh::io::Error::new(
-                    borsh::io::ErrorKind::InvalidData,
-                    "invalid candidate justification option",
-                ));
-            }
-        };
+        // Same option tag, bitmap bound (`MAX_BFT_SIGNERS` is this crate's
+        // `MAX_CANDIDATE_SIGNERS`) and `InvalidData` rejections as BFT votes.
+        let justification = crate::bft::read_optional_quorum(reader)?;
         Ok(Self {
             chunk,
             round,
@@ -75,7 +38,8 @@ impl BorshDeserialize for BftCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FinalityVotePhase;
+    use crate::{AggregatedVote, FinalityVoteData, FinalityVotePhase};
+    use neutrino_primitives::BitVec;
 
     fn candidate() -> BftCandidate {
         BftCandidate {

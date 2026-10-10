@@ -12,7 +12,7 @@ use crate::{
 use alloc::{collections::BTreeMap, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::BlockProof;
-use neutrino_primitives::{BlsPublicKey, BlsSignature, Hash};
+use neutrino_primitives::{BitVec, BlsPublicKey, BlsSignature, Hash, Validator};
 
 /// Maximum independent assertions in one fact receipt.
 pub const MAX_FACTS: usize = 64;
@@ -53,18 +53,77 @@ pub enum FactRequest {
 impl FactRequest {
     /// Content identity binds variant, lengths, domains, keys and exact bytes.
     pub fn id(&self) -> Hash {
-        commitment(&(b"neutrino-cryptographic-fact", self))
+        self.borrowed().id()
     }
 
-    fn verify(&self, verifier: &mut impl Verifier) -> Result<bool, HistoryError> {
+    const fn borrowed(&self) -> FactRequestRef<'_> {
         match self {
             Self::Signature {
                 key,
                 message,
                 signature,
                 possession,
-            } => Ok(if *possession {
-                message.as_slice() == key && verifier.pop(key, signature)
+            } => FactRequestRef::Signature {
+                key,
+                message: message.as_slice(),
+                signature,
+                possession: *possession,
+            },
+            Self::Aggregate {
+                keys,
+                message,
+                signature,
+            } => FactRequestRef::Aggregate {
+                keys: keys.as_slice(),
+                message: message.as_slice(),
+                signature,
+            },
+            Self::Block { key, proof } => FactRequestRef::Block { key, proof },
+        }
+    }
+
+    fn verify(&self, verifier: &mut impl Verifier) -> Result<bool, HistoryError> {
+        self.borrowed().verify(verifier)
+    }
+}
+
+/// Borrowed [`FactRequest`] with an identical Borsh encoding: the same variant
+/// order, and `&[u8]`/`&[BlsPublicKey]` encode exactly like the owned vectors.
+/// Verifiers derive ids from it without cloning messages, keys or proofs.
+#[derive(BorshSerialize, Clone, Copy)]
+enum FactRequestRef<'a> {
+    Signature {
+        key: &'a BlsPublicKey,
+        message: &'a [u8],
+        signature: &'a BlsSignature,
+        possession: bool,
+    },
+    Aggregate {
+        keys: &'a [BlsPublicKey],
+        message: &'a [u8],
+        signature: &'a BlsSignature,
+    },
+    Block {
+        key: &'a [u32; 8],
+        proof: &'a BlockProof,
+    },
+}
+
+impl FactRequestRef<'_> {
+    /// Equal to [`FactRequest::id`] of the owned request.
+    fn id(self) -> Hash {
+        commitment(&(b"neutrino-cryptographic-fact", self))
+    }
+
+    fn verify(self, verifier: &mut impl Verifier) -> Result<bool, HistoryError> {
+        match self {
+            Self::Signature {
+                key,
+                message,
+                signature,
+                possession,
+            } => Ok(if possession {
+                message == key.as_slice() && verifier.pop(key, signature)
             } else {
                 verifier.verify(key, message, signature)
             }),
@@ -74,6 +133,35 @@ impl FactRequest {
                 signature,
             } => Ok(verifier.aggregate(keys, message, signature)),
             Self::Block { key, proof } => block_is_valid(proof, key),
+        }
+    }
+
+    fn to_request(self) -> FactRequest {
+        match self {
+            Self::Signature {
+                key,
+                message,
+                signature,
+                possession,
+            } => FactRequest::Signature {
+                key: *key,
+                message: message.to_vec(),
+                signature: *signature,
+                possession,
+            },
+            Self::Aggregate {
+                keys,
+                message,
+                signature,
+            } => FactRequest::Aggregate {
+                keys: keys.to_vec(),
+                message: message.to_vec(),
+                signature: *signature,
+            },
+            Self::Block { key, proof } => FactRequest::Block {
+                key: *key,
+                proof: proof.clone(),
+            },
         }
     }
 }
@@ -189,21 +277,35 @@ impl FactRecorder {
     /// Check or reuse one request and record its explicit verdict.
     pub fn check(&mut self, request: FactRequest) -> bool {
         let id = request.id();
+        let valid = self.verdict(&id, request.borrowed());
+        self.requests.entry(id).or_insert((request, valid));
+        valid
+    }
+
+    /// [`Self::check`] for a borrowed request, copied only when its id is new.
+    fn check_fact(&mut self, request: FactRequestRef<'_>) -> bool {
+        let id = request.id();
+        let valid = self.verdict(&id, request);
+        self.requests
+            .entry(id)
+            .or_insert_with(|| (request.to_request(), valid));
+        valid
+    }
+
+    fn verdict(&mut self, id: &Hash, request: FactRequestRef<'_>) -> bool {
         let value = self
             .known
-            .get(&id)
+            .get(id)
             .copied()
-            .or_else(|| self.requests.get(&id).map(|(_, value)| *value));
-        let valid = if let Some(value) = value {
+            .or_else(|| self.requests.get(id).map(|(_, value)| *value));
+        if let Some(value) = value {
             value
         } else if let Ok(value) = request.verify(&mut self.direct) {
             value
         } else {
             self.failed = true;
             false
-        };
-        self.requests.entry(id).or_insert((request, valid));
-        valid
+        }
     }
     /// Extract checked assertions. A panic/resource failure never becomes a fact.
     pub fn finish(self) -> Result<Vec<(FactRequest, bool)>, HistoryError> {
@@ -243,7 +345,7 @@ impl FactReader {
             missing: false,
         })
     }
-    fn check(&mut self, request: &FactRequest) -> bool {
+    fn check_fact(&mut self, request: FactRequestRef<'_>) -> bool {
         self.facts.get(&request.id()).copied().unwrap_or_else(|| {
             self.missing = true;
             false
@@ -256,7 +358,7 @@ impl FactReader {
 }
 
 macro_rules! signature_verifier {
-    ($type:ty, $check:expr) => {
+    ($type:ty) => {
         impl Verifier for $type {
             fn verify(
                 &mut self,
@@ -264,15 +366,12 @@ macro_rules! signature_verifier {
                 message: &[u8],
                 signature: &BlsSignature,
             ) -> bool {
-                $check(
-                    self,
-                    FactRequest::Signature {
-                        key: *key,
-                        message: message.to_vec(),
-                        signature: *signature,
-                        possession: false,
-                    },
-                )
+                self.check_fact(FactRequestRef::Signature {
+                    key,
+                    message,
+                    signature,
+                    possession: false,
+                })
             }
             fn aggregate(
                 &mut self,
@@ -280,35 +379,27 @@ macro_rules! signature_verifier {
                 message: &[u8],
                 signature: &BlsSignature,
             ) -> bool {
-                $check(
-                    self,
-                    FactRequest::Aggregate {
-                        keys: keys.to_vec(),
-                        message: message.to_vec(),
-                        signature: *signature,
-                    },
-                )
+                self.check_fact(FactRequestRef::Aggregate {
+                    keys,
+                    message,
+                    signature,
+                })
             }
             fn pop(&mut self, key: &BlsPublicKey, signature: &BlsSignature) -> bool {
-                $check(
-                    self,
-                    FactRequest::Signature {
-                        key: *key,
-                        message: key.to_vec(),
-                        signature: *signature,
-                        possession: true,
-                    },
-                )
+                // A possession proof signs exactly the key bytes.
+                self.check_fact(FactRequestRef::Signature {
+                    key,
+                    message: key,
+                    signature,
+                    possession: true,
+                })
             }
         }
     };
 }
-signature_verifier!(FactRecorder, |this: &mut FactRecorder, request| this
-    .check(request));
-signature_verifier!(FactReader, |this: &mut FactReader, request| this
-    .check(&request));
-signature_verifier!(HybridVerifier, |this: &mut HybridVerifier, request| this
-    .check(&request));
+signature_verifier!(FactRecorder);
+signature_verifier!(FactReader);
+signature_verifier!(HybridVerifier);
 
 /// Answers from recursively authenticated fact statements first and falls
 /// back to in-circuit BLS for anything they do not cover.
@@ -337,7 +428,7 @@ impl HybridVerifier {
         })
     }
 
-    fn check(&mut self, request: &FactRequest) -> bool {
+    fn check_fact(&mut self, request: FactRequestRef<'_>) -> bool {
         if let Some(valid) = self.facts.get(&request.id()) {
             self.hits += 1;
             return *valid;
@@ -367,10 +458,7 @@ impl HybridVerifier {
 }
 impl EvidenceVerifier for FactRecorder {
     fn rejects_block(&mut self, proof: &BlockProof, key: &[u32; 8]) -> Result<bool, HistoryError> {
-        let valid = self.check(FactRequest::Block {
-            key: *key,
-            proof: proof.clone(),
-        });
+        let valid = self.check_fact(FactRequestRef::Block { key, proof });
         if self.failed {
             Err(HistoryError::Unsupported)
         } else {
@@ -380,10 +468,7 @@ impl EvidenceVerifier for FactRecorder {
 }
 impl EvidenceVerifier for FactReader {
     fn rejects_block(&mut self, proof: &BlockProof, key: &[u32; 8]) -> Result<bool, HistoryError> {
-        let valid = self.check(&FactRequest::Block {
-            key: *key,
-            proof: proof.clone(),
-        });
+        let valid = self.check_fact(FactRequestRef::Block { key, proof });
         if self.missing {
             Err(HistoryError::Unsupported)
         } else {
@@ -396,19 +481,12 @@ impl EvidenceVerifier for FactReader {
 /// This extraction does not assert membership, quorum, validity or guilt.
 pub fn vote_requests(
     domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
+    validators: &[Validator],
     vote: &neutrino_consensus_types::FinalityVote,
 ) -> Vec<FactRequest> {
     let mut requests = Vec::new();
-    let message = crate::slashing::vote_message(domain, &vote.data);
-    let keys: Vec<_> = validators
-        .iter()
-        .enumerate()
-        .filter_map(|(index, validator)| {
-            (vote.aggregation_bits.get(u32::try_from(index).ok()?) == Some(true))
-                .then_some(validator.pubkey)
-        })
-        .collect();
+    let message = vote.data.signing_message(domain);
+    let keys = marked_keys(validators, &vote.aggregation_bits);
     if keys.len() == 1 {
         requests.push(FactRequest::Signature {
             key: keys[0],
@@ -428,7 +506,7 @@ pub fn vote_requests(
         };
         requests.push(FactRequest::Signature {
             key: validator.pubkey,
-            message: crate::slashing::vote_message(domain, &claim.vote),
+            message: claim.vote.signing_message(domain),
             signature: claim.vote_signature,
             possession: false,
         });
@@ -439,49 +517,33 @@ pub fn vote_requests(
             possession: false,
         });
         if let Some(quorum) = &claim.unlock_quorum {
-            let keys = validators
-                .iter()
-                .enumerate()
-                .filter_map(|(index, validator)| {
-                    (quorum
-                        .aggregate
-                        .aggregation_bits
-                        .get(u32::try_from(index).ok()?)
-                        == Some(true))
-                    .then_some(validator.pubkey)
-                })
-                .collect();
-            requests.push(FactRequest::Aggregate {
-                keys,
-                message: crate::slashing::vote_message(domain, &quorum.data),
-                signature: quorum.aggregate.signature,
-            });
+            requests.push(quorum_request(domain, validators, quorum));
         }
     }
     requests
 }
 
-/// Aggregate check for a quorum certificate over `validators`.
-fn quorum_request(
-    domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
-    quorum: &neutrino_consensus_types::QuorumCertificate,
-) -> FactRequest {
-    let keys = validators
+/// Keys of every validator marked in `bits`, in set order. Extraction only:
+/// membership and activity are checked by the consuming verifier.
+fn marked_keys(validators: &[Validator], bits: &BitVec) -> Vec<BlsPublicKey> {
+    validators
         .iter()
         .enumerate()
         .filter_map(|(index, validator)| {
-            (quorum
-                .aggregate
-                .aggregation_bits
-                .get(u32::try_from(index).ok()?)
-                == Some(true))
-            .then_some(validator.pubkey)
+            (bits.get(u32::try_from(index).ok()?) == Some(true)).then_some(validator.pubkey)
         })
-        .collect();
+        .collect()
+}
+
+/// Aggregate check for a quorum certificate over `validators`.
+fn quorum_request(
+    domain: neutrino_primitives::ConsensusDomain,
+    validators: &[Validator],
+    quorum: &neutrino_consensus_types::QuorumCertificate,
+) -> FactRequest {
     FactRequest::Aggregate {
-        keys,
-        message: crate::slashing::vote_message(domain, &quorum.data),
+        keys: marked_keys(validators, &quorum.aggregate.aggregation_bits),
+        message: quorum.data.signing_message(domain),
         signature: quorum.aggregate.signature,
     }
 }
@@ -490,7 +552,7 @@ fn quorum_request(
 /// certificate, so a chunk's proposal checks can be answered from facts.
 pub fn proposal_requests(
     domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
+    validators: &[Validator],
     proposal: &neutrino_consensus_types::BftProposal,
 ) -> Vec<FactRequest> {
     let mut requests = Vec::new();
@@ -515,7 +577,7 @@ pub fn proposal_requests(
 /// Round-change report signature and its carried highest quorum, if any.
 pub fn round_change_requests(
     domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
+    validators: &[Validator],
     report: &neutrino_consensus_types::RoundChange,
 ) -> Vec<FactRequest> {
     let mut requests = Vec::new();
@@ -536,7 +598,7 @@ pub fn round_change_requests(
 /// Every signature a round-change certificate carries.
 pub fn round_change_certificate_requests(
     domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
+    validators: &[Validator],
     certificate: &neutrino_consensus_types::RoundChangeCertificate,
 ) -> Vec<FactRequest> {
     certificate
@@ -549,21 +611,13 @@ pub fn round_change_certificate_requests(
 /// Exact nil signatures available for early cryptographic fact compression.
 pub fn nil_vote_requests(
     domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
+    validators: &[Validator],
     vote: &neutrino_consensus_types::NilVote,
 ) -> Vec<FactRequest> {
     let mut requests = Vec::new();
     let message = vote.data.signing_message(domain);
-    let keys: Vec<_> = validators
-        .iter()
-        .enumerate()
-        .filter_map(|(index, validator)| {
-            (vote.aggregation_bits.get(u32::try_from(index).ok()?) == Some(true))
-                .then_some(validator.pubkey)
-        })
-        .collect();
     requests.push(FactRequest::Aggregate {
-        keys,
+        keys: marked_keys(validators, &vote.aggregation_bits),
         message: message.clone(),
         signature: vote.signature,
     });
@@ -590,7 +644,7 @@ pub fn nil_vote_requests(
 /// Header authentication and VRF facts can be compressed before finality.
 pub fn header_requests(
     domain: neutrino_primitives::ConsensusDomain,
-    validators: &[neutrino_primitives::Validator],
+    validators: &[Validator],
     seed: &Hash,
     header: &neutrino_consensus_types::Header,
 ) -> Vec<FactRequest> {
@@ -612,4 +666,75 @@ pub fn header_requests(
             possession: false
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn block_proof() -> BlockProof {
+        BlockProof {
+            height: 3,
+            block_hash: [4; 32],
+            public_inputs: neutrino_consensus_types::BlockProofPublicInputs {
+                chain_id: 1,
+                height: 3,
+                parent_block_hash: [2; 32],
+                block_hash: [4; 32],
+                state_root_before: [5; 32],
+                state_root_after: [6; 32],
+                transactions_root: [7; 32],
+                receipt_root: [8; 32],
+                da_root: [9; 32],
+                vm_code_hash: [10; 32],
+                block_program: [11; 8],
+                gas_used: 12,
+                gas_limit: 13,
+                proposer_address: [14; 32],
+                runtime_extra: [15; 32],
+            },
+            proof_bytes: vec![16, 17],
+        }
+    }
+
+    #[test]
+    fn borrowed_requests_encode_and_identify_like_owned_requests() {
+        let requests = [
+            FactRequest::Signature {
+                key: [1; 48],
+                message: vec![2, 3],
+                signature: [4; 96],
+                possession: false,
+            },
+            FactRequest::Signature {
+                key: [1; 48],
+                message: vec![1; 48],
+                signature: [4; 96],
+                possession: true,
+            },
+            FactRequest::Aggregate {
+                keys: vec![[5; 48], [6; 48]],
+                message: Vec::new(),
+                signature: [7; 96],
+            },
+            FactRequest::Block {
+                key: [8; 8],
+                proof: block_proof(),
+            },
+        ];
+        for request in &requests {
+            let borrowed = request.borrowed();
+            assert_eq!(
+                borsh::to_vec(&borrowed).unwrap(),
+                borsh::to_vec(request).unwrap()
+            );
+            assert_eq!(
+                request.id(),
+                commitment(&(b"neutrino-cryptographic-fact", request))
+            );
+            assert_eq!(borrowed.id(), request.id());
+            assert_eq!(&borrowed.to_request(), request);
+        }
+    }
 }

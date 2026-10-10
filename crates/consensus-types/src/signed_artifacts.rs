@@ -6,11 +6,11 @@
 extern crate alloc;
 use crate::{
     BftProposal, BlockProof, FinalityVote, NilVote, QuorumCertificate, RoundChange,
-    RoundChangeCertificate,
+    RoundChangeCertificate, tagged_commitment,
 };
 use alloc::{boxed::Box, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{ChunkId, Hash, blake3_256};
+use neutrino_primitives::{ChunkId, Hash};
 
 /// Maximum encoded source artifact, independent of chain age.
 pub const MAX_SIGNED_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
@@ -84,40 +84,17 @@ impl SignedArtifact {
     /// Exact content identity. Proof identities match existing signed envelope hashes.
     #[must_use]
     pub fn id(&self) -> Hash {
-        let (tag, bytes) = match self {
-            Self::Vote(vote) => (
-                Some(b"neutrino/artifact/vote".as_slice()),
-                borsh::to_vec(vote),
-            ),
-            Self::Quorum(quorum) => (
-                Some(b"neutrino/artifact/quorum".as_slice()),
-                borsh::to_vec(quorum),
-            ),
-            Self::BlockProof(proof) => (None, borsh::to_vec(proof)),
-            Self::Proposal(value) => (
-                Some(b"neutrino/artifact/proposal".as_slice()),
-                borsh::to_vec(value),
-            ),
-            Self::NilVote(value) => (
-                Some(b"neutrino/artifact/nilvote".as_slice()),
-                borsh::to_vec(value),
-            ),
-            Self::RoundChange(value) => (
-                Some(b"neutrino/artifact/roundchange".as_slice()),
-                borsh::to_vec(value),
-            ),
-            Self::RoundChangeCertificate(value) => (
-                Some(b"neutrino/artifact/roundchangecertificate".as_slice()),
-                borsh::to_vec(value),
-            ),
-        };
-        let mut bytes = bytes.expect("canonical source encoding");
-        if let Some(tag) = tag {
-            let mut tagged = tag.to_vec();
-            tagged.append(&mut bytes);
-            bytes = tagged;
+        match self {
+            Self::Vote(vote) => tagged_commitment(b"neutrino/artifact/vote", vote),
+            Self::Quorum(quorum) => tagged_commitment(b"neutrino/artifact/quorum", quorum),
+            Self::BlockProof(proof) => crate::evidence::commitment(proof),
+            Self::Proposal(value) => tagged_commitment(b"neutrino/artifact/proposal", value),
+            Self::NilVote(value) => tagged_commitment(b"neutrino/artifact/nilvote", value),
+            Self::RoundChange(value) => tagged_commitment(b"neutrino/artifact/roundchange", value),
+            Self::RoundChangeCertificate(value) => {
+                tagged_commitment(b"neutrino/artifact/roundchangecertificate", value)
+            }
         }
-        blake3_256(&bytes)
     }
 
     /// Source chunk computed from the protocol block range, with overflow rejection.

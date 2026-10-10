@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{BitVec, DOMAIN_PARTICIPATION, Hash, Validator, blake3_256};
+use neutrino_primitives::{BitVec, DOMAIN_PARTICIPATION, Hash, Validator};
 
 /// Commitment of "no certified chunk yet": the boundary value at genesis and
 /// the runtime's commitment when it receives no report.
@@ -63,9 +63,7 @@ impl ParticipationReport {
     /// Domain-separated commitment of the exact report.
     #[must_use]
     pub fn commitment(&self) -> Hash {
-        let mut bytes = Vec::from(DOMAIN_PARTICIPATION);
-        bytes.extend_from_slice(&borsh::to_vec(self).expect("canonical participation report"));
-        blake3_256(&bytes)
+        crate::tagged_commitment(&DOMAIN_PARTICIPATION, self)
     }
 }
 

@@ -56,15 +56,11 @@ pub struct BytesHex(pub Vec<u8>);
 
 impl Serialize for BytesHex {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        let encoded = if self.0.is_empty() {
-            String::from("0x")
-        } else {
-            let mut s = String::with_capacity(2 + self.0.len() * 2);
-            s.push_str("0x");
-            s.push_str(&hex::encode(&self.0));
-            s
-        };
-        ser.serialize_str(&encoded)
+        let mut buf = vec![0u8; 2 + self.0.len() * 2];
+        buf[0] = b'0';
+        buf[1] = b'x';
+        hex::encode_to_slice(&self.0, &mut buf[2..]).map_err(serde::ser::Error::custom)?;
+        ser.serialize_str(core::str::from_utf8(&buf).map_err(serde::ser::Error::custom)?)
     }
 }
 
@@ -72,9 +68,6 @@ impl<'de> Deserialize<'de> for BytesHex {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(de)?;
         let stripped = raw.strip_prefix("0x").unwrap_or(&raw);
-        if stripped.is_empty() {
-            return Ok(Self(Vec::new()));
-        }
         let bytes = hex::decode(stripped).map_err(serde::de::Error::custom)?;
         Ok(Self(bytes))
     }
@@ -445,6 +438,21 @@ mod tests {
         assert_eq!(s, "\"0x01020304\"");
         let back: BytesHex = serde_json::from_str(&s).unwrap();
         assert_eq!(back, b);
+    }
+
+    #[test]
+    fn bytes_hex_keeps_lowercase_and_empty_forms() {
+        let b = BytesHex(vec![0xAB, 0x00, 0xFF]);
+        assert_eq!(serde_json::to_string(&b).unwrap(), "\"0xab00ff\"");
+        let empty = serde_json::to_string(&BytesHex::default()).unwrap();
+        assert_eq!(empty, "\"0x\"");
+        for json in ["\"0x\"", "\"\""] {
+            let back: BytesHex = serde_json::from_str(json).unwrap();
+            assert_eq!(back, BytesHex::default());
+        }
+        let back: BytesHex = serde_json::from_str("\"AB00ff\"").unwrap();
+        assert_eq!(back, b);
+        assert!(serde_json::from_str::<BytesHex>("\"0xabc\"").is_err());
     }
 
     #[test]

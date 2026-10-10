@@ -16,6 +16,7 @@
 //!   [`Hasher::hash_value`].
 //! * The empty trie has root [`crate::EMPTY_TRIE_ROOT`] (`[0; 32]`).
 
+use alloc::collections::btree_map::Entry;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -265,10 +266,16 @@ impl<H: Hasher> Trie<H> {
     pub fn insert(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), TrieError> {
         let path = BitPath::for_key(key);
         let value_hash = H::hash_value(&value);
-        if self.values.insert(value_hash, value.clone()).is_none() {
-            self.pending_values.push((value_hash, value));
+        match self.values.entry(value_hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(value.clone());
+                self.pending_values.push((value_hash, value));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(value);
+            }
         }
-        let new_root = self.insert_at(self.root, &path, value_hash)?;
+        let new_root = self.insert_at(self.root, &path, 0, value_hash)?;
         self.root = new_root;
         Ok(())
     }
@@ -276,7 +283,7 @@ impl<H: Hasher> Trie<H> {
     /// Remove the value at `key` and return it if present.
     pub fn remove(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let path = BitPath::for_key(key);
-        let (new_root, removed) = self.remove_at(self.root, &path);
+        let (new_root, removed) = self.remove_at(self.root, &path, 0);
         self.root = new_root;
         removed.and_then(|value_hash| self.values.get(&value_hash).cloned())
     }
@@ -497,21 +504,30 @@ impl<H: Hasher> Trie<H> {
     fn store_node(&mut self, node: &Node) -> Hash {
         let encoded = node.encode();
         let hash = H::hash_node(&encoded);
-        if self.nodes.insert(hash, encoded.clone()).is_none() {
-            self.pending_nodes.push((hash, encoded));
+        match self.nodes.entry(hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(encoded.clone());
+                self.pending_nodes.push((hash, encoded));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(encoded);
+            }
         }
         hash
     }
 
+    /// Insert below `node_hash` the key whose remaining path is `path`'s bits
+    /// from `offset` onward (`offset <= path.bit_len()`).
     fn insert_at(
         &mut self,
         node_hash: Hash,
         path: &BitPath,
+        offset: u32,
         value_hash: Hash,
     ) -> Result<Hash, TrieError> {
         if node_hash == ZERO_HASH {
             return Ok(self.store_node(&Node::Leaf {
-                key_suffix: path.clone(),
+                key_suffix: path.suffix(offset),
                 value_hash,
             }));
         }
@@ -521,17 +537,16 @@ impl<H: Hasher> Trie<H> {
             Node::Leaf {
                 key_suffix,
                 value_hash: existing_vh,
-            } => self.insert_into_leaf(key_suffix, existing_vh, path, value_hash),
+            } => self.insert_into_leaf(key_suffix, existing_vh, &path.suffix(offset), value_hash),
             Node::Branch { left, right } => {
-                if path.is_empty() {
+                if offset >= path.bit_len() {
                     return Err(TrieError::PrefixCollision);
                 }
-                let bit = path.bit(0);
-                let rest = path.suffix(1);
+                let bit = path.bit(offset);
                 let (new_left, new_right) = if bit {
-                    (left, self.insert_at(right, &rest, value_hash)?)
+                    (left, self.insert_at(right, path, offset + 1, value_hash)?)
                 } else {
-                    (self.insert_at(left, &rest, value_hash)?, right)
+                    (self.insert_at(left, path, offset + 1, value_hash)?, right)
                 };
                 Ok(self.store_node(&Node::Branch {
                     left: new_left,
@@ -539,7 +554,7 @@ impl<H: Hasher> Trie<H> {
                 }))
             }
             Node::Extension { prefix, child } => {
-                self.insert_into_extension(prefix, child, path, value_hash)
+                self.insert_into_extension(prefix, child, path, offset, value_hash)
             }
         }
     }
@@ -597,25 +612,29 @@ impl<H: Hasher> Trie<H> {
         }
     }
 
+    /// [`Trie::insert_at`] for an extension node; `path` and `offset` as there.
     fn insert_into_extension(
         &mut self,
         prefix: BitPath,
         child: Hash,
         path: &BitPath,
+        offset: u32,
         value_hash: Hash,
     ) -> Result<Hash, TrieError> {
-        let common = prefix.common_prefix_len(path);
-        if common == prefix.bit_len() {
-            let rest = path.suffix(common);
-            if rest.is_empty() {
+        if path.matches_at(offset, &prefix) {
+            let rest = offset + prefix.bit_len();
+            if rest == path.bit_len() {
                 return Err(TrieError::PrefixCollision);
             }
-            let new_child = self.insert_at(child, &rest, value_hash)?;
+            let new_child = self.insert_at(child, path, rest, value_hash)?;
             return Ok(self.store_node(&Node::Extension {
                 prefix,
                 child: new_child,
             }));
         }
+        // The new key diverges inside the prefix; split it on the remaining path.
+        let path = &path.suffix(offset);
+        let common = prefix.common_prefix_len(path);
         if common == path.bit_len() {
             return Err(TrieError::PrefixCollision);
         }
@@ -660,7 +679,9 @@ impl<H: Hasher> Trie<H> {
         }
     }
 
-    fn remove_at(&mut self, node_hash: Hash, path: &BitPath) -> (Hash, Option<Hash>) {
+    /// Remove below `node_hash` the key whose remaining path is `path`'s bits
+    /// from `offset` onward (`offset <= path.bit_len()`).
+    fn remove_at(&mut self, node_hash: Hash, path: &BitPath, offset: u32) -> (Hash, Option<Hash>) {
         if node_hash == ZERO_HASH {
             return (ZERO_HASH, None);
         }
@@ -670,22 +691,23 @@ impl<H: Hasher> Trie<H> {
                 key_suffix,
                 value_hash,
             } => {
-                if &key_suffix == path {
+                if key_suffix.bit_len() == path.bit_len() - offset
+                    && path.matches_at(offset, &key_suffix)
+                {
                     (ZERO_HASH, Some(value_hash))
                 } else {
                     (node_hash, None)
                 }
             }
             Node::Branch { left, right } => {
-                if path.is_empty() {
+                if offset >= path.bit_len() {
                     return (node_hash, None);
                 }
-                let bit = path.bit(0);
-                let rest = path.suffix(1);
+                let bit = path.bit(offset);
                 let (new_child, removed) = if bit {
-                    self.remove_at(right, &rest)
+                    self.remove_at(right, path, offset + 1)
                 } else {
-                    self.remove_at(left, &rest)
+                    self.remove_at(left, path, offset + 1)
                 };
                 if removed.is_none() {
                     return (node_hash, None);
@@ -700,16 +722,11 @@ impl<H: Hasher> Trie<H> {
                 (collapsed_hash, removed)
             }
             Node::Extension { prefix, child } => {
-                let len = prefix.bit_len();
-                if path.bit_len() < len {
+                if !path.matches_at(offset, &prefix) {
                     return (node_hash, None);
                 }
-                let segment = path.prefix(len);
-                if segment != prefix {
-                    return (node_hash, None);
-                }
-                let rest = path.suffix(len);
-                let (new_child, removed) = self.remove_at(child, &rest);
+                let rest = offset + prefix.bit_len();
+                let (new_child, removed) = self.remove_at(child, path, rest);
                 if removed.is_none() {
                     return (node_hash, None);
                 }
@@ -738,7 +755,7 @@ impl<H: Hasher> Trie<H> {
                 key_suffix,
                 value_hash,
             } => {
-                let combined_path = concat_bits(&prefix, &key_suffix);
+                let combined_path = prefix.concat(&key_suffix);
                 self.store_node(&Node::Leaf {
                     key_suffix: combined_path,
                     value_hash,
@@ -748,7 +765,7 @@ impl<H: Hasher> Trie<H> {
                 prefix: child_prefix,
                 child: grandchild,
             } => {
-                let combined_prefix = concat_bits(&prefix, &child_prefix);
+                let combined_prefix = prefix.concat(&child_prefix);
                 self.store_node(&Node::Extension {
                     prefix: combined_prefix,
                     child: grandchild,
@@ -760,15 +777,14 @@ impl<H: Hasher> Trie<H> {
 
     fn absorb_into_parent(&mut self, surviving_child: Hash, child_bit: bool) -> Hash {
         let surviving_node = self.fetch_node(&surviving_child);
-        let mut prefix_bits = BitPath::empty();
-        prefix_bits = push_bit(&prefix_bits, child_bit);
+        let prefix_bits = BitPath::single(child_bit);
 
         match surviving_node {
             Node::Leaf {
                 key_suffix,
                 value_hash,
             } => {
-                let combined = concat_bits(&prefix_bits, &key_suffix);
+                let combined = prefix_bits.concat(&key_suffix);
                 self.store_node(&Node::Leaf {
                     key_suffix: combined,
                     value_hash,
@@ -778,7 +794,7 @@ impl<H: Hasher> Trie<H> {
                 prefix: child_prefix,
                 child: grandchild,
             } => {
-                let combined = concat_bits(&prefix_bits, &child_prefix);
+                let combined = prefix_bits.concat(&child_prefix);
                 self.store_node(&Node::Extension {
                     prefix: combined,
                     child: grandchild,
@@ -813,43 +829,6 @@ fn decode_raw_key(bits: &[bool]) -> Option<Vec<u8>> {
         return None;
     }
     Some(encoded[4..].to_vec())
-}
-
-fn concat_bits(head: &BitPath, tail: &BitPath) -> BitPath {
-    if head.is_empty() {
-        return tail.clone();
-    }
-    if tail.is_empty() {
-        return head.clone();
-    }
-    let mut acc = head.clone();
-    for i in 0..tail.bit_len() {
-        acc = push_bit(&acc, tail.bit(i));
-    }
-    acc
-}
-
-fn push_bit(path: &BitPath, bit: bool) -> BitPath {
-    let new_len = path.bit_len() + 1;
-    let new_byte_len = (new_len as usize).div_ceil(8);
-    let mut bytes = path.as_bytes().to_vec();
-    if bytes.len() < new_byte_len {
-        bytes.push(0);
-    }
-    if bit {
-        let byte_index = ((new_len - 1) / 8) as usize;
-        let bit_offset = 7 - ((new_len - 1) % 8) as usize;
-        bytes[byte_index] |= 1_u8 << bit_offset;
-    }
-    encode_bitpath_from_parts(new_len, &bytes)
-}
-
-fn encode_bitpath_from_parts(bit_len: u32, bytes: &[u8]) -> BitPath {
-    let mut buf = Vec::with_capacity(4 + bytes.len());
-    buf.extend_from_slice(&bit_len.to_le_bytes());
-    buf.extend_from_slice(bytes);
-    let (path, _) = BitPath::decode(&buf).expect("synthesized BitPath bytes are canonical");
-    path
 }
 
 #[cfg(test)]
@@ -1231,6 +1210,86 @@ mod tests {
             trie.prove(key)
                 .verify_exclusion::<Blake3Hasher>(&trie.root(), key)
                 .expect("random exclusion proof");
+        }
+    }
+
+    /// Root of the canonical trie holding exactly `leaves`, built from scratch:
+    /// one key is a leaf, keys sharing a nonempty prefix sit under an extension,
+    /// and otherwise the first bit splits them under a branch.
+    fn canonical_subtree(leaves: &[(BitPath, Hash)]) -> Hash {
+        let node = match leaves {
+            [] => return ZERO_HASH,
+            [(key_suffix, value_hash)] => Node::Leaf {
+                key_suffix: key_suffix.clone(),
+                value_hash: *value_hash,
+            },
+            [(first, _), rest @ ..] => {
+                let common = rest
+                    .iter()
+                    .map(|(path, _)| first.common_prefix_len(path))
+                    .min()
+                    .unwrap();
+                if common > 0 {
+                    let children: Vec<_> = leaves
+                        .iter()
+                        .map(|(path, value_hash)| (path.suffix(common), *value_hash))
+                        .collect();
+                    Node::Extension {
+                        prefix: first.prefix(common),
+                        child: canonical_subtree(&children),
+                    }
+                } else {
+                    let (mut left, mut right) = (Vec::new(), Vec::new());
+                    for (path, value_hash) in leaves {
+                        let side = if path.bit(0) { &mut right } else { &mut left };
+                        side.push((path.suffix(1), *value_hash));
+                    }
+                    Node::Branch {
+                        left: canonical_subtree(&left),
+                        right: canonical_subtree(&right),
+                    }
+                }
+            }
+        };
+        Blake3Hasher::hash_node(&node.encode())
+    }
+
+    fn canonical_root(entries: &BTreeMap<Vec<u8>, Vec<u8>>) -> Hash {
+        let leaves: Vec<_> = entries
+            .iter()
+            .map(|(key, value)| (BitPath::for_key(key), Blake3Hasher::hash_value(value)))
+            .collect();
+        canonical_subtree(&leaves)
+    }
+
+    #[test]
+    fn incremental_roots_match_a_from_scratch_canonical_build() {
+        fn below(rng: &mut ChaCha20Rng, bound: u32) -> usize {
+            usize::try_from(rng.next_u32() % bound).unwrap()
+        }
+        let alphabet = [0x00, 0x01, 0x7F, 0x80, 0xFF];
+        let mut rng = ChaCha20Rng::seed_from_u64(0x4F46_4653);
+        let mut keys = Vec::new();
+        for _ in 0..48 {
+            let len = below(&mut rng, 6);
+            let key: Vec<u8> = (0..len).map(|_| alphabet[below(&mut rng, 5)]).collect();
+            keys.push(key);
+        }
+        let mut trie = TestTrie::new();
+        let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for step in 0..400_usize {
+            let key = &keys[below(&mut rng, 48)];
+            if below(&mut rng, 3) == 0 {
+                assert_eq!(trie.remove(key), entries.remove(key), "step {step}");
+            } else {
+                let value = vec![u8::try_from(step % 251).unwrap(); 1 + step % 5];
+                trie.insert(key, value.clone()).expect("insert");
+                entries.insert(key.clone(), value);
+            }
+            assert_eq!(trie.root(), canonical_root(&entries), "step {step}");
+        }
+        for (key, value) in &entries {
+            assert_eq!(trie.get(key).as_ref(), Some(value));
         }
     }
 

@@ -37,8 +37,6 @@ pub type StateRoot = Hash;
 pub type BlockHash = Hash;
 /// Chunk commitment hash.
 pub type ChunkHash = Hash;
-/// Transaction hash.
-pub type TxHash = Hash;
 /// Public randomness seed.
 pub type Seed = Hash;
 /// Fixed-point `Q64.64` value.
@@ -77,6 +75,30 @@ impl ConsensusDomain {
         message.extend_from_slice(&self.chain_id.to_le_bytes());
         message.extend_from_slice(&self.chain_spec_hash);
         message.extend_from_slice(payload);
+        message
+    }
+
+    /// Encode `tag || chain_id LE8 || chain_spec_hash || borsh(payload)`, byte-for-byte
+    /// equal to `signing_message(tag, &borsh::to_vec(payload).expect(..))` without
+    /// the intermediate payload buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `payload` fails to serialize, exactly where the
+    /// `borsh::to_vec(payload).expect(..)` form would.
+    #[must_use]
+    pub fn signing_message_borsh<T: BorshSerialize + ?Sized>(
+        self,
+        tag: DomainTag,
+        payload: &T,
+    ) -> Vec<u8> {
+        let mut message = Vec::with_capacity(16 + 8 + 32);
+        message.extend_from_slice(&tag);
+        message.extend_from_slice(&self.chain_id.to_le_bytes());
+        message.extend_from_slice(&self.chain_spec_hash);
+        payload
+            .serialize(&mut message)
+            .expect("canonical signing payload serializes");
         message
     }
 }
@@ -221,13 +243,28 @@ pub const fn fixed_u128_from_integer(value: u64) -> FixedU128 {
     (value as u128) << FIXED_U128_FRAC_BITS
 }
 
-/// Converts a rational number into `Q64.64`. Returns zero for a zero denominator.
-pub const fn fixed_u128_ratio(numerator: u64, denominator: u64) -> FixedU128 {
-    if denominator == 0 {
-        0
-    } else {
-        ((numerator as u128) << FIXED_U128_FRAC_BITS) / (denominator as u128)
-    }
+/// Whether `numerator / denominator` is a valid BFT quorum fraction: both
+/// terms nonzero, at most one, and at least two thirds. The two-thirds
+/// comparison is evaluated in `u128`, so it cannot overflow.
+#[must_use]
+pub const fn quorum_fraction_valid(numerator: u64, denominator: u64) -> bool {
+    numerator != 0
+        && denominator != 0
+        && numerator <= denominator
+        && (numerator as u128) * 3 >= (denominator as u128) * 2
+}
+
+/// Whether `stake / total_stake >= numerator / denominator`, evaluated exactly
+/// as `stake * denominator >= total_stake * numerator` in `u128`, which cannot
+/// overflow for `u64` operands.
+#[must_use]
+pub const fn quorum_reached(
+    stake: u64,
+    total_stake: u64,
+    numerator: u64,
+    denominator: u64,
+) -> bool {
+    (stake as u128) * (denominator as u128) >= (total_stake as u128) * (numerator as u128)
 }
 
 /// Computes a BLAKE3-256 digest.
@@ -363,11 +400,6 @@ impl<const MAX_LEN: usize> BoundedBytes<MAX_LEN> {
         }
 
         Ok(Self { inner: bytes })
-    }
-
-    /// Returns the maximum permitted byte length.
-    pub const fn max_len() -> usize {
-        MAX_LEN
     }
 
     /// Returns the current byte length.
@@ -1083,11 +1115,7 @@ impl LightClientParams {
 }
 
 fn validate_quorum(numerator: u64, denominator: u64) -> Result<(), ChainSpecError> {
-    if denominator == 0
-        || numerator == 0
-        || numerator > denominator
-        || u128::from(numerator) * 3 < u128::from(denominator) * 2
-    {
+    if !quorum_fraction_valid(numerator, denominator) {
         return Err(ChainSpecError::InvalidQuorum);
     }
 
@@ -1195,6 +1223,51 @@ mod tests {
             domain.chain_spec_hash,
             other.consensus_domain().chain_spec_hash
         );
+    }
+
+    #[test]
+    fn borsh_signing_message_matches_the_encoded_payload_form() {
+        let domain = test_chain_spec().consensus_domain();
+        let payload = (7_u64, [3_u8; 32], alloc::vec![1_u8, 2, 3], Some(9_u32));
+        assert_eq!(
+            domain.signing_message_borsh(DOMAIN_PREVOTE, &payload),
+            domain.signing_message(DOMAIN_PREVOTE, &borsh::to_vec(&payload).unwrap())
+        );
+        assert_eq!(
+            domain.signing_message_borsh(DOMAIN_BFT_NIL, &()),
+            domain.signing_message(DOMAIN_BFT_NIL, &[])
+        );
+    }
+
+    #[test]
+    fn quorum_helpers_match_the_widened_reference_arithmetic() {
+        let samples = [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            u64::MAX / 3,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for numerator in samples {
+            for denominator in samples {
+                let (n, d) = (u128::from(numerator), u128::from(denominator));
+                let valid = d != 0 && n != 0 && n <= d && n * 3 >= d * 2;
+                assert_eq!(quorum_fraction_valid(numerator, denominator), valid);
+                for stake in samples {
+                    for total in samples {
+                        let expected = u128::from(stake) * d >= u128::from(total) * n;
+                        let actual = quorum_reached(stake, total, numerator, denominator);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

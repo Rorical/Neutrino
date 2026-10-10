@@ -169,6 +169,7 @@ impl Pacemaker {
         if self.reports.len() > 2 {
             return Err(BftError::WrongVoteTarget);
         }
+        let mut verified = Vec::new();
         for (round, reports) in &self.reports {
             if *round <= self.round || reports.len() > validators.len() {
                 return Err(BftError::WrongVoteTarget);
@@ -180,7 +181,14 @@ impl Pacemaker {
                 {
                     return Err(BftError::WrongVoteTarget);
                 }
-                crate::verify_round_change_native(domain, validators, report, fraction)?;
+                crate::verify_round_change_native(
+                    domain,
+                    validators,
+                    None,
+                    report,
+                    fraction,
+                    &mut verified,
+                )?;
             }
         }
         Ok(())
@@ -199,7 +207,14 @@ impl Pacemaker {
         if report.chunk_id != self.chunk_id || report.round <= self.round {
             return Err(BftError::WrongVoteTarget);
         }
-        crate::verify_round_change_native(domain, validators, &report, fraction)?;
+        crate::verify_round_change_native(
+            domain,
+            validators,
+            None,
+            &report,
+            fraction,
+            &mut Vec::new(),
+        )?;
         let reported_round = report.round;
         let reports = self.reports.entry(reported_round).or_default();
         if let Some(existing) = reports.get(&report.validator_index) {

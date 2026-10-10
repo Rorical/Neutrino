@@ -65,7 +65,7 @@ impl BitPath {
         let mut encoded = Vec::with_capacity(4 + key.len());
         encoded.extend_from_slice(&key_len.to_le_bytes());
         encoded.extend_from_slice(key);
-        Self::from_key(&encoded)
+        Self::from_owned_key(encoded)
     }
 
     /// Build a path from raw bytes without adding the trie key length
@@ -81,14 +81,25 @@ impl BitPath {
     /// larger than any plausible state key.
     #[must_use]
     pub fn from_key(key: &[u8]) -> Self {
-        let bit_len_usize = key
+        Self::from_owned_key(key.to_vec())
+    }
+
+    /// [`BitPath::from_key`] over owned bytes, without copying them again.
+    fn from_owned_key(bytes: Vec<u8>) -> Self {
+        let bit_len_usize = bytes
             .len()
             .checked_mul(8)
             .expect("trie key bit length fits usize");
         let bit_len = u32::try_from(bit_len_usize).expect("trie key bit length fits u32");
+        Self { bit_len, bytes }
+    }
+
+    /// The canonical one-bit path.
+    #[must_use]
+    pub(crate) fn single(bit: bool) -> Self {
         Self {
-            bit_len,
-            bytes: key.to_vec(),
+            bit_len: 1,
+            bytes: vec![u8::from(bit) << 7],
         }
     }
 
@@ -223,6 +234,83 @@ impl BitPath {
         let full_bytes_u32 =
             u32::try_from(full_bytes).expect("common-prefix byte count fits in u32");
         full_bytes_u32 * 8 + common_in_last
+    }
+
+    /// Whether `other`'s bits occur in this path starting at bit `offset`,
+    /// without allocating. `false` when `other` would run past the end.
+    ///
+    /// Only bits are compared, so for canonical paths (such as every decoded
+    /// node path) this equals comparing `other` with the allocated
+    /// `self.suffix(offset).prefix(other.bit_len())` whenever that is in range.
+    #[must_use]
+    pub(crate) fn matches_at(&self, offset: u32, other: &Self) -> bool {
+        let Some(end) = offset.checked_add(other.bit_len) else {
+            return false;
+        };
+        if end > self.bit_len {
+            return false;
+        }
+        let start = (offset / 8) as usize;
+        let shift = offset % 8;
+        // Byte `index` of this path's bits read from `offset`, MSB-aligned.
+        let window = |index: usize| {
+            let high = self.bytes[start + index] << shift;
+            if shift == 0 {
+                return high;
+            }
+            let low = self
+                .bytes
+                .get(start + index + 1)
+                .map_or(0, |byte| byte >> (8 - shift));
+            high | low
+        };
+        let full = (other.bit_len / 8) as usize;
+        if (0..full).any(|index| window(index) != other.bytes[index]) {
+            return false;
+        }
+        let tail = other.bit_len % 8;
+        if tail == 0 {
+            return true;
+        }
+        let mask = 0xFF_u8 << (8 - tail);
+        (window(full) & mask) == (other.bytes[full] & mask)
+    }
+
+    /// This path followed by `tail`, in canonical form. An empty operand
+    /// returns a clone of the other one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the combined bit length does not fit in `u32`.
+    #[must_use]
+    pub(crate) fn concat(&self, tail: &Self) -> Self {
+        if self.is_empty() {
+            return tail.clone();
+        }
+        if tail.is_empty() {
+            return self.clone();
+        }
+        let bit_len = self
+            .bit_len
+            .checked_add(tail.bit_len)
+            .expect("concatenated bit length fits u32");
+        let mut bytes = Vec::with_capacity(bytes_for_bits(bit_len) + 1);
+        bytes.extend_from_slice(&self.bytes[..bytes_for_bits(self.bit_len)]);
+        mask_padding(&mut bytes, self.bit_len);
+        let tail_bytes = &tail.bytes[..bytes_for_bits(tail.bit_len)];
+        let shift = self.bit_len % 8;
+        if shift == 0 {
+            bytes.extend_from_slice(tail_bytes);
+        } else {
+            for &byte in tail_bytes {
+                let last = bytes.last_mut().expect("a non-empty head has a byte");
+                *last |= byte >> shift;
+                bytes.push(byte << (8 - shift));
+            }
+        }
+        bytes.truncate(bytes_for_bits(bit_len));
+        mask_padding(&mut bytes, bit_len);
+        Self { bit_len, bytes }
     }
 
     /// Append the canonical encoding to `buf`.
@@ -398,6 +486,102 @@ mod tests {
         // bit_len = 3 must have low five bits zero in the trailing byte.
         let bytes = [3, 0, 0, 0, 0b1110_0001];
         assert_eq!(BitPath::decode(&bytes), Err(TrieError::NonCanonicalBitPath));
+    }
+
+    /// The pre-refactor bit-at-a-time concatenation, the reference for `concat`.
+    fn legacy_concat(head: &BitPath, tail: &BitPath) -> BitPath {
+        if head.is_empty() {
+            return tail.clone();
+        }
+        if tail.is_empty() {
+            return head.clone();
+        }
+        let mut acc = head.clone();
+        for i in 0..tail.bit_len() {
+            acc = legacy_push_bit(&acc, tail.bit(i));
+        }
+        acc
+    }
+
+    fn legacy_push_bit(path: &BitPath, bit: bool) -> BitPath {
+        let new_len = path.bit_len() + 1;
+        let new_byte_len = (new_len as usize).div_ceil(8);
+        let mut bytes = path.as_bytes().to_vec();
+        if bytes.len() < new_byte_len {
+            bytes.push(0);
+        }
+        if bit {
+            let byte_index = ((new_len - 1) / 8) as usize;
+            let bit_offset = 7 - ((new_len - 1) % 8) as usize;
+            bytes[byte_index] |= 1_u8 << bit_offset;
+        }
+        let mut buf = Vec::with_capacity(4 + bytes.len());
+        buf.extend_from_slice(&new_len.to_le_bytes());
+        buf.extend_from_slice(&bytes);
+        let (path, _) = BitPath::decode(&buf).expect("synthesized BitPath bytes are canonical");
+        path
+    }
+
+    /// Canonical paths of many lengths, taken at aligned and unaligned offsets.
+    fn sample_paths() -> Vec<BitPath> {
+        let source = BitPath::from_key(&[0xA5, 0x3C, 0xFF, 0x00, 0x96, 0x71, 0x0E, 0xD2]);
+        let mut paths = Vec::new();
+        for start in [0, 1, 3, 7, 8, 9, 13] {
+            for len in 0..=24 {
+                paths.push(source.suffix(start).prefix(len));
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn concat_matches_the_bit_at_a_time_reference() {
+        let paths = sample_paths();
+        for head in &paths {
+            for tail in &paths {
+                let joined = head.concat(tail);
+                assert_eq!(joined, legacy_concat(head, tail), "{head:?} ++ {tail:?}");
+                assert_eq!(joined.bit_len(), head.bit_len() + tail.bit_len());
+            }
+        }
+        for bit in [false, true] {
+            assert_eq!(
+                BitPath::single(bit),
+                legacy_push_bit(&BitPath::empty(), bit)
+            );
+        }
+    }
+
+    #[test]
+    fn matches_at_and_offset_suffixes_agree_with_allocating_slices() {
+        let paths = sample_paths();
+        let long = BitPath::from_key(&[0xA5, 0x3C, 0xFF, 0x00, 0x96]);
+        for path in paths.iter().chain([&long]) {
+            for offset in 0..=path.bit_len() {
+                let rest = path.suffix(offset);
+                for first in 0..=rest.bit_len() {
+                    assert_eq!(rest.suffix(first), path.suffix(offset + first));
+                }
+                for other in &paths {
+                    let expected = offset + other.bit_len() <= path.bit_len()
+                        && rest.prefix(other.bit_len()) == *other;
+                    assert_eq!(path.matches_at(offset, other), expected);
+                }
+            }
+            for other in &paths {
+                assert!(!path.matches_at(path.bit_len() + 1, other));
+                assert!(!path.matches_at(u32::MAX, other));
+            }
+        }
+    }
+
+    #[test]
+    fn for_key_prefixes_the_little_endian_key_length() {
+        assert_eq!(
+            BitPath::for_key(b"abc"),
+            BitPath::from_key(&[3, 0, 0, 0, b'a', b'b', b'c'])
+        );
+        assert_eq!(BitPath::for_key(&[]), BitPath::from_key(&[0; 4]));
     }
 
     #[test]

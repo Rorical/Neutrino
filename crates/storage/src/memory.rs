@@ -82,11 +82,11 @@ impl Database for MemoryDatabase {
     }
 
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error> {
-        let mut next = self.clone();
+        // `apply_op` cannot fail, so applying in place is as atomic as
+        // swapping in an updated copy.
         for op in batch.into_operations() {
-            next.apply_op(op);
+            self.apply_op(op);
         }
-        *self = next;
         Ok(())
     }
 

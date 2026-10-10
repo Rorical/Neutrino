@@ -277,7 +277,77 @@ impl ForkChoice {
     }
 
     /// Returns the current fork-choice head.
+    ///
+    /// Latest-vote weight is summed once per voted chunk end block, then each
+    /// candidate is scored by a single walk over its ancestry.
     pub fn head(&self) -> BlockHash {
+        let mut weights = BTreeMap::<BlockHash, u128>::new();
+        for vote in self.votes.values() {
+            if let Some(chunk) = self.chunks.get(&vote.data.chunk_hash) {
+                *weights.entry(chunk.end_block_hash).or_default() += u128::from(vote.weight);
+            }
+        }
+        self.blocks
+            .iter()
+            .filter_map(|(hash, node)| self.walk_candidate(*hash, node, &weights))
+            .max_by(compare_candidates)
+            .map_or(self.finalized, |score| score.hash)
+    }
+
+    /// Score one candidate from a single walk over the blocks [`Self::block_extends`]
+    /// visits: the candidate, then parents until a block is unknown or its own parent.
+    ///
+    /// The candidate must extend the finalized block with no `Invalid` block
+    /// before it on the walk; the finalized candidate itself checks every known
+    /// block it walks through. Every vote target and the boosted block on the
+    /// walk add their weight. The total is summed in `u128`, which cannot
+    /// overflow, and a candidate whose total exceeds `u64` is dropped exactly as
+    /// a checked `u64` sum of non-negative weights would fail.
+    fn walk_candidate(
+        &self,
+        candidate: BlockHash,
+        node: &BlockNode,
+        weights: &BTreeMap<BlockHash, u128>,
+    ) -> Option<CandidateScore> {
+        let mut extends_finalized = false;
+        let mut invalid = false;
+        let mut weight = 0_u128;
+        let mut hash = candidate;
+        loop {
+            if hash == self.finalized {
+                extends_finalized = true;
+            }
+            weight += weights.get(&hash).copied().unwrap_or(0);
+            if let Some(boost) = self.proposer_boost
+                && boost.block_hash == hash
+            {
+                weight += u128::from(boost.weight);
+            }
+            let Some(visited) = self.blocks.get(&hash) else {
+                break;
+            };
+            invalid |= visited.proof_status == ProofStatus::Invalid
+                && (!extends_finalized || candidate == self.finalized);
+            if visited.parent_hash == hash {
+                break;
+            }
+            hash = visited.parent_hash;
+        }
+        if !extends_finalized || invalid {
+            return None;
+        }
+        Some(CandidateScore {
+            hash: candidate,
+            score: u64::try_from(weight).ok()?,
+            height: node.height,
+            vrf_tie_breaker: node.vrf_tie_breaker,
+        })
+    }
+
+    /// Pre-refactor scoring: one ancestor walk per vote, kept as the
+    /// reference that [`Self::head`] must match.
+    #[cfg(test)]
+    fn head_reference(&self) -> BlockHash {
         self.blocks
             .keys()
             .filter_map(|hash| self.score_candidate(*hash).ok().flatten())
@@ -285,6 +355,7 @@ impl ForkChoice {
             .map_or(self.finalized, |score| score.hash)
     }
 
+    #[cfg(test)]
     fn score_candidate(
         &self,
         candidate: BlockHash,
@@ -321,6 +392,7 @@ impl ForkChoice {
         }))
     }
 
+    #[cfg(test)]
     fn vote_applies_to_candidate(&self, vote: &ChunkVote, candidate: BlockHash) -> bool {
         self.chunks
             .get(&vote.data.chunk_hash)
@@ -343,6 +415,7 @@ impl ForkChoice {
         false
     }
 
+    #[cfg(test)]
     fn has_invalid_ancestor(&self, mut hash: BlockHash) -> bool {
         while let Some(node) = self.blocks.get(&hash) {
             if node.proof_status == ProofStatus::Invalid {
@@ -624,5 +697,159 @@ mod tests {
         assert_eq!(tree.proposer_boost.unwrap().block_hash, live);
         tree.retain_finalized_subtree();
         assert_eq!(tree.head(), live);
+    }
+
+    /// Deterministic SplitMix64 stream for generated fork-choice states.
+    struct TestRng(u64);
+
+    impl TestRng {
+        const fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut mixed = self.0;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            mixed ^ (mixed >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            usize::try_from(self.next_u64() % u64::try_from(bound).unwrap()).unwrap()
+        }
+
+        fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+            items[self.below(items.len())]
+        }
+    }
+
+    fn assert_matches_reference(tree: &ForkChoice, stage: &str) {
+        assert_eq!(tree.head(), tree.head_reference(), "{stage}");
+    }
+
+    #[test]
+    fn single_walk_head_matches_the_per_vote_reference_on_varied_dags() {
+        let statuses = [
+            ProofStatus::PendingProof,
+            ProofStatus::Proven,
+            ProofStatus::Invalid,
+            ProofStatus::Finalized,
+        ];
+        let mut rng = TestRng(0x6E65_7574_7269_6E6F);
+        let (mut moved_heads, mut overflows) = (0_usize, 0_usize);
+        for case in 0..300_u64 {
+            let mut tree = ForkChoice::new(hash(u8::try_from(case % 3).unwrap()));
+            let mut blocks = Vec::new();
+            for index in 0..=rng.below(24) {
+                let parent = if blocks.is_empty() || rng.below(5) == 0 {
+                    tree.finalized()
+                } else {
+                    rng.pick(&blocks)
+                };
+                let proposer = u32::try_from(rng.below(4)).unwrap();
+                let mut block_header = header(parent, 1 + rng.next_u64() % 20, proposer);
+                block_header.timestamp = u64::try_from(index).unwrap();
+                let block = tree.add_block(&block_header).unwrap();
+                let status = rng.pick(&statuses);
+                tree.on_block_proof(block, status).unwrap();
+                blocks.push(block);
+            }
+            for validator in 0..u32::try_from(rng.below(12)).unwrap() {
+                let end = if rng.below(6) == 0 {
+                    hash(200)
+                } else {
+                    rng.pick(&blocks)
+                };
+                let target = chunk(end, rng.next_u64() % 4);
+                if rng.below(4) != 0 {
+                    tree.add_chunk(&target);
+                }
+                let weight = match rng.below(8) {
+                    0 => u64::MAX,
+                    1 => u64::MAX / 2,
+                    _ => rng.next_u64() % 100,
+                };
+                tree.add_vote(validator, vote(&target, weight));
+            }
+            let boosted = rng.pick(&blocks);
+            let boost_weight = rng.next_u64() % 1_000;
+            match rng.below(3) {
+                0 => {}
+                1 => {
+                    let fraction = DEFAULT_PROPOSER_BOOST_FRACTION;
+                    let result = tree.set_proposer_boost(boosted, boost_weight, fraction);
+                    assert_eq!(result, Ok(()));
+                }
+                _ => {
+                    tree.proposer_boost = Some(ProposerBoost {
+                        block_hash: boosted,
+                        weight: u64::MAX - boost_weight % 4,
+                    });
+                }
+            }
+            assert_matches_reference(&tree, &format!("case {case} before finality"));
+            for block in &blocks {
+                if tree.score_candidate(*block) == Err(ForkChoiceError::ScoreOverflow) {
+                    overflows += 1;
+                }
+            }
+
+            let target = rng.pick(&blocks);
+            match rng.below(3) {
+                0 if tree.block_extends(target, tree.finalized()) => {
+                    let finalized = chunk(target, 99);
+                    let result = tree.add_finalized_chunk(&finalized, &cert(&finalized));
+                    assert_eq!(result, Ok(()));
+                }
+                1 => tree.finalized = hash(250),
+                _ => tree.finalized = target,
+            }
+            assert_matches_reference(&tree, &format!("case {case} after finality"));
+            if tree.head() != tree.finalized() {
+                moved_heads += 1;
+            }
+            tree.retain_finalized_subtree();
+            assert_matches_reference(&tree, &format!("case {case} after pruning"));
+        }
+        assert!(moved_heads > 0, "generated states never chose a block head");
+        assert!(overflows > 0, "generated states never overflowed a score");
+    }
+
+    #[test]
+    fn single_walk_head_matches_the_reference_through_self_parented_blocks() {
+        let looped = hash(77);
+        let node = BlockNode {
+            hash: looped,
+            parent_hash: looped,
+            height: 1,
+            proposer_index: 0,
+            proof_status: ProofStatus::Proven,
+            vrf_tie_breaker: hash(5),
+        };
+        let mut tree = ForkChoice::default();
+        tree.blocks.insert(looped, node);
+        let child = tree.add_block(&header(looped, 2, 1)).unwrap();
+        let grandchild = tree.add_block(&header(child, 3, 2)).unwrap();
+        let sibling = tree.add_block(&header(looped, 2, 3)).unwrap();
+        let rooted = tree.add_block(&header(ZERO_HASH, 1, 1)).unwrap();
+        for (block, weight) in [(looped, 5), (child, 7), (grandchild, 1), (rooted, 4)] {
+            let target = chunk(block, weight);
+            tree.add_chunk(&target);
+            tree.add_vote(u32::try_from(weight).unwrap(), vote(&target, weight));
+        }
+        tree.set_proposer_boost(sibling, 100, DEFAULT_PROPOSER_BOOST_FRACTION)
+            .unwrap();
+        for (finalized, invalid) in [
+            (ZERO_HASH, None),
+            (looped, None),
+            (looped, Some(sibling)),
+            (child, Some(looped)),
+        ] {
+            for block in [looped, child, grandchild, sibling, rooted] {
+                tree.on_block_proof(block, ProofStatus::Proven).unwrap();
+            }
+            if let Some(block) = invalid {
+                tree.on_block_proof(block, ProofStatus::Invalid).unwrap();
+            }
+            tree.finalized = finalized;
+            assert_matches_reference(&tree, &format!("finalized {finalized:?}"));
+        }
     }
 }

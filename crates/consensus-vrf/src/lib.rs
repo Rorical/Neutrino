@@ -5,10 +5,10 @@
 //! Consensus-level VRF integration.
 //!
 //! This crate sits above the low-level `neutrino-vrf` primitive. It understands
-//! validator-set indexing, header proposer claims, finalized-seed folding, and
-//! public chunk-aggregator selection. The cryptographic construction and
-//! threshold math are implemented in `neutrino-vrf`; this crate wires those
-//! primitives to the consensus wire types from docs 02 and 12.
+//! validator-set indexing, header proposer claims and public chunk-aggregator
+//! selection. The cryptographic construction and threshold math are implemented
+//! in `neutrino-vrf`; this crate wires those primitives to the consensus wire
+//! types from docs 02 and 12.
 
 extern crate alloc;
 
@@ -24,7 +24,10 @@ use neutrino_primitives::{
 use neutrino_vrf::{VrfOutput, is_eligible, verify};
 
 /// Number of swap-or-not rounds used for public committee shuffling.
-pub const SHUFFLE_ROUND_COUNT: u8 = 90;
+pub(crate) const SHUFFLE_ROUND_COUNT: u8 = 90;
+
+/// Per-round swap-or-not pivots, which depend only on the seed.
+type ShufflePivots = [u64; SHUFFLE_ROUND_COUNT as usize];
 
 /// Result of a successful proposer VRF verification.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -206,19 +209,8 @@ pub fn verify_header_proposer(
     })
 }
 
-/// Computes the next public seed from finalized VRF proof bytes in height order.
-pub fn next_public_seed(prev_seed: &Seed, vrf_proofs: &[BlsSignature]) -> Seed {
-    neutrino_vrf::fold_seed(prev_seed, vrf_proofs)
-}
-
-/// Computes the next public seed from finalized headers in canonical height order.
-pub fn next_public_seed_from_headers(prev_seed: &Seed, headers: &[Header]) -> Seed {
-    let proofs: Vec<BlsSignature> = headers.iter().map(|header| header.vrf_proof).collect();
-    next_public_seed(prev_seed, &proofs)
-}
-
 /// Computes the public pseudo-random output used for aggregator selection.
-pub fn aggregator_selection_output(
+pub(crate) fn aggregator_selection_output(
     seed: &Seed,
     chunk_id: ChunkId,
     round: u32,
@@ -235,14 +227,18 @@ pub fn aggregator_selection_output(
 
 /// Computes Ethereum-style swap-or-not shuffling for one validator index.
 ///
+/// `pivots` must be [`shuffle_pivots`] of the same `seed`; computing them once
+/// lets a whole committee share the 90 per-round pivot hashes.
+///
 /// Returns `None` when `validator_count == 0` or `index >= validator_count`.
 /// For valid inputs this is a permutation over `0..validator_count`, so callers
 /// can iterate source positions and map them into shuffled validator indices
 /// without allocating the whole shuffled list.
-pub fn compute_shuffled_index(
+pub(crate) fn compute_shuffled_index(
     index: ValidatorIndex,
     validator_count: ValidatorIndex,
     seed: &Seed,
+    pivots: &ShufflePivots,
 ) -> Option<ValidatorIndex> {
     if validator_count == 0 || index >= validator_count {
         return None;
@@ -250,8 +246,8 @@ pub fn compute_shuffled_index(
 
     let mut index = u64::from(index);
     let count = u64::from(validator_count);
-    for round in 0..SHUFFLE_ROUND_COUNT {
-        let pivot = shuffle_pivot(seed, round) % count;
+    for (round, pivot) in (0..SHUFFLE_ROUND_COUNT).zip(pivots) {
+        let pivot = pivot % count;
         let flip = (pivot + count - index) % count;
         let position = index.max(flip);
         let source = shuffle_source(seed, round, position / 256);
@@ -279,15 +275,12 @@ pub fn aggregator_committee(
     expected_aggregators_per_round: FixedU128,
 ) -> Result<Vec<AggregatorSelection>, VrfError> {
     let total_stake = total_active_stake(active_set)?;
-    let validator_count = ValidatorIndex::try_from(active_set.len()).map_err(|_| {
-        VrfError::ValidatorIndexOverflow {
-            len: active_set.len(),
-        }
-    })?;
+    let validator_count = indexed_validator_count(active_set)?;
+    let pivots = shuffle_pivots(seed);
     let mut selected = Vec::new();
 
     for source_index in 0..validator_count {
-        let validator_index = compute_shuffled_index(source_index, validator_count, seed)
+        let validator_index = compute_shuffled_index(source_index, validator_count, seed, &pivots)
             .expect("source index is within validator count");
         let validator = &active_set
             [usize::try_from(validator_index).expect("u32 fits usize on supported targets")];
@@ -311,6 +304,50 @@ pub fn aggregator_committee(
     Ok(selected)
 }
 
+/// Whether `validator_index` is a member of [`aggregator_committee`] for the
+/// same inputs, without building the committee.
+///
+/// The committee shuffle only permutes visiting order, so a validator is a
+/// member exactly when it is active and its own selection output passes the
+/// stake-weighted threshold. Errors match [`aggregator_committee`]; an index
+/// outside the active set is not a member.
+pub fn is_aggregator(
+    active_set: &[Validator],
+    seed: &Seed,
+    chunk_id: ChunkId,
+    round: u32,
+    validator_index: ValidatorIndex,
+    expected_aggregators_per_round: FixedU128,
+) -> Result<bool, VrfError> {
+    let total_stake = total_active_stake(active_set)?;
+    indexed_validator_count(active_set)?;
+    let position = usize::try_from(validator_index).expect("u32 fits usize on supported targets");
+    let Some(validator) = active_set.get(position) else {
+        return Ok(false);
+    };
+    if validator.slashed || validator.effective_stake == 0 {
+        return Ok(false);
+    }
+    Ok(is_eligible(
+        &aggregator_selection_output(seed, chunk_id, round, validator_index),
+        validator.effective_stake,
+        total_stake,
+        expected_aggregators_per_round,
+    ))
+}
+
+fn indexed_validator_count(active_set: &[Validator]) -> Result<ValidatorIndex, VrfError> {
+    let len = active_set.len();
+    ValidatorIndex::try_from(len).map_err(|_| VrfError::ValidatorIndexOverflow { len })
+}
+
+/// Every round's swap-or-not pivot for `seed`, in round order.
+fn shuffle_pivots(seed: &Seed) -> ShufflePivots {
+    core::array::from_fn(|round| {
+        shuffle_pivot(seed, u8::try_from(round).expect("shuffle round fits u8"))
+    })
+}
+
 fn shuffle_pivot(seed: &Seed, round: u8) -> u64 {
     let digest = shuffle_digest(seed, round, None);
     u64::from_le_bytes(
@@ -327,13 +364,14 @@ fn shuffle_source(seed: &Seed, round: u8, position_window: u64) -> Hash {
 }
 
 fn shuffle_digest(seed: &Seed, round: u8, position_window: Option<u32>) -> Hash {
-    let mut message = Vec::with_capacity(seed.len() + 1 + 4);
-    message.extend_from_slice(seed);
-    message.push(round);
-    if let Some(position_window) = position_window {
-        message.extend_from_slice(&position_window.to_le_bytes());
-    }
-    sha256(&message)
+    let mut message = [0_u8; 32 + 1 + 4];
+    message[..32].copy_from_slice(seed);
+    message[32] = round;
+    let len = position_window.map_or(33, |window| {
+        message[33..].copy_from_slice(&window.to_le_bytes());
+        message.len()
+    });
+    sha256(&message[..len])
 }
 
 fn active_validator(
@@ -499,23 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn seed_fold_from_headers_matches_proof_order() {
-        let sk_a = secret_key(5);
-        let sk_b = secret_key(6);
-        let (proof_a, _) = neutrino_vrf::eval(&sk_a, DOMAIN, &SEED, SLOT);
-        let (proof_b, _) = neutrino_vrf::eval(&sk_b, DOMAIN, &SEED, SLOT + 1);
-        let header_a = header(0, proof_a.to_bytes());
-        let header_b = header(1, proof_b.to_bytes());
-
-        let folded = next_public_seed_from_headers(&SEED, &[header_a.clone(), header_b.clone()]);
-        let direct = next_public_seed(&SEED, &[header_a.vrf_proof, header_b.vrf_proof]);
-        let reversed = next_public_seed_from_headers(&SEED, &[header_b, header_a]);
-
-        assert_eq!(folded, direct);
-        assert_ne!(folded, reversed);
-    }
-
-    #[test]
     fn aggregator_output_binds_chunk_round_and_index() {
         let base = aggregator_selection_output(&SEED, 1, 2, 3);
 
@@ -527,16 +548,109 @@ mod tests {
     #[test]
     fn shuffled_index_is_a_seeded_permutation() {
         let count = 16;
+        let pivots = shuffle_pivots(&SEED);
         let mut shuffled: Vec<_> = (0..count)
-            .map(|index| compute_shuffled_index(index, count, &SEED).expect("valid index"))
-            .collect();
+            .map(|index| compute_shuffled_index(index, count, &SEED, &pivots))
+            .collect::<Option<_>>()
+            .expect("valid indices");
         let identity: Vec<_> = (0..count).collect();
 
         assert_ne!(shuffled, identity);
         shuffled.sort_unstable();
         assert_eq!(shuffled, identity);
-        assert_eq!(compute_shuffled_index(count, count, &SEED), None);
-        assert_eq!(compute_shuffled_index(0, 0, &SEED), None);
+        assert_eq!(compute_shuffled_index(count, count, &SEED, &pivots), None);
+        assert_eq!(compute_shuffled_index(0, 0, &SEED, &pivots), None);
+    }
+
+    /// The pre-refactor shuffle: a heap message per digest and a fresh pivot
+    /// hash in every round of every index.
+    fn reference_digest(seed: &Seed, round: u8, position_window: Option<u32>) -> Hash {
+        let mut message = Vec::with_capacity(seed.len() + 1 + 4);
+        message.extend_from_slice(seed);
+        message.push(round);
+        if let Some(position_window) = position_window {
+            message.extend_from_slice(&position_window.to_le_bytes());
+        }
+        sha256(&message)
+    }
+
+    fn reference_shuffled_index(index: u32, validator_count: u32, seed: &Seed) -> Option<u32> {
+        if validator_count == 0 || index >= validator_count {
+            return None;
+        }
+        let mut index = u64::from(index);
+        let count = u64::from(validator_count);
+        for round in 0..SHUFFLE_ROUND_COUNT {
+            let digest = reference_digest(seed, round, None);
+            let pivot = u64::from_le_bytes(digest[..8].try_into().unwrap()) % count;
+            let flip = (pivot + count - index) % count;
+            let position = index.max(flip);
+            let window = u32::try_from(position / 256).unwrap();
+            let source = reference_digest(seed, round, Some(window));
+            let byte = source[usize::try_from((position % 256) / 8).unwrap()];
+            if (byte >> (position % 8)) & 1 == 1 {
+                index = flip;
+            }
+        }
+        Some(u32::try_from(index).unwrap())
+    }
+
+    #[test]
+    fn precomputed_pivots_and_stack_digests_match_the_reference_shuffle() {
+        for seed_byte in [0x00, 0x42, 0xFF] {
+            let seed = [seed_byte; 32];
+            for round in [0, 1, 89] {
+                for window in [None, Some(0), Some(1), Some(u32::MAX)] {
+                    assert_eq!(
+                        shuffle_digest(&seed, round, window),
+                        reference_digest(&seed, round, window)
+                    );
+                }
+            }
+            let pivots = shuffle_pivots(&seed);
+            for count in [0, 1, 2, 3, 7, 16, 255, 256, 257, 300] {
+                for index in (0..count).chain([count, count + 1]) {
+                    assert_eq!(
+                        compute_shuffled_index(index, count, &seed, &pivots),
+                        reference_shuffled_index(index, count, &seed),
+                        "seed {seed_byte:#x}, index {index}/{count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_aggregator_answers_committee_membership_with_the_same_errors() {
+        let pk = secret_key(10).public_key().to_bytes();
+        let mut active_set: Vec<_> = (1..=24).map(|stake| validator(pk, stake * 7)).collect();
+        active_set[3].slashed = true;
+        active_set[11].effective_stake = 0;
+        for seed_byte in [0x01, 0x42, 0x99] {
+            let seed = [seed_byte; 32];
+            for (chunk_id, round) in [(0, 0), (9, 1), (1_000, 7)] {
+                for expected in [1, 4, 30].map(fixed_u128_from_integer) {
+                    let committee =
+                        aggregator_committee(&active_set, &seed, chunk_id, round, expected)
+                            .expect("committee selected");
+                    for index in 0..30 {
+                        let member = committee.iter().any(|s| s.validator_index == index);
+                        assert_eq!(
+                            is_aggregator(&active_set, &seed, chunk_id, round, index, expected),
+                            Ok(member),
+                            "seed {seed_byte:#x}, chunk {chunk_id}, round {round}, index {index}"
+                        );
+                    }
+                }
+            }
+        }
+        let overflow = [validator(pk, u64::MAX), validator(pk, 1)];
+        for set in [&[][..], &overflow[..]] {
+            assert_eq!(
+                is_aggregator(set, &SEED, 0, 0, 0, FIXED_U128_ONE),
+                aggregator_committee(set, &SEED, 0, 0, FIXED_U128_ONE).map(|_| true)
+            );
+        }
     }
 
     #[test]

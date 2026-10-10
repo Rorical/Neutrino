@@ -25,22 +25,6 @@
 //! reachable end-to-end the moment the facade crate sits between the
 //! JSON-RPC layer and `runtime_call` — without recompiling the node.
 
-/// JSON-RPC method families. Mostly informational; the server registers
-/// methods directly without consulting this enum.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum RpcNamespace {
-    /// `chain_*` — blocks and proof-finalized chunk boundaries.
-    Chain,
-    /// `system_*` — chain id, health, runtime identity.
-    System,
-    /// `state_*` — raw trie reads.
-    State,
-    /// `mempool_*` — transaction submission and status.
-    Mempool,
-    /// `runtime_*` — read-only runtime view calls.
-    Runtime,
-}
-
 pub mod backend;
 pub mod history;
 pub mod metrics;

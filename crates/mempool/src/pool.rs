@@ -177,11 +177,9 @@ impl Mempool {
         }
         self.total_bytes = new_total;
         self.by_hash.insert(hash);
-        let insert_at = self
-            .txs
-            .iter()
-            .position(|entry| priority > entry.priority)
-            .unwrap_or(self.txs.len());
+        // The queue is non-increasing in priority, so this is the first entry
+        // with a strictly lower priority: after every equal one, keeping FIFO.
+        let insert_at = self.txs.partition_point(|tx| tx.priority >= priority);
         self.txs.insert(
             insert_at,
             MempoolEntry {

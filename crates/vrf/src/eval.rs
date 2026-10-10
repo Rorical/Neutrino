@@ -30,8 +30,9 @@ pub type VrfProof = Signature;
 /// `slot` makes each `(validator, slot)` tuple have exactly one output
 /// per finalized-seed epoch.
 pub fn vrf_message(domain: ConsensusDomain, finalized_seed: &Seed, slot: Slot) -> Vec<u8> {
-    let mut payload = Vec::from(*finalized_seed);
-    payload.extend_from_slice(&slot.to_le_bytes());
+    let mut payload = [0_u8; 32 + 8];
+    payload[..32].copy_from_slice(finalized_seed);
+    payload[32..].copy_from_slice(&slot.to_le_bytes());
     domain.signing_message(DOMAIN_VRF, &payload)
 }
 

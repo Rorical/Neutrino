@@ -135,11 +135,13 @@ impl VoteAccumulator {
         let claims = merge_signed_claims(&self.attestations, vote.attestations, |claim| {
             (claim.validator_index, claim.vote_signature)
         })?;
-        if claims.len() == self.attestations.len() {
+        let retained = self.attestations.len();
+        if claims.len() == retained {
             return Ok(());
         }
-        let signatures: Vec<_> = claims.iter().map(|claim| claim.vote_signature).collect();
-        let signature = aggregate_vote_signatures(&signatures)?;
+        let signature = extend_vote_aggregate(&existing.signature, &claims, retained, |claim| {
+            claim.vote_signature
+        })?;
         let aggregation_bits = union_bit_vecs(&existing.aggregation_bits, &vote.aggregation_bits);
         let combined_stake = bitmap_stake(validators, &aggregation_bits)?;
         self.attestations = claims;
@@ -240,12 +242,6 @@ impl ChunkBft {
         self.round
     }
 
-    /// Number of validators in the active set.
-    #[must_use]
-    pub const fn active_set_len(&self) -> usize {
-        self.active_set.len()
-    }
-
     /// Eligible total, value-vote and explicit nil stake in this round.
     #[must_use]
     pub fn observed_stake(&self) -> [u64; 5] {
@@ -327,7 +323,7 @@ impl ChunkBft {
     /// Whether the accumulated prevote stake currently meets the
     /// configured 2/3 prevote quorum.
     #[must_use]
-    pub fn prevote_quorum_reached(&self) -> bool {
+    pub const fn prevote_quorum_reached(&self) -> bool {
         quorum_reached(
             self.prevotes.aggregate_stake,
             self.total_stake,
@@ -338,7 +334,7 @@ impl ChunkBft {
     /// Whether the accumulated precommit stake currently meets the
     /// configured 2/3 precommit quorum.
     #[must_use]
-    pub fn precommit_quorum_reached(&self) -> bool {
+    pub const fn precommit_quorum_reached(&self) -> bool {
         quorum_reached(
             self.precommits.aggregate_stake,
             self.total_stake,
@@ -467,6 +463,7 @@ impl ChunkBft {
                 verify_round_certificate_native(
                     self.domain,
                     &self.active_set,
+                    self.total_stake,
                     certificate,
                     self.prevote_quorum,
                 )?;
@@ -488,7 +485,13 @@ impl ChunkBft {
             {
                 return Err(BftError::WrongVoteTarget);
             }
-            verify_value_quorum_native(self.domain, &self.active_set, quorum, self.prevote_quorum)?;
+            verify_value_quorum_native(
+                self.domain,
+                &self.active_set,
+                Some(self.total_stake),
+                quorum,
+                self.prevote_quorum,
+            )?;
         }
         if self
             .proposal
@@ -518,11 +521,13 @@ impl ChunkBft {
         let claims = merge_signed_claims(&known.attestations, vote.attestations, |claim| {
             (claim.validator_index, claim.vote_signature)
         })?;
-        if claims.len() == known.attestations.len() {
+        let retained = known.attestations.len();
+        if claims.len() == retained {
             return Ok(());
         }
-        let signatures: Vec<_> = claims.iter().map(|claim| claim.vote_signature).collect();
-        let signature = aggregate_vote_signatures(&signatures)?;
+        let signature = extend_vote_aggregate(&known.signature, &claims, retained, |claim| {
+            claim.vote_signature
+        })?;
         let aggregation_bits = union_bit_vecs(&known.aggregation_bits, &vote.aggregation_bits);
         bitmap_stake(&self.active_set, &aggregation_bits)?;
         known.attestations = claims;
@@ -573,7 +578,13 @@ impl ChunkBft {
             return Err(BftError::InvalidAggregateSignature);
         }
         verify_vote_signature(self.domain, &self.active_set, &vote)?;
-        verify_attestations(self.domain, &self.active_set, &vote, self.prevote_quorum)?;
+        verify_attestations(
+            self.domain,
+            &self.active_set,
+            self.total_stake,
+            &vote,
+            self.prevote_quorum,
+        )?;
         match expected_phase {
             FinalityVotePhase::Prevote => self.prevotes.record(vote, stake, &self.active_set)?,
             FinalityVotePhase::Precommit => {
@@ -621,12 +632,30 @@ fn verify_individual_native(
     message: &[u8],
     signature: &BlsSignature,
 ) -> Result<(), BftError> {
+    let key = active_signer_key(validators, index)?;
+    verify_with_key(&key, message, signature)
+}
+
+/// Decoded key of an active, unslashed validator with positive stake.
+#[cfg(feature = "std")]
+fn active_signer_key(
+    validators: &[Validator],
+    index: u32,
+) -> Result<neutrino_crypto::bls::PublicKey, BftError> {
     let validator = validators
         .get(index as usize)
         .filter(|validator| !validator.slashed && validator.effective_stake > 0)
         .ok_or(BftError::InvalidAggregationBits)?;
-    let key = neutrino_crypto::bls::PublicKey::from_bytes(&validator.pubkey)
-        .map_err(|_| BftError::InvalidAggregateSignature)?;
+    neutrino_crypto::bls::PublicKey::from_bytes(&validator.pubkey)
+        .map_err(|_| BftError::InvalidAggregateSignature)
+}
+
+#[cfg(feature = "std")]
+fn verify_with_key(
+    key: &neutrino_crypto::bls::PublicKey,
+    message: &[u8],
+    signature: &BlsSignature,
+) -> Result<(), BftError> {
     let signature = neutrino_crypto::bls::Signature::from_bytes(signature)
         .map_err(|_| BftError::InvalidAggregateSignature)?;
     key.verify(message, &signature)
@@ -650,6 +679,7 @@ fn verify_nil_native(
     vote: &NilVote,
 ) -> Result<(), BftError> {
     nil_stake(validators, vote)?;
+    let message = vote.data.signing_message(domain);
     let mut seen = alloc::collections::BTreeSet::new();
     let mut public_keys = Vec::new();
     for claim in &vote.attestations {
@@ -659,24 +689,10 @@ fn verify_nil_native(
         {
             return Err(BftError::InvalidAggregationBits);
         }
-        verify_individual_native(
-            validators,
-            claim.validator_index,
-            &vote.data.signing_message(domain),
-            &claim.vote_signature,
-        )?;
-        verify_individual_native(
-            validators,
-            claim.validator_index,
-            &claim.signing_message(domain),
-            &claim.signature,
-        )?;
-        public_keys.push(
-            neutrino_crypto::bls::PublicKey::from_bytes(
-                &validators[claim.validator_index as usize].pubkey,
-            )
-            .map_err(|_| BftError::InvalidAggregateSignature)?,
-        );
+        let key = active_signer_key(validators, claim.validator_index)?;
+        verify_with_key(&key, &message, &claim.vote_signature)?;
+        verify_with_key(&key, &claim.signing_message(domain), &claim.signature)?;
+        public_keys.push(key);
     }
     if seen.len()
         != (0..vote.aggregation_bits.bit_len())
@@ -688,12 +704,8 @@ fn verify_nil_native(
     let refs: Vec<_> = public_keys.iter().collect();
     let signature = neutrino_crypto::bls::Signature::from_bytes(&vote.signature)
         .map_err(|_| BftError::InvalidAggregateSignature)?;
-    neutrino_crypto::bls::fast_aggregate_verify(
-        &refs,
-        &vote.data.signing_message(domain),
-        &signature,
-    )
-    .map_err(|_| BftError::InvalidAggregateSignature)
+    neutrino_crypto::bls::fast_aggregate_verify(&refs, &message, &signature)
+        .map_err(|_| BftError::InvalidAggregateSignature)
 }
 
 #[cfg(not(feature = "std"))]
@@ -705,9 +717,12 @@ fn verify_nil_native(
     Err(BftError::SignatureAggregationUnavailable)
 }
 
+/// Authenticate a carried prevote QC. `total_stake` is the active-set total
+/// when already known; `None` computes it at the point the stake check needs it.
 fn verify_value_quorum_native(
     domain: ConsensusDomain,
     validators: &[Validator],
+    total_stake: Option<u64>,
     quorum: &neutrino_consensus_types::QuorumCertificate,
     fraction: (u64, u64),
 ) -> Result<(), BftError> {
@@ -721,21 +736,26 @@ fn verify_value_quorum_native(
         signature: quorum.aggregate.signature,
         attestations: Vec::new(),
     };
-    if !quorum_reached(
-        vote_stake(validators, &vote)?,
-        total_active_stake(validators)?,
-        fraction,
-    ) {
+    let stake = vote_stake(validators, &vote)?;
+    let total_stake = total_stake.map_or_else(|| total_active_stake(validators), Ok)?;
+    if !quorum_reached(stake, total_stake, fraction) {
         return Err(BftError::InvalidQuorum);
     }
     verify_vote_signature(domain, validators, &vote)
 }
 
-fn verify_round_change_native(
+/// Authenticate one round-change report and its carried QC.
+///
+/// `total_stake` is as for [`verify_value_quorum_native`]. A QC equal to one
+/// in `verified` was already fully checked against these same inputs, so only
+/// this report's target checks repeat; each newly verified QC is appended.
+fn verify_round_change_native<'a>(
     domain: ConsensusDomain,
     validators: &[Validator],
-    report: &RoundChange,
+    total_stake: Option<u64>,
+    report: &'a RoundChange,
     fraction: (u64, u64),
+    verified: &mut Vec<&'a neutrino_consensus_types::QuorumCertificate>,
 ) -> Result<(), BftError> {
     if report.round == 0 {
         return Err(BftError::WrongVoteTarget);
@@ -750,7 +770,10 @@ fn verify_round_change_native(
         if quorum.data.chunk_id != report.chunk_id || quorum.data.round >= report.round {
             return Err(BftError::WrongVoteTarget);
         }
-        verify_value_quorum_native(domain, validators, quorum, fraction)?;
+        if !verified.contains(&quorum) {
+            verify_value_quorum_native(domain, validators, total_stake, quorum, fraction)?;
+            verified.push(quorum);
+        }
     }
     Ok(())
 }
@@ -758,11 +781,13 @@ fn verify_round_change_native(
 fn verify_round_certificate_native(
     domain: ConsensusDomain,
     validators: &[Validator],
+    total_stake: u64,
     certificate: &neutrino_consensus_types::RoundChangeCertificate,
     fraction: (u64, u64),
 ) -> Result<(), BftError> {
     validate_quorum(fraction)?;
     let mut seen = alloc::collections::BTreeSet::new();
+    let mut verified = Vec::new();
     let mut stake = 0_u64;
     for report in &certificate.reports {
         if report.chunk_id != certificate.chunk_id
@@ -771,12 +796,19 @@ fn verify_round_certificate_native(
         {
             return Err(BftError::WrongVoteTarget);
         }
-        verify_round_change_native(domain, validators, report, fraction)?;
+        verify_round_change_native(
+            domain,
+            validators,
+            Some(total_stake),
+            report,
+            fraction,
+            &mut verified,
+        )?;
         stake = stake
             .checked_add(validators[report.validator_index as usize].effective_stake)
             .ok_or(BftError::StakeOverflow)?;
     }
-    if !quorum_reached(stake, total_active_stake(validators)?, fraction) {
+    if !quorum_reached(stake, total_stake, fraction) {
         return Err(BftError::InvalidQuorum);
     }
     Ok(())
@@ -786,9 +818,11 @@ fn verify_round_certificate_native(
 fn verify_attestations(
     domain: ConsensusDomain,
     validators: &[Validator],
+    total_stake: u64,
     vote: &FinalityVote,
     prevote_quorum: (u64, u64),
 ) -> Result<(), BftError> {
+    let vote_message = finality_vote_signed_message(domain, &vote.data);
     let mut seen = alloc::collections::BTreeSet::new();
     let mut checked_quorums = Vec::new();
     for claim in &vote.attestations {
@@ -810,11 +844,8 @@ fn verify_attestations(
             .map_err(|_| BftError::InvalidAggregateSignature)?;
         let individual = neutrino_crypto::bls::Signature::from_bytes(&claim.vote_signature)
             .map_err(|_| BftError::InvalidAggregateSignature)?;
-        key.verify(
-            &finality_vote_signed_message(domain, &claim.vote),
-            &individual,
-        )
-        .map_err(|_| BftError::InvalidAggregateSignature)?;
+        key.verify(&vote_message, &individual)
+            .map_err(|_| BftError::InvalidAggregateSignature)?;
         key.verify(&claim.signing_message(domain), &signature)
             .map_err(|_| BftError::InvalidAggregateSignature)?;
         if let Some(quorum) = &claim.unlock_quorum {
@@ -830,7 +861,7 @@ fn verify_attestations(
                 return Err(BftError::WrongVoteTarget);
             }
             let stake = bitmap_stake(validators, &quorum.aggregate.aggregation_bits)?;
-            if !quorum_reached(stake, total_active_stake(validators)?, prevote_quorum) {
+            if !quorum_reached(stake, total_stake, prevote_quorum) {
                 return Err(BftError::InvalidQuorum);
             }
             if !checked_quorums.contains(&quorum) {
@@ -852,18 +883,15 @@ fn verify_attestations(
 fn verify_attestations(
     _chain_id: ConsensusDomain,
     _validators: &[Validator],
+    _total_stake: u64,
     _vote: &FinalityVote,
     _prevote_quorum: (u64, u64),
 ) -> Result<(), BftError> {
     Err(BftError::SignatureAggregationUnavailable)
 }
 
-fn validate_quorum((numerator, denominator): (u64, u64)) -> Result<(), BftError> {
-    if numerator == 0
-        || denominator == 0
-        || numerator > denominator
-        || 3 * u128::from(numerator) < 2 * u128::from(denominator)
-    {
+const fn validate_quorum((numerator, denominator): (u64, u64)) -> Result<(), BftError> {
+    if !neutrino_primitives::quorum_fraction_valid(numerator, denominator) {
         return Err(BftError::InvalidQuorum);
     }
     Ok(())
@@ -953,8 +981,12 @@ fn verify_vote_signature(
     Err(BftError::SignatureAggregationUnavailable)
 }
 
-fn quorum_reached(stake: u64, total_stake: u64, (numerator, denominator): (u64, u64)) -> bool {
-    u128::from(stake) * u128::from(denominator) >= u128::from(total_stake) * u128::from(numerator)
+const fn quorum_reached(
+    stake: u64,
+    total_stake: u64,
+    (numerator, denominator): (u64, u64),
+) -> bool {
+    neutrino_primitives::quorum_reached(stake, total_stake, numerator, denominator)
 }
 
 fn merge_signed_claims<T: Clone>(
@@ -1003,14 +1035,52 @@ fn aggregate_vote_signatures(signatures: &[BlsSignature]) -> Result<BlsSignature
         .map_err(|_| BftError::InvalidAggregateSignature)
 }
 
+/// Aggregate the vote signatures of `claims[retained..]` onto `existing`, the
+/// aggregate of exactly `claims[..retained]`.
+///
+/// Every retained aggregate was verified with exact signer coverage against
+/// individually verified, subgroup-checked claim signatures. BLS signatures are
+/// unique per key and message, so a verified aggregate is the group sum of its
+/// claims; group addition is associative and commutative and the compressed
+/// encoding is canonical, so the result equals aggregating every claim afresh.
+/// The identity, reachable only when retained signatures cancel, does not
+/// decode and falls back to that full aggregation.
+#[cfg(feature = "std")]
+fn extend_vote_aggregate<T>(
+    existing: &BlsSignature,
+    claims: &[T],
+    retained: usize,
+    vote_signature: impl Fn(&T) -> BlsSignature,
+) -> Result<BlsSignature, BftError> {
+    let Ok(existing) = neutrino_crypto::bls::Signature::from_bytes(existing) else {
+        let signatures: Vec<_> = claims.iter().map(&vote_signature).collect();
+        return aggregate_vote_signatures(&signatures);
+    };
+    let added = claims[retained..]
+        .iter()
+        .map(|claim| neutrino_crypto::bls::Signature::from_bytes(&vote_signature(claim)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| BftError::InvalidAggregateSignature)?;
+    let refs: Vec<_> = core::iter::once(&existing).chain(&added).collect();
+    neutrino_crypto::bls::aggregate_signatures(&refs)
+        .map(|signature| signature.to_bytes())
+        .map_err(|_| BftError::InvalidAggregateSignature)
+}
+
 #[cfg(not(feature = "std"))]
-fn aggregate_vote_signatures(_signatures: &[BlsSignature]) -> Result<BlsSignature, BftError> {
+fn extend_vote_aggregate<T>(
+    _existing: &BlsSignature,
+    _claims: &[T],
+    _retained: usize,
+    _vote_signature: impl Fn(&T) -> BlsSignature,
+) -> Result<BlsSignature, BftError> {
     Err(BftError::SignatureAggregationUnavailable)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neutrino_consensus_types::{QuorumCertificate, RoundChangeCertificate};
     use neutrino_primitives::{BitVec, Validator};
 
     const DOMAIN: ConsensusDomain = ConsensusDomain {
@@ -1696,6 +1766,112 @@ mod tests {
                 Err(BftError::InvalidAggregationBits)
             );
             assert_eq!(bft.aggregate_stake(FinalityVotePhase::Precommit), 0);
+        }
+    }
+
+    #[test]
+    fn extended_aggregates_equal_full_reaggregation_even_after_cancellation() {
+        let message =
+            finality_vote_signed_message(DOMAIN, &vote_data(FinalityVotePhase::Prevote, 0));
+        // The scalars 1 and r - 1 are opposite, so their signatures sum to the identity.
+        let minus_one: [u8; 32] = [
+            0x73ed_a753_299d_7d48_u64,
+            0x3339_d808_09a1_d805,
+            0x53bd_a402_fffe_5bfe,
+            0xffff_ffff_0000_0000,
+        ]
+        .map(u64::to_be_bytes)
+        .concat()
+        .try_into()
+        .unwrap();
+        let mut one = [0_u8; 32];
+        one[31] = 1;
+        let mut keys: Vec<_> = [one, minus_one]
+            .iter()
+            .map(|scalar| neutrino_crypto::bls::SecretKey::from_bytes(scalar).unwrap())
+            .collect();
+        keys.extend((0..4).map(test_secret_key));
+        let signatures: Vec<_> = keys
+            .iter()
+            .map(|key| key.sign(&message).to_bytes())
+            .collect();
+        let cancelled = aggregate_vote_signatures(&signatures[..2]).unwrap();
+        assert!(neutrino_crypto::bls::Signature::from_bytes(&cancelled).is_err());
+        for end in 2..=signatures.len() {
+            let claims = &signatures[..end];
+            let expected = aggregate_vote_signatures(claims).unwrap();
+            for retained in 1..end {
+                let existing = aggregate_vote_signatures(&claims[..retained]).unwrap();
+                assert_eq!(
+                    extend_vote_aggregate(&existing, claims, retained, |signature| *signature),
+                    Ok(expected),
+                    "retained {retained} of {end}"
+                );
+            }
+        }
+    }
+
+    fn signed_round_change(
+        index: usize,
+        highest_quorum: Option<&QuorumCertificate>,
+    ) -> RoundChange {
+        let mut report = RoundChange {
+            chunk_id: chunk().chunk_id,
+            round: 1,
+            validator_index: u32::try_from(index).unwrap(),
+            highest_quorum: highest_quorum.cloned(),
+            signature: [0; 96],
+        };
+        let key = test_secret_key(index);
+        report.signature = key.sign(&report.signing_message(DOMAIN)).to_bytes();
+        report
+    }
+
+    fn verify_each_report(
+        validators: &[Validator],
+        reports: &[RoundChange],
+    ) -> Result<(), BftError> {
+        for report in reports {
+            let mut fresh = Vec::new();
+            verify_round_change_native(DOMAIN, validators, None, report, (2, 3), &mut fresh)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn round_certificates_verify_each_distinct_carried_quorum_once() {
+        let validators = validators();
+        let prevote = signed_vote_for_positions(FinalityVotePhase::Prevote, 0, &[0, 1]);
+        let precommit = signed_vote_for_positions(FinalityVotePhase::Precommit, 0, &[0, 1]);
+        let quorum = QuorumCertificate {
+            data: prevote.data,
+            aggregate: AggregatedVote {
+                aggregation_bits: prevote.aggregation_bits,
+                signature: prevote.signature,
+            },
+        };
+        let mut tampered = quorum.clone();
+        tampered.aggregate.signature = precommit.signature;
+        let (valid, forged) = (Some(&quorum), Some(&tampered));
+        for carried in [
+            [valid, valid, valid],
+            [valid, None, valid],
+            [None, valid, forged],
+            [forged, valid, valid],
+        ] {
+            let certificate = RoundChangeCertificate {
+                chunk_id: chunk().chunk_id,
+                round: 1,
+                reports: (0..3)
+                    .zip(carried)
+                    .map(|(index, quorum)| signed_round_change(index, quorum))
+                    .collect(),
+            };
+            let result =
+                verify_round_certificate_native(DOMAIN, &validators, 3, &certificate, (2, 3));
+            let expected = verify_each_report(&validators, &certificate.reports);
+            assert_eq!(result, expected);
+            assert_eq!(result.is_ok(), !carried.contains(&forged));
         }
     }
 }

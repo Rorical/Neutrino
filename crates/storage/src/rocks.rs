@@ -121,6 +121,23 @@ impl RocksDbDatabase {
             .cf_handle(column.name())
             .ok_or(RocksDbError::MissingColumn(column))
     }
+
+    /// Translate `batch` into one RocksDB write batch, failing on the first
+    /// operation that names a missing column.
+    fn to_write_batch(&self, batch: Batch) -> Result<WriteBatch, RocksDbError> {
+        let mut write_batch = WriteBatch::default();
+        for op in batch.into_operations() {
+            match op {
+                BatchOp::Put { column, key, value } => {
+                    write_batch.put_cf(&self.cf(column)?, key, value);
+                }
+                BatchOp::Delete { column, key } => {
+                    write_batch.delete_cf(&self.cf(column)?, key);
+                }
+            }
+        }
+        Ok(write_batch)
+    }
 }
 
 impl Database for RocksDbDatabase {
@@ -167,36 +184,14 @@ impl Database for RocksDbDatabase {
 
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error> {
         self.observe(Operation::Batch, || {
-            let mut write_batch = WriteBatch::default();
-            for op in batch.into_operations() {
-                match op {
-                    BatchOp::Put { column, key, value } => {
-                        let cf = self.cf(column)?;
-                        write_batch.put_cf(&cf, key, value);
-                    }
-                    BatchOp::Delete { column, key } => {
-                        let cf = self.cf(column)?;
-                        write_batch.delete_cf(&cf, key);
-                    }
-                }
-            }
+            let write_batch = self.to_write_batch(batch)?;
             self.db.write(write_batch).map_err(Into::into)
         })
     }
 
     fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
         self.observe(Operation::DurableBatch, || {
-            let mut write_batch = WriteBatch::default();
-            for op in batch.into_operations() {
-                match op {
-                    BatchOp::Put { column, key, value } => {
-                        write_batch.put_cf(&self.cf(column)?, key, value);
-                    }
-                    BatchOp::Delete { column, key } => {
-                        write_batch.delete_cf(&self.cf(column)?, key);
-                    }
-                }
-            }
+            let write_batch = self.to_write_batch(batch)?;
             let mut options = rocksdb::WriteOptions::default();
             options.set_sync(true);
             options.disable_wal(false);

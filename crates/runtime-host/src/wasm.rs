@@ -16,7 +16,6 @@
 // cousins of those carried by `master::wasm_abi`.
 #![allow(
     clippy::cast_possible_truncation, // usize <-> u32 conversions for wasm linear-memory addresses.
-    clippy::cast_possible_wrap,       // u32 length carried as i32 result code (negative = absent).
     clippy::cast_sign_loss,
     clippy::cast_lossless
 )]
@@ -231,12 +230,12 @@ impl WasmRuntime {
             .get_memory(&mut store, MEMORY_EXPORT)
             .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
 
+        let input_len = u32::try_from(input.len())
+            .map_err(|_| WasmError::Codec("input exceeds the guest address space".to_owned()))?;
         let allocate: TypedFunc<u32, u32> = instance
             .get_typed_func(&mut store, ALLOCATE_ENTRYPOINT)
             .map_err(wt_err)?;
-        let input_ptr = allocate
-            .call(&mut store, input.len() as u32)
-            .map_err(trap_err)?;
+        let input_ptr = allocate.call(&mut store, input_len).map_err(trap_err)?;
         memory
             .write(&mut store, input_ptr as usize, input)
             .map_err(wt_err)?;
@@ -244,20 +243,21 @@ impl WasmRuntime {
         let entry_fn: TypedFunc<(u32, u32), u64> =
             instance.get_typed_func(&mut store, entry).map_err(wt_err)?;
         let packed = entry_fn
-            .call(&mut store, (input_ptr, input.len() as u32))
+            .call(&mut store, (input_ptr, input_len))
             .map_err(trap_err)?;
         let output_ptr = (packed >> 32) as u32;
         let output_len = (packed & 0xFFFF_FFFF) as u32;
 
-        let mut output = vec![0u8; output_len as usize];
-        memory
-            .read(&store, output_ptr as usize, &mut output)
-            .map_err(wt_err)?;
+        // Bound the guest-chosen range before copying, so a hostile length
+        // cannot size a host allocation.
+        let output = guest_slice(memory.data(&store), output_ptr, output_len)
+            .ok_or_else(|| WasmError::Wasmtime("output range outside guest memory".to_owned()))?
+            .to_vec();
 
         if let Ok(deallocate) =
             instance.get_typed_func::<(u32, u32), ()>(&mut store, DEALLOCATE_ENTRYPOINT)
         {
-            let _ = deallocate.call(&mut store, (input_ptr, input.len() as u32));
+            let _ = deallocate.call(&mut store, (input_ptr, input_len));
             let _ = deallocate.call(&mut store, (output_ptr, output_len));
         }
 
@@ -452,17 +452,38 @@ impl HostState {
         }
     }
 
-    fn write(&mut self, key: &[u8], value: Vec<u8>) {
+    fn write(&mut self, key: &[u8], value: Vec<u8>) -> wasmtime::Result<()> {
         self.accessed.insert(key.to_vec());
+        // `TrieError` implements `std::error::Error` only when the trie's
+        // `std` feature is unified in, so convert it explicitly.
         self.scratch
             .insert(key, value)
-            .expect("trie insert never fails for length-prefixed keys");
+            .map_err(|error| wasmtime::Error::msg(format!("state write rejected: {error:?}")))?;
+        Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) {
         self.accessed.insert(key.to_vec());
         let _ = self.scratch.remove(key);
     }
+}
+
+/// Longest state key the trie can address: its length-prefixed bit path of
+/// `4 + len` bytes must count its bits in a `u32`. Longer keys trap instead of
+/// reaching the trie's panic.
+const MAX_STATE_KEY_BYTES: usize = (u32::MAX / 8) as usize - 4;
+
+/// The `len` bytes of `memory` at `ptr`, or `None` when the range leaves it.
+/// Checked before the host copies or allocates anything for the range.
+fn guest_slice(memory: &[u8], ptr: u32, len: u32) -> Option<&[u8]> {
+    let start = ptr as usize;
+    memory.get(start..start.checked_add(len as usize)?)
+}
+
+/// Trap for a host import naming memory outside the guest's linear memory,
+/// classified like the guest's own out-of-bounds access.
+fn out_of_bounds() -> wasmtime::Error {
+    Trap::MemoryOutOfBounds.into()
 }
 
 fn memory_of(caller: &mut Caller<'_, HostState>) -> Result<Memory, wasmtime::Error> {
@@ -478,9 +499,21 @@ fn read_bytes(
     len: u32,
 ) -> Result<Vec<u8>, wasmtime::Error> {
     let memory = memory_of(caller)?;
-    let mut buf = vec![0u8; len as usize];
-    memory.read(&*caller, ptr as usize, &mut buf)?;
-    Ok(buf)
+    guest_slice(memory.data(&*caller), ptr, len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(out_of_bounds)
+}
+
+/// [`read_bytes`] for a state key, which must also fit the trie.
+fn read_key(
+    caller: &mut Caller<'_, HostState>,
+    ptr: u32,
+    len: u32,
+) -> Result<Vec<u8>, wasmtime::Error> {
+    if len as usize > MAX_STATE_KEY_BYTES {
+        return Err(wasmtime::Error::msg("state key too long for the trie"));
+    }
+    read_bytes(caller, ptr, len)
 }
 
 fn write_bytes(
@@ -489,33 +522,40 @@ fn write_bytes(
     bytes: &[u8],
 ) -> Result<(), wasmtime::Error> {
     let memory = memory_of(caller)?;
-    memory.write(caller, ptr as usize, bytes)?;
-    Ok(())
+    memory
+        .write(caller, ptr as usize, bytes)
+        .map_err(|_| out_of_bounds())
 }
 
 // Six host imports registered as inline closures keeps each handler
 // next to its description and avoids name-pollution helper functions.
+// Every import validates its guest-supplied arguments and returns a trap
+// error on violation: a panic here would unwind out of wasmtime into the
+// node thread that called the runtime.
 fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
     linker
         .func_wrap(
             HOST_IMPORT_MODULE,
             "state_read_len",
-            |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> i32 {
-                let Ok(key) = read_bytes(&mut caller, key_ptr, key_len) else {
-                    return -1;
-                };
+            |mut caller: Caller<'_, HostState>,
+             key_ptr: u32,
+             key_len: u32|
+             -> wasmtime::Result<i32> {
+                let key = read_key(&mut caller, key_ptr, key_len)?;
                 let host = caller.data_mut();
                 host.accessed.insert(key.clone());
                 // Reads honour the scratch trie because that captures both
                 // live state and any writes the guest already made.
-                if let Some(v) = host.scratch.get(&key) {
-                    let len = v.len() as i32;
-                    host.pending_read_value = Some(v);
-                    len
-                } else {
+                let Some(value) = host.scratch.get(&key) else {
                     host.pending_read_value = None;
-                    -1
-                }
+                    return Ok(-1);
+                };
+                // `-1` means absent, so a present length must be a
+                // non-negative `i32`.
+                let len = i32::try_from(value.len())
+                    .map_err(|_| wasmtime::Error::msg("state value length exceeds i32::MAX"))?;
+                host.pending_read_value = Some(value);
+                Ok(len)
             },
         )
         .map_err(wt_err)?;
@@ -524,13 +564,13 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError
         .func_wrap(
             HOST_IMPORT_MODULE,
             "state_read_into",
-            |mut caller: Caller<'_, HostState>, value_ptr: u32| {
+            |mut caller: Caller<'_, HostState>, value_ptr: u32| -> wasmtime::Result<()> {
                 let value = caller
                     .data_mut()
                     .pending_read_value
                     .take()
-                    .expect("pending_read_value set by state_read_len");
-                let _ = write_bytes(&mut caller, value_ptr, &value);
+                    .ok_or_else(|| wasmtime::Error::msg("no pending state_read_len value"))?;
+                write_bytes(&mut caller, value_ptr, &value)
             },
         )
         .map_err(wt_err)?;
@@ -543,18 +583,19 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError
              key_ptr: u32,
              key_len: u32,
              value_ptr: u32,
-             value_len: u32| {
-                let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
-                let value = read_bytes(&mut caller, value_ptr, value_len).expect("read value");
+             value_len: u32|
+             -> wasmtime::Result<()> {
+                let key = read_key(&mut caller, key_ptr, key_len)?;
+                let value = read_bytes(&mut caller, value_ptr, value_len)?;
                 let host = caller.data_mut();
                 if host.read_only {
                     // Query mode: drop the write silently and flag the
                     // attempt so the caller substitutes
                     // PermissionDenied for the runtime's response.
                     host.write_attempted = true;
-                    return;
+                    return Ok(());
                 }
-                host.write(&key, value);
+                host.write(&key, value)
             },
         )
         .map_err(wt_err)?;
@@ -563,16 +604,20 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError
         .func_wrap(
             HOST_IMPORT_MODULE,
             "state_delete",
-            |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| {
-                let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
+            |mut caller: Caller<'_, HostState>,
+             key_ptr: u32,
+             key_len: u32|
+             -> wasmtime::Result<()> {
+                let key = read_key(&mut caller, key_ptr, key_len)?;
                 let host = caller.data_mut();
                 if host.read_only {
                     // Query mode: drop the delete silently and flag
                     // the attempt; see `state_write`.
                     host.write_attempted = true;
-                    return;
+                    return Ok(());
                 }
                 host.delete(&key);
+                Ok(())
             },
         )
         .map_err(wt_err)?;
@@ -581,9 +626,9 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError
         .func_wrap(
             HOST_IMPORT_MODULE,
             "pre_state_root",
-            |mut caller: Caller<'_, HostState>, out_ptr: u32| {
+            |mut caller: Caller<'_, HostState>, out_ptr: u32| -> wasmtime::Result<()> {
                 let root = caller.data().pre_root;
-                let _ = write_bytes(&mut caller, out_ptr, &root);
+                write_bytes(&mut caller, out_ptr, &root)
             },
         )
         .map_err(wt_err)?;
@@ -592,12 +637,190 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError
         .func_wrap(
             HOST_IMPORT_MODULE,
             "post_state_root",
-            |mut caller: Caller<'_, HostState>, out_ptr: u32| {
+            |mut caller: Caller<'_, HostState>, out_ptr: u32| -> wasmtime::Result<()> {
                 let root = caller.data().scratch.root();
-                let _ = write_bytes(&mut caller, out_ptr, &root);
+                write_bytes(&mut caller, out_ptr, &root)
             },
         )
         .map_err(wt_err)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Host imports in function-index order with their wasm type indices.
+    const IMPORTS: [(&str, u8); 6] = [
+        ("state_read_len", 0),
+        ("state_read_into", 1),
+        ("state_write", 2),
+        ("state_delete", 3),
+        ("pre_state_root", 1),
+        ("post_state_root", 1),
+    ];
+
+    /// Encoded function types: `(i32, i32) -> i32`, `(i32) -> ()`,
+    /// `(i32, i32, i32, i32) -> ()` and `(i32, i32) -> ()` for the imports,
+    /// then `(i32) -> i32` for `neutrino_allocate` and `(i32, i32) -> i64`
+    /// for the entrypoints.
+    const TYPES: [&[u8]; 6] = [
+        b"\x60\x02\x7f\x7f\x01\x7f",
+        b"\x60\x01\x7f\x00",
+        b"\x60\x04\x7f\x7f\x7f\x7f\x00",
+        b"\x60\x02\x7f\x7f\x00",
+        b"\x60\x01\x7f\x01\x7f",
+        b"\x60\x02\x7f\x7f\x01\x7e",
+    ];
+
+    // Entrypoint bodies. Each leaves `i64.const 0` unless it trapped; `-16`
+    // and 65 520 leave the single memory page once 32 bytes are added.
+
+    /// `state_read_into(0)` without any read.
+    const READ_INTO_UNREAD: &[u8] = b"\x41\x00\x10\x01\x42\x00";
+    /// `state_read_len(0, 2)` of absent key `[0, 0]`, then `state_read_into(0)`.
+    const READ_INTO_ABSENT: &[u8] = b"\x41\x00\x41\x02\x10\x00\x1a\x41\x00\x10\x01\x42\x00";
+    /// `state_read_len(-16, 32)`.
+    const READ_LEN_OUTSIDE: &[u8] = b"\x41\x70\x41\x20\x10\x00\x1a\x42\x00";
+    /// `state_write(-16, 32, 0, 0)`.
+    const WRITE_KEY_OUTSIDE: &[u8] = b"\x41\x70\x41\x20\x41\x00\x41\x00\x10\x02\x42\x00";
+    /// `state_write(0, 1, -16, 32)`.
+    const WRITE_VALUE_OUTSIDE: &[u8] = b"\x41\x00\x41\x01\x41\x70\x41\x20\x10\x02\x42\x00";
+    /// `state_delete(-16, 32)`.
+    const DELETE_OUTSIDE: &[u8] = b"\x41\x70\x41\x20\x10\x03\x42\x00";
+    /// `state_read_len(0, 1)` of present key `[0]`, then `state_read_into(-16)`.
+    const READ_INTO_OUTSIDE: &[u8] = b"\x41\x00\x41\x01\x10\x00\x1a\x41\x70\x10\x01\x42\x00";
+    /// `pre_state_root(65_520)`.
+    const PRE_ROOT_OUTSIDE: &[u8] = b"\x41\xf0\xff\x03\x10\x04\x42\x00";
+    /// `post_state_root(65_520)`.
+    const POST_ROOT_OUTSIDE: &[u8] = b"\x41\xf0\xff\x03\x10\x05\x42\x00";
+    /// Packed output at address 0 with length `u32::MAX`.
+    const HUGE_OUTPUT: &[u8] = b"\x42\xff\xff\xff\xff\x0f";
+
+    /// Append `value` as unsigned LEB128.
+    fn push_leb(out: &mut Vec<u8>, mut value: usize) {
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    /// Append `name` as a length-prefixed wasm name.
+    fn push_name(out: &mut Vec<u8>, name: &str) {
+        push_leb(out, name.len());
+        out.extend_from_slice(name.as_bytes());
+    }
+
+    /// A runtime whose query and admission entrypoints both run `body`, raw
+    /// instructions leaving the packed `i64` output. Host import `i` of
+    /// [`IMPORTS`] is function `i`; `neutrino_allocate` returns address 1024.
+    fn runtime_running(body: &[u8]) -> WasmRuntime {
+        let mut types = vec![6];
+        for ty in TYPES {
+            types.extend_from_slice(ty);
+        }
+        let mut imports = vec![6];
+        for (field, ty) in IMPORTS {
+            push_name(&mut imports, HOST_IMPORT_MODULE);
+            push_name(&mut imports, field);
+            imports.extend_from_slice(&[0x00, ty]);
+        }
+        let mut exports = vec![4];
+        for (field, kind, index) in [
+            (MEMORY_EXPORT, 0x02, 0),
+            (ALLOCATE_ENTRYPOINT, 0x00, 6),
+            (QUERY_ENTRYPOINT, 0x00, 7),
+            (VALIDATE_TX_ENTRYPOINT, 0x00, 7),
+        ] {
+            push_name(&mut exports, field);
+            exports.extend_from_slice(&[kind, index]);
+        }
+        // Two bodies without locals: `i32.const 1024`, then `body`.
+        let mut code = vec![2, 5, 0x00, 0x41, 0x80, 0x08, 0x0b];
+        push_leb(&mut code, body.len() + 2);
+        code.push(0x00);
+        code.extend_from_slice(body);
+        code.push(0x0b);
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        for (id, section) in [
+            (1, types),
+            (2, imports),
+            (3, vec![2, 4, 5]),
+            (5, vec![1, 0x00, 1]),
+            (7, exports),
+            (10, code),
+        ] {
+            module.push(id);
+            push_leb(&mut module, section.len());
+            module.extend_from_slice(&section);
+        }
+        WasmRuntime::new(&module).expect("valid test runtime")
+    }
+
+    /// Query and admission errors of a runtime running `body` over state
+    /// holding key `[0]`.
+    fn errors_of(body: &[u8]) -> [WasmError; 2] {
+        let runtime = runtime_running(body);
+        let mut live = Trie::<Poseidon2Hasher>::default();
+        live.insert(&[0], b"v".to_vec()).expect("test state");
+        let request = QueryRequest {
+            method: "any".to_owned(),
+            args: Vec::new(),
+        };
+        let query = runtime.query(&request, &live);
+        let admission = runtime.validate_tx(&[], 1, 1, &live);
+        [
+            query.expect_err("query traps"),
+            admission.expect_err("admission traps"),
+        ]
+    }
+
+    #[test]
+    fn reading_nothing_pending_traps_instead_of_panicking() {
+        for body in [READ_INTO_UNREAD, READ_INTO_ABSENT] {
+            for err in errors_of(body) {
+                assert!(matches!(err, WasmError::Wasmtime(_)), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn import_ranges_outside_memory_trap_as_memory_faults() {
+        for body in [
+            READ_LEN_OUTSIDE,
+            WRITE_KEY_OUTSIDE,
+            WRITE_VALUE_OUTSIDE,
+            DELETE_OUTSIDE,
+            READ_INTO_OUTSIDE,
+            PRE_ROOT_OUTSIDE,
+            POST_ROOT_OUTSIDE,
+        ] {
+            for err in errors_of(body) {
+                assert!(matches!(err, WasmError::ResourceLimit(_)), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn output_ranges_outside_memory_are_rejected_before_copying() {
+        for err in errors_of(HUGE_OUTPUT) {
+            assert!(matches!(err, WasmError::Wasmtime(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn guest_ranges_and_state_keys_are_bounded() {
+        let memory = [0_u8; 8];
+        assert_eq!(guest_slice(&memory, 8, 0), Some(&[][..]));
+        assert_eq!(guest_slice(&memory, 4, 4), Some(&memory[4..]));
+        assert_eq!(guest_slice(&memory, 4, 5), None);
+        assert_eq!(guest_slice(&memory, 9, 0), None);
+        assert_eq!(guest_slice(&memory, u32::MAX, u32::MAX), None);
+        // The trie prefixes a four-byte length and counts the bits in a u32.
+        let bits = |key_len: usize| u32::try_from((key_len + 4) * 8);
+        assert!(bits(MAX_STATE_KEY_BYTES).is_ok());
+        assert!(bits(MAX_STATE_KEY_BYTES + 1).is_err());
+    }
 }

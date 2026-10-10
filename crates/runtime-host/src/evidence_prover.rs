@@ -17,7 +17,8 @@ use neutrino_consensus_types::{
 use neutrino_proof_system::ProofError;
 use neutrino_prover_chunk::{
     evidence::{
-        EvidenceBatchWitness, EvidenceWitness, validate_evidence_batch, validate_evidence_using,
+        EvidenceBatchWitness, EvidenceWitness, MAX_EVIDENCE_FACT_STATEMENTS,
+        validate_evidence_batch, validate_evidence_using,
     },
     execution::commitment,
     facts::{FactRecorder, FactRequest, FactStatement, FactWitness, MAX_FACTS, ProvenFact},
@@ -26,13 +27,40 @@ use neutrino_prover_chunk::{
 use sp1_sdk::{SP1Stdin, blocking::ProveRequest};
 use std::{collections::BTreeSet, sync::Arc};
 
+/// Most fact requests one preproving call compresses.
+const MAX_PREPROVED_REQUESTS: usize = 16_384;
+
+/// What a set of fact receipts is ensured for, which decides how many
+/// statements it may span.
+#[derive(Clone, Copy)]
+enum FactUse {
+    /// Filling the reusable cache before any offence is known. Only the
+    /// request count is bounded; no single batch carries the result.
+    Preprove,
+    /// Attaching to one evidence batch, whose Guest accepts at most
+    /// [`MAX_EVIDENCE_FACT_STATEMENTS`] statements.
+    EvidenceBatch,
+}
+
+impl FactUse {
+    /// `true` when `cached` covering receipts plus the new statements
+    /// proving `missing` requests, [`MAX_FACTS`] per statement, fit this use.
+    const fn admits(self, cached: usize, missing: usize) -> bool {
+        let statements = cached.saturating_add(missing.div_ceil(MAX_FACTS));
+        match self {
+            Self::Preprove => true,
+            Self::EvidenceBatch => statements <= MAX_EVIDENCE_FACT_STATEMENTS,
+        }
+    }
+}
+
 impl<P: ProgramProver> Sp1ProofSystem<P> {
     pub(super) fn compress_facts(
         &self,
         fact_program: &VkDigest,
         requests: &[FactRequest],
     ) -> Result<Vec<Arc<FactReceipt>>, ProofError> {
-        if requests.len() > 16_384 {
+        if requests.len() > MAX_PREPROVED_REQUESTS {
             return Err(ProofError::InvalidWitness);
         }
         let known = self.with_fact_cache(fact_program, |cache| cache.verified())?;
@@ -43,13 +71,18 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         self.ensure_facts(
             fact_program,
             recorder.finish().map_err(|_| ProofError::InvalidWitness)?,
+            FactUse::Preprove,
         )
     }
 
+    /// Receipts covering every request: cached receipts first, then new
+    /// statements of at most [`MAX_FACTS`] proven requests each. Rejects a
+    /// set `purpose` does not admit before proving anything.
     fn ensure_facts(
         &self,
         fact_program: &VkDigest,
         requests: Vec<(FactRequest, bool)>,
+        purpose: FactUse,
     ) -> Result<Vec<Arc<FactReceipt>>, ProofError> {
         let fact = self.keys(fact_program)?;
         let _single_flight = self
@@ -65,6 +98,9 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             .into_iter()
             .filter(|(request, _)| missing.contains(&request.id()))
             .collect();
+        if !purpose.admits(receipts.len(), requests.len()) {
+            return Err(ProofError::InvalidWitness);
+        }
         for group in requests.chunks(MAX_FACTS) {
             let statement = FactStatement {
                 facts: group
@@ -100,9 +136,6 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             })?;
             receipts.push(receipt);
         }
-        if receipts.len() > 256 {
-            return Err(ProofError::InvalidWitness);
-        }
         Ok(receipts)
     }
 
@@ -137,6 +170,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         let receipts = self.ensure_facts(
             &fact_program,
             recorder.finish().map_err(|_| ProofError::InvalidWitness)?,
+            FactUse::EvidenceBatch,
         )?;
         let input = EvidenceBatchWitness {
             witnesses: witnesses.to_vec(),
@@ -177,5 +211,36 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
                 proof_bytes: bytes.clone(),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FactUse, MAX_PREPROVED_REQUESTS};
+    use neutrino_prover_chunk::{evidence::MAX_EVIDENCE_FACT_STATEMENTS, facts::MAX_FACTS};
+
+    #[test]
+    fn preproving_is_not_bounded_by_one_evidence_batch() {
+        // A full preproving call alone fills a whole evidence batch's
+        // statement budget, so any covering cached receipt exceeds it.
+        // Preproving must still accept and cache everything it proves.
+        assert!(FactUse::Preprove.admits(0, MAX_PREPROVED_REQUESTS));
+        assert!(FactUse::Preprove.admits(1, MAX_PREPROVED_REQUESTS));
+        assert!(FactUse::Preprove.admits(MAX_EVIDENCE_FACT_STATEMENTS, MAX_PREPROVED_REQUESTS));
+        assert!(!FactUse::EvidenceBatch.admits(1, MAX_PREPROVED_REQUESTS));
+    }
+
+    #[test]
+    fn evidence_batches_keep_the_guest_statement_bound() {
+        let full = MAX_EVIDENCE_FACT_STATEMENTS * MAX_FACTS;
+        let batch = FactUse::EvidenceBatch;
+        assert!(batch.admits(0, 0));
+        assert!(batch.admits(0, full));
+        assert!(!batch.admits(0, full + 1));
+        assert!(batch.admits(MAX_EVIDENCE_FACT_STATEMENTS, 0));
+        assert!(!batch.admits(MAX_EVIDENCE_FACT_STATEMENTS + 1, 0));
+        // A partial statement still costs a whole statement.
+        assert!(batch.admits(MAX_EVIDENCE_FACT_STATEMENTS - 1, MAX_FACTS));
+        assert!(!batch.admits(MAX_EVIDENCE_FACT_STATEMENTS - 1, MAX_FACTS + 1));
     }
 }

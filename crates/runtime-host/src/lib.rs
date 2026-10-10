@@ -66,6 +66,7 @@ pub fn expect_runtime_code_hash(chain_spec_hash: [u8; 32]) -> Result<(), ([u8; 3
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::evidence::EvidenceArtifact;
@@ -350,10 +351,21 @@ fn save_cached_vk_for(elf: &Elf, vk: &SP1VerifyingKey) -> Result<(), std::io::Er
     write_atomic(&path, &bytes)
 }
 
+/// Distinguishes this process's concurrent temporary files.
+static TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `path` with `bytes` atomically. Each call writes its own
+/// temporary file, named by process id and a per-process serial, then renames
+/// it over `path`, so concurrent writers never share or truncate one another's
+/// temporary file and readers only ever see a complete write.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)
+    let serial = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{serial}.tmp", std::process::id()));
+    let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Process-wide cache for the env-driven prover context. Subsequent
@@ -596,6 +608,39 @@ mod tests {
     fn errors_implement_std_error() {
         let err = Sp1HostError::Codec("nope".into());
         let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_share_a_temporary_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "neutrino-write-atomic-{}-{}",
+            std::process::id(),
+            TEMP_SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vk.bin");
+        // With one shared temporary name, a writer could rename another's
+        // half-written file into place or find its own file already renamed.
+        std::thread::scope(|scope| {
+            for writer in 0..8_u8 {
+                let path = &path;
+                scope.spawn(move || {
+                    let bytes = vec![writer; 64 * 1024];
+                    for _ in 0..16 {
+                        write_atomic(path, &bytes).expect("every concurrent write lands");
+                    }
+                });
+            }
+        });
+        let written = fs::read(&path).unwrap();
+        assert_eq!(written.len(), 64 * 1024);
+        assert!(written.iter().all(|byte| *byte == written[0]));
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["vk.bin"]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -10,8 +10,6 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use crate::bounded_cache::BoundedCache;
 
-static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Most verified fact receipts kept in memory and on disk per fact program.
 const FACT_CACHE_ENTRIES: usize = 256;
 
@@ -167,13 +165,7 @@ impl FactCache {
         }
         // Failure to write the optional cache does not invalidate a verified proof.
         if std::fs::create_dir_all(&self.directory).is_ok() {
-            let path = self.path(receipt.id);
-            let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = path.with_extension(format!("{}-{serial}.tmp", std::process::id()));
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
-            let _ = std::fs::remove_file(tmp);
+            let _ = crate::write_atomic(&self.path(receipt.id), bytes);
         }
         self.retain(receipt);
     }

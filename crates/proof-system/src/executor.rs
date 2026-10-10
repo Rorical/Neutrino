@@ -18,7 +18,7 @@ use core::fmt;
 
 use neutrino_consensus_types::Body;
 use neutrino_primitives::{Hash, StateRoot};
-use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidationCode, TxValidity};
+use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
 use neutrino_trie::{Poseidon2Hasher, Trie};
 
 /// Per-block consensus context passed to [`BlockExecutor::execute_block`].
@@ -143,7 +143,8 @@ pub trait BlockExecutor {
     ///
     /// Runs the runtime's `_neutrino_validate_tx` entrypoint
     /// against a read-only view of `state`. Returns the canonical
-    /// [`TxValidity`] result the runtime emitted: a [`TxValidationCode`]
+    /// [`TxValidity`] result the runtime emitted: a
+    /// [`TxValidationCode`](neutrino_runtime_abi::TxValidationCode)
     /// describing whether (and why not) the transaction is
     /// admissible, plus a mempool priority for the `Valid` case.
     ///
@@ -351,7 +352,6 @@ impl BlockExecutor for UnsupportedExecutor {
         // bytes, so report a definitive failure rather than silently
         // admitting an opaque blob. Mempool admission keys on the
         // returned `TxValidationCode`, not on the error path.
-        let _ = TxValidationCode::StateReadFailed;
         Err(String::from("block executor not configured"))
     }
 

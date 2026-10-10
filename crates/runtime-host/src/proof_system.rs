@@ -23,25 +23,33 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::StfPublicOutput;
+use neutrino_primitives::Hash;
 use neutrino_proof_system::{ProofError, ProofSystem, public_inputs::BlockProofPublicInputs};
 use neutrino_prover_chunk::receipt_codec;
 use sp1_sdk::{
     SP1Proof, SP1ProofWithPublicValues, SP1Stdin, SP1VerifyingKey,
-    blocking::{MockProver, ProveRequest, Prover, ProverClient},
+    blocking::{MockProver, Prover, ProverClient},
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
 use neutrino_consensus_types::history_proof::{GuestPrograms, VkDigest};
 
+use crate::bounded_cache::BoundedCache;
 use crate::executor::decode_witness_bundle;
 use crate::programs::{ProgramKeys, SharedRegistry};
-use crate::{ProgramProver, Sp1HostError};
+use crate::{ProgramProver, Sp1HostError, guarded, prove_compressed, push_receipt};
 
 /// Largest chunk-proof envelope accepted off the wire.
 const CHUNK_PROOF_WIRE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Most verified block receipts kept for exact-byte reuse.
+const BLOCK_CACHE_ENTRIES: usize = 64;
+
+/// Encoded-size budget of the verified block receipt cache.
+const BLOCK_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Declare a borsh wire wrapper around a bincode-serialized
 /// [`SP1ProofWithPublicValues`].
@@ -100,18 +108,18 @@ sp1_wire_proof! {
 
 #[derive(Clone)]
 struct VerifiedBlock {
-    identity: neutrino_primitives::Hash,
-    encoded_len: usize,
     bundle: Arc<SP1ProofWithPublicValues>,
     output: StfPublicOutput,
 }
 
-/// Host-selected witness, exact attached receipts and unique-request coverage.
-type AttachedFacts = (
-    neutrino_prover_chunk::consensus::ConsensusWitness,
-    Vec<Arc<super::fact_cache::FactReceipt>>,
-    (u64, u64),
-);
+/// Host-selected witness, exact attached receipts, unique-request coverage
+/// and the statement the chunk Guest must commit for that witness.
+struct AttachedFacts {
+    witness: neutrino_prover_chunk::consensus::ConsensusWitness,
+    receipts: Vec<Arc<super::fact_cache::FactReceipt>>,
+    coverage: (u64, u64),
+    statement: neutrino_prover_chunk::consensus::ConsensusStatement,
+}
 
 /// Adapter that drives an SP1 prover (mock, cpu, cuda, ...) through the
 /// consensus engine's [`ProofSystem`] trait.
@@ -134,9 +142,10 @@ pub struct Sp1ProofSystem<P: Prover> {
     pub(super) last_fact_coverage: Mutex<Option<(u64, u64)>>,
     /// Serializes cache misses across early and evidence workers. Never an engine lock.
     pub(super) fact_proving: Mutex<()>,
-    pub(super) histories: Mutex<VecDeque<super::history_prover::CachedHistory>>,
+    /// Exact-byte cache of verified history and chunk receipts.
+    pub(super) histories: Mutex<super::history_prover::HistoryCache>,
     /// Exact-byte cache of verified block receipts.
-    blocks: Mutex<VecDeque<VerifiedBlock>>,
+    blocks: Mutex<BoundedCache<Hash, VerifiedBlock>>,
 }
 
 impl<P> Sp1ProofSystem<P>
@@ -172,8 +181,11 @@ where
             facts: Mutex::new(BTreeMap::new()),
             last_fact_coverage: Mutex::new(None),
             fact_proving: Mutex::new(()),
-            histories: Mutex::new(VecDeque::new()),
-            blocks: Mutex::new(VecDeque::new()),
+            histories: Mutex::new(BoundedCache::new(
+                super::history_prover::HISTORY_CACHE_ENTRIES,
+                super::history_prover::HISTORY_CACHE_BYTES,
+            )),
+            blocks: Mutex::new(BoundedCache::new(BLOCK_CACHE_ENTRIES, BLOCK_CACHE_BYTES)),
         })
     }
 
@@ -185,13 +197,28 @@ where
     /// Install a Guest from its ELF bytes, running SP1 setup once, and return
     /// its digest. Installing an already known ELF is free.
     ///
+    /// Setup runs without holding the registry lock, so proving and
+    /// verification continue while a new Guest is prepared.
+    ///
     /// # Errors
     /// Returns [`Sp1HostError::Sdk`] when setup fails.
     pub fn install_guest(&self, elf: Vec<u8>) -> Result<VkDigest, Sp1HostError> {
-        self.programs
+        let elf = sp1_sdk::Elf::from(elf);
+        let elf_hash = neutrino_primitives::blake3_256(&elf);
+        let installed = self
+            .programs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .digest_of(&elf_hash);
+        if let Some(digest) = installed {
+            return Ok(digest);
+        }
+        let keys = crate::programs::setup(&self.prover, elf, elf_hash)?;
+        Ok(self
+            .programs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .install(&self.prover, sp1_sdk::Elf::from(elf))
+            .insert(keys))
     }
 
     /// `(digest, ELF hash)` of every installed Guest.
@@ -349,14 +376,13 @@ where
         {
             return Err(ProofError::PublicInputMismatch);
         }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        guarded(|| {
             neutrino_prover_chunk::proof_verification::verify_evidence_receipt(
                 bytes,
                 expected,
                 evidence_program,
             )
-        }))
-        .map_err(|_| ProofError::BackendRejected)?
+        })?
         .map_err(|_| ProofError::BackendRejected)
     }
 
@@ -397,10 +423,9 @@ where
         let digest = *expected_block_program;
         // Malformed adversarial internals may cause an upstream verifier to
         // abort instead of returning a verdict. Such failures are not slashable.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        guarded(|| {
             neutrino_prover_chunk::proof_verification::verify_block_artifact(proof, &digest).err()
-        }))
-        .map_err(|_| ProofError::BackendRejected)
+        })
     }
 
     fn prove_block(
@@ -453,28 +478,19 @@ where
 
         // 3. Keep proof witnesses out of normal stdin and supply verified
         //    attachments through the native recursive proof stream.
-        let evidence_vk = self
+        //    Attachments verify only under the anchor's installed
+        //    evidence program; without it the block cannot be proven.
+        let evidence = self
             .keys(&input.evidence_anchor.evidence_guest_vk_digest)
-            .ok()
-            .map(|keys| keys.vk.clone());
-        let stdin = crate::block_stdin(
-            &self.prover,
-            &input,
-            &witness,
-            &evidence_proofs,
-            evidence_vk.as_ref(),
-        )
-        .map_err(|_| ProofError::InvalidWitness)?;
+            .ok();
+        let evidence_vk = evidence.as_deref().map(|keys| &keys.vk);
+        let stdin = crate::block_stdin(&input, &witness, &evidence_proofs, evidence_vk)
+            .map_err(|_| ProofError::InvalidWitness)?;
 
         // 4. Drive the configured prover (mock / cpu / cuda / network)
         //    to produce a Compressed STARK bound to the embedded
         //    guest ELF's verifying key.
-        let proof = self
-            .prover
-            .prove(&block.pk, stdin)
-            .deferred_proof_verification(true)
-            .compressed()
-            .run()
+        let proof = prove_compressed(&self.prover, &block.pk, stdin)
             .map_err(|_| ProofError::BackendRejected)?;
 
         // 5. Cross-check the committed StfPublicOutput against the
@@ -490,35 +506,7 @@ where
         let committed: StfPublicOutput =
             BorshDeserialize::deserialize_reader(&mut proof.public_values.as_slice())
                 .map_err(|_| ProofError::MalformedProof)?;
-        if committed.pre_state_root != public_inputs.state_root_before
-            || committed.post_state_root != public_inputs.state_root_after
-        {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.gas_used != public_inputs.gas_used {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.receipts_root != public_inputs.receipt_root {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.validator_set_root != public_inputs.runtime_extra {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.chain_id != public_inputs.chain_id {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.block_height != public_inputs.height {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.block_gas_limit != public_inputs.gas_limit {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.proposer_address != public_inputs.proposer_address {
-            return Err(ProofError::PublicInputMismatch);
-        }
-        if committed.transactions_root != public_inputs.transactions_root {
-            return Err(ProofError::PublicInputMismatch);
-        }
+        Self::check_block_output(&committed, public_inputs)?;
 
         Sp1BlockProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof)
     }
@@ -559,8 +547,7 @@ where
             .blocks
             .lock()
             .map_err(|_| ProofError::BackendRejected)?
-            .iter()
-            .find(|entry| entry.identity == identity)
+            .get(&identity)
             .cloned();
         if let Some(cached) = cached {
             Self::check_block_output(&cached.output, inputs)?;
@@ -569,24 +556,13 @@ where
         let bundle = proof.to_sp1().map_err(|_| ProofError::MalformedProof)?;
         let output = self.verify_block_bundle(&bundle, inputs)?;
         let verified = VerifiedBlock {
-            identity,
-            encoded_len: proof.bytes.len(),
             bundle: Arc::new(bundle),
             output,
         };
-        let mut cache = self
-            .blocks
+        self.blocks
             .lock()
-            .map_err(|_| ProofError::BackendRejected)?;
-        if !cache.iter().any(|entry| entry.identity == identity) {
-            cache.push_back(verified.clone());
-        }
-        while cache.len() > 64
-            || cache.iter().map(|entry| entry.encoded_len).sum::<usize>() > 32 * 1024 * 1024
-        {
-            cache.pop_front();
-        }
-        drop(cache);
+            .map_err(|_| ProofError::BackendRejected)?
+            .insert(identity, proof.bytes.len(), verified.clone());
         Ok(verified)
     }
 
@@ -658,6 +634,12 @@ where
     /// attached in receipt order. Missing facts are never proven here: the
     /// guest falls back to in-circuit verification for them, so chunk
     /// proving never waits on the fact worker.
+    ///
+    /// The returned statement is the one this single consensus pass
+    /// derived. The chunk Guest derives the same statement from any subset
+    /// of attached facts, provided the attached statements are well formed,
+    /// never conflict and never contradict a recorded verdict; all three are
+    /// checked here.
     fn attach_fact_receipts(
         &self,
         witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
@@ -665,8 +647,9 @@ where
         let fact_program = witness.context.programs.execution.fact;
         let known = self.with_fact_cache(&fact_program, |cache| cache.verified())?;
         let mut recorder = neutrino_prover_chunk::facts::FactRecorder::with_verified(known);
-        neutrino_prover_chunk::consensus::validate_consensus_using(witness, &mut recorder)
-            .map_err(|_| ProofError::InvalidWitness)?;
+        let validated =
+            neutrino_prover_chunk::consensus::validate_consensus_using(witness, &mut recorder)
+                .map_err(|_| ProofError::InvalidWitness)?;
         let requests = recorder.finish().map_err(|_| ProofError::InvalidWitness)?;
         if requests.iter().any(|(_, valid)| !valid) {
             return Err(ProofError::InvalidWitness);
@@ -682,8 +665,25 @@ where
             .iter()
             .map(|receipt| receipt.statement.clone())
             .collect();
+        // The Guest's hybrid verifier rejects malformed or conflicting
+        // statements, and every recorded verdict was positive.
+        neutrino_prover_chunk::facts::HybridVerifier::new(&attached.facts)
+            .map_err(|_| ProofError::InvalidWitness)?;
+        if attached
+            .facts
+            .iter()
+            .flat_map(|statement| &statement.facts)
+            .any(|fact| !fact.valid && requested.contains(&fact.id))
+        {
+            return Err(ProofError::InvalidWitness);
+        }
         let coverage = attached_fact_coverage(&requested, &attached.facts);
-        Ok((attached, receipts, coverage))
+        Ok(AttachedFacts {
+            witness: attached,
+            receipts,
+            coverage,
+            statement: validated.statement,
+        })
     }
 
     /// Prove the stronger consensus chunk statement with explicit witnesses.
@@ -724,34 +724,25 @@ where
         // Learn which signature checks this chunk performs, then cover as many
         // as possible with receipts the early fact worker already produced.
         // Anything uncovered is verified in-circuit by the hybrid verifier.
-        let (witness, fact_receipts, coverage) = self.attach_fact_receipts(witness)?;
-        let witness = &witness;
-        let expected = neutrino_prover_chunk::consensus::validate_consensus(witness)
-            .map_err(|_| ProofError::InvalidWitness)?;
+        let AttachedFacts {
+            witness,
+            receipts: fact_receipts,
+            coverage,
+            statement: expected,
+        } = self.attach_fact_receipts(witness)?;
         let mut stdin = SP1Stdin::new();
-        stdin.write_vec(borsh::to_vec(witness).map_err(|_| ProofError::InvalidWitness)?);
+        stdin.write_vec(borsh::to_vec(&witness).map_err(|_| ProofError::InvalidWitness)?);
         for (proof, block) in block_proofs.iter().zip(&witness.blocks) {
             let verified = self.verified_block(proof, &block.public_inputs)?;
             if verified.output != block.output {
                 return Err(ProofError::PublicInputMismatch);
             }
-            let SP1Proof::Compressed(inner) = &verified.bundle.proof else {
-                return Err(ProofError::MalformedProof);
-            };
-            stdin.write_proof(*inner.clone(), block_keys.vk.vk.clone());
+            push_receipt(&mut stdin, &verified.bundle, &block_keys.vk)?;
         }
         for receipt in &fact_receipts {
-            let SP1Proof::Compressed(inner) = &receipt.bundle.proof else {
-                return Err(ProofError::MalformedProof);
-            };
-            stdin.write_proof(*inner.clone(), fact_keys.vk.vk.clone());
+            push_receipt(&mut stdin, &receipt.bundle, &fact_keys.vk)?;
         }
-        let proof = self
-            .prover
-            .prove(&chunk_keys.pk, stdin)
-            .deferred_proof_verification(true)
-            .compressed()
-            .run()
+        let proof = prove_compressed(&self.prover, &chunk_keys.pk, stdin)
             .map_err(|_| ProofError::BackendRejected)?;
         let committed: neutrino_prover_chunk::consensus::ConsensusStatement =
             borsh::from_slice(proof.public_values.as_slice())

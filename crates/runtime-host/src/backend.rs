@@ -132,7 +132,7 @@ mod tests {
         ] {
             let key = prover.setup_program(elf.clone()).unwrap();
             let verifier_key = verifier.setup(elf.clone()).unwrap();
-            assert_eq!(crate::elf_bytes(key.elf()), crate::elf_bytes(&elf));
+            assert_eq!(&**key.elf(), &*elf);
             assert_eq!(
                 key.verifying_key().hash_u32(),
                 verifier_key.verifying_key().hash_u32()

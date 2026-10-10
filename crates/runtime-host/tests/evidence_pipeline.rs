@@ -110,7 +110,7 @@ fn invalid_and_missing_attachments_are_rejected_before_guest_execution() {
     assert!(
         WasmRuntime::default_runtime()
             .unwrap()
-            .dry_run(&input, &LiveTrie::default(), &attachments)
+            .dry_run(&input, LiveTrie::default().trie(), &attachments)
             .is_err()
     );
     // Supply every state key the STF needs. Otherwise a missing-key panic
@@ -418,7 +418,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
     neutrino_runtime_host::evidence::verify_input_receipts(&input, &[alternate]).unwrap();
     let dry = WasmRuntime::default_runtime()
         .unwrap()
-        .dry_run(&input, &live, &attachments)
+        .dry_run(&input, live.trie(), &attachments)
         .unwrap();
     assert_eq!(
         neutrino_runtime_host::dry_run(&input, &live, &attachments).output,
@@ -433,7 +433,7 @@ fn real_compressed_recursion(prover: impl neutrino_runtime_host::ProgramProver) 
                 method: neutrino_default_runtime_core::QUERY_METHOD_ACCOUNT_GET.into(),
                 args: REPORTER.to_vec(),
             },
-            &rewarded,
+            rewarded.trie(),
         )
         .unwrap();
     let account: Option<neutrino_default_runtime_core::Account> =
@@ -853,7 +853,7 @@ fn pending_reporter_reward_matches_native_wasm_and_block_guest() {
     live.insert(QUEUE_KEY, borsh::to_vec(&vec![obligation.clone()]).unwrap());
     live.insert(&slashed_key(&obligation.sanction.offender.pubkey), vec![0]);
     let runtime = WasmRuntime::default_runtime().unwrap();
-    let wasm = runtime.dry_run(&input, &live, &[]).unwrap();
+    let wasm = runtime.dry_run(&input, live.trie(), &[]).unwrap();
     let native = neutrino_runtime_host::dry_run(&input, &live, &[]);
     assert_eq!(wasm.output, native.output);
     assert_eq!(wasm.output.accountability.executed.len(), 1);
@@ -864,7 +864,7 @@ fn pending_reporter_reward_matches_native_wasm_and_block_guest() {
                 method: neutrino_default_runtime_core::QUERY_METHOD_ACCOUNT_GET.into(),
                 args: REPORTER.to_vec(),
             },
-            &post,
+            post.trie(),
         )
         .unwrap();
     let account: Option<Account> = borsh::from_slice(&response.payload).unwrap();
@@ -873,7 +873,7 @@ fn pending_reporter_reward_matches_native_wasm_and_block_guest() {
         method: neutrino_default_runtime_core::QUERY_METHOD_ACCOUNTABILITY_METRICS.into(),
         args: Vec::new(),
     };
-    let response = runtime.query(&request, &post).unwrap();
+    let response = runtime.query(&request, post.trie()).unwrap();
     let mut native_state = TracingState::new(&post);
     assert_eq!(
         response,

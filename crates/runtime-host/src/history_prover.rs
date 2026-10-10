@@ -1,6 +1,8 @@
 //! Real compressed-STARK history composition and exact-byte verification reuse.
 
-use std::sync::Arc;
+#![allow(clippy::redundant_pub_crate)]
+
+use std::sync::{Arc, OnceLock};
 
 use neutrino_consensus_types::history_proof::{
     BoundedVec, ChainBinding, CheckpointInput, ConsensusBoundary, HistoryProof,
@@ -12,21 +14,36 @@ use neutrino_proof_system::{ProofError, VerifiedHistory, verify_history_proof};
 use neutrino_prover_chunk::{consensus::ConsensusStatement, receipt_codec};
 use sp1_sdk::{
     HashableKey, SP1Proof, SP1ProofWithPublicValues, SP1Stdin, SP1VerifyingKey,
-    blocking::{ProveRequest, Prover, ProverClient},
+    blocking::{LightProver, Prover, ProverClient},
 };
 
-use crate::{ProgramProver, Sp1ProofSystem, proof_system::Sp1ChunkProof};
+use crate::bounded_cache::BoundedCache;
+use crate::programs::ProgramKeys;
+use crate::{
+    ProgramProver, Sp1ProofSystem, guarded, proof_system::Sp1ChunkProof, prove_compressed,
+    push_receipt,
+};
 
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "the private cache entry is shared with the sibling proof_system module"
-)]
-pub(crate) struct CachedHistory {
-    identity: Hash,
-    key: [u32; 8],
-    encoded_len: usize,
-    bundle: Arc<SP1ProofWithPublicValues>,
+/// Verified history and chunk receipts keyed by their exact bytes' hash and
+/// the digest of the key they verified under.
+pub(super) type HistoryCache = BoundedCache<(Hash, [u32; 8]), Arc<SP1ProofWithPublicValues>>;
+
+/// Most verified history and chunk receipts kept for exact-byte reuse.
+pub(super) const HISTORY_CACHE_ENTRIES: usize = 128;
+
+/// Encoded-size budget of the verified history receipt cache.
+pub(super) const HISTORY_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// One process-wide light verifier. It is independent of the configured
+/// prover, so receipts from `MockProver` never verify.
+fn light_verifier() -> &'static LightProver {
+    static VERIFIER: OnceLock<LightProver> = OnceLock::new();
+    VERIFIER.get_or_init(|| ProverClient::builder().light().build())
 }
+
+/// A child receipt to recurse over, with the keys of the program it
+/// verifies under.
+type Child<P> = (Arc<SP1ProofWithPublicValues>, Arc<ProgramKeys<P>>);
 
 impl<P: ProgramProver> Sp1ProofSystem<P> {
     pub(super) fn trusted_history_domain(
@@ -84,52 +101,57 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         bytes: &[u8],
         key: &SP1VerifyingKey,
     ) -> Result<Arc<SP1ProofWithPublicValues>, ProofError> {
+        self.authenticate(bytes, key, || {
+            receipt_codec::decode::<SP1ProofWithPublicValues, MAX_HISTORY_RECEIPT_BYTES>(bytes)
+                .map_err(|_| ProofError::MalformedProof)
+        })
+    }
+
+    /// [`Self::authenticated_child`] for a receipt the caller already
+    /// decoded from exactly `bytes`.
+    fn authenticate_decoded(
+        &self,
+        bytes: &[u8],
+        bundle: SP1ProofWithPublicValues,
+        key: &SP1VerifyingKey,
+    ) -> Result<Arc<SP1ProofWithPublicValues>, ProofError> {
+        self.authenticate(bytes, key, || Ok(bundle))
+    }
+
+    /// Return the verified receipt encoded by `bytes`, reusing an earlier
+    /// verification of the same bytes under the same key. `decode` runs
+    /// only on a cache miss.
+    fn authenticate(
+        &self,
+        bytes: &[u8],
+        key: &SP1VerifyingKey,
+        decode: impl FnOnce() -> Result<SP1ProofWithPublicValues, ProofError>,
+    ) -> Result<Arc<SP1ProofWithPublicValues>, ProofError> {
         if bytes.is_empty() || bytes.len() > MAX_HISTORY_RECEIPT_BYTES {
             return Err(ProofError::MalformedProof);
         }
-        let identity = blake3_256(bytes);
-        let digest = key.hash_u32();
-        if let Some(found) = self
+        let identity = (blake3_256(bytes), key.hash_u32());
+        let cached = self
             .histories
             .lock()
             .map_err(|_| ProofError::BackendRejected)?
-            .iter()
-            .find(|entry| entry.identity == identity && entry.key == digest)
-        {
-            return Ok(Arc::clone(&found.bundle));
+            .get(&identity)
+            .cloned();
+        if let Some(found) = cached {
+            return Ok(found);
         }
-        let bundle =
-            receipt_codec::decode::<SP1ProofWithPublicValues, MAX_HISTORY_RECEIPT_BYTES>(bytes)
-                .map_err(|_| ProofError::MalformedProof)?;
+        let bundle = decode()?;
         if !matches!(bundle.proof, SP1Proof::Compressed(_)) {
             return Err(ProofError::MalformedProof);
         }
         // Independent real verification also rejects artifacts from MockProver.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ProverClient::builder()
-                .light()
-                .build()
-                .verify(&bundle, key, None)
-        }))
-        .map_err(|_| ProofError::BackendRejected)?
-        .map_err(|_| ProofError::BackendRejected)?;
-        let bundle = Arc::new(bundle);
-        let mut cache = self
-            .histories
-            .lock()
+        guarded(|| light_verifier().verify(&bundle, key, None))?
             .map_err(|_| ProofError::BackendRejected)?;
-        cache.push_back(CachedHistory {
-            identity,
-            key: digest,
-            encoded_len: bytes.len(),
-            bundle: Arc::clone(&bundle),
-        });
-        while cache.len() > 128
-            || cache.iter().map(|entry| entry.encoded_len).sum::<usize>() > 32 * 1024 * 1024
-        {
-            cache.pop_front();
-        }
-        drop(cache);
+        let bundle = Arc::new(bundle);
+        self.histories
+            .lock()
+            .map_err(|_| ProofError::BackendRejected)?
+            .insert(identity, bytes.len(), Arc::clone(&bundle));
         Ok(bundle)
     }
 
@@ -179,11 +201,11 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         if let Some(proof) = previous {
             self.verify_history_receipt(spec, proof, &proof.statement.start)?;
             let checkpoint = self.keys(&checkpoint_program)?;
-            children.push((
-                self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?,
-                checkpoint.vk.clone(),
-            ));
+            let bundle = self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?;
+            children.push((bundle, checkpoint));
         }
+        // The chunk program is pinned by the trusted chain binding.
+        let chunk_keys = self.keys(&domain.chain.consensus.chunk)?;
         let mut statements = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let bundle =
@@ -196,10 +218,9 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             if statement.chain != domain.chain {
                 return Err(ProofError::PublicInputMismatch);
             }
-            let chunk_keys = self.keys(&domain.chain.consensus.chunk)?;
-            let bundle = self.authenticated_child(&chunk.bytes, &chunk_keys.vk)?;
+            let bundle = self.authenticate_decoded(&chunk.bytes, bundle, &chunk_keys.vk)?;
             statements.push(statement);
-            children.push((bundle, chunk_keys.vk.clone()));
+            children.push((bundle, Arc::clone(&chunk_keys)));
         }
         let input = CheckpointInput::Fold {
             chain: domain.chain,
@@ -223,10 +244,8 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             // (`left.end == right.start`) is enforced by validation.
             self.verify_history_receipt(spec, proof, &proof.statement.start)?;
             let checkpoint = self.keys(&checkpoint_program)?;
-            children.push((
-                self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?,
-                checkpoint.vk.clone(),
-            ));
+            let bundle = self.authenticated_child(proof.receipt.as_ref(), &checkpoint.vk)?;
+            children.push((bundle, checkpoint));
         }
         self.prove_history_input(
             spec,
@@ -244,7 +263,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         spec: &ChainSpec,
         checkpoint_program: &neutrino_consensus_types::history_proof::VkDigest,
         input: &CheckpointInput,
-        children: &[(Arc<SP1ProofWithPublicValues>, SP1VerifyingKey)],
+        children: &[Child<P>],
     ) -> Result<VerifiedHistory, ProofError> {
         let expected =
             neutrino_prover_checkpoint::validate(input).map_err(|_| ProofError::InvalidWitness)?;
@@ -254,11 +273,8 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         }
         let mut stdin = SP1Stdin::new();
         stdin.write_vec(bytes);
-        for (bundle, key) in children {
-            let SP1Proof::Compressed(proof) = &bundle.proof else {
-                return Err(ProofError::MalformedProof);
-            };
-            stdin.write_proof(*proof.clone(), key.vk.clone());
+        for (bundle, keys) in children {
+            push_receipt(&mut stdin, bundle, &keys.vk)?;
         }
         if receipt_codec::encode(&stdin)
             .map_err(|_| ProofError::InvalidWitness)?
@@ -268,12 +284,7 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
             return Err(ProofError::InvalidWitness);
         }
         let key = self.keys(checkpoint_program)?;
-        let bundle = self
-            .prover
-            .prove(&key.pk, stdin)
-            .deferred_proof_verification(true)
-            .compressed()
-            .run()
+        let bundle = prove_compressed(&self.prover, &key.pk, stdin)
             .map_err(|_| ProofError::BackendRejected)?;
         if bundle.public_values.as_slice()
             != borsh::to_vec(&expected).map_err(|_| ProofError::MalformedProof)?

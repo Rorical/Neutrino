@@ -12,7 +12,6 @@ use neutrino_consensus_types::Body;
 use neutrino_default_runtime_core::{StfInput, Transaction};
 use neutrino_proof_system::executor::{BlockExecutionContext, BlockExecutor, ExecutionOutcome};
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
-use neutrino_runtime_core::host::LiveTrie;
 use neutrino_trie::{Poseidon2Hasher, Trie};
 use thiserror::Error;
 
@@ -47,13 +46,9 @@ pub enum ExecutorError {
     },
 }
 
-fn hex_hash(hash: &Hash) -> String {
-    use std::fmt::Write as _;
-    hash.iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
+/// Lowercase-hex rendering of a 32-byte hash for error messages.
+const fn hex_hash(hash: &Hash) -> blake3::Hash {
+    blake3::Hash::from_bytes(*hash)
 }
 
 impl From<WasmError> for ExecutorError {
@@ -256,22 +251,19 @@ impl BlockExecutor for WasmExecutor {
             transactions: txs,
         };
 
-        // Snapshot the engine's authoritative trie into a read-only
-        // LiveTrie view for dry-run. The TracingState used inside
-        // the wasm runtime clones the live trie on first write, so
-        // the snapshot itself stays untouched.
-        let live = LiveTrie::from_trie(state.clone());
-
+        // The runtime borrows the engine's authoritative trie as the
+        // pre-state and applies writes to its own scratch copy, so
+        // `state` stays untouched until the swap below.
         let DryRun {
             output,
             witness,
             post_state,
         } = self
             .runtime(&ctx.runtime_code_hash)?
-            .dry_run(&input, &live, &body.evidence_proofs)?;
+            .dry_run(&input, state, &body.evidence_proofs)?;
 
         // Commit the dry-run's post-state into the engine's trie.
-        // Read-only blocks fall back to a clone of `live`, so the
+        // Read-only blocks fall back to a clone of `state`, so the
         // swap is unconditional and idempotent.
         // Persist attachments beside the semantic input and state witness.
         // The prover sends them through SP1's separate recursive proof stream.
@@ -294,12 +286,10 @@ impl BlockExecutor for WasmExecutor {
         runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, ExecutorError> {
-        // Snapshot the trie into a read-only LiveTrie view. The
-        // WasmRuntime's query path clones the scratch trie internally
-        // and discards it after the call so no mutation can leak
-        // back into `state`.
-        let live = LiveTrie::from_trie(state.clone());
-        Ok(self.runtime(&runtime_code_hash)?.query(request, &live)?)
+        // The WasmRuntime's query path works on its own scratch copy
+        // and discards it after the call so no mutation can leak back
+        // into `state`.
+        Ok(self.runtime(&runtime_code_hash)?.query(request, state)?)
     }
 
     fn validate_tx(
@@ -310,12 +300,11 @@ impl BlockExecutor for WasmExecutor {
         runtime_code_hash: Hash,
         state: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, ExecutorError> {
-        let live = LiveTrie::from_trie(state.clone());
         Ok(self.runtime(&runtime_code_hash)?.validate_tx(
             tx_bytes,
             chain_id,
             block_gas_limit,
-            &live,
+            state,
         )?)
     }
 

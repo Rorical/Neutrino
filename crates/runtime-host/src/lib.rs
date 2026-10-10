@@ -18,6 +18,7 @@
 //!   output (covers the "tampered `post_state_root`" exit criterion).
 
 pub mod backend;
+mod bounded_cache;
 pub mod evidence;
 mod evidence_prover;
 pub mod executor;
@@ -49,17 +50,6 @@ pub fn default_runtime_code_hash() -> [u8; 32] {
     neutrino_primitives::blake3_256(wasm::DEFAULT_MASTER_WASM)
 }
 
-/// BLAKE3 hash of the embedded default-runtime SP1 Guest ELF.
-///
-/// Exposed alongside [`default_runtime_code_hash`] for observability
-/// (runtime identity queries, log lines, debugging tooling). The Guest
-/// ELF's identity is captured separately by the SP1 verifying-key
-/// cache, so this is informational.
-#[must_use]
-pub fn default_guest_elf_hash() -> [u8; 32] {
-    neutrino_primitives::blake3_256(&DEFAULT_GUEST_ELF)
-}
-
 /// Validate that the chain specification names the embedded WASM runtime.
 ///
 /// # Errors
@@ -80,12 +70,13 @@ use std::sync::OnceLock;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::evidence::EvidenceArtifact;
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput, apply_block};
+use neutrino_proof_system::ProofError;
 use neutrino_runtime_abi::StateWitness;
 use neutrino_runtime_core::host::{LiveTrie, TracingState};
 use neutrino_trie::{Poseidon2Hasher, Trie};
 use sp1_sdk::{
-    Elf, ExecutionReport, HashableKey, ProvingKey, SP1_CIRCUIT_VERSION, SP1ProofWithPublicValues,
-    SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey,
+    Elf, ExecutionReport, HashableKey, ProvingKey, SP1_CIRCUIT_VERSION, SP1Proof,
+    SP1ProofWithPublicValues, SP1ProvingKey, SP1PublicValues, SP1Stdin, SP1VerifyingKey,
     blocking::{ProveRequest, Prover, ProverClient},
     include_elf,
 };
@@ -174,6 +165,9 @@ pub struct ProverCtx<P: Prover> {
     pub pk: P::ProvingKey,
     /// Verifying key bound to this context's program.
     pub vk: SP1VerifyingKey,
+    /// Verifying key of [`DEFAULT_EVIDENCE_GUEST_ELF`], set up on the first
+    /// block that carries evidence attachments.
+    evidence_vk: OnceLock<SP1VerifyingKey>,
 }
 
 impl<P: Prover> ProverCtx<P> {
@@ -183,8 +177,33 @@ impl<P: Prover> ProverCtx<P> {
     /// Returns [`Sp1HostError::Sdk`] if `setup` fails.
     pub fn new(prover: P) -> Result<Self, Sp1HostError> {
         let pk = prover.setup(DEFAULT_GUEST_ELF.clone()).map_err(sdk_err)?;
+        Ok(Self::with_key(prover, pk))
+    }
+
+    fn with_key(prover: P, pk: P::ProvingKey) -> Self {
         let vk = pk.verifying_key().clone();
-        Ok(Self { prover, pk, vk })
+        Self {
+            prover,
+            pk,
+            vk,
+            evidence_vk: OnceLock::new(),
+        }
+    }
+
+    /// Evidence verifying key for a block with `evidence_proofs`, set up
+    /// once per context and only when the block carries attachments.
+    fn evidence_key(
+        &self,
+        evidence_proofs: &[EvidenceArtifact],
+    ) -> Result<Option<&SP1VerifyingKey>, Sp1HostError> {
+        if evidence_proofs.is_empty() {
+            return Ok(None);
+        }
+        if let Some(key) = self.evidence_vk.get() {
+            return Ok(Some(key));
+        }
+        let key = embedded_evidence_vk(&self.prover)?;
+        Ok(Some(self.evidence_vk.get_or_init(|| key)))
     }
 
     /// Produce a proof using the cached keys.
@@ -197,15 +216,9 @@ impl<P: Prover> ProverCtx<P> {
         witness: StateWitness,
         evidence_proofs: &[EvidenceArtifact],
     ) -> Result<BlockProof, Sp1HostError> {
-        let stdin = block_stdin(&self.prover, input, &witness, evidence_proofs, None)?;
-
-        let proof = self
-            .prover
-            .prove(&self.pk, stdin)
-            .deferred_proof_verification(true)
-            .compressed()
-            .run()
-            .map_err(sdk_err)?;
+        let evidence_vk = self.evidence_key(evidence_proofs)?;
+        let stdin = block_stdin(input, &witness, evidence_proofs, evidence_vk)?;
+        let proof = prove_compressed(&self.prover, &self.pk, stdin).map_err(sdk_err)?;
 
         Ok(BlockProof {
             proof,
@@ -246,7 +259,8 @@ impl<P: Prover> ProverCtx<P> {
         witness: &StateWitness,
         evidence_proofs: &[EvidenceArtifact],
     ) -> Result<(SP1PublicValues, ExecutionReport), Sp1HostError> {
-        let stdin = block_stdin(&self.prover, input, witness, evidence_proofs, None)?;
+        let evidence_vk = self.evidence_key(evidence_proofs)?;
+        let stdin = block_stdin(input, witness, evidence_proofs, evidence_vk)?;
         self.prover
             .execute(self.pk.elf().clone(), stdin)
             .deferred_proof_verification(true)
@@ -272,8 +286,7 @@ where
     /// Disk errors are non-fatal — they fall back to `setup`.
     pub fn new_cached_for(prover: P, elf: Elf) -> Result<Self, Sp1HostError> {
         let pk = prover.setup_program(elf)?;
-        let vk = pk.verifying_key().clone();
-        Ok(Self { prover, pk, vk })
+        Ok(Self::with_key(prover, pk))
     }
 
     /// Convenience: [`Self::new_cached_for`] against [`DEFAULT_GUEST_ELF`].
@@ -303,13 +316,6 @@ where
 // On-disk verifying-key cache.
 // ---------------------------------------------------------------------------
 
-fn elf_bytes(elf: &Elf) -> &[u8] {
-    match elf {
-        Elf::Static(b) => b,
-        Elf::Dynamic(arc) => arc.as_ref(),
-    }
-}
-
 fn cache_dir() -> PathBuf {
     if let Ok(env_dir) = std::env::var("NEUTRINO_SP1_CACHE_DIR") {
         return PathBuf::from(env_dir);
@@ -322,7 +328,7 @@ fn cache_dir() -> PathBuf {
 }
 
 fn cache_path_for(elf: &Elf) -> PathBuf {
-    let elf_hash = blake3::hash(elf_bytes(elf)).to_hex();
+    let elf_hash = blake3::hash(elf).to_hex();
     let file = format!("vk-sp1-{SP1_CIRCUIT_VERSION}-{elf_hash}.bin");
     cache_dir().join(file)
 }
@@ -376,6 +382,51 @@ fn codec_err<E: core::fmt::Display>(err: E) -> Sp1HostError {
     Sp1HostError::Codec(err.to_string())
 }
 
+/// Prove `stdin` as a Compressed STARK with deferred (recursive) proof
+/// verification enabled, as every block, evidence, chunk and history
+/// proof is.
+pub(crate) fn prove_compressed<P: Prover>(
+    prover: &P,
+    pk: &P::ProvingKey,
+    stdin: SP1Stdin,
+) -> Result<SP1ProofWithPublicValues, P::Error> {
+    prover
+        .prove(pk, stdin)
+        .deferred_proof_verification(true)
+        .compressed()
+        .run()
+}
+
+/// Queue a compressed child receipt on `stdin` for recursive verification
+/// under `vk`.
+pub(crate) fn push_receipt(
+    stdin: &mut SP1Stdin,
+    bundle: &SP1ProofWithPublicValues,
+    vk: &SP1VerifyingKey,
+) -> Result<(), ProofError> {
+    let SP1Proof::Compressed(inner) = &bundle.proof else {
+        return Err(ProofError::MalformedProof);
+    };
+    stdin.write_proof(*inner.clone(), vk.vk.clone());
+    Ok(())
+}
+
+/// Run an upstream verifier that may abort on malformed adversarial input
+/// instead of returning a verdict; such a panic becomes `BackendRejected`.
+pub(crate) fn guarded<T>(verify: impl FnOnce() -> T) -> Result<T, ProofError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(verify))
+        .map_err(|_| ProofError::BackendRejected)
+}
+
+/// Verifying key of [`DEFAULT_EVIDENCE_GUEST_ELF`] under `prover`.
+fn embedded_evidence_vk<P: Prover>(prover: &P) -> Result<SP1VerifyingKey, Sp1HostError> {
+    Ok(prover
+        .setup(DEFAULT_EVIDENCE_GUEST_ELF.clone())
+        .map_err(sdk_err)?
+        .verifying_key()
+        .clone())
+}
+
 /// Execute the STF natively against `live` and record the witness the
 /// SP1 Guest needs to replay the same transition. Pure dry-run — no
 /// writes are committed to `live`.
@@ -411,8 +462,8 @@ fn encode_stdin(
 
 // The block's normal stdin contains only STF input and state openings. Verified
 // evidence attachments enter SP1's separate recursive proof stream, never the STF.
-pub(crate) fn block_stdin<P: Prover>(
-    prover: &P,
+// They verify under `evidence_vk`, which must be the anchor's evidence program.
+pub(crate) fn block_stdin(
     input: &StfInput,
     witness: &StateWitness,
     evidence_proofs: &[EvidenceArtifact],
@@ -422,13 +473,10 @@ pub(crate) fn block_stdin<P: Prover>(
     let mut stdin = SP1Stdin::new();
     stdin.write_vec(encode_stdin(input, witness, evidence_proofs)?);
     if !proofs.is_empty() {
-        let key = match evidence_vk {
-            Some(key) => key.clone(),
-            None => prover
-                .setup(DEFAULT_EVIDENCE_GUEST_ELF.clone())
-                .map_err(sdk_err)?
-                .verifying_key()
-                .clone(),
+        let Some(key) = evidence_vk else {
+            return Err(Sp1HostError::Sdk(
+                "evidence program verifying key unavailable".into(),
+            ));
         };
         if key.hash_u32() != input.evidence_anchor.evidence_guest_vk_digest {
             return Err(Sp1HostError::Sdk(
@@ -436,7 +484,7 @@ pub(crate) fn block_stdin<P: Prover>(
             ));
         }
         for proof in proofs {
-            let sp1_sdk::SP1Proof::Compressed(inner) = proof else {
+            let SP1Proof::Compressed(inner) = proof else {
                 return Err(Sp1HostError::Sdk(
                     "evidence proof must be compressed".into(),
                 ));
@@ -465,14 +513,14 @@ where
     let pk = prover.setup(DEFAULT_GUEST_ELF.clone()).map_err(sdk_err)?;
     let vk = pk.verifying_key().clone();
 
-    let stdin = block_stdin(prover, input, &witness, evidence_proofs, None)?;
+    let evidence_vk = if evidence_proofs.is_empty() {
+        None
+    } else {
+        Some(embedded_evidence_vk(prover)?)
+    };
+    let stdin = block_stdin(input, &witness, evidence_proofs, evidence_vk.as_ref())?;
 
-    let proof = prover
-        .prove(&pk, stdin)
-        .deferred_proof_verification(true)
-        .compressed()
-        .run()
-        .map_err(sdk_err)?;
+    let proof = prove_compressed(prover, &pk, stdin).map_err(sdk_err)?;
     Ok(BlockProof { proof, vk, witness })
 }
 

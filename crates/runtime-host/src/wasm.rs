@@ -1,14 +1,16 @@
 //! WASM dynamic runtime host.
 //!
 //! Loads the `neutrino-default-runtime-master` cdylib in wasmtime,
-//! drives `apply_block` against a [`LiveTrie`], and collects the
-//! read / write set as a [`StateWitness`] (with on-path trie nodes)
-//! that the SP1 Guest can replay.
+//! drives `apply_block` against a borrowed state [`Trie`], and collects
+//! the read / write set as a
+//! [`StateWitness`](neutrino_runtime_abi::StateWitness) (with on-path
+//! trie nodes) that the SP1 Guest can replay.
 //!
 //! This is the non-proven execution path full nodes use for RPC,
 //! mempool tx admission, and dry-run / witness generation. The proven
 //! path (SP1) uses the same shared `apply_block` against
-//! [`WitnessState`] so the two paths cannot drift.
+//! [`WitnessState`](neutrino_runtime_core::WitnessState) so the two
+//! paths cannot drift.
 
 // FFI plumbing module — most lint allowances here cover the host-side
 // cousins of those carried by `master::wasm_abi`.
@@ -19,21 +21,21 @@
     clippy::cast_lossless
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::collections::BTreeSet;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_default_runtime_core::{StfInput, StfPublicOutput};
 use neutrino_primitives::StateRoot;
 use neutrino_runtime_abi::{
-    QUERY_ENTRYPOINT, QueryRequest, QueryResponse, QueryStatus, StateWitness, TrieNodeBytes,
-    TrieValueBytes, TxValidity, TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
+    ALLOCATE_ENTRYPOINT, APPLY_BLOCK_ENTRYPOINT, DEALLOCATE_ENTRYPOINT, HOST_IMPORT_MODULE,
+    MEMORY_EXPORT, QUERY_ENTRYPOINT, QueryRequest, QueryResponse, QueryStatus, TxValidity,
+    TxValidityDecodeError, VALIDATE_TX_ENTRYPOINT,
 };
-use neutrino_runtime_core::host::LiveTrie;
+use neutrino_runtime_core::host::witness_of;
 use neutrino_trie::{Poseidon2Hasher, Trie};
 use wasmtime::{
-    Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, Trap,
-    TypedFunc,
+    Caller, Config, Engine, InstancePre, Linker, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, Trap, TypedFunc,
 };
 
 use crate::{DryRun, Sp1HostError};
@@ -150,30 +152,34 @@ fn codec_err<E: std::fmt::Display>(err: E) -> WasmError {
 }
 
 /// Compiled WASM dynamic runtime. Hold one of these per process; it is
-/// safe to share across threads (every `dry_run` call creates a fresh
-/// `Store`).
+/// safe to share across threads (every call creates a fresh `Store`
+/// from the pre-linked module).
 pub struct WasmRuntime {
     engine: Engine,
-    module: Module,
+    /// The module linked against the host imports once at construction.
+    pre: InstancePre<HostState>,
     limits: WasmLimits,
 }
 
 impl WasmRuntime {
     /// Compile a runtime from raw wasm bytes (e.g. an on-chain runtime
-    /// upgrade payload). Use [`Self::default_runtime`] for the embedded
-    /// [`DEFAULT_MASTER_WASM`].
+    /// upgrade payload) and link it against the host imports. Use
+    /// [`Self::default_runtime`] for the embedded [`DEFAULT_MASTER_WASM`].
     ///
     /// # Errors
     /// Returns [`WasmError::Wasmtime`] if wasmtime cannot compile the
-    /// module.
+    /// module or resolve its imports.
     pub fn new(wasm: &[u8]) -> Result<Self, WasmError> {
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(wt_err)?;
         let module = Module::new(&engine, wasm).map_err(wt_err)?;
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        register_host_imports(&mut linker)?;
+        let pre = linker.instantiate_pre(&module).map_err(wt_err)?;
         Ok(Self {
             engine,
-            module,
+            pre,
             limits: WasmLimits::default(),
         })
     }
@@ -197,20 +203,65 @@ impl WasmRuntime {
         self.limits
     }
 
-    /// Create a store whose guest memory and fuel are capped.
-    fn store_with(&self, host: HostState, fuel: u64) -> Result<Store<Mutex<HostState>>, WasmError> {
-        let mut store = Store::new(&self.engine, Mutex::new(host));
-        store.limiter(|data| &mut data.get_mut().expect("HostState mutex").limits);
-        store.set_fuel(fuel).map_err(wt_err)?;
-        Ok(store)
-    }
-
     /// Compile the embedded default-runtime master.
     ///
     /// # Errors
     /// See [`Self::new`].
     pub fn default_runtime() -> Result<Self, WasmError> {
         Self::new(DEFAULT_MASTER_WASM)
+    }
+
+    /// Run one guest entrypoint in a fresh store whose memory and fuel
+    /// are capped: copy `input` into a guest allocation, call `entry`,
+    /// copy its packed `(ptr, len)` output back out and free both
+    /// buffers. Returns the output bytes and the final host state.
+    fn invoke(
+        &self,
+        entry: &str,
+        input: &[u8],
+        host: HostState,
+        fuel: u64,
+    ) -> Result<(Vec<u8>, HostState), WasmError> {
+        let mut store = Store::new(&self.engine, host);
+        store.limiter(|state| &mut state.limits);
+        store.set_fuel(fuel).map_err(wt_err)?;
+
+        let instance = self.pre.instantiate(&mut store).map_err(wt_err)?;
+        let memory = instance
+            .get_memory(&mut store, MEMORY_EXPORT)
+            .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
+
+        let allocate: TypedFunc<u32, u32> = instance
+            .get_typed_func(&mut store, ALLOCATE_ENTRYPOINT)
+            .map_err(wt_err)?;
+        let input_ptr = allocate
+            .call(&mut store, input.len() as u32)
+            .map_err(trap_err)?;
+        memory
+            .write(&mut store, input_ptr as usize, input)
+            .map_err(wt_err)?;
+
+        let entry_fn: TypedFunc<(u32, u32), u64> =
+            instance.get_typed_func(&mut store, entry).map_err(wt_err)?;
+        let packed = entry_fn
+            .call(&mut store, (input_ptr, input.len() as u32))
+            .map_err(trap_err)?;
+        let output_ptr = (packed >> 32) as u32;
+        let output_len = (packed & 0xFFFF_FFFF) as u32;
+
+        let mut output = vec![0u8; output_len as usize];
+        memory
+            .read(&store, output_ptr as usize, &mut output)
+            .map_err(wt_err)?;
+
+        if let Ok(deallocate) =
+            instance.get_typed_func::<(u32, u32), ()>(&mut store, DEALLOCATE_ENTRYPOINT)
+        {
+            let _ = deallocate.call(&mut store, (input_ptr, input.len() as u32));
+            let _ = deallocate.call(&mut store, (output_ptr, output_len));
+        }
+
+        Ok((output, store.into_data()))
     }
 
     /// Execute `apply_block` inside the WASM runtime against a tracing
@@ -225,87 +276,32 @@ impl WasmRuntime {
     /// real wasmtime ABI used in production.
     ///
     /// # Errors
-    /// Returns [`WasmError`] if linking, instantiation, or trap
-    /// recovery fails. Codec errors during input/output encoding are
-    /// surfaced the same way.
+    /// Returns [`WasmError`] if instantiation or trap recovery fails.
+    /// Codec errors during input/output encoding are surfaced the same
+    /// way.
     pub fn dry_run(
         &self,
         input: &StfInput,
-        live: &LiveTrie,
+        live: &Trie<Poseidon2Hasher>,
         evidence_proofs: &[neutrino_consensus_types::evidence::EvidenceArtifact],
     ) -> Result<DryRun, WasmError> {
         crate::evidence::verify_input_receipts(input, evidence_proofs).map_err(codec_err)?;
-        // Cloning the trie is a BTreeMap clone — fine for tests; this
-        // can switch to a reference-counted snapshot when blocks grow
-        // large.
-        let host = HostState {
-            live: live.clone(),
-            scratch: live.trie().clone(),
-            accessed: BTreeSet::new(),
-            pending_read_value: None,
-            read_only: false,
-            write_attempted: false,
-            limits: store_limits(self.limits.block_memory_bytes),
-        };
-        let mut store = self.store_with(host, u64::MAX)?;
-
-        let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
-        register_host_imports(&mut linker)?;
-
-        let instance = linker
-            .instantiate(&mut store, &self.module)
-            .map_err(wt_err)?;
-
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
-
         let mut input_bytes = Vec::new();
         BorshSerialize::serialize(input, &mut input_bytes).map_err(codec_err)?;
-
-        let allocate: TypedFunc<u32, u32> = instance
-            .get_typed_func(&mut store, "neutrino_allocate")
-            .map_err(wt_err)?;
-        let input_ptr = allocate
-            .call(&mut store, input_bytes.len() as u32)
-            .map_err(trap_err)?;
-        memory
-            .write(&mut store, input_ptr as usize, &input_bytes)
-            .map_err(wt_err)?;
-
-        let apply_block: TypedFunc<(u32, u32), u64> = instance
-            .get_typed_func(&mut store, "apply_block")
-            .map_err(wt_err)?;
-        let packed = apply_block
-            .call(&mut store, (input_ptr, input_bytes.len() as u32))
-            .map_err(trap_err)?;
-        let output_ptr = (packed >> 32) as u32;
-        let output_len = (packed & 0xFFFF_FFFF) as u32;
-
-        let mut output_bytes = vec![0u8; output_len as usize];
-        memory
-            .read(&store, output_ptr as usize, &mut output_bytes)
-            .map_err(wt_err)?;
+        let host = HostState::new(live, false, self.limits.block_memory_bytes);
+        let (output_bytes, host) =
+            self.invoke(APPLY_BLOCK_ENTRYPOINT, &input_bytes, host, u64::MAX)?;
         let output: StfPublicOutput =
             BorshDeserialize::try_from_slice(&output_bytes).map_err(codec_err)?;
-
-        if let Ok(deallocate) =
-            instance.get_typed_func::<(u32, u32), ()>(&mut store, "neutrino_deallocate")
-        {
-            let _ = deallocate.call(&mut store, (input_ptr, input_bytes.len() as u32));
-            let _ = deallocate.call(&mut store, (output_ptr, output_len));
-        }
 
         // Materialise the witness from the recorded accesses against
         // the live trie and return the post-state scratch trie so the
         // producer can swap it into the engine's authoritative state.
-        let host = store.into_data().into_inner().expect("HostState mutex");
-        let (post_state, witness) = host.into_state_and_witness();
-
+        let witness = witness_of(live, host.accessed);
         Ok(DryRun {
             output,
             witness,
-            post_state,
+            post_state: host.scratch,
         })
     }
 
@@ -322,77 +318,26 @@ impl WasmRuntime {
     /// `live`.
     ///
     /// # Errors
-    /// Returns [`WasmError`] if linking, instantiation, or trap
-    /// recovery fails. Codec errors during input/output encoding are
-    /// surfaced the same way.
+    /// Returns [`WasmError`] if instantiation or trap recovery fails.
+    /// Codec errors during input/output encoding are surfaced the same
+    /// way.
     pub fn query(
         &self,
         request: &QueryRequest,
-        live: &LiveTrie,
+        live: &Trie<Poseidon2Hasher>,
     ) -> Result<QueryResponse, WasmError> {
-        let host = HostState {
-            live: live.clone(),
-            scratch: live.trie().clone(),
-            accessed: BTreeSet::new(),
-            pending_read_value: None,
-            read_only: true,
-            write_attempted: false,
-            limits: store_limits(self.limits.query_memory_bytes),
-        };
-        let mut store = self.store_with(host, self.limits.query_fuel)?;
-
-        let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
-        register_host_imports(&mut linker)?;
-
-        let instance = linker
-            .instantiate(&mut store, &self.module)
-            .map_err(wt_err)?;
-
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
-
         let mut req_bytes = Vec::new();
         BorshSerialize::serialize(request, &mut req_bytes).map_err(codec_err)?;
-
-        let allocate: TypedFunc<u32, u32> = instance
-            .get_typed_func(&mut store, "neutrino_allocate")
-            .map_err(wt_err)?;
-        let req_ptr = allocate
-            .call(&mut store, req_bytes.len() as u32)
-            .map_err(trap_err)?;
-        memory
-            .write(&mut store, req_ptr as usize, &req_bytes)
-            .map_err(wt_err)?;
-
-        let query_fn: TypedFunc<(u32, u32), u64> = instance
-            .get_typed_func(&mut store, QUERY_ENTRYPOINT)
-            .map_err(wt_err)?;
-        let packed = query_fn
-            .call(&mut store, (req_ptr, req_bytes.len() as u32))
-            .map_err(trap_err)?;
-        let resp_ptr = (packed >> 32) as u32;
-        let resp_len = (packed & 0xFFFF_FFFF) as u32;
-
-        let mut resp_bytes = vec![0u8; resp_len as usize];
-        memory
-            .read(&store, resp_ptr as usize, &mut resp_bytes)
-            .map_err(wt_err)?;
+        let host = HostState::new(live, true, self.limits.query_memory_bytes);
+        let (resp_bytes, host) =
+            self.invoke(QUERY_ENTRYPOINT, &req_bytes, host, self.limits.query_fuel)?;
         let response: QueryResponse =
             BorshDeserialize::try_from_slice(&resp_bytes).map_err(codec_err)?;
 
-        if let Ok(deallocate) =
-            instance.get_typed_func::<(u32, u32), ()>(&mut store, "neutrino_deallocate")
-        {
-            let _ = deallocate.call(&mut store, (req_ptr, req_bytes.len() as u32));
-            let _ = deallocate.call(&mut store, (resp_ptr, resp_len));
-        }
-
-        // The scratch trie is dropped here implicitly when `host`
-        // goes out of scope; queries never mutate `live`. Any
-        // write attempt poisons the response so the caller cannot
-        // confuse a write-attempted query with a successful one.
-        let host = store.into_data().into_inner().expect("HostState mutex");
+        // The scratch trie is dropped with `host`; queries never
+        // mutate `live`. Any write attempt poisons the response so the
+        // caller cannot confuse a write-attempted query with a
+        // successful one.
         if host.write_attempted {
             return Ok(QueryResponse::err(
                 QueryStatus::PermissionDenied,
@@ -417,84 +362,35 @@ impl WasmRuntime {
     /// not for a correctly-implemented runtime).
     ///
     /// # Errors
-    /// Returns [`WasmError`] when linking, instantiation, or trap
-    /// recovery fails; or [`WasmError::InvalidTxValidity`] when the
-    /// runtime's response cannot be decoded as a [`TxValidity`].
+    /// Returns [`WasmError`] when instantiation or trap recovery
+    /// fails; or [`WasmError::InvalidTxValidity`] when the runtime's
+    /// response cannot be decoded as a [`TxValidity`].
     pub fn validate_tx(
         &self,
         tx_bytes: &[u8],
         chain_id: u64,
         block_gas_limit: u64,
-        live: &LiveTrie,
+        live: &Trie<Poseidon2Hasher>,
     ) -> Result<TxValidity, WasmError> {
-        let host = HostState {
-            live: live.clone(),
-            scratch: live.trie().clone(),
-            accessed: BTreeSet::new(),
-            pending_read_value: None,
-            read_only: true,
-            write_attempted: false,
-            limits: store_limits(self.limits.validate_tx_memory_bytes),
-        };
-        let mut store = self.store_with(host, self.limits.validate_tx_fuel)?;
-
-        let mut linker: Linker<Mutex<HostState>> = Linker::new(&self.engine);
-        register_host_imports(&mut linker)?;
-
-        let instance = linker
-            .instantiate(&mut store, &self.module)
-            .map_err(wt_err)?;
-
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| WasmError::Wasmtime("missing memory export".into()))?;
-
         // Canonical admission envelope:
         //   8B chain_id || 8B block_gas_limit || tx_bytes
         // The runtime's _neutrino_validate_tx decodes the prefix
-        // before parsing the tx itself. Putting the gas limit + price
-        // on the wire means a runtime that wraps multiple chain
-        // configurations can pick the right one even when the host
-        // does not surface BlockContext.
-        let chain_id_bytes = chain_id.to_le_bytes();
-        let gas_limit_bytes = block_gas_limit.to_le_bytes();
+        // before parsing the tx itself. Putting the gas limit on the
+        // wire means a runtime that wraps multiple chain
+        // configurations can pick the right one.
         let mut input_bytes = Vec::with_capacity(8 + 8 + tx_bytes.len());
-        input_bytes.extend_from_slice(&chain_id_bytes);
-        input_bytes.extend_from_slice(&gas_limit_bytes);
+        input_bytes.extend_from_slice(&chain_id.to_le_bytes());
+        input_bytes.extend_from_slice(&block_gas_limit.to_le_bytes());
         input_bytes.extend_from_slice(tx_bytes);
 
-        let allocate: TypedFunc<u32, u32> = instance
-            .get_typed_func(&mut store, "neutrino_allocate")
-            .map_err(wt_err)?;
-        let in_ptr = allocate
-            .call(&mut store, input_bytes.len() as u32)
-            .map_err(trap_err)?;
-        memory
-            .write(&mut store, in_ptr as usize, &input_bytes)
-            .map_err(wt_err)?;
+        let host = HostState::new(live, true, self.limits.validate_tx_memory_bytes);
+        let (out_bytes, host) = self.invoke(
+            VALIDATE_TX_ENTRYPOINT,
+            &input_bytes,
+            host,
+            self.limits.validate_tx_fuel,
+        )?;
 
-        let validate_fn: TypedFunc<(u32, u32), u64> = instance
-            .get_typed_func(&mut store, VALIDATE_TX_ENTRYPOINT)
-            .map_err(wt_err)?;
-        let packed = validate_fn
-            .call(&mut store, (in_ptr, input_bytes.len() as u32))
-            .map_err(trap_err)?;
-        let out_ptr = (packed >> 32) as u32;
-        let out_len = (packed & 0xFFFF_FFFF) as u32;
-
-        let mut out_bytes = vec![0u8; out_len as usize];
-        memory
-            .read(&store, out_ptr as usize, &mut out_bytes)
-            .map_err(wt_err)?;
-
-        if let Ok(deallocate) =
-            instance.get_typed_func::<(u32, u32), ()>(&mut store, "neutrino_deallocate")
-        {
-            let _ = deallocate.call(&mut store, (in_ptr, input_bytes.len() as u32));
-            let _ = deallocate.call(&mut store, (out_ptr, out_len));
-        }
-
-        let host = store.into_data().into_inner().expect("HostState mutex");
         if host.write_attempted {
             // A correctly-implemented runtime never writes during
             // admission, so a write attempt is a hard ABI violation;
@@ -515,14 +411,12 @@ impl WasmRuntime {
 // ---------------------------------------------------------------------------
 
 struct HostState {
-    /// Read-only snapshot of the pre-state trie. Used both for
-    /// reading values and for extracting witness nodes after the STF
-    /// finishes.
-    live: LiveTrie,
-    /// Scratch trie initialised from `live`. Writes go here so we can
-    /// report the correct `post_state_root` to the guest without
-    /// mutating `live`. Discarded after read-only query calls so no
-    /// mutation can leak from the runtime back to `live`.
+    /// Root of the borrowed pre-state trie, reported to the guest.
+    pre_root: StateRoot,
+    /// Scratch copy of the pre-state trie. Reads and writes go here so
+    /// the guest sees its own writes and the correct `post_state_root`
+    /// without mutating the caller's trie. Discarded after read-only
+    /// calls so no mutation can leak back.
     scratch: Trie<Poseidon2Hasher>,
     /// Keys the STF has read or written. Becomes the witness key set
     /// and drives node extraction.
@@ -544,18 +438,18 @@ struct HostState {
 }
 
 impl HostState {
-    const fn pre_state_root(&self) -> StateRoot {
-        self.live.state_root()
-    }
-
-    const fn post_state_root(&self) -> StateRoot {
-        self.scratch.root()
-    }
-
-    fn read_effective(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // Reads honour the scratch trie because that captures both
-        // live state and any overlay writes the guest already made.
-        self.scratch.get(key)
+    /// Fresh host state over a scratch copy of `live`, the one trie copy a
+    /// call needs because the store must own its data.
+    fn new(live: &Trie<Poseidon2Hasher>, read_only: bool, memory_bytes: usize) -> Self {
+        Self {
+            pre_root: live.root(),
+            scratch: live.clone(),
+            accessed: BTreeSet::new(),
+            pending_read_value: None,
+            read_only,
+            write_attempted: false,
+            limits: store_limits(memory_bytes),
+        }
     }
 
     fn write(&mut self, key: &[u8], value: Vec<u8>) {
@@ -569,46 +463,17 @@ impl HostState {
         self.accessed.insert(key.to_vec());
         let _ = self.scratch.remove(key);
     }
-
-    fn into_state_and_witness(self) -> (Trie<Poseidon2Hasher>, StateWitness) {
-        let mut nodes = BTreeMap::new();
-        let mut values = BTreeMap::new();
-        for key in &self.accessed {
-            self.live
-                .trie()
-                .collect_path_nodes(key, &mut nodes, &mut values);
-        }
-        let pre_root = self.pre_state_root();
-        if pre_root != neutrino_trie::EMPTY_TRIE_ROOT
-            && let Some(bytes) = self.live.trie().node_bytes(&pre_root)
-        {
-            nodes.entry(pre_root).or_insert_with(|| bytes.to_vec());
-        }
-        let witness = StateWitness {
-            pre_state_root: pre_root,
-            nodes: nodes
-                .into_iter()
-                .map(|(hash, bytes)| TrieNodeBytes { hash, bytes })
-                .collect(),
-            values: values
-                .into_iter()
-                .map(|(hash, bytes)| TrieValueBytes { hash, bytes })
-                .collect(),
-            witnessed_keys: self.accessed.into_iter().collect(),
-        };
-        (self.scratch, witness)
-    }
 }
 
-fn memory_of(caller: &mut Caller<'_, Mutex<HostState>>) -> Result<Memory, wasmtime::Error> {
+fn memory_of(caller: &mut Caller<'_, HostState>) -> Result<Memory, wasmtime::Error> {
     caller
-        .get_export("memory")
+        .get_export(MEMORY_EXPORT)
         .and_then(wasmtime::Extern::into_memory)
         .ok_or_else(|| wasmtime::Error::msg("missing memory export"))
 }
 
 fn read_bytes(
-    caller: &mut Caller<'_, Mutex<HostState>>,
+    caller: &mut Caller<'_, HostState>,
     ptr: u32,
     len: u32,
 ) -> Result<Vec<u8>, wasmtime::Error> {
@@ -619,7 +484,7 @@ fn read_bytes(
 }
 
 fn write_bytes(
-    caller: &mut Caller<'_, Mutex<HostState>>,
+    caller: &mut Caller<'_, HostState>,
     ptr: u32,
     bytes: &[u8],
 ) -> Result<(), wasmtime::Error> {
@@ -629,21 +494,21 @@ fn write_bytes(
 }
 
 // Six host imports registered as inline closures keeps each handler
-// next to its description and avoids name-pollution helper functions;
-// the resulting body is one line over the default clippy threshold.
-#[allow(clippy::too_many_lines)]
-fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), WasmError> {
+// next to its description and avoids name-pollution helper functions.
+fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
     linker
         .func_wrap(
-            "neutrino",
+            HOST_IMPORT_MODULE,
             "state_read_len",
-            |mut caller: Caller<'_, Mutex<HostState>>, key_ptr: u32, key_len: u32| -> i32 {
+            |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> i32 {
                 let Ok(key) = read_bytes(&mut caller, key_ptr, key_len) else {
                     return -1;
                 };
-                let mut host = caller.data().lock().expect("HostState mutex");
+                let host = caller.data_mut();
                 host.accessed.insert(key.clone());
-                if let Some(v) = host.read_effective(&key) {
+                // Reads honour the scratch trie because that captures both
+                // live state and any writes the guest already made.
+                if let Some(v) = host.scratch.get(&key) {
                     let len = v.len() as i32;
                     host.pending_read_value = Some(v);
                     len
@@ -657,13 +522,11 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
 
     linker
         .func_wrap(
-            "neutrino",
+            HOST_IMPORT_MODULE,
             "state_read_into",
-            |mut caller: Caller<'_, Mutex<HostState>>, value_ptr: u32| {
+            |mut caller: Caller<'_, HostState>, value_ptr: u32| {
                 let value = caller
-                    .data()
-                    .lock()
-                    .expect("HostState mutex")
+                    .data_mut()
                     .pending_read_value
                     .take()
                     .expect("pending_read_value set by state_read_len");
@@ -674,16 +537,16 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
 
     linker
         .func_wrap(
-            "neutrino",
+            HOST_IMPORT_MODULE,
             "state_write",
-            |mut caller: Caller<'_, Mutex<HostState>>,
+            |mut caller: Caller<'_, HostState>,
              key_ptr: u32,
              key_len: u32,
              value_ptr: u32,
              value_len: u32| {
                 let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
                 let value = read_bytes(&mut caller, value_ptr, value_len).expect("read value");
-                let mut host = caller.data().lock().expect("HostState mutex");
+                let host = caller.data_mut();
                 if host.read_only {
                     // Query mode: drop the write silently and flag the
                     // attempt so the caller substitutes
@@ -698,11 +561,11 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
 
     linker
         .func_wrap(
-            "neutrino",
+            HOST_IMPORT_MODULE,
             "state_delete",
-            |mut caller: Caller<'_, Mutex<HostState>>, key_ptr: u32, key_len: u32| {
+            |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| {
                 let key = read_bytes(&mut caller, key_ptr, key_len).expect("read key");
-                let mut host = caller.data().lock().expect("HostState mutex");
+                let host = caller.data_mut();
                 if host.read_only {
                     // Query mode: drop the delete silently and flag
                     // the attempt; see `state_write`.
@@ -716,14 +579,10 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
 
     linker
         .func_wrap(
-            "neutrino",
+            HOST_IMPORT_MODULE,
             "pre_state_root",
-            |mut caller: Caller<'_, Mutex<HostState>>, out_ptr: u32| {
-                let root = caller
-                    .data()
-                    .lock()
-                    .expect("HostState mutex")
-                    .pre_state_root();
+            |mut caller: Caller<'_, HostState>, out_ptr: u32| {
+                let root = caller.data().pre_root;
                 let _ = write_bytes(&mut caller, out_ptr, &root);
             },
         )
@@ -731,14 +590,10 @@ fn register_host_imports(linker: &mut Linker<Mutex<HostState>>) -> Result<(), Wa
 
     linker
         .func_wrap(
-            "neutrino",
+            HOST_IMPORT_MODULE,
             "post_state_root",
-            |mut caller: Caller<'_, Mutex<HostState>>, out_ptr: u32| {
-                let root = caller
-                    .data()
-                    .lock()
-                    .expect("HostState mutex")
-                    .post_state_root();
+            |mut caller: Caller<'_, HostState>, out_ptr: u32| {
+                let root = caller.data().scratch.root();
                 let _ = write_bytes(&mut caller, out_ptr, &root);
             },
         )

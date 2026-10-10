@@ -144,8 +144,8 @@ have passed.
 ## Runtime crate layout
 
 - `crates/runtime-abi/` — borsh wire types shared across all runtimes:
-  `StateWitness`, `WitnessEntry`, `BlockContext`, `Query{Request,Response}`,
-  `TxValidity`, `Status`, etc. No Rust logic.
+  `StateWitness`, `Query{Request,Response}`, `TxValidity` and the wasm ABI
+  entry-point names. No Rust logic.
 - `crates/runtime-core/` — framework code shared across all runtimes:
   `StateBackend` trait, `WitnessState` (no_std, guest-side),
   `TracingState` (host feature only), canonical `state_root_of` hash.

@@ -253,18 +253,57 @@ pub mod host {
         }
     }
 
+    /// Materialise the witness for `accessed` keys against the pre-state
+    /// trie `live`.
+    ///
+    /// The witness embeds every trie node along the touched paths (so the
+    /// Guest can both read and re-root) and the leaf value bytes for
+    /// present keys. The root node is always included (when the trie is
+    /// non-empty) so the Guest can bind to the claimed `pre_state_root`
+    /// even on blocks where the STF reads no state. Shared by
+    /// [`TracingState`] and the WASM runtime host so both emit identical
+    /// witnesses.
+    #[must_use]
+    pub fn witness_of(live: &Trie<Poseidon2Hasher>, accessed: BTreeSet<Vec<u8>>) -> StateWitness {
+        let pre_root = live.root();
+        let mut nodes = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        for key in &accessed {
+            live.collect_path_nodes(key, &mut nodes, &mut values);
+        }
+        // Always include the root node (when present) so an empty
+        // access set still produces a witness the Guest can bind to
+        // `pre_state_root`.
+        if pre_root != neutrino_trie::EMPTY_TRIE_ROOT
+            && let Some(bytes) = live.node_bytes(&pre_root)
+        {
+            nodes.entry(pre_root).or_insert_with(|| bytes.to_vec());
+        }
+        StateWitness {
+            pre_state_root: pre_root,
+            nodes: nodes
+                .into_iter()
+                .map(|(hash, bytes)| TrieNodeBytes { hash, bytes })
+                .collect(),
+            values: values
+                .into_iter()
+                .map(|(hash, bytes)| TrieValueBytes { hash, bytes })
+                .collect(),
+            witnessed_keys: accessed.into_iter().collect(),
+        }
+    }
+
     /// `StateBackend` that wraps a [`LiveTrie`] and records every key
     /// the STF touches. Used during dry-run so the host can build a
     /// [`StateWitness`] for the SP1 Guest.
     pub struct TracingState<'a> {
         live: &'a LiveTrie,
-        /// Per-block write overlay. Keyed by raw runtime key.
-        overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         /// Reads + writes performed by the STF.
         accessed: BTreeSet<Vec<u8>>,
         pre_root: StateRoot,
-        /// A scratch trie used to apply overlay writes so we can return
-        /// the correct `post_state_root` without mutating `live`.
+        /// A scratch trie holding `live` plus every write and delete
+        /// this run made, so reads see earlier writes and
+        /// `post_state_root` is correct without mutating `live`.
         ///
         /// Lazily initialised from `live` on the first write so the
         /// read-only paths stay free.
@@ -277,7 +316,6 @@ pub mod host {
         pub const fn new(live: &'a LiveTrie) -> Self {
             Self {
                 live,
-                overlay: BTreeMap::new(),
                 accessed: BTreeSet::new(),
                 pre_root: live.state_root(),
                 scratch: None,
@@ -287,20 +325,14 @@ pub mod host {
         /// Materialise the recorded read / write set as a
         /// [`StateWitness`] the SP1 Guest can replay against.
         ///
-        /// The witness embeds every trie node along the touched paths
-        /// (so the Guest can both read and re-root) and the leaf value
-        /// bytes for present keys. The root node is always included
-        /// (when the trie is non-empty) so the Guest can bind to the
-        /// claimed `pre_state_root` even on blocks where the STF
-        /// reads no state.
+        /// See [`witness_of`] for the witness contents.
         #[must_use]
         pub fn into_witness(self) -> StateWitness {
             self.into_committed_and_witness().1
         }
 
         /// Consume the tracer and return both the **post-state trie**
-        /// (with every overlay write applied) and the
-        /// [`StateWitness`].
+        /// (with every write applied) and the [`StateWitness`].
         ///
         /// The block producer uses this to advance the engine's
         /// authoritative state trie in lock-step with the witness it
@@ -314,33 +346,7 @@ pub mod host {
         /// and the root equals `pre_state_root`.
         #[must_use]
         pub fn into_committed_and_witness(self) -> (Trie<Poseidon2Hasher>, StateWitness) {
-            let mut nodes = BTreeMap::new();
-            let mut values = BTreeMap::new();
-            for key in &self.accessed {
-                self.live
-                    .trie()
-                    .collect_path_nodes(key, &mut nodes, &mut values);
-            }
-            // Always include the root node (when present) so an empty
-            // access set still produces a witness the Guest can bind
-            // to `pre_state_root`.
-            if self.pre_root != neutrino_trie::EMPTY_TRIE_ROOT
-                && let Some(bytes) = self.live.trie().node_bytes(&self.pre_root)
-            {
-                nodes.entry(self.pre_root).or_insert_with(|| bytes.to_vec());
-            }
-            let witness = StateWitness {
-                pre_state_root: self.pre_root,
-                nodes: nodes
-                    .into_iter()
-                    .map(|(hash, bytes)| TrieNodeBytes { hash, bytes })
-                    .collect(),
-                values: values
-                    .into_iter()
-                    .map(|(hash, bytes)| TrieValueBytes { hash, bytes })
-                    .collect(),
-                witnessed_keys: self.accessed.into_iter().collect(),
-            };
+            let witness = witness_of(self.live.trie(), self.accessed);
             // Read-only blocks fall back to a clone of the live trie
             // so the producer can swap the result back into the
             // engine unconditionally without inspecting the
@@ -350,30 +356,25 @@ pub mod host {
         }
 
         fn ensure_scratch(&mut self) -> &mut Trie<Poseidon2Hasher> {
-            if self.scratch.is_none() {
-                // Clone the live trie's content-addressed maps via
-                // collect_path_nodes for every accessed key. We don't
-                // own the live trie's full storage, but a clone of the
-                // underlying `Trie` is cheap (BTreeMap clone), and the
-                // STF only writes a handful of keys per block.
-                self.scratch = Some(self.live.trie().clone());
-            }
-            self.scratch.as_mut().expect("scratch just initialised")
+            // A clone of the underlying `Trie` is a BTreeMap clone, and
+            // the STF only writes a handful of keys per block.
+            let live = self.live;
+            self.scratch.get_or_insert_with(|| live.trie().clone())
         }
     }
 
     impl StateBackend for TracingState<'_> {
         fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
             self.accessed.insert(key.to_vec());
-            if let Some(slot) = self.overlay.get(key) {
-                return slot.clone();
-            }
-            self.live.get(key)
+            // The scratch trie, once present, is `live` with every write
+            // and delete of this run applied in order.
+            self.scratch
+                .as_ref()
+                .map_or_else(|| self.live.get(key), |scratch| scratch.get(key))
         }
 
         fn write(&mut self, key: &[u8], value: Vec<u8>) {
             self.accessed.insert(key.to_vec());
-            self.overlay.insert(key.to_vec(), Some(value.clone()));
             let trie = self.ensure_scratch();
             trie.insert(key, value)
                 .expect("trie insert never fails for length-prefixed keys");
@@ -381,7 +382,6 @@ pub mod host {
 
         fn delete(&mut self, key: &[u8]) {
             self.accessed.insert(key.to_vec());
-            self.overlay.insert(key.to_vec(), None);
             let trie = self.ensure_scratch();
             let _ = trie.remove(key);
         }

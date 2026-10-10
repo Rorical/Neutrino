@@ -6,6 +6,7 @@
 use crate::{
     ProgramProver, Sp1ProofSystem,
     fact_cache::{FactReceipt, verify_receipt},
+    prove_compressed, push_receipt,
 };
 use neutrino_consensus_types::{
     evidence::{
@@ -22,7 +23,7 @@ use neutrino_prover_chunk::{
     facts::{FactRecorder, FactRequest, FactStatement, FactWitness, MAX_FACTS, ProvenFact},
     receipt_codec,
 };
-use sp1_sdk::{SP1Proof, SP1Stdin, blocking::ProveRequest};
+use sp1_sdk::{SP1Stdin, blocking::ProveRequest};
 use std::{collections::BTreeSet, sync::Arc};
 
 impl<P: ProgramProver> Sp1ProofSystem<P> {
@@ -90,8 +91,13 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
                 .compressed()
                 .run()
                 .map_err(|_| ProofError::BackendRejected)?;
-            let receipt = Arc::new(FactReceipt::new(bundle, statement, &fact.vk)?);
-            self.with_fact_cache(fact_program, |cache| cache.insert(Arc::clone(&receipt)))?;
+            // Encode once: the length bounds the receipt and the bytes persist it.
+            let encoded = receipt_codec::encode(&bundle).map_err(|_| ProofError::MalformedProof)?;
+            let size = encoded.len();
+            let receipt = Arc::new(FactReceipt::new(bundle, statement, &fact.vk, size)?);
+            self.with_fact_cache(fact_program, |cache| {
+                cache.insert(Arc::clone(&receipt), &encoded);
+            })?;
             receipts.push(receipt);
         }
         if receipts.len() > 256 {
@@ -148,17 +154,9 @@ impl<P: ProgramProver> Sp1ProofSystem<P> {
         let mut stdin = SP1Stdin::new();
         stdin.write_vec(borsh::to_vec(&input).map_err(|_| ProofError::InvalidWitness)?);
         for receipt in receipts {
-            let SP1Proof::Compressed(proof) = &receipt.bundle.proof else {
-                return Err(ProofError::MalformedProof);
-            };
-            stdin.write_proof(*proof.clone(), fact.vk.vk.clone());
+            push_receipt(&mut stdin, &receipt.bundle, &fact.vk)?;
         }
-        let proof = self
-            .prover
-            .prove(&evidence.pk, stdin)
-            .deferred_proof_verification(true)
-            .compressed()
-            .run()
+        let proof = prove_compressed(&self.prover, &evidence.pk, stdin)
             .map_err(|_| ProofError::BackendRejected)?;
         verify_receipt(&proof, &batch, &evidence.vk)?;
         let bytes = receipt_codec::encode(&proof).map_err(|_| ProofError::MalformedProof)?;

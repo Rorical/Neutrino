@@ -8,15 +8,14 @@
 //! consensus node and any runtime (WASM dynamic runtime or SP1 guest). It
 //! declares:
 //!
-//! - The stable status codes for runtime operations ([`status::Status`]).
-//! - The borsh-encoded per-block context handed to every entrypoint
-//!   ([`BlockContext`]).
+//! - The WASM import module and export names the host links against
+//!   ([`HOST_IMPORT_MODULE`], [`APPLY_BLOCK_ENTRYPOINT`], ...).
 //! - The borsh-encoded read-only query request and response types
 //!   ([`QueryRequest`], [`QueryResponse`]).
 //! - The fixed-width transaction-validity result format
 //!   ([`TxValidity`], [`TxValidationCode`]).
 //! - The witness envelope handed to the SP1 Guest
-//!   ([`StateWitness`], [`WitnessEntry`]).
+//!   ([`StateWitness`], [`TrieNodeBytes`], [`TrieValueBytes`]).
 //!
 //! Field layouts are consensus-critical; the chain pins the runtime artifact hash.
 
@@ -25,14 +24,27 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
-use neutrino_primitives::{
-    BlockHash, BlsSignature, Hash, Height, Seed, Slot, StateRoot, ValidatorIndex,
-};
+use neutrino_primitives::{Hash, StateRoot};
 
-pub mod status;
+/// WASM import module through which the host supplies state access to a
+/// runtime.
+pub const HOST_IMPORT_MODULE: &str = "neutrino";
 
-pub use neutrino_primitives::RuntimeInfo;
-pub use status::{Status, UnknownStatus};
+/// Linear-memory export the host reads inputs from and writes outputs to.
+pub const MEMORY_EXPORT: &str = "memory";
+
+/// Runtime export that allocates a zeroed input buffer of the given length
+/// and returns its pointer.
+pub const ALLOCATE_ENTRYPOINT: &str = "neutrino_allocate";
+
+/// Runtime export that frees a `(pointer, length)` buffer previously
+/// returned by [`ALLOCATE_ENTRYPOINT`] or by an entrypoint's packed result.
+pub const DEALLOCATE_ENTRYPOINT: &str = "neutrino_deallocate";
+
+/// Runtime function name used by the host to apply one block. Takes a
+/// borsh-encoded STF input and returns a packed `pointer << 32 | length`
+/// output buffer.
+pub const APPLY_BLOCK_ENTRYPOINT: &str = "apply_block";
 
 /// Runtime function name used by the host to run a single transaction
 /// admission check against the WASM dynamic runtime.
@@ -203,34 +215,6 @@ pub enum TxValidityDecodeError {
     },
 }
 
-/// Borsh-encoded per-block context handed to every entrypoint by the
-/// runtime host.
-///
-/// All fields are engine-supplied and consensus-critical. The
-/// `parent_state_root` is the trie root the runtime is expected to
-/// extend; `seed` is the folded VRF outputs of the last finalized chunk
-/// (see `docs/design/12-randomness.md`); `vrf_proof` is the proposer's
-/// BLS-VRF for this slot.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
-pub struct BlockContext {
-    /// Block slot number.
-    pub slot: Slot,
-    /// Candidate block height.
-    pub height: Height,
-    /// Latest finalized randomness seed.
-    pub seed: Seed,
-    /// Parent block hash.
-    pub parent_hash: BlockHash,
-    /// Parent state root.
-    pub parent_state_root: StateRoot,
-    /// Block gas limit.
-    pub gas_limit: u64,
-    /// Proposer validator index.
-    pub proposer_index: ValidatorIndex,
-    /// Proposer VRF proof.
-    pub vrf_proof: BlsSignature,
-}
-
 /// Borsh-encoded read-only query request passed to
 /// [`QUERY_ENTRYPOINT`] through the runtime's input buffer.
 ///
@@ -379,38 +363,9 @@ pub struct StateWitness {
     pub witnessed_keys: Vec<Vec<u8>>,
 }
 
-/// Returns the [`RuntimeInfo`] this crate advertises by default.
-/// shares the canonical runtime metadata with the chain specification.
-#[must_use]
-pub fn default_runtime_info() -> RuntimeInfo {
-    RuntimeInfo::default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_block_context() -> BlockContext {
-        BlockContext {
-            slot: 42,
-            height: 17,
-            seed: [9; 32],
-            parent_hash: [1; 32],
-            parent_state_root: [2; 32],
-            gas_limit: 30_000_000,
-            proposer_index: 5,
-            vrf_proof: [3; 96],
-        }
-    }
-
-    #[test]
-    fn block_context_round_trips_through_borsh() {
-        let original = sample_block_context();
-        let encoded: Vec<u8> = borsh::to_vec(&original).expect("borsh serialization succeeds");
-        let decoded: BlockContext =
-            borsh::from_slice(&encoded).expect("borsh deserialization succeeds");
-        assert_eq!(decoded, original);
-    }
 
     #[test]
     fn transaction_validity_round_trips_fixed_encoding() {

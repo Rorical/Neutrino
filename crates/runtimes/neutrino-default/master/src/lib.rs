@@ -53,6 +53,7 @@ pub fn apply_block_with_witness(input_bytes: &[u8]) -> Vec<u8> {
 )]
 mod wasm_abi {
     use super::*;
+    use alloc::boxed::Box;
     use core::mem;
     use neutrino_primitives::StateRoot;
     use neutrino_runtime_core::StateBackend;
@@ -139,12 +140,27 @@ mod wasm_abi {
         ptr
     }
 
-    /// Drop a buffer previously returned by `neutrino_allocate`.
+    /// Drop a buffer previously returned by `neutrino_allocate` or by an
+    /// entrypoint's packed result. Both allocate exactly `len` bytes, so
+    /// rebuilding the allocation with capacity `len` matches its layout.
     #[unsafe(no_mangle)]
     extern "C" fn neutrino_deallocate(ptr: u32, len: u32) {
         unsafe {
             let _ = Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
         }
+    }
+
+    /// Leak `bytes` as an exact-size allocation and pack it as
+    /// `ptr << 32 | len` for the host.
+    ///
+    /// `into_boxed_slice` drops any spare capacity, so the host's later
+    /// `neutrino_deallocate(ptr, len)` frees the allocation with the layout
+    /// it was made with.
+    fn leak_packed(bytes: Vec<u8>) -> u64 {
+        let bytes: &'static mut [u8] = Box::leak(bytes.into_boxed_slice());
+        let ptr = bytes.as_ptr() as u32;
+        let len = bytes.len() as u32;
+        ((ptr as u64) << 32) | (len as u64)
     }
 
     /// Apply a block. The host writes a borsh-encoded `StfInput` into
@@ -160,12 +176,12 @@ mod wasm_abi {
         let mut backend = WasmHostBackend;
         let output: StfPublicOutput = core_apply_block(&input, &mut backend);
 
-        let bytes = borsh::to_vec(&output).expect("encode StfPublicOutput");
-        let ptr = bytes.as_ptr() as u32;
-        let len = bytes.len() as u32;
-        mem::forget(bytes);
-        ((ptr as u64) << 32) | (len as u64)
+        leak_packed(borsh::to_vec(&output).expect("encode StfPublicOutput"))
     }
+
+    /// Header length of the `_neutrino_validate_tx` envelope:
+    /// 8 (`chain_id`) + 8 (`block_gas_limit`). The fee rate is runtime state.
+    const VALIDATE_TX_HEADER_LEN: usize = 8 + 8;
 
     /// Transaction-admission entrypoint. Exposed under the ABI-defined
     /// symbol [`neutrino_runtime_abi::VALIDATE_TX_ENTRYPOINT`].
@@ -186,14 +202,10 @@ mod wasm_abi {
     /// allocation. Returns a packed `u64`: high 32 bits = output
     /// pointer, low 32 bits = output length (always
     /// [`neutrino_runtime_abi::TX_VALIDITY_ENCODED_LEN`]).
-    /// Header length of the `_neutrino_validate_tx` envelope:
-    /// 8 (`chain_id`) + 8 (`block_gas_limit`). The fee rate is runtime state.
-    const VALIDATE_TX_HEADER_LEN: usize = 8 + 8;
-
     #[unsafe(no_mangle)]
     extern "C" fn _neutrino_validate_tx(in_ptr: u32, in_len: u32) -> u64 {
         use neutrino_default_runtime_core::validate_tx as core_validate_tx;
-        use neutrino_runtime_abi::{TX_VALIDITY_ENCODED_LEN, TxValidationCode, TxValidity};
+        use neutrino_runtime_abi::{TxValidationCode, TxValidity};
 
         let bytes = unsafe { core::slice::from_raw_parts(in_ptr as *const u8, in_len as usize) };
         let validity = if bytes.len() < VALIDATE_TX_HEADER_LEN {
@@ -210,13 +222,7 @@ mod wasm_abi {
             core_validate_tx(tx_bytes, &mut backend, chain_id, block_gas_limit)
         };
 
-        let encoded = validity.encode();
-        let mut out: alloc::vec::Vec<u8> = alloc::vec![0u8; TX_VALIDITY_ENCODED_LEN];
-        out.copy_from_slice(&encoded);
-        let ptr = out.as_ptr() as u32;
-        let len = out.len() as u32;
-        mem::forget(out);
-        ((ptr as u64) << 32) | (len as u64)
+        leak_packed(validity.encode().to_vec())
     }
 
     /// Read-only query entrypoint. Exposed under the ABI-defined
@@ -250,11 +256,7 @@ mod wasm_abi {
             },
         );
 
-        let bytes = borsh::to_vec(&response).expect("encode QueryResponse");
-        let ptr = bytes.as_ptr() as u32;
-        let len = bytes.len() as u32;
-        mem::forget(bytes);
-        ((ptr as u64) << 32) | (len as u64)
+        leak_packed(borsh::to_vec(&response).expect("encode QueryResponse"))
     }
 
     // -----------------------------------------------------------------

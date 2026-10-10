@@ -46,7 +46,7 @@ fn request(method: &str, args: Vec<u8>) -> QueryRequest {
 
 fn run(runtime: &WasmRuntime, live: &LiveTrie, req: &QueryRequest) -> QueryResponse {
     runtime
-        .query(req, live)
+        .query(req, live.trie())
         .expect("wasmtime query should not trap")
 }
 

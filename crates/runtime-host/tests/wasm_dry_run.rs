@@ -72,7 +72,7 @@ fn wasm_dry_run_matches_native_on_signed_transfer() {
     let native = dry_run(&input, &live, &[]);
     let runtime = WasmRuntime::default_runtime().expect("compile master.wasm");
     let wasm = runtime
-        .dry_run(&input, &live, &[])
+        .dry_run(&input, live.trie(), &[])
         .expect("wasmtime dry_run");
 
     assert_eq!(wasm.output, native.output);
@@ -97,7 +97,7 @@ fn wasm_dry_run_matches_native_on_empty_block() {
     let native = dry_run(&input, &live, &[]);
     let runtime = WasmRuntime::default_runtime().expect("compile master.wasm");
     let wasm = runtime
-        .dry_run(&input, &live, &[])
+        .dry_run(&input, live.trie(), &[])
         .expect("wasmtime dry_run");
 
     assert_eq!(wasm.output, native.output);

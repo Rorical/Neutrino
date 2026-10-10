@@ -49,6 +49,24 @@ impl<P: Prover> Registry<P> {
         self.by_digest.get(digest).cloned()
     }
 
+    /// Digest of the Guest already installed from the ELF hashing to
+    /// `elf_hash`.
+    pub(crate) fn digest_of(&self, elf_hash: &Hash) -> Option<VkDigest> {
+        self.by_elf.get(elf_hash).copied()
+    }
+
+    /// Record set-up keys and return their digest. A digest that is already
+    /// installed keeps its existing keys.
+    pub(crate) fn insert(&mut self, keys: ProgramKeys<P>) -> VkDigest {
+        let digest = keys.vk.hash_u32();
+        let elf_hash = keys.elf_hash;
+        self.by_digest
+            .entry(digest)
+            .or_insert_with(|| Arc::new(keys));
+        self.by_elf.insert(elf_hash, digest);
+        digest
+    }
+
     pub(crate) fn installed(&self) -> Vec<(VkDigest, Hash)> {
         let mut all: Vec<_> = self
             .by_digest
@@ -64,18 +82,23 @@ impl<P: ProgramProver> Registry<P> {
     /// Set up `elf` if its hash is new and return the Guest's digest.
     pub(crate) fn install(&mut self, prover: &P, elf: Elf) -> Result<VkDigest, Sp1HostError> {
         let elf_hash = neutrino_primitives::blake3_256(&elf);
-        if let Some(digest) = self.by_elf.get(&elf_hash) {
-            return Ok(*digest);
+        if let Some(digest) = self.digest_of(&elf_hash) {
+            return Ok(digest);
         }
-        let pk = prover.setup_program(elf)?;
-        let vk = pk.verifying_key().clone();
-        let digest = vk.hash_u32();
-        self.by_digest
-            .entry(digest)
-            .or_insert_with(|| Arc::new(ProgramKeys { pk, vk, elf_hash }));
-        self.by_elf.insert(elf_hash, digest);
-        Ok(digest)
+        Ok(self.insert(setup(prover, elf, elf_hash)?))
     }
+}
+
+/// Run SP1 setup for `elf`, whose BLAKE3 hash is `elf_hash`. Holds no
+/// registry lock, so callers may run it concurrently with proving.
+pub(crate) fn setup<P: ProgramProver>(
+    prover: &P,
+    elf: Elf,
+    elf_hash: Hash,
+) -> Result<ProgramKeys<P>, Sp1HostError> {
+    let pk = prover.setup_program(elf)?;
+    let vk = pk.verifying_key().clone();
+    Ok(ProgramKeys { pk, vk, elf_hash })
 }
 
 /// Shared handle to the registry.

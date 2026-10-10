@@ -34,7 +34,7 @@ use neutrino_consensus_types::{
     BftCandidate, Block, BlockProof, ChunkProof, FinalityCert, HistoryProof,
 };
 use neutrino_primitives::{BlockHash, ChainId, ChunkId, Hash, Height, Slot, StateRoot};
-use std::io;
+use std::{io, time::Duration};
 use thiserror::Error;
 
 /// Status RPC protocol id.
@@ -78,6 +78,15 @@ pub const PROTOCOL_BFT_ROUND_BY_CHUNK: &str = "/neutrino/req/bft_round_by_chunk"
 pub const DEFAULT_MAX_REQUEST_SIZE: u64 = 1024 * 1024;
 /// Default maximum response payload size in bytes (32 MiB).
 pub const DEFAULT_MAX_RESPONSE_SIZE: u64 = 32 * 1024 * 1024;
+/// Request cap for the fixed-size identity queries `SignedArtifactById`,
+/// `SignedArtifactInventoryByChunk` and `BftRoundByChunk`.
+pub const MAX_IDENTITY_REQUEST_SIZE: u64 = 64;
+/// Response cap for one exact `SignedArtifactById` source.
+pub const MAX_SIGNED_ARTIFACT_RESPONSE_SIZE: u64 = 8_388_624;
+/// Response cap for one `SignedArtifactInventoryByChunk` page.
+pub const MAX_SIGNED_ARTIFACT_INVENTORY_RESPONSE_SIZE: u64 = 2048;
+/// Response cap for one `BftRoundByChunk` reply.
+pub const MAX_BFT_ROUND_RESPONSE_SIZE: u64 = 8_388_608;
 
 /// Maximum number of blocks returned in a single `BlocksByRange` response.
 ///
@@ -140,6 +149,80 @@ pub enum RpcProtocol {
 }
 
 impl RpcProtocol {
+    /// Every protocol in declaration order, so `protocol as usize` indexes it.
+    pub const ALL: [Self; 17] = [
+        Self::Status,
+        Self::Metadata,
+        Self::Ping,
+        Self::BlocksByRange,
+        Self::BlocksByRoot,
+        Self::StateByRoot,
+        Self::BlockProofByHash,
+        Self::BlockProofByHeight,
+        Self::ChunkProofById,
+        Self::CheckpointLatest,
+        Self::HistoryProofByRange,
+        Self::FinalityCertByChunk,
+        Self::WitnessByBlock,
+        Self::CandidateByChunk,
+        Self::SignedArtifactById,
+        Self::SignedArtifactInventoryByChunk,
+        Self::BftRoundByChunk,
+    ];
+
+    /// Outbound request timeout configured on this protocol's behaviour.
+    #[must_use]
+    pub const fn request_timeout(self) -> Duration {
+        Duration::from_secs(match self {
+            Self::Status
+            | Self::Metadata
+            | Self::Ping
+            | Self::CheckpointLatest
+            | Self::FinalityCertByChunk
+            | Self::CandidateByChunk
+            | Self::SignedArtifactById
+            | Self::SignedArtifactInventoryByChunk
+            | Self::BftRoundByChunk => 15,
+            Self::BlocksByRange
+            | Self::BlocksByRoot
+            | Self::StateByRoot
+            | Self::BlockProofByHash
+            | Self::BlockProofByHeight
+            | Self::ChunkProofById
+            | Self::HistoryProofByRange => 30,
+            Self::WitnessByBlock => 60,
+        })
+    }
+
+    /// `(request, response)` payload byte caps enforced by this protocol's codec.
+    #[must_use]
+    pub const fn size_limits(self) -> (u64, u64) {
+        match self {
+            Self::SignedArtifactById => {
+                (MAX_IDENTITY_REQUEST_SIZE, MAX_SIGNED_ARTIFACT_RESPONSE_SIZE)
+            }
+            Self::SignedArtifactInventoryByChunk => (
+                MAX_IDENTITY_REQUEST_SIZE,
+                MAX_SIGNED_ARTIFACT_INVENTORY_RESPONSE_SIZE,
+            ),
+            Self::BftRoundByChunk => (MAX_IDENTITY_REQUEST_SIZE, MAX_BFT_ROUND_RESPONSE_SIZE),
+            Self::Status
+            | Self::Metadata
+            | Self::Ping
+            | Self::BlocksByRange
+            | Self::BlocksByRoot
+            | Self::StateByRoot
+            | Self::BlockProofByHash
+            | Self::BlockProofByHeight
+            | Self::ChunkProofById
+            | Self::CheckpointLatest
+            | Self::HistoryProofByRange
+            | Self::FinalityCertByChunk
+            | Self::WitnessByBlock
+            | Self::CandidateByChunk => (DEFAULT_MAX_REQUEST_SIZE, DEFAULT_MAX_RESPONSE_SIZE),
+        }
+    }
+
     /// Canonical wire protocol id.
     #[must_use]
     pub const fn protocol_id(self) -> &'static str {
@@ -672,17 +755,6 @@ pub enum RpcError {
     /// libp2p reported an outbound request failure.
     #[error("outbound failure: {0}")]
     Outbound(String),
-    /// The host attempted to reply to an inbound RPC with the wrong response type.
-    #[error("response type mismatch: protocol {expected:?}, got {actual:?}")]
-    ResponseTypeMismatch {
-        /// Expected protocol (matching the inbound request).
-        expected: RpcProtocol,
-        /// Protocol of the response the host supplied.
-        actual: RpcProtocol,
-    },
-    /// The inbound request id is unknown (timed out or already answered).
-    #[error("unknown inbound request id: {0:?}")]
-    UnknownInboundId(RpcInboundId),
     /// libp2p rejected the response: peer disconnected before delivery.
     #[error("failed to deliver response to peer")]
     ResponseDeliveryFailed,
@@ -1004,6 +1076,38 @@ mod tests {
         assert_eq!(
             RpcProtocol::HistoryProofByRange.protocol_id(),
             "/neutrino/req/history_proof_by_range"
+        );
+    }
+
+    #[test]
+    fn per_protocol_timeouts_and_size_caps_are_pinned() {
+        for (index, protocol) in RpcProtocol::ALL.into_iter().enumerate() {
+            assert_eq!(protocol as usize, index);
+            let seconds = match protocol {
+                RpcProtocol::WitnessByBlock => 60,
+                RpcProtocol::BlocksByRange
+                | RpcProtocol::BlocksByRoot
+                | RpcProtocol::StateByRoot
+                | RpcProtocol::BlockProofByHash
+                | RpcProtocol::BlockProofByHeight
+                | RpcProtocol::ChunkProofById
+                | RpcProtocol::HistoryProofByRange => 30,
+                _ => 15,
+            };
+            assert_eq!(protocol.request_timeout(), Duration::from_secs(seconds));
+        }
+        assert_eq!(
+            RpcProtocol::SignedArtifactById.size_limits(),
+            (64, 8_388_624)
+        );
+        assert_eq!(
+            RpcProtocol::SignedArtifactInventoryByChunk.size_limits(),
+            (64, 2048)
+        );
+        assert_eq!(RpcProtocol::BftRoundByChunk.size_limits(), (64, 8_388_608));
+        assert_eq!(
+            RpcProtocol::CandidateByChunk.size_limits(),
+            (DEFAULT_MAX_REQUEST_SIZE, DEFAULT_MAX_RESPONSE_SIZE)
         );
     }
 

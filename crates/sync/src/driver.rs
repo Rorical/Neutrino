@@ -14,20 +14,21 @@
 //!
 //! [`NetworkService`]: neutrino_network::service::NetworkService
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
+use neutrino_network::libp2p::gossipsub::MessageAcceptance;
 use neutrino_network::rpc::{
     BlockProofByHeightRequest, BlocksByRangeRequest, HistoryProofByRangeRequest, RpcInboundId,
-    RpcProtocol, RpcRequest, RpcResponse, StateByRootRequest,
+    RpcProtocol, RpcRequest, RpcResponse, StateByRootRequest, Status,
 };
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::{SyncCommand, SyncEvent, SyncMachine, SyncMode, SyncState};
 use neutrino_network::topic::Topic;
-use neutrino_primitives::StateRoot;
+use neutrino_primitives::{Height, StateRoot};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -69,6 +70,14 @@ const PENDING_PROOF_BUFFER_LIMIT: usize = 256;
 /// Retain disconnected provider identities until the next availability event,
 /// while bounding memory even if distinct peers continuously churn.
 const HISTORY_PROVIDER_ATTEMPT_LIMIT: usize = 256;
+
+/// Upper bound on waiting for one outbound RPC result, so a vanished peer
+/// eventually surfaces as a timeout.
+const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cadence of the retry tick driving availability, round recovery and
+/// complete-chunk status polling.
+const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Live sync summary shared with observers outside the driver task, such as
 /// the `system_health` RPC. Cloning shares the same underlying counters.
@@ -177,8 +186,9 @@ pub struct SyncDriver {
     /// near-simultaneous bursts; without this buffer the receiver
     /// would drop a racing proof and rely on a later `ProofBackfill`
     /// round to refetch it, costing one BFT-mesh-settle's worth of
-    /// latency on every reorder.
-    pending_proofs: Vec<neutrino_consensus_types::BlockProof>,
+    /// latency on every reorder. Entries keep the proof's height and its
+    /// original gossip bytes, decoded again on retry.
+    pending_proofs: VecDeque<(Height, Vec<u8>)>,
     /// Latest availability event. Its sequence preserves a notice that races with
     /// an older pending range request's eventual unavailable response.
     history_announcement: Option<(u64, neutrino_network::PeerId)>,
@@ -218,7 +228,7 @@ impl SyncDriver {
             outbound_rx,
             outbound_tx,
             connected_peers: BTreeSet::new(),
-            pending_proofs: Vec::new(),
+            pending_proofs: VecDeque::new(),
             history_announcement: None,
             history_attempts: BTreeSet::new(),
             history_attempt_range: None,
@@ -288,7 +298,7 @@ impl SyncDriver {
 
     /// Drive the loop until the network event channel closes.
     pub async fn run(mut self) -> Result<(), SyncDriverError> {
-        let mut retry = tokio::time::interval(Duration::from_secs(5));
+        let mut retry = tokio::time::interval(RETRY_INTERVAL);
         loop {
             // Reflect the state left by the previous iteration before blocking.
             self.publish_status().await;
@@ -411,8 +421,7 @@ impl SyncDriver {
         &mut self,
         data: &[u8],
         source: neutrino_network::PeerId,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+    ) -> MessageAcceptance {
         let Ok(announcement) =
             borsh::from_slice::<neutrino_network::rpc::CheckpointAnnouncement>(data)
         else {
@@ -433,7 +442,7 @@ impl SyncDriver {
     }
 
     /// Dispatch one gossip message to the matching topic handler and
-    /// translate the outcome into a [`gossipsub::MessageAcceptance`] so
+    /// translate the outcome into a [`MessageAcceptance`] so
     /// scoring can react to application-level adversaries.
     ///
     /// Verdicts: `Reject` for un-decodable or semantically-wrong
@@ -446,8 +455,7 @@ impl SyncDriver {
         topic: Topic,
         data: Vec<u8>,
         source: neutrino_network::PeerId,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+    ) -> MessageAcceptance {
         if topic == Topic::BlockProofs {
             return self.handle_block_proof_gossip(data).await;
         }
@@ -455,11 +463,7 @@ impl SyncDriver {
             let Ok(proof) = borsh::from_slice::<neutrino_consensus_types::ChunkProof>(&data) else {
                 return MessageAcceptance::Reject;
             };
-            return match self.backend.verify_and_import_chunk_proof(proof).await {
-                Ok(_) => MessageAcceptance::Accept,
-                Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
-                Err(_) => MessageAcceptance::Ignore,
-            };
+            return verdict(&self.backend.verify_and_import_chunk_proof(proof).await);
         }
         if topic == Topic::BftCandidates {
             let Ok(candidate) = borsh::from_slice::<neutrino_consensus_types::BftCandidate>(&data)
@@ -480,11 +484,7 @@ impl SyncDriver {
             else {
                 return MessageAcceptance::Reject;
             };
-            return match bft::on_message(self, source, message).await {
-                Ok(()) => MessageAcceptance::Accept,
-                Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
-                Err(_) => MessageAcceptance::Ignore,
-            };
+            return verdict(&bft::on_message(self, source, message).await);
         }
         if topic == Topic::SignedArtifacts {
             if data.len() > topic.max_transmit_size() {
@@ -509,11 +509,11 @@ impl SyncDriver {
             return MessageAcceptance::Accept;
         }
         if topic == Topic::FinalityVotesPrevote || topic == Topic::FinalityVotesPrecommit {
-            return self.handle_finality_vote_gossip(data, source).await;
+            return self.handle_finality_vote_gossip(None, data, source).await;
         }
         if let Topic::AggregateFinalityVotes(subnet) = topic {
             return self
-                .handle_aggregate_finality_vote_gossip(subnet, data, source)
+                .handle_finality_vote_gossip(Some(subnet), data, source)
                 .await;
         }
         if topic == Topic::EvidenceProofs {
@@ -552,8 +552,7 @@ impl SyncDriver {
         &mut self,
         data: Vec<u8>,
         source: neutrino_network::PeerId,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+    ) -> MessageAcceptance {
         let block = match borsh::from_slice::<neutrino_consensus_types::Block>(&data) {
             Ok(b) => b,
             Err(err) => {
@@ -609,11 +608,7 @@ impl SyncDriver {
         }
     }
 
-    async fn handle_block_proof_gossip(
-        &mut self,
-        data: Vec<u8>,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+    async fn handle_block_proof_gossip(&mut self, data: Vec<u8>) -> MessageAcceptance {
         let proof = match borsh::from_slice::<neutrino_consensus_types::BlockProof>(&data) {
             Ok(p) => p,
             Err(err) => {
@@ -624,7 +619,7 @@ impl SyncDriver {
         let height = proof.height;
         match self
             .backend
-            .verify_and_import_block_proofs(height, vec![proof.clone()])
+            .verify_and_import_block_proofs(height, vec![proof])
             .await
         {
             Ok(_) => {
@@ -639,9 +634,9 @@ impl SyncDriver {
                 // driver against a Byzantine peer flooding
                 // future-height proofs onto the wire.
                 if self.pending_proofs.len() >= PENDING_PROOF_BUFFER_LIMIT {
-                    self.pending_proofs.remove(0);
+                    self.pending_proofs.pop_front();
                 }
-                self.pending_proofs.push(proof);
+                self.pending_proofs.push_back((height, data));
                 debug!(
                     height,
                     "buffering gossipped block proof until its block arrives"
@@ -663,20 +658,22 @@ impl SyncDriver {
         if self.pending_proofs.is_empty() {
             return;
         }
-        let drained: Vec<neutrino_consensus_types::BlockProof> =
-            core::mem::take(&mut self.pending_proofs);
-        for proof in drained {
-            let height = proof.height;
+        let drained = core::mem::take(&mut self.pending_proofs);
+        for (height, data) in drained {
+            // These bytes decoded when first buffered, so decoding cannot fail.
+            let Ok(proof) = borsh::from_slice::<neutrino_consensus_types::BlockProof>(&data) else {
+                continue;
+            };
             match self
                 .backend
-                .verify_and_import_block_proofs(height, vec![proof.clone()])
+                .verify_and_import_block_proofs(height, vec![proof])
                 .await
             {
                 Ok(_) => {
                     debug!(height, "imported previously-buffered block proof");
                 }
                 Err(SyncBackendError::ChainBehind(_)) => {
-                    self.pending_proofs.push(proof);
+                    self.pending_proofs.push_back((height, data));
                 }
                 Err(err) => {
                     debug!(
@@ -689,81 +686,42 @@ impl SyncDriver {
         }
     }
 
+    /// Route a finality vote from the direct topics (`subnet == None`) or an
+    /// aggregate subnet topic.
     async fn handle_finality_vote_gossip(
         &mut self,
+        subnet: Option<u8>,
         data: Vec<u8>,
         source: neutrino_network::PeerId,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
-        let vote = match borsh::from_slice::<neutrino_consensus_types::BftVote>(&data) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(?err, "failed to decode gossipped finality vote; rejecting");
-                return MessageAcceptance::Reject;
-            }
-        };
-        let neutrino_consensus_types::BftVote::Value(vote) = vote else {
-            return match bft::on_message(
-                self,
-                source,
-                neutrino_consensus_types::BftMessage::Vote(vote),
-            )
-            .await
-            {
-                Ok(()) => MessageAcceptance::Accept,
-                Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
-                Err(_) => MessageAcceptance::Ignore,
-            };
-        };
-        candidates::on_vote(self, source, None, &vote).await;
-        self.backend.ingest_finality_vote(vote.clone()).await;
-        availability::on_vote(self, source, &vote).await;
-        MessageAcceptance::Accept
-    }
-
-    async fn handle_aggregate_finality_vote_gossip(
-        &mut self,
-        subnet: u8,
-        data: Vec<u8>,
-        source: neutrino_network::PeerId,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+    ) -> MessageAcceptance {
         let vote = match borsh::from_slice::<neutrino_consensus_types::BftVote>(&data) {
             Ok(v) => v,
             Err(err) => {
                 warn!(
                     ?err,
-                    subnet, "failed to decode gossipped aggregate finality vote; rejecting"
+                    ?subnet,
+                    "failed to decode gossipped finality vote; rejecting"
                 );
                 return MessageAcceptance::Reject;
             }
         };
         let neutrino_consensus_types::BftVote::Value(vote) = vote else {
-            return match bft::on_message(
-                self,
-                source,
-                neutrino_consensus_types::BftMessage::Vote(vote),
-            )
-            .await
-            {
-                Ok(()) => MessageAcceptance::Accept,
-                Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
-                Err(_) => MessageAcceptance::Ignore,
-            };
+            let message = neutrino_consensus_types::BftMessage::Vote(vote);
+            return verdict(&bft::on_message(self, source, message).await);
         };
-        candidates::on_vote(self, source, Some(subnet), &vote).await;
-        self.backend
-            .ingest_aggregate_finality_vote(subnet, vote.clone())
-            .await;
+        candidates::on_vote(self, source, subnet, &vote).await;
+        if let Some(subnet) = subnet {
+            self.backend
+                .ingest_aggregate_finality_vote(subnet, vote.clone())
+                .await;
+        } else {
+            self.backend.ingest_finality_vote(vote.clone()).await;
+        }
         availability::on_vote(self, source, &vote).await;
         MessageAcceptance::Accept
     }
 
-    async fn handle_slashing_evidence_gossip(
-        &self,
-        data: Vec<u8>,
-    ) -> neutrino_network::libp2p::gossipsub::MessageAcceptance {
-        use neutrino_network::libp2p::gossipsub::MessageAcceptance;
+    async fn handle_slashing_evidence_gossip(&self, data: Vec<u8>) -> MessageAcceptance {
         let evidence = match borsh::from_slice::<neutrino_consensus_types::SlashingEvidence>(&data)
         {
             Ok(e) => e,
@@ -952,7 +910,6 @@ impl SyncDriver {
             let _ = self.fsm.on_event(SyncEvent::RpcFailed {
                 protocol: RpcProtocol::HistoryProofByRange,
                 peer,
-                error: "provider attempts exhausted for this availability event".to_owned(),
             });
             return;
         }
@@ -963,7 +920,6 @@ impl SyncDriver {
             let _ = self.fsm.on_event(SyncEvent::RpcFailed {
                 protocol: RpcProtocol::HistoryProofByRange,
                 peer,
-                error: "history request identity exhausted".to_owned(),
             });
             return;
         };
@@ -992,7 +948,6 @@ impl SyncDriver {
             let _ = self.fsm.on_event(SyncEvent::RpcFailed {
                 protocol: RpcProtocol::HistoryProofByRange,
                 peer,
-                error: "network command channel closed".to_owned(),
             });
         }
     }
@@ -1127,7 +1082,7 @@ impl SyncDriver {
         let outbound_tx = self.outbound_tx.clone();
         tokio::spawn(async move {
             // Bound the wait so a vanished peer eventually surfaces.
-            let result = match tokio::time::timeout(Duration::from_secs(30), resp_rx).await {
+            let result = match tokio::time::timeout(RPC_RESPONSE_TIMEOUT, resp_rx).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_canceled)) => Err(neutrino_network::rpc::RpcError::ResponseDeliveryFailed),
                 Err(_elapsed) => Err(neutrino_network::rpc::RpcError::Outbound(
@@ -1139,17 +1094,9 @@ impl SyncDriver {
         true
     }
 
-    async fn handle_rpc_failure(
-        &mut self,
-        protocol: RpcProtocol,
-        peer: neutrino_network::PeerId,
-        error: neutrino_network::rpc::RpcError,
-    ) {
-        let commands = self.fsm.on_event(SyncEvent::RpcFailed {
-            protocol,
-            peer,
-            error: error.to_string(),
-        });
+    /// Release the FSM's matching in-flight request and dispatch any retry.
+    async fn handle_rpc_failure(&mut self, protocol: RpcProtocol, peer: neutrino_network::PeerId) {
+        let commands = self.fsm.on_event(SyncEvent::RpcFailed { protocol, peer });
         self.dispatch_sync_commands(commands).await;
     }
 
@@ -1206,8 +1153,8 @@ impl SyncDriver {
                     self.handle_blocks_response(peer, payload.blocks).await;
                 }
                 Ok(other) => warn!(?other, "unexpected response type for BlocksByRange RPC"),
-                Err(err) => {
-                    self.handle_rpc_failure(RpcProtocol::BlocksByRange, peer, err)
+                Err(_) => {
+                    self.handle_rpc_failure(RpcProtocol::BlocksByRange, peer)
                         .await;
                 }
             },
@@ -1227,8 +1174,8 @@ impl SyncDriver {
                     .await;
                 }
                 Ok(other) => warn!(?other, "unexpected response type for StateByRoot RPC"),
-                Err(err) => {
-                    self.handle_rpc_failure(RpcProtocol::StateByRoot, peer, err)
+                Err(_) => {
+                    self.handle_rpc_failure(RpcProtocol::StateByRoot, peer)
                         .await;
                 }
             },
@@ -1245,8 +1192,8 @@ impl SyncDriver {
                     ?other,
                     "unexpected response type for BlockProofByHeight RPC"
                 ),
-                Err(err) => {
-                    self.handle_rpc_failure(RpcProtocol::BlockProofByHeight, peer, err)
+                Err(_) => {
+                    self.handle_rpc_failure(RpcProtocol::BlockProofByHeight, peer)
                         .await;
                 }
             },
@@ -1288,10 +1235,7 @@ impl SyncDriver {
                 self.dispatch_sync_commands(commands).await;
             }
             Ok(other) => warn!(?other, "unexpected response type for Status RPC"),
-            Err(error) => {
-                self.handle_rpc_failure(RpcProtocol::Status, peer, error)
-                    .await;
-            }
+            Err(_) => self.handle_rpc_failure(RpcProtocol::Status, peer).await,
         }
         self.try_next_history_provider().await;
     }
@@ -1359,15 +1303,11 @@ impl SyncDriver {
                     ?other,
                     "unexpected response type for HistoryProofByRange RPC"
                 );
-                let commands = self.fsm.on_event(SyncEvent::RpcFailed {
-                    protocol: RpcProtocol::HistoryProofByRange,
-                    peer,
-                    error: "unexpected history response type".to_owned(),
-                });
-                self.dispatch_sync_commands(commands).await;
+                self.handle_rpc_failure(RpcProtocol::HistoryProofByRange, peer)
+                    .await;
             }
-            Err(err) => {
-                self.handle_rpc_failure(RpcProtocol::HistoryProofByRange, peer, err)
+            Err(_) => {
+                self.handle_rpc_failure(RpcProtocol::HistoryProofByRange, peer)
                     .await;
             }
         }
@@ -1383,12 +1323,8 @@ impl SyncDriver {
         if proof.statement.start_checkpoint().hash() != start
             || proof.statement.end_checkpoint().hash() != end
         {
-            let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                protocol: RpcProtocol::HistoryProofByRange,
-                peer,
-                error: "history response does not match requested endpoints".to_owned(),
-            });
-            self.dispatch_sync_commands(cmds).await;
+            self.handle_rpc_failure(RpcProtocol::HistoryProofByRange, peer)
+                .await;
             return;
         }
         match self.backend.verify_and_import_history(proof).await {
@@ -1404,12 +1340,8 @@ impl SyncDriver {
             }
             Err(err) => {
                 warn!(?err, "rejected history range proof");
-                let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                    protocol: RpcProtocol::HistoryProofByRange,
-                    peer,
-                    error: err.to_string(),
-                });
-                self.dispatch_sync_commands(cmds).await;
+                self.handle_rpc_failure(RpcProtocol::HistoryProofByRange, peer)
+                    .await;
             }
         }
     }
@@ -1420,12 +1352,8 @@ impl SyncDriver {
         blocks: Vec<neutrino_consensus_types::Block>,
     ) {
         if blocks.is_empty() {
-            let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                protocol: RpcProtocol::BlocksByRange,
-                peer,
-                error: "empty block batch".to_owned(),
-            });
-            self.dispatch_sync_commands(cmds).await;
+            self.handle_rpc_failure(RpcProtocol::BlocksByRange, peer)
+                .await;
             return;
         }
         match self.backend.verify_and_import_headers(blocks).await {
@@ -1449,12 +1377,8 @@ impl SyncDriver {
             }
             Err(err) => {
                 warn!(?err, "rejected block batch");
-                let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                    protocol: RpcProtocol::BlocksByRange,
-                    peer,
-                    error: err.to_string(),
-                });
-                self.dispatch_sync_commands(cmds).await;
+                self.handle_rpc_failure(RpcProtocol::BlocksByRange, peer)
+                    .await;
             }
         }
     }
@@ -1466,12 +1390,8 @@ impl SyncDriver {
         proofs: Vec<neutrino_consensus_types::BlockProof>,
     ) {
         if proofs.is_empty() {
-            let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                protocol: RpcProtocol::BlockProofByHeight,
-                peer,
-                error: "empty block proof batch".to_owned(),
-            });
-            self.dispatch_sync_commands(cmds).await;
+            self.handle_rpc_failure(RpcProtocol::BlockProofByHeight, peer)
+                .await;
             return;
         }
         match self
@@ -1491,12 +1411,8 @@ impl SyncDriver {
             }
             Err(err) => {
                 warn!(?err, "rejected block proof batch");
-                let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                    protocol: RpcProtocol::BlockProofByHeight,
-                    peer,
-                    error: err.to_string(),
-                });
-                self.dispatch_sync_commands(cmds).await;
+                self.handle_rpc_failure(RpcProtocol::BlockProofByHeight, peer)
+                    .await;
             }
         }
     }
@@ -1521,59 +1437,18 @@ impl SyncDriver {
                     self.dispatch_sync_commands(cmds).await;
                 } else if !progress.next_items.is_empty() {
                     // Continue the trie walk.
-                    let _ = self
-                        .cmd_tx
-                        .send(NetworkCommand::SendRpcRequest {
-                            peer,
-                            request: RpcRequest::StateByRoot(StateByRootRequest {
-                                state_root,
-                                items: neutrino_consensus_types::bootstrap::StateItems::new(
-                                    progress.next_items.clone(),
-                                )
-                                .expect("bounded state continuation"),
-                            }),
-                            response_tx: {
-                                let (tx, rx) = oneshot::channel();
-                                let outbound_tx = self.outbound_tx.clone();
-                                let next_items = progress.next_items;
-                                tokio::spawn(async move {
-                                    let result = match tokio::time::timeout(
-                                        Duration::from_secs(30),
-                                        rx,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(r)) => r,
-                                        Ok(Err(_)) => Err(
-                                            neutrino_network::rpc::RpcError::ResponseDeliveryFailed,
-                                        ),
-                                        Err(_) => Err(neutrino_network::rpc::RpcError::Outbound(
-                                            "timeout".to_owned(),
-                                        )),
-                                    };
-                                    let _ = outbound_tx
-                                        .send(OutboundOutcome::StateNodes {
-                                            peer,
-                                            state_root,
-                                            items: next_items,
-                                            response: result,
-                                        })
-                                        .await;
-                                });
-                                tx
-                            },
-                        })
-                        .await;
+                    self.dispatch_one(SyncCommand::RequestStateNodes {
+                        peer,
+                        state_root,
+                        items: progress.next_items,
+                    })
+                    .await;
                 }
             }
             Err(err) => {
                 warn!(?err, "rejected state node batch");
-                let cmds = self.fsm.on_event(SyncEvent::RpcFailed {
-                    protocol: RpcProtocol::StateByRoot,
-                    peer,
-                    error: err.to_string(),
-                });
-                self.dispatch_sync_commands(cmds).await;
+                self.handle_rpc_failure(RpcProtocol::StateByRoot, peer)
+                    .await;
             }
         }
     }
@@ -1655,9 +1530,8 @@ fn hex_short(bytes: &[u8; 32]) -> String {
 fn bounded_history_reply(
     payload: neutrino_network::rpc::HistoryProofByRangeResponse,
 ) -> Result<neutrino_network::rpc::HistoryProofByRangeResponse, SyncBackendError> {
-    let size = borsh::to_vec(&payload)
-        .map_err(|error| SyncBackendError::Storage(error.to_string()))?
-        .len();
+    let size = borsh::object_length(&payload)
+        .map_err(|error| SyncBackendError::Storage(error.to_string()))?;
     // Reserve the RpcResult discriminant in the framed response.
     if u64::try_from(size).unwrap_or(u64::MAX) >= neutrino_network::rpc::DEFAULT_MAX_RESPONSE_SIZE {
         return Err(SyncBackendError::NotAvailable(
@@ -1665,6 +1539,28 @@ fn bounded_history_reply(
         ));
     }
     Ok(payload)
+}
+
+/// Whether two status handshakes describe the same chain and chain spec.
+fn same_chain(a: &Status, b: &Status) -> bool {
+    a.chain_id == b.chain_id && a.chain_spec_hash == b.chain_spec_hash
+}
+
+/// One bounded download page from `start` through at most `last`
+/// (`start <= last`): the requested entry count and the page's last height.
+fn page(start: Height, last: Height, max_entries: u64) -> (u64, Height) {
+    let count = (last - start + 1).min(max_entries);
+    (count, start + count - 1)
+}
+
+/// Gossip verdict for a backend outcome: verified-invalid data is rejected,
+/// data the node merely cannot use now is ignored.
+const fn verdict<T>(result: &Result<T, SyncBackendError>) -> MessageAcceptance {
+    match result {
+        Ok(_) => MessageAcceptance::Accept,
+        Err(SyncBackendError::Rejected(_)) => MessageAcceptance::Reject,
+        Err(_) => MessageAcceptance::Ignore,
+    }
 }
 
 fn rpc_reply<T>(

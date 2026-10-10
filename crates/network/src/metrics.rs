@@ -13,25 +13,6 @@ use std::{
 };
 use tokio::time::Instant;
 
-const PROTOCOLS: [RpcProtocol; 17] = [
-    RpcProtocol::Status,
-    RpcProtocol::Metadata,
-    RpcProtocol::Ping,
-    RpcProtocol::BlocksByRange,
-    RpcProtocol::BlocksByRoot,
-    RpcProtocol::StateByRoot,
-    RpcProtocol::BlockProofByHash,
-    RpcProtocol::BlockProofByHeight,
-    RpcProtocol::ChunkProofById,
-    RpcProtocol::CheckpointLatest,
-    RpcProtocol::HistoryProofByRange,
-    RpcProtocol::FinalityCertByChunk,
-    RpcProtocol::WitnessByBlock,
-    RpcProtocol::CandidateByChunk,
-    RpcProtocol::SignedArtifactById,
-    RpcProtocol::SignedArtifactInventoryByChunk,
-    RpcProtocol::BftRoundByChunk,
-];
 const OUTCOMES: [&str; 10] = [
     "ok",
     "remote_error",
@@ -44,7 +25,7 @@ const OUTCOMES: [&str; 10] = [
     "cancelled",
     "response_omission",
 ];
-const BOOTNODE_STATES: [&str; 6] = [
+const BOOTNODE_STATES: [&str; BootnodeState::COUNT] = [
     "connected",
     "pending",
     "backoff",
@@ -58,9 +39,27 @@ const BUCKETS_MILLIS: [u64; 10] = [1, 5, 10, 50, 100, 500, 1_000, 5_000, 10_000,
 const GOSSIP_PUBLISH: [&str; 3] = ["ok", "duplicate", "failed"];
 const GOSSIP_VALIDATION: [&str; 3] = ["accept", "reject", "ignore"];
 
-/// `PROTOCOLS` lists every variant in declaration order.
+/// `RpcProtocol::ALL` lists every variant in declaration order.
 const fn protocol_index(protocol: RpcProtocol) -> usize {
     protocol as usize
+}
+
+/// Reconnect state of one configured bootnode address. Discriminants index
+/// the `neutrino_bootnodes{state}` labels in `BOOTNODE_STATES`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum BootnodeState {
+    Connected,
+    Pending,
+    Backoff,
+    Ready,
+    Disabled,
+    Blocked,
+}
+
+impl BootnodeState {
+    /// Number of states, and therefore of exported state labels.
+    pub(crate) const COUNT: usize = 6;
 }
 
 fn protocol_label(protocol: RpcProtocol) -> &'static str {
@@ -228,7 +227,7 @@ pub struct NetworkMetrics {
     ping_ok: AtomicU64,
     ping_failed: AtomicU64,
     ping_latency: Histogram,
-    rpc: [[RpcMeasurements; 2]; PROTOCOLS.len()],
+    rpc: [[RpcMeasurements; 2]; RpcProtocol::ALL.len()],
     gossip_received: AtomicU64,
     gossip_received_bytes: AtomicU64,
     gossip_publish: [AtomicU64; GOSSIP_PUBLISH.len()],
@@ -446,7 +445,7 @@ impl NetworkMetrics {
         ] {
             family(out, name, kind);
         }
-        for protocol in PROTOCOLS {
+        for protocol in RpcProtocol::ALL {
             for direction in [Direction::Inbound, Direction::Outbound] {
                 let labels = format!(
                     "protocol=\"{}\",direction=\"{}\"",
@@ -608,9 +607,23 @@ mod tests {
     }
 
     #[test]
+    fn bootnode_state_discriminants_index_their_labels() {
+        for (state, label) in [
+            (BootnodeState::Connected, "connected"),
+            (BootnodeState::Pending, "pending"),
+            (BootnodeState::Backoff, "backoff"),
+            (BootnodeState::Ready, "ready"),
+            (BootnodeState::Disabled, "disabled"),
+            (BootnodeState::Blocked, "blocked"),
+        ] {
+            assert_eq!(BOOTNODE_STATES[state as usize], label);
+        }
+    }
+
+    #[test]
     fn protocol_and_outcome_labels_are_fixed_and_all_protocols_are_distinct() {
         let mut labels = std::collections::HashSet::new();
-        for (index, protocol) in PROTOCOLS.into_iter().enumerate() {
+        for (index, protocol) in RpcProtocol::ALL.into_iter().enumerate() {
             assert_eq!(protocol_index(protocol), index);
             assert!(labels.insert(protocol_label(protocol)));
         }

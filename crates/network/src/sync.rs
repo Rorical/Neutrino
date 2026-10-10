@@ -161,7 +161,7 @@ pub struct LocalProgress {
 
 /// Pseudo-events the driver feeds to the FSM after performing verification
 /// and storage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum SyncEvent {
     /// A peer just became reachable.
     PeerConnected(PeerId),
@@ -221,8 +221,6 @@ pub enum SyncEvent {
         protocol: RpcProtocol,
         /// Peer that failed to serve the request.
         peer: PeerId,
-        /// Operator-readable error.
-        error: String,
     },
     /// Reset the FSM to [`SyncState::Init`] (driver-initiated).
     Reset,
@@ -288,12 +286,17 @@ pub struct SyncBatchSizes {
     pub block_proof_batch: u64,
 }
 
+impl SyncBatchSizes {
+    /// One full response page per request.
+    pub const DEFAULT: Self = Self {
+        block_batch: rpc::MAX_BLOCKS_PER_RESPONSE,
+        block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
+    };
+}
+
 impl Default for SyncBatchSizes {
     fn default() -> Self {
-        Self {
-            block_batch: 16,
-            block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -327,10 +330,7 @@ impl SyncMachine {
             state: SyncState::Init,
             progress,
             sync_peer: None,
-            batch_sizes: SyncBatchSizes {
-                block_batch: 16,
-                block_proof_batch: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
-            },
+            batch_sizes: SyncBatchSizes::DEFAULT,
         }
     }
 
@@ -413,11 +413,7 @@ impl SyncMachine {
             SyncEvent::BodiesAdvanced { new_body_height } => {
                 self.on_bodies_advanced(new_body_height)
             }
-            SyncEvent::RpcFailed {
-                protocol,
-                peer,
-                error,
-            } => self.on_rpc_failed(protocol, peer, &error),
+            SyncEvent::RpcFailed { protocol, peer } => self.on_rpc_failed(protocol, peer),
         }
     }
 
@@ -652,21 +648,67 @@ impl SyncMachine {
         }
     }
 
+    /// The request that makes progress in the current backfill state.
+    fn request_for(&self, peer: PeerId) -> Option<SyncCommand> {
+        match self.state {
+            SyncState::HeaderBackfill {
+                local_head_height, ..
+            } => Some(SyncCommand::RequestBlocks {
+                peer,
+                start_height: local_head_height.saturating_add(1),
+                count: self.batch_sizes.block_batch,
+            }),
+            SyncState::StateFetch { target_state_root } => Some(SyncCommand::RequestStateNodes {
+                peer,
+                state_root: target_state_root,
+                // Seed with the authenticated root hash; verified nodes reveal child hashes.
+                items: vec![neutrino_consensus_types::bootstrap::StateItem::node(
+                    target_state_root,
+                )],
+            }),
+            SyncState::ProofBackfill { from_height, .. } => Some(SyncCommand::RequestBlockProofs {
+                peer,
+                start_height: from_height,
+                count: self.batch_sizes.block_proof_batch,
+            }),
+            SyncState::BodyBackfill { from_height, .. } => Some(SyncCommand::RequestBlocks {
+                peer,
+                start_height: from_height,
+                count: self.batch_sizes.block_batch,
+            }),
+            SyncState::Init
+            | SyncState::CheckpointBackfill { .. }
+            | SyncState::Following
+            | SyncState::Stalled { .. } => None,
+        }
+    }
+
+    /// [`Self::request_for`] the selected sync peer, if any.
+    fn request_from_sync_peer(&self) -> Vec<SyncCommand> {
+        self.sync_peer
+            .and_then(|sync_peer| self.request_for(sync_peer.peer))
+            .into_iter()
+            .collect()
+    }
+
+    /// Clear the `in_flight` bit of a backfill state so the driver may retry.
+    const fn release_in_flight(&mut self) {
+        if let SyncState::CheckpointBackfill { in_flight, .. }
+        | SyncState::HeaderBackfill { in_flight, .. }
+        | SyncState::ProofBackfill { in_flight, .. }
+        | SyncState::BodyBackfill { in_flight, .. } = &mut self.state
+        {
+            *in_flight = false;
+        }
+    }
+
     fn advance_to_header_backfill(&mut self, target_height: Height) -> Vec<SyncCommand> {
-        let local_head = self.progress.head_height;
         self.state = SyncState::HeaderBackfill {
-            local_head_height: local_head,
+            local_head_height: self.progress.head_height,
             target_height,
             in_flight: true,
         };
-        let Some(sync_peer) = self.sync_peer else {
-            return Vec::new();
-        };
-        vec![SyncCommand::RequestBlocks {
-            peer: sync_peer.peer,
-            start_height: local_head.saturating_add(1),
-            count: self.batch_sizes.block_batch,
-        }]
+        self.request_from_sync_peer()
     }
 
     fn on_headers_advanced(
@@ -693,31 +735,15 @@ impl SyncMachine {
                 target_height,
                 in_flight: true,
             };
-            let Some(sync_peer) = self.sync_peer else {
-                return Vec::new();
-            };
-            vec![SyncCommand::RequestBlocks {
-                peer: sync_peer.peer,
-                start_height: new_head_height.saturating_add(1),
-                count: self.batch_sizes.block_batch,
-            }]
+            self.request_from_sync_peer()
         }
     }
 
     fn advance_to_state_fetch(&mut self) -> Vec<SyncCommand> {
-        let target_state_root = self.progress.finalized_state_root;
-        self.state = SyncState::StateFetch { target_state_root };
-        let Some(sync_peer) = self.sync_peer else {
-            return Vec::new();
+        self.state = SyncState::StateFetch {
+            target_state_root: self.progress.finalized_state_root,
         };
-        vec![SyncCommand::RequestStateNodes {
-            peer: sync_peer.peer,
-            state_root: target_state_root,
-            // Seed with the authenticated root hash; verified nodes reveal child hashes.
-            items: vec![neutrino_consensus_types::bootstrap::StateItem::node(
-                target_state_root,
-            )],
-        }]
+        self.request_from_sync_peer()
     }
 
     fn on_state_root_reconstructed(&mut self, root: StateRoot) -> Vec<SyncCommand> {
@@ -749,14 +775,7 @@ impl SyncMachine {
             target_height: target,
             in_flight: true,
         };
-        let Some(sync_peer) = self.sync_peer else {
-            return Vec::new();
-        };
-        vec![SyncCommand::RequestBlockProofs {
-            peer: sync_peer.peer,
-            start_height: from,
-            count: self.batch_sizes.block_proof_batch,
-        }]
+        self.request_from_sync_peer()
     }
 
     fn advance_past_proof_backfill(&mut self) -> Vec<SyncCommand> {
@@ -774,20 +793,12 @@ impl SyncMachine {
         if new_proven_height >= target_height {
             self.advance_past_proof_backfill()
         } else {
-            let from = new_proven_height.saturating_add(1);
             self.state = SyncState::ProofBackfill {
-                from_height: from,
+                from_height: new_proven_height.saturating_add(1),
                 target_height,
                 in_flight: true,
             };
-            let Some(sync_peer) = self.sync_peer else {
-                return Vec::new();
-            };
-            vec![SyncCommand::RequestBlockProofs {
-                peer: sync_peer.peer,
-                start_height: from,
-                count: self.batch_sizes.block_proof_batch,
-            }]
+            self.request_from_sync_peer()
         }
     }
 
@@ -802,14 +813,7 @@ impl SyncMachine {
             target_height: target,
             in_flight: true,
         };
-        let Some(sync_peer) = self.sync_peer else {
-            return Vec::new();
-        };
-        vec![SyncCommand::RequestBlocks {
-            peer: sync_peer.peer,
-            start_height: from,
-            count: self.batch_sizes.block_batch,
-        }]
+        self.request_from_sync_peer()
     }
 
     fn on_bodies_advanced(&mut self, new_body_height: Height) -> Vec<SyncCommand> {
@@ -825,14 +829,7 @@ impl SyncMachine {
                 target_height,
                 in_flight: true,
             };
-            let Some(sync_peer) = self.sync_peer else {
-                return Vec::new();
-            };
-            vec![SyncCommand::RequestBlocks {
-                peer: sync_peer.peer,
-                start_height: new_body_height.saturating_add(1),
-                count: self.batch_sizes.block_batch,
-            }]
+            self.request_from_sync_peer()
         }
     }
 
@@ -848,12 +845,7 @@ impl SyncMachine {
         cmds
     }
 
-    fn on_rpc_failed(
-        &mut self,
-        protocol: RpcProtocol,
-        peer: PeerId,
-        _error: &str,
-    ) -> Vec<SyncCommand> {
+    fn on_rpc_failed(&mut self, protocol: RpcProtocol, peer: PeerId) -> Vec<SyncCommand> {
         if self.mode == SyncMode::LightClient
             && matches!(
                 protocol,
@@ -863,96 +855,26 @@ impl SyncMachine {
         {
             return Vec::new();
         }
-        // Clear in_flight on the matching state and let the driver retry.
-        match (&self.state, protocol) {
+        // Clear in_flight on the matching state and let the driver retry;
+        // only the history fetch waits for a fresh notification instead.
+        let retry = match (&self.state, protocol) {
             (
-                SyncState::CheckpointBackfill {
-                    local_finalized_index,
-                    target_index,
-                    ..
-                },
+                SyncState::CheckpointBackfill { .. },
                 RpcProtocol::HistoryProofByRange | RpcProtocol::CheckpointLatest,
-            ) => {
-                let (local, target) = (*local_finalized_index, *target_index);
-                self.state = SyncState::CheckpointBackfill {
-                    local_finalized_index: local,
-                    target_index: target,
-                    in_flight: false,
-                };
-                Vec::new()
-            }
+            ) => false,
             (
-                SyncState::HeaderBackfill {
-                    local_head_height,
-                    target_height,
-                    ..
-                },
+                SyncState::HeaderBackfill { .. } | SyncState::BodyBackfill { .. },
                 RpcProtocol::BlocksByRange,
-            ) => {
-                let (head, target) = (*local_head_height, *target_height);
-                self.state = SyncState::HeaderBackfill {
-                    local_head_height: head,
-                    target_height: target,
-                    in_flight: false,
-                };
-                vec![SyncCommand::RequestBlocks {
-                    peer,
-                    start_height: head.saturating_add(1),
-                    count: self.batch_sizes.block_batch,
-                }]
-            }
-            (SyncState::StateFetch { target_state_root }, RpcProtocol::StateByRoot) => {
-                let target_state_root = *target_state_root;
-                self.state = SyncState::StateFetch { target_state_root };
-                vec![SyncCommand::RequestStateNodes {
-                    peer,
-                    state_root: target_state_root,
-                    items: vec![neutrino_consensus_types::bootstrap::StateItem::node(
-                        target_state_root,
-                    )],
-                }]
-            }
-            (
-                SyncState::ProofBackfill {
-                    from_height,
-                    target_height,
-                    ..
-                },
-                RpcProtocol::BlockProofByHeight,
-            ) => {
-                let (from, target) = (*from_height, *target_height);
-                self.state = SyncState::ProofBackfill {
-                    from_height: from,
-                    target_height: target,
-                    in_flight: false,
-                };
-                vec![SyncCommand::RequestBlockProofs {
-                    peer,
-                    start_height: from,
-                    count: self.batch_sizes.block_proof_batch,
-                }]
-            }
-            (
-                SyncState::BodyBackfill {
-                    from_height,
-                    target_height,
-                    ..
-                },
-                RpcProtocol::BlocksByRange,
-            ) => {
-                let (from, target) = (*from_height, *target_height);
-                self.state = SyncState::BodyBackfill {
-                    from_height: from,
-                    target_height: target,
-                    in_flight: false,
-                };
-                vec![SyncCommand::RequestBlocks {
-                    peer,
-                    start_height: from,
-                    count: self.batch_sizes.block_batch,
-                }]
-            }
-            _ => Vec::new(),
+            )
+            | (SyncState::StateFetch { .. }, RpcProtocol::StateByRoot)
+            | (SyncState::ProofBackfill { .. }, RpcProtocol::BlockProofByHeight) => true,
+            _ => return Vec::new(),
+        };
+        self.release_in_flight();
+        if retry {
+            self.request_for(peer).into_iter().collect()
+        } else {
+            Vec::new()
         }
     }
 }
@@ -1311,7 +1233,6 @@ mod tests {
         let cmds = fsm.on_event(SyncEvent::RpcFailed {
             protocol: RpcProtocol::HistoryProofByRange,
             peer,
-            error: "transport closed".to_owned(),
         });
         assert_eq!(cmds, [] as [SyncCommand; 0]);
         match fsm.state() {
@@ -1406,7 +1327,6 @@ mod tests {
         fsm.on_event(SyncEvent::RpcFailed {
             protocol: RpcProtocol::HistoryProofByRange,
             peer: other,
-            error: "old request".to_owned(),
         });
         assert_eq!(fsm.state(), &state);
         assert_eq!(fsm.sync_peer(), Some(original));
@@ -1423,7 +1343,6 @@ mod tests {
         let cmds = fsm.on_event(SyncEvent::RpcFailed {
             protocol: RpcProtocol::StateByRoot,
             peer,
-            error: "timeout".to_owned(),
         });
         assert_eq!(
             cmds,
@@ -1449,7 +1368,6 @@ mod tests {
         let cmds = fsm.on_event(SyncEvent::RpcFailed {
             protocol: RpcProtocol::BlocksByRange,
             peer,
-            error: "timeout".to_owned(),
         });
         assert_eq!(
             cmds,

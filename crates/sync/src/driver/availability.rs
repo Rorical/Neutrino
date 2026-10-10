@@ -2,7 +2,7 @@
 
 use super::{OutboundOutcome, SyncDriver};
 use crate::EvidenceProofAcceptance;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use neutrino_consensus_types::{
     FinalityVote,
     signed_artifacts::{SignedArtifact, SignedArtifactInventory, SignedArtifactRef},
@@ -101,7 +101,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
     let Ok(local) = driver.backend.local_status().await else {
         return;
     };
-    if local.chain_id != status.chain_id || local.chain_spec_hash != status.chain_spec_hash {
+    if !super::same_chain(&local, &status) {
         return;
     }
     let Some(next) = local
@@ -274,15 +274,24 @@ async fn drive(driver: &mut SyncDriver) {
                 .values()
                 .any(|attempts| *attempts < MAX_PROVIDER_ATTEMPTS)
     });
-    let queries: Vec<_> = driver.availability.jobs.keys().copied().collect();
-    for query in queries {
-        if !driver
-            .backend
-            .signed_artifact_source_known(query.chunk())
-            .await
-        {
-            driver.availability.jobs.remove(&query);
+    // Many jobs share a source chunk; authenticate each chunk once.
+    let chunks: BTreeSet<u64> = driver
+        .availability
+        .jobs
+        .keys()
+        .map(|query| query.chunk())
+        .collect();
+    let mut stale = BTreeSet::new();
+    for chunk in chunks {
+        if !driver.backend.signed_artifact_source_known(chunk).await {
+            stale.insert(chunk);
         }
+    }
+    if !stale.is_empty() {
+        driver
+            .availability
+            .jobs
+            .retain(|query, _| !stale.contains(&query.chunk()));
     }
     while driver
         .availability

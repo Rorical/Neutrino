@@ -1,5 +1,6 @@
 //! Real loopback coverage for configured-address reconnects.
 
+use super::test_support::{TestNode, next_listen_addr, test_node};
 use super::*;
 use libp2p::{
     core::{ConnectedPoint, Endpoint, transport::PortUse},
@@ -7,12 +8,6 @@ use libp2p::{
     swarm::ConnectionId,
 };
 use tokio::{task::JoinHandle, time::timeout};
-
-struct PreparedService {
-    service: NetworkService,
-    commands: mpsc::Sender<NetworkCommand>,
-    events: mpsc::Receiver<NetworkEvent>,
-}
 
 struct RunningService {
     _commands: mpsc::Sender<NetworkCommand>,
@@ -27,17 +22,11 @@ impl RunningService {
     }
 }
 
-fn prepared(key: Keypair) -> PreparedService {
-    let (commands, receiver) = mpsc::channel(32);
-    let (sender, events) = mpsc::channel(128);
-    PreparedService {
-        service: NetworkService::new(key, receiver, sender).unwrap(),
-        commands,
-        events,
-    }
+fn prepared(key: Keypair) -> TestNode {
+    test_node(key, 32, 128)
 }
 
-fn start(prepared: PreparedService) -> RunningService {
+fn start(prepared: TestNode) -> RunningService {
     RunningService {
         _commands: prepared.commands,
         events: prepared.events,
@@ -71,18 +60,7 @@ async fn server(key: Keypair, address: Multiaddr) -> RunningService {
     let mut prepared = prepared(key);
     prepared.service.listen_on(address).unwrap();
     let mut running = start(prepared);
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(
-                running.events.recv().await.unwrap(),
-                NetworkEvent::NewListenAddr(_)
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("server listener binds");
+    next_listen_addr(&mut running.events).await;
     running
 }
 

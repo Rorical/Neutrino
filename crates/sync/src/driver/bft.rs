@@ -6,7 +6,9 @@ use alloc::collections::BTreeMap;
 use neutrino_consensus_types::{BftCandidate, BftMessage, BftProposal, BftVote};
 use neutrino_network::{
     PeerId,
-    rpc::{BftRoundByChunkRequest, RpcError, RpcRequest, RpcResponse, Status},
+    rpc::{
+        BftRoundByChunkRequest, CandidateByChunkRequest, RpcError, RpcRequest, RpcResponse, Status,
+    },
 };
 use tokio::time::{Duration, Instant};
 
@@ -71,7 +73,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
     let Ok(local) = driver.backend.local_status().await else {
         return;
     };
-    if status.chain_id != local.chain_id || status.chain_spec_hash != local.chain_spec_hash {
+    if !super::same_chain(&status, &local) {
         return;
     }
     let Some(connection) = driver.bft.connections.get(&peer).copied() else {
@@ -190,14 +192,19 @@ pub(super) async fn on_message(
     if let BftMessage::Vote(BftVote::Value(vote)) = &message {
         candidates::on_vote(driver, peer, None, vote).await;
     }
-    driver.backend.ingest_bft_message(message.clone()).await?;
-    let quorum = match &message {
+    // Only the quorum's exact target is needed after the message moves into the backend.
+    let quorum_target = match &message {
         BftMessage::RoundChange(report) => report.highest_quorum.as_ref(),
         BftMessage::RoundChangeCertificate(certificate) => certificate.highest_quorum(),
         _ => None,
-    };
-    if let Some(quorum) = quorum {
-        candidates::request_quorum(driver, peer, quorum).await;
+    }
+    .map(|quorum| CandidateByChunkRequest {
+        chunk_id: quorum.data.chunk_id,
+        chunk_hash: Some(quorum.data.chunk_hash),
+    });
+    driver.backend.ingest_bft_message(message).await?;
+    if let Some(query) = quorum_target {
+        candidates::request_quorum(driver, peer, query).await;
     }
     retry_pending(driver).await;
     Ok(())

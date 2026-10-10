@@ -84,6 +84,19 @@ struct Cursor {
     blocks: BTreeMap<u64, [u8; 32]>,
 }
 
+impl Cursor {
+    /// Download nothing yet of `target` along the branch ending at `head_block_hash`.
+    const fn new(target: crate::backend::ConsensusSyncTarget, head_block_hash: [u8; 32]) -> Self {
+        Self {
+            chunk_id: target.chunk_id,
+            head_block_hash,
+            next_header: target.start_height,
+            next_proof: target.start_height,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Step {
     Blocks {
@@ -237,7 +250,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
     let Ok(local) = driver.backend.local_status().await else {
         return true;
     };
-    if status.chain_id != local.chain_id || status.chain_spec_hash != local.chain_spec_hash {
+    if !super::same_chain(&status, &local) {
         return true;
     }
     if !driver.full_chunks.enabled {
@@ -281,26 +294,21 @@ async fn request_next(driver: &mut SyncDriver, peer: PeerId) {
     }) {
         return;
     }
-    let cursor = driver.full_chunks.cursors.entry(peer).or_insert(Cursor {
-        chunk_id: target.chunk_id,
-        head_block_hash: remote.head_block_hash,
-        next_header: target.start_height,
-        next_proof: target.start_height,
-        blocks: BTreeMap::new(),
-    });
+    let cursor = driver
+        .full_chunks
+        .cursors
+        .entry(peer)
+        .or_insert_with(|| Cursor::new(target, remote.head_block_hash));
     if cursor.chunk_id != target.chunk_id || cursor.head_block_hash != remote.head_block_hash {
-        *cursor = Cursor {
-            chunk_id: target.chunk_id,
-            head_block_hash: remote.head_block_hash,
-            next_header: target.start_height,
-            next_proof: target.start_height,
-            blocks: BTreeMap::new(),
-        };
+        *cursor = Cursor::new(target, remote.head_block_hash);
     }
     let available = target.end_height.min(remote.head_height);
     let (request, step) = if cursor.next_header <= available {
-        let count = (available - cursor.next_header + 1)
-            .min(neutrino_network::rpc::MAX_BLOCKS_PER_RESPONSE);
+        let (count, end) = super::page(
+            cursor.next_header,
+            available,
+            neutrino_network::rpc::MAX_BLOCKS_PER_RESPONSE,
+        );
         (
             RpcRequest::BlocksByRange(BlocksByRangeRequest {
                 head_block_hash: remote.head_block_hash,
@@ -311,12 +319,15 @@ async fn request_next(driver: &mut SyncDriver, peer: PeerId) {
             Step::Blocks {
                 head: remote.head_block_hash,
                 start: cursor.next_header,
-                end: cursor.next_header + count - 1,
+                end,
             },
         )
     } else if cursor.next_proof <= available {
-        let count = (available - cursor.next_proof + 1)
-            .min(neutrino_network::rpc::MAX_BLOCK_PROOFS_PER_RESPONSE);
+        let (count, end) = super::page(
+            cursor.next_proof,
+            available,
+            neutrino_network::rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
+        );
         (
             RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
                 head_block_hash: remote.head_block_hash,
@@ -326,7 +337,7 @@ async fn request_next(driver: &mut SyncDriver, peer: PeerId) {
             Step::Proofs {
                 head: remote.head_block_hash,
                 start: cursor.next_proof,
-                end: cursor.next_proof + count - 1,
+                end,
             },
         )
     } else if target.end_height <= available

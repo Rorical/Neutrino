@@ -57,7 +57,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
     let Ok(local) = driver.backend.local_status().await else {
         return true;
     };
-    if status.chain_id != local.chain_id || status.chain_spec_hash != local.chain_spec_hash {
+    if !super::same_chain(&status, &local) {
         return true;
     }
     if driver.bootstrap.peers.len() < super::HISTORY_PROVIDER_ATTEMPT_LIMIT

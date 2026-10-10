@@ -1,5 +1,6 @@
 //! Bounded reconnect state for explicitly configured bootstrap addresses.
 
+use crate::metrics::BootnodeState;
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol, swarm::ConnectionId};
 use neutrino_primitives::blake3_256;
 use std::time::Duration;
@@ -155,23 +156,23 @@ impl Bootnodes {
         matched
     }
 
-    pub(crate) fn states(&self, now: Instant) -> [u64; 6] {
-        let mut states = [0; 6];
+    pub(crate) fn states(&self, now: Instant) -> [u64; BootnodeState::COUNT] {
+        let mut states = [0; BootnodeState::COUNT];
         for (index, entry) in self.entries.iter().enumerate() {
             let state = if entry.disabled {
-                4
+                BootnodeState::Disabled
             } else if entry.connected_peer.is_some() {
-                0
+                BootnodeState::Connected
             } else if entry.pending.is_some() {
-                1
+                BootnodeState::Pending
             } else if !self.can_start(index) {
-                5
+                BootnodeState::Blocked
             } else if entry.retry_at > now {
-                2
+                BootnodeState::Backoff
             } else {
-                3
+                BootnodeState::Ready
             };
-            states[state] += 1;
+            states[state as usize] += 1;
         }
         states
     }

@@ -102,7 +102,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
     let Ok(local) = driver.backend.local_status().await else {
         return;
     };
-    if status.chain_id != local.chain_id || status.chain_spec_hash != local.chain_spec_hash {
+    if !super::same_chain(&status, &local) {
         return;
     }
     let Ok(Some(target)) = driver.backend.consensus_sync_target().await else {
@@ -139,19 +139,13 @@ fn enqueue_query(driver: &mut SyncDriver, peer: PeerId, query: CandidateByChunkR
     driver.candidates.queries.push((peer, query));
 }
 
+/// Discover the exact candidate named by an authenticated quorum.
 pub(super) async fn request_quorum(
     driver: &mut SyncDriver,
     peer: PeerId,
-    quorum: &neutrino_consensus_types::QuorumCertificate,
+    query: CandidateByChunkRequest,
 ) {
-    enqueue_query(
-        driver,
-        peer,
-        CandidateByChunkRequest {
-            chunk_id: quorum.data.chunk_id,
-            chunk_hash: Some(quorum.data.chunk_hash),
-        },
-    );
+    enqueue_query(driver, peer, query);
     drive(driver).await;
 }
 
@@ -348,14 +342,13 @@ fn next_payload(driver: &SyncDriver) -> Option<(PeerId, Step, RpcRequest)> {
         let hash = target.candidate.chunk.hash();
         let (step, rpc) = if target.blocks_complete {
             let start = target.next_proof;
-            let count = (target.candidate.chunk.end_height - start + 1)
-                .min(neutrino_network::rpc::MAX_BLOCK_PROOFS_PER_RESPONSE);
+            let (count, end) = super::page(
+                start,
+                target.candidate.chunk.end_height,
+                neutrino_network::rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
+            );
             (
-                Step::Proofs {
-                    hash,
-                    start,
-                    end: start + count - 1,
-                },
+                Step::Proofs { hash, start, end },
                 RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
                     head_block_hash: head,
                     start_height: start,
@@ -364,14 +357,13 @@ fn next_payload(driver: &SyncDriver) -> Option<(PeerId, Step, RpcRequest)> {
             )
         } else {
             let start = target.next_block;
-            let count = (target.candidate.chunk.end_height - start + 1)
-                .min(neutrino_network::rpc::MAX_BLOCKS_PER_RESPONSE);
+            let (count, end) = super::page(
+                start,
+                target.candidate.chunk.end_height,
+                neutrino_network::rpc::MAX_BLOCKS_PER_RESPONSE,
+            );
             (
-                Step::Blocks {
-                    hash,
-                    start,
-                    end: start + count - 1,
-                },
+                Step::Blocks { hash, start, end },
                 RpcRequest::BlocksByRange(BlocksByRangeRequest {
                     head_block_hash: head,
                     start_height: start,

@@ -303,6 +303,113 @@ fn body_authorization_follows_candidate_ancestry_and_checks_the_boundary() {
     );
 }
 
+thread_local! {
+    /// Panics raised on this thread, including ones a callee caught.
+    static PANICS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Panics raised so far on the calling thread. The release profile aborts on
+/// panic, so a rejection that unwinds kills the node even if it is caught.
+fn panics_on_this_thread() -> u32 {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            PANICS.with(|count| count.set(count.get().saturating_add(1)));
+            previous(info);
+        }));
+    });
+    PANICS.with(core::cell::Cell::get)
+}
+
+#[test]
+fn malformed_peer_evidence_is_rejected_without_unwinding() {
+    use neutrino_consensus_types::evidence::{
+        EvidenceArtifact, EvidenceContext, EvidenceStatement, EvidenceSubmission, SanctionKind,
+    };
+    use neutrino_default_runtime_core::{Transaction, TransferTx};
+
+    fn body_of(transactions: Vec<Vec<u8>>, evidence_proofs: Vec<EvidenceArtifact>) -> Body {
+        Body {
+            transactions,
+            evidence_proofs,
+            ..Body::default()
+        }
+    }
+
+    let (mut witness, _, _) = support::fixture([1; 8], [4; 32]);
+    witness.chain_spec.consensus.chunk_size = 2;
+    witness.chain_spec.proof.slot_budget_per_chunk = 2;
+    let mut engine = Engine::genesis(witness.chain_spec, MemoryDatabase::new()).unwrap();
+    engine.set_programs(support::guests([1; 8], [4; 32]));
+    let parent = &witness.blocks[0].header;
+    let parent_hash = engine.store_mut().put_header(parent).unwrap();
+    engine
+        .store_mut()
+        .put_body(&parent_hash, &Body::default())
+        .unwrap();
+    let statement = EvidenceStatement {
+        reporter: None,
+        chain_id: engine.chain_spec().chain_id,
+        chain_spec_hash: engine.chain_spec_hash(),
+        block_guest_vk_digest: [1; 8],
+        context: EvidenceContext {
+            chunk_id: 0,
+            chunk_hash: [3; 32],
+            end_height: 1,
+            validators_root: engine.chain_spec().genesis_validator_set_root,
+            seed: [0; 32],
+            source_block_guest_vk_digest: [1; 8],
+            source_runtime_code_hash: [0; 32],
+        },
+        offender: witness.context.active_validators[0].clone(),
+        kind: SanctionKind::Slash,
+        offence_id: [5; 32],
+        facts_commitment: [6; 32],
+    };
+    let evidence = borsh::to_vec(&Transaction::SubmitEvidence(EvidenceSubmission {
+        statement: statement.clone(),
+        history: neutrino_consensus_types::history::HistoryPath {
+            index: 0,
+            count: 0,
+            siblings: vec![[0; 32]; 64],
+        },
+    }))
+    .unwrap();
+    let ordinary = borsh::to_vec(&Transaction::Transfer(TransferTx {
+        from: [1; 32],
+        to: [2; 32],
+        amount: 0,
+        nonce: 0,
+        signature: [0; 64],
+    }))
+    .unwrap();
+    let attachment = EvidenceArtifact {
+        membership: neutrino_consensus_types::evidence::EvidenceMembership::default(),
+        evidence_guest_vk_digest: [2; 8],
+        statement,
+        proof_bytes: vec![1],
+    };
+    let authorize = |body: &Body| {
+        engine.authorize_consensus_body(2, parent_hash, body, parent.gas_limit, &[1; 8])
+    };
+
+    // Ordinary transactions alone carry no admission to check.
+    assert!(authorize(&body_of(vec![ordinary.clone()], Vec::new())).is_ok());
+    // Evidence after an ordinary transaction, and evidence the block's anchor
+    // cannot authenticate, trip assertions in the runtime's input validation.
+    // A peer body must be rejected before reaching them: the release profile
+    // aborts on panic, so a caught unwind still takes the whole node down.
+    let panics = panics_on_this_thread();
+    for rejected in [
+        body_of(vec![ordinary, evidence.clone()], vec![attachment.clone()]),
+        body_of(vec![evidence], vec![attachment]),
+    ] {
+        assert!(authorize(&rejected).is_err());
+    }
+    assert_eq!(panics_on_this_thread(), panics);
+}
+
 #[test]
 fn successor_bft_uses_the_proven_validator_root_without_a_recursive_checkpoint() {
     let (mut engine, _) = engine();

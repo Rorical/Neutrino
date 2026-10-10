@@ -163,11 +163,28 @@ impl RejectedProofCache {
     }
 
     /// The rejected envelope cached for `block_hash` and its rejection reason.
+    #[cfg(test)]
     pub(crate) fn get(
         &self,
         block_hash: &BlockHash,
     ) -> Option<&(BlockProof, ProofRejectionReason)> {
         self.entries.get(block_hash)
+    }
+
+    /// Rejected envelopes for blocks at heights `first..=last` on any branch,
+    /// ordered by height and then block hash.
+    fn within_heights(
+        &self,
+        first: Height,
+        last: Height,
+    ) -> alloc::vec::Vec<&(BlockProof, ProofRejectionReason)> {
+        let mut entries: alloc::vec::Vec<_> = self
+            .entries
+            .values()
+            .filter(|(proof, _)| (first..=last).contains(&proof.height))
+            .collect();
+        entries.sort_unstable_by_key(|(proof, _)| (proof.height, proof.block_hash));
+        entries
     }
 
     fn is_empty(&self) -> bool {
@@ -1361,9 +1378,9 @@ impl<DB: Database> Engine<DB> {
     /// Detect [`SlashingEvidence::InvalidProofSigning`] from an
     /// inbound finality vote.
     ///
-    /// Returns evidence for every covered block in the vote's chunk
-    /// whose exact proof envelope the signer explicitly attested to and
-    /// the local engine rejected at gossip-import
+    /// Returns evidence for every block at a covered height of the vote's
+    /// chunk, on any branch, whose exact proof envelope the signer explicitly
+    /// attested to and the local engine rejected at gossip-import
     /// time (see [`crate::Engine::import_block_proof`]'s rejected-
     /// proof cache). The signer's per-validator signature is
     /// re-verified before evidence is emitted so a malicious peer
@@ -1412,39 +1429,33 @@ impl<DB: Database> Engine<DB> {
             return Ok(alloc::vec::Vec::new());
         };
 
+        // The signer accepted exact envelope hashes, not the local canonical
+        // branch: a rejected envelope for a sibling block at a covered height
+        // is just as attributable, so consult every cached rejection there.
         let mut evidence = alloc::vec::Vec::new();
-        for height in start..=end {
-            let Ok(Some(block_hash)) = self.store().get_block_hash_by_height(height) else {
+        for (rejected_proof, reason) in self.rejected_proofs.within_heights(start, end) {
+            let Some(attestation) = vote.attestations.iter().find(|attestation| {
+                slashing::verify_vote_attestation_using(
+                    attestation,
+                    signer,
+                    &indexed.data,
+                    &validators,
+                    self.consensus_domain(),
+                    &mut *self.bls_verifier.borrow_mut(),
+                )
+                .is_ok()
+                    && slashing::verify_proof_acceptance(attestation, rejected_proof, chunk_size)
+                        .is_ok()
+            }) else {
                 continue;
             };
-            if let Some((rejected_proof, reason)) = self.rejected_proofs.get(&block_hash) {
-                let Some(attestation) = vote.attestations.iter().find(|attestation| {
-                    slashing::verify_vote_attestation_using(
-                        attestation,
-                        signer,
-                        &indexed.data,
-                        &validators,
-                        self.consensus_domain(),
-                        &mut *self.bls_verifier.borrow_mut(),
-                    )
-                    .is_ok()
-                        && slashing::verify_proof_acceptance(
-                            attestation,
-                            rejected_proof,
-                            chunk_size,
-                        )
-                        .is_ok()
-                }) else {
-                    continue;
-                };
-                evidence.push(SlashingEvidence::InvalidProofSigning {
-                    validator_index: signer,
-                    vote: indexed.clone(),
-                    attestation: attestation.clone(),
-                    rejected_proof: rejected_proof.clone(),
-                    reason: *reason,
-                });
-            }
+            evidence.push(SlashingEvidence::InvalidProofSigning {
+                validator_index: signer,
+                vote: indexed.clone(),
+                attestation: attestation.clone(),
+                rejected_proof: rejected_proof.clone(),
+                reason: *reason,
+            });
         }
         Ok(evidence)
     }
@@ -1915,5 +1926,29 @@ mod tests {
         let spec = chain_spec();
         let err = Engine::open(spec, MemoryDatabase::new()).expect_err("not initialised");
         assert!(matches!(err, EngineError::NotInitialised));
+    }
+
+    #[test]
+    fn malformed_chain_spec_hash_is_corruption_not_an_empty_database() {
+        use crate::store::pointers::CHAIN_SPEC_HASH;
+
+        let spec = chain_spec();
+        let engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).expect("genesis");
+        let mut db = engine.store().db().clone();
+        let tip = engine.store().get_tip().unwrap();
+        db.put(Column::Meta, CHAIN_SPEC_HASH, &[7; 31]).unwrap();
+
+        // Genesis must not mistake the damaged database for an empty one and
+        // overwrite it; reopening reports the corruption.
+        let err = Engine::genesis(spec.clone(), db.clone()).expect_err("corrupt metadata");
+        assert!(matches!(err, EngineError::Store(StoreError::Corrupt(_))));
+        let err = Engine::open(spec, db.clone()).expect_err("corrupt metadata");
+        assert!(matches!(err, EngineError::Store(StoreError::Corrupt(_))));
+        let store = ChainStore::new(db);
+        assert!(matches!(
+            store.get_chain_spec_hash(),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert_eq!(store.get_tip().unwrap(), tip);
     }
 }

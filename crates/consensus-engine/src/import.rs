@@ -53,8 +53,11 @@ pub const HISTORY_UNAVAILABLE: &str = "unavailable historical boundary";
 /// Successful outcome of [`Engine::import_block`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportBlockOutcome {
-    /// Hash of the imported block.
+    /// Hash of the imported block, which need not be the head: a sibling or
+    /// an already archived ancestor leaves the head where it was.
     pub block_hash: BlockHash,
+    /// New local head hash.
+    pub new_head_hash: BlockHash,
     /// New local head height.
     pub new_head_height: Height,
     /// New local head slot.
@@ -493,15 +496,7 @@ impl<DB: Database> Engine<DB> {
                 .as_ref()
                 .is_some_and(|body| body.same_consensus_content(&block.body))
         {
-            let head_slot = self
-                .store()
-                .get_header(&self.head_hash())?
-                .map_or(0, |header| header.slot);
-            return Ok(ImportBlockOutcome {
-                block_hash: self.head_hash(),
-                new_head_height: self.head_height(),
-                new_head_slot: head_slot,
-            });
+            return Ok(self.import_outcome(hash)?);
         }
 
         // Look up the parent header so we can check height-vs-parent
@@ -687,10 +682,25 @@ impl<DB: Database> Engine<DB> {
         // at the just-imported block, not at an inconsistent state.
         self.materialise_to_fork_choice_head(executor)?;
 
+        Ok(self.import_outcome(hash)?)
+    }
+
+    /// Outcome of importing `block_hash`: that block and the local head the
+    /// import left, which a sibling or duplicate import does not move.
+    fn import_outcome(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<ImportBlockOutcome, StoreError<DB::Error>> {
+        let new_head_hash = self.head_hash();
+        let new_head_slot = self
+            .store()
+            .get_header(&new_head_hash)?
+            .map_or(0, |header| header.slot);
         Ok(ImportBlockOutcome {
-            block_hash: hash,
+            block_hash,
+            new_head_hash,
             new_head_height: self.head_height(),
-            new_head_slot: block.header.slot,
+            new_head_slot,
         })
     }
 
@@ -1415,6 +1425,95 @@ mod tests {
         let outcome = engine.import_block(&block2).expect("second extends first");
         assert_eq!(outcome.new_head_height, 2);
         assert_eq!(engine.head_hash(), block2.hash());
+    }
+
+    #[test]
+    fn duplicate_import_reports_the_imported_block_and_the_unmoved_head() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let block1 = block(1, 1, engine.head_hash(), [5; 32]);
+        engine.import_block(&block1).unwrap();
+        let block2 = block(2, 2, block1.hash(), [6; 32]);
+        engine.import_block(&block2).unwrap();
+
+        // Replaying an archived ancestor names that ancestor, not the head.
+        let outcome = engine.import_block(&block1).unwrap();
+        assert_eq!(
+            outcome,
+            ImportBlockOutcome {
+                block_hash: block1.hash(),
+                new_head_hash: block2.hash(),
+                new_head_height: 2,
+                new_head_slot: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_proof_signing_detects_a_rejected_sibling_envelope() {
+        use neutrino_consensus_types::{
+            FinalityVote, FinalityVoteData, FinalityVotePhase, ProofRejectionReason,
+            SlashingEvidence,
+        };
+
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let genesis_hash = engine.head_hash();
+        let canonical = block(1, 1, genesis_hash, [5; 32]);
+        let sibling = block(1, 2, genesis_hash, [6; 32]);
+        engine.import_block(&canonical).unwrap();
+        engine.import_block(&sibling).unwrap();
+        let sibling_hash = sibling.hash();
+        let backend = AlternateMockBlockProofSystem;
+        let inputs = engine
+            .block_public_inputs(&sibling.header, ZERO_HASH, sibling_hash)
+            .unwrap();
+        let mut decoded = backend.prove_block(&[], &inputs).unwrap();
+        decoded.0.commitment[0] ^= 1;
+        let rejected = BlockProof {
+            height: 1,
+            block_hash: sibling_hash,
+            public_inputs: inputs,
+            proof_bytes: borsh::to_vec(&decoded).unwrap(),
+        };
+        assert!(matches!(
+            engine.import_block_proof(&rejected, &backend),
+            Err(ImportError::InvalidBlockProof(_))
+        ));
+        // The canonical height index names the other branch's block.
+        assert_eq!(
+            engine.store().get_block_hash_by_height(1).unwrap(),
+            Some(canonical.hash())
+        );
+
+        // A precommit whose signer accepted the sibling's rejected envelope.
+        let key = proposer();
+        let domain = engine.consensus_domain();
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            round: 0,
+            chunk_hash: [7; 32],
+            phase: FinalityVotePhase::Precommit,
+        };
+        let mut proof_hashes = vec![[0; 32]; usize::try_from(engine.chunk_size()).unwrap()];
+        proof_hashes[0] = neutrino_prover_chunk::execution::commitment(&rejected);
+        let mut aggregation_bits = neutrino_primitives::BitVec::default();
+        aggregation_bits.push(true);
+        let vote = FinalityVote {
+            signature: key.sign_finality_vote(domain, &data),
+            attestations: vec![key.attest_vote(domain, data.clone(), proof_hashes, None)],
+            aggregation_bits,
+            data,
+        };
+        let evidence = engine
+            .observe_vote_for_invalid_proof_signing(&vote)
+            .unwrap();
+        assert!(matches!(
+            evidence.as_slice(),
+            [SlashingEvidence::InvalidProofSigning {
+                rejected_proof,
+                reason: ProofRejectionReason::PublicInputsMismatch,
+                ..
+            }] if rejected_proof == &rejected
+        ));
     }
 
     /// Isolated mock receipts allow distinct encodings of the same statement;

@@ -10,7 +10,7 @@ use neutrino_prover_chunk::{
     execution::commitment,
     history::{HistoricalChunk, HistoricalOpening},
 };
-use neutrino_storage::{Batch, Column, Database};
+use neutrino_storage::{Batch, BatchOp, Column, Database};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ChainStore, StoreError};
@@ -200,7 +200,7 @@ impl<DB: Database> ChainStore<DB> {
         }
         for (key, mut addresses) in grouped {
             if let Some(previous) =
-                self.get_decoded::<Vec<[u8; 32]>>(Column::ReporterValidators, &key)?
+                self.staged_decoded::<Vec<[u8; 32]>>(batch, Column::ReporterValidators, &key)?
             {
                 validate_addresses::<DB::Error>(&previous)?;
                 addresses.extend(previous);
@@ -769,7 +769,8 @@ impl<DB: Database> ChainStore<DB> {
         Ok(owners)
     }
 
-    /// Stage `artifact`, whose identity is `id`, merging its prior owners.
+    /// Stage `artifact`, whose identity is `id`, merging its prior owners,
+    /// including owners staged earlier in the same batch.
     fn put_reporter_source_batch(
         &self,
         batch: &mut Batch,
@@ -781,7 +782,7 @@ impl<DB: Database> ChainStore<DB> {
         let key = source_key(chunk, id);
         let mut all = owners.to_vec();
         if let Some(prior) =
-            self.get_decoded::<Owned<SignedArtifact>>(Column::ReporterSources, &key)?
+            self.staged_decoded::<Owned<SignedArtifact>>(batch, Column::ReporterSources, &key)?
         {
             all.extend(prior.owners);
         }
@@ -824,26 +825,49 @@ impl<DB: Database> ChainStore<DB> {
         let hash = header.hash();
         let key = source_key(chunk, hash);
         let mut all = owners.to_vec();
-        if let Some(prior) = self.get_decoded::<Owned<Header>>(Column::ReporterHeaders, &key)? {
+        if let Some(prior) =
+            self.staged_decoded::<Owned<Header>>(batch, Column::ReporterHeaders, &key)?
+        {
             all.extend(prior.owners);
         }
         all.sort_unstable();
         all.dedup();
         if !all.is_empty() {
             put_owned(batch, Column::ReporterHeaders, key, &all, header)?;
+            let lookup = lookup_key(HEADER_LOOKUP, &hash);
             let mut chunks: Vec<u64> = self
-                .get_decoded(Column::ReporterIndex, &lookup_key(HEADER_LOOKUP, &hash))?
+                .staged_decoded(batch, Column::ReporterIndex, &lookup)?
                 .unwrap_or_default();
             chunks.push(chunk);
             chunks.sort_unstable();
             chunks.dedup();
-            batch.put(
-                Column::ReporterIndex,
-                lookup_key(HEADER_LOOKUP, &hash),
-                borsh::to_vec(&chunks)?,
-            );
+            batch.put(Column::ReporterIndex, lookup, borsh::to_vec(&chunks)?);
         }
         Ok(())
+    }
+
+    /// Decode `(column, key)` as `batch` would leave it: the batch's latest
+    /// write to that key overrides the database. A merge staged twice in one
+    /// batch therefore keeps the owners its earlier write added.
+    fn staged_decoded<T: BorshDeserialize>(
+        &self,
+        batch: &Batch,
+        column: Column,
+        key: &[u8],
+    ) -> Result<Option<T>, StoreError<DB::Error>> {
+        for op in batch.operations().iter().rev() {
+            let (written_column, written_key, value) = match op {
+                BatchOp::Put { column, key, value } => (*column, key, Some(value)),
+                BatchOp::Delete { column, key } => (*column, key, None),
+            };
+            if written_column == column && written_key.as_slice() == key {
+                return match value {
+                    Some(bytes) => Ok(Some(T::try_from_slice(bytes)?)),
+                    None => Ok(None),
+                };
+            }
+        }
+        self.get_decoded(column, key)
     }
 
     /// Compact saved boundary used for forensic source verification, never live BFT admission.
@@ -1210,6 +1234,78 @@ mod tests {
         assert!(cleaned.cleaned_records > 0);
         assert!(cleaned.cleaned_bytes > 0);
         store.validate_reporter_history().unwrap();
+    }
+
+    fn proof_of(header: &Header) -> BlockProof {
+        BlockProof {
+            height: header.height,
+            block_hash: header.hash(),
+            public_inputs: BlockProofPublicInputs {
+                chain_id: 7,
+                height: header.height,
+                parent_block_hash: header.parent_hash,
+                block_hash: header.hash(),
+                state_root_before: [0; 32],
+                state_root_after: header.state_root,
+                transactions_root: [0; 32],
+                receipt_root: [0; 32],
+                da_root: [0; 32],
+                vm_code_hash: [0; 32],
+                block_program: [0; 8],
+                gas_used: 0,
+                gas_limit: 1_000_000,
+                proposer_address: [0; 32],
+                runtime_extra: [0; 32],
+            },
+            proof_bytes: vec![1],
+        }
+    }
+
+    #[test]
+    fn owners_staged_twice_in_one_batch_are_merged() {
+        let mut store = ChainStore::new(MemoryDatabase::new());
+        let first = crate::test_db::header(1, 1, [0; 32], [1; 32]);
+        let second = crate::test_db::header(2, 2, first.hash(), [2; 32]);
+        store.put_header(&first).unwrap();
+        store.put_header(&second).unwrap();
+        let (a, b): (BlsPublicKey, BlsPublicKey) = ([1; 48], [2; 48]);
+        let later = SignedArtifact::BlockProof(proof_of(&second));
+        let mut batch = Batch::new();
+        // One vote's proof dependencies: `first` is both the parent of the
+        // later proof's block and the block of the earlier proof, and the
+        // later proof is accepted by both signers.
+        for (proof, owner) in [
+            (later.clone(), a),
+            (SignedArtifact::BlockProof(proof_of(&first)), b),
+            (later.clone(), b),
+        ] {
+            store
+                .put_reporter_source_batch(&mut batch, 0, proof.id(), &proof, &[owner])
+                .unwrap();
+        }
+        // Two withdrawal accounts of one identity staged by separate merges.
+        for address in [[3; 32], [4; 32]] {
+            store
+                .merge_reporter_identities_batch(&mut batch, &[(a, address)])
+                .unwrap();
+        }
+        store.db_mut().write_batch_durable(batch).unwrap();
+
+        // Every merge saw the owners staged before it, not only stored ones.
+        let header: Owned<Header> = store
+            .get_decoded(Column::ReporterHeaders, &source_key(0, first.hash()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.owners, vec![a, b]);
+        let source: Owned<SignedArtifact> = store
+            .get_decoded(Column::ReporterSources, &source_key(0, later.id()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.owners, vec![a, b]);
+        assert_eq!(
+            store.reporter_tracked_validators().unwrap(),
+            vec![(a, [3; 32]), (a, [4; 32])]
+        );
     }
 
     #[test]

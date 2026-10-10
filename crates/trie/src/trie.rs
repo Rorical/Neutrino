@@ -831,6 +831,59 @@ fn decode_raw_key(bits: &[bool]) -> Option<Vec<u8>> {
     Some(encoded[4..].to_vec())
 }
 
+/// Read `key` under `root` from content-addressed node and value stores,
+/// fetching only the nodes on the key's path instead of materialising the
+/// whole trie. The walk is the one [`Trie::get`] performs.
+///
+/// # Errors
+/// Returns [`TrieError::MissingRetainedEntry`] when a node or value the walk
+/// reaches is absent, or the decode error of a malformed node.
+pub fn lookup_persisted(
+    root: Hash,
+    key: &[u8],
+    mut node: impl FnMut(&Hash) -> Option<Vec<u8>>,
+    mut value: impl FnMut(&Hash) -> Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, TrieError> {
+    let path = BitPath::for_key(key);
+    let mut current = root;
+    let mut consumed: u32 = 0;
+    loop {
+        if current == ZERO_HASH {
+            return Ok(None);
+        }
+        let bytes = node(&current).ok_or(TrieError::MissingRetainedEntry)?;
+        match Node::decode(&bytes)? {
+            Node::Leaf {
+                key_suffix,
+                value_hash,
+            } => {
+                if path.suffix(consumed) != key_suffix {
+                    return Ok(None);
+                }
+                return value(&value_hash)
+                    .map(Some)
+                    .ok_or(TrieError::MissingRetainedEntry);
+            }
+            Node::Branch { left, right } => {
+                if consumed >= path.bit_len() {
+                    return Ok(None);
+                }
+                let bit = path.bit(consumed);
+                consumed += 1;
+                current = if bit { right } else { left };
+            }
+            Node::Extension { prefix, child } => {
+                let len = prefix.bit_len();
+                if consumed + len > path.bit_len() || path.suffix(consumed).prefix(len) != prefix {
+                    return Ok(None);
+                }
+                consumed += len;
+                current = child;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,6 +911,42 @@ mod tests {
         for (key, value) in pairs {
             trie.insert(key, value.to_vec()).expect("insert succeeds");
         }
+    }
+
+    #[test]
+    fn persisted_lookup_reads_exactly_what_the_trie_holds() {
+        let mut trie = TestTrie::new();
+        let keys: Vec<Vec<u8>> = (0_u8..40)
+            .map(|byte| vec![byte; usize::from(byte % 5) + 1])
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            trie.insert(key, value(u8::try_from(index).unwrap()))
+                .unwrap();
+        }
+        let root = trie.root();
+        let lookup = |trie: &TestTrie, key: &[u8]| {
+            lookup_persisted(
+                root,
+                key,
+                |hash| trie.nodes.get(hash).cloned(),
+                |hash| trie.values.get(hash).cloned(),
+            )
+        };
+        for key in &keys {
+            assert_eq!(lookup(&trie, key), Ok(trie.get(key)));
+        }
+        for absent in [&b""[..], b"missing", &[0_u8; 9], &[39_u8; 7]] {
+            assert_eq!(trie.get(absent), None);
+            assert_eq!(lookup(&trie, absent), Ok(None));
+        }
+        assert_eq!(
+            lookup_persisted(ZERO_HASH, b"any", |_| None, |_| None),
+            Ok(None)
+        );
+        assert_eq!(
+            lookup_persisted(root, &keys[0], |_| None, |_| None),
+            Err(TrieError::MissingRetainedEntry)
+        );
     }
 
     #[test]

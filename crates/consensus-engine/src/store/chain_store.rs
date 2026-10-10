@@ -1125,10 +1125,15 @@ impl<DB: Database> ChainStore<DB> {
         self.put_raw(Column::Meta, pointers::CHAIN_SPEC_HASH, &hash)
     }
 
-    /// Read the chain-spec hash.
+    /// Read the chain-spec hash. Absent metadata is `None`; malformed bytes
+    /// are corruption, never an uninitialised database that genesis may
+    /// overwrite.
     pub fn get_chain_spec_hash(&self) -> Result<Option<Hash>, StoreError<DB::Error>> {
-        let raw = self.get_raw(Column::Meta, pointers::CHAIN_SPEC_HASH)?;
-        Ok(raw.and_then(|bytes| Hash::try_from(bytes.as_slice()).ok()))
+        self.get_fixed(
+            Column::Meta,
+            pointers::CHAIN_SPEC_HASH,
+            "invalid chain spec hash",
+        )
     }
 }
 

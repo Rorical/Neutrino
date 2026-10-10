@@ -4,9 +4,11 @@ extern crate alloc;
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use borsh::{BorshDeserialize, BorshSerialize};
+use neutrino_consensus_types::evidence::{EvidenceAnchor, EvidenceArtifact};
 use neutrino_consensus_types::history::is_recent_history_index;
 use neutrino_consensus_types::history_proof::{ChainBinding, ConsensusPrograms};
 use neutrino_consensus_types::{AggregatedVote, Chunk, ChunkProof, FinalityCert};
+use neutrino_default_runtime_core::{Transaction, accountability};
 use neutrino_primitives::{ChunkId, Hash};
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_prover_chunk::{
@@ -213,6 +215,31 @@ impl<DB: Database> Engine<DB> {
             .unwrap_or_default()
     }
 
+    /// The governed runtime policy in the latest finalized state, read from
+    /// persisted trie nodes along one key path. Evidence pruning uses it so
+    /// nothing is dropped on unfinalized head state.
+    ///
+    /// # Errors
+    /// Reports storage failures and a finalized state missing its nodes.
+    pub fn finalized_runtime_policy(
+        &self,
+    ) -> Result<neutrino_default_runtime_core::RuntimePolicy, FinalizeError<DB::Error>> {
+        let root = self
+            .canonical_boundary(self.finalized_next_chunk_id())?
+            .state_root;
+        let db = self.store().db();
+        let bytes = neutrino_trie::lookup_persisted(
+            root,
+            neutrino_default_runtime_core::RUNTIME_POLICY_KEY,
+            |hash| db.get(Column::TrieNodes, hash).ok().flatten(),
+            |hash| db.get(Column::StateValues, hash).ok().flatten(),
+        )
+        .map_err(|_| crate::StoreError::Corrupt("finalized runtime policy state"))?;
+        Ok(bytes
+            .and_then(|bytes| borsh::from_slice(&bytes).ok())
+            .unwrap_or_default())
+    }
+
     /// Snapshot a self-contained offence for proving outside the engine lock.
     pub fn evidence_witness(
         &self,
@@ -348,12 +375,17 @@ impl<DB: Database> Engine<DB> {
 
     /// Bind a candidate to its finalized boundary and complete parent ancestry.
     /// The runtime authenticates receipts and protects replay in the branch state.
+    ///
+    /// Evidence admissions are checked by `admissions_are_well_formed`, which
+    /// rejects without unwinding: this runs natively on peer bodies, and the
+    /// release profile aborts on panic. The block gas limit does not affect
+    /// admission shape; it is accepted so callers pass the header as is.
     pub fn authorize_consensus_body(
         &self,
         height: u64,
         parent_hash: Hash,
         body: &neutrino_consensus_types::Body,
-        gas_limit: u64,
+        _gas_limit: u64,
         block_key: &[u32; 8],
     ) -> Result<(), FinalizeError<DB::Error>> {
         let chunk_id = self
@@ -394,39 +426,18 @@ impl<DB: Database> Engine<DB> {
         let anchor = self
             .evidence_anchor(height)
             .map_err(|_| ProofError::InvalidWitness)?;
-        let input = neutrino_default_runtime_core::StfInput {
-            evidence_anchor: anchor,
-            chain_id: self.chain_spec().chain_id,
-            block_height: height,
-            block_gas_limit: gas_limit,
-            proposer_address: [0; 32],
-            participation: None,
-            transactions: body
-                .transactions
-                .iter()
-                .map(|raw| borsh::from_slice(raw))
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        std::panic::catch_unwind(|| {
-            let _checked = neutrino_default_runtime_core::accountability::validate_input(&input);
-        })
-        .map_err(|_| ProofError::InvalidWitness)?;
-        let mut attachments = body.evidence_proofs.iter();
-        for transaction in &input.transactions {
-            if let neutrino_default_runtime_core::Transaction::SubmitEvidence(submission) =
-                transaction
-            {
-                let attachment = attachments.next().ok_or(ProofError::InvalidWitness)?;
-                if !attachment.binds(
-                    &submission.statement,
-                    &anchor.evidence_guest_vk_digest,
-                    &anchor.fact_guest_vk_digest,
-                ) {
-                    return Err(ProofError::InvalidWitness.into());
-                }
-            }
-        }
-        if attachments.next().is_some() {
+        let transactions = body
+            .transactions
+            .iter()
+            .map(|raw| borsh::from_slice(raw))
+            .collect::<Result<Vec<Transaction>, _>>()?;
+        if !admissions_are_well_formed(
+            self.chain_spec().chain_id,
+            height,
+            &anchor,
+            &transactions,
+            &body.evidence_proofs,
+        ) {
             return Err(ProofError::InvalidWitness.into());
         }
         Ok(())
@@ -930,4 +941,35 @@ impl<DB: Database> Engine<DB> {
             finality_cert: witness.finality_cert.clone(),
         })
     }
+}
+
+/// Whether a body's evidence admissions satisfy the runtime's input rules
+/// ([`accountability::check_admissions`]) and exactly one attachment per
+/// submission binds its statement to the anchor's evidence and fact programs,
+/// in order. Peer bodies reach this check in native code, where the release
+/// profile aborts on panic, so the non-panicking runtime check is used.
+fn admissions_are_well_formed(
+    chain_id: u64,
+    height: u64,
+    anchor: &EvidenceAnchor,
+    transactions: &[Transaction],
+    attachments: &[EvidenceArtifact],
+) -> bool {
+    if accountability::check_admissions(chain_id, height, anchor, transactions).is_err() {
+        return false;
+    }
+    let admissions = transactions
+        .iter()
+        .filter_map(|transaction| match transaction {
+            Transaction::SubmitEvidence(submission) => Some(submission),
+            _ => None,
+        });
+    admissions.clone().count() == attachments.len()
+        && admissions.zip(attachments).all(|(submission, attachment)| {
+            attachment.binds(
+                &submission.statement,
+                &anchor.evidence_guest_vk_digest,
+                &anchor.fact_guest_vk_digest,
+            )
+        })
 }

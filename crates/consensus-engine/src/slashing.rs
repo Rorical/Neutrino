@@ -79,18 +79,17 @@ pub struct SlashingMonitor {
     /// `(validator_index, chunk_id, round, phase) → vote` previously
     /// accepted from a single-signer aggregation bit set.
     seen_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedVote>,
-    /// Prevote quorums the local node has observed reach 2/3 stake,
-    /// keyed by `(chunk_id, round, chunk_hash)`. Populated by
-    /// [`Self::record_prevote_quorum`] from the BFT loop whenever
-    /// `recompute_quorum_transitions` first transitions a session
-    /// to `PrevoteQuorumObserved`. Consumed by the cross-round
-    /// `LockViolation` synthesiser in
-    /// [`Self::record_indexed_vote`].
     seen_nil_votes: BTreeMap<(ValidatorIndex, ChunkId, u32, FinalityVotePhase), IndexedNilVote>,
     seen_bft_proposals: BTreeMap<(ChunkId, u32, ValidatorIndex), BftProposal>,
     proposal_bytes: usize,
     attestation_bytes: usize,
     quorum_bytes: usize,
+    /// Prevote quorums the local node has observed reach 2/3 stake,
+    /// keyed by `(chunk_id, round, chunk_hash)`. Populated through
+    /// [`Self::record_prevote_quorum`], including whenever a BFT session's
+    /// shared quorum transition first crosses a value prevote quorum, live,
+    /// during signing recovery or on restart. Consumed by the cross-round
+    /// `LockViolation` synthesiser in [`Self::record_indexed_vote`].
     observed_prevote_quorums: BTreeMap<(ChunkId, u32, ChunkHash), QuorumCertificate>,
     /// Explicit authenticated claims; local absence of a QC is not slashable.
     attestations:

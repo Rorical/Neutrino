@@ -504,3 +504,54 @@ fn nil_precommit_quorum_closes_old_phases_before_restart_or_late_messages() {
         deadline
     );
 }
+
+#[test]
+fn nil_quorum_round_entry_feeds_the_new_leader_prevote_to_fork_choice() {
+    let spec = chain_spec_with(3);
+    let leader = bft_leader(spec.chain_id, 0, 1, &spec.initial_validators).unwrap();
+    let peers: Vec<_> = (0..3_u32).filter(|index| *index != leader).collect();
+    let mut engine = test_engine(spec.clone());
+    engine.set_local_voter(proposer(u8::try_from(leader).unwrap()));
+    engine
+        .open_bft_session_at(dummy_chunk(0, spec.genesis_validator_set_root), 0)
+        .unwrap();
+    let mut report = RoundChange {
+        chunk_id: 0,
+        round: 1,
+        validator_index: peers[0],
+        highest_quorum: None,
+        signature: [0; 96],
+    };
+    report.signature = proposer(u8::try_from(peers[0]).unwrap())
+        .sign_raw(&report.signing_message(spec.consensus_domain()))
+        .to_bytes();
+    assert!(engine.observe_round_change(report, 1).unwrap().is_empty());
+    let mut signers = test_engine(spec);
+    let mut actions = Vec::new();
+    for index in peers {
+        let vote = signers
+            .sign_nil_vote_durable(
+                &proposer(u8::try_from(index).unwrap()),
+                NilVoteData {
+                    chunk_id: 0,
+                    round: 0,
+                    phase: FinalityVotePhase::Precommit,
+                },
+            )
+            .unwrap();
+        actions.extend(engine.observe_nil_vote(vote, 2).unwrap());
+    }
+    // The nil precommit quorum completes the round-one certificate, so this
+    // entry point itself signs the new leader's proposal and value prevote.
+    assert_eq!(engine.bft_session(0).unwrap().round(), 1);
+    let prevote = actions
+        .iter()
+        .find_map(|action| match action {
+            BftAction::BroadcastPrevote(vote) => Some(vote.data.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(prevote.round, 1);
+    let recorded = engine.fork_choice().vote_for_validator(leader).unwrap();
+    assert_eq!(recorded.data, prevote);
+}

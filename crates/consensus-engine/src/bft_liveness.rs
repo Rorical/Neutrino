@@ -423,6 +423,8 @@ impl<DB: Database> Engine<DB> {
         }
         self.persist_bft_session(&session)?;
         self.bft_sessions.insert(id, session);
+        // Certified entry above may sign the new leader's proposal and votes.
+        self.feed_broadcast_actions_to_fork_choice(&actions);
         Ok(actions)
     }
 
@@ -498,6 +500,9 @@ impl<DB: Database> Engine<DB> {
         let Some(mut session) = self.bft_sessions.get(&id).cloned() else {
             return Ok(Vec::new());
         };
+        // A completed certificate may enter a round and sign; synchronize the
+        // signing identity, retained lock and interrupted reservations first.
+        self.recover_session_signing(&mut session)?;
         if session.precommit_quorum_observed() || report.round <= session.round() {
             return Ok(Vec::new());
         }
@@ -535,6 +540,8 @@ impl<DB: Database> Engine<DB> {
         let Some(mut session) = self.bft_sessions.get(&id).cloned() else {
             return Ok(Vec::new());
         };
+        // Entry may sign at once; synchronize signing state first.
+        self.recover_session_signing(&mut session)?;
         if certificate.round <= session.round() || session.precommit_quorum_observed() {
             return Ok(Vec::new());
         }

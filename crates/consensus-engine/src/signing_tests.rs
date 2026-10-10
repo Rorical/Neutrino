@@ -899,6 +899,64 @@ fn unfinished_session_rejects_key_replacement_consistently() {
 }
 
 #[test]
+fn certified_round_entry_recovers_the_signing_identity_before_leader_signing() {
+    let spec = spec();
+    let next_leader =
+        neutrino_consensus_types::bft_leader(spec.chain_id, 0, 1, &spec.initial_validators)
+            .unwrap();
+    let original = (next_leader + 1) % 3;
+    let mut engine = Engine::genesis(spec.clone(), MemoryDatabase::new()).unwrap();
+    engine.set_local_voter(key(original));
+    open_signed_fixture(&mut engine, chunk(&spec), 100).unwrap();
+    assert!(engine.bft_session(0).unwrap().local_prevoted());
+    // The replacement key leads round one: entering it unrecovered would sign
+    // a proposal and prevote into a session holding another key's votes.
+    engine.set_local_voter(key(next_leader));
+    let reports: Vec<_> = (0..3)
+        .map(|index| {
+            let mut report = RoundChange {
+                chunk_id: 0,
+                round: 1,
+                validator_index: index,
+                highest_quorum: None,
+                signature: [0; 96],
+            };
+            report.signature = key(index)
+                .sign_raw(&report.signing_message(spec.consensus_domain()))
+                .to_bytes();
+            report
+        })
+        .collect();
+    let journal = engine
+        .store()
+        .db()
+        .iter_column(Column::SigningJournal)
+        .unwrap();
+    let certificate = neutrino_consensus_types::RoundChangeCertificate {
+        chunk_id: 0,
+        round: 1,
+        reports: reports.clone(),
+    };
+    assert!(
+        engine
+            .observe_round_change_certificate(certificate, 110)
+            .is_err()
+    );
+    for report in reports {
+        assert!(engine.observe_round_change(report, 110).is_err());
+    }
+    assert_eq!(engine.bft_session(0).unwrap().round(), 0);
+    assert_eq!(
+        engine
+            .store()
+            .db()
+            .iter_column(Column::SigningJournal)
+            .unwrap(),
+        journal
+    );
+}
+
+#[test]
 fn corrupt_watermark_cannot_reauthorize_an_altered_attestation() {
     let spec = spec();
     let (mut engine, candidate) = engine_with_proof(&spec);

@@ -193,6 +193,9 @@ impl<DB: Database> Engine<DB> {
     /// are checked before a saved progress flag can authorize further signing.
     pub(crate) fn restore_bft_sessions(&mut self) -> Result<(), EngineError<DB::Error>> {
         let floor = self.finalized_next_chunk_id();
+        let root = self
+            .previous_validator_set_root()
+            .map_err(|_| StoreError::Corrupt("cannot restore BFT validator root"))?;
         let saved = self
             .store()
             .db()
@@ -217,7 +220,10 @@ impl<DB: Database> Engine<DB> {
                 return Err(StoreError::Corrupt("saved BFT session exceeds bound").into());
             }
             let saved: SavedSession = borsh::from_slice(&bytes)?;
-            let session = self.restore_bft_session(id, saved)?;
+            let mut session = self.restore_bft_session(id, saved, root)?;
+            // Saved raw quorums never mark a session finished by themselves;
+            // restart applies the same transition rule as live recompute.
+            self.advance_peer_quorum(&mut session, root);
             if let Some(lock) = &session.highest_lock {
                 self.slashing_monitor.record_prevote_quorum(lock.clone());
             }
@@ -227,6 +233,8 @@ impl<DB: Database> Engine<DB> {
         Ok(())
     }
 
+    /// Reauthenticate one saved session against the committed validator `root`.
+    /// Peer progress starts below quorum; the caller derives it afterwards.
     #[allow(
         clippy::too_many_lines,
         reason = "Authenticate every saved context, quorum and local reservation before installing the session."
@@ -235,13 +243,11 @@ impl<DB: Database> Engine<DB> {
         &self,
         id: u64,
         saved: SavedSession,
+        root: Hash,
     ) -> Result<BftSession, EngineError<DB::Error>> {
         let params = &self.chain_spec().consensus;
         let domain = self.consensus_domain();
         let prevote_quorum = self.bft_prevote_quorum();
-        let root = self
-            .previous_validator_set_root()
-            .map_err(|_| StoreError::Corrupt("cannot restore BFT validator root"))?;
         if saved.spec != self.chain_spec_hash()
             || saved.chunk.chunk_id != id
             || saved.validators != self.active_validator_set()
@@ -454,7 +460,7 @@ impl<DB: Database> Engine<DB> {
             chunk: saved.chunk,
             proof_hashes: saved.proof_hashes,
             local: LocalVoteProgress::from_flags(prevoted, precommitted),
-            peer_quorum: PeerQuorumProgress::observed(&bft),
+            peer_quorum: PeerQuorumProgress::BelowPrevote,
             bft,
             local_identity: saved.local_identity,
             local_votes: saved.local_votes,
@@ -559,12 +565,10 @@ impl<DB: Database> Engine<DB> {
                 actions.push(BftAction::local_vote(vote));
             }
         }
-        if session.precommit_quorum_observed() {
-            actions.push(BftAction::QuorumReached(
-                session
-                    .quorum_identity()
-                    .expect("precommit quorum has a certificate"),
-            ));
+        if session.precommit_quorum_observed()
+            && let Some(identity) = session.quorum_identity()
+        {
+            actions.push(BftAction::QuorumReached(identity));
         }
         emit_aggregator_actions(&mut session, &mut actions);
         self.persist_bft_session(&session)?;
@@ -647,7 +651,8 @@ impl<DB: Database> Engine<DB> {
         }
         session.local = LocalVoteProgress::from_flags(progress.prevoted, progress.precommitted);
         session.local_identity = Some(*voter.public_key_bytes());
-        session.peer_quorum = PeerQuorumProgress::observed(&session.bft);
+        let root = self.previous_validator_set_root()?;
+        self.advance_peer_quorum(session, root);
         Ok(true)
     }
 }

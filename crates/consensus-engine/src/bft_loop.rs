@@ -113,19 +113,6 @@ enum PeerQuorumProgress {
     PrecommitQuorumObserved,
 }
 
-impl PeerQuorumProgress {
-    /// Progress implied by the authenticated stake already accumulated in `bft`.
-    const fn observed(bft: &ChunkBft) -> Self {
-        if bft.prevote_quorum_reached() && bft.precommit_quorum_reached() {
-            Self::PrecommitQuorumObserved
-        } else if bft.prevote_quorum_reached() {
-            Self::PrevoteQuorumObserved
-        } else {
-            Self::BelowPrevote
-        }
-    }
-}
-
 /// Per-chunk BFT state combining the [`ChunkBft`] accumulator with
 /// the local validator's participation bookkeeping.
 #[derive(Clone, Debug)]
@@ -695,66 +682,44 @@ impl<DB: Database> Engine<DB> {
         let peer_vote_data = vote.data.clone();
 
         let mut actions = Vec::new();
-        let lock_quorum;
+        let mut session = self
+            .bft_sessions
+            .get(&chunk_id)
+            .expect("contains_key checked above")
+            .clone();
+        let prior_local = session.local_votes.clone();
+        self.recover_session_signing(&mut session)?;
+        for local in &session.local_votes {
+            if !prior_local.contains(local) {
+                actions.push(BftAction::local_vote(local));
+            }
+        }
+        if session.precommit_quorum_observed()
+            && let Some(identity) = session.quorum_identity()
         {
-            let mut session = self
-                .bft_sessions
-                .get(&chunk_id)
-                .expect("contains_key checked above")
-                .clone();
-            let prior_local = session.local_votes.clone();
-            self.recover_session_signing(&mut session)?;
-            for local in &session.local_votes {
-                if !prior_local.contains(local) {
-                    actions.push(BftAction::local_vote(local));
-                }
-            }
-            if session.precommit_quorum_observed() {
-                actions.push(BftAction::QuorumReached(
-                    session
-                        .quorum_identity()
-                        .expect("precommit quorum has a certificate"),
-                ));
-            }
-            // Pending-fix #6: capture peer_quorum BEFORE
-            // recompute_quorum_transitions transitions the session.
-            let prior_peer_quorum = session.peer_quorum;
-            if session.precommit_quorum_observed() {
-                self.authenticate_finished_bft_vote(&vote)?;
-            } else {
-                match vote.data.phase {
-                    FinalityVotePhase::Prevote => session.bft.add_prevote(vote)?,
-                    FinalityVotePhase::Precommit => session.bft.add_precommit(vote)?,
-                }
-                self.recompute_quorum_transitions(&mut session, &mut actions)?;
-                if session.prevote_quorum_observed() && session.proposal.is_some() {
-                    session.pacemaker.enter_precommit(now_secs);
-                }
-            }
-            emit_aggregator_actions(&mut session, &mut actions);
-            lock_quorum = capture_just_crossed_lock_quorum(&session, prior_peer_quorum);
-            if let Some(quorum) = &lock_quorum {
-                session.valid_value = Some((session.chunk.clone(), quorum.clone()));
-            }
-            self.persist_bft_session(&session)?;
-            self.bft_sessions.insert(chunk_id, session);
+            actions.push(BftAction::QuorumReached(identity));
         }
-
-        // Pending-fix #6: feed the just-crossed lock prevote
-        // quorum to the slashing monitor. Done before the
-        // fork-choice feed to keep the ordering deterministic for
-        // tests; both call sites are now safe under separate
-        // mutable borrows because the session borrow above was
-        // dropped at the end of the inner scope.
-        if let Some(quorum) = lock_quorum {
-            self.slashing_monitor.record_prevote_quorum(quorum);
+        if session.precommit_quorum_observed() {
+            self.authenticate_finished_bft_vote(&vote)?;
+        } else {
+            match vote.data.phase {
+                FinalityVotePhase::Prevote => session.bft.add_prevote(vote)?,
+                FinalityVotePhase::Precommit => session.bft.add_precommit(vote)?,
+            }
+            // Recompute retains valid values in rank order and records a newly
+            // crossed prevote quorum as slashing lock evidence.
+            self.recompute_quorum_transitions(&mut session, &mut actions)?;
+            if session.prevote_quorum_observed() && session.proposal.is_some() {
+                session.pacemaker.enter_precommit(now_secs);
+            }
         }
+        emit_aggregator_actions(&mut session, &mut actions);
+        self.persist_bft_session(&session)?;
+        self.bft_sessions.insert(chunk_id, session);
 
         // Feed the peer vote AND every newly-emitted local
         // broadcast vote (prevote on session open / round advance,
-        // precommit on prevote-quorum) into fork-choice. The
-        // session borrow is dropped, so `&mut self.fork_choice`
-        // is freely available.
+        // precommit on prevote-quorum) into fork-choice.
         self.add_vote_signers_to_fork_choice(&peer_contributions, &peer_vote_data);
         self.feed_broadcast_actions_to_fork_choice(&actions);
 
@@ -906,36 +871,44 @@ impl<DB: Database> Engine<DB> {
     }
 }
 
-/// Snapshot the lock-prevote [`QuorumCertificate`] produced when
-/// `session.peer_quorum` just transitioned from
-/// [`PeerQuorumProgress::BelowPrevote`] to anything else.
-///
-/// Used by the slashing-monitor feed for pending-fix #6:
-/// [`SlashingMonitor::record_prevote_quorum`] needs every
-/// `(chunk_id, round, chunk_hash)` that crossed 2/3 prevote stake
-/// so the cross-round `LockViolation` detector can attach lock
-/// evidence to subsequent conflicting precommits.
-///
-/// `prior_peer_quorum` is the value of `session.peer_quorum`
-/// before [`recompute_quorum_transitions`] ran; the helper
-/// compares to detect a fresh transition (so repeated `add_*`
-/// calls after the first quorum crossing don't emit duplicate
-/// snapshots — `SlashingMonitor::record_prevote_quorum` is also
-/// idempotent, but the helper keeps the BFT hot path quiet).
-fn capture_just_crossed_lock_quorum(
-    session: &BftSession,
-    prior_peer_quorum: PeerQuorumProgress,
-) -> Option<QuorumCertificate> {
-    if !matches!(prior_peer_quorum, PeerQuorumProgress::BelowPrevote) {
-        return None;
-    }
-    if matches!(session.peer_quorum, PeerQuorumProgress::BelowPrevote) {
-        return None;
-    }
-    session.current_prevote_quorum()
-}
-
 impl<DB: Database> Engine<DB> {
+    /// Advance `session`'s peer progress to what its accumulated authenticated
+    /// stake authorizes. Live recompute, signing recovery and restart share this
+    /// single rule: a precommit quorum becomes finalizable only together with the
+    /// prevote quorum, the round's accepted leader proposal, the committed
+    /// `validator_root` and a complete certificate. Raw stake alone never marks
+    /// a session finished. Each newly crossed value prevote quorum is recorded
+    /// as lock evidence for the slashing monitor's `LockViolation` detector.
+    ///
+    /// Returns the certificate identity when the precommit quorum newly became
+    /// finalizable. Callers apply it only after every local signature of the
+    /// round is accumulated, so the frozen identity covers them.
+    fn advance_peer_quorum(
+        &mut self,
+        session: &mut BftSession,
+        validator_root: Hash,
+    ) -> Option<BftQuorumIdentity> {
+        if session.peer_quorum == PeerQuorumProgress::BelowPrevote {
+            if !session.bft.prevote_quorum_reached() {
+                return None;
+            }
+            session.peer_quorum = PeerQuorumProgress::PrevoteQuorumObserved;
+            if let Some(quorum) = session.current_prevote_quorum() {
+                self.slashing_monitor.record_prevote_quorum(quorum);
+            }
+        }
+        if session.peer_quorum != PeerQuorumProgress::PrevoteQuorumObserved
+            || session.proposal.is_none()
+            || !session.bft.precommit_quorum_reached()
+            || !session.bft.validator_set_root_matches(validator_root)
+        {
+            return None;
+        }
+        let identity = session.quorum_identity()?;
+        session.peer_quorum = PeerQuorumProgress::PrecommitQuorumObserved;
+        Some(identity)
+    }
+
     /// Remember the current prevote QC as a valid value and return it, so an
     /// immediate local precommit declares exactly the retained certificate.
     fn retain_bft_valid_quorum(
@@ -974,9 +947,6 @@ impl<DB: Database> Engine<DB> {
                 None
             };
             let quorum = self.retain_bft_valid_quorum(session, voter.is_some())?;
-            if matches!(session.peer_quorum, PeerQuorumProgress::BelowPrevote) {
-                session.peer_quorum = PeerQuorumProgress::PrevoteQuorumObserved;
-            }
             if let Some(voter) = voter {
                 if self.stored_bft_proof_hashes(&session.chunk)?.as_ref()
                     != Some(&session.proof_hashes)
@@ -1010,27 +980,12 @@ impl<DB: Database> Engine<DB> {
                 actions.push(BftAction::BroadcastPrecommit(precommit));
             }
         }
-        // The committed validator-set root is read only once a finalizing
-        // precommit quorum is otherwise ready.
-        if matches!(
-            session.peer_quorum,
-            PeerQuorumProgress::PrevoteQuorumObserved
-        ) && session.bft.precommit_quorum_reached()
-            && session.proposal.is_some()
-            && session
-                .bft
-                .validator_set_root_matches(self.previous_validator_set_root()?)
-        {
-            // Bind the same validator-set root the chunk committed; if
-            // they have drifted, leave the session below-quorum so the
-            // finalize path does not produce a cert that the verifier
-            // will reject.
-            session.peer_quorum = PeerQuorumProgress::PrecommitQuorumObserved;
-            actions.push(BftAction::QuorumReached(
-                session
-                    .quorum_identity()
-                    .expect("precommit quorum has a certificate"),
-            ));
+        // Bind the same validator-set root the chunk committed; if they have
+        // drifted, leave the session unfinalized so the finalize path does not
+        // produce a cert that the verifier will reject.
+        let root = self.previous_validator_set_root()?;
+        if let Some(identity) = self.advance_peer_quorum(session, root) {
+            actions.push(BftAction::QuorumReached(identity));
         }
         Ok(())
     }
@@ -1333,6 +1288,31 @@ mod tests {
         }
     }
 
+    /// Round-zero proposal signed by the designated leader of `chunk`.
+    fn round_zero_proposal<DB: Database>(engine: &Engine<DB>, chunk: Chunk) -> BftProposal {
+        let index = neutrino_consensus_types::bft_leader(
+            engine.chain_spec().chain_id,
+            chunk.chunk_id,
+            0,
+            engine.active_validator_set(),
+        )
+        .unwrap();
+        // Each fixture uses these deterministic identities. Signing tests
+        // pass their own proposal helper because their key material differs.
+        let mut proposal = BftProposal {
+            chunk,
+            round: 0,
+            proposer_index: index,
+            valid_quorum: None,
+            round_change_certificate: None,
+            signature: [0; 96],
+        };
+        proposal.signature = proposer(u8::try_from(index).unwrap())
+            .sign_raw(&proposal.signing_message(engine.consensus_domain()))
+            .to_bytes();
+        proposal
+    }
+
     impl<DB: Database> Engine<DB> {
         /// Install an actual signed leader proposal in isolated BFT fixtures.
         /// Tests of the public proposal/branch boundary use the production API.
@@ -1348,28 +1328,8 @@ mod tests {
                 .proposal
                 .is_none()
             {
-                let index = neutrino_consensus_types::bft_leader(
-                    self.chain_spec().chain_id,
-                    chunk.chunk_id,
-                    0,
-                    self.active_validator_set(),
-                )
-                .unwrap();
-                // Each fixture uses these deterministic identities. Signing tests
-                // pass their own proposal helper because their key material differs.
-                let voter = proposer(u8::try_from(index).unwrap());
                 let chunk_id = chunk.chunk_id;
-                let mut proposal = neutrino_consensus_types::BftProposal {
-                    chunk,
-                    round: 0,
-                    proposer_index: index,
-                    valid_quorum: None,
-                    round_change_certificate: None,
-                    signature: [0; 96],
-                };
-                proposal.signature = voter
-                    .sign_raw(&proposal.signing_message(self.consensus_domain()))
-                    .to_bytes();
+                let proposal = round_zero_proposal(self, chunk);
                 let mut session = self.bft_sessions.get(&chunk_id).unwrap().clone();
                 actions.extend(self.accept_bft_leader_proposal(&mut session, proposal, now)?);
                 self.persist_bft_session(&session)?;
@@ -2037,6 +1997,183 @@ mod tests {
             }
             other => panic!("expected LockViolation, got {other:?}"),
         }
+    }
+
+    /// A prevote quorum completed by the local prevote while accepting the
+    /// leader proposal is lock evidence, exactly like one completed by a peer.
+    #[test]
+    fn prevote_quorum_completed_by_a_leader_proposal_feeds_the_slashing_monitor() {
+        let spec = chain_spec_with(3);
+        let leader =
+            neutrino_consensus_types::bft_leader(spec.chain_id, 0, 0, &spec.initial_validators)
+                .unwrap();
+        let local = u8::try_from((leader + 1) % 3).unwrap();
+        let peer = u8::try_from((leader + 2) % 3).unwrap();
+        let mut engine = test_engine(spec.clone());
+        engine.set_local_voter(proposer(local));
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
+        assert!(
+            engine
+                .open_bft_session_at(chunk.clone(), 0)
+                .unwrap()
+                .is_empty()
+        );
+        // The peer prevote arrives before the proposal and is not a quorum.
+        engine
+            .observe_finality_vote(test_vote(
+                0,
+                chunk.hash(),
+                0,
+                FinalityVotePhase::Prevote,
+                spec.consensus_domain(),
+                &proposer(peer),
+                3,
+            ))
+            .unwrap();
+        assert!(!engine.bft_session(0).unwrap().prevote_quorum_observed());
+        let proposal = round_zero_proposal(&engine, chunk);
+        engine.accept_authorized_bft_fixture(proposal, 0).unwrap();
+        let session = engine.bft_session(0).unwrap();
+        assert!(session.prevote_quorum_observed());
+        let lock = session.highest_lock_quorum().unwrap();
+        assert!(engine.slashing_monitor.prevote_quorum_is_observed(lock));
+    }
+
+    /// Peer value votes are accepted before the leader proposal. Restart must
+    /// derive progress under the live rule; raw quorums without a proposal
+    /// cannot finish the session or surface a certificate.
+    #[test]
+    fn restart_without_a_leader_proposal_keeps_raw_peer_quorums_unfinished() {
+        let spec = chain_spec_with(3);
+        let mut engine = test_engine(spec.clone());
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
+        assert!(
+            engine
+                .open_bft_session_at(chunk.clone(), 0)
+                .unwrap()
+                .is_empty()
+        );
+        for phase in [FinalityVotePhase::Prevote, FinalityVotePhase::Precommit] {
+            for index in [1, 2] {
+                let actions = engine
+                    .observe_finality_vote(test_vote(
+                        0,
+                        chunk.hash(),
+                        0,
+                        phase,
+                        spec.consensus_domain(),
+                        &proposer(index),
+                        3,
+                    ))
+                    .unwrap();
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, BftAction::QuorumReached(_)))
+                );
+            }
+        }
+        let session = engine.bft_session(0).unwrap();
+        assert!(session.proposal().is_none());
+        assert!(session.chunk_bft().precommit_quorum_reached());
+        assert!(!session.precommit_quorum_observed());
+
+        let mut restored = Engine::open(spec, engine.store().db().clone()).unwrap();
+        let session = restored.bft_session(0).unwrap();
+        assert!(session.prevote_quorum_observed());
+        assert!(!session.precommit_quorum_observed());
+        assert!(
+            !restored
+                .resume_bft_actions()
+                .unwrap()
+                .iter()
+                .any(|action| matches!(action, BftAction::QuorumReached(_)))
+        );
+        // The late proposal completes the certificate under the same rule.
+        let proposal = round_zero_proposal(&restored, chunk);
+        let actions = restored.accept_authorized_bft_fixture(proposal, 1).unwrap();
+        let session = restored.bft_session(0).unwrap();
+        assert!(session.precommit_quorum_observed());
+        let reached: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                BftAction::QuorumReached(quorum) => Some(*quorum),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reached, [session.quorum_identity().unwrap()]);
+    }
+
+    /// Crossing a prevote quorum retains its QC only through the ordered
+    /// valid-value rule, which never demotes a higher-ranked value.
+    #[test]
+    fn crossing_a_prevote_quorum_cannot_demote_a_higher_ranked_valid_value() {
+        let spec = chain_spec_with(3);
+        let mut engine = test_engine(spec.clone());
+        engine.set_local_voter(proposer(0));
+        let chunk = dummy_chunk(0, spec.genesis_validator_set_root);
+        engine.open_authorized_bft_session(chunk.clone()).unwrap();
+        // Bookkeeping isolation: an equal-round QC for a larger target hash
+        // outranks the current target under `qc_rank`.
+        let higher = (0..=u8::MAX)
+            .map(|byte| Chunk {
+                end_state_root: [byte; 32],
+                ..chunk.clone()
+            })
+            .find(|candidate| candidate.hash() > chunk.hash())
+            .unwrap();
+        let data = FinalityVoteData {
+            chunk_id: 0,
+            round: 0,
+            chunk_hash: higher.hash(),
+            phase: FinalityVotePhase::Prevote,
+        };
+        let signatures: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|index| {
+                let voter = proposer(index);
+                neutrino_crypto::bls::Signature::from_bytes(
+                    &voter.sign_finality_vote(spec.consensus_domain(), &data),
+                )
+                .unwrap()
+            })
+            .collect();
+        let higher_quorum = QuorumCertificate {
+            data,
+            aggregate: neutrino_consensus_types::AggregatedVote {
+                aggregation_bits: BitVec::from_bytes(3, vec![0b110]).unwrap(),
+                signature: neutrino_crypto::bls::aggregate_signatures(
+                    &signatures.iter().collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .to_bytes(),
+            },
+        };
+        let mut session = engine.bft_sessions.get(&0).unwrap().clone();
+        assert!(Engine::<MemoryDatabase>::remember_bft_valid_value(
+            &mut session,
+            higher,
+            higher_quorum.clone(),
+        ));
+        engine.bft_sessions.insert(0, session);
+
+        engine
+            .observe_finality_vote(test_vote(
+                0,
+                chunk.hash(),
+                0,
+                FinalityVotePhase::Prevote,
+                spec.consensus_domain(),
+                &proposer(1),
+                3,
+            ))
+            .unwrap();
+        let session = engine.bft_session(0).unwrap();
+        assert_eq!(
+            session.highest_lock_quorum().unwrap().data.chunk_hash,
+            chunk.hash()
+        );
+        assert_eq!(session.highest_valid_quorum(), Some(&higher_quorum));
     }
 
     #[test]

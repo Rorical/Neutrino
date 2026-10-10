@@ -1,6 +1,6 @@
 //! Opportunistic early fact compression. BFT never waits on a proof.
 
-use super::ChainBackend;
+use super::{ChainBackend, reporter_retention};
 use crate::metrics::NodeMetrics;
 use crate::proof_metrics::{BacklogGuard, FACT_QUEUE_CAPACITY, ProofStage};
 use crate::proving_budget::ProvingBudget;
@@ -21,7 +21,6 @@ async fn run_fact_worker<P: ProofSystem + Send + Sync + 'static>(
     mut rx: mpsc::Receiver<FactJob>,
     prover: Arc<P>,
     budget: Arc<ProvingBudget>,
-    metrics: Arc<NodeMetrics>,
 ) {
     let mut carried = None;
     while let Some(job) = match carried.take() {
@@ -48,14 +47,11 @@ async fn run_fact_worker<P: ProofSystem + Send + Sync + 'static>(
         }
         let prover = Arc::clone(&prover);
         let budget = Arc::clone(&budget);
-        let metrics = Arc::clone(&metrics);
         match tokio::task::spawn_blocking(move || {
             drop(pending);
-            let _permit = budget.acquire(ProofStage::Fact);
-            metrics
-                .proof_pipeline
-                .fact_proofs
-                .time(|| prover.preprove_facts(&program, &requests))
+            budget.prove(ProofStage::Fact, || {
+                prover.preprove_facts(&program, &requests)
+            })
         })
         .await
         {
@@ -134,13 +130,13 @@ where
         let mut guard = self.fact_jobs.lock().expect("fact queue mutex");
         if guard.as_ref().is_none_or(mpsc::Sender::is_closed) {
             let (tx, rx) = mpsc::channel::<FactJob>(FACT_QUEUE_CAPACITY);
-            self.spawn_background_worker(
+            self.spawn_supervised(
                 "facts",
+                true,
                 run_fact_worker(
                     rx,
                     Arc::clone(&self.proof_system),
                     Arc::clone(&self.proving_budget),
-                    Arc::clone(&self.metrics),
                 ),
             );
             *guard = Some(tx);
@@ -161,28 +157,17 @@ where
     )> {
         self.with_engine(|engine| {
             let next = engine.finalized_next_chunk_id();
+            let historical = engine.store().historical_chunk(chunk_id).ok().flatten();
             if chunk_id < next
                 && !neutrino_consensus_types::history::is_recent_history_index(chunk_id, next)
-                && !(engine.retention_info().is_ok_and(|info| {
-                    info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
-                }) && engine
-                    .store()
-                    .historical_chunk(chunk_id)
-                    .ok()
-                    .flatten()
-                    .is_some())
+                && !(reporter_retention(engine) && historical.is_some())
             {
                 return None;
             }
-            let validators = engine
-                .store()
-                .historical_chunk(chunk_id)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || engine.active_validator_set().to_vec(),
-                    |record| record.validators,
-                );
+            let validators = historical.map_or_else(
+                || engine.active_validator_set().to_vec(),
+                |record| record.validators,
+            );
             Some((engine.chain_spec().consensus_domain(), validators))
         })
     }
@@ -227,6 +212,9 @@ where
     }
 
     pub(super) fn queue_vote_facts(&self, vote: &neutrino_consensus_types::FinalityVote) {
+        if self.fact_program().is_none() {
+            return;
+        }
         let requests = self.with_engine(|engine| {
             let next = engine.finalized_next_chunk_id();
             if vote.data.chunk_id < next
@@ -256,6 +244,9 @@ where
     }
 
     pub(crate) fn queue_header_facts(&self, header: &neutrino_consensus_types::Header) {
+        if self.fact_program().is_none() {
+            return;
+        }
         let requests = self.with_engine(|engine| {
             let id =
                 header.height.saturating_sub(1) / engine.chain_spec().consensus.chunk_size.max(1);

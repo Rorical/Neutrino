@@ -18,7 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::ChainBackend;
+use super::{ChainBackend, not_available, rejected, storage_error};
 
 const STATE_KEY: &[u8] = b"light_client_state";
 const PROOF_KEY: &[u8] = b"light_client_latest_proof";
@@ -89,7 +89,7 @@ pub(super) struct LightRuntime {
 }
 
 /// Reuse only the exact artifact/domain already authenticated outside the engine lock.
-struct Authenticated<'a>(&'a VerifiedHistory);
+pub(super) struct Authenticated<'a>(pub(super) &'a VerifiedHistory);
 impl HistoryVerifier for Authenticated<'_> {
     type Error = ();
     fn verify_history(
@@ -109,7 +109,7 @@ fn timestamp() -> Result<u64, SyncBackendError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
-        .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))
+        .map_err(not_available)
 }
 fn policy_error(error: LightClientError) -> SyncBackendError {
     match error {
@@ -229,6 +229,11 @@ where
         })
     }
 
+    /// Whether this backend runs as a proof-only light node.
+    pub(super) fn is_light(&self) -> bool {
+        self.light.lock().expect("light state").is_some()
+    }
+
     pub(super) fn light_checkpoint(&self) -> Option<Checkpoint> {
         self.light
             .lock()
@@ -290,8 +295,8 @@ where
             verify_history_proof(verifier.as_ref(), &spec, proof, &anchor)
         })
         .await
-        .map_err(|error| SyncBackendError::Storage(error.to_string()))?
-        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+        .map_err(storage_error)?
+        .map_err(rejected)?;
         let target = authenticated.proof().statement.end_checkpoint().hash();
         let outcome = next
             .accept(
@@ -313,14 +318,12 @@ where
             batch.put(
                 Column::Meta,
                 STATE_KEY,
-                borsh::to_vec(&stored)
-                    .map_err(|error| SyncBackendError::Storage(error.to_string()))?,
+                borsh::to_vec(&stored).map_err(storage_error)?,
             );
             batch.put(
                 Column::Meta,
                 PROOF_KEY,
-                borsh::to_vec(&proof)
-                    .map_err(|error| SyncBackendError::Storage(error.to_string()))?,
+                borsh::to_vec(&proof).map_err(storage_error)?,
             );
         }
         self.with_engine_mut(|engine| {
@@ -345,7 +348,7 @@ where
                 engine
                     .store_mut()
                     .write_observed_batch(batch, false)
-                    .map_err(|error| SyncBackendError::Storage(error.to_string()))?;
+                    .map_err(storage_error)?;
                 state.client = next;
                 state.latest = Some(proof);
             }

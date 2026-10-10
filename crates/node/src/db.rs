@@ -43,6 +43,22 @@ impl NodeDb {
     }
 }
 
+impl From<core::convert::Infallible> for NodeDbError {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
+/// Forward one operation to whichever backend is selected.
+macro_rules! delegate {
+    ($self:expr, $db:ident => $call:expr) => {
+        match $self {
+            Self::Memory($db) => $call.map_err(NodeDbError::from),
+            Self::Rocks($db) => $call.map_err(NodeDbError::from),
+        }
+    };
+}
+
 impl Database for NodeDb {
     type Error = NodeDbError;
 
@@ -54,71 +70,31 @@ impl Database for NodeDb {
     }
 
     fn get(&self, column: Column, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        match self {
-            Self::Memory(db) => Ok(db.get(column, key).expect("memory get is infallible")),
-            Self::Rocks(db) => db.get(column, key).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.get(column, key))
     }
 
     fn put(&mut self, column: Column, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(db) => {
-                db.put(column, key, value)
-                    .expect("memory put is infallible");
-                Ok(())
-            }
-            Self::Rocks(db) => db.put(column, key, value).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.put(column, key, value))
     }
 
     fn delete(&mut self, column: Column, key: &[u8]) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(db) => {
-                db.delete(column, key).expect("memory delete is infallible");
-                Ok(())
-            }
-            Self::Rocks(db) => db.delete(column, key).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.delete(column, key))
     }
 
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(db) => {
-                db.write_batch(batch)
-                    .expect("memory write_batch is infallible");
-                Ok(())
-            }
-            Self::Rocks(db) => db.write_batch(batch).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.write_batch(batch))
     }
 
     fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(db) => {
-                db.write_batch_durable(batch)
-                    .expect("memory durable batch is infallible");
-                Ok(())
-            }
-            Self::Rocks(db) => db.write_batch_durable(batch).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.write_batch_durable(batch))
     }
 
     fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
-        match self {
-            Self::Memory(db) => Ok(db
-                .iter_column(column)
-                .expect("memory iter_column is infallible")),
-            Self::Rocks(db) => db.iter_column(column).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.iter_column(column))
     }
 
     fn iter_prefix(&self, column: Column, prefix: &[u8]) -> Result<ColumnSnapshot, Self::Error> {
-        match self {
-            Self::Memory(db) => Ok(db
-                .iter_prefix(column, prefix)
-                .expect("memory iter_prefix is infallible")),
-            Self::Rocks(db) => db.iter_prefix(column, prefix).map_err(NodeDbError::from),
-        }
+        delegate!(self, db => db.iter_prefix(column, prefix))
     }
 }
 

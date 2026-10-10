@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use neutrino_consensus_engine::{Engine, RetentionPolicy};
-use neutrino_consensus_types::{Block, Header, HistoryProof};
+use neutrino_consensus_types::{Block, Body, Header, HistoryProof};
 use neutrino_mempool::InsertError;
 use neutrino_primitives::{BlockHash, ChainId, Hash, Height, Validator, ZERO_HASH};
 use neutrino_proof_system::ProofSystem;
@@ -18,7 +18,7 @@ use neutrino_trie::{Hasher, Node, Poseidon2Hasher, Trie};
 
 use super::ChainBackend;
 
-fn storage_error(error: impl core::fmt::Display) -> QueryError {
+pub(super) fn storage_error(error: impl core::fmt::Display) -> QueryError {
     QueryError::Storage(error.to_string())
 }
 
@@ -216,11 +216,7 @@ where
         .get_body(&hash)
         .map_err(storage_error)?
         .ok_or(QueryError::BodyUnavailable)?;
-    let roots = neutrino_consensus_engine::compute_body_roots(&body);
-    if roots.da_root != header.da_root
-        || roots.transactions_root != header.transactions_root
-        || roots.votes_root != header.votes_root
-    {
+    if !body_matches_header(&header, &body) {
         return Err(storage_error(
             "stored body does not match the header commitment",
         ));
@@ -228,7 +224,16 @@ where
     Ok(Some(Block { header, body }))
 }
 
-fn read_state<DB: Database>(engine: &Engine<DB>, at: &BlockId) -> Result<Trie, QueryError>
+/// Whether `body` reproduces the data, transaction and vote commitments of `header`.
+pub(super) fn body_matches_header(header: &Header, body: &Body) -> bool {
+    let roots = neutrino_consensus_engine::compute_body_roots(body);
+    roots.da_root == header.da_root
+        && roots.transactions_root == header.transactions_root
+        && roots.votes_root == header.votes_root
+}
+
+/// State committed by the block `at` selects, with that block's height.
+fn read_state<DB: Database>(engine: &Engine<DB>, at: &BlockId) -> Result<(Trie, Height), QueryError>
 where
     DB::Error: core::fmt::Debug + core::fmt::Display,
 {
@@ -245,7 +250,7 @@ where
         }
         Err(error)
     })?;
-    Ok(Trie::from_persisted(root, data.nodes, data.values))
+    Ok((Trie::from_persisted(root, data.nodes, data.values), height))
 }
 
 pub(super) struct AuthenticatedState {
@@ -326,20 +331,14 @@ where
 {
     /// State at `at` together with the runtime artifact that interprets it.
     async fn rpc_state_snapshot(&self, at: &BlockId) -> Result<(Trie, Hash), QueryError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return Err(QueryError::StateUnavailable);
         }
         let engine = Arc::clone(&self.engine);
         let at = at.clone();
         tokio::task::spawn_blocking(move || {
             let engine = engine.lock().expect("engine mutex poisoned");
-            let state = read_state(&engine, &at)?;
-            let hash = resolve_id(&engine, &at)?.ok_or(QueryError::BlockNotFound)?;
-            let height = if hash == engine.chain_spec().genesis_block_hash {
-                0
-            } else {
-                required_header(&engine, hash)?.height
-            };
+            let (state, height) = read_state(&engine, &at)?;
             let runtime = engine
                 .runtime_code_hash_for(height)
                 .map_err(|_| QueryError::StateUnavailable)?;
@@ -370,7 +369,7 @@ where
     }
 
     async fn history_latest(&self) -> Result<Vec<u8>, QueryError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return borsh::to_vec(
                 &self
                     .light_latest_proof()
@@ -402,7 +401,7 @@ where
         self.subscribe_history(id)
     }
     async fn history_proof(&self, start: Hash, end: Hash) -> Result<Vec<u8>, QueryError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             let proof = self
                 .light_latest_proof()
                 .map_err(storage_error)?
@@ -496,7 +495,7 @@ where
     }
 
     async fn active_validator_set(&self) -> Vec<Validator> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return Vec::new();
         }
         self.with_engine(|engine| engine.active_validator_set().to_vec())
@@ -546,7 +545,7 @@ where
     }
 
     async fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, SubmitError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return Err(SubmitError::Rejected {
                 reason: "proof-only node has no transaction execution state".into(),
             });

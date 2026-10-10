@@ -1,5 +1,5 @@
 //! Fixed-cardinality execution, admission, import and consensus observations.
-use crate::metrics::{NodeMetrics, StageMetrics, counter, family};
+use crate::metrics::{NodeMetrics, StageMetrics, counter, labeled, loads};
 use neutrino_consensus_engine::BftAction;
 use neutrino_consensus_types::Body;
 use neutrino_primitives::Hash;
@@ -7,7 +7,6 @@ use neutrino_proof_system::{BlockExecutionContext, ErasedBlockExecutor, Executio
 use neutrino_runtime_abi::{QueryRequest, QueryResponse, TxValidity};
 use neutrino_trie::{Poseidon2Hasher, Trie};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -180,45 +179,30 @@ impl ExecutionMetrics {
         self.render_outcomes(out);
     }
     fn render_outcomes(&self, out: &mut String) {
-        family(
+        labeled(
             out,
             "neutrino_transaction_validity_total",
             "Runtime validation verdicts including traps.",
             "counter",
+            "code",
+            VALIDITY_CODES.into_iter().zip(loads(&self.validity_codes)),
         );
-        for (code, count) in VALIDITY_CODES.iter().zip(&self.validity_codes) {
-            let _ = writeln!(
-                out,
-                "neutrino_transaction_validity_total{{code=\"{code}\"}} {}",
-                count.load(Ordering::Relaxed)
-            );
-        }
-        family(
+        labeled(
             out,
             "neutrino_transaction_admissions_total",
             "Mempool admission attempts.",
             "counter",
+            "outcome",
+            ADMISSIONS.into_iter().zip(loads(&self.admissions)),
         );
-        for (outcome, count) in ADMISSIONS.iter().zip(&self.admissions) {
-            let _ = writeln!(
-                out,
-                "neutrino_transaction_admissions_total{{outcome=\"{outcome}\"}} {}",
-                count.load(Ordering::Relaxed)
-            );
-        }
-        family(
+        labeled(
             out,
             "neutrino_bft_actions_total",
             "Generated BFT actions including retransmission.",
             "counter",
+            "action",
+            ACTIONS.into_iter().zip(loads(&self.actions)),
         );
-        for (action, count) in ACTIONS.iter().zip(&self.actions) {
-            let _ = writeln!(
-                out,
-                "neutrino_bft_actions_total{{action=\"{action}\"}} {}",
-                count.load(Ordering::Relaxed)
-            );
-        }
     }
     fn render_stages(&self, out: &mut String) {
         for (stage, name, help) in [

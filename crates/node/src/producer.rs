@@ -3,7 +3,7 @@
 #![allow(clippy::redundant_pub_crate)]
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use borsh::to_vec;
 use neutrino_consensus_engine::{ProductionError, ProposerKey};
@@ -38,7 +38,7 @@ pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
     let mut last_attempted_slot = current_slot(
         config.genesis_time_secs,
         config.slot_duration_secs,
-        unix_now_secs(),
+        crate::now_secs(),
     )
     .saturating_sub(1);
 
@@ -92,7 +92,7 @@ pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
                 }
             }
             () = tokio::time::sleep_until(tick) => {
-                let now = unix_now_secs();
+                let now = crate::now_secs();
                 let slot = current_slot(config.genesis_time_secs, config.slot_duration_secs, now);
                 failed.clear();
                 if slot > last_attempted_slot && jobs.available() > 0 {
@@ -134,12 +134,6 @@ async fn attempt_slot<P: ProgramProver + 'static>(
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => warn!(slot, %error, "block production task cancelled"),
     }
-}
-
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 fn current_slot(genesis_time_secs: u64, slot_duration_secs: u64, now_secs: u64) -> u64 {

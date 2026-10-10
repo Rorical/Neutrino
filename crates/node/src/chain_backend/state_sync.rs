@@ -8,7 +8,7 @@ use neutrino_sync::{StateProgress, SyncBackendError};
 use neutrino_trie::{Hasher, Node, Poseidon2Hasher, Trie};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{ChainBackend, p2p_queries, rpc_queries};
+use super::{ChainBackend, p2p_queries, rejected, rpc_queries, storage_error};
 use neutrino_proof_system::ProofSystem;
 
 use neutrino_consensus_engine::store::pointers::{
@@ -47,27 +47,31 @@ impl Download {
         if kind == StateItemKind::Node && hash == ZERO_HASH {
             return Ok(());
         }
+        // `StateItem` orders by kind, hash, then offset: every pending
+        // fragment of this object lies in one contiguous range.
+        let first = StateItem {
+            kind,
+            hash,
+            offset: 0,
+        };
+        let last = StateItem {
+            offset: u64::MAX,
+            ..first
+        };
         if !self.completed.contains(&(kind, hash))
-            && !self
-                .pending
-                .iter()
-                .any(|item| item.kind == kind && item.hash == hash)
+            && self.pending.range(first..=last).next().is_none()
         {
             if self.completed.len() + self.pending.len() >= MAX_ENTRIES {
                 return Err(SyncBackendError::NotAvailable(
                     "state entry budget exceeded".into(),
                 ));
             }
-            self.pending.insert(StateItem {
-                kind,
-                hash,
-                offset: 0,
-            });
+            self.pending.insert(first);
         }
         Ok(())
     }
     fn discover_children(&mut self, bytes: &[u8]) -> Result<(), SyncBackendError> {
-        match Node::decode(bytes).map_err(|error| SyncBackendError::Rejected(error.to_string()))? {
+        match Node::decode(bytes).map_err(rejected)? {
             Node::Leaf { value_hash, .. } => {
                 self.discover(StateItemKind::Value, value_hash)?;
             }
@@ -95,18 +99,13 @@ fn load<DB: Database>(db: &DB, root: Hash) -> Result<Download, SyncBackendError>
 where
     DB::Error: core::fmt::Display,
 {
-    let Some(bytes) = db
-        .get(Column::Meta, DOWNLOAD_KEY)
-        .map_err(p2p_queries::storage_error)?
-    else {
+    let Some(bytes) = db.get(Column::Meta, DOWNLOAD_KEY).map_err(storage_error)? else {
         return Ok(Download::new(root));
     };
     if bytes.len() > MAX_ENTRIES * 80 + 128 {
-        return Err(p2p_queries::storage_error(
-            "oversized state download metadata",
-        ));
+        return Err(storage_error("oversized state download metadata"));
     }
-    let download: Download = borsh::from_slice(&bytes).map_err(p2p_queries::storage_error)?;
+    let download: Download = borsh::from_slice(&bytes).map_err(storage_error)?;
     if download.root != root {
         return Err(SyncBackendError::NotAvailable(
             "another state snapshot is being reconstructed".into(),
@@ -115,9 +114,7 @@ where
     if download.completed.len() + download.pending.len() > MAX_ENTRIES
         || download.bytes > DEFAULT_MAX_BYTES
     {
-        return Err(p2p_queries::storage_error(
-            "state download metadata exceeds budget",
-        ));
+        return Err(storage_error("state download metadata exceeds budget"));
     }
     Ok(download)
 }
@@ -165,10 +162,10 @@ where
                 let storage_key = key(root, expected.kind, expected.hash);
                 let mut bytes = db
                     .get(Column::Meta, &storage_key)
-                    .map_err(p2p_queries::storage_error)?
+                    .map_err(storage_error)?
                     .unwrap_or_default();
                 if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected.offset {
-                    return Err(p2p_queries::storage_error(
+                    return Err(storage_error(
                         "state fragment offset disagrees with durable progress",
                     ));
                 }
@@ -201,12 +198,12 @@ where
                         discard.put(
                             Column::Meta,
                             DOWNLOAD_KEY,
-                            borsh::to_vec(&reset).map_err(p2p_queries::storage_error)?,
+                            borsh::to_vec(&reset).map_err(storage_error)?,
                         );
                         engine
                             .store_mut()
                             .write_observed_batch(discard, true)
-                            .map_err(p2p_queries::storage_error)?;
+                            .map_err(storage_error)?;
                         return Err(SyncBackendError::Rejected(
                             "state object content hash mismatch".into(),
                         ));
@@ -226,12 +223,12 @@ where
             batch.put(
                 Column::Meta,
                 DOWNLOAD_KEY,
-                borsh::to_vec(&download).map_err(p2p_queries::storage_error)?,
+                borsh::to_vec(&download).map_err(storage_error)?,
             );
             engine
                 .store_mut()
                 .write_observed_batch(batch, true)
-                .map_err(p2p_queries::storage_error)?;
+                .map_err(storage_error)?;
             Ok(StateProgress {
                 root_complete: download.pending.is_empty(),
                 next_items: download.next(),
@@ -253,10 +250,8 @@ where
             for (kind, hash) in &download.completed {
                 let bytes = db
                     .get(Column::Meta, &key(root, *kind, *hash))
-                    .map_err(p2p_queries::storage_error)?
-                    .ok_or_else(|| {
-                        p2p_queries::storage_error("completed state object is missing")
-                    })?;
+                    .map_err(storage_error)?
+                    .ok_or_else(|| storage_error("completed state object is missing"))?;
                 match kind {
                     StateItemKind::Node => {
                         nodes.insert(*hash, bytes);
@@ -309,7 +304,7 @@ where
             engine
                 .store_mut()
                 .write_observed_batch(batch, true)
-                .map_err(p2p_queries::storage_error)
+                .map_err(storage_error)
         })
     }
 }

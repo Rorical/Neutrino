@@ -174,6 +174,26 @@ pub(crate) fn family(out: &mut String, name: &str, help: &str, kind: &str) {
     let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
 }
 
+/// Write a metric family whose samples differ only in the `key` label.
+pub(crate) fn labeled<'a, V: std::fmt::Display>(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    kind: &str,
+    key: &str,
+    samples: impl IntoIterator<Item = (&'a str, V)>,
+) {
+    family(out, name, help, kind);
+    for (label, value) in samples {
+        let _ = writeln!(out, "{name}{{{key}=\"{label}\"}} {value}");
+    }
+}
+
+/// Current values of a fixed array of counters.
+pub(crate) fn loads(values: &[AtomicU64]) -> impl Iterator<Item = u64> + '_ {
+    values.iter().map(|value| value.load(Ordering::Relaxed))
+}
+
 /// Write a complete unlabelled gauge.
 pub(crate) fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
     family(out, name, help, "gauge");
@@ -209,6 +229,22 @@ pub struct NodeMetrics {
     pub blocks_produced: AtomicU64,
     /// Block proof jobs waiting for a worker.
     pub block_proof_queue_pending: AtomicU64,
+}
+
+impl NodeMetrics {
+    /// Attempt counters and latencies of one proving stage.
+    #[must_use]
+    pub const fn proof_stage(&self, stage: crate::proof_metrics::ProofStage) -> &StageMetrics {
+        use crate::proof_metrics::ProofStage;
+        match stage {
+            ProofStage::Block => &self.block_proofs,
+            ProofStage::Chunk => &self.chunk_proofs,
+            ProofStage::Fact => &self.proof_pipeline.fact_proofs,
+            ProofStage::Evidence => &self.proof_pipeline.evidence_proofs,
+            ProofStage::HistoryFold => &self.history_folds,
+            ProofStage::HistoryMerge => &self.history_merges,
+        }
+    }
 }
 
 /// One live BFT session as seen by the engine.
@@ -612,30 +648,15 @@ impl Scraper {
                 .sample_age
                 .map_or_else(|| "-1".to_owned(), |age| age.as_secs().to_string()),
         );
-        let _ = writeln!(
-            body,
-            "# HELP neutrino_readiness_reason Current finite readiness reason.\n# TYPE neutrino_readiness_reason gauge"
+        labeled(
+            &mut body,
+            "neutrino_readiness_reason",
+            "Current finite readiness reason.",
+            "gauge",
+            "reason",
+            crate::health::ReadinessReason::ALL
+                .map(|reason| (reason.label(), u8::from(health.reason == reason))),
         );
-        for reason in [
-            "starting",
-            "stopping",
-            "critical_task_failed",
-            "health_sample_stale",
-            "bootstrap_pending",
-            "trust_anchor_expired",
-            "insufficient_peers",
-            "syncing",
-            "history_lag_exceeded",
-            "finality_stalled",
-            "ok",
-            "health_sample_pending",
-        ] {
-            let _ = writeln!(
-                body,
-                "neutrino_readiness_reason{{reason=\"{reason}\"}} {}",
-                u8::from(health.reason == reason)
-            );
-        }
         let body = Arc::new(body);
         *cached = Some((Instant::now(), Arc::clone(&body)));
         body
@@ -712,7 +733,7 @@ async fn respond(mut stream: TcpStream, scraper: Arc<Scraper>) -> std::io::Resul
             } else {
                 health.ready
             };
-            let reason = if healthy { "ok" } else { health.reason };
+            let reason = if healthy { "ok" } else { health.reason.label() };
             (
                 if healthy {
                     "200 OK"

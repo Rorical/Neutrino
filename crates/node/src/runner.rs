@@ -119,18 +119,18 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
         .validate()
         .map_err(|error| NodeError::ProofSystem(error.into()))?;
     config.health.validate().map_err(NodeError::Engine)?;
-    config
+    let reporter = config
         .reporter_reward_address()
         .map_err(NodeError::Engine)?;
     if config.role == NodeRole::LightClient {
-        return Box::pin(run_with_prover(config, || {
+        return Box::pin(run_with_prover(config, reporter, || {
             Ok(sp1_sdk::blocking::ProverClient::builder().light().build())
         }))
         .await;
     }
     match config.proving.backend {
         ProvingBackend::Cpu => {
-            Box::pin(run_with_prover(config, || {
+            Box::pin(run_with_prover(config, reporter, || {
                 Ok(sp1_sdk::blocking::ProverClient::builder().cpu().build())
             }))
             .await
@@ -139,7 +139,7 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
             #[cfg(feature = "cuda")]
             {
                 let device = config.proving.cuda_device.unwrap_or(0);
-                Box::pin(run_with_prover(config, move || {
+                Box::pin(run_with_prover(config, reporter, move || {
                     neutrino_runtime_host::backend::cuda_prover(device)
                 }))
                 .await
@@ -152,9 +152,11 @@ pub async fn run(config: NodeConfig) -> Result<(), NodeError> {
     }
 }
 
+/// `reporter` is the reward address [`run`] already decoded from `config`.
 #[allow(clippy::too_many_lines)]
 async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
     config: NodeConfig,
+    reporter: Option<[u8; 32]>,
     build_prover: impl FnOnce() -> Result<P, Sp1HostError> + Send + 'static,
 ) -> Result<(), NodeError> {
     // Every node requires a `chain_spec_path`. Misconfigured deployments
@@ -185,14 +187,6 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
             hex_short(&spec),
             hex_short(&actual),
         ))));
-    }
-    let unbonding_delay_blocks = chain_spec.runtime.unbonding_delay_blocks;
-    if chain_spec.runtime.evidence_max_age_blocks >= unbonding_delay_blocks
-        || unbonding_delay_blocks <= chain_spec.consensus.chunk_size
-    {
-        return Err(NodeError::ChainSpec(ChainSpecError::Validation(
-            "unbonding delay must exceed both one chunk and the liveness evidence window".into(),
-        )));
     }
     let production_config = build_block_producer_config(&config, &chain_spec)?;
     // Validate addresses before starting any worker, including backend workers.
@@ -334,10 +328,7 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
                     concrete_backend.set_program_store(store);
                     concrete_backend.restore_programs();
                 }
-                if let Some(address) = config
-                    .reporter_reward_address()
-                    .map_err(NodeError::Engine)?
-                {
+                if let Some(address) = reporter {
                     concrete_backend
                         .initialize_reporter(address)
                         .map_err(NodeError::Engine)?;
@@ -665,13 +656,7 @@ fn required_proposer_key(
 /// Short hex preview for log lines / error messages. Truncates to
 /// the first 8 bytes so a `Display::fmt` of a hash stays readable.
 fn hex_short(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(18);
-    for b in &bytes[..8] {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{b:02x}");
-    }
-    s.push_str("..");
-    s
+    format!("{}..", hex::encode(&bytes[..8]))
 }
 
 async fn wait_for_shutdown() -> Result<(), std::io::Error> {

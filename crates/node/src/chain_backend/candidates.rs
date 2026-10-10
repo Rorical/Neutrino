@@ -1,8 +1,10 @@
 //! Authenticated branch preparation behind advisory candidate discovery.
 
-use super::{ChainBackend, SyncBackendError};
+use super::{
+    ChainBackend, SyncBackendError, chunk_matches_context, not_available, rejected, storage_error,
+};
 use neutrino_consensus_types::BftCandidate;
-use neutrino_network::{Topic, rpc::CandidateByChunkResponse, service::NetworkCommand};
+use neutrino_network::{Topic, rpc::CandidateByChunkResponse};
 use neutrino_primitives::{ChunkId, Hash, blake3_256};
 use neutrino_proof_system::ProofSystem;
 use neutrino_storage::Database;
@@ -18,10 +20,7 @@ where
         id: ChunkId,
         hash: Option<Hash>,
     ) -> Result<CandidateByChunkResponse, SyncBackendError> {
-        if self.light_checkpoint().is_some()
-            || self.bootstrap_pending()
-            || self.block_program().is_none()
-        {
+        if self.is_light() || self.bootstrap_pending() || self.block_program().is_none() {
             return Err(SyncBackendError::NotAvailable(
                 "candidate unavailable".into(),
             ));
@@ -43,7 +42,7 @@ where
                         candidate.chunk.end_block_hash,
                         self.proof_system.as_ref(),
                     )
-                    .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                    .map_err(not_available)?;
                 return Ok(candidate);
             }
             if let Some(cached) = hash.and_then(|hash| {
@@ -58,7 +57,7 @@ where
                         cached.end_block_hash,
                         self.proof_system.as_ref(),
                     )
-                    .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                    .map_err(not_available)?;
                 let validated =
                     neutrino_prover_chunk::consensus::validate_candidate(&prepared.witness)
                         .map_err(|error| SyncBackendError::Rejected(format!("{error:?}")))?;
@@ -76,7 +75,7 @@ where
             }
             let prepared = engine
                 .prepare_consensus_chunk(id, self.proof_system.as_ref())
-                .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                .map_err(not_available)?;
             let validated = neutrino_prover_chunk::consensus::validate_candidate(&prepared.witness)
                 .map_err(|error| SyncBackendError::Rejected(format!("{error:?}")))?;
             let chunk = neutrino_prover_chunk::consensus::as_chunk(&validated.execution.chunk);
@@ -99,8 +98,7 @@ where
                 "candidate validator bitmap exceeds transport cap".into(),
             ));
         }
-        if borsh::object_length(&candidate)
-            .map_err(|error| SyncBackendError::Storage(error.to_string()))?
+        if borsh::object_length(&candidate).map_err(storage_error)?
             > Topic::BftCandidates.max_transmit_size()
         {
             return Err(SyncBackendError::NotAvailable(
@@ -111,7 +109,7 @@ where
     }
 
     pub(super) fn authenticated_bft_candidate_hint(&self, candidate: &BftCandidate) -> bool {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return false;
         }
         self.with_engine(|engine| {
@@ -122,22 +120,7 @@ where
             let Ok((context, _, _)) = engine.consensus_boundary(candidate.chunk.chunk_id) else {
                 return false;
             };
-            let start = candidate
-                .chunk
-                .chunk_id
-                .checked_mul(params.chunk_size)
-                .and_then(|height| height.checked_add(1));
-            let end = candidate
-                .chunk
-                .chunk_id
-                .checked_add(1)
-                .and_then(|id| id.checked_mul(params.chunk_size));
-            if start != Some(candidate.chunk.start_height)
-                || end != Some(candidate.chunk.end_height)
-                || candidate.chunk.start_state_root != context.pre_state_root
-                || candidate.chunk.active_validator_set_root
-                    != neutrino_consensus_engine::validator_set_root(&context.active_validators)
-            {
+            if !chunk_matches_context(&candidate.chunk, &context, params.chunk_size) {
                 return false;
             }
             let vote = neutrino_consensus_types::FinalityVoteData {
@@ -163,7 +146,7 @@ where
         &self,
         vote: &neutrino_consensus_types::FinalityVote,
     ) -> bool {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return false;
         }
         self.with_engine(|engine| {
@@ -197,14 +180,12 @@ where
         &self,
         candidate: &BftCandidate,
     ) -> Result<(), SyncBackendError> {
-        if self.light_checkpoint().is_some() || self.block_program().is_none() {
+        if self.is_light() || self.block_program().is_none() {
             return Err(SyncBackendError::NotAvailable(
                 "complete consensus backend unavailable".into(),
             ));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |time| time.as_secs());
+        let now = crate::now_secs();
         if !self.authenticated_bft_candidate_hint(candidate) {
             return Err(SyncBackendError::Rejected(
                 "candidate hint is not bound to the current context".into(),
@@ -226,14 +207,14 @@ where
             // signed leader proposal or pacemaker quorum authorizes progression.
             engine
                 .offer_bft_candidate(candidate, now, self.proof_system.as_ref())
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                .map_err(rejected)
         })
     }
 
     pub(super) async fn publish_bft_candidate(&self) {
-        let Some(publisher) = self.publisher_snapshot() else {
+        if self.publisher_snapshot().is_none() {
             return;
-        };
+        }
         let id = self.with_engine(neutrino_consensus_engine::Engine::finalized_next_chunk_id);
         // The first publication authenticates the branch. Avoid preparing the
         // same immutable candidate again for every subsequent vote action.
@@ -267,14 +248,7 @@ where
         {
             return;
         }
-        if publisher
-            .send(NetworkCommand::Publish {
-                topic: Topic::BftCandidates,
-                data,
-            })
-            .await
-            .is_ok()
-        {
+        if self.publish_encoded(Topic::BftCandidates, data).await {
             *self
                 .last_candidate_notice
                 .lock()

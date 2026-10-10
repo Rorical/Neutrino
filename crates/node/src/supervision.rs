@@ -31,6 +31,26 @@ struct Registry {
     cleanup: Vec<Box<dyn FnOnce() + Send>>,
 }
 
+type Joined = Result<(Id, Result<(), String>), tokio::task::JoinError>;
+
+impl Registry {
+    /// Join the next finished task and release its registration.
+    fn poll_joined(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<(Option<TaskInfo>, Joined)>> {
+        self.tasks.poll_join_next_with_id(cx).map(|joined| {
+            joined.map(|result| {
+                let id = match &result {
+                    Ok((id, _)) => *id,
+                    Err(error) => error.id(),
+                };
+                (self.names.remove(&id), result)
+            })
+        })
+    }
+}
+
 /// Clones register workers with the runner's owner; they never extend its life.
 #[derive(Clone)]
 #[expect(
@@ -41,7 +61,6 @@ pub(crate) struct TaskSpawner(Arc<Mutex<Registry>>);
 
 impl TaskSpawner {
     pub(crate) fn render_metrics(&self, out: &mut String) {
-        use std::fmt::Write as _;
         const WORKERS: [&str; 14] = [
             "network",
             "sync",
@@ -73,15 +92,14 @@ impl TaskSpawner {
                 .unwrap_or(WORKERS.len());
             counts[index] += 1;
         }
-        crate::metrics::family(
+        crate::metrics::labeled(
             out,
             "neutrino_worker_tasks",
             "Registered tasks, including completed tasks awaiting supervision.",
             "gauge",
+            "worker",
+            WORKERS.into_iter().chain(["other"]).zip(counts),
         );
-        for (name, count) in WORKERS.iter().chain(&["other"]).zip(counts) {
-            let _ = writeln!(out, "neutrino_worker_tasks{{worker=\"{name}\"}} {count}");
-        }
     }
 
     pub(crate) fn spawn_critical(
@@ -157,14 +175,9 @@ impl TaskSupervisor {
         loop {
             let (info, result) = poll_fn(|cx| {
                 let mut registry = self.spawner.0.lock().expect("task registry poisoned");
-                match registry.tasks.poll_join_next_with_id(cx) {
-                    Poll::Ready(Some(result)) => {
-                        let id = match &result {
-                            Ok((id, _)) => *id,
-                            Err(error) => error.id(),
-                        };
-                        let info = registry.names.remove(&id).expect("registered task name");
-                        Poll::Ready((info, result))
+                match registry.poll_joined(cx) {
+                    Poll::Ready(Some((info, result))) => {
+                        Poll::Ready((info.expect("registered task name"), result))
                     }
                     Poll::Ready(None) | Poll::Pending => {
                         registry.wake = Some(cx.waker().clone());
@@ -202,19 +215,7 @@ impl TaskSupervisor {
         loop {
             let done = poll_fn(|cx| {
                 let mut registry = self.spawner.0.lock().expect("task registry poisoned");
-                match registry.tasks.poll_join_next_with_id(cx) {
-                    Poll::Ready(Some(result)) => {
-                        let id = match result {
-                            Ok((id, _)) => id,
-                            Err(error) => error.id(),
-                        };
-                        registry.names.remove(&id);
-                        drop(registry);
-                        Poll::Ready(false)
-                    }
-                    Poll::Ready(None) => Poll::Ready(true),
-                    Poll::Pending => Poll::Pending,
-                }
+                registry.poll_joined(cx).map(|joined| joined.is_none())
             })
             .await;
             if done {

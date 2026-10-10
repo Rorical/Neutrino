@@ -24,6 +24,10 @@ use neutrino_storage::Database;
 use neutrino_sync::EvidenceProofAcceptance;
 use std::sync::{Arc, atomic::Ordering};
 
+/// Encoded bytes a produced body may spend on evidence admissions and ordinary
+/// transactions together, counting four length-prefix bytes per item.
+const BODY_BYTE_BUDGET: usize = 7 * 1024 * 1024;
+
 impl<DB, P> ChainBackend<DB, P>
 where
     DB: Database + Send + 'static,
@@ -71,7 +75,7 @@ where
             .proof_pipeline
             .evidence_backlog
             .track(witnesses.len());
-        self.spawn_background_job("evidence", async move {
+        self.spawn_supervised("evidence", false, async move {
             let result = tokio::task::spawn_blocking(move || {
                 prove_and_install_evidence(
                     engine.as_ref(),
@@ -377,7 +381,7 @@ where
                 let Ok(attachment_bytes) = borsh::object_length(&artifact) else {
                     continue;
                 };
-                if bytes + tx.len() + attachment_bytes + 4 > 7 * 1024 * 1024 {
+                if bytes + tx.len() + attachment_bytes + 4 > BODY_BYTE_BUDGET {
                     continue;
                 }
                 bytes += tx.len() + attachment_bytes + 4;
@@ -387,7 +391,7 @@ where
             }
             let mut ordinary_count = 0;
             for tx in transactions {
-                if bytes.saturating_add(tx.len()).saturating_add(4) > 7 * 1024 * 1024 {
+                if bytes.saturating_add(tx.len()).saturating_add(4) > BODY_BYTE_BUDGET {
                     break;
                 }
                 bytes += tx.len() + 4;
@@ -413,13 +417,9 @@ fn prove_and_install_evidence<DB: Database, P: ProofSystem>(
     let mut batches = vec![(witnesses, pending)];
     while let Some((batch, pending)) = batches.pop() {
         drop(pending);
-        let result = {
-            let _permit = budget.acquire(crate::proof_metrics::ProofStage::Evidence);
-            metrics
-                .proof_pipeline
-                .evidence_proofs
-                .time(|| prover.prove_evidence_batch(&batch, execution))
-        };
+        let result = budget.prove(crate::proof_metrics::ProofStage::Evidence, || {
+            prover.prove_evidence_batch(&batch, execution)
+        });
         let artifacts = match result {
             Ok(artifacts) => artifacts,
             Err(neutrino_proof_system::ProofError::InvalidWitness) if batch.len() > 1 => {

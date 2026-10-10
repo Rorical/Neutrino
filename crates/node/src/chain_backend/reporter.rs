@@ -1,7 +1,6 @@
 //! Selective evidence retention driven exclusively by finalized runtime state.
 
-use super::{ChainBackend, rpc_queries};
-use neutrino_consensus_engine::RetentionPolicy;
+use super::{ChainBackend, reporter_retention, rpc_queries};
 use neutrino_default_runtime_core::{
     Address, MAX_REPORTER_STATUS_IDENTITIES, QUERY_METHOD_ACCOUNTABILITY_METRICS,
     QUERY_METHOD_REPORTER_STATUS, ReporterIdentity, ReporterStatus, ReporterStatusRequest,
@@ -77,11 +76,7 @@ where
         if recipient == [0; 32] {
             return Err("reporter reward address must be nonzero".into());
         }
-        if !self.with_engine(|engine| {
-            engine
-                .retention_info()
-                .is_ok_and(|info| info.policy == RetentionPolicy::Reporter)
-        }) {
+        if !self.with_engine(reporter_retention) {
             return Err("reporter requires reporter retention policy".into());
         }
         *self.reporter.lock().expect("reporter runtime") = Some(ReporterRuntime {
@@ -415,7 +410,7 @@ fn eligible_identities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neutrino_consensus_engine::Engine;
+    use neutrino_consensus_engine::{Engine, RetentionPolicy};
     use neutrino_default_runtime_core::{Validator, encode_validator, validator_key};
     use neutrino_proof_system::MockProofSystem;
     use neutrino_runtime_core::host::LiveTrie;

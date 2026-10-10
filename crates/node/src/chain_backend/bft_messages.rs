@@ -1,17 +1,11 @@
 //! Signed leader proposals, explicit nil votes and authenticated pacemaker catchup.
 
-use super::{ChainBackend, SyncBackendError};
+use super::{ChainBackend, SyncBackendError, chunk_matches_context, rejected};
 use neutrino_consensus_types::{BftMessage, BftProposal};
-use neutrino_network::{Topic, rpc::BftRoundByChunkResponse, service::NetworkCommand};
+use neutrino_network::{Topic, rpc::BftRoundByChunkResponse};
 use neutrino_primitives::ChunkId;
 use neutrino_proof_system::ProofSystem;
 use neutrino_storage::Database;
-
-pub(super) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| time.as_secs())
-}
 
 impl<DB, P> ChainBackend<DB, P>
 where
@@ -23,7 +17,7 @@ where
         &self,
         id: ChunkId,
     ) -> Result<BftRoundByChunkResponse, SyncBackendError> {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return Err(SyncBackendError::NotAvailable(
                 "BFT session unavailable".into(),
             ));
@@ -44,7 +38,7 @@ where
     }
 
     pub(super) fn authenticated_bft_proposal_hint(&self, proposal: &BftProposal) -> bool {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return false;
         }
         self.with_engine(|engine| {
@@ -53,25 +47,14 @@ where
             {
                 return false;
             }
-            let params = &engine.chain_spec().consensus;
             let Ok((context, _, _)) = engine.consensus_boundary(proposal.chunk.chunk_id) else {
                 return false;
             };
-            let start = proposal
-                .chunk
-                .chunk_id
-                .checked_mul(params.chunk_size)
-                .and_then(|height| height.checked_add(1));
-            let end = proposal
-                .chunk
-                .chunk_id
-                .checked_add(1)
-                .and_then(|id| id.checked_mul(params.chunk_size));
-            start == Some(proposal.chunk.start_height)
-                && end == Some(proposal.chunk.end_height)
-                && proposal.chunk.start_state_root == context.pre_state_root
-                && proposal.chunk.active_validator_set_root
-                    == neutrino_consensus_engine::validator_set_root(&context.active_validators)
+            chunk_matches_context(
+                &proposal.chunk,
+                &context,
+                engine.chain_spec().consensus.chunk_size,
+            )
         })
     }
 
@@ -79,12 +62,12 @@ where
         &self,
         message: BftMessage,
     ) -> Result<(), SyncBackendError> {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return Err(SyncBackendError::NotAvailable(
                 "BFT signing is not active".into(),
             ));
         }
-        let now = now_secs();
+        let now = crate::now_secs();
         let is_proposal = matches!(message, BftMessage::Proposal(_));
         self.retain_availability_bft_message(&message, false).await;
         let actions = match message {
@@ -123,16 +106,12 @@ where
             }
             BftMessage::Vote(neutrino_consensus_types::BftVote::Nil(vote)) => self
                 .with_live_engine_mut(|engine| {
-                    engine
-                        .observe_nil_vote(vote, now)
-                        .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                    engine.observe_nil_vote(vote, now).map_err(rejected)
                 })?,
             BftMessage::RoundChange(report) => {
                 let accepted = report.clone();
                 let actions = self.with_live_engine_mut(|engine| {
-                    engine
-                        .observe_round_change(report, now)
-                        .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                    engine.observe_round_change(report, now).map_err(rejected)
                 })?;
                 self.queue_round_change_facts(&accepted);
                 actions
@@ -142,7 +121,7 @@ where
                 let actions = self.with_live_engine_mut(|engine| {
                     engine
                         .observe_round_change_certificate(certificate, now)
-                        .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                        .map_err(rejected)
                 })?;
                 self.queue_round_change_certificate_facts(&accepted);
                 actions
@@ -159,9 +138,9 @@ where
         if !self.retain_availability_bft_message(message, true).await {
             return;
         }
-        let Some(publisher) = self.publisher_snapshot() else {
+        if self.publisher_snapshot().is_none() {
             return;
-        };
+        }
         let Ok(data) = borsh::to_vec(message) else {
             return;
         };
@@ -169,12 +148,7 @@ where
             tracing::warn!("BFT message exceeds the protocol transport budget");
             return;
         }
-        let _ = publisher
-            .send(NetworkCommand::Publish {
-                topic: Topic::BftMessages,
-                data,
-            })
-            .await;
+        self.publish_encoded(Topic::BftMessages, data).await;
     }
 
     /// A vote can arrive before its signed proposal or exact branch. Retain only

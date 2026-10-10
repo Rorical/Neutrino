@@ -2,59 +2,39 @@
 
 use std::sync::{Arc, Mutex};
 
-use neutrino_consensus_engine::{Engine, ProposerKey, validator_set::validator_set_root};
+use neutrino_consensus_engine::Engine;
 use neutrino_consensus_types::history_proof::{
     ChainBinding, ConsensusBoundary, ExecutionPrograms, HistoryProof, HistoryStatement, ProofDomain,
 };
-use neutrino_primitives::{
-    BoundedBytes, ChainSpec, ConsensusParams, LightClientParams, ProofParams, RuntimeInfo,
-    RuntimeParams, StateParams, Validator,
-};
+use neutrino_primitives::BoundedBytes;
 use neutrino_proof_system::MockProofSystem;
 use neutrino_rpc::HistoryJobStatus;
 use neutrino_storage::{Column, Database, MemoryDatabase};
 
+use super::super::state_sync_tests::spec;
 use super::{
-    JOB_LIFETIME_SECS, Job, MAX_JOBS, admit, bounded_error, expire_jobs, jobs, now, range_split,
-    recover_jobs, run_job, save,
+    JOB_LIFETIME_SECS, Job, JobState, MAX_JOBS, admit, bounded_error, expire_jobs, jobs, now,
+    range_split, recover_jobs, run_job, save,
 };
 use crate::{ChainBackend, proving_budget::ProvingBudget};
 
-fn spec() -> ChainSpec {
-    let validators = vec![Validator {
-        pubkey: *ProposerKey::from_ikm(&[6; 32], 0)
-            .unwrap()
-            .public_key_bytes(),
-        withdrawal_credentials: [7; 32],
-        effective_stake: 32_000_000_000,
-        slashed: false,
-        activation_epoch: 0,
-        exit_epoch: u64::MAX,
-        last_active_chunk: 0,
-    }];
-    ChainSpec {
-        name: BoundedBytes::new(b"history-scheduler-test".to_vec()).unwrap(),
-        chain_id: 41,
-        genesis_time: 0,
-        genesis_gas_limit: 30_000_000,
-        runtime_info: RuntimeInfo::default(),
-        runtime_code_hash: [1; 32],
-        genesis_seed: [2; 32],
-        genesis_state_root: [3; 32],
-        genesis_block_hash: [4; 32],
-        genesis_validator_set_root: validator_set_root(&validators),
-        consensus: ConsensusParams::default(),
-        proof: ProofParams::default(),
-        state: StateParams::default(),
-        light_client: LightClientParams::default(),
-        runtime: RuntimeParams::default(),
-        initial_validators: validators,
-        metadata: BoundedBytes::new(Vec::new()).unwrap(),
-    }
-}
-
 fn engine() -> Engine<MemoryDatabase> {
     Engine::genesis(spec(), MemoryDatabase::new()).unwrap()
+}
+
+#[test]
+fn job_state_keeps_its_one_byte_persisted_encoding() {
+    for (state, byte) in [
+        (JobState::Queued, 0_u8),
+        (JobState::Running, 1),
+        (JobState::Completed, 2),
+        (JobState::Failed, 3),
+        (JobState::Cancelled, 4),
+    ] {
+        assert_eq!(borsh::to_vec(&state).unwrap(), [byte]);
+        assert_eq!(borsh::from_slice::<JobState>(&[byte]).unwrap(), state);
+    }
+    assert!(borsh::from_slice::<JobState>(&[5]).is_err());
 }
 
 #[test]
@@ -95,7 +75,7 @@ fn history_queue_metrics_follow_claim_progress_and_terminal_lease_release() {
             .load(Ordering::Relaxed),
         8
     );
-    first.state = 1;
+    first.state = JobState::Running;
     save(&mut engine, &first).unwrap();
     super::refresh_history_metrics(&engine, &metrics);
     assert_eq!(
@@ -112,7 +92,7 @@ fn history_queue_metrics_follow_claim_progress_and_terminal_lease_release() {
             .load(Ordering::Relaxed),
         1
     );
-    first.state = 2;
+    first.state = JobState::Completed;
     save(&mut engine, &first).unwrap();
     super::refresh_history_metrics(&engine, &metrics);
     assert_eq!(
@@ -191,7 +171,7 @@ fn job(start: u64, end: u64) -> Job {
             end: boundary(end),
         },
         progress: None,
-        state: 0,
+        state: JobState::Queued,
         created: now(),
         error: None,
         automatic: false,
@@ -208,7 +188,7 @@ fn reopen(engine: &Engine<MemoryDatabase>) -> Engine<MemoryDatabase> {
 fn progress_and_retention_lease_survive_restart_and_release_together() {
     let mut engine = engine();
     let mut running = job(3, 18);
-    running.state = 1;
+    running.state = JobState::Running;
     running.progress = Some([8; 32]);
     running.attempts = 2;
     save(&mut engine, &running).unwrap();
@@ -218,7 +198,7 @@ fn progress_and_retention_lease_survive_restart_and_release_together() {
     assert_eq!(recovered.attempts, 2);
     assert!(reopened.store().history_range_is_pinned(4, 5).unwrap());
     assert!(!reopened.store().history_range_is_pinned(18, 19).unwrap());
-    running.state = 3;
+    running.state = JobState::Failed;
     running.error = Some("prover unavailable".into());
     save(&mut reopened, &running).unwrap();
     let reopened = reopen(&reopened);
@@ -232,12 +212,12 @@ fn progress_and_retention_lease_survive_restart_and_release_together() {
 fn recovery_requeues_interrupted_work_and_cancels_expired_work() {
     let mut engine = engine();
     let mut interrupted = job(0, 4);
-    interrupted.state = 1;
+    interrupted.state = JobState::Running;
     interrupted.progress = Some([11; 32]);
     interrupted.attempts = 1;
     save(&mut engine, &interrupted).unwrap();
     let mut expired = job(4, 8);
-    expired.state = 1;
+    expired.state = JobState::Running;
     expired.created = now().saturating_sub(JOB_LIFETIME_SECS + 1);
     save(&mut engine, &expired).unwrap();
     let mut reopened = reopen(&engine);
@@ -246,7 +226,7 @@ fn recovery_requeues_interrupted_work_and_cancels_expired_work() {
         .iter()
         .find(|item| item.id() == interrupted.id())
         .unwrap();
-    assert_eq!(running.state, 0);
+    assert_eq!(running.state, JobState::Queued);
     assert_eq!(running.progress, interrupted.progress);
     assert_eq!(running.attempts, 1);
     assert!(reopened.store().history_range_is_pinned(0, 4).unwrap());
@@ -254,7 +234,7 @@ fn recovery_requeues_interrupted_work_and_cancels_expired_work() {
         .iter()
         .find(|item| item.id() == expired.id())
         .unwrap();
-    assert_eq!(cancelled.state, 4);
+    assert_eq!(cancelled.state, JobState::Cancelled);
     assert!(!reopened.store().history_range_is_pinned(4, 8).unwrap());
     assert_eq!(jobs(&reopen(&reopened)).unwrap().len(), 2);
 }
@@ -266,7 +246,7 @@ fn diagnostic_truncation_keeps_unicode_valid_and_job_storage_bounded() {
     assert_eq!(error.chars().count(), 1024);
     assert_eq!(error.len(), 4096);
     let mut failed = job(0, 4);
-    failed.state = 3;
+    failed.state = JobState::Failed;
     failed.error = Some(error);
     let mut engine = engine();
     save(&mut engine, &failed).unwrap();
@@ -279,14 +259,14 @@ fn manual_retry_preserves_completed_progress_and_restores_its_pin() {
     let mut partial = job(2, 6);
     insert_untrusted_progress(&mut engine, &mut partial, 2);
     let mut failed = job(2, 10);
-    failed.state = 3;
+    failed.state = JobState::Failed;
     failed.progress = partial.progress;
     failed.attempts = 3;
     failed.error = Some("temporarily unavailable".into());
     save(&mut engine, &failed).unwrap();
     let mut engine = reopen(&engine);
     let retried = admit(&mut engine, job(2, 10)).unwrap();
-    assert_eq!(retried.state, 0);
+    assert_eq!(retried.state, JobState::Queued);
     assert_eq!(retried.progress, failed.progress);
     assert_eq!(retried.attempts, 0);
     assert!(retried.error.is_none());
@@ -307,7 +287,7 @@ fn live_expiry_releases_dependencies_without_restart() {
     let updates = expire_jobs(&mut engine).unwrap();
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].id(), expired.id());
-    assert_eq!(updates[0].state, 4);
+    assert_eq!(updates[0].state, JobState::Cancelled);
     assert!(!engine.store().history_source_range_is_pinned(2, 6).unwrap());
     assert!(engine.store().history_range_is_pinned(6, 10).unwrap());
     assert!(expire_jobs(&mut engine).unwrap().is_empty());
@@ -322,12 +302,15 @@ fn switching_archive_to_pruned_cancels_oversized_source_leases_on_recovery() {
         .unwrap();
     let archived = job(0, 100);
     save(&mut engine, &archived).unwrap();
-    assert_eq!(recover_jobs(&mut engine).unwrap()[0].state, 0);
+    assert_eq!(
+        recover_jobs(&mut engine).unwrap()[0].state,
+        JobState::Queued
+    );
     engine
         .set_retention_policy(RetentionPolicy::Pruned)
         .unwrap();
     let recovered = recover_jobs(&mut engine).unwrap();
-    assert_eq!(recovered[0].state, 4);
+    assert_eq!(recovered[0].state, JobState::Cancelled);
     assert!(
         !engine
             .store()
@@ -350,12 +333,12 @@ fn completed_progress_needs_only_an_artifact_lease() {
     );
     let restored = jobs(&reopen(&engine)).unwrap().pop().unwrap();
     assert_eq!(restored.progress, completed_progress.progress);
-    assert_eq!(restored.state, 0);
+    assert_eq!(restored.state, JobState::Queued);
 }
 
 #[test]
 fn explicit_request_restarts_terminal_jobs_when_their_unpinned_progress_was_evicted() {
-    for terminal in [2, 3, 4] {
+    for terminal in [JobState::Completed, JobState::Failed, JobState::Cancelled] {
         let mut engine = engine();
         let mut previous = job(2, 10);
         insert_untrusted_progress(&mut engine, &mut previous, 2);
@@ -370,7 +353,7 @@ fn explicit_request_restarts_terminal_jobs_when_their_unpinned_progress_was_evic
             .unwrap();
         let mut engine = reopen(&engine);
         let retried = admit(&mut engine, job(2, 10)).unwrap();
-        assert_eq!(retried.state, 0);
+        assert_eq!(retried.state, JobState::Queued);
         assert!(retried.progress.is_none());
         assert_eq!(retried.attempts, 0);
         assert!(engine.store().history_range_is_pinned(2, 10).unwrap());
@@ -385,14 +368,14 @@ fn current_cached_result_takes_precedence_over_a_terminal_jobs_older_progress() 
     let mut partial = job(2, 6);
     insert_untrusted_progress(&mut engine, &mut partial, 2);
     let mut failed = job(2, 10);
-    failed.state = 3;
+    failed.state = JobState::Failed;
     failed.progress = partial.progress;
     save(&mut engine, &failed).unwrap();
     let mut cached = job(2, 10);
     insert_untrusted_progress(&mut engine, &mut cached, 2);
-    cached.state = 2;
+    cached.state = JobState::Completed;
     let completed = admit(&mut engine, cached.clone()).unwrap();
-    assert_eq!(completed.state, 2);
+    assert_eq!(completed.state, JobState::Completed);
     assert_eq!(completed.progress, cached.progress);
     assert_ne!(completed.progress, partial.progress);
     assert!(!engine.store().history_range_is_pinned(2, 10).unwrap());
@@ -404,13 +387,13 @@ fn exhausted_automatic_job_is_not_requeued_in_an_unbounded_loop() {
     let mut engine = engine();
     let mut failed = job(0, 12);
     failed.automatic = true;
-    failed.state = 3;
+    failed.state = JobState::Failed;
     failed.attempts = 3;
     save(&mut engine, &failed).unwrap();
     let mut new = job(0, 12);
     new.automatic = true;
     let retained = admit(&mut engine, new).unwrap();
-    assert_eq!(retained.state, 3);
+    assert_eq!(retained.state, JobState::Failed);
     assert_eq!(retained.attempts, 3);
     assert!(!engine.store().history_range_is_pinned(0, 12).unwrap());
 }
@@ -425,7 +408,7 @@ fn queue_cannot_evict_active_jobs_and_only_reclaims_a_terminal_record() {
     assert!(admit(&mut engine, job(100, 101)).is_err());
     assert_eq!(jobs(&engine).unwrap().len(), MAX_JOBS);
     let mut cancelled = job(0, 1);
-    cancelled.state = 4;
+    cancelled.state = JobState::Cancelled;
     save(&mut engine, &cancelled).unwrap();
     admit(&mut engine, job(100, 101)).unwrap();
     let saved = jobs(&engine).unwrap();
@@ -534,7 +517,7 @@ async fn subscription_receives_a_terminal_update_without_polling() {
     let backend = ChainBackend::new(engine, MockProofSystem::new());
     let mut updates = backend.subscribe_history(queued.id()).unwrap();
     assert_eq!(updates.borrow().status, HistoryJobStatus::Queued);
-    queued.state = 2;
+    queued.state = JobState::Completed;
     backend
         .with_engine_mut(|engine| save(engine, &queued))
         .unwrap();
@@ -591,7 +574,7 @@ async fn bootstrap_pause_cancels_dormant_jobs_and_releases_their_pins() {
     let queued = job(0, 4);
     engine.set_history_domain(domain_of(&queued)).unwrap();
     let mut interrupted = job(4, 8);
-    interrupted.state = 1;
+    interrupted.state = JobState::Running;
     save(&mut engine, &queued).unwrap();
     save(&mut engine, &interrupted).unwrap();
     let backend = ChainBackend::new(engine, MockProofSystem::new());
@@ -601,7 +584,12 @@ async fn bootstrap_pause_cancels_dormant_jobs_and_releases_their_pins() {
         .store(true, std::sync::atomic::Ordering::Release);
     backend.pause_history_jobs().await.unwrap();
     backend.with_engine(|engine| {
-        assert!(jobs(engine).unwrap().iter().all(|job| job.state == 4));
+        assert!(
+            jobs(engine)
+                .unwrap()
+                .iter()
+                .all(|job| job.state == JobState::Cancelled)
+        );
         assert!(!engine.store().history_range_is_pinned(0, 8).unwrap());
     });
     backend.start_history_jobs();
@@ -617,7 +605,7 @@ async fn bootstrap_pause_cancels_dormant_jobs_and_releases_their_pins() {
 async fn bootstrap_pause_waits_for_running_worker_before_releasing_dependencies() {
     let mut engine = engine();
     let mut running = job(0, 4);
-    running.state = 1;
+    running.state = JobState::Running;
     save(&mut engine, &running).unwrap();
     let backend = Arc::new(ChainBackend::new(engine, MockProofSystem::new()));
     backend

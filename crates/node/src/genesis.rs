@@ -27,6 +27,12 @@ pub struct GenesisState {
     pub staked_validators: usize,
 }
 
+/// Insert one genesis record, reporting trie failures as spec validation errors.
+fn insert(trie: &mut Trie, key: &[u8], value: Vec<u8>) -> Result<(), ChainSpecError> {
+    trie.insert(key, value)
+        .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))
+}
+
 /// Build the genesis trie.
 ///
 /// Each `[[accounts]]` entry seeds a nonce-zero balance. Each validator
@@ -55,8 +61,7 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
             nonce: 0,
             balance: entry.balance,
         };
-        trie.insert(&account_key(&address), encode_account(&account))
-            .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+        insert(&mut trie, &account_key(&address), encode_account(&account))?;
     }
     let mut set = ValidatorSet::default();
     let mut candidates = neutrino_default_runtime_core::ConsensusCandidates::default();
@@ -76,14 +81,14 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
             )));
         }
         let stake = u128::from(validator.effective_stake);
-        trie.insert(
+        insert(
+            &mut trie,
             &validator_key(&credentials),
             encode_validator(&RuntimeValidator {
                 stake,
                 active: stake > 0,
             }),
-        )
-        .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+        )?;
         if stake > 0 {
             set.upsert(credentials, stake);
         }
@@ -97,28 +102,28 @@ pub fn build_genesis_state(file: &ChainSpecFile) -> Result<GenesisState, ChainSp
         staked_validators += 1;
     }
     if !set.entries.is_empty() {
-        trie.insert(
+        insert(
+            &mut trie,
             VALIDATOR_SET_KEY,
             borsh::to_vec(&set).expect("borsh encode ValidatorSet never fails"),
-        )
-        .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+        )?;
     }
     if !candidates.entries.is_empty() {
-        trie.insert(
+        insert(
+            &mut trie,
             neutrino_default_runtime_core::CONSENSUS_CANDIDATES_KEY,
             borsh::to_vec(&candidates).expect("borsh encode ConsensusCandidates never fails"),
-        )
-        .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+        )?;
     }
     // The governable runtime policy starts from the specification's values
     // and lives in state from here on (design 24). The parameters come from
     // the file directly: `to_chain_spec` needs this function's root first.
     let policy = neutrino_default_runtime_core::RuntimePolicy::from_params(&file.runtime_params());
-    trie.insert(
+    insert(
+        &mut trie,
         neutrino_default_runtime_core::RUNTIME_POLICY_KEY,
         borsh::to_vec(&policy).expect("borsh encode RuntimePolicy never fails"),
-    )
-    .map_err(|err| ChainSpecError::Validation(format!("genesis trie: {err:?}")))?;
+    )?;
     let root = trie.root();
     Ok(GenesisState {
         trie,

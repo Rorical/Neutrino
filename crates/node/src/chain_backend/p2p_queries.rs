@@ -18,11 +18,7 @@ use neutrino_storage::Database;
 use neutrino_sync::SyncBackendError;
 use std::collections::BTreeMap;
 
-use super::{ChainBackend, rpc_queries};
-
-pub(super) fn storage_error(error: impl core::fmt::Display) -> SyncBackendError {
-    SyncBackendError::Storage(error.to_string())
-}
+use super::{ChainBackend, not_available, rpc_queries, storage_error};
 
 pub(super) fn query_error(error: QueryError) -> SyncBackendError {
     match error {
@@ -38,8 +34,10 @@ pub(super) fn query_error(error: QueryError) -> SyncBackendError {
     }
 }
 
+/// Refuse a response whose encoding would exceed the wire limit. Read-only
+/// queries measure it after releasing the engine lock.
 fn bounded<T: BorshSerialize>(payload: T) -> Result<T, SyncBackendError> {
-    let size = borsh::to_vec(&payload).map_err(storage_error)?.len();
+    let size = borsh::object_length(&payload).map_err(storage_error)?;
     if u64::try_from(size).unwrap_or(u64::MAX) >= rpc::DEFAULT_MAX_RESPONSE_SIZE {
         return Err(SyncBackendError::NotAvailable(
             "response exceeds the wire size limit".to_owned(),
@@ -140,7 +138,7 @@ where
     P: ProofSystem + Send + Sync + 'static,
 {
     pub(super) fn p2p_local_metadata(&self) -> rpc::Metadata {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return rpc::Metadata {
                 role_flags: rpc::role_flags::LIGHT_CLIENT,
                 ..rpc::Metadata::default()
@@ -319,8 +317,9 @@ where
                         .ok_or_else(|| storage_error("branch header is missing"))
                 })
                 .collect::<Result<_, _>>()?;
-            bounded(BlocksByRangeResponse { blocks })
+            Ok::<_, SyncBackendError>(BlocksByRangeResponse { blocks })
         })
+        .and_then(bounded)
     }
 
     pub(super) fn p2p_blocks_by_root(
@@ -337,8 +336,9 @@ where
                         .ok_or_else(|| missing("requested block is unavailable"))
                 })
                 .collect::<Result<_, _>>()?;
-            bounded(BlocksByRootResponse { blocks })
+            Ok::<_, SyncBackendError>(BlocksByRootResponse { blocks })
         })
+        .and_then(bounded)
     }
 
     pub(super) fn p2p_state_nodes(
@@ -418,7 +418,7 @@ where
             engine
                 .store_mut()
                 .refresh_state_snapshot(root, now)
-                .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                .map_err(not_available)?;
             Ok(response)
         })
     }
@@ -449,8 +449,9 @@ where
                     Ok(proof)
                 })
                 .collect::<Result<_, _>>()?;
-            bounded(BlockProofByHashResponse { proofs })
+            Ok::<_, SyncBackendError>(BlockProofByHashResponse { proofs })
         })
+        .and_then(bounded)
     }
 
     pub(super) fn p2p_block_proofs_by_height(
@@ -484,8 +485,9 @@ where
                 }
                 proofs.push(proof);
             }
-            bounded(BlockProofByHeightResponse { proofs })
+            Ok::<_, SyncBackendError>(BlockProofByHeightResponse { proofs })
         })
+        .and_then(bounded)
     }
 
     pub(super) fn p2p_chunk_proofs_by_id(
@@ -519,8 +521,9 @@ where
                     Ok(proof)
                 })
                 .collect::<Result<_, _>>()?;
-            bounded(ChunkProofByIdResponse { proofs })
+            Ok::<_, SyncBackendError>(ChunkProofByIdResponse { proofs })
         })
+        .and_then(bounded)
     }
 
     pub(super) fn p2p_history_proof_by_range(
@@ -528,7 +531,7 @@ where
         start: Hash,
         end: Hash,
     ) -> Result<HistoryProofByRangeResponse, SyncBackendError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             let proof = self
                 .light_latest_proof()
                 .map_err(storage_error)?
@@ -587,8 +590,9 @@ where
                     Ok(cert)
                 })
                 .collect::<Result<_, _>>()?;
-            bounded(FinalityCertByChunkResponse { certs })
+            Ok::<_, SyncBackendError>(FinalityCertByChunkResponse { certs })
         })
+        .and_then(bounded)
     }
 
     pub(super) fn p2p_witnesses_by_block(
@@ -613,7 +617,8 @@ where
                         .ok_or_else(|| missing("block witness is unavailable"))
                 })
                 .collect::<Result<_, _>>()?;
-            bounded(WitnessByBlockResponse { witnesses })
+            Ok::<_, SyncBackendError>(WitnessByBlockResponse { witnesses })
         })
+        .and_then(bounded)
     }
 }

@@ -43,17 +43,18 @@ mod state_sync;
 #[cfg(test)]
 mod state_sync_tests;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use borsh::BorshSerialize;
 use neutrino_consensus_engine::{
-    BftAction, BftQuorumIdentity, Engine, FinalizeError, FinalizeOutcome, ImportError,
-    ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError, ProveOutcome,
-    vrf_rejection_reason,
+    BftAction, BftQuorumIdentity, Engine, FinalizeError, FinalizeOutcome, ImportBlockOutcome,
+    ImportError, ProductionConfig, ProductionError, ProductionOutcome, ProposerKey, ProveError,
+    ProveOutcome, RetentionPolicy, vrf_rejection_reason,
 };
 use neutrino_consensus_types::{
-    Block, BlockProof, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
+    Block, BlockProof, Chunk, ChunkProof, FinalityVote, HistoryProof, SlashingEvidence,
 };
 use neutrino_mempool::{InsertError, Mempool};
 use neutrino_network::Topic;
@@ -95,6 +96,72 @@ const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 /// Fact pre-proving requests queued for one fact program.
 type FactJobSender = mpsc::Sender<facts::FactJob>;
 
+/// Map a local storage or encoding failure onto the sync error surface.
+fn storage_error(error: impl core::fmt::Display) -> SyncBackendError {
+    SyncBackendError::Storage(error.to_string())
+}
+
+/// Map an objectively invalid input onto the sync error surface.
+fn rejected(error: impl core::fmt::Display) -> SyncBackendError {
+    SyncBackendError::Rejected(error.to_string())
+}
+
+/// Map a dependency that is not locally available onto the sync error surface.
+fn not_available(error: impl core::fmt::Display) -> SyncBackendError {
+    SyncBackendError::NotAvailable(error.to_string())
+}
+
+/// Whether `engine` runs the reporter retention policy. An unreadable
+/// retention record counts as another policy.
+fn reporter_retention<DB: Database>(engine: &Engine<DB>) -> bool {
+    engine
+        .retention_info()
+        .is_ok_and(|info| info.policy == RetentionPolicy::Reporter)
+}
+
+/// Inclusive height range covered by `chunk_id`, if representable.
+fn chunk_height_range(chunk_id: ChunkId, chunk_size: u64) -> Option<(Height, Height)> {
+    let end = chunk_id.checked_add(1)?.checked_mul(chunk_size)?;
+    let start = chunk_id.checked_mul(chunk_size)?.checked_add(1)?;
+    Some((start, end))
+}
+
+/// Whether `chunk` spans exactly its own height range and starts from the
+/// authenticated pre-state and validator set of `context`.
+fn chunk_matches_context(
+    chunk: &Chunk,
+    context: &neutrino_prover_chunk::execution::ExecutionContext,
+    chunk_size: u64,
+) -> bool {
+    chunk_height_range(chunk.chunk_id, chunk_size) == Some((chunk.start_height, chunk.end_height))
+        && chunk.start_state_root == context.pre_state_root
+        && chunk.active_validator_set_root
+            == neutrino_consensus_engine::validator_set_root(&context.active_validators)
+}
+
+/// Snapshot an optional shared slot, releasing its lock immediately.
+fn cloned<T: Clone>(slot: &Mutex<Option<T>>) -> Option<T> {
+    slot.lock().expect("ChainBackend slot poisoned").clone()
+}
+
+/// Hand one encoded gossip message to the network task.
+async fn send_publication(
+    publisher: &mpsc::Sender<NetworkCommand>,
+    topic: Topic,
+    data: Vec<u8>,
+) -> bool {
+    match publisher
+        .send(NetworkCommand::Publish { topic, data })
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            debug!(?error, ?topic, "gossip publish channel closed");
+            false
+        }
+    }
+}
+
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
 /// Internally wraps an [`Engine`] behind a `std::sync::Mutex`. The mutex
@@ -107,6 +174,11 @@ type FactJobSender = mpsc::Sender<facts::FactJob>;
 /// path the mutex can be swapped for an `RwLock`.
 pub struct ChainBackend<DB: Database, P: ProofSystem> {
     engine: Arc<Mutex<Engine<DB>>>,
+    /// Shared copy of the engine's live state trie, reused while its root is
+    /// unchanged. Lock order: `engine`, then `head_state`.
+    head_state: Mutex<Option<Arc<neutrino_trie::Trie<neutrino_trie::Poseidon2Hasher>>>>,
+    /// Hash of the engine's immutable chain specification.
+    chain_spec_hash: Hash,
     fact_jobs: Mutex<Option<FactJobSender>>,
     history: Arc<history::HistoryRuntime>,
     light: Mutex<Option<light::LightRuntime>>,
@@ -185,12 +257,12 @@ type ConsensusProofTask<P> = (
 /// re-hashing every item.
 #[derive(Default)]
 struct SlashingPool {
-    evidence: Vec<(Hash, SlashingEvidence)>,
+    evidence: VecDeque<(Hash, SlashingEvidence)>,
     seen: BTreeSet<Hash>,
 }
 
 impl SlashingPool {
-    const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.evidence.len()
     }
 
@@ -214,17 +286,19 @@ impl SlashingPool {
     /// a malformed on-disk state with two rows hashing the same
     /// key). The cap is enforced post-load — if disk somehow holds
     /// more rows than `SLASHING_POOL_MAX_ENTRIES`, the oldest
-    /// (front-of-vector) entries are dropped from memory only; the
+    /// (front-of-queue) entries are dropped from memory only; the
     /// next drain cycle re-syncs the on-disk view.
     fn load_from_disk(&mut self, entries: Vec<(Hash, SlashingEvidence)>) {
         for (key, evidence) in entries {
             if !self.seen.insert(key) {
                 continue;
             }
-            self.evidence.push((key, evidence));
+            self.evidence.push_back((key, evidence));
         }
         while self.evidence.len() > SLASHING_POOL_MAX_ENTRIES {
-            let (evicted_key, _) = self.evidence.remove(0);
+            let Some((evicted_key, _)) = self.evidence.pop_front() else {
+                break;
+            };
             self.seen.remove(&evicted_key);
         }
     }
@@ -268,8 +342,12 @@ where
             });
         slashing_pool.load_from_disk(persisted);
         let metrics = Arc::new(crate::metrics::NodeMetrics::default());
+        // The engine never replaces its chain specification after construction.
+        let chain_spec_hash = engine.chain_spec().hash();
         Self {
             engine: Arc::new(Mutex::new(engine)),
+            head_state: Mutex::new(None),
+            chain_spec_hash,
             fact_jobs: Mutex::new(None),
             history: Arc::new(history::HistoryRuntime::default()),
             light: Mutex::new(None),
@@ -313,41 +391,25 @@ where
             .expect("background tasks mutex") = Some(spawner);
     }
 
-    fn spawn_background_worker(
+    /// Register `future` with the runner's supervisor, or spawn it on the
+    /// current runtime when no supervisor is installed. A `critical` worker
+    /// must never return; a job may complete.
+    fn spawn_supervised(
         &self,
         name: &'static str,
+        critical: bool,
         future: impl core::future::Future<Output = ()> + Send + 'static,
     ) {
-        let spawner = self
-            .background_tasks
-            .lock()
-            .expect("background tasks mutex")
-            .clone();
-        if let Some(spawner) = spawner {
-            let _ = spawner.spawn_critical(name, async move {
+        if let Some(spawner) = cloned(&self.background_tasks) {
+            let task = async move {
                 future.await;
                 Ok(())
-            });
-        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(future);
-        }
-    }
-
-    fn spawn_background_job(
-        &self,
-        name: &'static str,
-        future: impl core::future::Future<Output = ()> + Send + 'static,
-    ) {
-        let spawner = self
-            .background_tasks
-            .lock()
-            .expect("background tasks mutex")
-            .clone();
-        if let Some(spawner) = spawner {
-            let _ = spawner.spawn_job(name, async move {
-                future.await;
-                Ok(())
-            });
+            };
+            let _ = if critical {
+                spawner.spawn_critical(name, task)
+            } else {
+                spawner.spawn_job(name, task)
+            };
         } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(future);
         }
@@ -443,33 +505,31 @@ where
         })
     }
 
-    /// Re-run the configured `ProofSystem::verify_block` against a
-    /// peer-supplied `BlockProof` envelope. Returns `true` iff the
-    /// proof passes verification.
-    ///
-    /// Used by [`Self::ingest_slashing_evidence`] to drop dishonest
-    /// `InvalidProofSigning` claims. A backend error or lack of support
-    /// cannot establish an objective rejection.
-    fn block_proof_objectively_rejected(&self, proof: &BlockProof) -> bool {
-        let id = blake3_256(&borsh::to_vec(proof).expect("canonical block proof envelope"));
-        let token = self.begin_block_verdict(id);
-        if let Some(verdict) = self.cached_block_verdict_at(token) {
-            return matches!(verdict, availability::ProofVerdict::Rejected(_));
-        }
-        let Some(expected) = self.accountability_block_program(proof.height) else {
-            return false;
-        };
-        let Ok(verdict) = self.proof_system.classify_block_rejection(proof, &expected) else {
-            return false;
-        };
-        self.remember_block_verdict(token, verdict.into()) && verdict.is_some()
+    fn block_executor_snapshot(&self) -> Option<Arc<dyn ErasedBlockExecutor>> {
+        cloned(&self.block_executor)
     }
 
-    fn block_executor_snapshot(&self) -> Option<Arc<dyn ErasedBlockExecutor>> {
-        self.block_executor
+    /// Shared snapshot of the engine's live state trie. Readers at an unchanged
+    /// root reuse one copy instead of cloning the whole trie per call. The
+    /// caller holds the engine lock, which is always taken before this cache.
+    fn head_state_snapshot(
+        &self,
+        engine: &Engine<DB>,
+    ) -> Arc<neutrino_trie::Trie<neutrino_trie::Poseidon2Hasher>> {
+        let mut cached = self
+            .head_state
             .lock()
-            .expect("ChainBackend block_executor poisoned")
-            .clone()
+            .expect("ChainBackend head_state poisoned");
+        if let Some(state) = cached
+            .as_ref()
+            .filter(|state| state.root() == engine.state().root())
+        {
+            return Arc::clone(state);
+        }
+        let state = Arc::new(engine.state().clone());
+        *cached = Some(Arc::clone(&state));
+        drop(cached);
+        state
     }
 
     /// Install the sync driver's status handle so RPC health reflects the
@@ -603,10 +663,7 @@ where
     /// Installed sync status handle, if a driver has published one.
     #[must_use]
     pub fn sync_status(&self) -> Option<SyncStatus> {
-        self.sync_status
-            .lock()
-            .expect("ChainBackend sync_status poisoned")
-            .clone()
+        cloned(&self.sync_status)
     }
 
     /// Enable the multi-validator chunk-BFT loop by installing the
@@ -621,7 +678,7 @@ where
             .network_publisher
             .lock()
             .expect("ChainBackend network_publisher poisoned") = Some(publisher);
-        if self.light_checkpoint().is_none() {
+        if !self.is_light() {
             self.start_evidence_jobs();
             self.start_history_jobs();
         }
@@ -647,10 +704,7 @@ where
     /// the mutex immediately.
     #[must_use]
     pub fn local_voter(&self) -> Option<Arc<ProposerKey>> {
-        self.local_voter
-            .lock()
-            .expect("ChainBackend local_voter poisoned")
-            .clone()
+        cloned(&self.local_voter)
     }
 
     /// Whether the BFT loop's broadcast side is enabled.
@@ -668,10 +722,30 @@ where
     }
 
     fn publisher_snapshot(&self) -> Option<mpsc::Sender<NetworkCommand>> {
-        self.network_publisher
-            .lock()
-            .expect("ChainBackend network_publisher poisoned")
-            .clone()
+        cloned(&self.network_publisher)
+    }
+
+    /// Encode and gossip `message` on `topic`. Returns whether it reached the
+    /// network command channel; without a publisher nothing is encoded.
+    async fn publish<T: BorshSerialize + Sync>(&self, topic: Topic, message: &T) -> bool {
+        let Some(publisher) = self.publisher_snapshot() else {
+            return false;
+        };
+        match borsh::to_vec(message) {
+            Ok(data) => send_publication(&publisher, topic, data).await,
+            Err(error) => {
+                warn!(?error, ?topic, "failed to encode gossip message");
+                false
+            }
+        }
+    }
+
+    /// Gossip an already encoded message on `topic`; see [`Self::publish`].
+    async fn publish_encoded(&self, topic: Topic, data: Vec<u8>) -> bool {
+        let Some(publisher) = self.publisher_snapshot() else {
+            return false;
+        };
+        send_publication(&publisher, topic, data).await
     }
 
     /// Number of distinct slashing-evidence items currently pooled.
@@ -739,9 +813,7 @@ where
             if self.bootstrap_pending() {
                 return false;
             }
-            if engine.retention_info().is_ok_and(|info| {
-                info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
-            }) {
+            if reporter_retention(engine) {
                 let Ok(source) = neutrino_prover_chunk::history::evidence_chunk_id(
                     engine.chain_spec(),
                     evidence,
@@ -823,7 +895,10 @@ where
     /// so it survives a node restart (pending-fix #5).
     async fn pool_and_gossip_slashing(&self, evidence: SlashingEvidence) {
         if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence
-            && !self.block_proof_objectively_rejected(rejected_proof)
+            && !matches!(
+                self.signed_proof_verdict(rejected_proof).await,
+                Some(availability::ProofVerdict::Rejected(_))
+            )
         {
             return;
         }
@@ -837,25 +912,7 @@ where
             // recipient already bound, while raw inputs remain durable for retry.
             return;
         }
-        let Some(publisher) = self.publisher_snapshot() else {
-            return;
-        };
-        let data = match borsh::to_vec(&evidence) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!(?err, "failed to encode slashing evidence for gossip");
-                return;
-            }
-        };
-        if let Err(err) = publisher
-            .send(NetworkCommand::Publish {
-                topic: Topic::SlashingEvidence,
-                data,
-            })
-            .await
-        {
-            debug!(?err, "slashing evidence publish channel closed");
-        }
+        self.publish(Topic::SlashingEvidence, &evidence).await;
     }
 
     /// Local chain id; convenience helper for the node binary.
@@ -899,12 +956,9 @@ where
         }
         if self.block_program().is_some()
             && !self.with_engine(|e| {
-                let next_chunk = e
-                    .latest_finalized_chunk_id()
-                    .map_or(Some(0), |id| id.checked_add(1));
                 e.head_height()
                     .checked_div(e.chain_spec().consensus.chunk_size)
-                    == next_chunk
+                    == Some(e.finalized_next_chunk_id())
             })
         {
             return Ok(None);
@@ -962,15 +1016,12 @@ where
             return Ok(());
         };
         let replaces_attachments = self.with_engine(|engine| {
-            let next = engine
-                .latest_finalized_chunk_id()
-                .map_or(Some(0), |id| id.checked_add(1));
             let chunk = block
                 .header
                 .height
                 .checked_sub(1)
                 .and_then(|h| h.checked_div(engine.chain_spec().consensus.chunk_size));
-            if chunk != next {
+            if chunk != Some(engine.finalized_next_chunk_id()) {
                 return Err(SyncBackendError::ChainBehind(
                     "waiting for the previous complete chunk proof".to_owned(),
                 ));
@@ -983,11 +1034,8 @@ where
                     block.header.gas_limit,
                     &key,
                 )
-                .map_err(|err| SyncBackendError::Rejected(err.to_string()))?;
-            let archived = engine
-                .store()
-                .get_body(&block.hash())
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+                .map_err(rejected)?;
+            let archived = engine.store().get_body(&block.hash()).map_err(rejected)?;
             Ok(archived.as_ref().is_some_and(|body| {
                 body.same_consensus_content(&block.body) && body != &block.body
             }))
@@ -999,7 +1047,7 @@ where
             // block's own chunk boundary, never ones the peer declares.
             let programs = self
                 .with_engine(|engine| engine.programs_for_height(block.header.height))
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?
+                .map_err(rejected)?
                 .execution;
             for attachment in &block.body.evidence_proofs {
                 if !attachment.binds(&attachment.statement, &programs.evidence, &programs.fact) {
@@ -1013,10 +1061,61 @@ where
                         &attachment.membership.batch,
                         &programs.evidence,
                     )
-                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+                    .map_err(rejected)?;
             }
         }
         Ok(())
+    }
+
+    /// Header import is a full-node path: refuse while checkpoint state
+    /// downloads, then on proof-only nodes.
+    fn ensure_full_import(&self) -> Result<(), SyncBackendError> {
+        self.reject_bootstrapping()?;
+        self.reject_light()
+    }
+
+    /// Slashing detection runs first: a peer that gossips a validly-signed but
+    /// non-extending header (e.g. an equivocating block we already reorg'd
+    /// past) must still be surfaced as evidence even if the import later
+    /// rejects it on chain continuity grounds. Headers that fail signature
+    /// verification are silently dropped — they are not authentic so there is
+    /// no slashable signer to attribute. The consensus body is then authorized.
+    async fn observe_and_authorize(&self, block: &Block) -> Result<(), SyncBackendError> {
+        if let Ok(Some(evidence)) = self.with_live_engine_mut(|engine| {
+            engine
+                .observe_header_for_slashing(&block.header)
+                .map_err(rejected)
+        }) {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
+        self.authorize_incoming_consensus_body(block)
+    }
+
+    /// Import `block`, re-executing it when an executor is installed. The
+    /// outer error is the bootstrap barrier; the inner one is the engine's.
+    fn import_block_raw(
+        &self,
+        block: &Block,
+        executor: Option<&dyn ErasedBlockExecutor>,
+    ) -> Result<Result<ImportBlockOutcome, ImportError<DB::Error>>, SyncBackendError> {
+        self.with_live_engine_mut(|engine| {
+            Ok(match executor {
+                Some(executor) => engine.import_block_with_dry_run(block, executor),
+                None => engine.import_block(block),
+            })
+        })
+    }
+
+    /// Local effects of an imported block, and the head it produced.
+    fn after_block_import(&self, block: &Block, outcome: &ImportBlockOutcome) -> HeadersImported {
+        self.queue_header_facts(&block.header);
+        self.forget_mined_transactions(&block.body.transactions);
+        self.absorb_programs(&block.body.programs);
+        HeadersImported {
+            new_head_height: outcome.new_head_height,
+            new_head_hash: outcome.block_hash,
+            new_head_slot: outcome.new_head_slot,
+        }
     }
 
     /// Submit a peer-supplied transaction into the local mempool.
@@ -1052,7 +1151,7 @@ where
                     e.chain_spec().chain_id,
                     e.chain_spec().genesis_gas_limit,
                     e.runtime_code_hash_for(e.head_height()).ok(),
-                    e.state().clone(),
+                    self.head_state_snapshot(e),
                     executor,
                 )
             })
@@ -1147,14 +1246,11 @@ where
             }
             e.prepare_block_proof(block_hash)
         })?;
-        let permit = self
-            .proving_budget
-            .acquire(crate::proof_metrics::ProofStage::Block);
         let completed = self
-            .metrics
-            .block_proofs
-            .time(|| job.prove(self.proof_system.as_ref()))?;
-        drop(permit);
+            .proving_budget
+            .prove(crate::proof_metrics::ProofStage::Block, || {
+                job.prove(self.proof_system.as_ref())
+            })?;
         self.with_engine_mut(|e| {
             if self.bootstrap_pending() {
                 return Err(ProveError::Backend(
@@ -1274,9 +1370,17 @@ where
             self.record_finalized_execution(e, chunk_id);
             Ok(outcome)
         })?;
-        self.refresh_reporter_tracking();
-        self.start_history_jobs();
+        self.after_chunk_finality(true);
         Ok(outcome)
+    }
+
+    /// Follow a newly finalized boundary: reporter retention is refreshed
+    /// against it and, when `start_history`, the history worker is woken.
+    fn after_chunk_finality(&self, start_history: bool) {
+        self.refresh_reporter_tracking();
+        if start_history {
+            self.start_history_jobs();
+        }
     }
 
     /// Current head height, snapshotted under the engine mutex.
@@ -1381,41 +1485,31 @@ where
     /// Next chunk id the local engine is ready to finalize.
     ///
     /// `Some(0)` immediately after genesis; `Some(latest + 1)` after
-    /// at least one chunk has finalized; `None` only if the
-    /// `latest_finalized_chunk_id` pointer overflows `u64`, which is
-    /// effectively unreachable.
+    /// at least one chunk has finalized. The engine validates that the
+    /// finalized chunk count is representable, so this is always `Some`.
     pub fn next_chunk_to_close(&self) -> Option<u64> {
-        self.with_engine(|e| {
-            e.latest_finalized_chunk_id()
-                .map_or(Some(0), |latest| latest.checked_add(1))
-        })
+        Some(self.with_engine(Engine::finalized_next_chunk_id))
     }
 
     fn contiguous_proven_height(e: &Engine<DB>) -> Result<Height, SyncBackendError> {
         let first = e
             .retention_info()
-            .map_err(p2p_queries::storage_error)?
+            .map_err(storage_error)?
             .first_retained_height;
         let mut height = first.saturating_sub(1);
         for candidate in first..=e.head_height() {
             let hash = e
                 .store()
                 .get_block_hash_by_height(candidate)
-                .map_err(p2p_queries::storage_error)?
+                .map_err(storage_error)?
                 .ok_or_else(|| {
                     SyncBackendError::Storage("canonical height is missing".to_owned())
                 })?;
-            let Some(proof) = e
-                .store()
-                .get_block_proof(&hash)
-                .map_err(p2p_queries::storage_error)?
-            else {
+            let Some(proof) = e.store().get_block_proof(&hash).map_err(storage_error)? else {
                 break;
             };
             if proof.height != candidate || proof.block_hash != hash {
-                return Err(p2p_queries::storage_error(
-                    "canonical proof cursor is inconsistent",
-                ));
+                return Err(storage_error("canonical proof cursor is inconsistent"));
             }
             height = candidate;
         }
@@ -1431,25 +1525,32 @@ where
     fn contiguous_body_height(e: &Engine<DB>) -> Result<Height, SyncBackendError> {
         let first = e
             .retention_info()
-            .map_err(p2p_queries::storage_error)?
+            .map_err(storage_error)?
             .first_retained_height;
         let mut height = first.saturating_sub(1);
         for candidate in first..=e.head_height() {
             let hash = e
                 .store()
                 .get_block_hash_by_height(candidate)
-                .map_err(p2p_queries::storage_error)?
+                .map_err(storage_error)?
                 .ok_or_else(|| {
                     SyncBackendError::Storage("canonical height is missing".to_owned())
                 })?;
-            if e.store()
-                .get_body(&hash)
-                .map_err(p2p_queries::storage_error)?
-                .is_none()
-            {
+            let Some(body) = e.store().get_body(&hash).map_err(storage_error)? else {
                 break;
+            };
+            // The same checks as serving the block, reading its body once.
+            if let Some(header) =
+                rpc_queries::checked_header(e, hash).map_err(p2p_queries::query_error)?
+            {
+                rpc_queries::ensure_payload_height(e, header.height)
+                    .map_err(p2p_queries::query_error)?;
+                if !rpc_queries::body_matches_header(&header, &body) {
+                    return Err(storage_error(
+                        "stored body does not match the header commitment",
+                    ));
+                }
             }
-            rpc_queries::read_block(e, hash).map_err(p2p_queries::query_error)?;
             height = candidate;
         }
         Ok(height)
@@ -1472,7 +1573,7 @@ where
             engine
                 .store_mut()
                 .write_observed_batch(batch, true)
-                .map_err(p2p_queries::storage_error)?;
+                .map_err(storage_error)?;
             if engine.head_state_root() == root {
                 engine.replace_state_with_reconstructed(state);
             }
@@ -1497,13 +1598,27 @@ where
         f: impl FnOnce(&mut Engine<DB>) -> Result<R, SyncBackendError>,
     ) -> Result<R, SyncBackendError> {
         self.with_engine_mut(|engine| {
-            if self.bootstrap_pending() {
-                return Err(SyncBackendError::NotAvailable(
-                    "checkpoint state is downloading".into(),
-                ));
-            }
+            self.reject_bootstrapping()?;
             f(engine)
         })
+    }
+
+    /// Refuse a mutation while checkpoint state is downloading.
+    fn reject_bootstrapping(&self) -> Result<(), SyncBackendError> {
+        if self.bootstrap_pending() {
+            return Err(SyncBackendError::NotAvailable(
+                "checkpoint state is downloading".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse an execution-state operation on a proof-only node.
+    fn reject_light(&self) -> Result<(), SyncBackendError> {
+        if self.is_light() {
+            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
+        }
+        Ok(())
     }
 
     /// If the chunk containing `height` now has every block proof in place, open a BFT
@@ -1557,13 +1672,10 @@ where
                 return;
             }
         };
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        let actions = match self.with_live_engine_mut(|e| {
-            e.open_bft_session_at(chunk, now_secs)
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-        }) {
+        let now_secs = crate::now_secs();
+        let actions = match self
+            .with_live_engine_mut(|e| e.open_bft_session_at(chunk, now_secs).map_err(rejected))
+        {
             Ok(actions) => actions,
             Err(err) => {
                 debug!(chunk_id, ?err, "open_bft_session failed");
@@ -1591,7 +1703,7 @@ where
         engine
             .prepare_bft_consensus_chunk(chunk_id, self.proof_system.as_ref())
             .map(|_| ())
-            .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+            .map_err(rejected)
     }
 
     // Once this round's local precommit is durable, incoming votes cannot cause
@@ -1635,9 +1747,7 @@ where
         let actions = self
             .with_live_engine_mut(|engine| {
                 self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
-                engine
-                    .resume_bft_actions()
-                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                engine.resume_bft_actions().map_err(rejected)
             })
             .map_err(|error| error.to_string())?;
         self.handle_bft_actions(actions).await;
@@ -1704,22 +1814,8 @@ where
             return;
         }
         self.queue_vote_facts(vote);
-        let Some(publisher) = self.publisher_snapshot() else {
-            return;
-        };
-        let data = match borsh::to_vec(&neutrino_consensus_types::BftVote::Value(vote.clone())) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!(?err, ?topic, "failed to encode finality vote for gossip");
-                return;
-            }
-        };
-        if let Err(err) = publisher
-            .send(NetworkCommand::Publish { topic, data })
-            .await
-        {
-            debug!(?err, ?topic, "BFT publish channel closed");
-        }
+        let message = neutrino_consensus_types::BftVote::Value(vote.clone());
+        self.publish(topic, &message).await;
     }
 
     /// Tick open sessions' phase deadlines and publish resulting nil votes,
@@ -1742,9 +1838,7 @@ where
         }
         let actions = match self.with_live_engine_mut(|engine| {
             self.validate_bft_signing_candidate(engine, engine.finalized_next_chunk_id())?;
-            engine
-                .tick_bft_round_timeouts(now_secs)
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+            engine.tick_bft_round_timeouts(now_secs).map_err(rejected)
         }) {
             Ok(actions) => actions,
             Err(err) => {
@@ -1759,8 +1853,80 @@ where
         }
     }
 
-    fn map_store_err<E: core::fmt::Display>(err: E) -> SyncBackendError {
-        SyncBackendError::Storage(err.to_string())
+    /// Shared intake of partial (`subnet` is `None`) and aggregate value votes.
+    /// Aggregates retain the same individual attestations and use the same
+    /// authenticated accumulator as partial value votes; `subnet` only labels
+    /// their trace and rejection logs.
+    async fn ingest_value_vote(&self, vote: FinalityVote, subnet: Option<u8>) {
+        if self.is_light() || self.bootstrap_pending() {
+            return;
+        }
+        if self.with_engine(|engine| {
+            let count = engine.finalized_next_chunk_id();
+            vote.data.chunk_id > count
+                || (vote.data.chunk_id < count
+                    && !neutrino_consensus_types::history::is_recent_history_index(
+                        vote.data.chunk_id,
+                        count,
+                    ))
+        }) {
+            return;
+        }
+        if let Some(subnet) = subnet {
+            trace!(
+                subnet,
+                chunk_id = vote.data.chunk_id,
+                round = vote.data.round,
+                ?vote.data.phase,
+                "received aggregate finality vote"
+            );
+        } else {
+            trace!(
+                chunk_id = vote.data.chunk_id,
+                round = vote.data.round,
+                ?vote.data.phase,
+                "received finality vote"
+            );
+        }
+        // Forensic-cache pressure cannot suppress independently verified live BFT.
+        self.retain_availability_vote(&vote).await;
+        // Signed attestations preserve individual attribution through aggregation.
+        if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
+            for item in evidence {
+                self.pool_and_gossip_slashing(item).await;
+            }
+        }
+        // The mandatory precommit attestation binds exact proof envelopes.
+        // Invalid-proof evidence retains the rejected original BlockProof so
+        // the evidence path can independently confirm the objective rejection.
+        let invalid_proof_evidence = self
+            .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
+            .unwrap_or_default();
+        for evidence in invalid_proof_evidence {
+            self.pool_and_gossip_slashing(evidence).await;
+        }
+        if !self.vote_matches_bft_session(&vote) {
+            self.defer_bft_vote(vote);
+            return;
+        }
+        let actions = match self.with_live_engine_mut(|engine| {
+            self.validate_live_vote_signing_candidate(engine, vote.data.chunk_id)?;
+            engine
+                .observe_finality_vote_at(vote.clone(), crate::now_secs())
+                .map_err(rejected)
+        }) {
+            Ok(actions) => actions,
+            Err(err) => {
+                if subnet.is_some() {
+                    debug!(?err, "engine rejected aggregate finality vote");
+                } else {
+                    debug!(?err, "engine rejected finality vote");
+                }
+                return;
+            }
+        };
+        self.queue_vote_facts(&vote);
+        self.handle_bft_actions(actions).await;
     }
 
     fn map_import_err(err: ImportError<DB::Error>) -> SyncBackendError {
@@ -1810,32 +1976,26 @@ where
     async fn consensus_sync_target(
         &self,
     ) -> Result<Option<neutrino_sync::backend::ConsensusSyncTarget>, SyncBackendError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return Ok(None);
         }
         if self.block_program().is_none() {
             return Ok(None);
         }
         self.with_engine(|engine| {
-            let chunk_id = engine
-                .latest_finalized_chunk_id()
-                .map_or(Some(0), |id| id.checked_add(1))
-                .ok_or_else(|| SyncBackendError::Rejected("chunk overflow".to_owned()))?;
+            let chunk_id = engine.finalized_next_chunk_id();
             let size = engine.chain_spec().consensus.chunk_size;
-            let end_height = chunk_id
-                .checked_add(1)
-                .and_then(|id| id.checked_mul(size))
-                .ok_or_else(|| SyncBackendError::Rejected("height overflow".to_owned()))?;
-            let start = end_height - size + 1;
+            let (start_height, end_height) =
+                chunk_height_range(chunk_id, size).ok_or_else(|| rejected("height overflow"))?;
             Ok(Some(neutrino_sync::backend::ConsensusSyncTarget {
                 chunk_id,
-                start_height: start,
+                start_height,
                 end_height,
             }))
         })
     }
     fn supports_bft_candidate_sync(&self) -> bool {
-        self.light_checkpoint().is_none() && self.block_program().is_some()
+        !self.is_light() && self.block_program().is_some()
     }
 
     async fn bft_candidate(
@@ -1865,13 +2025,11 @@ where
     }
 
     fn supports_bft_message_sync(&self) -> bool {
-        !self.bootstrap_pending()
-            && self.light_checkpoint().is_none()
-            && self.block_program().is_some()
+        !self.bootstrap_pending() && !self.is_light() && self.block_program().is_some()
     }
 
     async fn current_bft_round(&self) -> Option<(ChunkId, u32)> {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return None;
         }
         Some(self.with_engine(|engine| {
@@ -1907,11 +2065,11 @@ where
     }
 
     fn supports_signed_artifact_sync(&self) -> bool {
-        !self.bootstrap_pending() && self.light_checkpoint().is_none()
+        !self.bootstrap_pending() && !self.is_light()
     }
 
     async fn signed_artifact_source_known(&self, id: ChunkId) -> bool {
-        self.light_checkpoint().is_none() && self.availability_source_known(id)
+        !self.is_light() && self.availability_source_known(id)
     }
 
     async fn signed_artifact_matches_source(
@@ -1967,7 +2125,7 @@ where
     }
 
     async fn latest_checkpoint(&self) -> Result<CheckpointLatestResponse, SyncBackendError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             let proof = self
                 .light_latest_proof()
                 .map_err(SyncBackendError::Storage)?
@@ -1979,7 +2137,7 @@ where
         }
         let proof = self
             .with_engine(Engine::latest_history_proof)
-            .map_err(|error| SyncBackendError::Storage(error.to_string()))?
+            .map_err(storage_error)?
             .ok_or_else(|| {
                 SyncBackendError::NotAvailable("no recursive prefix proof available".into())
             })?;
@@ -2093,7 +2251,7 @@ where
         proof: HistoryProof,
     ) -> Result<CheckpointsImported, SyncBackendError> {
         let metric_timer = self.metrics.execution.history_verification.timer();
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             let result = self.accept_light_history(proof).await;
             metric_timer.finish(result.is_ok());
             return result;
@@ -2105,7 +2263,7 @@ where
                     .canonical_boundary(statement.start.next_chunk_id)
                     .map(|boundary| (engine.chain_spec().clone(), boundary))
             })
-            .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+            .map_err(rejected)?;
         let prover = Arc::clone(&self.proof_system);
         let verified = tokio::task::spawn_blocking(move || {
             neutrino_proof_system::verify_history_proof(
@@ -2116,12 +2274,10 @@ where
             )
         })
         .await
-        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?
-        .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+        .map_err(rejected)?
+        .map_err(rejected)?;
         self.with_live_engine_mut(|engine| {
-            engine
-                .commit_verified_history(verified)
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+            engine.commit_verified_history(verified).map_err(rejected)
         })?;
         self.start_history_jobs();
         metric_timer.finish(true);
@@ -2139,14 +2295,7 @@ where
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError> {
         let metric_timer = self.metrics.execution.block_imports.timer();
-        if self.bootstrap_pending() {
-            return Err(SyncBackendError::NotAvailable(
-                "checkpoint state is downloading".into(),
-            ));
-        }
-        if self.light_checkpoint().is_some() {
-            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
-        }
+        self.ensure_full_import()?;
         // Pending-fix #7 follow-on: route sync-driver header batches
         // through the executor-equipped import path so re-execution
         // catches forged commitments on sync-replay too. Backends
@@ -2157,30 +2306,11 @@ where
         let executor = self.block_executor_snapshot();
         let mut last: Option<HeadersImported> = None;
         for block in blocks {
-            if let Ok(Some(evidence)) = self.with_live_engine_mut(|engine| {
-                engine
-                    .observe_header_for_slashing(&block.header)
-                    .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-            }) {
-                self.pool_and_gossip_slashing(evidence).await;
-            }
-            self.authorize_incoming_consensus_body(&block)?;
-            let block_ref = &block;
-            let outcome = self.with_live_engine_mut(|e| {
-                match executor.as_ref() {
-                    Some(executor) => e.import_block_with_dry_run(block_ref, executor.as_ref()),
-                    None => e.import_block(block_ref),
-                }
-                .map_err(Self::map_import_err)
-            })?;
-            self.queue_header_facts(&block.header);
-            self.forget_mined_transactions(&block.body.transactions);
-            self.absorb_programs(&block.body.programs);
-            last = Some(HeadersImported {
-                new_head_height: outcome.new_head_height,
-                new_head_hash: outcome.block_hash,
-                new_head_slot: outcome.new_head_slot,
-            });
+            self.observe_and_authorize(&block).await?;
+            let outcome = self
+                .import_block_raw(&block, executor.as_deref())?
+                .map_err(Self::map_import_err)?;
+            last = Some(self.after_block_import(&block, &outcome));
         }
         let result = last.ok_or_else(|| SyncBackendError::Rejected("empty block batch".to_owned()));
         metric_timer.finish(result.is_ok());
@@ -2193,9 +2323,7 @@ where
         items: Vec<neutrino_consensus_types::bootstrap::StateItem>,
         entries: Vec<neutrino_consensus_types::bootstrap::StateEntry>,
     ) -> Result<StateProgress, SyncBackendError> {
-        if self.light_checkpoint().is_some() {
-            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
-        }
+        self.reject_light()?;
         let pending = self.bootstrap_state()?;
         if pending
             .as_ref()
@@ -2224,9 +2352,7 @@ where
         proofs: Vec<BlockProof>,
     ) -> Result<ProofsImported, SyncBackendError> {
         let metric_timer = self.metrics.execution.block_verification.timer();
-        if self.light_checkpoint().is_some() {
-            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
-        }
+        self.reject_light()?;
         let mut expected_height = start;
         let mut last_height = None;
         let mut imported_heights: Vec<Height> = Vec::new();
@@ -2244,9 +2370,8 @@ where
             // trie to the new fork-choice head. Executor-less
             // backends keep the prior behaviour.
             let proof_ref = &proof;
-            let verdict_token = self.begin_block_verdict(blake3_256(
-                &borsh::to_vec(&proof).expect("canonical block proof envelope"),
-            ));
+            let verdict_token =
+                self.begin_block_verdict(availability::block_proof_source_id(&proof));
             let executor = self.block_executor_snapshot();
             let result = self.with_live_engine_mut(|e| {
                 match executor.as_ref() {
@@ -2269,9 +2394,10 @@ where
         let new_proven_height = last_height
             .ok_or_else(|| SyncBackendError::Rejected("empty block proof batch".to_owned()))?;
 
-        // After every imported proof, check whether the chunk
-        // covering that height is now proof-ready and open a BFT
-        // session if so. Off-boundary heights are cheap to inspect.
+        // Every proof is imported; check once per touched chunk whether it
+        // is now proof-ready and open a BFT session if so.
+        let chunk_size = self.chunk_size().max(1);
+        imported_heights.dedup_by_key(|height| height.checked_sub(1).map(|h| h / chunk_size));
         for height in imported_heights {
             self.maybe_open_bft_session_for_height(height).await;
         }
@@ -2285,31 +2411,8 @@ where
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
         let metric_timer = self.metrics.execution.block_imports.timer();
-        if self.bootstrap_pending() {
-            return Err(SyncBackendError::NotAvailable(
-                "checkpoint state is downloading".into(),
-            ));
-        }
-        if self.light_checkpoint().is_some() {
-            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
-        }
-        // Slashing detection runs first: a peer that gossips a
-        // validly-signed but non-extending header (e.g. an
-        // equivocating block we already reorg'd past) must still be
-        // surfaced as evidence even if `import_block` later rejects
-        // the second copy on chain continuity grounds. Headers that
-        // fail signature verification are silently dropped — they
-        // are not authentic so there is no slashable signer to
-        // attribute.
-        if let Ok(Some(evidence)) = self.with_live_engine_mut(|engine| {
-            engine
-                .observe_header_for_slashing(&block.header)
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-        }) {
-            self.pool_and_gossip_slashing(evidence).await;
-        }
-
-        self.authorize_incoming_consensus_body(&block)?;
+        self.ensure_full_import()?;
+        self.observe_and_authorize(&block).await?;
 
         // Pending-fix #7: when a dynamic-runtime executor is
         // installed, route the import through
@@ -2319,13 +2422,7 @@ where
         // parent state. Tests / RPC-only nodes that leave the
         // executor unset fall back to the no-dry-run path.
         let executor = self.block_executor_snapshot();
-        let import_result = self.with_live_engine_mut(|e| {
-            Ok(match executor.as_ref() {
-                Some(executor) => e.import_block_with_dry_run(&block, executor.as_ref()),
-                None => e.import_block(&block),
-            })
-        })?;
-        let outcome = match import_result {
+        let outcome = match self.import_block_raw(&block, executor.as_deref())? {
             Ok(outcome) => outcome,
             Err(ImportError::HeaderVrf(vrf_err)) => {
                 // The header signature already verified above (the
@@ -2342,19 +2439,13 @@ where
             }
             Err(other) => return Err(Self::map_import_err(other)),
         };
-        self.queue_header_facts(&block.header);
-        self.forget_mined_transactions(&block.body.transactions);
-        self.absorb_programs(&block.body.programs);
+        let imported = self.after_block_import(&block, &outcome);
         metric_timer.finish(true);
-        Ok(HeadersImported {
-            new_head_height: outcome.new_head_height,
-            new_head_hash: outcome.block_hash,
-            new_head_slot: outcome.new_head_slot,
-        })
+        Ok(imported)
     }
 
     async fn submit_transaction(&self, bytes: Vec<u8>) {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return;
         }
         match Self::submit_transaction(self, bytes) {
@@ -2368,9 +2459,7 @@ where
         proof: ChunkProof,
     ) -> Result<ChunkProofImported, SyncBackendError> {
         let metric_timer = self.metrics.execution.chunk_verification.timer();
-        if self.light_checkpoint().is_some() {
-            return Err(SyncBackendError::NotAvailable("proof-only node".into()));
-        }
+        self.reject_light()?;
         {
             let certificate = &proof.finality_cert;
             let chunk = neutrino_prover_chunk::consensus::as_chunk(&proof.public_inputs);
@@ -2378,7 +2467,7 @@ where
                 .with_live_engine_mut(|engine| {
                     engine
                         .observe_certificate_for_slashing(&chunk, certificate)
-                        .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                        .map_err(rejected)
                 })
                 .unwrap_or_default();
             for item in evidence {
@@ -2395,14 +2484,11 @@ where
                         "chunk already finalized".to_owned(),
                     ));
                 }
-                let next = engine
-                    .latest_finalized_chunk_id()
-                    .map_or(Some(0), |id| id.checked_add(1));
-                if next != Some(proof.chunk_id)
+                if engine.finalized_next_chunk_id() != proof.chunk_id
                     || engine
                         .store()
                         .get_header(&proof.public_inputs.end_block_hash)
-                        .map_err(Self::map_store_err)?
+                        .map_err(storage_error)?
                         .is_none()
                 {
                     return Err(SyncBackendError::ChainBehind(
@@ -2430,7 +2516,7 @@ where
             }
             Ok(outcome)
         })?;
-        self.refresh_reporter_tracking();
+        self.after_chunk_finality(false);
         if self.block_program().is_some() {
             let certificate = &proof.finality_cert;
             self.retain_availability_vote(&certificate.prevote_vote())
@@ -2462,131 +2548,25 @@ where
     }
 
     async fn ingest_finality_vote(&self, vote: FinalityVote) {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
-            return;
-        }
-        if self.with_engine(|engine| {
-            let count = engine.finalized_next_chunk_id();
-            vote.data.chunk_id > count
-                || (vote.data.chunk_id < count
-                    && !neutrino_consensus_types::history::is_recent_history_index(
-                        vote.data.chunk_id,
-                        count,
-                    ))
-        }) {
-            return;
-        }
-        trace!(
-            chunk_id = vote.data.chunk_id,
-            round = vote.data.round,
-            ?vote.data.phase,
-            "received finality vote"
-        );
-        // Forensic-cache pressure cannot suppress independently verified live BFT.
-        self.retain_availability_vote(&vote).await;
-        // Signed attestations preserve individual attribution through aggregation.
-        if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
-            for item in evidence {
-                self.pool_and_gossip_slashing(item).await;
-            }
-        }
-        // The mandatory precommit attestation binds exact proof envelopes.
-        // Invalid-proof evidence retains the rejected original BlockProof so
-        // the evidence path can independently confirm the objective rejection.
-        let invalid_proof_evidence = self
-            .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
-            .unwrap_or_default();
-        for evidence in invalid_proof_evidence {
-            self.pool_and_gossip_slashing(evidence).await;
-        }
-        if !self.vote_matches_bft_session(&vote) {
-            self.defer_bft_vote(vote);
-            return;
-        }
-        let actions = match self.with_live_engine_mut(|engine| {
-            self.validate_live_vote_signing_candidate(engine, vote.data.chunk_id)?;
-            engine
-                .observe_finality_vote_at(vote.clone(), bft_messages::now_secs())
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-        }) {
-            Ok(actions) => actions,
-            Err(err) => {
-                debug!(?err, "engine rejected finality vote");
-                return;
-            }
-        };
-        self.queue_vote_facts(&vote);
-        self.handle_bft_actions(actions).await;
+        self.ingest_value_vote(vote, None).await;
     }
 
     async fn ingest_aggregate_finality_vote(&self, subnet: u8, vote: FinalityVote) {
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
-            return;
-        }
-        if self.with_engine(|engine| {
-            let count = engine.finalized_next_chunk_id();
-            vote.data.chunk_id > count
-                || (vote.data.chunk_id < count
-                    && !neutrino_consensus_types::history::is_recent_history_index(
-                        vote.data.chunk_id,
-                        count,
-                    ))
-        }) {
-            return;
-        }
-        // Aggregates retain the same individual attestations and use the same
-        // authenticated accumulator as partial value votes.
-        trace!(
-            subnet,
-            chunk_id = vote.data.chunk_id,
-            round = vote.data.round,
-            ?vote.data.phase,
-            "received aggregate finality vote"
-        );
-        self.retain_availability_vote(&vote).await;
-        if let Ok(evidence) = self.with_engine_mut(|e| e.observe_votes_for_slashing(&vote)) {
-            for item in evidence {
-                self.pool_and_gossip_slashing(item).await;
-            }
-        }
-        let invalid_proof_evidence = self
-            .with_engine(|e| e.observe_vote_for_invalid_proof_signing(&vote))
-            .unwrap_or_default();
-        for evidence in invalid_proof_evidence {
-            self.pool_and_gossip_slashing(evidence).await;
-        }
-        if !self.vote_matches_bft_session(&vote) {
-            self.defer_bft_vote(vote);
-            return;
-        }
-        let actions = match self.with_live_engine_mut(|engine| {
-            self.validate_live_vote_signing_candidate(engine, vote.data.chunk_id)?;
-            engine
-                .observe_finality_vote_at(vote.clone(), bft_messages::now_secs())
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
-        }) {
-            Ok(actions) => actions,
-            Err(err) => {
-                debug!(?err, "engine rejected aggregate finality vote");
-                return;
-            }
-        };
-        self.queue_vote_facts(&vote);
-        self.handle_bft_actions(actions).await;
+        self.ingest_value_vote(vote, Some(subnet)).await;
     }
 
     async fn ingest_evidence_proof(
         &self,
         report: neutrino_consensus_types::evidence::EvidenceReport,
     ) -> neutrino_sync::EvidenceProofAcceptance {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return neutrino_sync::EvidenceProofAcceptance::Deferred;
         }
         self.accept_evidence_report(report).await
     }
 
     async fn ingest_slashing_evidence(&self, evidence: SlashingEvidence) {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return;
         }
         // Verify the peer-supplied evidence cryptographically before
@@ -2625,7 +2605,10 @@ where
         // `verify_block`. If it succeeds, the emitter was wrong
         // (or malicious) about the rejection — drop the evidence.
         if let SlashingEvidence::InvalidProofSigning { rejected_proof, .. } = &evidence
-            && !self.block_proof_objectively_rejected(rejected_proof)
+            && !matches!(
+                self.signed_proof_verdict(rejected_proof).await,
+                Some(availability::ProofVerdict::Rejected(_))
+            )
         {
             debug!(
                 block_hash = ?rejected_proof.block_hash,

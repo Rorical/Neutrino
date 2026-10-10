@@ -28,12 +28,7 @@ use neutrino_primitives::{Hash, blake3_256, merkle_root_of_hashes};
 /// Lowercase hex of a content hash.
 #[must_use]
 pub fn hex_hash(hash: &Hash) -> String {
-    use std::fmt::Write as _;
-    hash.iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
+    hex::encode(hash)
 }
 
 /// Split an artifact into authenticated pieces. `None` when the artifact is
@@ -67,14 +62,7 @@ pub fn split_into_pieces(bytes: &[u8]) -> Option<Vec<ProgramPiece>> {
 /// Parse the lowercase hex produced by [`hex_hash`].
 #[must_use]
 pub fn parse_hex_hash(text: &str) -> Option<Hash> {
-    if text.len() != 64 {
-        return None;
-    }
-    let mut hash = [0_u8; 32];
-    for (byte, pair) in hash.iter_mut().zip(text.as_bytes().chunks(2)) {
-        *byte = u8::from_str_radix(core::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(hash)
+    hex::FromHex::from_hex(text).ok()
 }
 
 /// Content hash governance names for an artifact. `None` for an empty or

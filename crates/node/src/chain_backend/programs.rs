@@ -81,7 +81,7 @@ where
             engine
                 .runtime_code_hash_for(engine.head_height())
                 .ok()
-                .map(|runtime| (engine.state().clone(), runtime))
+                .map(|runtime| (self.head_state_snapshot(engine), runtime))
         }) else {
             return BTreeMap::new();
         };
@@ -203,7 +203,7 @@ where
             }
         };
         if tokio::runtime::Handle::try_current().is_ok() {
-            self.spawn_background_job("program-restore", async move {
+            self.spawn_supervised("program-restore", false, async move {
                 tokio::task::spawn_blocking(install)
                     .await
                     .expect("program restore worker panicked");
@@ -259,7 +259,7 @@ where
                 };
                 // SP1 setup is slow; keep it off async workers when possible.
                 if tokio::runtime::Handle::try_current().is_ok() {
-                    self.spawn_background_job("program-install", async move {
+                    self.spawn_supervised("program-install", false, async move {
                         tokio::task::spawn_blocking(install)
                             .await
                             .expect("program installation worker panicked");

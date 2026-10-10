@@ -133,6 +133,17 @@ impl ProvingBudget {
     pub(crate) fn acquire(self: &Arc<Self>, stage: ProofStage) -> ProvingPermit {
         self.request(stage).wait()
     }
+
+    /// Run one native prover call for `stage` under a permit, timing it in the
+    /// stage's metrics. The permit is released after the call returns or unwinds.
+    pub(crate) fn prove<T, E>(
+        self: &Arc<Self>,
+        stage: ProofStage,
+        attempt: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _permit = self.acquire(stage);
+        self.metrics.proof_stage(stage).time(attempt)
+    }
 }
 
 #[expect(

@@ -14,21 +14,44 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Notify, watch};
 
-use super::ChainBackend;
+use super::{ChainBackend, rpc_queries::storage_error as query_error};
+use crate::now_secs as now;
+use crate::proof_metrics::ProofStage;
 
 const MAX_JOBS: usize = 32;
 const JOB_LIFETIME_SECS: u64 = 24 * 60 * 60;
+
+/// Persisted job lifecycle, encoded as its one-byte discriminant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+enum JobState {
+    /// Awaiting a worker or its retry deadline.
+    Queued = 0,
+    /// Claimed by the worker.
+    Running = 1,
+    /// Proven and committed.
+    Completed = 2,
+    /// Exhausted its attempts.
+    Failed = 3,
+    /// Expired, outside the retention policy, or paused for bootstrap.
+    Cancelled = 4,
+}
+
+impl JobState {
+    /// Terminal jobs release their source retention lease.
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct Job {
     range: HistoryStatement,
     progress: Option<Hash>,
-    // 0 queued, 1 running, 2 completed, 3 failed, 4 cancelled.
-    state: u8,
+    state: JobState,
     created: u64,
     error: Option<String>,
     automatic: bool,
@@ -46,11 +69,11 @@ impl Job {
             start: HashHex(self.range.start_checkpoint().hash()),
             end: HashHex(self.range.end_checkpoint().hash()),
             status: match self.state {
-                0 => HistoryJobStatus::Queued,
-                1 => HistoryJobStatus::Running,
-                2 => HistoryJobStatus::Completed,
-                4 => HistoryJobStatus::Cancelled,
-                _ => HistoryJobStatus::Failed,
+                JobState::Queued => HistoryJobStatus::Queued,
+                JobState::Running => HistoryJobStatus::Running,
+                JobState::Completed => HistoryJobStatus::Completed,
+                JobState::Cancelled => HistoryJobStatus::Cancelled,
+                JobState::Failed => HistoryJobStatus::Failed,
             },
             error: self.error.clone(),
         }
@@ -81,15 +104,6 @@ impl HistoryRuntime {
     }
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |time| time.as_secs())
-}
-fn query_error(error: impl core::fmt::Display) -> QueryError {
-    QueryError::Storage(error.to_string())
-}
-
 fn jobs<DB: Database>(engine: &Engine<DB>) -> Result<Vec<Job>, String>
 where
     DB::Error: core::fmt::Debug + core::fmt::Display,
@@ -101,12 +115,17 @@ where
         .into_iter()
         .map(|(id, bytes)| {
             let job: Job = borsh::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if id != job.id() || job.state > 4 || job.range.covered_chunks().is_none() {
+            if id != job.id() || job.range.covered_chunks().is_none() {
                 return Err("invalid persisted history job".into());
             }
             Ok(job)
         })
         .collect()
+}
+
+/// Number of `records` in `state`, saturated into a gauge value.
+fn count_in(records: &[Job], state: JobState) -> u64 {
+    u64::try_from(records.iter().filter(|job| job.state == state).count()).unwrap_or(u64::MAX)
 }
 
 fn refresh_history_metrics<DB: Database>(engine: &Engine<DB>, metrics: &crate::metrics::NodeMetrics)
@@ -123,16 +142,10 @@ where
     });
     match snapshot {
         Ok((records, pinned)) => {
-            pipeline.history_queued.store(
-                u64::try_from(records.iter().filter(|job| job.state == 0).count())
-                    .unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            pipeline.history_running.store(
-                u64::try_from(records.iter().filter(|job| job.state == 1).count())
-                    .unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            let queued = count_in(&records, JobState::Queued);
+            let running = count_in(&records, JobState::Running);
+            pipeline.history_queued.store(queued, Ordering::Relaxed);
+            pipeline.history_running.store(running, Ordering::Relaxed);
             pipeline
                 .history_pinned_chunks
                 .store(pinned, Ordering::Relaxed);
@@ -150,7 +163,7 @@ where
     DB::Error: core::fmt::Debug + core::fmt::Display,
 {
     let bytes = borsh::to_vec(job).map_err(|error| error.to_string())?;
-    if job.state >= 2 {
+    if job.state.is_terminal() {
         engine
             .store_mut()
             .put_history_job_without_pin(&job.id(), &bytes)
@@ -194,7 +207,7 @@ where
 {
     let existing = jobs(engine)?;
     if let Some(found) = existing.iter().find(|item| item.id() == job.id()) {
-        if !job.automatic && found.state >= 2 {
+        if !job.automatic && found.state.is_terminal() {
             let mut restarted = job;
             // Terminal jobs release their retention lease. A later explicit
             // request can reuse only progress that survived normal eviction;
@@ -216,7 +229,7 @@ where
     if existing.len() >= MAX_JOBS {
         let oldest = existing
             .iter()
-            .filter(|item| item.state >= 2)
+            .filter(|item| item.state.is_terminal())
             .min_by_key(|item| item.created)
             .ok_or("history queue is full")?;
         engine
@@ -243,7 +256,7 @@ where
     if end <= engine.recursive_covered_chunks()
         || jobs(engine)?
             .iter()
-            .any(|job| job.automatic && job.state < 2)
+            .any(|job| job.automatic && !job.state.is_terminal())
     {
         return Ok(());
     }
@@ -266,7 +279,7 @@ where
         Job {
             range,
             progress,
-            state: 0,
+            state: JobState::Queued,
             created: now(),
             error: None,
             automatic: true,
@@ -334,7 +347,7 @@ where
     }
 
     pub(super) fn start_history_jobs(&self) {
-        if self.light_checkpoint().is_some()
+        if self.is_light()
             || self.bootstrap_pending()
             || self.history.paused.load(Ordering::Acquire)
             || !self.history.initialized.load(Ordering::Acquire)
@@ -362,7 +375,7 @@ where
             publisher: self.publisher_snapshot(),
             metrics: Arc::clone(&self.metrics),
         };
-        self.spawn_background_worker("history", actor.run());
+        self.spawn_supervised("history", true, actor.run());
     }
 
     /// Stop admission and drain a running proof before releasing its dependencies.
@@ -397,7 +410,7 @@ where
         start: Hash,
         end: Hash,
     ) -> Result<HistoryJobInfo, QueryError> {
-        if self.light_checkpoint().is_some() {
+        if self.is_light() {
             return Err(QueryError::StateUnavailable);
         }
         let job = self.with_engine_mut(|engine| {
@@ -432,7 +445,7 @@ where
             if jobs(engine)
                 .map_err(query_error)?
                 .iter()
-                .any(|job| job.id() == range.range_id() && job.state < 2)
+                .any(|job| job.id() == range.range_id() && !job.state.is_terminal())
             {
                 self.metrics
                     .proof_pipeline
@@ -444,7 +457,11 @@ where
                 Job {
                     range,
                     progress: cached.as_ref().map(|proof| proof.statement.range_id()),
-                    state: if cached.is_some() { 2 } else { 0 },
+                    state: if cached.is_some() {
+                        JobState::Completed
+                    } else {
+                        JobState::Queued
+                    },
                     created: now(),
                     error: None,
                     automatic: false,
@@ -575,9 +592,9 @@ where
         refresh_history_metrics(&engine, &self.metrics);
         let mut job = records
             .into_iter()
-            .filter(|job| job.state == 0 && job.retry_after <= now())
+            .filter(|job| job.state == JobState::Queued && job.retry_after <= now())
             .min_by_key(|job| (!job.automatic, job.created))?;
-        job.state = 1;
+        job.state = JobState::Running;
         job.attempts = job.attempts.saturating_add(1);
         let saved = save(&mut engine, &job);
         refresh_history_metrics(&engine, &self.metrics);
@@ -600,13 +617,13 @@ where
             .and_then(|records| {
                 records
                     .into_iter()
-                    .filter(|job| job.state < 2)
+                    .filter(|job| !job.state.is_terminal())
                     .map(|job| {
                         let expiry = job
                             .created
                             .saturating_add(JOB_LIFETIME_SECS)
                             .saturating_add(1);
-                        if job.state == 0 && job.retry_after > now() {
+                        if job.state == JobState::Queued && job.retry_after > now() {
                             expiry.min(job.retry_after)
                         } else {
                             expiry
@@ -682,25 +699,25 @@ where
         match result {
             Ok(Ok(done)) => {
                 job = done;
-                job.state = 2;
+                job.state = JobState::Completed;
                 job.error = None;
             }
             Ok(Err(error)) => {
-                job.state = 3;
+                job.state = JobState::Failed;
                 job.error = Some(bounded_error(&error));
             }
             Err(error) => {
-                job.state = 3;
+                job.state = JobState::Failed;
                 job.error = Some(bounded_error(&error.to_string()));
             }
         }
-        if job.state == 3
+        if job.state == JobState::Failed
             && (self.state.paused.load(Ordering::Acquire)
                 || now().saturating_sub(job.created) > JOB_LIFETIME_SECS)
         {
-            job.state = 4;
-        } else if job.state == 3 && job.attempts < 3 {
-            job.state = 0;
+            job.state = JobState::Cancelled;
+        } else if job.state == JobState::Failed && job.attempts < 3 {
+            job.state = JobState::Queued;
             job.retry_after = now().saturating_add(60 * u64::from(job.attempts));
         }
         let saved = {
@@ -711,14 +728,14 @@ where
             result
         };
         if let Err(error) = saved {
-            job.state = 3;
+            job.state = JobState::Failed;
             job.error = Some(bounded_error(&error));
         }
         job
     }
 
     async fn announce(&self, job: &Job) {
-        if job.state == 2
+        if job.state == JobState::Completed
             && let Some(publisher) = self.publisher.as_ref()
         {
             let announcement = neutrino_network::rpc::CheckpointAnnouncement {
@@ -908,12 +925,10 @@ where
             .map(|chunk| borsh::from_slice(&chunk.proof_bytes))
             .collect::<Result<_, _>>()
             .map_err(|error| error.to_string())?;
-        let _permit = self
-            .budget
-            .acquire(crate::proof_metrics::ProofStage::HistoryFold);
+        let _permit = self.budget.acquire(ProofStage::HistoryFold);
         self.check_pause()?;
         self.metrics
-            .history_folds
+            .proof_stage(ProofStage::HistoryFold)
             .time(|| {
                 self.prover
                     .prove_history_fold(&self.spec, previous, &chunks)
@@ -1016,12 +1031,10 @@ where
         } else {
             let split = range_split(start, end)?;
             let (left, right) = self.prove_halves(start, split, end, parallel)?;
-            let _permit = self
-                .budget
-                .acquire(crate::proof_metrics::ProofStage::HistoryMerge);
+            let _permit = self.budget.acquire(ProofStage::HistoryMerge);
             self.check_pause()?;
             self.metrics
-                .history_merges
+                .proof_stage(ProofStage::HistoryMerge)
                 .time(|| self.prover.prove_history_merge(&self.spec, &left, &right))
                 .map_err(|error| error.to_string())?
         };
@@ -1080,8 +1093,8 @@ where
 {
     let mut cancelled = Vec::new();
     for mut job in jobs(engine)? {
-        if job.state == 0 || (include_running && job.state == 1) {
-            job.state = 4;
+        if job.state == JobState::Queued || (include_running && job.state == JobState::Running) {
+            job.state = JobState::Cancelled;
             job.error = Some("history job paused for checkpoint bootstrap".into());
             save(engine, &job)?;
             cancelled.push(job);
@@ -1102,7 +1115,7 @@ where
         != neutrino_consensus_engine::RetentionPolicy::Archive;
     for mut job in jobs(engine)? {
         if let Some(reason) = cancellation_reason(&job, pruned) {
-            job.state = 4;
+            job.state = JobState::Cancelled;
             job.error = Some(reason.into());
             save(engine, &job)?;
             expired.push(job);
@@ -1112,7 +1125,7 @@ where
 }
 
 fn cancellation_reason(job: &Job, pruned: bool) -> Option<&'static str> {
-    if job.state >= 2 {
+    if job.state.is_terminal() {
         None
     } else if now().saturating_sub(job.created) > JOB_LIFETIME_SECS {
         Some("history job expired")
@@ -1140,11 +1153,11 @@ where
         .policy
         != neutrino_consensus_engine::RetentionPolicy::Archive;
     for job in &mut records {
-        if job.state == 1 {
-            job.state = 0;
+        if job.state == JobState::Running {
+            job.state = JobState::Queued;
         }
         if let Some(reason) = cancellation_reason(job, pruned) {
-            job.state = 4;
+            job.state = JobState::Cancelled;
             job.error = Some(reason.into());
         }
         save(engine, job)?;

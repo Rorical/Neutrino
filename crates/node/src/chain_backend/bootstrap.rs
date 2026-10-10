@@ -4,9 +4,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::{
     HistoryProof,
     bootstrap::{BootstrapData, StateItem},
+    history::HISTORY_RETENTION_CHUNKS,
     history_proof::{Checkpoint, ConsensusBoundary},
 };
-use neutrino_light_client::{HistoryVerifier, LightClient};
+use neutrino_light_client::LightClient;
 use neutrino_primitives::{BoundedBytes, Hash};
 use neutrino_proof_system::{ProofSystem, VerifiedHistory, verify_history_proof};
 use neutrino_prover_chunk::{execution::commitment, history::HistoricalOpening};
@@ -14,7 +15,7 @@ use neutrino_storage::{Batch, Column, Database};
 use neutrino_sync::{StateProgress, SyncBackendError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{ChainBackend, p2p_queries};
+use super::{ChainBackend, light::Authenticated, not_available, rejected, storage_error};
 
 use neutrino_consensus_engine::store::pointers::BOOTSTRAP_PENDING as PENDING_KEY;
 
@@ -37,30 +38,11 @@ pub(super) struct BootstrapRuntime {
     fetching: bool,
 }
 
-struct Authenticated<'a>(&'a VerifiedHistory);
-impl HistoryVerifier for Authenticated<'_> {
-    type Error = ();
-    fn verify_history(
-        &self,
-        proof: &HistoryProof,
-        domain: &neutrino_consensus_types::history_proof::ProofDomain,
-    ) -> Result<(), ()> {
-        if proof == self.0.proof() && domain == self.0.domain() {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-}
-
 fn now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
         .map_err(|error| error.to_string())
-}
-fn rejected(error: impl core::fmt::Display) -> SyncBackendError {
-    SyncBackendError::Rejected(error.to_string())
 }
 
 fn validate_data(data: &BootstrapData) -> Result<Vec<HistoricalOpening>, SyncBackendError> {
@@ -77,7 +59,7 @@ fn validate_data(data: &BootstrapData) -> Result<Vec<HistoricalOpening>, SyncBac
             "bootstrap context differs from authenticated boundary",
         ));
     }
-    let first = end.next_chunk_id.saturating_sub(8);
+    let first = end.next_chunk_id.saturating_sub(HISTORY_RETENTION_CHUNKS);
     if data.recent.len() != usize::try_from(end.next_chunk_id - first).map_err(rejected)? {
         return Err(rejected("bootstrap lacks recent consensus history"));
     }
@@ -193,14 +175,13 @@ where
             for (key, _) in engine
                 .store()
                 .db()
-                .iter_column(Column::Meta)
+                .iter_prefix(
+                    Column::Meta,
+                    neutrino_consensus_engine::store::pointers::STATE_DOWNLOAD_ENTRY_PREFIX,
+                )
                 .map_err(|error| error.to_string())?
             {
-                if key.starts_with(
-                    neutrino_consensus_engine::store::pointers::STATE_DOWNLOAD_ENTRY_PREFIX,
-                ) {
-                    batch.delete(Column::Meta, key);
-                }
+                batch.delete(Column::Meta, key);
             }
             engine
                 .store_mut()
@@ -405,11 +386,7 @@ where
         // Serialize admission with every chain mutation. A caller that passed an
         // earlier optimistic check must recheck after acquiring this same lock.
         let pending = self.with_engine_mut(|engine| {
-            if active
-                && engine
-                    .reporter_has_history()
-                    .map_err(p2p_queries::storage_error)?
-            {
+            if active && engine.reporter_has_history().map_err(storage_error)? {
                 return Err(SyncBackendError::NotAvailable(
                     "reporter must follow every append while retained evidence needs path updates"
                         .into(),
@@ -511,7 +488,7 @@ where
             authenticate(verifier.as_ref(), &spec, &candidate, future)
         })
         .await
-        .map_err(p2p_queries::storage_error)??;
+        .map_err(storage_error)??;
         self.persist_bootstrap_download(pending)?;
         let items = self.state_download_items(root)?;
         if items.is_empty() {
@@ -557,12 +534,10 @@ where
                     for (key, _) in engine
                         .store()
                         .db()
-                        .iter_column(Column::Meta)
-                        .map_err(p2p_queries::storage_error)?
+                        .iter_prefix(Column::Meta, &prefix)
+                        .map_err(storage_error)?
                     {
-                        if key.starts_with(&prefix) {
-                            batch.delete(Column::Meta, key);
-                        }
+                        batch.delete(Column::Meta, key);
                     }
                     batch.delete(
                         Column::Meta,
@@ -573,12 +548,12 @@ where
             batch.put(
                 Column::Meta,
                 PENDING_KEY,
-                borsh::to_vec(&pending).map_err(p2p_queries::storage_error)?,
+                borsh::to_vec(&pending).map_err(storage_error)?,
             );
             engine
                 .store_mut()
                 .write_observed_batch(batch, true)
-                .map_err(p2p_queries::storage_error)?;
+                .map_err(storage_error)?;
             runtime.pending = Some(pending);
             drop(guard);
             Ok(())
@@ -586,9 +561,7 @@ where
     }
 
     pub(super) async fn finish_bootstrap(&self) -> Result<(), SyncBackendError> {
-        self.pause_history_jobs()
-            .await
-            .map_err(p2p_queries::storage_error)?;
+        self.pause_history_jobs().await.map_err(storage_error)?;
         let (pending, future) = {
             let guard = self.bootstrap.lock().expect("bootstrap runtime");
             let runtime = guard
@@ -611,7 +584,7 @@ where
             authenticate(verifier.as_ref(), &spec, &candidate, future)
         })
         .await
-        .map_err(p2p_queries::storage_error)??;
+        .map_err(storage_error)??;
         let root = pending.data.genesis_prefix.statement.end.state_root;
         let trie = self.reconstructed_state(root)?;
         self.with_engine_mut(|engine| {
@@ -631,7 +604,7 @@ where
             *self.bootstrap.lock().expect("bootstrap runtime") = None;
             Ok(())
         })?;
-        self.refresh_reporter_tracking();
+        self.after_chunk_finality(false);
         self.resume_history_jobs();
         Ok(())
     }
@@ -653,41 +626,41 @@ where
             let header = engine
                 .store()
                 .get_header(&boundary.block_hash)
-                .map_err(p2p_queries::storage_error)?
+                .map_err(storage_error)?
                 .ok_or_else(|| {
                     SyncBackendError::NotAvailable("bootstrap anchor header unavailable".into())
                 })?;
             let validators = engine
                 .store()
                 .get_validator_set_snapshot(boundary.next_chunk_id)
-                .map_err(p2p_queries::storage_error)?
+                .map_err(storage_error)?
                 .ok_or_else(|| {
                     SyncBackendError::NotAvailable("bootstrap validator context unavailable".into())
                 })?;
             let frontier = engine
                 .store()
                 .history_frontier(boundary.next_chunk_id)
-                .map_err(p2p_queries::storage_error)?;
-            let recent = (boundary.next_chunk_id.saturating_sub(8)..boundary.next_chunk_id)
+                .map_err(storage_error)?;
+            let first = boundary
+                .next_chunk_id
+                .saturating_sub(HISTORY_RETENTION_CHUNKS);
+            let recent = (first..boundary.next_chunk_id)
                 .map(|id| {
                     let opening = engine
                         .store()
                         .historical_opening(id, boundary.next_chunk_id)
-                        .map_err(p2p_queries::storage_error)?;
-                    BoundedBytes::new(borsh::to_vec(&opening).map_err(p2p_queries::storage_error)?)
+                        .map_err(storage_error)?;
+                    BoundedBytes::new(borsh::to_vec(&opening).map_err(storage_error)?)
                         .map_err(rejected)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let data = BootstrapData::new(prefix, header, validators, frontier, recent)
-                .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                .map_err(not_available)?;
             validate_data(&data)?;
             engine
                 .store_mut()
-                .pin_state_snapshot(
-                    boundary.state_root,
-                    now().map_err(p2p_queries::storage_error)?,
-                )
-                .map_err(|error| SyncBackendError::NotAvailable(error.to_string()))?;
+                .pin_state_snapshot(boundary.state_root, now().map_err(storage_error)?)
+                .map_err(not_available)?;
             Ok(data)
         })
     }

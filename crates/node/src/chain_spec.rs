@@ -369,24 +369,11 @@ pub(crate) fn decode_hex_exact<const N: usize>(
         });
     }
     let mut out = [0_u8; N];
-    for (idx, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
-        let high = parse_hex_nibble(chunk[0], field)?;
-        let low = parse_hex_nibble(chunk[1], field)?;
-        out[idx] = (high << 4) | low;
-    }
+    hex::decode_to_slice(trimmed, &mut out).map_err(|error| ChainSpecError::Hex {
+        field: field.to_owned(),
+        reason: error.to_string(),
+    })?;
     Ok(out)
-}
-
-fn parse_hex_nibble(byte: u8, field: &str) -> Result<u8, ChainSpecError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(ChainSpecError::Hex {
-            field: field.to_owned(),
-            reason: format!("invalid hex digit: {:?}", char::from(byte)),
-        }),
-    }
 }
 
 #[cfg(test)]

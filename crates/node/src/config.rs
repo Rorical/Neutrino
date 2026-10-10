@@ -431,26 +431,32 @@ pub struct RpcConfigToml {
     pub runtime_call_timeout_ms: u64,
 }
 
-const fn default_max_connections() -> u32 {
-    200
+// Defaults come from the RPC crate so the TOML mirror cannot drift from it.
+fn default_max_connections() -> u32 {
+    neutrino_rpc::RpcConfig::default().max_connections
 }
-const fn default_max_request_body_size() -> u32 {
-    10 * 1024 * 1024
+fn default_max_request_body_size() -> u32 {
+    neutrino_rpc::RpcConfig::default().max_request_body_size
 }
-const fn default_max_response_body_size() -> u32 {
-    15 * 1024 * 1024
+fn default_max_response_body_size() -> u32 {
+    neutrino_rpc::RpcConfig::default().max_response_body_size
 }
-const fn default_max_concurrent_requests() -> u32 {
-    64
+fn default_max_concurrent_requests() -> u32 {
+    neutrino_rpc::RpcConfig::default().max_concurrent_requests
 }
-const fn default_requests_per_second() -> u32 {
-    50
+fn default_requests_per_second() -> u32 {
+    neutrino_rpc::RpcConfig::default().requests_per_second_per_connection
 }
-const fn default_max_batch_requests() -> u32 {
-    16
+fn default_max_batch_requests() -> u32 {
+    neutrino_rpc::RpcConfig::default().max_batch_requests
 }
-const fn default_runtime_call_timeout_ms() -> u64 {
-    2000
+fn default_runtime_call_timeout_ms() -> u64 {
+    u64::try_from(
+        neutrino_rpc::RpcConfig::default()
+            .runtime_call_timeout
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 impl RpcConfigToml {

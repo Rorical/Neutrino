@@ -1,21 +1,26 @@
 //! Original signed source availability and delayed offence detection.
 
-use super::ChainBackend;
+use super::{ChainBackend, reporter_retention, storage_error};
 use neutrino_consensus_types::signed_artifacts::{
     SignedArtifact, SignedArtifactInventory, SignedArtifactKind, SignedArtifactRef,
 };
-use neutrino_consensus_types::{FinalityVote, SlashingEvidence};
+use neutrino_consensus_types::{BlockProof, FinalityVote, SlashingEvidence};
 use neutrino_network::{
     Topic,
     rpc::{SignedArtifactByIdResponse, SignedArtifactInventoryByChunkResponse},
-    service::NetworkCommand,
 };
-use neutrino_primitives::{ChunkId, Hash};
+use neutrino_primitives::{ChunkId, Hash, blake3_256};
 use neutrino_proof_system::ProofSystem;
 use neutrino_storage::Database;
 use neutrino_sync::{EvidenceProofAcceptance, SyncBackendError};
 
 type Rejection = neutrino_consensus_types::ProofRejectionReason;
+
+/// Source identity of a block proof, equal to its `SignedArtifact::BlockProof`
+/// id: the untagged BLAKE3 of the canonical envelope, computed without a copy.
+pub(super) fn block_proof_source_id(proof: &BlockProof) -> Hash {
+    blake3_256(&borsh::to_vec(proof).expect("canonical block proof envelope"))
+}
 
 fn deduplicate_source_votes(votes: &mut Vec<FinalityVote>) {
     let mut seen = std::collections::BTreeSet::new();
@@ -132,7 +137,6 @@ where
 {
     pub(super) fn begin_block_verdict(&self, source: Hash) -> VerdictToken {
         let program = self.block_program();
-        let chain_spec = self.with_engine(|engine| engine.chain_spec().hash());
         let generation = self
             .availability_verdicts
             .lock()
@@ -140,27 +144,37 @@ where
             .generation;
         VerdictToken {
             program,
-            chain_spec,
+            chain_spec: self.chain_spec_hash,
             source,
             generation,
         }
     }
 
+    /// Current verdict for `source`, read under one cache lock.
     pub(super) fn cached_block_verdict(&self, source: Hash) -> Option<ProofVerdict> {
-        let token = self.begin_block_verdict(source);
-        self.cached_block_verdict_at(token)
+        let program = self.block_program();
+        let cache = self
+            .availability_verdicts
+            .lock()
+            .expect("availability verdict cache");
+        let token = VerdictToken {
+            program,
+            chain_spec: self.chain_spec_hash,
+            source,
+            generation: cache.generation,
+        };
+        cache.get(token, program, self.chain_spec_hash)
     }
 
     pub(super) fn cached_block_verdict_at(&self, token: VerdictToken) -> Option<ProofVerdict> {
         let program = self.block_program();
-        let chain_spec = self.with_engine(|engine| engine.chain_spec().hash());
-        // Scope reads release the Engine lock before taking the cache lock.
-        // Bootstrap holds Engine while invalidating this generation, so a reset
-        // between these reads and lookup cannot return a prior trust verdict.
+        // Bootstrap invalidates this generation while holding the Engine lock,
+        // so a reset between token creation and lookup cannot return a prior
+        // trust verdict.
         self.availability_verdicts
             .lock()
             .expect("availability verdict cache")
-            .get(token, program, chain_spec)
+            .get(token, program, self.chain_spec_hash)
     }
 
     pub(super) fn remember_block_verdict(
@@ -169,11 +183,10 @@ where
         verdict: ProofVerdict,
     ) -> bool {
         let program = self.block_program();
-        let chain_spec = self.with_engine(|engine| engine.chain_spec().hash());
         self.availability_verdicts
             .lock()
             .expect("availability verdict cache")
-            .remember(token, program, chain_spec, verdict)
+            .remember(token, program, self.chain_spec_hash, verdict)
     }
 
     pub(super) fn reset_block_verdicts(&self) {
@@ -187,22 +200,18 @@ where
     pub(super) fn availability_source_known(&self, chunk_id: ChunkId) -> bool {
         self.with_engine(|engine| {
             let next = engine.finalized_next_chunk_id();
-            chunk_id == next
-                || (engine.retention_info().is_ok_and(|info| {
-                    info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
-                }) && engine
+            if chunk_id == next {
+                return true;
+            }
+            let retained = reporter_retention(engine)
+                || neutrino_consensus_types::history::is_recent_history_index(chunk_id, next);
+            retained
+                && engine
                     .store()
                     .historical_chunk(chunk_id)
                     .ok()
                     .flatten()
-                    .is_some())
-                || (neutrino_consensus_types::history::is_recent_history_index(chunk_id, next)
-                    && engine
-                        .store()
-                        .historical_chunk(chunk_id)
-                        .ok()
-                        .flatten()
-                        .is_some())
+                    .is_some()
         })
     }
 
@@ -215,7 +224,7 @@ where
             engine
                 .store()
                 .signed_artifact(&id)
-                .map_err(|error| SyncBackendError::Storage(error.to_string()))?
+                .map_err(storage_error)?
                 .map(|(_, artifact)| SignedArtifactByIdResponse { artifact })
                 .ok_or_else(|| SyncBackendError::NotAvailable("signed source unavailable".into()))
         })
@@ -231,7 +240,7 @@ where
             engine
                 .store()
                 .signed_artifact_inventory(chunk_id, after)
-                .map_err(|error| SyncBackendError::Storage(error.to_string()))
+                .map_err(storage_error)
         })
     }
 
@@ -249,23 +258,20 @@ where
         artifact: SignedArtifact,
     ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
-        if self.light_checkpoint().is_some() || self.bootstrap_pending() {
+        if self.is_light() || self.bootstrap_pending() {
             return Deferred;
         }
-        let Some(source) =
+        let Some(chunk_id) =
             self.with_engine(|engine| artifact.chunk_id(engine.chain_spec().consensus.chunk_size))
         else {
             return Rejected;
         };
-        if !self.availability_source_known(source) {
+        if !self.availability_source_known(chunk_id) {
             return Deferred;
         }
+        let id = artifact.id();
         if self
-            .with_engine(|engine| {
-                engine
-                    .store()
-                    .signed_artifact_metadata_by_id(&artifact.id())
-            })
+            .with_engine(|engine| engine.store().signed_artifact_metadata_by_id(&id))
             .ok()
             .flatten()
             .is_some()
@@ -276,15 +282,10 @@ where
             return Rejected;
         }
         if let SignedArtifact::BlockProof(proof) = &artifact
-            && self.signed_proof_verdict(proof).await.is_none()
+            && self.signed_proof_verdict_for(proof, id).await.is_none()
         {
             return Deferred;
         }
-        let chunk =
-            self.with_engine(|engine| artifact.chunk_id(engine.chain_spec().consensus.chunk_size));
-        let Some(chunk_id) = chunk else {
-            return Rejected;
-        };
         let retained = self.with_live_engine_mut(|engine| {
             match &artifact {
                 SignedArtifact::Vote(vote) => engine.retain_signed_vote(vote),
@@ -292,7 +293,7 @@ where
                 SignedArtifact::BlockProof(proof) => engine.retain_signed_proof(proof),
                 other => engine.retain_signed_artifact(other, false),
             }
-            .map_err(Self::map_store_err)
+            .map_err(storage_error)
         });
         if retained.is_err() {
             return Deferred;
@@ -301,15 +302,18 @@ where
             for claim in &vote.attestations {
                 if let Some(quorum) = &claim.unlock_quorum {
                     let _ = self.with_live_engine_mut(|engine| {
-                        engine
-                            .retain_signed_quorum(quorum)
-                            .map_err(Self::map_store_err)
+                        engine.retain_signed_quorum(quorum).map_err(storage_error)
                     });
                 }
             }
         }
-        self.observe_signed_source_accountability(&artifact).await;
-        self.publish_signed_inventory(chunk_id, vec![artifact.reference()])
+        self.observe_signed_source_accountability(&artifact, id, Some(chunk_id))
+            .await;
+        let reference = SignedArtifactRef {
+            id,
+            kind: artifact.kind(),
+        };
+        self.publish_signed_inventory(chunk_id, vec![reference])
             .await;
         Accepted
     }
@@ -421,16 +425,17 @@ where
                 .with_live_engine_mut(|engine| {
                     engine
                         .retain_signed_artifact(&artifact, true)
-                        .map_err(Self::map_store_err)
+                        .map_err(storage_error)
                 })
                 .is_err()
             {
                 return false;
             }
-            self.observe_signed_source_accountability(&artifact).await;
+            let reference = artifact.reference();
+            self.observe_signed_source_accountability(&artifact, reference.id, chunk)
+                .await;
             if let Some(chunk) = chunk {
-                self.publish_signed_inventory(chunk, vec![artifact.reference()])
-                    .await;
+                self.publish_signed_inventory(chunk, vec![reference]).await;
             }
             true
         } else {
@@ -440,11 +445,13 @@ where
 
     /// Cache only exact current-backend proof verdicts. Restart starts with an
     /// empty cache; operational failures never become rejection evidence.
-    async fn signed_proof_verdict(
-        &self,
-        proof: &neutrino_consensus_types::BlockProof,
-    ) -> Option<ProofVerdict> {
-        let id = SignedArtifact::BlockProof(proof.clone()).id();
+    pub(super) async fn signed_proof_verdict(&self, proof: &BlockProof) -> Option<ProofVerdict> {
+        self.signed_proof_verdict_for(proof, block_proof_source_id(proof))
+            .await
+    }
+
+    /// [`Self::signed_proof_verdict`] for a proof whose source `id` is known.
+    async fn signed_proof_verdict_for(&self, proof: &BlockProof, id: Hash) -> Option<ProofVerdict> {
         let token = self.begin_block_verdict(id);
         if let Some(verdict) = self.cached_block_verdict_at(token) {
             return Some(verdict);
@@ -468,27 +475,44 @@ where
             .then_some(verdict)
     }
 
+    /// A rejected proof envelope retained under `hash`, with its reason.
+    async fn rejected_signed_proof(&self, hash: Hash) -> Option<(BlockProof, Rejection)> {
+        if self.cached_block_verdict(hash) == Some(ProofVerdict::Valid) {
+            return None;
+        }
+        let Some((_, SignedArtifact::BlockProof(proof))) = self
+            .with_engine(|engine| engine.store().signed_artifact(&hash))
+            .ok()
+            .flatten()
+        else {
+            return None;
+        };
+        match self.signed_proof_verdict(&proof).await {
+            Some(ProofVerdict::Rejected(reason)) => Some((proof, reason)),
+            _ => None,
+        }
+    }
+
     async fn detect_signed_proof_offences(
         &self,
         votes: Vec<FinalityVote>,
     ) -> Vec<SlashingEvidence> {
+        // Each declared proof is classified once, however many claims cite it.
+        let mut rejections = std::collections::BTreeMap::<Hash, _>::new();
+        for hash in votes
+            .iter()
+            .flat_map(|vote| &vote.attestations)
+            .flat_map(|claim| &claim.proof_hashes)
+        {
+            if let std::collections::btree_map::Entry::Vacant(entry) = rejections.entry(*hash) {
+                entry.insert(self.rejected_signed_proof(*hash).await);
+            }
+        }
         let mut evidence = Vec::new();
-        for vote in votes {
+        for vote in &votes {
             for claim in &vote.attestations {
                 for hash in &claim.proof_hashes {
-                    if self.cached_block_verdict(*hash) == Some(ProofVerdict::Valid) {
-                        continue;
-                    }
-                    let Some((_, SignedArtifact::BlockProof(proof))) = self
-                        .with_engine(|engine| engine.store().signed_artifact(hash))
-                        .ok()
-                        .flatten()
-                    else {
-                        continue;
-                    };
-                    let Some(ProofVerdict::Rejected(reason)) =
-                        self.signed_proof_verdict(&proof).await
-                    else {
+                    let Some(Some((proof, reason))) = rejections.get(hash) else {
                         continue;
                     };
                     let indexed = neutrino_consensus_types::IndexedVote {
@@ -499,8 +523,8 @@ where
                         validator_index: claim.validator_index,
                         vote: indexed,
                         attestation: claim.clone(),
-                        rejected_proof: proof,
-                        reason,
+                        rejected_proof: proof.clone(),
+                        reason: *reason,
                     };
                     if self
                         .with_engine(|engine| engine.verify_slashing_evidence(&item))
@@ -514,53 +538,46 @@ where
         evidence
     }
 
-    async fn observe_signed_source_accountability(&self, artifact: &SignedArtifact) {
+    /// Report offences an accepted source establishes. `id` is the artifact's
+    /// identity and `chunk` its source chunk, both already derived by the caller.
+    async fn observe_signed_source_accountability(
+        &self,
+        artifact: &SignedArtifact,
+        id: Hash,
+        chunk: Option<ChunkId>,
+    ) {
         let mut evidence = self
             .with_engine_mut(|engine| engine.observe_signed_artifact(artifact))
             .unwrap_or_default();
-        let votes =
-            match artifact {
-                SignedArtifact::Vote(vote) => vec![vote.clone()],
-                SignedArtifact::BlockProof(_) => {
-                    let id = artifact.id();
-                    let metadata = self
-                        .with_engine(|engine| {
-                            let chunk = artifact
-                                .chunk_id(engine.chain_spec().consensus.chunk_size)
-                                .ok_or(neutrino_consensus_engine::StoreError::Corrupt(
-                                    "proof source range",
-                                ))?;
-                            engine.store().signed_artifact_metadata_for_chunk(chunk)
-                        })
-                        .unwrap_or_default();
-                    let mut votes = Vec::new();
-                    for item in metadata.into_iter().filter(|item| {
-                        item.kind == SignedArtifactKind::Vote && item.proof_hashes.contains(&id)
-                    }) {
-                        if let Some((_, SignedArtifact::Vote(vote))) = self
-                            .with_engine(|engine| engine.store().signed_artifact(&item.id))
-                            .ok()
-                            .flatten()
-                        {
-                            votes.push(vote);
-                        }
+        let votes = match (artifact, chunk) {
+            (SignedArtifact::Vote(vote), _) => vec![vote.clone()],
+            (SignedArtifact::BlockProof(_), Some(chunk)) => {
+                let metadata = self
+                    .with_engine(|engine| engine.store().signed_artifact_metadata_for_chunk(chunk))
+                    .unwrap_or_default();
+                let mut votes = Vec::new();
+                for item in metadata.into_iter().filter(|item| {
+                    item.kind == SignedArtifactKind::Vote && item.proof_hashes.contains(&id)
+                }) {
+                    if let Some((_, SignedArtifact::Vote(vote))) = self
+                        .with_engine(|engine| engine.store().signed_artifact(&item.id))
+                        .ok()
+                        .flatten()
+                    {
+                        votes.push(vote);
                     }
-                    if let Some(chunk) = self.with_engine(|engine| {
-                        artifact.chunk_id(engine.chain_spec().consensus.chunk_size)
-                    }) {
-                        votes.extend(self.reporter_source_votes(chunk).into_iter().filter(
-                            |vote| {
-                                vote.attestations
-                                    .iter()
-                                    .any(|claim| claim.proof_hashes.contains(&id))
-                            },
-                        ));
-                    }
-                    deduplicate_source_votes(&mut votes);
-                    votes
                 }
-                _ => Vec::new(),
-            };
+                let reporter = self.reporter_source_votes(chunk);
+                votes.extend(reporter.into_iter().filter(|vote| {
+                    vote.attestations
+                        .iter()
+                        .any(|claim| claim.proof_hashes.contains(&id))
+                }));
+                deduplicate_source_votes(&mut votes);
+                votes
+            }
+            _ => Vec::new(),
+        };
         evidence.extend(self.detect_signed_proof_offences(votes).await);
         for item in evidence {
             self.pool_and_gossip_slashing(item).await;
@@ -590,9 +607,7 @@ where
             }
         }
         let reporter_chunks = self.with_engine(|engine| {
-            if engine.retention_info().is_ok_and(|info| {
-                info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
-            }) {
+            if reporter_retention(engine) {
                 engine.store().reporter_history_chunks().unwrap_or_default()
             } else {
                 Vec::new()
@@ -610,9 +625,7 @@ where
 
     fn reporter_source_votes(&self, chunk: ChunkId) -> Vec<FinalityVote> {
         self.with_engine(|engine| {
-            if !engine.retention_info().is_ok_and(|info| {
-                info.policy == neutrino_consensus_engine::RetentionPolicy::Reporter
-            }) {
+            if !reporter_retention(engine) {
                 return Vec::new();
             }
             engine
@@ -632,12 +645,11 @@ where
     /// Invalid imports still need the backend's exact objective rejection classifier.
     pub(super) async fn retain_imported_proof_source(
         &self,
-        proof: &neutrino_consensus_types::BlockProof,
+        proof: &BlockProof,
         accepted: bool,
         token: VerdictToken,
     ) {
-        let id = SignedArtifact::BlockProof(proof.clone()).id();
-        if token.source != id
+        if token.source != block_proof_source_id(proof)
             || (accepted && !self.remember_block_verdict(token, ProofVerdict::Valid))
         {
             return;
@@ -652,7 +664,7 @@ where
 
     /// Exact pointer replacement after accepted receipt import avoids duplicating
     /// valid compressed proofs in the detached accountability source store.
-    pub(super) fn compact_available_proof(&self, proof: &neutrino_consensus_types::BlockProof) {
+    pub(super) fn compact_available_proof(&self, proof: &BlockProof) {
         let _ = self.with_engine_mut(|engine| engine.store_mut().compact_accepted_artifact(proof));
     }
 
@@ -697,22 +709,12 @@ where
         entries.sort_by_key(|entry| entry.id);
         entries.dedup_by_key(|entry| entry.id);
         entries.truncate(neutrino_consensus_types::signed_artifacts::MAX_ARTIFACT_INVENTORY);
-        let Some(publisher) = self.publisher_snapshot() else {
-            return;
-        };
-        let Ok(data) = borsh::to_vec(&SignedArtifactInventory {
+        let inventory = SignedArtifactInventory {
             chunk_id,
             entries,
             next: None,
-        }) else {
-            return;
         };
-        let _ = publisher
-            .send(NetworkCommand::Publish {
-                topic: Topic::SignedArtifacts,
-                data,
-            })
-            .await;
+        self.publish(Topic::SignedArtifacts, &inventory).await;
     }
 }
 

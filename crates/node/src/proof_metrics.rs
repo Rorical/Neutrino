@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::metrics::{LatencyHistogram, StageMetrics, counter, family, gauge};
+use crate::metrics::{LatencyHistogram, StageMetrics, counter, family, gauge, labeled, loads};
 use crate::proving_budget::ProvingPriority;
 
 /// Optional early-fact groups queued before producers drop new work.
@@ -386,55 +386,39 @@ impl ProofMetrics {
     }
 
     fn render_outcomes(&self, out: &mut String) {
-        family(
+        labeled(
             out,
             "neutrino_evidence_report_import_total",
             "Incoming report admission attempts, independent of receipt verification.",
             "counter",
+            "outcome",
+            ["accepted", "rejected", "deferred"]
+                .into_iter()
+                .zip(loads(&self.evidence_outcomes)),
         );
-        for (outcome, counter) in ["accepted", "rejected", "deferred"]
-            .into_iter()
-            .zip(&self.evidence_outcomes)
-        {
-            let _ = writeln!(
-                out,
-                "neutrino_evidence_report_import_total{{outcome=\"{outcome}\"}} {}",
-                counter.load(Ordering::Relaxed)
-            );
-        }
-        family(
+        labeled(
             out,
             "neutrino_evidence_local_install_total",
             "Locally proven receipt installation attempts.",
             "counter",
+            "outcome",
+            ["inserted", "existing", "rejected", "deferred"]
+                .into_iter()
+                .zip(loads(&self.local_evidence_outcomes)),
         );
-        for (outcome, counter) in ["inserted", "existing", "rejected", "deferred"]
-            .into_iter()
-            .zip(&self.local_evidence_outcomes)
-        {
-            let _ = writeln!(
-                out,
-                "neutrino_evidence_local_install_total{{outcome=\"{outcome}\"}} {}",
-                counter.load(Ordering::Relaxed)
-            );
-        }
-        family(
+        labeled(
             out,
             "neutrino_fact_queue_dropped_total",
             "Optional fact groups not enqueued by reason.",
             "counter",
+            "reason",
+            [
+                ("full", &self.fact_dropped_full),
+                ("closed", &self.fact_dropped_closed),
+                ("oversize", &self.fact_dropped_oversize),
+            ]
+            .map(|(reason, value)| (reason, value.load(Ordering::Relaxed))),
         );
-        for (reason, counter) in [
-            ("full", &self.fact_dropped_full),
-            ("closed", &self.fact_dropped_closed),
-            ("oversize", &self.fact_dropped_oversize),
-        ] {
-            let _ = writeln!(
-                out,
-                "neutrino_fact_queue_dropped_total{{reason=\"{reason}\"}} {}",
-                counter.load(Ordering::Relaxed)
-            );
-        }
         counter(
             out,
             "neutrino_evidence_worker_busy_total",

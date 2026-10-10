@@ -43,3 +43,10 @@ pub use runner::{NodeError, run};
 mod proof_queue;
 mod proving_budget;
 pub(crate) mod supervision;
+
+/// Wall-clock Unix time in whole seconds; a clock before the epoch reads zero.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}

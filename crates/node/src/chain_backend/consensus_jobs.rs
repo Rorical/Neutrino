@@ -1,7 +1,8 @@
 //! Event-driven complete proving with exact BFT quorum fencing.
 
-use super::{BftQuorumIdentity, ChainBackend, ProposerKey, SyncBackendError};
-use neutrino_network::{Topic, service::NetworkCommand};
+use super::{BftQuorumIdentity, ChainBackend, ProposerKey, SyncBackendError, rejected};
+use crate::proof_metrics::ProofStage;
+use neutrino_network::Topic;
 use neutrino_proof_system::{ProofError, ProofSystem};
 use neutrino_storage::Database;
 use std::sync::Arc;
@@ -59,10 +60,10 @@ where
             }
             let mut prepared = engine
                 .prepare_bft_consensus_chunk(identity.chunk_id, self.proof_system.as_ref())
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+                .map_err(rejected)?;
             engine
                 .certify_consensus_chunk(&mut prepared, voter)
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+                .map_err(rejected)?;
             if engine.bft_quorum_identity(identity.chunk_id) != Some(identity) {
                 return Err(SyncBackendError::NotAvailable(
                     "BFT quorum changed before launch".into(),
@@ -87,10 +88,10 @@ where
             .chunk_backlog
             .track(prepared.witness.blocks.len());
         let (tx, rx) = oneshot::channel();
-        self.spawn_background_job("consensus-proof", async move {
+        self.spawn_supervised("consensus-proof", false, async move {
             let result = tokio::task::spawn_blocking(move || {
                 drop(pending);
-                let _permit = budget.acquire(crate::proof_metrics::ProofStage::Chunk);
+                let _permit = budget.acquire(ProofStage::Chunk);
                 if engine
                     .lock()
                     .expect("engine mutex poisoned")
@@ -100,7 +101,7 @@ where
                     return Err(ProofError::InvalidWitness);
                 }
                 let proof = metrics
-                    .chunk_proofs
+                    .proof_stage(ProofStage::Chunk)
                     .time(|| prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness));
                 if proof.is_ok()
                     && let Some((covered, total)) = prover.last_chunk_fact_coverage()
@@ -138,10 +139,7 @@ where
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             clock.tick().await;
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |time| time.as_secs());
-            self.tick_bft_round_timeouts(now_secs).await;
+            self.tick_bft_round_timeouts(crate::now_secs()).await;
         }
     }
 
@@ -194,28 +192,16 @@ where
                     self.proof_system.as_ref(),
                     executor.as_deref(),
                 )
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+                .map_err(rejected)?;
             self.record_finalized_execution(engine, identity.chunk_id);
             Ok(outcome)
         });
         match outcome {
             Ok(outcome) => {
-                self.refresh_reporter_tracking();
+                // Evidence scheduling refreshes reporter retention first.
                 self.start_evidence_jobs();
                 self.start_history_jobs();
-                if let Some(publisher) = self.publisher_snapshot() {
-                    match borsh::to_vec(&outcome.chunk_proof) {
-                        Ok(data) => {
-                            let _ = publisher
-                                .send(NetworkCommand::Publish {
-                                    topic: Topic::ChunkProofs,
-                                    data,
-                                })
-                                .await;
-                        }
-                        Err(error) => warn!(?identity, %error, "chunk proof encoding failed"),
-                    }
-                }
+                self.publish(Topic::ChunkProofs, &outcome.chunk_proof).await;
             }
             Err(error) => warn!(?identity, %error, "complete chunk commit rejected"),
         }

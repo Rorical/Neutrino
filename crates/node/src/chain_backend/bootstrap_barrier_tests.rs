@@ -252,7 +252,7 @@ async fn bootstrap_rechecks_reporter_history_created_by_an_admitted_source_write
                 resume_rx.recv().unwrap();
                 engine
                     .retain_signed_artifact(&source, false)
-                    .map_err(ChainBackend::<MemoryDatabase, MockProofSystem>::map_store_err)
+                    .map_err(super::super::storage_error)
             })
             .unwrap()
     });

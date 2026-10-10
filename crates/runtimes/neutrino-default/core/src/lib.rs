@@ -111,7 +111,8 @@ pub enum ReceiptStatus {
     /// Sender lacked the balance / stake to satisfy the transaction.
     /// Folds in "no validator to slash / exit" because the
     /// semantically-equivalent condition is "validator has zero stake
-    /// to deduct."
+    /// to deduct", and a stake, unstake, deposit or registration of a
+    /// zero amount, which has nothing to move.
     InsufficientBalance,
     /// The transaction was skipped pre-flight because including it
     /// would push the block's running `gas_used` past
@@ -184,7 +185,9 @@ pub struct Receipt {
     /// Gas the transaction actually consumed. Equals [`tx_gas`] of
     /// the matching transaction on success, `0` on failure.
     pub gas_used: u64,
-    /// [`tx_kind_code`] of the matching transaction.
+    /// [`tx_kind_code`] of the matching transaction, or
+    /// [`accountability::SANCTION_RECEIPT_KIND`] for a mandatory sanction
+    /// execution.
     pub kind: u8,
 }
 
@@ -370,7 +373,8 @@ pub struct StfPublicOutput {
 ///
 /// Receipts:
 ///
-/// - Mandatory queue executions emit kind-8 receipts first. The STF then
+/// - Mandatory queue executions emit receipts of kind
+///   [`accountability::SANCTION_RECEIPT_KIND`] first. The STF then
 ///   emits one [`Receipt`] per transaction (in canonical
 ///   order), with `status_code = 0` on success, `1` on either soft
 ///   rejection or gas-overflow drop. `gas_used` reflects the gas

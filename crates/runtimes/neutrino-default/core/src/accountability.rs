@@ -28,11 +28,13 @@ pub const QUEUE_KEY: &[u8] = b"accountability:queue:v1";
 pub const GAS_EVIDENCE_ADMISSION: u64 = 10_000;
 /// Absolute allocation bound, independent of a hostile claimed policy.
 pub const MAX_PENDING: u32 = 4096;
-/// Receipt kind of a mandatory sanction execution. The value is committed by
-/// the receipts root; it coincides with the transaction kind code of
-/// `ProposeUpgrade`, but mandatory receipts always precede the transaction
-/// receipts.
-pub(crate) const SANCTION_RECEIPT_KIND: u8 = 8;
+/// Receipt kind of a mandatory sanction execution, committed by the receipts
+/// root.
+///
+/// The value is reserved outside the [`tx_kind_code`](crate::tx_kind_code)
+/// range, so a receipt's kind alone tells a sanction execution from every
+/// transaction kind; the next transaction kind takes the following value.
+pub const SANCTION_RECEIPT_KIND: u8 = 11;
 
 /// Minimal proven sanction consumed by chunk validator rotation.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -189,40 +191,103 @@ impl BorshSerialize for Encoded<'_> {
     }
 }
 
-/// Check input shape before any writes; receipt authenticity is an outer-shell
-/// obligation and is never inferred from an input boolean.
-#[must_use]
-pub fn validate_input(input: &StfInput) -> ValidatedInput<'_> {
-    assert!(
-        input.evidence_anchor.is_well_formed(),
-        "invalid accountability anchor"
-    );
+/// Why a block input violates the accountability input rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputError {
+    /// The evidence anchor is not well formed.
+    Anchor,
+    /// An evidence admission follows an ordinary transaction.
+    Order,
+    /// An evidence submission does not bind this chain, height and anchor.
+    Binding,
+    /// More evidence admissions than the pending queue can hold.
+    Cap,
+}
+
+impl InputError {
+    /// Fixed description, also the Guest's panic message.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Anchor => "invalid accountability anchor",
+            Self::Order => "evidence admissions must precede ordinary transactions",
+            Self::Binding => "evidence binding",
+            Self::Cap => "evidence admission cap",
+        }
+    }
+}
+
+/// Check a block's evidence admissions without panicking.
+///
+/// The anchor must be well formed, evidence submissions must form the
+/// transaction prefix, each must bind this chain, height and anchor, and
+/// their number must not exceed the pending cap.
+///
+/// Native callers that face peer input use this; a panic there aborts the
+/// node under the release profile instead of rejecting the block.
+///
+/// # Errors
+/// Returns the first violated rule, in the order listed above.
+pub fn check_admissions(
+    chain_id: u64,
+    block_height: u64,
+    anchor: &EvidenceAnchor,
+    transactions: &[Transaction],
+) -> Result<(), InputError> {
+    if !anchor.is_well_formed() {
+        return Err(InputError::Anchor);
+    }
     let mut ordinary = false;
     let mut count = 0_u32;
-    for tx in &input.transactions {
+    for tx in transactions {
         match tx {
             Transaction::SubmitEvidence(submission) => {
-                assert!(
-                    !ordinary,
-                    "evidence admissions must precede ordinary transactions"
-                );
-                assert!(
-                    submission.binds(input.chain_id, input.block_height, &input.evidence_anchor),
-                    "evidence binding"
-                );
-                count = count.checked_add(1).expect("bounded evidence count");
+                if ordinary {
+                    return Err(InputError::Order);
+                }
+                if !submission.binds(chain_id, block_height, anchor) {
+                    return Err(InputError::Binding);
+                }
+                count = count.checked_add(1).ok_or(InputError::Cap)?;
             }
             _ => ordinary = true,
         }
     }
-    assert!(count <= MAX_PENDING, "evidence admission cap");
-    ValidatedInput { input }
+    if count > MAX_PENDING {
+        return Err(InputError::Cap);
+    }
+    Ok(())
+}
+
+/// Fallible [`validate_input`] for native callers.
+///
+/// # Errors
+/// Returns the first input rule [`check_admissions`] finds violated.
+pub fn try_validate_input(input: &StfInput) -> Result<ValidatedInput<'_>, InputError> {
+    check_admissions(
+        input.chain_id,
+        input.block_height,
+        &input.evidence_anchor,
+        &input.transactions,
+    )?;
+    Ok(ValidatedInput { input })
+}
+
+/// Check input shape before any writes; receipt authenticity is an outer-shell
+/// obligation and is never inferred from an input boolean. The Guest relies
+/// on the panic: an invalid input yields no proof.
+///
+/// # Panics
+/// Panics with [`InputError::message`] when [`check_admissions`] fails.
+#[must_use]
+pub fn validate_input(input: &StfInput) -> ValidatedInput<'_> {
+    try_validate_input(input).unwrap_or_else(|error| panic!("{}", error.message()))
 }
 
 /// An immutable input whose policy, evidence ordering and historical bindings
 /// have been checked.
 ///
-/// Only [`validate_input`] can construct this token.
+/// Only [`try_validate_input`] (and [`validate_input`]) can construct this token.
 /// It does not establish receipt authenticity; the execution shell still owns
 /// exact proof verification before invoking the state transition.
 pub struct ValidatedInput<'a> {

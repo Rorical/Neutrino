@@ -1254,6 +1254,55 @@ fn deposit_without_funds_is_rejected() {
 }
 
 #[test]
+fn unstakes_maturing_together_share_one_queue_entry() {
+    // Many unstakes in one block must not grow the queue by one entry each:
+    // with a zero gas price that was a free way to inflate every later
+    // withdrawal, deduction and reporter-status scan of the queue.
+    let alice = signing_key(44);
+    let addr = address_of(&alice);
+    let mut live = LiveTrie::default();
+    live.insert(
+        &account_key(&addr),
+        encode_account(&Account {
+            nonce: 0,
+            balance: 0,
+        }),
+    );
+    seed_validator(&mut live, &addr, 50);
+    let mut set = ValidatorSet::default();
+    set.upsert(addr, 50);
+    live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+
+    let input = StfInput {
+        evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
+        chain_id: CHAIN_ID,
+        block_height: 100,
+        block_gas_limit: TEST_BLOCK_GAS_LIMIT,
+        proposer_address: [0u8; 32],
+        participation: None,
+        transactions: alloc::vec![
+            Transaction::Unstake(signed_unstake(&alice, 10, 0, CHAIN_ID)),
+            Transaction::Unstake(signed_unstake(&alice, 15, 1, CHAIN_ID)),
+            Transaction::Unstake(signed_unstake(&alice, 5, 2, CHAIN_ID)),
+        ],
+    };
+    let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!(host_out.applied, 3);
+
+    let (_, post) = apply_against(&live, &input);
+    assert_eq!(read_validator(&post, &addr).stake, 20);
+    let queue = read_withdrawal_queue(&post, &addr);
+    assert_eq!(
+        queue.entries,
+        alloc::vec![Withdrawal {
+            amount: 30,
+            mature_at_height: 100 + DEFAULT_UNBONDING_DELAY_BLOCKS,
+        }]
+    );
+}
+
+#[test]
 fn unstake_queues_withdrawal_with_unbonding_delay() {
     let alice = signing_key(43);
     let addr = address_of(&alice);
@@ -1842,6 +1891,161 @@ fn receipts_root_distinguishes_success_and_failure() {
     assert_eq!(fail_out.failed, 1);
 }
 
+/// One transaction of every kind. Kind codes ignore signatures and amounts.
+fn one_transaction_of_each_kind() -> Vec<Transaction> {
+    let address = [1; 32];
+    let mut evidence = crate::test_support::evidence_input();
+    let submission = accountability::tests::admission(
+        &mut evidence,
+        1,
+        address,
+        neutrino_consensus_types::evidence::SanctionKind::Slash,
+    );
+    let programs = ProgramSet {
+        runtime_code_hash: [2; 32],
+        execution: neutrino_consensus_types::history_proof::ExecutionPrograms {
+            fact: [3; 8],
+            evidence: [4; 8],
+            block: [5; 8],
+        },
+    };
+    alloc::vec![
+        Transaction::Transfer(TransferTx {
+            from: address,
+            to: address,
+            amount: 1,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::Stake(StakeTx {
+            validator: address,
+            amount: 1,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::Unstake(UnstakeTx {
+            validator: address,
+            amount: 1,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::Deposit(DepositTx {
+            depositor: address,
+            validator: address,
+            amount: 1,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::VoluntaryExit(VoluntaryExitTx {
+            validator: address,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::Withdraw(WithdrawTx {
+            validator: address,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::RegisterValidator(RegisterValidatorTx {
+            depositor: address,
+            validator: address,
+            bls_pubkey: [0; 48],
+            pop_signature: [0; 96],
+            deposit_amount: 1,
+            nonce: 0,
+            signature: [0; 64],
+            validator_signature: [0; 64],
+        }),
+        submission,
+        Transaction::ProposeUpgrade(ProposeUpgradeTx {
+            proposer: address,
+            programs,
+            artifacts: governance::ProgramArtifacts::default(),
+            activate_at_chunk: 1,
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::VoteUpgrade(VoteUpgradeTx {
+            voter: address,
+            proposal_id: [0; 32],
+            nonce: 0,
+            signature: [0; 64],
+        }),
+        Transaction::ProposePolicy(ProposePolicyTx {
+            proposer: address,
+            policy: RuntimePolicy::default(),
+            nonce: 0,
+            signature: [0; 64],
+        }),
+    ]
+}
+
+#[test]
+fn sanction_receipt_kind_is_distinct_from_every_transaction_kind() {
+    // Mandatory sanction receipts used kind 8, the code of `ProposeUpgrade`,
+    // so a receipt's kind did not say what produced it.
+    let mut kinds = alloc::collections::BTreeSet::new();
+    for tx in one_transaction_of_each_kind() {
+        // Exhaustive: a new transaction kind fails to compile until it is
+        // pinned here with its wire code and sampled above.
+        let pinned = match &tx {
+            Transaction::Transfer(_) => 0,
+            Transaction::Stake(_) => 1,
+            Transaction::Unstake(_) => 2,
+            Transaction::Deposit(_) => 3,
+            Transaction::VoluntaryExit(_) => 4,
+            Transaction::Withdraw(_) => 5,
+            Transaction::RegisterValidator(_) => 6,
+            Transaction::SubmitEvidence(_) => 7,
+            Transaction::ProposeUpgrade(_) => 8,
+            Transaction::VoteUpgrade(_) => 9,
+            Transaction::ProposePolicy(_) => 10,
+        };
+        assert_eq!(tx_kind_code(&tx), pinned);
+        assert!(kinds.insert(pinned), "one sample per transaction kind");
+    }
+    assert_eq!(kinds.len(), 11);
+    assert_eq!(accountability::SANCTION_RECEIPT_KIND, 11);
+    assert!(!kinds.contains(&accountability::SANCTION_RECEIPT_KIND));
+}
+
+#[test]
+fn mandatory_sanction_receipt_carries_the_sanction_kind() {
+    let addr = [0x5A; 32];
+    let mut live = LiveTrie::default();
+    seed_validator(&mut live, &addr, 100);
+    let mut set = ValidatorSet::default();
+    set.upsert(addr, 100);
+    live.insert(VALIDATOR_SET_KEY, borsh::to_vec(&set).unwrap());
+    let input = proven_sanction_input(
+        fee_input(alloc::vec![], [0; 32]),
+        &mut live,
+        addr,
+        30,
+        neutrino_consensus_types::evidence::SanctionKind::Slash,
+    );
+    let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!(host_out.accountability.executed.len(), 1);
+    // The execution's receipt precedes the receipt of the admitting
+    // transaction, and the two kinds differ.
+    let admission_kind = tx_kind_code(&input.transactions[0]);
+    assert_ne!(admission_kind, accountability::SANCTION_RECEIPT_KIND);
+    let expected = compute_receipts_root(&[
+        Receipt {
+            status_code: ReceiptStatus::Success.as_u32(),
+            gas_used: GAS_SANCTION,
+            kind: accountability::SANCTION_RECEIPT_KIND,
+        },
+        Receipt {
+            status_code: ReceiptStatus::Success.as_u32(),
+            gas_used: accountability::GAS_EVIDENCE_ADMISSION,
+            kind: admission_kind,
+        },
+    ]);
+    assert_eq!(host_out.receipts_root, expected);
+}
+
 // -----------------------------------------------------------------
 // Fees + proposer rewards
 // -----------------------------------------------------------------
@@ -2111,4 +2315,188 @@ fn validate_tx_accepts_deposit_voluntary_exit_and_withdraw() {
         validate_against(&live, &withdraw).code,
         TxValidationCode::Valid,
     );
+}
+
+// -----------------------------------------------------------------
+// Zero-amount staking transactions
+// -----------------------------------------------------------------
+
+fn signed_register_validator(
+    depositor: &SigningKey,
+    validator: &SigningKey,
+    deposit_amount: u128,
+    nonce: u64,
+) -> RegisterValidatorTx {
+    let mut tx = RegisterValidatorTx {
+        depositor: address_of(depositor),
+        validator: address_of(validator),
+        bls_pubkey: [0x11; 48],
+        pop_signature: [0x22; 96],
+        deposit_amount,
+        nonce,
+        signature: [0u8; 64],
+        validator_signature: [0u8; 64],
+    };
+    let message = register_validator_sig_message(CHAIN_ID, &tx);
+    tx.signature = depositor.sign(&message).to_bytes();
+    tx.validator_signature = validator.sign(&message).to_bytes();
+    tx
+}
+
+#[test]
+fn zero_amount_staking_transactions_are_refused_by_admission_and_execution() {
+    // At the default zero fee rate a zero-amount unstake appended an empty
+    // withdrawal entry for free, and a zero stake, deposit or registration
+    // minted a zero-stake validator and consensus candidate. The shared check
+    // refuses all four, so admission and execution agree and nothing is
+    // written.
+    let alice = signing_key(90);
+    let addr = address_of(&alice);
+    let mut live = live_with_validator(addr, 50);
+    live.insert(
+        &account_key(&addr),
+        encode_account(&Account {
+            nonce: 0,
+            balance: 100,
+        }),
+    );
+    let refused = [
+        Transaction::Unstake(signed_unstake(&alice, 0, 0, CHAIN_ID)),
+        Transaction::Stake(signed_stake(&alice, 0, 0, CHAIN_ID)),
+        Transaction::Deposit(signed_deposit(&alice, [0xBB; 32], 0, 0, CHAIN_ID)),
+        Transaction::RegisterValidator(signed_register_validator(&alice, &signing_key(0xCC), 0, 0)),
+    ];
+    for tx in refused {
+        assert_eq!(
+            validate_against(&live, &tx).code,
+            TxValidationCode::InsufficientBalance,
+        );
+        let kind = tx_kind_code(&tx);
+        let input = fee_input(alloc::vec![tx], [0; 32]);
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!((host_out.applied, host_out.failed), (0, 1));
+        assert_eq!(host_out.post_state_root, host_out.pre_state_root);
+        assert_eq!(
+            host_out.receipts_root,
+            compute_receipts_root(&[Receipt {
+                status_code: ReceiptStatus::InsufficientBalance.as_u32(),
+                gas_used: 0,
+                kind,
+            }]),
+        );
+    }
+    // The smallest non-zero unstake still queues its entry.
+    let input = fee_input(
+        alloc::vec![Transaction::Unstake(signed_unstake(&alice, 1, 0, CHAIN_ID))],
+        [0; 32],
+    );
+    let (out, post) = apply_against(&live, &input);
+    assert_eq!(out.applied, 1);
+    assert_eq!(read_withdrawal_queue(&post, &addr).entries.len(), 1);
+}
+
+#[test]
+fn register_validator_mints_an_active_registered_candidate() {
+    let alice = signing_key(91);
+    let alice_addr = address_of(&alice);
+    let validator_key = signing_key(0xCC);
+    let validator = address_of(&validator_key);
+    let live = live_with_account(
+        alice_addr,
+        Account {
+            nonce: 0,
+            balance: 100,
+        },
+    );
+    let tx =
+        Transaction::RegisterValidator(signed_register_validator(&alice, &validator_key, 40, 0));
+    assert_eq!(validate_against(&live, &tx).code, TxValidationCode::Valid);
+    let input = fee_input(alloc::vec![tx], [0; 32]);
+    let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!(host_out.applied, 1);
+    let mut candidates = ConsensusCandidates::default();
+    candidates.upsert(ConsensusCandidate {
+        address: validator,
+        stake: 40,
+        identity: Some(BlsIdentity {
+            pubkey: [0x11; 48],
+            pop_signature: [0x22; 96],
+        }),
+    });
+    assert_eq!(host_out.validator_set_root, candidates.root());
+
+    let (_, post) = apply_against(&live, &input);
+    assert_eq!(read_account(&post, &alice_addr).balance, 60);
+    assert_eq!(
+        read_validator(&post, &validator),
+        Validator {
+            stake: 40,
+            active: true,
+        },
+    );
+    let set: ValidatorSet = borsh::from_slice(&post.get(VALIDATOR_SET_KEY).unwrap()).unwrap();
+    assert_eq!(set.total_stake(), 40);
+    let registrations: ValidatorRegistrations =
+        borsh::from_slice(&post.get(VALIDATOR_REGISTRATIONS_KEY).unwrap()).unwrap();
+    assert!(registrations.contains(&validator));
+}
+
+#[test]
+fn register_validator_requires_the_validator_address_to_consent() {
+    // Without the validator's signature anyone could register another
+    // address under a BLS key they control, blocking that address from ever
+    // registering itself and exposing its future stake to that key.
+    let alice = signing_key(92);
+    let alice_addr = address_of(&alice);
+    let victim = signing_key(93);
+    let live = live_with_account(
+        alice_addr,
+        Account {
+            nonce: 0,
+            balance: 100,
+        },
+    );
+    let mut forged = signed_register_validator(&alice, &victim, 40, 0);
+    forged.validator_signature = alice
+        .sign(&register_validator_sig_message(CHAIN_ID, &forged))
+        .to_bytes();
+    let tx = Transaction::RegisterValidator(forged);
+    assert_eq!(
+        validate_against(&live, &tx).code,
+        TxValidationCode::BadSignature
+    );
+    let input = fee_input(alloc::vec![tx], [0; 32]);
+    let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!((host_out.applied, host_out.failed), (0, 1));
+    assert_eq!(host_out.post_state_root, host_out.pre_state_root);
+
+    // Self-registration signs the same message twice with one key.
+    let own = Transaction::RegisterValidator(signed_register_validator(&alice, &alice, 40, 0));
+    assert_eq!(validate_against(&live, &own).code, TxValidationCode::Valid);
+}
+
+// -----------------------------------------------------------------
+// Stake totals
+// -----------------------------------------------------------------
+
+#[test]
+fn validator_set_total_stake_saturates_on_every_build() {
+    // An unchecked sum panicked natively, where overflow checks are on, but
+    // wrapped in the SP1 Guest, where they are off.
+    let mut set = ValidatorSet::default();
+    set.upsert([1; 32], u128::MAX);
+    set.upsert([2; 32], 1);
+    assert_eq!(set.total_stake(), u128::MAX);
+    // Governance divides by this total; a voter holding the saturated stake
+    // still reaches quorum.
+    let proposal = UpgradeProposal {
+        proposer: [1; 32],
+        action: ProposalAction::Policy(RuntimePolicy::default()),
+        proposed_at_chunk: 0,
+        voters: alloc::vec![[1; 32]],
+    };
+    assert!(proposal.quorum_reached(&set));
 }

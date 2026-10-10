@@ -198,27 +198,28 @@ fn query_validator_registrations(backend: &ActivationBackend) -> Vec<ValidatorRe
     borsh::from_slice(&resp.payload).expect("decode Vec<ValidatorRegistration>")
 }
 
-/// Build a signed `RegisterValidator` tx funded by `depositor`,
-/// binding the BLS pubkey + POP carried by `bls`.
+/// Build a `RegisterValidator` tx funded by `depositor` and consented to by
+/// `validator`, binding the BLS pubkey + POP carried by `bls`.
 fn signed_register_validator(
     depositor: &SigningKey,
-    validator: Address,
+    validator: &SigningKey,
     bls: &ProposerKey,
     deposit_amount: u128,
     nonce: u64,
 ) -> RegisterValidatorTx {
     let mut tx = RegisterValidatorTx {
         depositor: address_of(depositor),
-        validator,
+        validator: address_of(validator),
         bls_pubkey: *bls.public_key_bytes(),
         pop_signature: bls.prove_possession().to_bytes(),
         deposit_amount,
         nonce,
         signature: [0u8; 64],
+        validator_signature: [0u8; 64],
     };
-    tx.signature = depositor
-        .sign(&register_validator_sig_message(CHAIN_ID, &tx))
-        .to_bytes();
+    let message = register_validator_sig_message(CHAIN_ID, &tx);
+    tx.signature = depositor.sign(&message).to_bytes();
+    tx.validator_signature = validator.sign(&message).to_bytes();
     tx
 }
 
@@ -289,7 +290,7 @@ fn build_activated_scenario(
     // Block 1: submit + apply `RegisterValidator`.
     let register = Transaction::RegisterValidator(signed_register_validator(
         depositor,
-        address_of(new_validator),
+        new_validator,
         new_bls,
         DEPOSIT_AMOUNT,
         0,
@@ -337,7 +338,7 @@ fn register_validator_activates_after_delay() {
     // Block 1: submit RegisterValidator.
     let register = Transaction::RegisterValidator(signed_register_validator(
         &depositor,
-        address_of(&new_validator),
+        &new_validator,
         &new_bls,
         DEPOSIT_AMOUNT,
         0,
@@ -499,10 +500,11 @@ fn register_validator_with_invalid_pop_is_filtered_at_bridge() {
         deposit_amount: DEPOSIT_AMOUNT,
         nonce: 0,
         signature: [0u8; 64],
+        validator_signature: [0u8; 64],
     };
-    tx.signature = depositor
-        .sign(&register_validator_sig_message(CHAIN_ID, &tx))
-        .to_bytes();
+    let message = register_validator_sig_message(CHAIN_ID, &tx);
+    tx.signature = depositor.sign(&message).to_bytes();
+    tx.validator_signature = bad_validator.sign(&message).to_bytes();
     let register = Transaction::RegisterValidator(tx);
     let bytes = borsh::to_vec(&register).expect("encode register");
 

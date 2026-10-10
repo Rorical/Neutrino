@@ -69,7 +69,8 @@ pub const fn tx_gas(tx: &Transaction) -> u64 {
 /// Written into every [`Receipt`](crate::Receipt) so downstream consumers
 /// can decode receipts without reading the matching transaction. Values are
 /// part of the consensus-bound receipts-root commitment; new
-/// variants must append, never reorder.
+/// variants must append, never reorder, and skip `11`, which is
+/// [`SANCTION_RECEIPT_KIND`](crate::accountability::SANCTION_RECEIPT_KIND).
 #[must_use]
 pub const fn tx_kind_code(tx: &Transaction) -> u8 {
     match tx {
@@ -238,7 +239,7 @@ pub struct TransferTx {
 pub struct StakeTx {
     /// Validator + signer.
     pub validator: Address,
-    /// Stake amount to bond. Zero is allowed but still consumes a nonce.
+    /// Stake amount to bond. Must be non-zero.
     pub amount: u128,
     /// Signer's expected next nonce.
     pub nonce: u64,
@@ -251,7 +252,8 @@ pub struct StakeTx {
 pub struct UnstakeTx {
     /// Validator + signer.
     pub validator: Address,
-    /// Amount of stake to unbond.
+    /// Amount of stake to unbond. Must be non-zero, so every queued
+    /// withdrawal entry carries value.
     pub amount: u128,
     /// Signer's expected next nonce.
     pub nonce: u64,
@@ -273,7 +275,7 @@ pub struct DepositTx {
     /// Target validator. Their `validator_key(validator)` stake is
     /// credited; their account is unaffected.
     pub validator: Address,
-    /// Amount to move. Zero is permitted but still consumes a nonce.
+    /// Amount to move. Must be non-zero.
     pub amount: u128,
     /// Depositor's expected next nonce.
     pub nonce: u64,
@@ -322,10 +324,12 @@ pub struct WithdrawTx {
 /// active validator set after verifying the POP. The runtime itself does not
 /// link `bls_pubkey` for verification — it stores it as opaque bytes.
 ///
-/// The Ed25519 signature is produced by `depositor`, not by the
-/// validator's BLS identity (the depositor and validator addresses
-/// may be the same). The POP, separately, binds the BLS private key
-/// to its corresponding public key.
+/// Both `depositor` and `validator` sign [`register_validator_sig_message`]
+/// with their Ed25519 account keys (one key signs both when they are the
+/// same address). The validator's signature is its consent: without it
+/// anyone could bind another address, and its future stake, to a BLS key
+/// the registrant controls and so block that address from registering
+/// itself. The POP, separately, binds the BLS private key to its public key.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisterValidatorTx {
     /// Account paying the deposit and signing the transaction.
@@ -345,14 +349,16 @@ pub struct RegisterValidatorTx {
     /// it as opaque bytes.
     pub pop_signature: neutrino_primitives::BlsSignature,
     /// Initial stake credited to the validator from the depositor's
-    /// spendable balance. Zero is permitted but discouraged —
-    /// the validator would join with `stake = 0` and contribute
-    /// nothing to VRF eligibility or BFT quorum weighting.
+    /// spendable balance. Must be non-zero: a registration always mints an
+    /// active, staked validator.
     pub deposit_amount: u128,
     /// Depositor's expected next nonce.
     pub nonce: u64,
-    /// Ed25519 signature over [`register_validator_sig_message`].
+    /// Depositor's Ed25519 signature over [`register_validator_sig_message`].
     pub signature: [u8; 64],
+    /// Validator's Ed25519 signature over the same message, consenting to
+    /// the registration of its address.
+    pub validator_signature: [u8; 64],
 }
 
 // ---------------------------------------------------------------------------

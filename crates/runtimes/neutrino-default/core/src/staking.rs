@@ -34,6 +34,22 @@ use crate::{Address, ReceiptStatus};
 // Shared signer checks
 // ---------------------------------------------------------------------------
 
+/// Refuse a staking transaction that moves nothing.
+///
+/// A zero amount changes no balance or stake but would still write records:
+/// an unstake would append an empty withdrawal entry, and a stake, deposit or
+/// registration would mint a zero-stake validator and consensus candidate. At
+/// a zero fee rate that lets anyone grow those records for free, so the shared
+/// checks reject it before any state access, reported like any other amount
+/// the sender cannot back.
+const fn require_amount(amount: u128) -> Result<(), ReceiptStatus> {
+    if amount == 0 {
+        Err(ReceiptStatus::InsufficientBalance)
+    } else {
+        Ok(())
+    }
+}
+
 fn authenticate(
     signer: &Address,
     message: &[u8],
@@ -174,7 +190,16 @@ fn unbond<B: StateBackend>(
     withdrawal: Withdrawal,
 ) {
     let mut queue = load_withdrawal_queue(state, address);
-    queue.entries.push(withdrawal);
+    // Unbonds maturing at the same height share one entry, so a validator
+    // adds at most one entry per block however many unstakes it submits.
+    // Same-maturity entries are always the queue's tail, and deductions and
+    // withdrawals only depend on the amount queued at each maturity.
+    match queue.entries.last_mut() {
+        Some(last) if last.mature_at_height == withdrawal.mature_at_height => {
+            last.amount = last.amount.saturating_add(withdrawal.amount);
+        }
+        _ => queue.entries.push(withdrawal),
+    }
     validator.stake -= withdrawal.amount;
     validator.active = validator.stake > 0;
     signer.balance -= fee;
@@ -248,6 +273,7 @@ pub(crate) fn check_stake<B: StateBackend>(
     fee: u128,
     tx: &StakeTx,
 ) -> Result<(Account, u128, Validator), ReceiptStatus> {
+    require_amount(tx.amount)?;
     authenticate(
         &tx.validator,
         &stake_sig_message(chain_id, tx),
@@ -285,6 +311,7 @@ pub(crate) fn check_deposit<B: StateBackend>(
     fee: u128,
     tx: &DepositTx,
 ) -> Result<(Account, u128, Validator), ReceiptStatus> {
+    require_amount(tx.amount)?;
     authenticate(
         &tx.depositor,
         &deposit_sig_message(chain_id, tx),
@@ -325,6 +352,7 @@ pub(crate) fn check_unstake<B: StateBackend>(
     fee: u128,
     tx: &UnstakeTx,
 ) -> Result<(Account, Validator), ReceiptStatus> {
+    require_amount(tx.amount)?;
     authenticate(
         &tx.validator,
         &unstake_sig_message(chain_id, tx),
@@ -518,11 +546,11 @@ pub(crate) fn check_register_validator<B: StateBackend>(
     fee: u128,
     tx: &RegisterValidatorTx,
 ) -> Result<(Account, u128, ValidatorRegistrations), ReceiptStatus> {
-    authenticate(
-        &tx.depositor,
-        &register_validator_sig_message(chain_id, tx),
-        &tx.signature,
-    )?;
+    require_amount(tx.deposit_amount)?;
+    let message = register_validator_sig_message(chain_id, tx);
+    authenticate(&tx.depositor, &message, &tx.signature)?;
+    // The registered address must consent; see `RegisterValidatorTx`.
+    authenticate(&tx.validator, &message, &tx.validator_signature)?;
     let (depositor, debit) = check_payer(state, &tx.depositor, tx.nonce, tx.deposit_amount, fee)?;
     let registrations = load_validator_registrations(state);
     if registrations.contains(&tx.validator) {
@@ -546,10 +574,11 @@ pub(crate) fn apply_register_validator<B: StateBackend>(
         check_register_validator(state, chain_id, fee, tx)?;
 
     // Mint the validator record. Mirrors `apply_deposit` but the
-    // validator did not exist before this call.
+    // validator did not exist before this call; the shared check refused a
+    // zero deposit, so the new validator is active.
     let validator = Validator {
         stake: tx.deposit_amount,
-        active: tx.deposit_amount > 0,
+        active: true,
     };
     depositor.balance -= debit;
     depositor.nonce = depositor.nonce.saturating_add(1);
@@ -574,16 +603,7 @@ pub(crate) fn apply_register_validator<B: StateBackend>(
     store_account(state, &tx.depositor, &depositor);
     store_validator_registrations(state, &registrations);
     // The candidate projection reads the registration stored above.
-    if validator.active {
-        commit_validator(state, &tx.validator, &validator);
-    } else {
-        // A zero deposit mints an inactive record and rewrites the set
-        // unchanged: registration never removes an existing set entry.
-        let set = load_validator_set(state);
-        store_validator(state, &tx.validator, &validator);
-        store_validator_set(state, &set);
-        sync_consensus_candidate(state, &tx.validator, Some(&validator));
-    }
+    commit_validator(state, &tx.validator, &validator);
     Ok(())
 }
 

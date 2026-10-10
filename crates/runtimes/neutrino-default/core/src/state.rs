@@ -553,10 +553,17 @@ impl ValidatorSet {
         }
     }
 
-    /// Sum of all entries' stakes.
+    /// Sum of all entries' stakes, saturating at `u128::MAX`.
+    ///
+    /// Saturating like [`WithdrawalQueue::total`] and the governance vote
+    /// tally, so the total of a subset never exceeds the total of the set and
+    /// every build agrees: a plain sum would panic natively, where overflow
+    /// checks are on, but wrap in the SP1 Guest, where they are off.
     #[must_use]
     pub fn total_stake(&self) -> u128 {
-        self.entries.iter().map(|e| e.stake).sum()
+        self.entries
+            .iter()
+            .fold(0_u128, |total, entry| total.saturating_add(entry.stake))
     }
 }
 
@@ -694,17 +701,15 @@ pub struct Withdrawal {
 
 /// Per-validator FIFO queue of unbonding entries.
 ///
-/// Stored under `withdrawal_key(addr)`. Empty queues remain in
-/// state with `entries: vec![]` rather than being deleted: deletes
-/// require sibling-path witness data the dry-run access set does
-/// not capture, and a few bytes per validator is an acceptable
-/// trade-off for witness uniformity.
+/// Stored under `withdrawal_key(addr)` and never stored empty: a withdrawal
+/// or mandatory deduction that removes the last entry deletes the key, as
+/// does retiring the validator. The witness carries the sibling nodes those
+/// deletions need, so an absent key is how state records an empty queue.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct WithdrawalQueue {
-    /// Pending entries in FIFO insertion order. Maturity is monotonic
-    /// because every entry created in block `H` matures at
-    /// `H + input.unbonding_delay_blocks`, which is strictly greater than
-    /// any earlier entry's maturity.
+    /// Pending entries in FIFO insertion order. Maturity never decreases
+    /// along the queue because every entry created in block `H` matures at
+    /// `H + input.unbonding_delay_blocks`, which no earlier entry exceeds.
     pub entries: Vec<Withdrawal>,
 }
 

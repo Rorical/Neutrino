@@ -212,7 +212,8 @@ fn submit_transaction_admits_valid_transfer_and_block_charges_gas() {
     let alice = signing_key(4);
     let alice_addr = address_of(&alice);
     let bob_addr = [0xBB; 32];
-    let backend = seeded_backend(alice_addr, 100);
+    // Covers the transfer and its fee.
+    let backend = seeded_backend(alice_addr, 1_000_000);
 
     // Admit a valid transfer.
     let tx = Transaction::Transfer(signed_transfer(&alice, bob_addr, 30, 0, CHAIN_ID));

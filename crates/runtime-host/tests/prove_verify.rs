@@ -16,6 +16,8 @@ use rand_core::SeedableRng;
 use sp1_sdk::blocking::{MockProver, ProverClient};
 
 const CHAIN_ID: u64 = 42;
+/// Starting balance covering each test's transactions and their fees.
+const FUNDS: u128 = 1_000_000;
 
 static MOCK_CTX: OnceLock<ProverCtx<MockProver>> = OnceLock::new();
 
@@ -84,7 +86,7 @@ fn full_pipeline_signed_transfer_mock() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: FUNDS,
         },
     );
 
@@ -192,7 +194,7 @@ fn master_apply_block_with_witness_matches_dry_run() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 50,
+            balance: FUNDS,
         },
     );
 
@@ -224,7 +226,7 @@ fn real_prover_full_pipeline() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: FUNDS,
         },
     );
 
@@ -283,13 +285,13 @@ fn real_prover_demonstration() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: FUNDS,
         },
     );
 
     println!("[1] Pre-state");
     println!("    alice address     0x{}", hex(&alice_addr));
-    println!("    alice balance     100");
+    println!("    alice balance     {FUNDS}");
     println!("    alice nonce       0");
     println!("    bob address       0x{}", hex(&bob_addr));
     println!("    pre_state_root    0x{}", hex(&live.state_root()));

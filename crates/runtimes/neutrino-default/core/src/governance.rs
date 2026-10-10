@@ -871,6 +871,15 @@ mod tests {
             reporter_reward_bps: 10_001,
             ..policy
         };
+        // Fees and the validator stake floor are mandatory protections.
+        let free = RuntimePolicy {
+            gas_price: 0,
+            ..policy
+        };
+        let no_stake_floor = RuntimePolicy {
+            min_validator_stake: 0,
+            ..policy
+        };
         let (applied, failed, pending) = run(
             &live,
             &block(
@@ -879,17 +888,19 @@ mod tests {
                     propose_policy(&a, too_old, 0),
                     propose_policy(&a, no_queue, 0),
                     propose_policy(&a, excessive_reward, 0),
+                    propose_policy(&a, free, 0),
+                    propose_policy(&a, no_stake_floor, 0),
                 ],
             ),
         );
-        assert_eq!((applied, failed), (0, 3));
+        assert_eq!((applied, failed), (0, 5));
         assert_eq!(pending.proposal, None);
 
         // A valid proposal waits for quorum like a program upgrade and does
         // not touch the policy in force.
         let (out, live) = apply_against(&live, &block(0, vec![propose_policy(&a, policy, 0)]));
         assert_eq!((out.applied, out.failed), (1, 0));
-        assert_eq!(out.gas_price, 0);
+        assert_eq!(out.gas_price, RuntimePolicy::default().gas_price);
         let mut view = TracingState::new(&live);
         let proposal = status(&mut view).proposal.unwrap();
         assert_eq!(proposal.action, ProposalAction::Policy(policy));
@@ -910,7 +921,7 @@ mod tests {
         // the old policy.
         let (out, live) = apply_against(&live, &block(0, vec![vote(&b, proposal.id(), 0)]));
         assert_eq!((out.applied, out.failed), (1, 0));
-        assert_eq!(out.gas_price, 0);
+        assert_eq!(out.gas_price, RuntimePolicy::default().gas_price);
         let mut view = TracingState::new(&live);
         assert_eq!(status(&mut view), UpgradeStatus::default());
         assert_eq!(crate::load_runtime_policy(&mut view), policy);

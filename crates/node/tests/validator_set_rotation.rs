@@ -7,7 +7,8 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, StakeTx, Transaction, account_key, encode_account, stake_sig_message,
+    Account, Address, RUNTIME_POLICY_KEY, RuntimePolicy, StakeTx, Transaction, account_key,
+    encode_account, stake_sig_message,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
@@ -56,6 +57,14 @@ fn chain_spec_validators(runtime_addr: Address) -> Vec<Validator> {
     }]
 }
 
+/// Runtime parameters whose stake floor admits the test's small stake.
+fn runtime_params() -> RuntimeParams {
+    RuntimeParams {
+        min_validator_stake: RUNTIME_STAKE,
+        ..RuntimeParams::default()
+    }
+}
+
 fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> ChainSpec {
     let validators = chain_spec_validators(runtime_addr);
     let proof = ProofParams {
@@ -89,7 +98,7 @@ fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> Chai
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
-        runtime: RuntimeParams::default(),
+        runtime: runtime_params(),
         initial_validators: validators,
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     }
@@ -97,6 +106,10 @@ fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> Chai
 
 fn seed_validator_account(addr: Address, balance: u128) -> LiveTrie {
     let mut live = LiveTrie::default();
+    live.insert(
+        RUNTIME_POLICY_KEY,
+        borsh::to_vec(&RuntimePolicy::from_params(&runtime_params())).expect("encode policy"),
+    );
     let account = Account { nonce: 0, balance };
     live.insert(&account_key(&addr), encode_account(&account));
     live

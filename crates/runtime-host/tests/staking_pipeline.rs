@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_default_runtime_core::{
-    Account, Address, StakeTx, StfInput, Transaction, UnstakeTx, account_key, encode_account,
-    stake_sig_message, unstake_sig_message,
+    Account, Address, RUNTIME_POLICY_KEY, RuntimePolicy, StakeTx, StfInput, Transaction, UnstakeTx,
+    account_key, encode_account, stake_sig_message, unstake_sig_message,
 };
 use neutrino_runtime_core::host::LiveTrie;
 use neutrino_runtime_host::{ProverCtx, dry_run};
@@ -17,6 +17,8 @@ use rand_core::SeedableRng;
 use sp1_sdk::blocking::{MockProver, ProverClient};
 
 const CHAIN_ID: u64 = 7;
+/// Starting balance covering each test's transactions and their fees.
+const FUNDS: u128 = 1_000_000;
 
 static MOCK_CTX: OnceLock<ProverCtx<MockProver>> = OnceLock::new();
 
@@ -58,8 +60,18 @@ fn signed_unstake(sk: &SigningKey, amount: u128, nonce: u64) -> UnstakeTx {
     tx
 }
 
+/// State holding `account` under a policy whose stake floor admits the tests'
+/// small stakes.
 fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     let mut live = LiveTrie::default();
+    let policy = RuntimePolicy {
+        min_validator_stake: 1,
+        ..RuntimePolicy::default()
+    };
+    live.insert(
+        RUNTIME_POLICY_KEY,
+        borsh::to_vec(&policy).expect("encode policy"),
+    );
     live.insert(&account_key(&addr), encode_account(&account));
     live
 }
@@ -86,7 +98,7 @@ fn stake_pipeline_prove_verify_mock() {
         addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: FUNDS,
         },
     );
 
@@ -120,7 +132,7 @@ fn stake_then_unstake_round_trip() {
         addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: FUNDS,
         },
     );
 

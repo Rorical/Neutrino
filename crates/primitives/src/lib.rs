@@ -825,17 +825,34 @@ pub const DEFAULT_SLASH_AMOUNT: u128 = u128::MAX;
 /// chains pick a value calibrated to their stake unit.
 pub const DEFAULT_INACTIVITY_LEAK_AMOUNT: u128 = 1;
 
+/// Default native-token cost per gas unit.
+///
+/// Fees are mandatory: a zero rate would let anyone fill blocks and grow
+/// per-account runtime records for free, so chain specifications and
+/// governance may only choose a positive rate.
+pub const DEFAULT_GAS_PRICE: u128 = 1;
+
+/// Default minimum stake of a runtime validator, in base units.
+///
+/// Matches the canonical 32-token genesis stake at nine decimals.
+/// Registration, stake and deposit must reach it, and a partial unstake may
+/// not leave a validator below it, so each consensus candidate entry is
+/// backed by real, slashable stake rather than dust.
+pub const DEFAULT_MIN_VALIDATOR_STAKE: u128 = 32_000_000_000;
+
 /// Runtime-execution constants covered by the chain-spec hash.
 ///
 /// Captures the chain's fee-market and consensus-economics knobs.
 /// Borsh uses one positional wire format; adding or reordering fields is an
 /// incompatible protocol change, with no fallback for previous layouts.
-/// `Default` returns the canonical no-fee, full-stake-slash configuration with
-/// [`DEFAULT_UNBONDING_DELAY_BLOCKS`] (fourteen days). Chains override individual
-/// fields through `chain-spec.toml`:
+/// `Default` returns the canonical configuration: [`DEFAULT_GAS_PRICE`],
+/// [`DEFAULT_MIN_VALIDATOR_STAKE`], full-stake slashing and
+/// [`DEFAULT_UNBONDING_DELAY_BLOCKS`] (fourteen days). Chains override
+/// individual fields through `chain-spec.toml`:
 ///
 /// ```toml
 /// gas_price = "3"
+/// min_validator_stake = "32000000000"
 /// unbonding_delay_blocks = 302_400   // fourteen days of 4 s slots
 /// slash_amount = "1000000000000000000000"
 /// inactivity_leak_amount = "1000000000"
@@ -853,12 +870,16 @@ pub struct RuntimeParams {
     pub evidence_admissions_per_block: u32,
     /// Mandatory FIFO executions reserved at the start of each block.
     pub evidence_executions_per_block: u32,
-    /// Native-token cost per gas unit. `0` disables fees entirely
-    /// The runtime
+    /// Native-token cost per gas unit; must be positive. The runtime
     /// debits `tx_gas(tx) * gas_price` from each successful signed
     /// transaction's sender and credits the accumulated sum to the
-    /// block proposer's runtime account.
+    /// block proposer's runtime account. Governable after genesis.
     pub gas_price: u128,
+    /// Minimum stake of a runtime validator; must be positive. Registration,
+    /// stake and deposit must reach it, and a partial unstake may not leave
+    /// a validator below it (a full exit to zero is always allowed).
+    /// Governable after genesis.
+    pub min_validator_stake: u128,
     /// Number of blocks an unstaked / exited amount waits in the
     /// per-validator withdrawal queue before becoming claimable by
     /// a [`Transaction::Withdraw`]. Surfaced through
@@ -882,7 +903,8 @@ impl Default for RuntimeParams {
             evidence_max_pending: 1024,
             evidence_admissions_per_block: 16,
             evidence_executions_per_block: 16,
-            gas_price: 0,
+            gas_price: DEFAULT_GAS_PRICE,
+            min_validator_stake: DEFAULT_MIN_VALIDATOR_STAKE,
             unbonding_delay_blocks: DEFAULT_UNBONDING_DELAY_BLOCKS,
             slash_amount: DEFAULT_SLASH_AMOUNT,
             inactivity_leak_amount: DEFAULT_INACTIVITY_LEAK_AMOUNT,
@@ -970,6 +992,12 @@ impl ChainSpec {
             || self.runtime.evidence_admissions_per_block > self.runtime.evidence_max_pending
         {
             return Err(ChainSpecError::InvalidEvidencePolicy);
+        }
+        if self.runtime.gas_price == 0 {
+            return Err(ChainSpecError::ZeroGasPrice);
+        }
+        if self.runtime.min_validator_stake == 0 {
+            return Err(ChainSpecError::ZeroMinValidatorStake);
         }
 
         // Weak subjectivity is only sound while a fork signed by the anchor's
@@ -1118,6 +1146,10 @@ fn validate_quorum(numerator: u64, denominator: u64) -> Result<(), ChainSpecErro
 pub enum ChainSpecError {
     /// Evidence limits or the relationship to the withdrawal delay are invalid.
     InvalidEvidencePolicy,
+    /// The fee rate is zero; every signed transaction must pay a fee.
+    ZeroGasPrice,
+    /// The minimum validator stake is zero.
+    ZeroMinValidatorStake,
     /// Chain ID zero is reserved as invalid.
     ZeroChainId,
     /// The declared genesis validator commitment does not match the ordered set.
@@ -1159,6 +1191,8 @@ impl fmt::Display for ChainSpecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidEvidencePolicy => f.write_str("invalid evidence queue/window policy"),
+            Self::ZeroGasPrice => f.write_str("gas price must be non-zero"),
+            Self::ZeroMinValidatorStake => f.write_str("minimum validator stake must be non-zero"),
             Self::ZeroChainId => f.write_str("chain ID must be non-zero"),
             Self::InvalidGenesisValidatorRoot => {
                 f.write_str("genesis validator root is not canonical")
@@ -1436,6 +1470,18 @@ mod tests {
         spec.light_client.weak_subjectivity_period_secs =
             spec.runtime.unbonding_delay_blocks * spec.consensus.slot_duration_secs;
         assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn fees_and_validator_stake_have_positive_floors() {
+        let mut spec = test_chain_spec();
+        assert!(spec.runtime.gas_price > 0);
+        assert!(spec.runtime.min_validator_stake > 0);
+        spec.runtime.gas_price = 0;
+        assert_eq!(spec.validate(), Err(ChainSpecError::ZeroGasPrice));
+        let mut spec = test_chain_spec();
+        spec.runtime.min_validator_stake = 0;
+        assert_eq!(spec.validate(), Err(ChainSpecError::ZeroMinValidatorStake));
     }
 
     #[test]

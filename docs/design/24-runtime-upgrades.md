@@ -231,8 +231,11 @@ accountable for the pairing through reproducible builds and off-chain audit.
 ### Governable runtime policy
 
 The same proposal and vote machinery changes the `RuntimePolicy` held in runtime
-state under `runtime:policy`: fee rate, evidence window and queue bounds, and
-sanction amounts. `ProposePolicyTx` opens a proposal whose action is
+state under `runtime:policy`: fee rate, minimum validator stake, evidence window
+and queue bounds, and sanction amounts. The fee rate and minimum stake are always
+positive: every signed transaction pays a fee, registration, stake and deposit must
+reach the minimum stake, and a partial unstake may not leave a validator below it
+(a full exit to zero is always allowed). `ProposePolicyTx` opens a proposal whose action is
 `ProposalAction::Policy`; quorum writes the new policy and it applies from the next
 block. Genesis seeds the record from the chain specification's `[runtime]` values,
 and the STF, the mempool admission path and the node's evidence selection all read it

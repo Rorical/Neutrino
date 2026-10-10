@@ -32,8 +32,9 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, RegisterValidatorTx, Transaction, UnstakeTx, ValidatorRegistration,
-    ValidatorSet, account_key, encode_account, register_validator_sig_message, unstake_sig_message,
+    Account, Address, RUNTIME_POLICY_KEY, RegisterValidatorTx, RuntimePolicy, Transaction,
+    UnstakeTx, ValidatorRegistration, ValidatorSet, account_key, encode_account,
+    register_validator_sig_message, unstake_sig_message,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
@@ -96,6 +97,14 @@ fn chain_spec_validators(runtime_addr: Address) -> Vec<Validator> {
     }]
 }
 
+/// Runtime parameters whose stake floor admits the test's small deposit.
+fn runtime_params() -> RuntimeParams {
+    RuntimeParams {
+        min_validator_stake: DEPOSIT_AMOUNT,
+        ..RuntimeParams::default()
+    }
+}
+
 fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> ChainSpec {
     let validators = chain_spec_validators(runtime_addr);
     let proof = ProofParams {
@@ -129,17 +138,21 @@ fn build_chain_spec(runtime_addr: Address, genesis_state_root: [u8; 32]) -> Chai
         proof,
         state: StateParams::default(),
         light_client: LightClientParams::default(),
-        runtime: RuntimeParams::default(),
+        runtime: runtime_params(),
         initial_validators: validators,
         metadata: BoundedBytes::new(Vec::new()).expect("empty fits"),
     }
 }
 
-/// Seed the genesis trie with one funded account per `(addr,
-/// balance)` pair. Used for the chain-spec validator (so it can
-/// receive proposer fees) and the depositor.
+/// Seed the genesis trie with the spec's runtime policy and one funded
+/// account per `(addr, balance)` pair. Used for the chain-spec validator
+/// (so it can receive proposer fees) and the depositor.
 fn seed_accounts(accounts: &[(Address, u128)]) -> LiveTrie {
     let mut live = LiveTrie::default();
+    live.insert(
+        RUNTIME_POLICY_KEY,
+        borsh::to_vec(&RuntimePolicy::from_params(&runtime_params())).expect("encode policy"),
+    );
     for (addr, balance) in accounts {
         let acct = Account {
             nonce: 0,

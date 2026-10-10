@@ -38,12 +38,22 @@ use crate::{Address, ReceiptStatus};
 ///
 /// A zero amount changes no balance or stake but would still write records:
 /// an unstake would append an empty withdrawal entry, and a stake, deposit or
-/// registration would mint a zero-stake validator and consensus candidate. At
-/// a zero fee rate that lets anyone grow those records for free, so the shared
-/// checks reject it before any state access, reported like any other amount
-/// the sender cannot back.
+/// registration would mint a zero-stake validator and consensus candidate.
+/// The shared checks reject it before any state access, reported like any
+/// other amount the sender cannot back.
 const fn require_amount(amount: u128) -> Result<(), ReceiptStatus> {
     if amount == 0 {
+        Err(ReceiptStatus::InsufficientBalance)
+    } else {
+        Ok(())
+    }
+}
+
+/// Refuse a validator stake that is neither zero nor at least the governed
+/// minimum, so every consensus candidate entry is backed by real, slashable
+/// stake rather than dust. A full exit to zero is always allowed.
+const fn require_bonded(stake: u128, min_stake: u128) -> Result<(), ReceiptStatus> {
+    if stake != 0 && stake < min_stake {
         Err(ReceiptStatus::InsufficientBalance)
     } else {
         Ok(())
@@ -93,24 +103,33 @@ fn check_payer<B: StateBackend>(
 }
 
 /// Funding checks shared by stake and deposit: the funder pays `amount` plus
-/// the fee and `validator`'s stake absorbs `amount`. Returns the funder's
-/// account, its debit and the validator record as it will be stored.
+/// the fee and `validator`'s stake absorbs `amount`, ending at or above
+/// `min_stake`. Returns the funder's account, its debit and the validator
+/// record as it will be stored.
 fn check_bond<B: StateBackend>(
     state: &mut B,
     funder: &Address,
     validator: &Address,
-    amount: u128,
-    nonce: u64,
-    fee: u128,
+    bond: Bond,
 ) -> Result<(Account, u128, Validator), ReceiptStatus> {
-    let (account, debit) = check_payer(state, funder, nonce, amount, fee)?;
+    let (account, debit) = check_payer(state, funder, bond.nonce, bond.amount, bond.fee)?;
     let mut bonded = load_validator(state, validator);
     bonded.stake = bonded
         .stake
-        .checked_add(amount)
+        .checked_add(bond.amount)
         .ok_or(ReceiptStatus::Overflow)?;
+    require_bonded(bonded.stake, bond.min_stake)?;
     bonded.active = bonded.stake > 0;
     Ok((account, debit, bonded))
+}
+
+/// Amounts of one stake or deposit.
+#[derive(Clone, Copy)]
+struct Bond {
+    amount: u128,
+    nonce: u64,
+    fee: u128,
+    min_stake: u128,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +290,7 @@ pub(crate) fn check_stake<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     fee: u128,
+    min_stake: u128,
     tx: &StakeTx,
 ) -> Result<(Account, u128, Validator), ReceiptStatus> {
     require_amount(tx.amount)?;
@@ -279,23 +299,23 @@ pub(crate) fn check_stake<B: StateBackend>(
         &stake_sig_message(chain_id, tx),
         &tx.signature,
     )?;
-    check_bond(
-        state,
-        &tx.validator,
-        &tx.validator,
-        tx.amount,
-        tx.nonce,
+    let bond = Bond {
+        amount: tx.amount,
+        nonce: tx.nonce,
         fee,
-    )
+        min_stake,
+    };
+    check_bond(state, &tx.validator, &tx.validator, bond)
 }
 
 pub(crate) fn apply_stake<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     fee: u128,
+    min_stake: u128,
     tx: &StakeTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut signer, debit, validator) = check_stake(state, chain_id, fee, tx)?;
+    let (mut signer, debit, validator) = check_stake(state, chain_id, fee, min_stake, tx)?;
     signer.balance -= debit;
     signer.nonce = signer.nonce.saturating_add(1);
     store_account(state, &tx.validator, &signer);
@@ -309,6 +329,7 @@ pub(crate) fn check_deposit<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     fee: u128,
+    min_stake: u128,
     tx: &DepositTx,
 ) -> Result<(Account, u128, Validator), ReceiptStatus> {
     require_amount(tx.amount)?;
@@ -317,23 +338,23 @@ pub(crate) fn check_deposit<B: StateBackend>(
         &deposit_sig_message(chain_id, tx),
         &tx.signature,
     )?;
-    check_bond(
-        state,
-        &tx.depositor,
-        &tx.validator,
-        tx.amount,
-        tx.nonce,
+    let bond = Bond {
+        amount: tx.amount,
+        nonce: tx.nonce,
         fee,
-    )
+        min_stake,
+    };
+    check_bond(state, &tx.depositor, &tx.validator, bond)
 }
 
 pub(crate) fn apply_deposit<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     fee: u128,
+    min_stake: u128,
     tx: &DepositTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut depositor, debit, validator) = check_deposit(state, chain_id, fee, tx)?;
+    let (mut depositor, debit, validator) = check_deposit(state, chain_id, fee, min_stake, tx)?;
     // Self-deposit (`depositor == validator`) overlaps with the stake path:
     // the account and validator records live under different keys.
     depositor.balance -= debit;
@@ -344,12 +365,14 @@ pub(crate) fn apply_deposit<B: StateBackend>(
 }
 
 /// Checks of an unstake. The unstaked amount leaves the stake pool, not the
-/// balance pool, so the fee is the only balance debit. Returns the signer's
-/// account and validator record.
+/// balance pool, so the fee is the only balance debit. A partial unstake may
+/// not leave the validator below `min_stake`. Returns the signer's account
+/// and validator record.
 pub(crate) fn check_unstake<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     fee: u128,
+    min_stake: u128,
     tx: &UnstakeTx,
 ) -> Result<(Account, Validator), ReceiptStatus> {
     require_amount(tx.amount)?;
@@ -363,6 +386,7 @@ pub(crate) fn check_unstake<B: StateBackend>(
     if validator.stake < tx.amount {
         return Err(ReceiptStatus::InsufficientBalance);
     }
+    require_bonded(validator.stake - tx.amount, min_stake)?;
     Ok((signer, validator))
 }
 
@@ -372,9 +396,10 @@ pub(crate) fn apply_unstake<B: StateBackend>(
     block_height: u64,
     unbonding_delay: u64,
     fee: u128,
+    min_stake: u128,
     tx: &UnstakeTx,
 ) -> Result<(), ReceiptStatus> {
-    let (signer, validator) = check_unstake(state, chain_id, fee, tx)?;
+    let (signer, validator) = check_unstake(state, chain_id, fee, min_stake, tx)?;
     let mature_at_height = block_height
         .checked_add(unbonding_delay)
         .ok_or(ReceiptStatus::Overflow)?;
@@ -544,9 +569,11 @@ pub(crate) fn check_register_validator<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     fee: u128,
+    min_stake: u128,
     tx: &RegisterValidatorTx,
 ) -> Result<(Account, u128, ValidatorRegistrations), ReceiptStatus> {
     require_amount(tx.deposit_amount)?;
+    require_bonded(tx.deposit_amount, min_stake)?;
     let message = register_validator_sig_message(chain_id, tx);
     authenticate(&tx.depositor, &message, &tx.signature)?;
     // The registered address must consent; see `RegisterValidatorTx`.
@@ -568,10 +595,11 @@ pub(crate) fn apply_register_validator<B: StateBackend>(
     chain_id: u64,
     block_height: u64,
     fee: u128,
+    min_stake: u128,
     tx: &RegisterValidatorTx,
 ) -> Result<(), ReceiptStatus> {
     let (mut depositor, debit, mut registrations) =
-        check_register_validator(state, chain_id, fee, tx)?;
+        check_register_validator(state, chain_id, fee, min_stake, tx)?;
 
     // Mint the validator record. Mirrors `apply_deposit` but the
     // validator did not exist before this call; the shared check refused a

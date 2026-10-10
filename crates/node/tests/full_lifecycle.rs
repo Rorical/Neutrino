@@ -44,6 +44,8 @@ use rand_core::SeedableRng;
 const CHAIN_ID: u64 = 9001;
 const UNBONDING_DELAY_BLOCKS: u64 = 8;
 const CHUNK_SIZE: u64 = 4;
+/// Balance each signer keeps aside for transaction fees.
+const FEE_FUNDS: u128 = 1_000_000;
 
 type LifecycleBackend = ChainBackend<MemoryDatabase, NativeChunkTestSystem>;
 
@@ -89,6 +91,11 @@ fn signed_withdraw(sk: &SigningKey, nonce: u64) -> WithdrawTx {
     tx
 }
 
+/// Fee charged for a transaction consuming `gas` under the genesis policy.
+fn fee(gas: u64) -> u128 {
+    u128::from(gas) * RuntimeParams::default().gas_price
+}
+
 fn proposer_key() -> ProposerKey {
     ProposerKey::from_ikm(&[0x5A; 32], 0).expect("derive proposer")
 }
@@ -112,10 +119,12 @@ fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveT
     }
     // Genesis seeds the governable policy from the spec. The STF checks it
     // against the anchor's unbonding delay, so the short delay below needs
-    // the matching short evidence window in state too.
+    // the matching short evidence window in state too. The lifecycle bonds a
+    // deliberately small stake.
     let runtime = RuntimeParams {
         unbonding_delay_blocks: UNBONDING_DELAY_BLOCKS,
         evidence_max_age_blocks: 2,
+        min_validator_stake: 1,
         ..RuntimeParams::default()
     };
     live.insert(
@@ -262,7 +271,7 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
             depositor_addr,
             Account {
                 nonce: 0,
-                balance: 100,
+                balance: 100 + FEE_FUNDS,
             },
         ),
         // Validator account exists at nonce 0 so it can sign its own
@@ -271,7 +280,7 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
             validator_addr,
             Account {
                 nonce: 0,
-                balance: 0,
+                balance: FEE_FUNDS,
             },
         ),
     ]);
@@ -301,9 +310,10 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
     // an authenticated zero until the withdrawal retires it.
     assert_eq!(h2.runtime_extra, candidates_root(&[(validator_addr, 0)]));
 
-    // Balance still zero; queue carries 60.
+    // Balance only paid the fee; queue carries 60.
+    let after_unstake = FEE_FUNDS - fee(GAS_UNSTAKE);
     let acct_after_unstake = query_account(&backend, validator_addr);
-    assert_eq!(acct_after_unstake.balance, 0);
+    assert_eq!(acct_after_unstake.balance, after_unstake);
     assert_eq!(acct_after_unstake.nonce, 1);
     let queue = query_pending_withdrawals(&backend, validator_addr);
     assert_eq!(queue.entries.len(), 1);
@@ -319,7 +329,7 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
     let h3 = produce_with_tx(&backend, &proposer, 3, &early_withdraw);
     assert_eq!(h3.gas_used, GAS_WITHDRAW);
     let acct_after_early = query_account(&backend, validator_addr);
-    assert_eq!(acct_after_early.balance, 0);
+    assert_eq!(acct_after_early.balance, after_unstake - fee(GAS_WITHDRAW));
     assert_eq!(acct_after_early.nonce, 2);
     assert_eq!(
         query_pending_withdrawals(&backend, validator_addr)
@@ -358,14 +368,18 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
 
     // Final state.
     let acct_final = query_account(&backend, validator_addr);
-    assert_eq!(acct_final.balance, 60, "60 units returned to balance");
+    assert_eq!(
+        acct_final.balance,
+        after_unstake - 2 * fee(GAS_WITHDRAW) + 60,
+        "60 units returned to balance",
+    );
     assert_eq!(acct_final.nonce, 3);
     let queue_final = query_pending_withdrawals(&backend, validator_addr);
     assert!(queue_final.entries.is_empty(), "queue drained");
 
     // Depositor account also still reflects the original Deposit:
-    // balance debited by 60, nonce bumped once.
+    // balance debited by 60 plus its fee, nonce bumped once.
     let depositor_final = query_account(&backend, depositor_addr);
-    assert_eq!(depositor_final.balance, 40);
+    assert_eq!(depositor_final.balance, 40 + FEE_FUNDS - fee(GAS_DEPOSIT));
     assert_eq!(depositor_final.nonce, 1);
 }

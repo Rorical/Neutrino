@@ -124,7 +124,8 @@ have passed.
   exactly two runtime records, `consensus:candidates` and the scheduled upgrade, and
   hands the runtime one input, the previous chunk's certified `ParticipationReport`,
   whose commitment travels in the boundary; economic rules never enter the Guests.
-  Governable runtime policy (fee rate, the liveness evidence window, sanction amounts)
+  Governable runtime policy (positive fee rate, minimum validator stake, the liveness
+  evidence window, sanction amounts)
   is runtime state under `runtime:policy`, seeded from the spec at genesis and changed
   only by governance; unbonding delay, chunk size and all consensus parameters stay
   in the spec.

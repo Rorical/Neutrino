@@ -240,10 +240,8 @@ pub struct StfInput {
     /// The engine looks this up from
     /// `active_validator_set[header.proposer_index].withdrawal_credentials`,
     /// which is the same 32-byte address slashing / inactivity-leak
-    /// transactions key on. With a zero policy fee rate this field is
-    /// unused by the STF (no fees are charged), but the consensus
-    /// header still binds it through the SP1 proof's public inputs
-    /// so the runtime cannot redirect fees mid-block.
+    /// transactions key on. The consensus header binds it through the SP1
+    /// proof's public inputs so the runtime cannot redirect fees mid-block.
     pub proposer_address: Address,
     /// Certified precommit participation of the previous chunk, identical in
     /// every block of a chunk and `None` only in chunk zero. The chunk Guest
@@ -369,7 +367,7 @@ pub struct StfPublicOutput {
 /// - Failed transactions consume no gas and pay no fee. Successful
 ///   fee-bearing transactions (see [`tx_charges_fee`]) debit
 ///   `tx_gas(tx) * policy.gas_price` from the sender and credit the
-///   block's fee recipient; a zero policy fee rate disables fees.
+///   block's fee recipient. The governed fee rate is always positive.
 ///
 /// Receipts:
 ///
@@ -417,6 +415,7 @@ pub fn apply_block_validated<B: StateBackend>(
     let facts = BlockFacts {
         input,
         gas_price: policy.gas_price,
+        min_validator_stake: policy.min_validator_stake,
         governance: governance::BlockContext {
             chunk: input.evidence_anchor.chunk_id,
             height: input.block_height,
@@ -469,6 +468,8 @@ struct BlockFacts<'a> {
     input: &'a StfInput,
     /// Fee rate in force for the whole block.
     gas_price: u128,
+    /// Minimum validator stake in force for the whole block.
+    min_validator_stake: u128,
     governance: governance::BlockContext<'a>,
     /// Obligations left by the mandatory phase; ordinary transactions never
     /// change the queue.
@@ -545,21 +546,25 @@ fn apply_transaction<B: StateBackend>(
     let input = facts.input;
     let chain_id = input.chain_id;
     let unbonding_delay = input.evidence_anchor.unbonding_delay_blocks;
+    let min_stake = facts.min_validator_stake;
     match tx {
         Transaction::Transfer(transfer) => staking::apply_transfer(state, chain_id, fee, transfer),
-        Transaction::Stake(stake_tx) => staking::apply_stake(state, chain_id, fee, stake_tx),
+        Transaction::Stake(stake_tx) => {
+            staking::apply_stake(state, chain_id, fee, min_stake, stake_tx)
+        }
         Transaction::Unstake(unstake_tx) => staking::apply_unstake(
             state,
             chain_id,
             input.block_height,
             unbonding_delay,
             fee,
+            min_stake,
             unstake_tx,
         ),
         // Admitted by the mandatory phase before any ordinary transaction.
         Transaction::SubmitEvidence(_) => Ok(()),
         Transaction::Deposit(deposit_tx) => {
-            staking::apply_deposit(state, chain_id, fee, deposit_tx)
+            staking::apply_deposit(state, chain_id, fee, min_stake, deposit_tx)
         }
         Transaction::VoluntaryExit(exit_tx) => staking::apply_voluntary_exit(
             state,
@@ -577,9 +582,14 @@ fn apply_transaction<B: StateBackend>(
             fee,
             withdraw_tx,
         ),
-        Transaction::RegisterValidator(register_tx) => {
-            staking::apply_register_validator(state, chain_id, input.block_height, fee, register_tx)
-        }
+        Transaction::RegisterValidator(register_tx) => staking::apply_register_validator(
+            state,
+            chain_id,
+            input.block_height,
+            fee,
+            min_stake,
+            register_tx,
+        ),
         Transaction::ProposeUpgrade(propose_tx) => {
             governance::apply_propose(state, chain_id, &facts.governance, fee, propose_tx)
         }
@@ -644,9 +654,10 @@ pub fn validate_tx<B: StateBackend>(
         return TxValidity::invalid(TxValidationCode::InsufficientBalance);
     }
 
-    let gas_price = load_runtime_policy(state).gas_price;
+    let policy = load_runtime_policy(state);
+    let min_stake = policy.min_validator_stake;
     let fee = if tx_charges_fee(&tx) {
-        u128::from(cost).saturating_mul(gas_price)
+        u128::from(cost).saturating_mul(policy.gas_price)
     } else {
         0
     };
@@ -655,15 +666,15 @@ pub fn validate_tx<B: StateBackend>(
         Transaction::Transfer(transfer) => {
             admission(staking::check_transfer(state, chain_id, fee, transfer))
         }
-        Transaction::Stake(stake_tx) => {
-            admission(staking::check_stake(state, chain_id, fee, stake_tx))
-        }
-        Transaction::Unstake(unstake_tx) => {
-            admission(staking::check_unstake(state, chain_id, fee, unstake_tx))
-        }
-        Transaction::Deposit(deposit_tx) => {
-            admission(staking::check_deposit(state, chain_id, fee, deposit_tx))
-        }
+        Transaction::Stake(stake_tx) => admission(staking::check_stake(
+            state, chain_id, fee, min_stake, stake_tx,
+        )),
+        Transaction::Unstake(unstake_tx) => admission(staking::check_unstake(
+            state, chain_id, fee, min_stake, unstake_tx,
+        )),
+        Transaction::Deposit(deposit_tx) => admission(staking::check_deposit(
+            state, chain_id, fee, min_stake, deposit_tx,
+        )),
         Transaction::VoluntaryExit(exit_tx) => {
             admission(staking::check_voluntary_exit(state, chain_id, fee, exit_tx))
         }
@@ -671,7 +682,7 @@ pub fn validate_tx<B: StateBackend>(
             admission(staking::admit_withdraw(state, chain_id, fee, withdraw_tx))
         }
         Transaction::RegisterValidator(register_tx) => admission(
-            staking::check_register_validator(state, chain_id, fee, register_tx),
+            staking::check_register_validator(state, chain_id, fee, min_stake, register_tx),
         ),
         // Consensus-driven transactions are never user-submittable.
         // The producer injects them directly into `body.transactions`

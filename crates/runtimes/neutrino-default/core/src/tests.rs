@@ -46,8 +46,35 @@ fn signed_transfer(
 
 fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(&account_key(&addr), encode_account(&account));
     live
+}
+
+/// Funds that cover any test transaction's fee at the canonical fee rate.
+const FEE_FUNDS: u128 = 1_000_000;
+
+/// The canonical positive fee rate with a minimum stake small enough for the
+/// unit-sized stakes these tests use; the minimum is governable.
+fn test_policy() -> RuntimePolicy {
+    RuntimePolicy {
+        min_validator_stake: 1,
+        ..RuntimePolicy::default()
+    }
+}
+
+/// Fee [`test_policy`] charges for `tx`.
+fn fee_of(tx: &Transaction) -> u128 {
+    u128::from(tx_gas(tx)) * test_policy().gas_price
+}
+
+/// Fees one payer paid for every transaction of `inputs`, all applied.
+fn fees_paid(inputs: &[&StfInput]) -> u128 {
+    inputs
+        .iter()
+        .flat_map(|input| &input.transactions)
+        .map(fee_of)
+        .sum()
 }
 
 /// Drive one block through the dry-run path and then replay it
@@ -91,7 +118,7 @@ fn signed_transfer_moves_balance_and_bumps_nonce() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
 
@@ -281,7 +308,7 @@ fn self_transfer_only_bumps_nonce() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
 
@@ -334,7 +361,7 @@ fn stake_moves_balance_to_stake_and_updates_set_root() {
         addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
 
@@ -371,7 +398,7 @@ fn unstake_after_stake_queues_withdrawal_and_zeroes_candidate_stake() {
         addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
 
@@ -852,7 +879,7 @@ fn applied_transfer_consumes_transfer_gas() {
         address_of(&alice),
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let input = StfInput {
@@ -910,7 +937,7 @@ fn gas_limit_clamps_transactions_per_block() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let tx0 = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
@@ -967,6 +994,7 @@ fn gas_limit_zero_drops_every_transaction() {
 
 fn live_with_validator(addr: Address, stake: u128) -> LiveTrie {
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     seed_validator(&mut live, &addr, stake);
     let mut set = ValidatorSet::default();
     if stake > 0 {
@@ -979,9 +1007,6 @@ fn live_with_validator(addr: Address, stake: u128) -> LiveTrie {
 fn validate_against(live: &LiveTrie, tx: &Transaction) -> TxValidity {
     let bytes = borsh::to_vec(tx).expect("encode tx");
     let mut tracer = TracingState::new(live);
-    // Pre-fee-market default: gas_price = 0 disables fees, so the
-    // admission balance check matches zero-price execution
-    // behaviour every existing test was written against.
     validate_tx(&bytes, &mut tracer, CHAIN_ID, TEST_BLOCK_GAS_LIMIT)
 }
 
@@ -992,7 +1017,7 @@ fn validate_tx_accepts_well_formed_transfer() {
         address_of(&alice),
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
@@ -1090,7 +1115,7 @@ fn validate_tx_accepts_stake_when_balance_covers_it() {
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         }),
     );
     let tx = Transaction::Stake(signed_stake(&alice, 60, 0, CHAIN_ID));
@@ -1195,7 +1220,7 @@ fn deposit_moves_balance_from_depositor_to_validator_stake() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
 
@@ -1214,7 +1239,7 @@ fn deposit_moves_balance_from_depositor_to_validator_stake() {
     assert_eq!(host_out.applied, 1);
     let (_, post) = apply_against(&live, &input);
     let alice_acc = read_account(&post, &alice_addr);
-    assert_eq!(alice_acc.balance, 40);
+    assert_eq!(alice_acc.balance, 40 + FEE_FUNDS - fees_paid(&[&input]));
     assert_eq!(alice_acc.nonce, 1);
     let bob_val = read_validator(&post, &bob_addr);
     assert_eq!(bob_val.stake, 60);
@@ -1261,11 +1286,12 @@ fn unstakes_maturing_together_share_one_queue_entry() {
     let alice = signing_key(44);
     let addr = address_of(&alice);
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         }),
     );
     seed_validator(&mut live, &addr, 50);
@@ -1307,11 +1333,12 @@ fn unstake_queues_withdrawal_with_unbonding_delay() {
     let alice = signing_key(43);
     let addr = address_of(&alice);
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         }),
     );
     // Validator with stake = 50, pre-populated directly.
@@ -1335,9 +1362,9 @@ fn unstake_queues_withdrawal_with_unbonding_delay() {
     assert_eq!(host_out.applied, 1);
 
     let (_, post) = apply_against(&live, &input);
-    // Balance unchanged: unstake no longer credits immediately.
+    // Only the fee leaves the balance: unstake does not credit immediately.
     let acc = read_account(&post, &addr);
-    assert_eq!(acc.balance, 0);
+    assert_eq!(acc.balance, FEE_FUNDS - fees_paid(&[&input]));
     assert_eq!(acc.nonce, 1);
     // Stake reduced.
     let val = read_validator(&post, &addr);
@@ -1357,11 +1384,12 @@ fn voluntary_exit_drains_stake_and_marks_inactive() {
     let alice = signing_key(44);
     let addr = address_of(&alice);
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         }),
     );
     seed_validator(&mut live, &addr, 80);
@@ -1427,11 +1455,12 @@ fn withdraw_credits_only_matured_entries() {
     let addr = address_of(&alice);
     // Pre-populate a queue with one matured + one pending entry.
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         }),
     );
     let queue = WithdrawalQueue {
@@ -1464,7 +1493,7 @@ fn withdraw_credits_only_matured_entries() {
 
     let (_, post) = apply_against(&live, &input);
     let acc = read_account(&post, &addr);
-    assert_eq!(acc.balance, 25);
+    assert_eq!(acc.balance, 25 + FEE_FUNDS - fees_paid(&[&input]));
     assert_eq!(acc.nonce, 1);
     let remaining = read_withdrawal_queue(&post, &addr);
     assert_eq!(remaining.entries.len(), 1);
@@ -1477,11 +1506,12 @@ fn withdraw_with_no_matured_entries_succeeds_but_credits_zero() {
     let alice = signing_key(47);
     let addr = address_of(&alice);
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 10,
+            balance: 10 + FEE_FUNDS,
         }),
     );
     let queue = WithdrawalQueue {
@@ -1507,7 +1537,7 @@ fn withdraw_with_no_matured_entries_succeeds_but_credits_zero() {
 
     let (_, post) = apply_against(&live, &input);
     let acc = read_account(&post, &addr);
-    assert_eq!(acc.balance, 10); // unchanged
+    assert_eq!(acc.balance, 10 + FEE_FUNDS - fees_paid(&[&input])); // only the fee
     assert_eq!(acc.nonce, 1); // bumped
     let remaining = read_withdrawal_queue(&post, &addr);
     assert_eq!(remaining.entries.len(), 1);
@@ -1522,11 +1552,12 @@ fn withdraw_drains_empty_queue_removes_state_entry() {
     let alice = signing_key(48);
     let addr = address_of(&alice);
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         }),
     );
     let queue = WithdrawalQueue {
@@ -1563,7 +1594,7 @@ fn full_unstake_withdraw_lifecycle_round_trips() {
         addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
 
@@ -1592,8 +1623,11 @@ fn full_unstake_withdraw_lifecycle_round_trips() {
         ))],
     };
     let (_, live2) = apply_against(&live1, &input2);
-    // Balance still 60, queue carries 40, validator stake 0.
-    assert_eq!(read_account(&live2, &addr).balance, 60);
+    // Balance still 60 less fees, queue carries 40, validator stake 0.
+    assert_eq!(
+        read_account(&live2, &addr).balance,
+        60 + FEE_FUNDS - fees_paid(&[&input1, &input2])
+    );
     assert_eq!(read_validator(&live2, &addr).stake, 0);
     assert_eq!(read_withdrawal_queue(&live2, &addr).total(), 40);
 
@@ -1608,7 +1642,11 @@ fn full_unstake_withdraw_lifecycle_round_trips() {
         transactions: alloc::vec![Transaction::Withdraw(signed_withdraw(&alice, 2, CHAIN_ID))],
     };
     let (_, live3) = apply_against(&live2, &early);
-    assert_eq!(read_account(&live3, &addr).balance, 60); // unchanged
+    // Unchanged but for the withdrawal's fee.
+    assert_eq!(
+        read_account(&live3, &addr).balance,
+        60 + FEE_FUNDS - fees_paid(&[&input1, &input2, &early])
+    );
     assert_eq!(read_withdrawal_queue(&live3, &addr).total(), 40);
 
     // A withdraw at the maturity height claims the 40 back.
@@ -1623,7 +1661,10 @@ fn full_unstake_withdraw_lifecycle_round_trips() {
         transactions: alloc::vec![Transaction::Withdraw(signed_withdraw(&alice, 3, CHAIN_ID))],
     };
     let (_, live4) = apply_against(&live3, &mature);
-    assert_eq!(read_account(&live4, &addr).balance, 100);
+    assert_eq!(
+        read_account(&live4, &addr).balance,
+        100 + FEE_FUNDS - fees_paid(&[&input1, &input2, &early, &mature])
+    );
     assert_eq!(read_withdrawal_queue(&live4, &addr).total(), 0);
     // Nothing staked or queued remains, so the validator record is gone.
     assert!(live4.get(&validator_key(&addr)).is_none());
@@ -1638,7 +1679,7 @@ fn full_withdrawal_retires_registration_and_validator_records() {
         addr,
         Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         },
     );
     let mut index = ValidatorRegistrations::default();
@@ -1677,7 +1718,10 @@ fn full_withdrawal_retires_registration_and_validator_records() {
     };
     let (output, post) = apply_against(&live, &input);
     assert_eq!(output.applied, 1);
-    assert_eq!(read_account(&post, &addr).balance, 40);
+    assert_eq!(
+        read_account(&post, &addr).balance,
+        40 + FEE_FUNDS - fees_paid(&[&input])
+    );
     assert!(post.get(&validator_key(&addr)).is_none());
     assert!(post.get(&withdrawal_key(&addr)).is_none());
     assert!(post.get(&registration_key(&addr)).is_none());
@@ -1731,18 +1775,19 @@ fn receipts_root_pins_specific_status_codes_per_failure_mode() {
     let bob = signing_key(71);
     let alice_addr = address_of(&alice);
     let mut live = LiveTrie::default();
+    seed_policy(&mut live, &test_policy());
     live.insert(
         &account_key(&alice_addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         }),
     );
     live.insert(
         &account_key(&address_of(&bob)),
         encode_account(&Account {
             nonce: 5,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         }),
     );
 
@@ -1761,10 +1806,10 @@ fn receipts_root_pins_specific_status_codes_per_failure_mode() {
     bad_sig.signature[0] ^= 0xFF;
     // [2] wrong nonce: bob's account is at nonce 5 but the tx uses 0
     let wrong_nonce = signed_transfer(&bob, [0xEF; 32], 10, 0, CHAIN_ID);
-    // [3] insufficient balance: alice has 100 - 30 = 70 after tx[0] commits.
-    //     transferring 1_000 fails. Sign at nonce=1 because tx[0]
-    //     bumped alice's nonce.
-    let insufficient = signed_transfer(&alice, [0xFE; 32], 1_000, 1, CHAIN_ID);
+    // [3] insufficient balance: alice holds less than her funds after
+    //     tx[0] commits, so transferring twice those funds fails. Sign at
+    //     nonce=1 because tx[0] bumped alice's nonce.
+    let insufficient = signed_transfer(&alice, [0xFE; 32], 2 * FEE_FUNDS, 1, CHAIN_ID);
     let input = StfInput {
         evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
         chain_id: CHAIN_ID,
@@ -1821,7 +1866,7 @@ fn receipts_root_pins_out_of_block_gas_status() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let tx0 = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 30, 0, CHAIN_ID));
@@ -1863,14 +1908,14 @@ fn receipts_root_distinguishes_success_and_failure() {
         address_of(&alice),
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let live_fail = live_with_account(
         address_of(&alice),
         Account {
             nonce: 7, // mismatched
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let tx = Transaction::Transfer(signed_transfer(&alice, [0xAB; 32], 1, 0, CHAIN_ID));
@@ -2072,7 +2117,7 @@ fn priced(mut live: LiveTrie, gas_price: u128) -> LiveTrie {
         &mut live,
         &RuntimePolicy {
             gas_price,
-            ..RuntimePolicy::default()
+            ..test_policy()
         },
     );
     live
@@ -2284,7 +2329,7 @@ fn validate_tx_accepts_deposit_voluntary_exit_and_withdraw() {
         address_of(&alice),
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let deposit = Transaction::Deposit(signed_deposit(&alice, bob_addr, 50, 0, CHAIN_ID));
@@ -2296,7 +2341,14 @@ fn validate_tx_accepts_deposit_voluntary_exit_and_withdraw() {
     // Voluntary exit: validator with stake.
     let charlie = signing_key(61);
     let charlie_addr = address_of(&charlie);
-    let live = live_with_validator(charlie_addr, 100);
+    let mut live = live_with_validator(charlie_addr, 100);
+    live.insert(
+        &account_key(&charlie_addr),
+        encode_account(&Account {
+            nonce: 0,
+            balance: FEE_FUNDS,
+        }),
+    );
     let exit = Transaction::VoluntaryExit(signed_voluntary_exit(&charlie, 0, CHAIN_ID));
     assert_eq!(validate_against(&live, &exit).code, TxValidationCode::Valid,);
 
@@ -2307,7 +2359,7 @@ fn validate_tx_accepts_deposit_voluntary_exit_and_withdraw() {
         dave_addr,
         Account {
             nonce: 0,
-            balance: 0,
+            balance: FEE_FUNDS,
         },
     );
     let withdraw = Transaction::Withdraw(signed_withdraw(&dave, 0, CHAIN_ID));
@@ -2357,7 +2409,7 @@ fn zero_amount_staking_transactions_are_refused_by_admission_and_execution() {
         &account_key(&addr),
         encode_account(&Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         }),
     );
     let refused = [
@@ -2406,7 +2458,7 @@ fn register_validator_mints_an_active_registered_candidate() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let tx =
@@ -2428,7 +2480,10 @@ fn register_validator_mints_an_active_registered_candidate() {
     assert_eq!(host_out.validator_set_root, candidates.root());
 
     let (_, post) = apply_against(&live, &input);
-    assert_eq!(read_account(&post, &alice_addr).balance, 60);
+    assert_eq!(
+        read_account(&post, &alice_addr).balance,
+        60 + FEE_FUNDS - fees_paid(&[&input])
+    );
     assert_eq!(
         read_validator(&post, &validator),
         Validator {
@@ -2444,6 +2499,91 @@ fn register_validator_mints_an_active_registered_candidate() {
 }
 
 #[test]
+fn minimum_stake_bounds_bonding_and_partial_unstakes() {
+    // Every candidate entry must be backed by at least the governed minimum
+    // stake, while a full exit to zero always stays possible.
+    const MIN: u128 = 100;
+    let alice = signing_key(95);
+    let alice_addr = address_of(&alice);
+    let bob = signing_key(96);
+    let funded = |live: &mut LiveTrie, addr: Address| {
+        live.insert(
+            &account_key(&addr),
+            encode_account(&Account {
+                nonce: 0,
+                balance: FEE_FUNDS,
+            }),
+        );
+    };
+    let mut live = LiveTrie::default();
+    seed_policy(
+        &mut live,
+        &RuntimePolicy {
+            min_validator_stake: MIN,
+            ..RuntimePolicy::default()
+        },
+    );
+    funded(&mut live, alice_addr);
+    // Each case: the transaction, and whether the minimum admits it.
+    let cases = [
+        (
+            Transaction::Stake(signed_stake(&alice, MIN - 1, 0, CHAIN_ID)),
+            false,
+        ),
+        (
+            Transaction::Stake(signed_stake(&alice, MIN, 0, CHAIN_ID)),
+            true,
+        ),
+        (
+            Transaction::Deposit(signed_deposit(&alice, [0xBB; 32], MIN - 1, 0, CHAIN_ID)),
+            false,
+        ),
+        (
+            Transaction::Deposit(signed_deposit(&alice, [0xBB; 32], MIN, 0, CHAIN_ID)),
+            true,
+        ),
+        (
+            Transaction::RegisterValidator(signed_register_validator(&alice, &bob, MIN - 1, 0)),
+            false,
+        ),
+        (
+            Transaction::RegisterValidator(signed_register_validator(&alice, &bob, MIN, 0)),
+            true,
+        ),
+    ];
+    for (tx, admitted) in cases {
+        let expected = if admitted {
+            TxValidationCode::Valid
+        } else {
+            TxValidationCode::InsufficientBalance
+        };
+        assert_eq!(validate_against(&live, &tx).code, expected);
+        let input = fee_input(alloc::vec![tx], [0; 32]);
+        let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, u32::from(admitted));
+    }
+
+    // A staked validator may unstake down to the minimum or fully exit, but
+    // never leave dust behind.
+    let mut staked = live.clone();
+    seed_validator(&mut staked, &alice_addr, 3 * MIN);
+    for (amount, admitted) in [(2 * MIN + 1, false), (2 * MIN, true), (3 * MIN, true)] {
+        let tx = Transaction::Unstake(signed_unstake(&alice, amount, 0, CHAIN_ID));
+        let expected = if admitted {
+            TxValidationCode::Valid
+        } else {
+            TxValidationCode::InsufficientBalance
+        };
+        assert_eq!(validate_against(&staked, &tx).code, expected);
+        let input = fee_input(alloc::vec![tx], [0; 32]);
+        let (host_out, guest_out) = dry_run_then_replay(&input, &staked);
+        assert_eq!(host_out, guest_out);
+        assert_eq!(host_out.applied, u32::from(admitted));
+    }
+}
+
+#[test]
 fn register_validator_requires_the_validator_address_to_consent() {
     // Without the validator's signature anyone could register another
     // address under a BLS key they control, blocking that address from ever
@@ -2455,7 +2595,7 @@ fn register_validator_requires_the_validator_address_to_consent() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: 100 + FEE_FUNDS,
         },
     );
     let mut forged = signed_register_validator(&alice, &victim, 40, 0);

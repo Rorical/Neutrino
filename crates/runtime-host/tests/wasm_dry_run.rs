@@ -12,6 +12,8 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
 const CHAIN_ID: u64 = 7;
+/// Starting balance covering each test's transactions and their fees.
+const FUNDS: u128 = 1_000_000;
 
 fn signing_key(seed: u64) -> SigningKey {
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -54,7 +56,7 @@ fn wasm_dry_run_matches_native_on_signed_transfer() {
         alice_addr,
         Account {
             nonce: 0,
-            balance: 100,
+            balance: FUNDS,
         },
     );
 

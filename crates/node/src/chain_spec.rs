@@ -131,10 +131,14 @@ pub struct ChainSpecFile {
     #[serde(default)]
     pub chunk_size: Option<u64>,
     /// Optional override for [`RuntimeParams::gas_price`] (per-gas
-    /// native-token fee). Defaults to `0`, which disables the fee
-    /// market entirely.
+    /// native-token fee). Must be positive; defaults to
+    /// [`neutrino_primitives::DEFAULT_GAS_PRICE`].
     #[serde(default)]
     pub gas_price: Option<u128>,
+    /// Optional override for [`RuntimeParams::min_validator_stake`]. Must be
+    /// positive; defaults to [`neutrino_primitives::DEFAULT_MIN_VALIDATOR_STAKE`].
+    #[serde(default)]
+    pub min_validator_stake: Option<u128>,
     /// Optional override for [`RuntimeParams::unbonding_delay_blocks`].
     /// Defaults to the canonical evidence-safe delay in `RuntimeParams`.
     #[serde(default)]
@@ -206,6 +210,9 @@ impl ChainSpecFile {
         let mut runtime = RuntimeParams::default();
         if let Some(gas_price) = self.gas_price {
             runtime.gas_price = gas_price;
+        }
+        if let Some(min_stake) = self.min_validator_stake {
+            runtime.min_validator_stake = min_stake;
         }
         if let Some(unbonding) = self.unbonding_delay_blocks {
             runtime.unbonding_delay_blocks = unbonding;

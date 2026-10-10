@@ -242,8 +242,10 @@ pub(crate) const DEFAULT_REPORTER_REWARD_BPS: u16 = 1_000;
 /// anchor.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimePolicy {
-    /// Native-token cost per gas unit; `0` disables fees.
+    /// Native-token cost per gas unit; always positive.
     pub gas_price: u128,
+    /// Minimum stake a validator may hold other than zero.
+    pub min_validator_stake: u128,
     /// Evidence admission window after its source chunk ends, in blocks.
     pub evidence_max_age_blocks: u64,
     /// Maximum verified sanctions retained in the mandatory FIFO.
@@ -272,6 +274,7 @@ impl RuntimePolicy {
     pub const fn from_params(params: &neutrino_primitives::RuntimeParams) -> Self {
         Self {
             gas_price: params.gas_price,
+            min_validator_stake: params.min_validator_stake,
             evidence_max_age_blocks: params.evidence_max_age_blocks,
             evidence_max_pending: params.evidence_max_pending,
             evidence_admissions_per_block: params.evidence_admissions_per_block,
@@ -285,7 +288,9 @@ impl RuntimePolicy {
     /// Structural bounds that hold for any chain.
     #[must_use]
     pub const fn is_well_formed(&self) -> bool {
-        self.evidence_max_age_blocks > 0
+        self.gas_price > 0
+            && self.min_validator_stake > 0
+            && self.evidence_max_age_blocks > 0
             && self.evidence_max_pending > 0
             && self.evidence_max_pending <= accountability::MAX_PENDING
             && self.evidence_admissions_per_block > 0

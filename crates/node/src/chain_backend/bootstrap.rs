@@ -204,8 +204,7 @@ where
             }
             engine
                 .store_mut()
-                .db_mut()
-                .write_batch_durable(batch)
+                .write_observed_batch(batch, true)
                 .map_err(|error| error.to_string())?;
             Ok(())
         })?;
@@ -347,7 +346,7 @@ where
                 self.with_engine_mut(|engine| {
                     let mut batch = Batch::new();
                     batch.delete(Column::Meta, PENDING_KEY);
-                    engine.store_mut().db_mut().write_batch_durable(batch)
+                    engine.store_mut().write_observed_batch(batch, true)
                 })
                 .map_err(|error| error.to_string())?;
                 saved_pending = None;
@@ -578,8 +577,7 @@ where
             );
             engine
                 .store_mut()
-                .db_mut()
-                .write_batch_durable(batch)
+                .write_observed_batch(batch, true)
                 .map_err(p2p_queries::storage_error)?;
             runtime.pending = Some(pending);
             drop(guard);

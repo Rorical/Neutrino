@@ -185,6 +185,54 @@ fn unknown_method_returns_unknown_method_status() {
 }
 
 #[test]
+fn settlement_query_is_bounded_read_only_and_preserves_overflow_flags() {
+    use neutrino_default_runtime_core::{
+        QUERY_METHOD_ACCOUNTABILITY_METRICS,
+        accountability::settlement::{
+            SETTLEMENT_TOTALS_KEY, SettlementCounter, SettlementSnapshot, SettlementTotals,
+        },
+    };
+    use neutrino_runtime_core::host::TracingState;
+    let runtime = WasmRuntime::default_runtime().unwrap();
+    let mut totals = SettlementTotals::default();
+    totals.slash.deducted = SettlementCounter {
+        value: u128::MAX,
+        overflowed: true,
+    };
+    totals.slash.rewarded.value = 17;
+    let live = live_with(&[(
+        SETTLEMENT_TOTALS_KEY.to_vec(),
+        borsh::to_vec(&totals).unwrap(),
+    )]);
+    let root = live.state_root();
+    let req = request(QUERY_METHOD_ACCOUNTABILITY_METRICS, Vec::new());
+    let response = run(&runtime, &live, &req);
+    let mut native = TracingState::new(&live);
+    assert_eq!(
+        response,
+        neutrino_default_runtime_core::query(&req, &mut native)
+    );
+    assert_eq!(native.post_state_root(), root);
+    let decoded: SettlementSnapshot = borsh::from_slice(&response.payload).unwrap();
+    assert_eq!(decoded.totals, totals);
+    assert_eq!(decoded.pending_slash, 0);
+    assert_eq!(
+        run(
+            &runtime,
+            &live,
+            &request(QUERY_METHOD_ACCOUNTABILITY_METRICS, vec![1])
+        )
+        .code,
+        QueryStatus::InvalidArguments.as_u32()
+    );
+    let empty = run(&runtime, &LiveTrie::default(), &req);
+    assert_eq!(
+        borsh::from_slice::<SettlementSnapshot>(&empty.payload).unwrap(),
+        SettlementSnapshot::default()
+    );
+}
+
+#[test]
 fn malformed_request_bytes_yield_invalid_arguments() {
     // Direct invocation: feed the WASM runtime bytes that do not
     // borsh-decode as a `QueryRequest` by constructing a request

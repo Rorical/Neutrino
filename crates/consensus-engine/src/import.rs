@@ -688,10 +688,7 @@ impl<DB: Database> Engine<DB> {
                     batch.put(neutrino_storage::Column::StateValues, key, bytes);
                 }
             }
-            self.store_mut()
-                .db_mut()
-                .write_batch(batch)
-                .map_err(StoreError::Database)?;
+            self.store_mut().write_observed_batch(batch, false)?;
         }
         self.fork_choice = next_fork_choice;
 

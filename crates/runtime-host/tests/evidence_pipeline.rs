@@ -869,6 +869,23 @@ fn pending_reporter_reward_matches_native_wasm_and_block_guest() {
         .unwrap();
     let account: Option<Account> = borsh::from_slice(&response.payload).unwrap();
     assert_eq!(account.unwrap().balance, 7);
+    let request = neutrino_runtime_abi::QueryRequest {
+        method: neutrino_default_runtime_core::QUERY_METHOD_ACCOUNTABILITY_METRICS.into(),
+        args: Vec::new(),
+    };
+    let response = runtime.query(&request, &post).unwrap();
+    let mut native_state = TracingState::new(&post);
+    assert_eq!(
+        response,
+        neutrino_default_runtime_core::query(&request, &mut native_state)
+    );
+    let totals: neutrino_default_runtime_core::accountability::settlement::SettlementSnapshot =
+        borsh::from_slice(&response.payload).unwrap();
+    assert_eq!(totals.totals.slash.executed.value, 1);
+    assert_eq!(totals.totals.slash.deducted.value, 73);
+    assert_eq!(totals.totals.slash.rewarded.value, 7);
+    assert_eq!(totals.totals.slash.burned.value, 66);
+    assert_eq!(totals.pending_slash, 0);
     let execution =
         neutrino_runtime_host::ProverCtx::new_cached(ProverClient::builder().mock().build())
             .unwrap();

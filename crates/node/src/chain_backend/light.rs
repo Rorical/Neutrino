@@ -220,8 +220,7 @@ where
                 );
                 engine
                     .store_mut()
-                    .db_mut()
-                    .write_batch(batch)
+                    .write_observed_batch(batch, false)
                     .map_err(|error| error.to_string())?;
             }
             *state = Some(runtime);
@@ -345,8 +344,7 @@ where
             if outcome == UpdateOutcome::Advanced {
                 engine
                     .store_mut()
-                    .db_mut()
-                    .write_batch(batch)
+                    .write_observed_batch(batch, false)
                     .map_err(|error| SyncBackendError::Storage(error.to_string()))?;
                 state.client = next;
                 state.latest = Some(proof);

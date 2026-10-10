@@ -48,6 +48,80 @@ fn seed_policy(live: &mut LiveTrie, policy: &RuntimePolicy) {
 }
 
 #[test]
+fn empty_block_preserves_existing_totals_without_witnessing_them() {
+    let input = input();
+    let mut live = LiveTrie::default();
+    let mut totals = settlement::SettlementTotals::default();
+    totals.slash.deducted.value = 100;
+    totals.slash.rewarded.value = 10;
+    totals.slash.burned.value = 90;
+    live.insert(
+        settlement::SETTLEMENT_TOTALS_KEY,
+        borsh::to_vec(&totals).unwrap(),
+    );
+    let mut state = TracingState::new(&live);
+    let output = crate::apply_block(&input, &mut state);
+    assert_eq!(output.pre_state_root, output.post_state_root);
+    assert_eq!(output.accountability.admitted, [] as [Sanction; 0]);
+    assert_eq!(output.accountability.executed, [] as [Sanction; 0]);
+    let (_, witness) = state.into_committed_and_witness();
+    assert!(
+        !witness
+            .witnessed_keys
+            .iter()
+            .any(|key| key == settlement::SETTLEMENT_TOTALS_KEY)
+    );
+    let mut guest = WitnessState::new(&witness).unwrap();
+    assert_eq!(crate::apply_block(&input, &mut guest), output);
+    assert_eq!(guest.post_state_root(), output.post_state_root);
+}
+
+#[test]
+fn shared_collateral_is_counted_only_when_each_fifo_deduction_executes() {
+    let mut input = input();
+    let first = report(&mut input, 1, SanctionKind::Slash);
+    let mut second = report(&mut input, 2, SanctionKind::Slash);
+    let Transaction::SubmitEvidence(submission) = &mut second else {
+        unreachable!()
+    };
+    submission.statement.offender.withdrawal_credentials = [1; 32];
+    input.transactions = vec![first, second];
+    let mut live = LiveTrie::default();
+    seed_validator(&mut live, 1, 73);
+    let mut state = TracingState::new(&live);
+    crate::apply_block(&input, &mut state);
+    let snapshot = settlement::snapshot(&mut state);
+    assert_eq!(snapshot.totals.slash.admitted.value, 2);
+    assert_eq!(snapshot.totals.slash.executed.value, 2);
+    assert_eq!(snapshot.totals.slash.zero_deductions.value, 1);
+    assert_eq!(snapshot.totals.slash.deducted.value, 73);
+    assert_eq!(snapshot.totals.slash.rewarded.value, 7);
+    assert_eq!(snapshot.totals.slash.burned.value, 66);
+    assert_eq!(crate::load_account(&mut state, &REPORTER).balance, 7);
+}
+
+#[test]
+fn cumulative_metrics_overflow_never_blocks_mandatory_settlement() {
+    let mut input = input();
+    input.transactions = vec![report(&mut input, 1, SanctionKind::Slash)];
+    let mut live = LiveTrie::default();
+    seed_validator(&mut live, 1, 100);
+    let mut totals = settlement::SettlementTotals::default();
+    totals.slash.deducted.value = u128::MAX;
+    live.insert(
+        settlement::SETTLEMENT_TOTALS_KEY,
+        borsh::to_vec(&totals).unwrap(),
+    );
+    let mut state = TracingState::new(&live);
+    crate::apply_block(&input, &mut state);
+    let totals = settlement::load_totals(&mut state);
+    assert_eq!(totals.slash.deducted.value, u128::MAX);
+    assert!(totals.slash.deducted.overflowed);
+    assert_eq!(crate::load_account(&mut state, &REPORTER).balance, 10);
+    assert_eq!(load_queue(&mut state), [] as [PendingSanction; 0]);
+}
+
+#[test]
 fn reward_uses_actual_stake_and_unbonding_deduction_and_replays_in_guest() {
     let mut input = input();
     input.transactions = vec![report(&mut input, 1, SanctionKind::Slash)];
@@ -91,6 +165,13 @@ fn reward_uses_actual_stake_and_unbonding_deduction_and_replays_in_guest() {
             nonce: 4,
         }
     );
+    let settled = settlement::snapshot(&mut state);
+    assert_eq!(settled.totals.slash.admitted.value, 1);
+    assert_eq!(settled.totals.slash.executed.value, 1);
+    assert_eq!(settled.totals.slash.deducted.value, 101);
+    assert_eq!(settled.totals.slash.rewarded.value, 10);
+    assert_eq!(settled.totals.slash.burned.value, 91);
+    assert_eq!(settled.pending_slash, 0);
     let (_, witness) = state.into_committed_and_witness();
     let mut guest = WitnessState::new(&witness).unwrap();
     assert_eq!(crate::apply_block(&input, &mut guest), output);
@@ -143,6 +224,11 @@ fn pending_reward_terms_survive_policy_changes_and_fifo_delay() {
     assert_eq!(queued[0].amount, 50);
     assert_eq!(queued[0].reporter, Some(REPORTER));
     assert_eq!(queued[0].reporter_reward_bps, 1_000);
+    let snapshot = settlement::snapshot(&mut state);
+    assert_eq!(snapshot.pending_slash, 1);
+    assert_eq!(snapshot.totals.slash.admitted.value, 2);
+    assert_eq!(snapshot.totals.slash.executed.value, 1);
+    assert_eq!(snapshot.totals.slash.zero_deductions.value, 1);
     assert_eq!(crate::load_account(&mut state, &REPORTER).balance, 0);
     let (post, _) = state.into_committed_and_witness();
     let mut live = LiveTrie::from_trie(post);
@@ -155,6 +241,11 @@ fn pending_reward_terms_survive_policy_changes_and_fifo_delay() {
     let output = crate::apply_block(&input, &mut state);
     assert_eq!(output.accountability.executed[0].offender.pubkey, [2; 48]);
     assert_eq!(crate::load_account(&mut state, &REPORTER).balance, 3);
+    let totals = settlement::load_totals(&mut state);
+    assert_eq!(totals.slash.executed.value, 2);
+    assert_eq!(totals.slash.deducted.value, 37);
+    assert_eq!(totals.slash.rewarded.value, 3);
+    assert_eq!(totals.slash.burned.value, 34);
     assert_eq!(load_queue(&mut state), [] as [PendingSanction; 0]);
     let (_, witness) = state.into_committed_and_witness();
     assert_eq!(
@@ -208,6 +299,10 @@ fn maximum_deduction_and_full_account_do_not_overflow_or_block_fifo() {
         u128::MAX
     );
     assert_eq!(crate::load_account(&mut state, &REPORTER).nonce, 8);
+    let totals = settlement::load_totals(&mut state);
+    assert_eq!(totals.slash.deducted.value, u128::MAX);
+    assert_eq!(totals.slash.rewarded.value, 1);
+    assert_eq!(totals.slash.burned.value, u128::MAX - 1);
     assert_eq!(load_queue(&mut state), [] as [PendingSanction; 0]);
     let (_, witness) = state.into_committed_and_witness();
     assert_eq!(

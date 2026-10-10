@@ -46,6 +46,13 @@ impl NodeDb {
 impl Database for NodeDb {
     type Error = NodeDbError;
 
+    fn statistics(&self) -> Option<neutrino_storage::DatabaseStatistics> {
+        match self {
+            Self::Memory(db) => db.statistics(),
+            Self::Rocks(db) => db.statistics(),
+        }
+    }
+
     fn get(&self, column: Column, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         match self {
             Self::Memory(db) => Ok(db.get(column, key).expect("memory get is infallible")),
@@ -103,5 +110,44 @@ impl Database for NodeDb {
                 .expect("memory iter_column is infallible")),
             Self::Rocks(db) => db.iter_column(column).map_err(NodeDbError::from),
         }
+    }
+
+    fn iter_prefix(&self, column: Column, prefix: &[u8]) -> Result<ColumnSnapshot, Self::Error> {
+        match self {
+            Self::Memory(db) => Ok(db
+                .iter_prefix(column, prefix)
+                .expect("memory iter_prefix is infallible")),
+            Self::Rocks(db) => db.iter_prefix(column, prefix).map_err(NodeDbError::from),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_prefix_reads_keep_the_bounded_backend_scan() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "neutrino-node-prefix-{}-{unique}",
+            std::process::id()
+        ));
+        {
+            let mut db = NodeDb::open_rocks(&path).unwrap();
+            db.put(Column::Meta, b"wanted:a", b"a").unwrap();
+            db.put(Column::Meta, b"other:b", b"b").unwrap();
+            assert_eq!(
+                db.iter_prefix(Column::Meta, b"wanted:").unwrap(),
+                vec![(b"wanted:a".to_vec(), b"a".to_vec())]
+            );
+            let stats = db.statistics().unwrap();
+            assert_eq!(stats.attempts[5], 0, "no full-column scan");
+            assert_eq!(stats.attempts[6], 1, "one bounded prefix scan");
+        }
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

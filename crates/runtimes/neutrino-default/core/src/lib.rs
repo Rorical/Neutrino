@@ -2493,6 +2493,12 @@ pub const QUERY_METHOD_PARTICIPATION: &str = "participation";
 /// in request order. Reporters should query an authenticated finalized state
 /// before deleting historical sources.
 pub const QUERY_METHOD_REPORTER_STATUS: &str = "reporter_status";
+/// Query method: durable actual sanction settlements and bounded FIFO counts.
+///
+/// Args: none. Returns borsh [`accountability::settlement::SettlementSnapshot`].
+/// Querying finalized state excludes speculative executions and survives restart
+/// and authenticated state bootstrap without replaying old block bodies.
+pub const QUERY_METHOD_ACCOUNTABILITY_METRICS: &str = "accountability_metrics";
 /// Maximum identities accepted in one reporter status query.
 pub const MAX_REPORTER_STATUS_IDENTITIES: usize = 256;
 
@@ -2550,6 +2556,15 @@ pub fn query<B: neutrino_runtime_core::StateBackend>(
         QUERY_METHOD_RUNTIME_INFO => query_runtime_info(),
         QUERY_METHOD_PENDING_WITHDRAWALS => query_pending_withdrawals(&request.args, state),
         QUERY_METHOD_REPORTER_STATUS => query_reporter_status(&request.args, state),
+        QUERY_METHOD_ACCOUNTABILITY_METRICS => {
+            if !request.args.is_empty() {
+                return QueryResponse::err(QueryStatus::InvalidArguments, alloc::vec![]);
+            }
+            QueryResponse::ok(
+                borsh::to_vec(&accountability::settlement::snapshot(state))
+                    .expect("canonical settlement snapshot"),
+            )
+        }
         QUERY_METHOD_VALIDATOR_REGISTRATIONS => query_validator_registrations(state),
         QUERY_METHOD_CONSENSUS_CANDIDATES => {
             let payload = borsh::to_vec(&load_consensus_candidates(state))

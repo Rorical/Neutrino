@@ -24,6 +24,7 @@
 
 use crate::behaviour::{NeutrinoBehaviour, NeutrinoBehaviourEvent};
 use crate::bootnodes::Bootnodes;
+use crate::metrics::{Direction, NetworkMetrics, RpcObservation, RpcOutcome};
 use crate::rpc::{
     self, BftRoundByChunkCodec, BftRoundByChunkResponse, BlockProofByHashCodec,
     BlockProofByHashResponse, BlockProofByHeightCodec, BlockProofByHeightResponse,
@@ -46,13 +47,14 @@ use libp2p::{
     kad::{self, store::MemoryStore},
     noise, ping,
     request_response::{
-        self, OutboundFailure, OutboundRequestId, ProtocolSupport, ResponseChannel,
+        self, InboundRequestId, OutboundFailure, OutboundRequestId, ProtocolSupport,
+        ResponseChannel,
     },
     swarm::{DialError, SwarmEvent, dial_opts::DialOpts},
     tcp, yamux,
 };
 use neutrino_primitives::blake3_256;
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -237,6 +239,48 @@ impl core::fmt::Debug for NetworkCommand {
     }
 }
 
+struct PendingOutbound {
+    tx: oneshot::Sender<Result<RpcResponse, RpcError>>,
+    observation: RpcObservation,
+}
+
+impl PendingOutbound {
+    fn send(self, result: Result<RpcResponse, RpcError>) -> bool {
+        let Self {
+            tx,
+            mut observation,
+        } = self;
+        let outcome = match &result {
+            Ok(_) => RpcOutcome::Ok,
+            Err(RpcError::Remote(_)) => RpcOutcome::RemoteError,
+            Err(_) => RpcOutcome::DeliveryFailed,
+        };
+        let delivered = tx.send(result).is_ok();
+        observation.complete(if delivered {
+            outcome
+        } else {
+            RpcOutcome::DeliveryFailed
+        });
+        delivered
+    }
+
+    fn fail(self, error: &OutboundFailure) {
+        let Self {
+            tx,
+            mut observation,
+        } = self;
+        observation.complete(RpcOutcome::outbound(error));
+        let _ = tx.send(Err(RpcError::Outbound(format!("{error:?}"))));
+    }
+}
+
+struct PendingInbound {
+    observation: RpcObservation,
+    response_outcome: RpcOutcome,
+    /// Host-facing wire id, assigned once the request is forwarded.
+    raw: Option<u64>,
+}
+
 /// Tracks in-flight RPC state across the independent
 /// `request_response::Behaviour` instances.
 ///
@@ -247,38 +291,27 @@ impl core::fmt::Debug for NetworkCommand {
 #[derive(Default)]
 struct RpcDispatch {
     next_inbound_raw: u64,
+    metrics: Arc<NetworkMetrics>,
+    inbound_observations: HashMap<(RpcProtocol, InboundRequestId), PendingInbound>,
+    inbound_wire_ids: HashMap<u64, (RpcProtocol, InboundRequestId)>,
 
-    pending_status: HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_metadata: HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_ping: HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_blocks_by_range:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_blocks_by_root:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_state_by_root:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_block_proof_by_hash:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_block_proof_by_height:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_chunk_proof_by_id:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_checkpoint_latest:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_history_proof_by_range:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_finality_cert_by_chunk:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_witness_by_block:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_candidate_by_chunk:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_signed_artifact_by_id:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_signed_artifact_inventory_by_chunk:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
-    pending_bft_round_by_chunk:
-        HashMap<OutboundRequestId, oneshot::Sender<Result<RpcResponse, RpcError>>>,
+    pending_status: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_metadata: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_ping: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_blocks_by_range: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_blocks_by_root: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_state_by_root: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_block_proof_by_hash: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_block_proof_by_height: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_chunk_proof_by_id: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_checkpoint_latest: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_history_proof_by_range: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_finality_cert_by_chunk: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_witness_by_block: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_candidate_by_chunk: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_signed_artifact_by_id: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_signed_artifact_inventory_by_chunk: HashMap<OutboundRequestId, PendingOutbound>,
+    pending_bft_round_by_chunk: HashMap<OutboundRequestId, PendingOutbound>,
 
     inbound_status: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Status>>>,
     inbound_metadata: HashMap<u64, ResponseChannel<rpc::RpcResult<rpc::Metadata>>>,
@@ -310,9 +343,139 @@ struct RpcDispatch {
 }
 
 impl RpcDispatch {
-    const fn next_inbound_id(&mut self, protocol: RpcProtocol) -> RpcInboundId {
+    fn observe_event<Q, R>(
+        &mut self,
+        protocol: RpcProtocol,
+        event: &request_response::Event<Q, R>,
+    ) {
+        match event {
+            request_response::Event::Message {
+                message: request_response::Message::Request { request_id, .. },
+                ..
+            } => {
+                self.inbound_observations.insert(
+                    (protocol, *request_id),
+                    PendingInbound {
+                        observation: self.metrics.rpc_start(protocol, Direction::Inbound),
+                        response_outcome: RpcOutcome::Ok,
+                        raw: None,
+                    },
+                );
+            }
+            request_response::Event::InboundFailure {
+                request_id, error, ..
+            } => {
+                let outcome = self.metrics.inbound_failure(protocol, error);
+                self.finish_inbound(protocol, *request_id, outcome);
+            }
+            request_response::Event::ResponseSent { request_id, .. } => {
+                if let Some(pending) = self.inbound_observations.get(&(protocol, *request_id)) {
+                    let outcome = pending.response_outcome;
+                    self.finish_inbound(protocol, *request_id, outcome);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn response_outcome(&mut self, inbound_id: RpcInboundId, response: &RpcResponse) {
+        if let Some(key) = self.inbound_wire_ids.get(&inbound_id.raw)
+            && let Some(pending) = self.inbound_observations.get_mut(key)
+        {
+            pending.response_outcome = if matches!(response, RpcResponse::Error { .. }) {
+                RpcOutcome::RemoteError
+            } else {
+                RpcOutcome::Ok
+            };
+        }
+    }
+
+    fn response_delivery_failed(&mut self, inbound_id: RpcInboundId) {
+        if let Some(&(protocol, request_id)) = self.inbound_wire_ids.get(&inbound_id.raw) {
+            self.finish_inbound(protocol, request_id, RpcOutcome::DeliveryFailed);
+        }
+    }
+
+    fn finish_inbound(
+        &mut self,
+        protocol: RpcProtocol,
+        request_id: InboundRequestId,
+        outcome: RpcOutcome,
+    ) {
+        let Some(mut pending) = self.inbound_observations.remove(&(protocol, request_id)) else {
+            return;
+        };
+        pending.observation.complete(outcome);
+        if let Some(raw) = pending.raw {
+            self.inbound_wire_ids.remove(&raw);
+            // A timeout can precede the host's reply; release its stale channel too.
+            match protocol {
+                RpcProtocol::Status => {
+                    self.inbound_status.remove(&raw);
+                }
+                RpcProtocol::Metadata => {
+                    self.inbound_metadata.remove(&raw);
+                }
+                RpcProtocol::Ping => {
+                    self.inbound_ping.remove(&raw);
+                }
+                RpcProtocol::BlocksByRange => {
+                    self.inbound_blocks_by_range.remove(&raw);
+                }
+                RpcProtocol::BlocksByRoot => {
+                    self.inbound_blocks_by_root.remove(&raw);
+                }
+                RpcProtocol::StateByRoot => {
+                    self.inbound_state_by_root.remove(&raw);
+                }
+                RpcProtocol::BlockProofByHash => {
+                    self.inbound_block_proof_by_hash.remove(&raw);
+                }
+                RpcProtocol::BlockProofByHeight => {
+                    self.inbound_block_proof_by_height.remove(&raw);
+                }
+                RpcProtocol::ChunkProofById => {
+                    self.inbound_chunk_proof_by_id.remove(&raw);
+                }
+                RpcProtocol::CheckpointLatest => {
+                    self.inbound_checkpoint_latest.remove(&raw);
+                }
+                RpcProtocol::HistoryProofByRange => {
+                    self.inbound_history_proof_by_range.remove(&raw);
+                }
+                RpcProtocol::FinalityCertByChunk => {
+                    self.inbound_finality_cert_by_chunk.remove(&raw);
+                }
+                RpcProtocol::WitnessByBlock => {
+                    self.inbound_witness_by_block.remove(&raw);
+                }
+                RpcProtocol::CandidateByChunk => {
+                    self.inbound_candidate_by_chunk.remove(&raw);
+                }
+                RpcProtocol::SignedArtifactById => {
+                    self.inbound_signed_artifact_by_id.remove(&raw);
+                }
+                RpcProtocol::SignedArtifactInventoryByChunk => {
+                    self.inbound_signed_artifact_inventory_by_chunk.remove(&raw);
+                }
+                RpcProtocol::BftRoundByChunk => {
+                    self.inbound_bft_round_by_chunk.remove(&raw);
+                }
+            }
+        }
+    }
+
+    fn next_inbound_id(
+        &mut self,
+        protocol: RpcProtocol,
+        request_id: InboundRequestId,
+    ) -> RpcInboundId {
         let raw = self.next_inbound_raw;
         self.next_inbound_raw = self.next_inbound_raw.wrapping_add(1);
+        if let Some(pending) = self.inbound_observations.get_mut(&(protocol, request_id)) {
+            pending.raw = Some(raw);
+        }
+        self.inbound_wire_ids.insert(raw, (protocol, request_id));
         RpcInboundId { protocol, raw }
     }
 
@@ -322,6 +485,10 @@ impl RpcDispatch {
         id: OutboundRequestId,
         tx: oneshot::Sender<Result<RpcResponse, RpcError>>,
     ) {
+        let tx = PendingOutbound {
+            tx,
+            observation: self.metrics.rpc_start(protocol, Direction::Outbound),
+        };
         match protocol {
             RpcProtocol::Status => self.pending_status.insert(id, tx),
             RpcProtocol::Metadata => self.pending_metadata.insert(id, tx),
@@ -349,7 +516,7 @@ impl RpcDispatch {
         &mut self,
         protocol: RpcProtocol,
         id: OutboundRequestId,
-    ) -> Option<oneshot::Sender<Result<RpcResponse, RpcError>>> {
+    ) -> Option<PendingOutbound> {
         match protocol {
             RpcProtocol::Status => self.pending_status.remove(&id),
             RpcProtocol::Metadata => self.pending_metadata.remove(&id),
@@ -381,6 +548,7 @@ pub struct NetworkService {
     event_tx: mpsc::Sender<NetworkEvent>,
     rpc: RpcDispatch,
     bootnodes: Bootnodes,
+    metrics: Arc<NetworkMetrics>,
 }
 
 impl NetworkService {
@@ -416,12 +584,17 @@ impl NetworkService {
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
+        let metrics = Arc::new(NetworkMetrics::default());
         Ok(Self {
             swarm,
             command_rx,
             event_tx,
-            rpc: RpcDispatch::default(),
+            rpc: RpcDispatch {
+                metrics: Arc::clone(&metrics),
+                ..RpcDispatch::default()
+            },
             bootnodes: Bootnodes::default(),
+            metrics,
         })
     }
 
@@ -449,7 +622,20 @@ impl NetworkService {
             bootnodes.local_address(address);
         }
         self.bootnodes = bootnodes;
+        self.publish_bootnode_metrics();
         Ok(())
+    }
+
+    /// Shared process-lifetime measurements; obtain before moving this service
+    /// into its task. The handle does not retain the swarm.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<NetworkMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    fn publish_bootnode_metrics(&self) {
+        self.metrics
+            .bootnode_states(self.bootnodes.states(tokio::time::Instant::now()));
     }
 
     /// Begin listening on the given multiaddress.
@@ -458,7 +644,11 @@ impl NetworkService {
     ///
     /// Returns the underlying [`TransportError`] when the address cannot be bound.
     pub fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<io::Error>> {
-        self.swarm.listen_on(addr)
+        let result = self.swarm.listen_on(addr);
+        if result.is_err() {
+            self.metrics.listener_failure();
+        }
+        result
     }
 
     /// The local node's [`PeerId`].
@@ -473,14 +663,17 @@ impl NetworkService {
     /// Returns an error when a listener fails or the host event receiver closes.
     pub async fn run(mut self) -> Result<(), NetworkError> {
         loop {
+            self.publish_bootnode_metrics();
             let retry_at = self.bootnodes.next_deadline();
             tokio::select! {
                 event = self.swarm.select_next_some() => {
                     match &event {
                         SwarmEvent::ListenerError { listener_id, error } => {
+                            self.metrics.listener_failure();
                             return Err(NetworkError::Listener(format!("{listener_id:?}: {error}")));
                         }
                         SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                            self.metrics.listener_failure();
                             return Err(NetworkError::Listener(format!("{listener_id:?} closed: {reason:?}")));
                         }
                         _ => {}
@@ -520,8 +713,10 @@ impl NetworkService {
         if !self.bootnodes.start(index, connection) {
             return;
         }
+        self.metrics.bootnode_attempt();
         info!(address = %self.bootnodes.address(index), "dialing configured bootnode");
         if let Err(error) = self.swarm.dial(options) {
+            self.metrics.bootnode_failure(&error);
             self.bootnodes.failed(
                 connection,
                 tokio::time::Instant::now(),
@@ -549,6 +744,8 @@ impl NetworkService {
                 num_established,
                 ..
             } => {
+                self.metrics
+                    .connected(endpoint.is_dialer(), num_established.get() == 1);
                 self.bootnodes
                     .connected(peer_id, connection_id, endpoint.get_remote_address());
                 info!(%peer_id, ?endpoint, "connection established");
@@ -561,10 +758,13 @@ impl NetworkService {
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
+                endpoint,
                 num_established,
                 cause,
                 ..
             } => {
+                self.metrics
+                    .disconnected(endpoint.is_dialer(), num_established == 0);
                 self.bootnodes
                     .disconnected(peer_id, num_established, tokio::time::Instant::now());
                 info!(%peer_id, ?cause, "connection closed");
@@ -580,11 +780,13 @@ impl NetworkService {
                 peer_id,
                 error,
             } => {
-                self.bootnodes.failed(
+                if self.bootnodes.failed(
                     connection_id,
                     tokio::time::Instant::now(),
                     matches!(error, DialError::LocalPeerId { .. }),
-                );
+                ) {
+                    self.metrics.bootnode_failure(&error);
+                }
                 debug!(?peer_id, %error, "outgoing connection failed");
             }
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::Identify(
@@ -605,8 +807,14 @@ impl NetworkService {
                 result,
                 ..
             })) => match result {
-                Ok(rtt) => debug!(%peer, ?rtt, "ping success"),
-                Err(err) => warn!(%peer, ?err, "ping failed"),
+                Ok(rtt) => {
+                    self.metrics.ping(Some(rtt));
+                    debug!(%peer, ?rtt, "ping success");
+                }
+                Err(err) => {
+                    self.metrics.ping(None);
+                    warn!(%peer, ?err, "ping failed");
+                }
             },
             SwarmEvent::Behaviour(NeutrinoBehaviourEvent::Gossipsub(
                 gossipsub::Event::Message {
@@ -615,6 +823,7 @@ impl NetworkService {
                     message_id,
                 },
             )) => {
+                self.metrics.gossip_received(message.data.len());
                 let topic_str = message.topic.as_str().to_owned();
                 if let Some(topic) = parse_topic(&topic_str) {
                     let _ = self
@@ -627,6 +836,8 @@ impl NetworkService {
                         })
                         .await;
                 } else {
+                    self.metrics
+                        .gossip_validation(gossipsub::MessageAcceptance::Reject);
                     warn!(topic = %topic_str, "received gossip on unknown topic; rejecting");
                     // An unknown topic from a connected peer is a
                     // protocol violation; drop the message and let the
@@ -736,7 +947,9 @@ impl NetworkService {
             }
             NetworkCommand::Publish { topic, data } => {
                 let ident = topic.to_ident();
-                match self.swarm.behaviour_mut().gossipsub.publish(ident, data) {
+                let result = self.swarm.behaviour_mut().gossipsub.publish(ident, data);
+                self.metrics.gossip_publish(&result);
+                match result {
                     Ok(msg_id) => debug!(%topic, %msg_id, "published"),
                     Err(gossipsub::PublishError::Duplicate) => {
                         debug!(%topic, "exact gossip content already published");
@@ -775,6 +988,7 @@ impl NetworkService {
                 propagation_source,
                 acceptance,
             } => {
+                self.metrics.gossip_validation(acceptance);
                 let _ = self
                     .swarm
                     .behaviour_mut()
@@ -849,6 +1063,7 @@ impl NetworkService {
             return;
         }
 
+        self.rpc.response_outcome(inbound_id, &response);
         let behaviour = self.swarm.behaviour_mut();
         let delivered = match (inbound_id.protocol, response) {
             (RpcProtocol::Status, RpcResponse::Status(payload)) => self
@@ -1185,6 +1400,7 @@ impl NetworkService {
         };
 
         if !delivered {
+            self.rpc.response_delivery_failed(inbound_id);
             warn!(?inbound_id, "failed to deliver RPC response (timed out?)");
         }
     }
@@ -1193,16 +1409,19 @@ impl NetworkService {
         &mut self,
         ev: request_response::Event<rpc::Status, rpc::RpcResult<rpc::Status>>,
     ) {
+        self.rpc.observe_event(RpcProtocol::Status, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Status);
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Status, request_id);
                 self.rpc.inbound_status.insert(inbound_id.raw, channel);
                 let _ = self
                     .event_tx
@@ -1239,16 +1458,19 @@ impl NetworkService {
         &mut self,
         ev: request_response::Event<rpc::MetadataRequest, rpc::RpcResult<rpc::Metadata>>,
     ) {
+        self.rpc.observe_event(RpcProtocol::Metadata, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Metadata);
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Metadata, request_id);
                 self.rpc.inbound_metadata.insert(inbound_id.raw, channel);
                 let _ = self
                     .event_tx
@@ -1289,16 +1511,19 @@ impl NetworkService {
         &mut self,
         ev: request_response::Event<rpc::PingPayload, rpc::RpcResult<rpc::PingPayload>>,
     ) {
+        self.rpc.observe_event(RpcProtocol::Ping, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Ping);
+                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::Ping, request_id);
                 self.rpc.inbound_ping.insert(inbound_id.raw, channel);
                 let _ = self
                     .event_tx
@@ -1338,16 +1563,21 @@ impl NetworkService {
             rpc::RpcResult<BlocksByRangeResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::BlocksByRange, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlocksByRange);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::BlocksByRange, request_id);
                 self.rpc
                     .inbound_blocks_by_range
                     .insert(inbound_id.raw, channel);
@@ -1393,16 +1623,21 @@ impl NetworkService {
         &mut self,
         ev: request_response::Event<rpc::BlocksByRootRequest, rpc::RpcResult<BlocksByRootResponse>>,
     ) {
+        self.rpc.observe_event(RpcProtocol::BlocksByRoot, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlocksByRoot);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::BlocksByRoot, request_id);
                 self.rpc
                     .inbound_blocks_by_root
                     .insert(inbound_id.raw, channel);
@@ -1448,16 +1683,21 @@ impl NetworkService {
         &mut self,
         ev: request_response::Event<rpc::StateByRootRequest, rpc::RpcResult<StateByRootResponse>>,
     ) {
+        self.rpc.observe_event(RpcProtocol::StateByRoot, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::StateByRoot);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::StateByRoot, request_id);
                 self.rpc
                     .inbound_state_by_root
                     .insert(inbound_id.raw, channel);
@@ -1503,16 +1743,21 @@ impl NetworkService {
             rpc::RpcResult<BlockProofByHashResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::BlockProofByHash, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlockProofByHash);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::BlockProofByHash, request_id);
                 self.rpc
                     .inbound_block_proof_by_hash
                     .insert(inbound_id.raw, channel);
@@ -1561,16 +1806,21 @@ impl NetworkService {
             rpc::RpcResult<BlockProofByHeightResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::BlockProofByHeight, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BlockProofByHeight);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::BlockProofByHeight, request_id);
                 self.rpc
                     .inbound_block_proof_by_height
                     .insert(inbound_id.raw, channel);
@@ -1621,16 +1871,21 @@ impl NetworkService {
             rpc::RpcResult<ChunkProofByIdResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::ChunkProofById, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::ChunkProofById);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::ChunkProofById, request_id);
                 self.rpc
                     .inbound_chunk_proof_by_id
                     .insert(inbound_id.raw, channel);
@@ -1679,16 +1934,21 @@ impl NetworkService {
             rpc::RpcResult<CheckpointLatestResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::CheckpointLatest, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::CheckpointLatest);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::CheckpointLatest, request_id);
                 self.rpc
                     .inbound_checkpoint_latest
                     .insert(inbound_id.raw, channel);
@@ -1737,16 +1997,22 @@ impl NetworkService {
             rpc::RpcResult<HistoryProofByRangeResponse>,
         >,
     ) {
+        self.rpc
+            .observe_event(RpcProtocol::HistoryProofByRange, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::HistoryProofByRange);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::HistoryProofByRange, request_id);
                 self.rpc
                     .inbound_history_proof_by_range
                     .insert(inbound_id.raw, channel);
@@ -1801,16 +2067,22 @@ impl NetworkService {
             rpc::RpcResult<FinalityCertByChunkResponse>,
         >,
     ) {
+        self.rpc
+            .observe_event(RpcProtocol::FinalityCertByChunk, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::FinalityCertByChunk);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::FinalityCertByChunk, request_id);
                 self.rpc
                     .inbound_finality_cert_by_chunk
                     .insert(inbound_id.raw, channel);
@@ -1865,16 +2137,21 @@ impl NetworkService {
             rpc::RpcResult<WitnessByBlockResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::WitnessByBlock, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::WitnessByBlock);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::WitnessByBlock, request_id);
                 self.rpc
                     .inbound_witness_by_block
                     .insert(inbound_id.raw, channel);
@@ -1923,16 +2200,21 @@ impl NetworkService {
             rpc::RpcResult<CandidateByChunkResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::CandidateByChunk, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::CandidateByChunk);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::CandidateByChunk, request_id);
                 self.rpc
                     .inbound_candidate_by_chunk
                     .insert(inbound_id.raw, channel);
@@ -1981,16 +2263,21 @@ impl NetworkService {
             rpc::RpcResult<SignedArtifactByIdResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::SignedArtifactById, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::SignedArtifactById);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::SignedArtifactById, request_id);
                 self.rpc
                     .inbound_signed_artifact_by_id
                     .insert(inbound_id.raw, channel);
@@ -2041,18 +2328,22 @@ impl NetworkService {
             rpc::RpcResult<SignedArtifactInventoryByChunkResponse>,
         >,
     ) {
+        self.rpc
+            .observe_event(RpcProtocol::SignedArtifactInventoryByChunk, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
                 let inbound_id = self
                     .rpc
-                    .next_inbound_id(RpcProtocol::SignedArtifactInventoryByChunk);
+                    .next_inbound_id(RpcProtocol::SignedArtifactInventoryByChunk, request_id);
                 self.rpc
                     .inbound_signed_artifact_inventory_by_chunk
                     .insert(inbound_id.raw, channel);
@@ -2110,16 +2401,21 @@ impl NetworkService {
             rpc::RpcResult<BftRoundByChunkResponse>,
         >,
     ) {
+        self.rpc.observe_event(RpcProtocol::BftRoundByChunk, &ev);
         match ev {
             request_response::Event::Message {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
-                let inbound_id = self.rpc.next_inbound_id(RpcProtocol::BftRoundByChunk);
+                let inbound_id = self
+                    .rpc
+                    .next_inbound_id(RpcProtocol::BftRoundByChunk, request_id);
                 self.rpc
                     .inbound_bft_round_by_chunk
                     .insert(inbound_id.raw, channel);
@@ -2167,8 +2463,9 @@ impl NetworkService {
         request_id: OutboundRequestId,
         error: &OutboundFailure,
     ) {
+        self.metrics.outbound_failure(protocol, error);
         if let Some(tx) = self.rpc.take_outbound(protocol, request_id) {
-            let _ = tx.send(Err(RpcError::Outbound(format!("{error:?}"))));
+            tx.fail(error);
         } else {
             debug!(?protocol, ?error, "outbound failure for unknown request id");
         }
@@ -2880,6 +3177,8 @@ mod tests {
         svc_a
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
+        let metrics_a = svc_a.metrics();
+        let metrics_b = svc_b.metrics();
         tokio::spawn(svc_a.run());
         tokio::spawn(svc_b.run());
 
@@ -3034,6 +3333,24 @@ mod tests {
                 .unwrap();
             assert!(matches!(response, Err(RpcError::Remote(error)) if error == expected));
         }
+        timeout(TokDuration::from_secs(5), async {
+            loop {
+                let mut body_a = String::new();
+                let mut body_b = String::new();
+                metrics_a.render(&mut body_a);
+                metrics_b.render(&mut body_b);
+                let complete = ["status", "blocks_by_root", "state_by_root", "ping"].into_iter().all(|protocol| {
+                    let outcome = if protocol == "status" { "ok" } else { "remote_error" };
+                    [(&body_a, "outbound"), (&body_b, "inbound")].into_iter().all(|(body, direction)| {
+                        body.contains(&format!("neutrino_network_rpc_completed_total{{protocol=\"{protocol}\",direction=\"{direction}\",outcome=\"{outcome}\"}} 1"))
+                            && body.contains(&format!("neutrino_network_rpc_inflight{{protocol=\"{protocol}\",direction=\"{direction}\"}} 0"))
+                            && body.contains(&format!("neutrino_network_rpc_seconds_count{{protocol=\"{protocol}\",direction=\"{direction}\"}} 1"))
+                    })
+                });
+                if complete { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("both ends record exact RPC outcomes and release inflight");
     }
 
     /// Adversarial gossipsub scoring: peer A publishes a payload that

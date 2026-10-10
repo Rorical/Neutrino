@@ -40,6 +40,50 @@ struct Registry {
 pub(crate) struct TaskSpawner(Arc<Mutex<Registry>>);
 
 impl TaskSpawner {
+    pub(crate) fn render_metrics(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        const WORKERS: [&str; 14] = [
+            "network",
+            "sync",
+            "producer",
+            "bft-clock",
+            "consensus-notifications",
+            "history",
+            "facts",
+            "metrics",
+            "health-monitor",
+            "rpc",
+            "consensus-proof",
+            "evidence",
+            "program-restore",
+            "program-install",
+        ];
+        // The final slot counts every unlisted worker name.
+        let mut counts = [0_usize; WORKERS.len() + 1];
+        for task in self
+            .0
+            .lock()
+            .expect("task registry poisoned")
+            .names
+            .values()
+        {
+            let index = WORKERS
+                .iter()
+                .position(|worker| *worker == task.name)
+                .unwrap_or(WORKERS.len());
+            counts[index] += 1;
+        }
+        crate::metrics::family(
+            out,
+            "neutrino_worker_tasks",
+            "Registered tasks, including completed tasks awaiting supervision.",
+            "gauge",
+        );
+        for (name, count) in WORKERS.iter().chain(&["other"]).zip(counts) {
+            let _ = writeln!(out, "neutrino_worker_tasks{{worker=\"{name}\"}} {count}");
+        }
+    }
+
     pub(crate) fn spawn_critical(
         &self,
         name: &'static str,

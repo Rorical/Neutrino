@@ -51,6 +51,8 @@ toml                              = "1.1.6"
 tracing                           = "0.1.44"
 tracing-subscriber                = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
+sysinfo = "=0.30.13"
+
 [dev-dependencies]
 neutrino-vrf = { workspace = true }
 tokio                 = { version = "1.53.1", features = ["full", "test-util"] }

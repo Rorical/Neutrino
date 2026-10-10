@@ -1,12 +1,113 @@
 //! Opportunistic early fact compression. BFT never waits on a proof.
 
 use super::ChainBackend;
+use crate::metrics::NodeMetrics;
+use crate::proof_metrics::{BacklogGuard, FACT_QUEUE_CAPACITY, ProofStage};
+use crate::proving_budget::ProvingBudget;
 use neutrino_consensus_types::history_proof::VkDigest;
 use neutrino_proof_system::ProofSystem;
 use neutrino_prover_chunk::facts::{FactRequest, MAX_FACTS};
 use neutrino_storage::Database;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::mpsc;
+
+pub(super) struct FactJob {
+    program: VkDigest,
+    requests: Vec<FactRequest>,
+    pending: BacklogGuard,
+}
+
+async fn run_fact_worker<P: ProofSystem + Send + Sync + 'static>(
+    mut rx: mpsc::Receiver<FactJob>,
+    prover: Arc<P>,
+    budget: Arc<ProvingBudget>,
+    metrics: Arc<NodeMetrics>,
+) {
+    let mut carried = None;
+    while let Some(job) = match carried.take() {
+        Some(job) => Some(job),
+        None => rx.recv().await,
+    } {
+        let FactJob {
+            program,
+            mut requests,
+            pending,
+        } = job;
+        let mut pending = vec![pending];
+        for _ in 0..FACT_QUEUE_CAPACITY {
+            let Ok(next) = rx.try_recv() else {
+                break;
+            };
+            if next.program == program {
+                requests.extend(next.requests);
+                pending.push(next.pending);
+            } else {
+                carried = Some(next);
+                break;
+            }
+        }
+        let prover = Arc::clone(&prover);
+        let budget = Arc::clone(&budget);
+        let metrics = Arc::clone(&metrics);
+        match tokio::task::spawn_blocking(move || {
+            drop(pending);
+            let _permit = budget.acquire(ProofStage::Fact);
+            metrics
+                .proof_pipeline
+                .fact_proofs
+                .time(|| prover.preprove_facts(&program, &requests))
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "early fact proof unavailable; evidence will prove on demand");
+            }
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => tracing::warn!(%error, "early fact worker cancelled"),
+        }
+    }
+}
+
+fn enqueue_fact_groups(
+    sender: &mpsc::Sender<FactJob>,
+    program: VkDigest,
+    requests: &[FactRequest],
+    metrics: &NodeMetrics,
+) {
+    let groups = requests.chunks(MAX_FACTS);
+    let count = groups.len();
+    for (index, group) in groups.enumerate() {
+        let pipeline = &metrics.proof_pipeline;
+        if !borsh::object_length(&group).is_ok_and(|bytes| bytes <= 2 * 1024 * 1024) {
+            pipeline
+                .fact_dropped_oversize
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let job = FactJob {
+            program,
+            requests: group.to_vec(),
+            pending: pipeline.fact_backlog.track(group.len()),
+        };
+        let remaining = u64::try_from(count - index).unwrap_or(u64::MAX);
+        match sender.try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                pipeline
+                    .fact_dropped_full
+                    .fetch_add(remaining, Ordering::Relaxed);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                pipeline
+                    .fact_dropped_closed
+                    .fetch_add(remaining, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+}
 
 impl<DB, P> ChainBackend<DB, P>
 where
@@ -32,56 +133,21 @@ where
         }
         let mut guard = self.fact_jobs.lock().expect("fact queue mutex");
         if guard.as_ref().is_none_or(mpsc::Sender::is_closed) {
-            let (tx, mut rx) = mpsc::channel::<(VkDigest, Vec<FactRequest>)>(8);
-            let prover = Arc::clone(&self.proof_system);
-            let budget = Arc::clone(&self.proving_budget);
-            self.spawn_background_worker("facts", async move {
-                let mut carried: Option<(VkDigest, Vec<FactRequest>)> = None;
-                while let Some((program, mut requests)) = match carried.take() {
-                    Some(group) => Some(group),
-                    None => rx.recv().await,
-                } {
-                    // Coalesce already queued groups for the same program
-                    // without delaying consensus or starting a timer. Drain at
-                    // most the bounded queue's capacity so continuous arrivals
-                    // cannot starve proving; a group for another program is
-                    // carried into the next round.
-                    for _ in 0..8 {
-                        let Ok((next_program, group)) = rx.try_recv() else {
-                            break;
-                        };
-                        if next_program == program {
-                            requests.extend(group);
-                        } else {
-                            carried = Some((next_program, group));
-                            break;
-                        }
-                    }
-                    let prover = Arc::clone(&prover);
-                    let budget = Arc::clone(&budget);
-                    match tokio::task::spawn_blocking(move || {
-                        let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Normal);
-                        prover.preprove_facts(&program, &requests)
-                    }).await {
-                        Ok(Ok(())) => {},
-                        Ok(Err(error)) => tracing::debug!(%error, "early fact proof unavailable; evidence will prove on demand"),
-                        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                        Err(error) => tracing::warn!(%error, "early fact worker cancelled"),
-                    }
-                }
-            });
+            let (tx, rx) = mpsc::channel::<FactJob>(FACT_QUEUE_CAPACITY);
+            self.spawn_background_worker(
+                "facts",
+                run_fact_worker(
+                    rx,
+                    Arc::clone(&self.proof_system),
+                    Arc::clone(&self.proving_budget),
+                    Arc::clone(&self.metrics),
+                ),
+            );
             *guard = Some(tx);
         }
         let sender = guard.as_ref().expect("initialized fact queue").clone();
         drop(guard);
-        for group in requests.chunks(MAX_FACTS) {
-            // Eight queued groups, one worker, at most 2 MiB per group.
-            if borsh::object_length(&group).is_ok_and(|bytes| bytes <= 2 * 1024 * 1024)
-                && sender.try_send((fact_program, group.to_vec())).is_err()
-            {
-                break;
-            }
-        }
+        enqueue_fact_groups(&sender, fact_program, requests, &self.metrics);
     }
 
     /// Validators that signed material for `chunk_id`: the historical record
@@ -219,3 +285,7 @@ where
         self.queue_facts(&requests);
     }
 }
+
+#[cfg(test)]
+#[path = "fact_metrics_tests.rs"]
+mod metrics_tests;

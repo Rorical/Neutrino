@@ -12,8 +12,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use std::time::Duration;
 
 type Pause = (mpsc::Sender<()>, mpsc::Receiver<()>);
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct Hooks {
@@ -48,6 +50,7 @@ impl Database for FaultDatabase {
     }
 
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error> {
+        pause_batch_deletions(&batch, &self.hooks.delete);
         self.inner.write_batch(batch).unwrap();
         Ok(())
     }
@@ -67,6 +70,7 @@ impl Database for FaultDatabase {
                 return Err("injected durable raw insertion failure");
             }
         }
+        pause_batch_deletions(&batch, &self.hooks.delete);
         self.inner.write_batch_durable(batch).unwrap();
         Ok(())
     }
@@ -76,11 +80,27 @@ impl Database for FaultDatabase {
     }
 }
 
+fn pause_batch_deletions(batch: &Batch, hook: &Mutex<Option<Pause>>) {
+    if batch.operations().iter().any(|operation| {
+        matches!(
+            operation,
+            BatchOp::Delete {
+                column: Column::SlashingPool,
+                ..
+            }
+        )
+    }) {
+        pause_once(hook);
+    }
+}
+
 fn pause_once(hook: &Mutex<Option<Pause>>) {
     let pause = hook.lock().unwrap().take();
     if let Some((entered, resume)) = pause {
         entered.send(()).unwrap();
-        resume.recv().unwrap();
+        resume
+            .recv_timeout(PAUSE_TIMEOUT)
+            .expect("paused database operation must be resumed");
     }
 }
 
@@ -129,6 +149,35 @@ fn offence() -> SlashingEvidence {
 }
 
 #[test]
+fn ordinary_and_durable_batch_deletions_trigger_the_pause_hook() {
+    for durable in [false, true] {
+        let hooks = Arc::new(Hooks::default());
+        let mut database = FaultDatabase {
+            inner: MemoryDatabase::new(),
+            hooks: Arc::clone(&hooks),
+        };
+        database.put(Column::SlashingPool, &[1; 32], &[2]).unwrap();
+        let (entered, resume) = arm_pause(&hooks.delete);
+        let deletion = std::thread::spawn(move || {
+            let mut batch = Batch::new();
+            batch.delete(Column::SlashingPool, [1; 32]);
+            if durable {
+                database.write_batch_durable(batch).unwrap();
+            } else {
+                database.write_batch(batch).unwrap();
+            }
+            database
+        });
+        entered
+            .recv_timeout(PAUSE_TIMEOUT)
+            .expect("batch deletion must trigger the database pause hook");
+        resume.send(()).unwrap();
+        let database = deletion.join().unwrap();
+        assert_eq!(database.get(Column::SlashingPool, &[1; 32]).unwrap(), None);
+    }
+}
+
+#[test]
 fn failed_durable_insert_does_not_poison_deduplication() {
     let hooks = Arc::new(Hooks::default());
     let backend = backend(Arc::clone(&hooks));
@@ -161,7 +210,9 @@ fn finalized_cleanup_cannot_be_undone_by_a_stale_computed_offence() {
     let inserting = Arc::clone(&backend);
     let input = evidence.clone();
     let insert = std::thread::spawn(move || inserting.insert_persistent(&input));
-    entered.recv().unwrap();
+    entered
+        .recv_timeout(PAUSE_TIMEOUT)
+        .expect("durable insertion must trigger the database pause hook");
     // No cleanup can see an insertion before its durable outcome is known.
     assert!(backend.slashing_pool.try_lock().is_err());
     let cleaning = Arc::clone(&backend);
@@ -195,7 +246,9 @@ fn drain_keeps_pool_locked_until_the_old_disk_row_is_deleted() {
     let (entered, resume) = arm_pause(&hooks.delete);
     let draining = Arc::clone(&backend);
     let drain = std::thread::spawn(move || draining.drain_slashing_pool(1));
-    entered.recv().unwrap();
+    entered
+        .recv_timeout(PAUSE_TIMEOUT)
+        .expect("raw pool drain must trigger the database deletion pause hook");
     assert!(backend.slashing_pool.try_lock().is_err());
     resume.send(()).unwrap();
     assert_eq!(drain.join().unwrap(), vec![evidence.clone()]);

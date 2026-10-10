@@ -2,8 +2,7 @@
 //!
 //! The node records proving outcomes and latencies as they happen and samples
 //! chain, sync and BFT state once per second. The exposition is rendered by
-//! hand and served by a tiny HTTP/1.1 responder so the metrics surface adds no
-//! dependencies and shares nothing with the JSON-RPC server.
+//! hand and served by a tiny HTTP/1.1 responder independently of JSON-RPC.
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -18,17 +17,68 @@ use crate::health::NodeHealth;
 
 /// Histogram bucket upper bounds in seconds, chosen for proof latencies that
 /// range from a few seconds (blocks) to many minutes (chunks on CPU).
-pub const LATENCY_BUCKETS_SECS: [f64; 10] =
-    [1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0];
+pub const LATENCY_BUCKETS_SECS: [f64; 17] = [
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    1800.0,
+];
+
+/// Cumulative latency histogram over [`LATENCY_BUCKETS_SECS`].
+#[derive(Debug, Default)]
+pub(crate) struct LatencyHistogram {
+    sum_micros: AtomicU64,
+    buckets: [AtomicU64; LATENCY_BUCKETS_SECS.len()],
+    overflow: AtomicU64,
+}
+
+impl LatencyHistogram {
+    /// Record one latency and return it in whole microseconds.
+    pub(crate) fn observe(&self, elapsed: Duration) -> u64 {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+        let secs = elapsed.as_secs_f64();
+        LATENCY_BUCKETS_SECS
+            .iter()
+            .position(|bound| secs <= *bound)
+            .map_or(&self.overflow, |index| &self.buckets[index])
+            .fetch_add(1, Ordering::Relaxed);
+        micros
+    }
+
+    /// Render the `_bucket`, `_sum` and `_count` samples of `name`, with
+    /// `labels` (comma-separated `key="value"` pairs) prepended to each.
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
+        let separator = if labels.is_empty() { "" } else { "," };
+        let mut count = 0_u64;
+        for (bound, bucket) in LATENCY_BUCKETS_SECS.iter().zip(&self.buckets) {
+            count += bucket.load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{name}_bucket{{{labels}{separator}le=\"{bound}\"}} {count}"
+            );
+        }
+        count += self.overflow.load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "{name}_bucket{{{labels}{separator}le=\"+Inf\"}} {count}"
+        );
+        let sum = seconds(self.sum_micros.load(Ordering::Relaxed));
+        if labels.is_empty() {
+            let _ = writeln!(out, "{name}_sum {sum}\n{name}_count {count}");
+        } else {
+            let _ = writeln!(
+                out,
+                "{name}_sum{{{labels}}} {sum}\n{name}_count{{{labels}}} {count}"
+            );
+        }
+    }
+}
 
 /// Counters and a latency histogram for one proving stage.
 #[derive(Debug, Default)]
 pub struct StageMetrics {
     ok: AtomicU64,
     failed: AtomicU64,
-    seconds_sum_micros: AtomicU64,
-    buckets: [AtomicU64; LATENCY_BUCKETS_SECS.len()],
-    overflow: AtomicU64,
+    latency: LatencyHistogram,
     last_micros: AtomicU64,
     max_micros: AtomicU64,
 }
@@ -42,54 +92,111 @@ impl StageMetrics {
         } else {
             self.failed.fetch_add(1, Ordering::Relaxed);
         }
-        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        self.seconds_sum_micros.fetch_add(micros, Ordering::Relaxed);
+        let micros = self.latency.observe(elapsed);
         self.last_micros.store(micros, Ordering::Relaxed);
         self.max_micros.fetch_max(micros, Ordering::Relaxed);
-        let secs = elapsed.as_secs_f64();
-        let bucket = LATENCY_BUCKETS_SECS
-            .iter()
-            .position(|bound| secs <= *bound)
-            .map_or(&self.overflow, |index| &self.buckets[index]);
-        bucket.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn render(&self, out: &mut String, name: &str, help: &str) {
+    /// Render this fixed-name stage in Prometheus text format.
+    pub fn render(&self, out: &mut String, name: &str, help: &str) {
         let ok = self.ok.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
-        let _ = writeln!(out, "# HELP {name}_total {help} attempts by outcome.");
-        let _ = writeln!(out, "# TYPE {name}_total counter");
+        family(
+            out,
+            &format!("{name}_total"),
+            &format!("{help} attempts by outcome."),
+            "counter",
+        );
         let _ = writeln!(out, "{name}_total{{outcome=\"ok\"}} {ok}");
         let _ = writeln!(out, "{name}_total{{outcome=\"failed\"}} {failed}");
-        let _ = writeln!(out, "# HELP {name}_seconds {help} latency.");
-        let _ = writeln!(out, "# TYPE {name}_seconds histogram");
-        let mut cumulative = 0_u64;
-        for (bound, bucket) in LATENCY_BUCKETS_SECS.iter().zip(&self.buckets) {
-            cumulative += bucket.load(Ordering::Relaxed);
-            let _ = writeln!(out, "{name}_seconds_bucket{{le=\"{bound}\"}} {cumulative}");
+        let histogram = format!("{name}_seconds");
+        family(out, &histogram, &format!("{help} latency."), "histogram");
+        self.latency.render(out, &histogram, "");
+        gauge(
+            out,
+            &format!("{name}_last_seconds"),
+            "Most recent attempt latency.",
+            seconds(self.last_micros.load(Ordering::Relaxed)),
+        );
+        gauge(
+            out,
+            &format!("{name}_max_seconds"),
+            "Largest observed attempt latency.",
+            seconds(self.max_micros.load(Ordering::Relaxed)),
+        );
+    }
+
+    /// Measure an attempt, recording failure on early return or unwinding.
+    pub fn timer(&self) -> StageTimer<'_> {
+        StageTimer {
+            metrics: self,
+            started: Instant::now(),
+            ok: false,
         }
-        cumulative += self.overflow.load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_seconds_bucket{{le=\"+Inf\"}} {cumulative}");
-        let sum = seconds(self.seconds_sum_micros.load(Ordering::Relaxed));
-        let _ = writeln!(out, "{name}_seconds_sum {sum}");
-        let _ = writeln!(out, "{name}_seconds_count {cumulative}");
-        let last = seconds(self.last_micros.load(Ordering::Relaxed));
-        let max = seconds(self.max_micros.load(Ordering::Relaxed));
-        let _ = writeln!(out, "# TYPE {name}_last_seconds gauge");
-        let _ = writeln!(out, "{name}_last_seconds {last}");
-        let _ = writeln!(out, "# TYPE {name}_max_seconds gauge");
-        let _ = writeln!(out, "{name}_max_seconds {max}");
+    }
+
+    /// Time `attempt`, recording success only for `Ok` and failure on unwinding.
+    pub fn time<T, E>(&self, attempt: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let timer = self.timer();
+        let result = attempt();
+        timer.finish(result.is_ok());
+        result
+    }
+}
+
+/// Records a stage attempt when dropped, including early errors and panics.
+pub struct StageTimer<'a> {
+    metrics: &'a StageMetrics,
+    started: Instant,
+    ok: bool,
+}
+
+impl StageTimer<'_> {
+    /// Complete the attempt with the supplied outcome.
+    pub fn finish(mut self, ok: bool) {
+        self.ok = ok;
+    }
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics.observe(self.started.elapsed(), self.ok);
     }
 }
 
 /// Render microseconds as decimal seconds without a lossy float cast.
-fn seconds(micros: u64) -> String {
+pub(crate) fn seconds(micros: u64) -> String {
     format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
+}
+
+/// Write the `HELP` and `TYPE` lines of a metric family.
+pub(crate) fn family(out: &mut String, name: &str, help: &str, kind: &str) {
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+}
+
+/// Write a complete unlabelled gauge.
+pub(crate) fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
+    family(out, name, help, "gauge");
+    let _ = writeln!(out, "{name} {value}");
+}
+
+/// Write a complete unlabelled counter.
+pub(crate) fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    family(out, name, help, "counter");
+    let _ = writeln!(out, "{name} {value}");
 }
 
 /// Process-lifetime counters updated at the proving and production sites.
 #[derive(Debug, Default)]
 pub struct NodeMetrics {
+    /// Queueing, admission and optional proof stages.
+    pub proof_pipeline: crate::proof_metrics::ProofMetrics,
+    /// Reporter retention, submission and finalized economic state.
+    pub reporter: crate::reporter_metrics::ReporterMetrics,
+    /// Execution, imports, transaction admission and BFT events.
+    pub execution: crate::execution_metrics::ExecutionMetrics,
+    /// Locally dispatched block workers, including budget waiters.
+    pub block_proof_queue_launched: AtomicU64,
     /// Block proofs produced by this node.
     pub block_proofs: StageMetrics,
     /// Complete consensus chunk proofs produced by this node.
@@ -102,12 +209,6 @@ pub struct NodeMetrics {
     pub blocks_produced: AtomicU64,
     /// Block proof jobs waiting for a worker.
     pub block_proof_queue_pending: AtomicU64,
-    /// Block proof jobs currently proving.
-    pub block_proof_queue_running: AtomicU64,
-    /// Signature checks of the last chunk answered by fact receipts.
-    pub chunk_fact_checks_covered: AtomicU64,
-    /// Signature checks the last chunk performed in total.
-    pub chunk_fact_checks_total: AtomicU64,
 }
 
 /// One live BFT session as seen by the engine.
@@ -117,6 +218,16 @@ pub struct NodeMetrics {
     reason = "independent phase flags exported as gauges"
 )]
 pub struct BftSessionGauge {
+    /// Eligible stake represented by this session.
+    pub total_stake: u64,
+    /// Value prevote stake accumulated in the current round.
+    pub prevote_stake: u64,
+    /// Value precommit stake accumulated in the current round.
+    pub precommit_stake: u64,
+    /// Explicit nil prevote stake in the current round.
+    pub nil_prevote_stake: u64,
+    /// Explicit nil precommit stake in the current round.
+    pub nil_precommit_stake: u64,
     /// Chunk under vote.
     pub chunk_id: u64,
     /// Current round.
@@ -138,6 +249,10 @@ pub struct BftSessionGauge {
     reason = "independent operational conditions exported as gauges"
 )]
 pub struct MetricsSnapshot {
+    /// An authenticated current validator list is locally available.
+    pub validator_set_available: bool,
+    /// Total seats, including zero-weight and permanently ejected identities.
+    pub validator_seats: u64,
     /// Unfinalised head height.
     pub head_height: u64,
     /// Number of finalized chunks.
@@ -146,7 +261,7 @@ pub struct MetricsSnapshot {
     pub recursive_covered_chunks: u64,
     /// Chunks whose raw data may have been pruned.
     pub pruned_before_chunk: u64,
-    /// Size of the active consensus validator set; zero when unavailable in proof-only mode.
+    /// Number of unslashed, positive-weight consensus validators.
     pub active_validators: u64,
     /// Connected peers, if a sync driver is attached.
     pub peers: u64,
@@ -174,12 +289,9 @@ pub trait MetricsSource: Send + Sync {
     fn metrics(&self) -> &NodeMetrics;
     /// Sample live state. Called by the supervised health monitor once per second.
     fn snapshot(&self) -> MetricsSnapshot;
-}
-
-fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
-    let _ = writeln!(out, "# HELP {name} {help}");
-    let _ = writeln!(out, "# TYPE {name} gauge");
-    let _ = writeln!(out, "{name} {value}");
+    /// Append subsystem exposition that only scrapes need. Called on a blocking
+    /// thread at most once per [`SNAPSHOT_INTERVAL`], never by the health monitor.
+    fn render_subsystems(&self, _out: &mut String) {}
 }
 
 /// Render the Prometheus text exposition for `metrics` and `snapshot`.
@@ -189,6 +301,9 @@ pub fn render(metrics: &NodeMetrics, snapshot: &MetricsSnapshot) -> String {
     render_chain_gauges(&mut out, snapshot);
     render_worker_gauges(&mut out, metrics);
     render_sessions(&mut out, snapshot);
+    metrics.proof_pipeline.render(&mut out);
+    metrics.reporter.render(&mut out);
+    metrics.execution.render(&mut out);
     metrics
         .block_proofs
         .render(&mut out, "neutrino_block_proof", "Block proof");
@@ -205,6 +320,7 @@ pub fn render(metrics: &NodeMetrics, snapshot: &MetricsSnapshot) -> String {
 }
 
 fn render_chain_gauges(out: &mut String, snapshot: &MetricsSnapshot) {
+    render_validator_gauges(out, snapshot);
     gauge(
         out,
         "neutrino_head_height",
@@ -251,12 +367,6 @@ fn render_chain_gauges(out: &mut String, snapshot: &MetricsSnapshot) {
     );
     gauge(
         out,
-        "neutrino_active_validators",
-        "Size of the active consensus validator set.",
-        snapshot.active_validators,
-    );
-    gauge(
-        out,
         "neutrino_peers",
         "Connected libp2p peers.",
         snapshot.peers,
@@ -275,8 +385,31 @@ fn render_chain_gauges(out: &mut String, snapshot: &MetricsSnapshot) {
     );
 }
 
-fn render_worker_gauges(out: &mut String, metrics: &NodeMetrics) {
+fn render_validator_gauges(out: &mut String, snapshot: &MetricsSnapshot) {
     gauge(
+        out,
+        "neutrino_validator_set_available",
+        "An authenticated current validator list is locally available.",
+        u8::from(snapshot.validator_set_available),
+    );
+    if snapshot.validator_set_available {
+        gauge(
+            out,
+            "neutrino_validator_seats",
+            "Consensus seats including zero-weight identities.",
+            snapshot.validator_seats,
+        );
+        gauge(
+            out,
+            "neutrino_active_validators",
+            "Unslashed consensus validators with positive effective stake.",
+            snapshot.active_validators,
+        );
+    }
+}
+
+fn render_worker_gauges(out: &mut String, metrics: &NodeMetrics) {
+    counter(
         out,
         "neutrino_blocks_produced_total",
         "Blocks produced by the local proposer.",
@@ -292,34 +425,82 @@ fn render_worker_gauges(out: &mut String, metrics: &NodeMetrics) {
         out,
         "neutrino_block_proof_queue_running",
         "Block proof jobs currently proving.",
-        metrics.block_proof_queue_running.load(Ordering::Relaxed),
+        metrics
+            .proof_pipeline
+            .budget
+            .inflight(crate::proof_metrics::ProofStage::Block),
     );
+    let coverage = metrics.proof_pipeline.fact_coverage();
     gauge(
         out,
-        "neutrino_chunk_fact_checks_covered",
-        "Signature checks of the last chunk proof answered by fact receipts.",
-        metrics.chunk_fact_checks_covered.load(Ordering::Relaxed),
+        "neutrino_last_chunk_fact_coverage_available",
+        "A locally proven successful chunk has supplied coherent fact coverage.",
+        u8::from(coverage.is_some()),
     );
+    if let Some((covered, total)) = coverage {
+        gauge(
+            out,
+            "neutrino_last_chunk_fact_checks_covered",
+            "Unique fact checks answered by attached receipts in the latest successfully locally proven chunk.",
+            covered,
+        );
+        gauge(
+            out,
+            "neutrino_last_chunk_fact_checks",
+            "Unique fact checks requested by the latest successfully locally proven chunk.",
+            total,
+        );
+    }
     gauge(
         out,
-        "neutrino_chunk_fact_checks_total",
-        "Signature checks the last chunk proof performed.",
-        metrics.chunk_fact_checks_total.load(Ordering::Relaxed),
+        "neutrino_block_proof_queue_launched",
+        "Dispatched block workers including those awaiting global proof capacity.",
+        metrics.block_proof_queue_launched.load(Ordering::Relaxed),
     );
 }
 
+/// BFT sessions exposed as labelled slots; the rest are only counted.
+const SESSION_SLOTS: usize = 64;
+
 fn render_sessions(out: &mut String, snapshot: &MetricsSnapshot) {
-    let _ = writeln!(
-        out,
-        "# HELP neutrino_bft_session BFT session flags per chunk under vote."
-    );
-    let _ = writeln!(out, "# TYPE neutrino_bft_session gauge");
-    for session in &snapshot.bft_sessions {
+    // Labels describe bounded positions, while chunk identities are values.
+    for (name, help) in [
+        ("neutrino_bft_session", "Current BFT session phase flags."),
+        ("neutrino_bft_session_round", "Current BFT session round."),
+        (
+            "neutrino_bft_session_chunk",
+            "Chunk identity as a value, never a label.",
+        ),
+        (
+            "neutrino_bft_session_stake",
+            "Eligible stake by phase in the current round.",
+        ),
+    ] {
+        family(out, name, help, "gauge");
+    }
+    for (slot, session) in snapshot.bft_sessions.iter().take(SESSION_SLOTS).enumerate() {
         let _ = writeln!(
             out,
-            "neutrino_bft_session_round{{chunk_id=\"{}\"}} {}",
-            session.chunk_id, session.round
+            "neutrino_bft_session_round{{slot=\"{slot}\"}} {}",
+            session.round
         );
+        let _ = writeln!(
+            out,
+            "neutrino_bft_session_chunk{{slot=\"{slot}\"}} {}",
+            session.chunk_id
+        );
+        for (phase, stake) in [
+            ("total", session.total_stake),
+            ("prevote", session.prevote_stake),
+            ("precommit", session.precommit_stake),
+            ("nil_prevote", session.nil_prevote_stake),
+            ("nil_precommit", session.nil_precommit_stake),
+        ] {
+            let _ = writeln!(
+                out,
+                "neutrino_bft_session_stake{{slot=\"{slot}\",phase=\"{phase}\"}} {stake}"
+            );
+        }
         for (flag, value) in [
             ("local_prevoted", session.local_prevoted),
             ("local_precommitted", session.local_precommitted),
@@ -328,8 +509,7 @@ fn render_sessions(out: &mut String, snapshot: &MetricsSnapshot) {
         ] {
             let _ = writeln!(
                 out,
-                "neutrino_bft_session{{chunk_id=\"{}\",flag=\"{flag}\"}} {}",
-                session.chunk_id,
+                "neutrino_bft_session{{slot=\"{slot}\",flag=\"{flag}\"}} {}",
                 u8::from(value)
             );
         }
@@ -339,6 +519,12 @@ fn render_sessions(out: &mut String, snapshot: &MetricsSnapshot) {
         "neutrino_bft_sessions",
         "Number of live BFT sessions.",
         snapshot.bft_sessions.len(),
+    );
+    gauge(
+        out,
+        "neutrino_bft_sessions_unexposed",
+        "Sessions beyond the fixed 64-slot exposition budget.",
+        snapshot.bft_sessions.len().saturating_sub(SESSION_SLOTS),
     );
 }
 
@@ -374,6 +560,7 @@ impl Scraper {
         }
         let snapshot = self.health.snapshot();
         let mut body = render(self.source.metrics(), &snapshot);
+        self.source.render_subsystems(&mut body);
         let health = self.health.status();
         gauge(
             &mut body,
@@ -417,6 +604,38 @@ impl Scraper {
             "Sync FSM is waiting for its first peer handshake.",
             u8::from(snapshot.sync_awaiting_peer),
         );
+        gauge(
+            &mut body,
+            "neutrino_health_sample_age_seconds",
+            "Age of the last health sample; -1 before the first sample.",
+            health
+                .sample_age
+                .map_or_else(|| "-1".to_owned(), |age| age.as_secs().to_string()),
+        );
+        let _ = writeln!(
+            body,
+            "# HELP neutrino_readiness_reason Current finite readiness reason.\n# TYPE neutrino_readiness_reason gauge"
+        );
+        for reason in [
+            "starting",
+            "stopping",
+            "critical_task_failed",
+            "health_sample_stale",
+            "bootstrap_pending",
+            "trust_anchor_expired",
+            "insufficient_peers",
+            "syncing",
+            "history_lag_exceeded",
+            "finality_stalled",
+            "ok",
+            "health_sample_pending",
+        ] {
+            let _ = writeln!(
+                body,
+                "neutrino_readiness_reason{{reason=\"{reason}\"}} {}",
+                u8::from(health.reason == reason)
+            );
+        }
         let body = Arc::new(body);
         *cached = Some((Instant::now(), Arc::clone(&body)));
         body
@@ -481,7 +700,11 @@ async fn respond(mut stream: TcpStream, scraper: Arc<Scraper>) -> std::io::Resul
     let path = parts.next().unwrap_or("");
     let (status, body): (&str, Arc<String>) =
         if method == "GET" && (path == "/metrics" || path == "/") {
-            ("200 OK", scraper.exposition())
+            let scraper = Arc::clone(&scraper);
+            let body = tokio::task::spawn_blocking(move || scraper.exposition())
+                .await
+                .map_err(std::io::Error::other)?;
+            ("200 OK", body)
         } else if method == "GET" && matches!(path, "/health" | "/ready" | "/live") {
             let health = scraper.health.status();
             let healthy = if path == "/live" {
@@ -632,8 +855,8 @@ mod tests {
         assert!(out.contains("neutrino_history_proof_lag_chunks 2"));
         assert!(out.contains("neutrino_syncing 1"));
         assert!(out.contains("neutrino_blocks_produced_total 7"));
-        assert!(out.contains("neutrino_bft_session{chunk_id=\"5\",flag=\"local_prevoted\"} 1"));
-        assert!(out.contains("neutrino_bft_session{chunk_id=\"5\",flag=\"precommit_quorum\"} 0"));
+        assert!(out.contains("neutrino_bft_session{slot=\"0\",flag=\"local_prevoted\"} 1"));
+        assert!(out.contains("neutrino_bft_session{slot=\"0\",flag=\"precommit_quorum\"} 0"));
     }
 
     #[tokio::test]
@@ -706,5 +929,111 @@ mod tests {
         assert_eq!(stub.2.load(Ordering::Relaxed), 1);
         monitor.abort();
         let _ = monitor.await;
+    }
+    #[test]
+    fn chunk_identity_changes_never_create_label_values() {
+        let metrics = NodeMetrics::default();
+        let mut snapshot = MetricsSnapshot {
+            bft_sessions: vec![BftSessionGauge {
+                chunk_id: 1,
+                ..BftSessionGauge::default()
+            }],
+            ..MetricsSnapshot::default()
+        };
+        let first = render(&metrics, &snapshot);
+        snapshot.bft_sessions[0].chunk_id = u64::MAX;
+        let later = render(&metrics, &snapshot);
+        let labels = |body: &str| {
+            body.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| line.split_once(' ').unwrap().0.to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&first), labels(&later));
+        assert!(!later.contains("chunk_id="));
+        assert!(later.contains("# TYPE neutrino_blocks_produced_total counter"));
+        assert!(!later.contains("neutrino_chunk_fact_checks_total"));
+    }
+
+    #[test]
+    fn complete_exposition_fixture_has_unique_samples_and_coherent_coverage() {
+        let metrics = NodeMetrics::default();
+        metrics
+            .block_proofs
+            .observe(Duration::from_millis(500), true);
+        metrics.proof_pipeline.set_fact_coverage(3, 7);
+        metrics.reporter.set_inventory(
+            [1; 32],
+            &neutrino_consensus_engine::store::ReporterStorageStats::default(),
+            crate::reporter_metrics::ReportPoolMetrics::default(),
+        );
+        metrics.reporter.set_economics(
+            [1; 32],
+            128,
+            &neutrino_default_runtime_core::accountability::settlement::SettlementSnapshot::default(
+            ),
+        );
+        let mut extra = String::new();
+        crate::supervision::TaskSupervisor::new()
+            .spawner()
+            .render_metrics(&mut extra);
+        neutrino_network::metrics::NetworkMetrics::default().render(&mut extra);
+        neutrino_sync::metrics::SyncMetrics::default().render(&mut extra);
+        neutrino_rpc::metrics::RpcMetrics::default().render(&mut extra);
+        let mut process = crate::process_metrics::ProcessSampler::default();
+        process.set_path(std::env::current_dir().unwrap());
+        process.sample(&mut extra);
+        let mut body = render(
+            &metrics,
+            &MetricsSnapshot {
+                validator_set_available: true,
+                bft_sessions: vec![BftSessionGauge::default()],
+                ..MetricsSnapshot::default()
+            },
+        );
+        body.push_str(&extra);
+        let mut seen = std::collections::BTreeSet::new();
+        for line in body
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let (key, value) = line.split_once(' ').expect("sample has a value");
+            assert!(seen.insert(key), "duplicate sample {key}");
+            assert!(value.parse::<f64>().expect("numeric sample").is_finite());
+        }
+        assert!(body.contains("neutrino_last_chunk_fact_checks_covered 3"));
+        assert!(body.contains("neutrino_last_chunk_fact_checks 7"));
+        if let Some(path) = std::env::var_os("NEUTRINO_METRICS_FIXTURE") {
+            std::fs::write(path, body).expect("write requested promtool fixture");
+        }
+    }
+
+    #[test]
+    fn unknown_validator_lists_do_not_report_genesis_counts() {
+        let metrics = NodeMetrics::default();
+        let mut snapshot = MetricsSnapshot {
+            active_validators: 4,
+            validator_seats: 5,
+            ..MetricsSnapshot::default()
+        };
+        let unknown = render(&metrics, &snapshot);
+        assert!(unknown.contains("neutrino_validator_set_available 0"));
+        assert!(!unknown.contains("neutrino_active_validators "));
+        snapshot.validator_set_available = true;
+        let known = render(&metrics, &snapshot);
+        assert!(known.contains("neutrino_active_validators 4"));
+        assert!(known.contains("neutrino_validator_seats 5"));
+    }
+
+    #[test]
+    fn stage_timer_records_early_return_once() {
+        let metrics = StageMetrics::default();
+        drop(metrics.timer());
+        metrics.timer().finish(true);
+        let mut body = String::new();
+        metrics.render(&mut body, "attempt", "Attempt");
+        assert!(body.contains("attempt_total{outcome=\"ok\"} 1"));
+        assert!(body.contains("attempt_total{outcome=\"failed\"} 1"));
+        assert!(body.contains("attempt_seconds_count 2"));
     }
 }

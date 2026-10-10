@@ -17,12 +17,16 @@ pub mod chain_backend;
 pub mod chain_spec;
 pub mod config;
 pub mod db;
+pub mod execution_metrics;
 pub mod genesis;
 pub(crate) mod health;
 pub(crate) mod identity;
 pub mod metrics;
+mod process_metrics;
 pub(crate) mod producer;
 pub mod programs;
+pub mod proof_metrics;
+pub mod reporter_metrics;
 pub mod runner;
 
 pub use chain_backend::ChainBackend;

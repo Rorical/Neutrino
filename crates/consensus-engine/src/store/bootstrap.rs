@@ -253,8 +253,6 @@ impl<DB: Database> ChainStore<DB> {
             );
         }
         self.retain_reporter_bootstrap_batch(&mut batch, recent)?;
-        self.db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 }

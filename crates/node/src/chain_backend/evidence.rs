@@ -50,6 +50,10 @@ where
             return;
         }
         if self.evidence_job_running.swap(true, Ordering::AcqRel) {
+            self.metrics
+                .proof_pipeline
+                .evidence_busy
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let witnesses = self.select_evidence_jobs(execution.block);
@@ -62,45 +66,22 @@ where
         let budget = Arc::clone(&self.proving_budget);
         let running = Arc::clone(&self.evidence_job_running);
         let publisher = self.publisher_snapshot();
+        let metrics = Arc::clone(&self.metrics);
+        let pending = metrics
+            .proof_pipeline
+            .evidence_backlog
+            .track(witnesses.len());
         self.spawn_background_job("evidence", async move {
             let result = tokio::task::spawn_blocking(move || {
-                let mut produced = Vec::new();
-                let mut batches = vec![witnesses];
-                while let Some(batch) = batches.pop() {
-                    let result = {
-                        let _permit =
-                            budget.acquire(crate::proving_budget::ProvingPriority::Normal);
-                        prover.prove_evidence_batch(&batch, &execution)
-                    };
-                    let artifacts = match result {
-                        Ok(artifacts) => artifacts,
-                        Err(neutrino_proof_system::ProofError::InvalidWitness)
-                            if batch.len() > 1 =>
-                        {
-                            let middle = batch.len() / 2;
-                            batches.push(batch[middle..].to_vec());
-                            batches.push(batch[..middle].to_vec());
-                            continue;
-                        }
-                        Err(_) => continue,
-                    };
-                    for artifact in artifacts {
-                        // The backend returns verified artifacts. Storage/network
-                        // readers verify independently at their trust boundary.
-                        if artifact.evidence_guest_vk_digest != execution.evidence {
-                            continue;
-                        }
-                        let report = {
-                            let mut engine = engine.lock().expect("engine mutex");
-                            let Some(report) = install_local_artifact(&mut engine, artifact) else {
-                                continue;
-                            };
-                            report
-                        };
-                        produced.push(report);
-                    }
-                }
-                produced
+                prove_and_install_evidence(
+                    engine.as_ref(),
+                    prover.as_ref(),
+                    &budget,
+                    &metrics,
+                    witnesses,
+                    pending,
+                    &execution,
+                )
             })
             .await;
             running.store(false, Ordering::Release);
@@ -263,6 +244,15 @@ where
         &self,
         report: EvidenceReport,
     ) -> EvidenceProofAcceptance {
+        let outcome = self.accept_evidence_report_inner(report).await;
+        self.metrics.proof_pipeline.evidence_outcome(outcome);
+        outcome
+    }
+
+    async fn accept_evidence_report_inner(
+        &self,
+        report: EvidenceReport,
+    ) -> EvidenceProofAcceptance {
         use EvidenceProofAcceptance::{Accepted, Deferred, Rejected};
         if report.artifact.proof_bytes.is_empty()
             || report.artifact.proof_bytes.len()
@@ -275,13 +265,18 @@ where
             Err(outcome) => return outcome,
         };
         let prover = Arc::clone(&self.proof_system);
+        let metrics = Arc::clone(&self.metrics);
         let result = tokio::task::spawn_blocking(move || {
-            prover
-                .verify_evidence(
-                    &report.artifact.proof_bytes,
-                    &report.artifact.membership.batch,
-                    &evidence_program,
-                )
+            metrics
+                .proof_pipeline
+                .evidence_verification
+                .time(|| {
+                    prover.verify_evidence(
+                        &report.artifact.proof_bytes,
+                        &report.artifact.membership.batch,
+                        &evidence_program,
+                    )
+                })
                 .map(|()| report)
         })
         .await;
@@ -404,24 +399,101 @@ where
     }
 }
 
+/// Prove independently retryable batches and install receipts under the engine lock.
+fn prove_and_install_evidence<DB: Database, P: ProofSystem>(
+    engine: &std::sync::Mutex<neutrino_consensus_engine::Engine<DB>>,
+    prover: &P,
+    budget: &Arc<crate::proving_budget::ProvingBudget>,
+    metrics: &crate::metrics::NodeMetrics,
+    witnesses: Vec<EvidenceWitness>,
+    pending: crate::proof_metrics::BacklogGuard,
+    execution: &neutrino_consensus_types::history_proof::ExecutionPrograms,
+) -> Vec<EvidenceReport> {
+    let mut produced = Vec::new();
+    let mut batches = vec![(witnesses, pending)];
+    while let Some((batch, pending)) = batches.pop() {
+        drop(pending);
+        let result = {
+            let _permit = budget.acquire(crate::proof_metrics::ProofStage::Evidence);
+            metrics
+                .proof_pipeline
+                .evidence_proofs
+                .time(|| prover.prove_evidence_batch(&batch, execution))
+        };
+        let artifacts = match result {
+            Ok(artifacts) => artifacts,
+            Err(neutrino_proof_system::ProofError::InvalidWitness) if batch.len() > 1 => {
+                let middle = batch.len() / 2;
+                let right = batch[middle..].to_vec();
+                let left = batch[..middle].to_vec();
+                batches.push((
+                    right,
+                    metrics
+                        .proof_pipeline
+                        .evidence_backlog
+                        .track(batch.len() - middle),
+                ));
+                batches.push((left, metrics.proof_pipeline.evidence_backlog.track(middle)));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        for artifact in artifacts {
+            // The backend returns verified artifacts. Storage/network
+            // readers verify independently at their trust boundary.
+            if artifact.evidence_guest_vk_digest != execution.evidence {
+                metrics
+                    .proof_pipeline
+                    .local_evidence_outcome(EvidenceProofAcceptance::Rejected, false);
+                continue;
+            }
+            let report = {
+                let mut engine = engine.lock().expect("engine mutex");
+                match install_local_artifact(&mut engine, artifact) {
+                    Ok((report, fresh)) => {
+                        metrics
+                            .proof_pipeline
+                            .local_evidence_outcome(EvidenceProofAcceptance::Accepted, fresh);
+                        if fresh && report.artifact.statement.reporter.is_some() {
+                            metrics.reporter.submitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        report
+                    }
+                    Err(outcome) => {
+                        metrics
+                            .proof_pipeline
+                            .local_evidence_outcome(outcome, false);
+                        continue;
+                    }
+                }
+            };
+            produced.push(report);
+        }
+    }
+    produced
+}
+
 /// Attach a local opening and check the tip again after background proving.
 fn install_local_artifact<DB: Database>(
     engine: &mut neutrino_consensus_engine::Engine<DB>,
     artifact: EvidenceArtifact,
-) -> Option<EvidenceReport> {
+) -> Result<(EvidenceReport, bool), EvidenceProofAcceptance> {
     let submission = engine
         .evidence_submission(artifact.statement.clone())
-        .ok()?;
+        .map_err(|_| EvidenceProofAcceptance::Deferred)?;
     let mut report = EvidenceReport {
         artifact,
         history: submission.history,
     };
     // Proving may span finalization or a program switch. Check admission and
     // pool coverage before attaching the path and receipt to durable storage.
-    let (submission, _) = ready_report(engine, &report).ok()?;
+    let (submission, _) = ready_report(engine, &report)?;
     report.history = submission.history;
-    engine.store_mut().put_evidence_report(&report).ok()?;
-    Some(report)
+    let fresh = engine
+        .store_mut()
+        .put_evidence_report(&report)
+        .map_err(|_| EvidenceProofAcceptance::Deferred)?;
+    Ok((report, fresh))
 }
 
 /// Snapshot jumps may leave verified receipts awaiting a reporter's refreshed

@@ -72,6 +72,11 @@ runtime counts active stake plus funds still in the withdrawal queue, including
 funds whose delay elapsed but which have not been withdrawn. This matches the
 mandatory deduction operation. An unfinalized withdrawal never deletes evidence.
 Unavailable or malformed query results must preserve local evidence.
+Eligibility refresh caching binds both the finalized boundary and the tracked
+identity/account generation. A late authenticated context can therefore trigger
+a refresh even without new finality. Before cleanup, both bindings are checked
+again; concurrent changes keep all sources until a new query succeeds. Ordinary
+signature arrivals and path updates do not invalidate that cache.
 
 Collateral belongs to the withdrawal account in the current runtime. Several
 historical BLS identities sharing that account therefore remain accountable while
@@ -148,6 +153,37 @@ Reward amounts, eligibility and account bookkeeping remain runtime economics.
 Consensus and the Chunk Guest consume the existing proven safety sanction; they
 do not read the reporter's economic records or implement the reward rule.
 
+The default runtime also maintains one fixed-size cumulative record under
+`accountability:settlement_totals`. For each of the two sanction kinds it records
+admitted and executed obligations, executions with zero deductions, actual funds
+deducted, actual reporter credits and funds destroyed. Execution updates these
+totals alongside the sanction and account writes; the Block Guest proves the same
+runtime transition. Shared withdrawal accounts contribute only the amounts each
+FIFO operation actually removes, so several accountable BLS identities do not
+multiply the recorded collateral. The totals remain authenticated execution state
+across restart and snapshot installation; no replay of old block bodies is needed.
+
+The read-only `accountability_metrics` query takes empty arguments and returns a
+borsh `accountability::settlement::SettlementSnapshot`: cumulative `totals` plus
+`pending_slash` and `pending_inactivity` counts from the bounded FIFO. Pending
+counts represent obligations, not estimated deductions or promised rewards.
+Each cumulative value uses checked `u128` arithmetic. If its mathematical total
+exceeds the representation, the value stays at `u128::MAX` and its `overflowed`
+flag becomes true. This explicit loss of precision never blocks mandatory
+execution or changes transfers; exact reward and deduction arithmetic remains
+independent of observational counters.
+
+Nodes query the installed runtime against authenticated finalized state, using
+the program which produced that state. A query result is published as current
+only if the finalized boundary still matches after query execution. Unchanged
+boundaries reuse the last successful result. Speculative head execution does not
+advance the exported cumulative economic counters. Missing state, query errors
+and runtimes without this interface expose unavailable observations, retaining
+last-success values and their finalized height when known. Light clients expose
+unavailable economics because a committed state root alone does not supply the
+runtime records. Economic totals describe chain state and must not be summed
+across observing nodes.
+
 The current wire types and persistent formats are replaced directly. Changed
 runtime and Evidence Guest programs require fresh program identities and a new
 compressed-composition acceptance run; results from preceding ELFs do not establish
@@ -157,9 +193,10 @@ identities are immutable fields of `ChainBinding`; deploying this change to an
 existing chain requires a hard fork, rather than an ordinary runtime governance
 upgrade. A fresh development chain must use the rebuilt program identities.
 
-## Verification
+## Verification of the preceding reporter implementation
 
-On 2026-10-09, `cargo build --locked`, `cargo test --locked --no-fail-fast`,
+Before cumulative settlement instrumentation, on 2026-10-09,
+`cargo build --locked`, `cargo test --locked --no-fail-fast`,
 `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`
 and `git diff --check` passed. The full test run reported **1,114 passed, zero
 failed and six ignored**. The rebuilt Guests passed execution and public-input
@@ -167,3 +204,26 @@ binding tests, including native/WASM/Block Guest parity for queued reporter
 rewards. Logs are saved under `target/verification/reporter-{build,tests,clippy,fmt}.log`.
 Real compressed proof composition remains a separate, unrerun acceptance gate for
 these new ELFs.
+
+## Verification of the metrics instrumentation
+
+On 2026-10-09, after adding cumulative settlement instrumentation,
+`cargo build --locked`, `cargo test --locked --no-fail-fast`,
+`cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`
+and `git diff --check` passed. The full test run reported **1,202 passed, zero
+failed and six ignored**. This includes finalized-statistic deduplication,
+atomic retention inventories and cleanup, eligibility-cache races, and
+native/WASM/Block Guest settlement parity plus native/WASM query parity with the
+rebuilt programs.
+Logs are saved under `target/verification/metrics-build-final.log`,
+`metrics-tests-verified.log`, `metrics-clippy-verified.log` and
+`metrics-fmt-final.log`.
+
+Promtool 3.5.0 accepted the complete generated metric exposition and the staging
+monitoring package: 30 configured rules, 43 dashboard queries and 29 actual
+evaluation assertions. The assertions cover distinct proof stages, unknown sync
+targets and unavailable inventories with retained nonzero values. Logs are saved
+under `target/verification/metrics-{promtool,exposition}-final.log`.
+
+These checks do not replace real compressed Evidence → Block → Chunk → History
+composition. That separate acceptance gate remains unrerun for the rebuilt ELFs.

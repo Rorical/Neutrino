@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::{HeadersImported, SyncBackend, SyncBackendError};
 use crate::error::SyncDriverError;
+use crate::metrics::Phase;
 
 mod availability;
 mod bft;
@@ -79,6 +80,7 @@ struct SyncStatusInner {
     peers: AtomicU64,
     syncing: AtomicBool,
     awaiting_first_peer: AtomicBool,
+    metrics: crate::metrics::SyncMetrics,
 }
 
 impl Default for SyncStatus {
@@ -89,6 +91,7 @@ impl Default for SyncStatus {
             peers: AtomicU64::new(0),
             syncing: AtomicBool::new(true),
             awaiting_first_peer: AtomicBool::new(true),
+            metrics: crate::metrics::SyncMetrics::default(),
         }))
     }
 }
@@ -100,16 +103,18 @@ impl SyncStatus {
         self.0.peers.load(Ordering::Relaxed)
     }
 
-    /// `true` until the sync FSM reaches [`SyncState::Following`]; a
-    /// [`SyncState::Stalled`] driver also reports `true` because it is not
-    /// tracking the live head.
+    /// `true` while bootstrap or known sync targets remain incomplete.
+    /// Sequential full sync compares authenticated local progress with its
+    /// download targets instead of relying on an idle FSM. Unknown targets
+    /// and a [`SyncState::Stalled`] driver remain syncing.
     #[must_use]
     pub fn is_syncing(&self) -> bool {
         self.0.syncing.load(Ordering::Relaxed)
     }
 
-    /// `true` while the sync FSM is in [`SyncState::Init`], waiting for a
-    /// useful peer handshake rather than working on a known backfill target.
+    /// `true` while the sync FSM is in [`SyncState::Init`] and neither
+    /// sequential full sync nor bootstrap has established a target. This means
+    /// waiting for a useful handshake rather than working on known backfill.
     /// The value is initially `true` and may become `true` again after a reset;
     /// it does not record whether this process has ever had a connected peer.
     /// Operators can use this with a zero-peer policy for an intentionally
@@ -119,16 +124,29 @@ impl SyncStatus {
         self.0.awaiting_first_peer.load(Ordering::Relaxed)
     }
 
+    /// Append fixed-label sync and bootstrap metrics. Cloned status handles
+    /// observe the driver's event counters and latest progress snapshot.
+    pub fn render_metrics(&self, out: &mut String) {
+        self.0.metrics.render(out);
+    }
+
+    #[cfg(test)]
     fn publish(&self, peers: usize, state: &SyncState) {
+        self.publish_observation(
+            peers,
+            !matches!(state, SyncState::Following),
+            matches!(state, SyncState::Init),
+        );
+    }
+
+    fn publish_observation(&self, peers: usize, syncing: bool, awaiting_peer: bool) {
         self.0
             .awaiting_first_peer
-            .store(matches!(state, SyncState::Init), Ordering::Relaxed);
+            .store(awaiting_peer, Ordering::Relaxed);
         self.0
             .peers
             .store(u64::try_from(peers).unwrap_or(u64::MAX), Ordering::Relaxed);
-        self.0
-            .syncing
-            .store(!matches!(state, SyncState::Following), Ordering::Relaxed);
+        self.0.syncing.store(syncing, Ordering::Relaxed);
     }
 }
 
@@ -224,9 +242,48 @@ impl SyncDriver {
         self.status.clone()
     }
 
-    fn publish_status(&self) {
+    fn metrics(&self) -> &crate::metrics::SyncMetrics {
+        &self.status.0.metrics
+    }
+
+    async fn publish_status(&mut self) {
+        let fsm_phase = self.metrics().publish_fsm(self.fsm.state());
+        full_chunk::publish_metrics(self);
+        let bootstrap_syncing = bootstrap::is_syncing(self);
+        let full_chunk_syncing = if self.full_chunks.enabled {
+            let (local, target) = full_chunk::observe_local(self).await;
+            if let Some(local) = &local {
+                self.metrics().publish_progress(local);
+            }
+            self.metrics()
+                .publish_full_availability(local.is_some(), target.as_ref());
+            Some(full_chunk::is_syncing(
+                self,
+                local.as_ref(),
+                target.as_ref(),
+            ))
+        } else {
+            self.metrics()
+                .publish_non_full_progress(self.fsm.progress());
+            None
+        };
+        let syncing = bootstrap_syncing
+            || full_chunk_syncing
+                .unwrap_or_else(|| !matches!(self.fsm.state(), SyncState::Following));
+        let awaiting_peer = !bootstrap_syncing
+            && full_chunk_syncing.is_none()
+            && matches!(self.fsm.state(), SyncState::Init);
         self.status
-            .publish(self.connected_peers.len(), self.fsm.state());
+            .publish_observation(self.connected_peers.len(), syncing, awaiting_peer);
+        let bootstrap_kind = bootstrap::active_kind(self);
+        self.metrics()
+            .publish_bootstrap(bootstrap_kind.is_some(), bootstrap_syncing);
+        self.metrics().publish_phase(Phase::select(
+            fsm_phase,
+            bootstrap_kind,
+            bootstrap_syncing,
+            full_chunk_syncing,
+        ));
     }
 
     /// Drive the loop until the network event channel closes.
@@ -234,7 +291,7 @@ impl SyncDriver {
         let mut retry = tokio::time::interval(Duration::from_secs(5));
         loop {
             // Reflect the state left by the previous iteration before blocking.
-            self.publish_status();
+            self.publish_status().await;
             tokio::select! {
                 _ = retry.tick() => {
                     availability::on_retry(&mut self).await;

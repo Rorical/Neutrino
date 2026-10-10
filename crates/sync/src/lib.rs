@@ -18,6 +18,8 @@ extern crate alloc;
 pub mod backend;
 pub mod driver;
 pub mod error;
+/// Fixed-label synchronization and bootstrap measurements.
+pub mod metrics;
 
 pub use backend::{
     CheckpointsImported, ChunkProofImported, EvidenceProofAcceptance, HeadersImported,

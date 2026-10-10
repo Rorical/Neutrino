@@ -58,6 +58,7 @@ struct MockState {
     status: Status,
     /// Explicit ordinary-head fixture, independent of candidate availability.
     local_progress_override: Option<LocalProgress>,
+    local_progress_error: bool,
     rpc_calls: Vec<String>,
     advance_to_index: CheckpointIndex,
     advance_to_height: Height,
@@ -229,6 +230,11 @@ impl SyncBackend for MockBackend {
         Ok({
             let (status, endpoint) = {
                 let state = self.inner.lock().unwrap();
+                if state.local_progress_error {
+                    return Err(SyncBackendError::Storage(
+                        "local progress unavailable".to_owned(),
+                    ));
+                }
                 if let Some(progress) = state.local_progress_override {
                     return Ok(progress);
                 }
@@ -2625,6 +2631,7 @@ struct PendingBootstrap {
     runner: tokio::task::JoinHandle<Result<(), neutrino_sync::SyncDriverError>>,
     peer: PeerId,
     status: Status,
+    sync_status: neutrino_sync::SyncStatus,
 }
 
 impl PendingBootstrap {
@@ -2663,7 +2670,9 @@ impl PendingBootstrap {
             cmd_tx,
             event_rx,
         );
+        let sync_status = driver.status();
         let mut pending = Self {
+            sync_status,
             backend,
             peer: random_peer(),
             status: Status {
@@ -2800,12 +2809,14 @@ fn latest_anchor_bootstrap(resume: bool) -> (PendingBootstrap, PeerId) {
         cmd_tx,
         event_rx,
     );
+    let sync_status = driver.status();
     // Equal-count ranking chooses the later key. Give that key to the peer whose
     // advertised checkpoint disagrees with the independently trusted endpoint.
     let mut peers = [random_peer(), random_peer()];
     peers.sort_unstable();
     (
         PendingBootstrap {
+            sync_status,
             backend,
             proof,
             events,
@@ -2893,6 +2904,17 @@ async fn bootstrap_requests_recursive_context_then_fragments_before_raw_blocks()
         assert!(!state.bootstrap_fetching);
         drop(state);
     }
+    let mut metrics = String::new();
+    pending.sync_status.render_metrics(&mut metrics);
+    assert!(
+        metrics
+            .contains("neutrino_sync_bootstrap_results_total{kind=\"history\",outcome=\"ok\"} 1")
+    );
+    assert!(
+        metrics.contains("neutrino_sync_bootstrap_results_total{kind=\"state\",outcome=\"ok\"} 1")
+    );
+    assert!(metrics.contains("neutrino_sync_bootstrap_installs_total 1"));
+    assert!(metrics.contains("neutrino_sync_bootstrap_pending_items 0"));
     pending.stop().await;
 }
 
@@ -2910,6 +2932,14 @@ async fn bootstrap_rejects_wrong_endpoint_before_backend_installation() {
     pending.quiet().await;
     assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
     assert_eq!(pending.backend.inner.lock().unwrap().status.head_height, 0);
+    assert!(pending.sync_status.is_syncing());
+    assert!(!pending.sync_status.awaiting_first_peer());
+    let mut metrics = String::new();
+    pending.sync_status.render_metrics(&mut metrics);
+    assert!(metrics.contains(
+        "neutrino_sync_bootstrap_results_total{kind=\"history\",outcome=\"rejected\"} 1"
+    ));
+    assert!(metrics.contains("neutrino_sync_bootstrap_installs_total 0"));
     pending.stop().await;
 }
 
@@ -2940,6 +2970,16 @@ async fn bootstrap_disconnected_response_cannot_release_replacement_request() {
     current.send(Ok(pending.manifest())).unwrap();
     let (_, _, _reply) = pending.state().await;
     assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 1);
+    let mut metrics = String::new();
+    pending.sync_status.render_metrics(&mut metrics);
+    assert!(metrics.contains("neutrino_sync_bootstrap_requests_total{kind=\"history\"} 2"));
+    assert!(metrics.contains(
+        "neutrino_sync_bootstrap_results_total{kind=\"history\",outcome=\"cancelled\"} 1"
+    ));
+    assert!(
+        metrics
+            .contains("neutrino_sync_bootstrap_results_total{kind=\"history\",outcome=\"ok\"} 1")
+    );
     pending.stop().await;
 }
 
@@ -3155,3 +3195,159 @@ mod bft_round_recovery;
 
 #[path = "driver_loop/signed_artifact_backfill.rs"]
 mod signed_artifact_backfill;
+
+#[tokio::test(start_paused = true)]
+async fn sequential_full_sync_observer_tracks_authenticated_progress_and_new_targets() {
+    let backend = MockBackend::default();
+    let local = LocalProgress {
+        finalized_chunk_id: Some(0),
+        head_height: 2,
+        proven_height: 2,
+        body_height: 2,
+        ..LocalProgress::default()
+    };
+    let peer_status = Status {
+        finalized_chunk_id: Some(0),
+        head_height: 2,
+        ..Status::default()
+    };
+    {
+        let mut state = backend.inner.lock().unwrap();
+        state.full_chunk_size = Some(2);
+        state.chunk_proof_imports.push(0);
+        state.status = peer_status;
+        state.local_progress_override = Some(local);
+    }
+    let (commands, mut requests) = mpsc::channel(64);
+    let (events, event_rx) = mpsc::channel(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend.clone()),
+        local,
+        commands,
+        event_rx,
+    );
+    let status = driver.status();
+    assert!(status.is_syncing());
+    assert!(status.awaiting_first_peer());
+    let runner = tokio::spawn(driver.run());
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let (request, reply) = next_full_sync_request(&mut requests).await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    reply.send(Ok(RpcResponse::Status(peer_status))).unwrap();
+    assert_no_full_sync_payload_request(&mut requests, peer_status).await;
+    assert!(
+        !status.is_syncing(),
+        "authenticated head/proofs/finality are caught up even while the FSM stays Init"
+    );
+    assert!(!status.awaiting_first_peer());
+    let mut metrics = String::new();
+    status.render_metrics(&mut metrics);
+    assert!(metrics.contains("neutrino_sync_phase{phase=\"following\"} 1"));
+
+    let ahead = Status {
+        finalized_chunk_id: Some(1),
+        head_height: 4,
+        ..peer_status
+    };
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let (_, reply) = next_full_sync_request(&mut requests).await;
+    reply.send(Ok(RpcResponse::Status(ahead))).unwrap();
+    let (request, _reply) = next_full_sync_payload_request(&mut requests, ahead).await;
+    assert!(matches!(request, RpcRequest::BlocksByRange(_)));
+    tokio::task::yield_now().await;
+    assert!(
+        status.is_syncing(),
+        "a later target makes the observer report backfill again"
+    );
+    assert!(!status.awaiting_first_peer());
+    drop(events);
+    runner.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequential_full_sync_unknown_target_cannot_report_following() {
+    let backend = MockBackend::default();
+    let local = LocalProgress {
+        finalized_chunk_id: Some(0),
+        head_height: 2,
+        proven_height: 2,
+        body_height: 2,
+        ..LocalProgress::default()
+    };
+    let peer_status = Status {
+        finalized_chunk_id: Some(0),
+        head_height: 2,
+        ..Status::default()
+    };
+    {
+        let mut state = backend.inner.lock().unwrap();
+        state.full_chunk_size = Some(2);
+        state.chunk_proof_imports.push(0);
+        state.status = peer_status;
+        state.local_progress_override = Some(local);
+    }
+    let (commands, mut requests) = mpsc::channel(64);
+    let (events, event_rx) = mpsc::channel(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend.clone()),
+        local,
+        commands,
+        event_rx,
+    );
+    let status = driver.status();
+    let runner = tokio::spawn(driver.run());
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let (_, reply) = next_full_sync_request(&mut requests).await;
+    reply.send(Ok(RpcResponse::Status(peer_status))).unwrap();
+    assert_no_full_sync_payload_request(&mut requests, peer_status).await;
+    assert!(!status.is_syncing());
+    backend.inner.lock().unwrap().full_chunk_size = None;
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let (_, reply) = next_full_sync_request(&mut requests).await;
+    reply.send(Ok(RpcResponse::Status(peer_status))).unwrap();
+    assert_no_full_sync_payload_request(&mut requests, peer_status).await;
+    assert!(
+        status.is_syncing(),
+        "an unknown authenticated target is conservative"
+    );
+    assert!(!status.awaiting_first_peer());
+    let mut metrics = String::new();
+    status.render_metrics(&mut metrics);
+    assert!(metrics.contains("neutrino_sync_progress_available 1"));
+    assert!(metrics.contains("neutrino_sync_full_chunk_target_available 0"));
+    assert!(!metrics.contains("neutrino_sync_full_chunk_consensus_target{"));
+    {
+        let mut state = backend.inner.lock().unwrap();
+        state.full_chunk_size = Some(2);
+        state.local_progress_error = true;
+    }
+    events
+        .send(NetworkEvent::PeerConnected(random_peer()))
+        .await
+        .unwrap();
+    let (_, reply) = next_full_sync_request(&mut requests).await;
+    reply.send(Ok(RpcResponse::Status(peer_status))).unwrap();
+    assert_no_full_sync_payload_request(&mut requests, peer_status).await;
+    metrics.clear();
+    status.render_metrics(&mut metrics);
+    assert!(status.is_syncing());
+    assert!(metrics.contains("neutrino_sync_progress_available 0"));
+    assert!(metrics.contains("neutrino_sync_full_chunk_target_available 1"));
+    assert!(!metrics.contains("neutrino_sync_fsm_progress{"));
+    drop(events);
+    runner.await.unwrap().unwrap();
+}

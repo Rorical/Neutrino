@@ -485,10 +485,7 @@ impl<DB: Database> Engine<DB> {
         let mut cleanup = neutrino_storage::Batch::new();
         self.expired_signing_entries(&mut cleanup)?;
         if !cleanup.is_empty() {
-            self.store_mut()
-                .db_mut()
-                .write_batch_durable(cleanup)
-                .map_err(StoreError::Database)?;
+            self.store_mut().write_observed_batch(cleanup, true)?;
         }
         let chunk_hash = chunk.hash();
         let round = initial.as_ref().map_or(0, |certificate| certificate.round);
@@ -1089,6 +1086,8 @@ fn build_local_vote(
     reason = "independent phase flags mirrored as gauges"
 )]
 pub struct BftSessionOverview {
+    /// Total, value prevote/precommit and nil prevote/precommit stake.
+    pub stake: [u64; 5],
     /// Chunk under vote.
     pub chunk_id: ChunkId,
     /// Current round.
@@ -1110,6 +1109,7 @@ impl<DB: Database> Engine<DB> {
         self.bft_sessions
             .values()
             .map(|session| BftSessionOverview {
+                stake: session.chunk_bft().observed_stake(),
                 chunk_id: session.chunk_id(),
                 round: session.round(),
                 local_prevoted: session.local_prevoted(),

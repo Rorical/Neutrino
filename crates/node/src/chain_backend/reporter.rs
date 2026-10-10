@@ -3,18 +3,62 @@
 use super::{ChainBackend, rpc_queries};
 use neutrino_consensus_engine::RetentionPolicy;
 use neutrino_default_runtime_core::{
-    Address, MAX_REPORTER_STATUS_IDENTITIES, QUERY_METHOD_REPORTER_STATUS, ReporterIdentity,
-    ReporterStatus, ReporterStatusRequest,
+    Address, MAX_REPORTER_STATUS_IDENTITIES, QUERY_METHOD_ACCOUNTABILITY_METRICS,
+    QUERY_METHOD_REPORTER_STATUS, ReporterIdentity, ReporterStatus, ReporterStatusRequest,
+    accountability::settlement::SettlementSnapshot,
 };
 use neutrino_primitives::Hash;
 use neutrino_proof_system::ProofSystem;
 use neutrino_runtime_abi::QueryRequest;
 use neutrino_storage::Database;
 use neutrino_trie::Trie;
+use std::sync::atomic::Ordering;
+
+struct ReporterTrackingSnapshot {
+    boundary: neutrino_consensus_types::history_proof::ConsensusBoundary,
+    state: Trie<neutrino_trie::Poseidon2Hasher>,
+    runtime: Hash,
+    identities: Vec<ReporterIdentity>,
+    revision: u64,
+}
+
+type Engine<DB> = neutrino_consensus_engine::Engine<DB>;
+
+/// Generation of the tracked identity set; ordinary retention leaves it unchanged.
+fn tracked_revision<DB: Database>(engine: &mut Engine<DB>) -> Result<u64, String>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    engine
+        .store_mut()
+        .reporter_storage_stats()
+        .map(|stats| stats.tracked_revision)
+        .map_err(|error| error.to_string())
+}
+
+/// Finalized post-state and the runtime that wrote it, ready for a query.
+fn finalized_query_state<DB: Database>(
+    engine: &Engine<DB>,
+    boundary: &neutrino_consensus_types::history_proof::ConsensusBoundary,
+) -> Result<(Trie<neutrino_trie::Poseidon2Hasher>, Hash), String>
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    let data = rpc_queries::read_state_data(engine, boundary.state_root)
+        .map_err(|error| error.to_string())?;
+    let state = Trie::from_persisted(boundary.state_root, data.nodes, data.values);
+    // A boundary can activate new programs. Its post-state was written by
+    // the runtime executing its final block, before that activation.
+    let runtime = engine
+        .runtime_code_hash_for(boundary.height)
+        .map_err(|error| error.to_string())?;
+    Ok((state, runtime))
+}
 
 pub(super) struct ReporterRuntime {
     pub(super) recipient: Address,
     last_finalized: Option<Hash>,
+    last_tracked_revision: Option<u64>,
 }
 
 impl<DB, P> ChainBackend<DB, P>
@@ -43,6 +87,7 @@ where
         *self.reporter.lock().expect("reporter runtime") = Some(ReporterRuntime {
             recipient,
             last_finalized: None,
+            last_tracked_revision: None,
         });
         self.refresh_reporter_tracking();
         Ok(())
@@ -80,30 +125,38 @@ where
 
     pub(super) fn refresh_reporter_tracking(&self) {
         if let Err(error) = self.update_reporter_tracking() {
+            self.metrics
+                .reporter
+                .query_failures
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .reporter
+                .eligibility_available
+                .store(0, Ordering::Relaxed);
             // Failure never implies withdrawal: retaining sources is safe, while
             // deleting on a failed query would lose a slashable identity's proof.
             tracing::warn!(%error, "reporter retains sources until finalized economic query succeeds");
         }
     }
 
-    fn update_reporter_tracking(&self) -> Result<(), String> {
-        let Some(last_finalized) = self
-            .reporter
-            .lock()
-            .expect("reporter runtime")
-            .as_ref()
-            .map(|runtime| runtime.last_finalized)
-        else {
-            return Ok(());
-        };
-        let executor = self
-            .block_executor_snapshot()
-            .ok_or("reporter requires an installed runtime executor")?;
-        let snapshot = self.with_engine_mut(|engine| {
+    fn reporter_tracking_snapshot(
+        &self,
+        last_finalized: Option<Hash>,
+        last_tracked_revision: Option<u64>,
+    ) -> Result<Option<ReporterTrackingSnapshot>, String> {
+        self.with_engine_mut(|engine| {
             let boundary = engine
                 .canonical_boundary(engine.finalized_next_chunk_id())
                 .map_err(|error| error.to_string())?;
-            if last_finalized == Some(boundary.block_hash) {
+            let revision = tracked_revision(engine)?;
+            if last_finalized == Some(boundary.block_hash)
+                && last_tracked_revision == Some(revision)
+                && revision != u64::MAX
+            {
+                self.metrics
+                    .reporter
+                    .eligibility_available
+                    .store(1, Ordering::Relaxed);
                 return Ok(None);
             }
             // New authenticated memberships get source ownership before the
@@ -111,14 +164,8 @@ where
             engine
                 .seed_reporter_tracking()
                 .map_err(|error| error.to_string())?;
-            let data = rpc_queries::read_state_data(engine, boundary.state_root)
-                .map_err(|error| error.to_string())?;
-            let state = Trie::from_persisted(boundary.state_root, data.nodes, data.values);
-            // A boundary can activate new programs. Its post-state was written by
-            // the runtime executing its final block, before that activation.
-            let runtime = engine
-                .runtime_code_hash_for(boundary.height)
-                .map_err(|error| error.to_string())?;
+            let revision = tracked_revision(engine)?;
+            let (state, runtime) = finalized_query_state(engine, &boundary)?;
             let identities = engine
                 .reporter_tracked_validators()
                 .map_err(|error| error.to_string())?
@@ -128,13 +175,37 @@ where
                     withdrawal_credentials,
                 })
                 .collect::<Vec<_>>();
-            Ok::<_, String>(Some((boundary, state, runtime, identities)))
-        })?;
-        let Some((boundary, state, runtime, identities)) = snapshot else {
+            Ok(Some(ReporterTrackingSnapshot {
+                boundary,
+                state,
+                runtime,
+                identities,
+                revision,
+            }))
+        })
+    }
+
+    fn update_reporter_tracking(&self) -> Result<(), String> {
+        let Some((last_finalized, last_tracked_revision)) = self
+            .reporter
+            .lock()
+            .expect("reporter runtime")
+            .as_ref()
+            .map(|runtime| (runtime.last_finalized, runtime.last_tracked_revision))
+        else {
             return Ok(());
         };
+        let executor = self
+            .block_executor_snapshot()
+            .ok_or("reporter requires an installed runtime executor")?;
+        let Some(snapshot) =
+            self.reporter_tracking_snapshot(last_finalized, last_tracked_revision)?
+        else {
+            return Ok(());
+        };
+        let timer = self.metrics.reporter.eligibility_queries.timer();
         let mut eligible = Vec::new();
-        for group in identities.chunks(MAX_REPORTER_STATUS_IDENTITIES) {
+        for group in snapshot.identities.chunks(MAX_REPORTER_STATUS_IDENTITIES) {
             let request = QueryRequest {
                 method: QUERY_METHOD_REPORTER_STATUS.to_owned(),
                 args: borsh::to_vec(&ReporterStatusRequest {
@@ -142,7 +213,7 @@ where
                 })
                 .map_err(|error| error.to_string())?,
             };
-            let response = executor.query(&request, runtime, &state)?;
+            let response = executor.query(&request, snapshot.runtime, &snapshot.state)?;
             if !response.is_ok() {
                 return Err("reporter status query did not succeed".into());
             }
@@ -150,29 +221,170 @@ where
                 borsh::from_slice(&response.payload).map_err(|error| error.to_string())?;
             eligible.extend(eligible_identities(group, &statuses)?);
         }
+        self.commit_reporter_eligibility(&snapshot, &eligible)?;
+        timer.finish(true);
+        Ok(())
+    }
+
+    fn commit_reporter_eligibility(
+        &self,
+        snapshot: &ReporterTrackingSnapshot,
+        eligible: &[(neutrino_primitives::BlsPublicKey, Address)],
+    ) -> Result<(), String> {
         let mut raw_pool = self.slashing_pool.lock().expect("reporter raw pool");
         self.with_engine_mut(|engine| {
             if engine
                 .canonical_boundary(engine.finalized_next_chunk_id())
                 .map_err(|error| error.to_string())?
-                != boundary
+                != snapshot.boundary
             {
                 // Another finalization won the race; its callback will query the
                 // new state. Never apply deletion using an older snapshot.
-                return Ok(());
+                return Err("finalized boundary changed during reporter economic query".into());
+            }
+            let current_revision = tracked_revision(engine)?;
+            if current_revision != snapshot.revision
+                || (snapshot.revision == u64::MAX
+                    && engine
+                        .reporter_tracked_validators()
+                        .map_err(|error| error.to_string())?
+                        != snapshot
+                            .identities
+                            .iter()
+                            .map(|identity| (identity.pubkey, identity.withdrawal_credentials))
+                            .collect::<Vec<_>>())
+            {
+                return Err(
+                    "reporter tracked identities changed during economic query; retaining sources"
+                        .into(),
+                );
             }
             let removed = engine
-                .set_reporter_eligible(&eligible)
+                .set_reporter_eligible(eligible)
                 .map_err(|error| error.to_string())?;
+            let after_revision = tracked_revision(engine)?;
+            self.metrics.reporter.cleaned.fetch_add(
+                u64::try_from(removed.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             raw_pool.evidence.retain(|(key, _)| !removed.contains(key));
             for key in removed {
                 raw_pool.seen.remove(&key);
             }
             if let Some(reporter) = self.reporter.lock().expect("reporter runtime").as_mut() {
-                reporter.last_finalized = Some(boundary.block_hash);
+                reporter.last_finalized = Some(snapshot.boundary.block_hash);
+                reporter.last_tracked_revision = Some(after_revision);
             }
-            Ok(())
+            self.metrics
+                .reporter
+                .last_success_height
+                .store(snapshot.boundary.height, Ordering::Relaxed);
+            self.metrics
+                .reporter
+                .eligibility_available
+                .store(1, Ordering::Relaxed);
+            Ok::<(), String>(())
         })
+    }
+
+    /// Refresh local inventories and runtime-owned finalized totals. The monitor
+    /// calls this outside the async executor; unchanged roots and tracked identity
+    /// sets never repeat WASM queries, and unchanged inventory revisions never
+    /// rescan pooled proof bytes.
+    pub(super) fn refresh_reporter_metrics(&self) {
+        self.refresh_reporter_tracking();
+        let result = self.with_engine_mut(|engine| {
+            let finalized = engine
+                .canonical_boundary(engine.finalized_next_chunk_id())
+                .map_err(|error| error.to_string())?;
+            let stats = engine
+                .store_mut()
+                .reporter_storage_stats()
+                .map_err(|error| error.to_string())?;
+            if !self
+                .metrics
+                .reporter
+                .inventory_current(stats.revision, finalized.block_hash)
+            {
+                let [active, dormant] = engine
+                    .store()
+                    .evidence_pool_metrics()
+                    .map_err(|error| error.to_string())?;
+                self.metrics.reporter.set_inventory(
+                    finalized.block_hash,
+                    &stats,
+                    crate::reporter_metrics::ReportPoolMetrics { active, dormant },
+                );
+            }
+            Ok::<_, String>(())
+        });
+        if let Err(error) = result {
+            self.metrics.reporter.inventory_unavailable();
+            tracing::debug!(%error, "reporter inventory metrics unavailable");
+        }
+        if let Err(error) = self.update_finalized_economics() {
+            self.metrics
+                .reporter
+                .economic_query_failures
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.reporter.economics_unavailable();
+            tracing::debug!(%error, "finalized runtime economic metrics unavailable");
+        }
+    }
+
+    fn update_finalized_economics(&self) -> Result<(), String> {
+        // Light clients authenticate roots but possess no execution state or
+        // installed runtime. They must expose unavailable rather than genesis 0.
+        if self.light_health().is_some() || self.bootstrap_pending() {
+            self.metrics.reporter.economics_unavailable();
+            return Ok(());
+        }
+        let snapshot = self.with_engine(|engine| {
+            let boundary = engine
+                .canonical_boundary(engine.finalized_next_chunk_id())
+                .map_err(|error| error.to_string())?;
+            if self.metrics.reporter.economics_current(boundary.block_hash) {
+                return Ok(None);
+            }
+            let (state, runtime) = finalized_query_state(engine, &boundary)?;
+            Ok::<_, String>(Some((boundary, state, runtime)))
+        })?;
+        let Some((boundary, state, runtime)) = snapshot else {
+            return Ok(());
+        };
+        let timer = self.metrics.reporter.economic_queries.timer();
+        let executor = self
+            .block_executor_snapshot()
+            .ok_or("installed runtime unavailable for economic metrics")?;
+        let response = executor.query(
+            &QueryRequest {
+                method: QUERY_METHOD_ACCOUNTABILITY_METRICS.into(),
+                args: Vec::new(),
+            },
+            runtime,
+            &state,
+        )?;
+        if !response.is_ok() {
+            return Err("installed runtime does not expose settlement metrics".into());
+        }
+        let value: SettlementSnapshot =
+            borsh::from_slice(&response.payload).map_err(|error| error.to_string())?;
+        self.with_engine(|engine| {
+            if engine
+                .canonical_boundary(engine.finalized_next_chunk_id())
+                .ok()
+                .as_ref()
+                == Some(&boundary)
+            {
+                self.metrics
+                    .reporter
+                    .set_economics(boundary.block_hash, boundary.height, &value);
+            } else {
+                self.metrics.reporter.economics_unavailable();
+            }
+        });
+        timer.finish(true);
+        Ok(())
     }
 }
 
@@ -208,7 +420,7 @@ mod tests {
     use neutrino_proof_system::MockProofSystem;
     use neutrino_runtime_core::host::LiveTrie;
     use neutrino_runtime_host::WasmExecutor;
-    use neutrino_storage::{Column, MemoryDatabase};
+    use neutrino_storage::{Batch, Column, MemoryDatabase};
 
     fn finalized_genesis_backend() -> ChainBackend<MemoryDatabase, MockProofSystem> {
         let mut spec = super::super::state_sync_tests::spec();
@@ -240,6 +452,130 @@ mod tests {
         let backend = ChainBackend::new(engine, MockProofSystem::new());
         backend.set_block_executor(WasmExecutor::default_runtime().unwrap());
         backend
+    }
+
+    #[test]
+    fn finalized_metrics_query_is_cached_and_missing_runtime_is_unavailable() {
+        let backend = finalized_genesis_backend();
+        backend.refresh_reporter_metrics();
+        backend.refresh_reporter_metrics();
+        let mut out = String::new();
+        backend.metrics.reporter.render(&mut out);
+        assert!(out.contains("neutrino_accountability_metrics_available 1"));
+        assert!(out.contains("neutrino_accountability_query_total{outcome=\"ok\"} 1"));
+        assert!(out.contains("neutrino_accountability_deducted_total{kind=\"slash\"} 0"));
+        let missing = finalized_genesis_backend();
+        *missing.block_executor.lock().unwrap() = None;
+        missing.refresh_reporter_metrics();
+        out.clear();
+        missing.metrics.reporter.render(&mut out);
+        assert!(out.contains("neutrino_accountability_metrics_available 0"));
+        assert!(!out.contains("neutrino_accountability_deducted_total"));
+        assert_eq!(
+            missing
+                .metrics
+                .reporter
+                .economic_query_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    fn add_tracked_identity(
+        backend: &ChainBackend<MemoryDatabase, MockProofSystem>,
+        pubkey: neutrino_primitives::BlsPublicKey,
+        address: Address,
+    ) {
+        backend.with_engine_mut(|engine| {
+            let mut batch = Batch::new();
+            batch.put(
+                Column::ReporterValidators,
+                pubkey,
+                borsh::to_vec(&vec![address]).unwrap(),
+            );
+            engine
+                .store_mut()
+                .write_observed_batch(batch, true)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn new_tracked_identity_refreshes_eligibility_at_unchanged_finalized_boundary() {
+        let backend = finalized_genesis_backend();
+        backend.initialize_reporter([9; 32]).unwrap();
+        let original = backend.with_engine(|engine| engine.reporter_tracked_validators().unwrap());
+        let finalized =
+            backend.with_engine(neutrino_consensus_engine::Engine::finalized_next_chunk_id);
+        let mut initial = String::new();
+        backend.metrics.reporter.render(&mut initial);
+        assert!(initial.contains("neutrino_reporter_eligibility_query_total{outcome=\"ok\"} 1"));
+
+        // A late authenticated historical source can reintroduce an identity
+        // whose account has already withdrawn. Finality need not advance.
+        add_tracked_identity(&backend, [42; 48], [43; 32]);
+        backend.refresh_reporter_tracking();
+        assert_eq!(
+            backend.with_engine(|engine| engine.reporter_tracked_validators().unwrap()),
+            original
+        );
+        assert_eq!(
+            backend.with_engine(neutrino_consensus_engine::Engine::finalized_next_chunk_id),
+            finalized
+        );
+        // The cache stores the generation after cleanup, so its own deletion
+        // does not trigger another query on the next monitor tick.
+        backend.refresh_reporter_tracking();
+        let mut out = String::new();
+        backend.metrics.reporter.render(&mut out);
+        assert!(out.contains("neutrino_reporter_eligibility_query_total{outcome=\"ok\"} 2"));
+        assert_eq!(
+            backend
+                .metrics
+                .reporter
+                .query_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn new_funded_identity_during_query_prevents_stale_eligibility_cleanup() {
+        let backend = finalized_genesis_backend();
+        backend.initialize_reporter([9; 32]).unwrap();
+        let snapshot = backend
+            .reporter_tracking_snapshot(None, None)
+            .unwrap()
+            .unwrap();
+        let eligible: Vec<_> = snapshot
+            .identities
+            .iter()
+            .map(|identity| (identity.pubkey, identity.withdrawal_credentials))
+            .collect();
+
+        // Runtime execution happens outside the engine lock. Another source
+        // can authenticate a second BLS identity sharing the funded account
+        // after the request was captured, but before its result is applied.
+        let late = ([42; 48], eligible[0].1);
+        add_tracked_identity(&backend, late.0, late.1);
+        let before = backend.with_engine(|engine| engine.reporter_tracked_validators().unwrap());
+        assert!(before.contains(&late));
+        assert!(
+            backend
+                .commit_reporter_eligibility(&snapshot, &eligible)
+                .is_err()
+        );
+        assert_eq!(
+            backend.with_engine(|engine| engine.reporter_tracked_validators().unwrap()),
+            before
+        );
+
+        // A fresh query classifies both accounts and keeps both funded owners.
+        backend.refresh_reporter_tracking();
+        assert_eq!(
+            backend.with_engine(|engine| engine.reporter_tracked_validators().unwrap()),
+            before
+        );
     }
 
     #[test]

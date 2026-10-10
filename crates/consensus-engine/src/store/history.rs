@@ -539,7 +539,7 @@ impl<DB: Database> ChainStore<DB> {
     pub fn delete_history_job(&mut self, id: &Hash) -> Result<(), StoreError<DB::Error>> {
         let mut batch = Batch::new();
         batch.delete(Column::HistoryJobs, id);
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 
     /// Recover durable scheduler records once at startup.
@@ -703,7 +703,7 @@ impl<DB: Database> ChainStore<DB> {
                 statement.end.next_chunk_id.to_be_bytes(),
             );
         }
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 }
 
@@ -831,7 +831,7 @@ impl<DB: Database> ChainStore<DB> {
                 borsh::to_vec(&checkpoint)?,
             );
         }
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 
     /// Retain every child artifact in a queued/running job's canonical range.
@@ -859,7 +859,34 @@ impl<DB: Database> ChainStore<DB> {
     pub fn unpin_history_range(&mut self, id: &Hash) -> Result<(), StoreError<DB::Error>> {
         let mut batch = Batch::new();
         batch.delete(Column::HistoryPins, id);
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
+    }
+
+    /// Count distinct source chunks retained by durable history leases.
+    ///
+    /// Reads lease intervals only; overlapping jobs do not double count and
+    /// the work does not grow with the length of their source ranges.
+    pub fn pinned_history_source_chunks(&self) -> Result<u64, StoreError<DB::Error>> {
+        let mut ranges: Vec<_> = self
+            .history_dependencies()?
+            .into_iter()
+            .filter(|pin| pin.start < pin.end)
+            .map(|pin| (pin.start, pin.end))
+            .collect();
+        ranges.sort_unstable();
+        let mut count = 0_u64;
+        let mut merged: Option<(u64, u64)> = None;
+        for (start, end) in ranges {
+            match merged {
+                Some((first, last)) if start <= last => merged = Some((first, last.max(end))),
+                Some((first, last)) => {
+                    count = count.saturating_add(last - first);
+                    merged = Some((start, end));
+                }
+                None => merged = Some((start, end)),
+            }
+        }
+        Ok(merged.map_or(count, |(first, last)| count.saturating_add(last - first)))
     }
 
     /// Whether an active job still requires chunk receipts and statements in this interval.
@@ -926,7 +953,7 @@ impl<DB: Database> ChainStore<DB> {
         let mut batch = Batch::new();
         batch.put(Column::HistoryJobs, id, bytes);
         batch.put(Column::HistoryPins, id, borsh::to_vec(&dependencies)?);
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 
     /// Atomically persist a terminal job and release its child-retention lease.
@@ -941,7 +968,7 @@ impl<DB: Database> ChainStore<DB> {
         let mut batch = Batch::new();
         batch.put(Column::HistoryJobs, id, bytes);
         batch.delete(Column::HistoryPins, id);
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 }
 
@@ -1038,6 +1065,23 @@ pub(super) mod tests {
             seed: [9; 32],
             finality,
         }
+    }
+
+    #[test]
+    fn pinned_chunk_metric_counts_interval_union_without_reading_sources() {
+        let mut store = ChainStore::new(MemoryDatabase::new());
+        store.pin_history_range(&[1; 32], 0, 5).unwrap();
+        store.pin_history_range(&[2; 32], 3, 8).unwrap();
+        store.pin_history_range(&[3; 32], 10, 12).unwrap();
+        assert_eq!(store.pinned_history_source_chunks().unwrap(), 10);
+        store.unpin_history_range(&[1; 32]).unwrap();
+        assert_eq!(store.pinned_history_source_chunks().unwrap(), 7);
+        store.pin_history_range(&[4; 32], 0, u64::MAX).unwrap();
+        assert_eq!(store.pinned_history_source_chunks().unwrap(), u64::MAX);
+        store.unpin_history_range(&[4; 32]).unwrap();
+        store.unpin_history_range(&[2; 32]).unwrap();
+        store.unpin_history_range(&[3; 32]).unwrap();
+        assert_eq!(store.pinned_history_source_chunks().unwrap(), 0);
     }
 
     #[test]

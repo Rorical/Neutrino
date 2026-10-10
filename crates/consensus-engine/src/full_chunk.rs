@@ -854,10 +854,7 @@ impl<DB: Database> Engine<DB> {
             .store()
             .consensus_finalization_batch(witness, &wire, &statement, &state)?;
         if self.store().get_block_hash_by_height(chunk.end_height)? == Some(chunk.end_block_hash) {
-            self.store_mut()
-                .db_mut()
-                .write_batch(batch)
-                .map_err(crate::store::StoreError::Database)?;
+            self.store_mut().write_observed_batch(batch, false)?;
         } else {
             let executor = executor.ok_or(ProofError::Unsupported)?;
             // Proof verification precedes replay; a failed replay or DB batch

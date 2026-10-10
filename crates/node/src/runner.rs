@@ -362,6 +362,10 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
                 info!(%addr, ?id, "listening");
             }
             svc.configure_bootnodes(bootnodes)?;
+            concrete_backend.set_network_metrics(svc.metrics());
+            if let Some(path) = &config.data_dir {
+                concrete_backend.set_metrics_data_path(path.clone());
+            }
             let _ = tasks.spawner().spawn_critical("network", async move {
                 Box::pin(svc.run()).await.map_err(|error| error.to_string())
             });
@@ -472,7 +476,12 @@ async fn run_with_prover<P: ProgramProver + Send + Sync + 'static>(
             }
             if let Some(runtime_cfg) = rpc_config {
                 let listen = runtime_cfg.listen;
-                let handle = neutrino_rpc::serve(rpc_backend, runtime_cfg).await?;
+                let handle = neutrino_rpc::serve_with_metrics(
+                    rpc_backend,
+                    runtime_cfg,
+                    concrete_backend.rpc_metrics(),
+                )
+                .await?;
                 let stop_handle = handle.clone();
                 tasks.on_shutdown(move || {
                     let _ = stop_handle.stop();

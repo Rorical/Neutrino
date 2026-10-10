@@ -17,9 +17,9 @@ use super::{ChainStore, StoreError};
 use crate::{ReporterIdentity, RetentionPolicy};
 
 #[derive(BorshSerialize, BorshDeserialize)]
-struct Owned<T> {
+pub(super) struct Owned<T> {
     owners: Vec<BlsPublicKey>,
-    value: T,
+    pub(super) value: T,
 }
 
 struct ReporterContext {
@@ -74,9 +74,7 @@ impl<DB: Database> ChainStore<DB> {
         }
         let mut batch = Batch::new();
         self.retain_reporter_source_batch(&mut batch, chunk, artifact)?;
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 
     pub(crate) fn seed_reporter_tracking(
@@ -85,9 +83,7 @@ impl<DB: Database> ChainStore<DB> {
     ) -> Result<(), StoreError<DB::Error>> {
         let mut batch = Batch::new();
         self.merge_reporter_identities_batch(&mut batch, identities)?;
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 
     /// Identities with selectively retained material and their historical withdrawal addresses.
@@ -238,9 +234,7 @@ impl<DB: Database> ChainStore<DB> {
                 &keys,
             )?;
         }
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.write_observed_batch(batch, true)?;
         Ok(removed_raw)
     }
 
@@ -862,9 +856,7 @@ impl<DB: Database> ChainStore<DB> {
             return Ok(());
         }
         self.put_reporter_header_batch(&mut batch, chunk, header, &owners)?;
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 
     pub(super) fn retain_reporter_finalization_batch(
@@ -1152,11 +1144,22 @@ mod tests {
             )
             .unwrap();
         store.db_mut().write_batch_durable(batch).unwrap();
+        let retained = store.reporter_storage_stats().unwrap();
+        assert_eq!(retained.headers.records, 2);
+        assert_eq!(retained.paths.records, retained.history.records);
+        assert!(retained.paths.bytes > 0);
+        assert!(retained.contexts.bytes > 0);
+        assert!(retained.signatures.records >= 2);
+        assert_eq!(retained.signatures.bytes, retained.signatures.records * 96);
         // The second proof depends on the first header. Releasing that acceptor
         // must retain the first header's independent, still-bonded proposer.
         store.set_reporter_eligible(&identities[..1]).unwrap();
         assert_eq!(store.reporter_header(&first.hash()).unwrap(), Some(first));
         assert!(store.reporter_header(&second.hash()).unwrap().is_none());
+        let cleaned = store.reporter_storage_stats().unwrap();
+        assert_eq!(cleaned.headers.records, 1);
+        assert!(cleaned.cleaned_records > 0);
+        assert!(cleaned.cleaned_bytes > 0);
         store.validate_reporter_history().unwrap();
     }
 

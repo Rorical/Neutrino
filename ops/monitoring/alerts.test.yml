@@ -1,0 +1,167 @@
+rule_files: [alerts.yml,expected-targets.yml]
+evaluation_interval: 15s
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'neutrino_block_proof_total{outcome="failed",job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+1x15'
+      - series: 'neutrino_chunk_proof_total{outcome="failed",job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+2x15'
+      - series: 'neutrino_fact_proof_total{outcome="failed",job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+0x15'
+      - series: 'neutrino_evidence_proof_total{outcome="failed",job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+0x15'
+      - series: 'neutrino_history_fold_total{outcome="failed",job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+0x15'
+      - series: 'neutrino_history_merge_total{outcome="failed",job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+0x15'
+    promql_expr_test:
+      - expr: 'neutrino_local_proof_failures_15m'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'neutrino_local_proof_failures_15m{job="neutrino",instance="node:9615",node="validator-1",outcome="failed",stage="block"}'
+            value: 15
+          - labels: 'neutrino_local_proof_failures_15m{job="neutrino",instance="node:9615",node="validator-1",outcome="failed",stage="chunk"}'
+            value: 30
+          - labels: 'neutrino_local_proof_failures_15m{job="neutrino",instance="node:9615",node="validator-1",outcome="failed",stage="fact"}'
+            value: 0
+          - labels: 'neutrino_local_proof_failures_15m{job="neutrino",instance="node:9615",node="validator-1",outcome="failed",stage="evidence"}'
+            value: 0
+          - labels: 'neutrino_local_proof_failures_15m{job="neutrino",instance="node:9615",node="validator-1",outcome="failed",stage="history_fold"}'
+            value: 0
+          - labels: 'neutrino_local_proof_failures_15m{job="neutrino",instance="node:9615",node="validator-1",outcome="failed",stage="history_merge"}'
+            value: 0
+      - expr: 'sum by(instance,job,node) (neutrino_local_proof_failures_15m)'
+        eval_time: 15m
+        exp_samples:
+          - labels: '{job="neutrino",instance="node:9615",node="validator-1"}'
+            value: 45
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: NeutrinoProofFailures
+        exp_alerts:
+          - exp_labels: {severity: warning,job: neutrino,instance: 'node:9615',node: validator-1}
+            exp_annotations: {summary: 'A local proof generation attempt failed'}
+  - interval: 15s
+    input_series:
+      - series: 'up{job="neutrino",node="validator-1"}'
+        values: '1+0x8'
+      - series: 'up{job="neutrino",node="validator-2"}'
+        values: '1+0x8'
+      - series: 'up{job="neutrino",node="validator-3"}'
+        values: '1+0x8'
+      - series: 'up{job="neutrino",node="validator-4"}'
+        values: '1+0x8'
+    alert_rule_test:
+      - eval_time: 90s
+        alertname: NeutrinoExpectedTargetMissing
+        exp_alerts:
+          - exp_labels: {severity: critical,job: neutrino,node: reporter-1,role: reporter}
+            exp_annotations: {summary: 'Expected node reporter-1 disappeared from service discovery'}
+  - interval: 15s
+    input_series:
+      - series: 'neutrino_data_filesystem_sample_available{job="neutrino",instance="node:9615"}'
+        values: '0+0x24'
+      - series: 'neutrino_data_directory_configured{job="neutrino",instance="node:9615"}'
+        values: '1+0x24'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NeutrinoFilesystemMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: NeutrinoFilesystemMetricsUnavailable
+        exp_alerts:
+          - exp_labels: {severity: warning,job: neutrino,instance: 'node:9615'}
+            exp_annotations: {summary: 'Configured data filesystem capacity cannot be sampled'}
+  - interval: 15s
+    input_series:
+      - series: 'up{job="neutrino",instance="node:9615",node="validator-1"}'
+        values: '0+0x8'
+    alert_rule_test:
+      - eval_time: 90s
+        alertname: NeutrinoNodeDown
+        exp_alerts:
+          - exp_labels: {severity: critical,job: neutrino,instance: 'node:9615',node: validator-1}
+            exp_annotations:
+              summary: 'Node validator-1 cannot be scraped'
+              description: 'Inspect process exit code and named critical-worker logs. The metrics listener stops with the node.'
+  - interval: 15s
+    input_series:
+      - series: 'neutrino_finality_progress_age_seconds{job="neutrino",instance="node:9615"}'
+        values: '60+0x8'
+      - series: 'neutrino_finality_stall_timeout_seconds{job="neutrino",instance="node:9615"}'
+        values: '60+0x8'
+    alert_rule_test:
+      - eval_time: 90s
+        alertname: NeutrinoFinalityStalled
+        exp_alerts:
+          - exp_labels: {severity: critical,job: neutrino,instance: 'node:9615'}
+            exp_annotations: {summary: 'Finality exceeds the configured stall timeout'}
+  - interval: 15s
+    input_series:
+      - series: 'up{job="neutrino",instance="node:9615"}'
+        values: '1+0x50'
+      - series: 'neutrino_ready{job="neutrino",instance="node:9615"}'
+        values: '0+0x50'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: NeutrinoNodeNotReady
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: NeutrinoNodeNotReady
+        exp_alerts:
+          - exp_labels: {severity: warning,job: neutrino,instance: 'node:9615'}
+            exp_annotations:
+              summary: 'Node  is not ready'
+              description: 'Inspect neutrino_readiness_reason and sync progress. Startup/bootstrap may legitimately take longer on CPU.'
+  - interval: 15s
+    input_series:
+      - series: 'neutrino_reporter_inventory_available{job="neutrino",instance="stale:9615",node="stale",role="reporter"}'
+        values: '0+0x48'
+      - series: 'neutrino_reporter_inventory_available{job="neutrino",instance="current:9615",node="current",role="reporter"}'
+        values: '1+0x48'
+      - series: 'neutrino_reporter_inventory_available{job="neutrino",instance="disabled:9615",node="disabled",role="full"}'
+        values: '0+0x48'
+      - series: 'neutrino_evidence_pool_records{job="neutrino",instance="stale:9615",node="stale",role="reporter",status="active"}'
+        values: '256+0x48'
+      - series: 'neutrino_evidence_pool_records{job="neutrino",instance="current:9615",node="current",role="reporter",status="active"}'
+        values: '256+0x48'
+      - series: 'neutrino_evidence_pool_records{job="neutrino",instance="disabled:9615",node="disabled",role="full",status="active"}'
+        values: '256+0x48'
+      - series: 'neutrino_evidence_pool_bytes{job="neutrino",instance="stale:9615",node="stale",role="reporter",status="active"}'
+        values: '33554432+0x48'
+      - series: 'neutrino_evidence_pool_bytes{job="neutrino",instance="current:9615",node="current",role="reporter",status="active"}'
+        values: '33554432+0x48'
+      - series: 'neutrino_evidence_pool_bytes{job="neutrino",instance="disabled:9615",node="disabled",role="full",status="active"}'
+        values: '33554432+0x48'
+      - series: 'neutrino_reporter_retained_records{job="neutrino",instance="stale:9615",node="stale",role="reporter",kind="raw_reports"}'
+        values: '1024+0x48'
+      - series: 'neutrino_reporter_retained_records{job="neutrino",instance="current:9615",node="current",role="reporter",kind="raw_reports"}'
+        values: '1024+0x48'
+      - series: 'neutrino_reporter_retained_records{job="neutrino",instance="disabled:9615",node="disabled",role="full",kind="raw_reports"}'
+        values: '1024+0x48'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NeutrinoEvidencePoolPressure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: NeutrinoEvidencePoolPressure
+        exp_alerts:
+          - exp_labels: {severity: warning,job: neutrino,instance: 'current:9615',node: current}
+            exp_annotations: {summary: 'Proven evidence pool exceeds 90% of its shared active/dormant capacity'}
+      - eval_time: 4m
+        alertname: NeutrinoRawEvidencePoolPressure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: NeutrinoRawEvidencePoolPressure
+        exp_alerts:
+          - exp_labels: {severity: warning,job: neutrino,instance: 'current:9615',node: current,role: reporter,kind: raw_reports}
+            exp_annotations: {summary: 'Raw misconduct pool exceeds 90% capacity'}
+      - eval_time: 9m
+        alertname: NeutrinoReporterInventoryUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: NeutrinoReporterInventoryUnavailable
+        exp_alerts:
+          - exp_labels: {severity: warning,job: neutrino,instance: 'stale:9615',node: stale,role: reporter}
+            exp_annotations: {summary: 'Reporter retention inventory has no current successful sample'}

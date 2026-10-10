@@ -57,6 +57,80 @@ fn engine() -> Engine<MemoryDatabase> {
     Engine::genesis(spec(), MemoryDatabase::new()).unwrap()
 }
 
+#[test]
+fn history_queue_metrics_follow_claim_progress_and_terminal_lease_release() {
+    use std::sync::atomic::Ordering;
+    let metrics = crate::metrics::NodeMetrics::default();
+    let mut engine = engine();
+    let mut first = job(0, 5);
+    let second = job(3, 8);
+    save(&mut engine, &first).unwrap();
+    save(&mut engine, &second).unwrap();
+    super::refresh_history_metrics(&engine, &metrics);
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_available
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_queued
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_running
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_pinned_chunks
+            .load(Ordering::Relaxed),
+        8
+    );
+    first.state = 1;
+    save(&mut engine, &first).unwrap();
+    super::refresh_history_metrics(&engine, &metrics);
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_queued
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_running
+            .load(Ordering::Relaxed),
+        1
+    );
+    first.state = 2;
+    save(&mut engine, &first).unwrap();
+    super::refresh_history_metrics(&engine, &metrics);
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_running
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        metrics
+            .proof_pipeline
+            .history_pinned_chunks
+            .load(Ordering::Relaxed),
+        5
+    );
+}
+
 #[tokio::test]
 async fn persisted_program_profile_does_not_enable_pruning_before_authentication() {
     let mut engine = engine();

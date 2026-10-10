@@ -138,10 +138,7 @@ impl<DB: Database> Engine<DB> {
                 }
             }
         }
-        self.store_mut()
-            .db_mut()
-            .write_batch(batch)
-            .map_err(StoreError::Database)?;
+        self.store_mut().write_observed_batch(batch, false)?;
         if state_available {
             *self.state_mut_internal() = candidate;
         }

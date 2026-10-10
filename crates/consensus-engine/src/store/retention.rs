@@ -105,9 +105,7 @@ impl<DB: Database> ChainStore<DB> {
             self.prune_history_frontiers_batch(&mut batch, current, prefix)?;
         }
         batch.put(Column::Meta, RETENTION_KEY, borsh::to_vec(&info)?);
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 
     pub(crate) fn history_dependencies(

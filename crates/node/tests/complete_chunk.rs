@@ -3,6 +3,8 @@
 mod bft_proof_notifications;
 #[path = "complete_chunk/evidence_report_races.rs"]
 mod evidence_report_races;
+#[path = "complete_chunk/finalized_metrics.rs"]
+mod finalized_metrics;
 #[path = "complete_chunk/reporter_mode.rs"]
 mod reporter_mode;
 #[path = "../../prover-chunk/tests/support/mod.rs"]

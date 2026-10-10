@@ -246,6 +246,24 @@ impl ChunkBft {
         self.active_set.len()
     }
 
+    /// Eligible total, value-vote and explicit nil stake in this round.
+    #[must_use]
+    pub fn observed_stake(&self) -> [u64; 5] {
+        [
+            self.total_stake,
+            self.prevotes.aggregate_stake,
+            self.precommits.aggregate_stake,
+            self.nil_prevotes
+                .as_ref()
+                .and_then(|vote| nil_stake(&self.active_set, vote).ok())
+                .unwrap_or(0),
+            self.nil_precommits
+                .as_ref()
+                .and_then(|vote| nil_stake(&self.active_set, vote).ok())
+                .unwrap_or(0),
+        ]
+    }
+
     /// Advance the chunk-BFT state to a fresh round.
     ///
     /// Preserves the chain id, chunk, active set, validator-set root,

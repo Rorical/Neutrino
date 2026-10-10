@@ -47,6 +47,7 @@ pub(crate) struct HealthStatus {
     pub reason: &'static str,
     pub finality_age: Duration,
     pub stall_timeout: Duration,
+    pub sample_age: Option<Duration>,
 }
 
 impl NodeHealth {
@@ -172,6 +173,7 @@ impl NodeHealth {
             reason,
             finality_age,
             stall_timeout: self.stall_timeout,
+            sample_age: state.sampled_at.map(|at| now.saturating_duration_since(at)),
         }
     }
 }

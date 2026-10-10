@@ -114,6 +114,20 @@ pub async fn serve(
     backend: Arc<dyn RpcBackend>,
     config: RpcConfig,
 ) -> Result<ServerHandle, RpcStartError> {
+    serve_with_metrics(
+        backend,
+        config,
+        Arc::new(crate::metrics::RpcMetrics::default()),
+    )
+    .await
+}
+
+/// Start the RPC server with externally accessible fixed-cardinality metrics.
+pub async fn serve_with_metrics(
+    backend: Arc<dyn RpcBackend>,
+    config: RpcConfig,
+    metrics: Arc<crate::metrics::RpcMetrics>,
+) -> Result<ServerHandle, RpcStartError> {
     let module = build_module_with(backend, config.runtime_call_timeout)?;
     let server_config = ServerConfig::builder()
         .max_connections(config.max_connections)
@@ -135,6 +149,7 @@ pub async fn serve(
     )));
     let rpc_middleware = RpcServiceBuilder::new().layer_fn(move |service| RequestGovernor {
         service,
+        metrics: Arc::clone(&metrics),
         permits: Arc::clone(&permits),
         buckets: Arc::clone(&buckets),
     });
@@ -223,11 +238,18 @@ impl BucketTable {
 
 /// Connection id used when jsonrpsee attached none to the request.
 const ANONYMOUS_CONNECTION: usize = usize::MAX;
+/// Per-connection request budget exhausted.
+pub(crate) const RATE_LIMITED_CODE: i32 = -32006;
+/// Server-wide in-flight request limit reached.
+pub(crate) const BUSY_CODE: i32 = -32005;
+/// `runtime_call` deadline elapsed. Runtime execution failures share this code.
+pub(crate) const RUNTIME_TIMEOUT_CODE: i32 = -32012;
 
 /// Rate and concurrency guard applied in front of method dispatch.
 #[derive(Clone)]
 struct RequestGovernor<S> {
     service: S,
+    metrics: Arc<crate::metrics::RpcMetrics>,
     permits: Arc<tokio::sync::Semaphore>,
     buckets: Arc<Mutex<BucketTable>>,
 }
@@ -245,7 +267,7 @@ impl<S> RequestGovernor<S> {
             .try_take(conn, f64::from(cost));
         if !allowed {
             return Err(ErrorObjectOwned::owned(
-                -32006,
+                RATE_LIMITED_CODE,
                 "rate limited: per-connection request budget exhausted",
                 None::<()>,
             ));
@@ -254,7 +276,7 @@ impl<S> RequestGovernor<S> {
             .try_acquire_many_owned(cost)
             .map_err(|_| {
                 ErrorObjectOwned::owned(
-                    -32005,
+                    BUSY_CODE,
                     "server busy: too many requests in flight",
                     None::<()>,
                 )
@@ -282,13 +304,18 @@ where
             .extensions()
             .get::<ConnectionId>()
             .map_or(ANONYMOUS_CONNECTION, |id| id.0);
+        let observation = self
+            .metrics
+            .begin(crate::metrics::RpcMetrics::kind(request.method_name()));
         let admitted = self.admit(conn, 1);
         let service = self.service.clone();
         async move {
-            match admitted {
+            let response = match admitted {
                 Ok(_permit) => service.call(request).await,
                 Err(error) => MethodResponse::error(request.id(), error),
-            }
+            };
+            observation.finish(response.as_error_code());
+            response
         }
     }
 
@@ -299,13 +326,20 @@ where
             .get::<ConnectionId>()
             .map_or(ANONYMOUS_CONNECTION, |id| id.0);
         let cost = u32::try_from(requests.len()).unwrap_or(u32::MAX).max(1);
+        let observation = self.metrics.begin(crate::metrics::BATCH);
         let admitted = self.admit(conn, cost);
         let service = self.service.clone();
         async move {
-            match admitted {
+            let response = match admitted {
                 Ok(_permit) => service.batch(requests).await,
                 Err(error) => MethodResponse::error(Id::Null, error),
-            }
+            };
+            observation.finish(if response.is_batch() {
+                batch_error_code(response.as_ref())
+            } else {
+                response.as_error_code()
+            });
+            response
         }
     }
 
@@ -313,8 +347,38 @@ where
         &self,
         n: Notification<'a>,
     ) -> impl Future<Output = MethodResponse> + Send + 'a {
-        self.service.notification(n)
+        let observation = self.metrics.begin(crate::metrics::NOTIFICATION);
+        let future = self.service.notification(n);
+        async move {
+            let response = future.await;
+            observation.finish(response.as_error_code());
+            response
+        }
     }
+}
+
+// jsonrpsee marks a transport batch successful even when its individual
+// responses failed. Result payloads are skipped; only error codes are kept.
+fn batch_error_code(json: &str) -> Option<i32> {
+    #[derive(serde::Deserialize)]
+    struct ErrorCode {
+        code: i32,
+    }
+    #[derive(serde::Deserialize)]
+    struct Verdict {
+        error: Option<ErrorCode>,
+    }
+    let Ok(verdicts) = serde_json::from_str::<Vec<Verdict>>(json) else {
+        return Some(-32603);
+    };
+    verdicts
+        .into_iter()
+        .filter_map(|verdict| verdict.error.map(|error| error.code))
+        .fold(None, |code, next| {
+            (code.is_none() || next == RUNTIME_TIMEOUT_CODE)
+                .then_some(next)
+                .or(code)
+        })
 }
 
 /// Shared context handed to every RPC handler.
@@ -525,7 +589,7 @@ fn register_runtime_methods(module: &mut RpcModule<RpcContext>) -> Result<(), Rp
                 }),
                 Ok(Err(err)) => Err(runtime_err(&err)),
                 Err(_) => Err(ErrorObjectOwned::owned(
-                    -32012,
+                    RUNTIME_TIMEOUT_CODE,
                     "runtime_call timed out",
                     None::<()>,
                 )),
@@ -731,6 +795,7 @@ mod governor_tests {
     fn admit_reports_rate_limit_and_busy_distinctly() {
         let governor = RequestGovernor {
             service: (),
+            metrics: Arc::default(),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             buckets: Arc::new(Mutex::new(BucketTable::new(50, 16))),
         };
@@ -763,5 +828,22 @@ mod governor_tests {
         assert!(table.try_take(3, 1.0));
         assert_eq!(table.buckets.len(), 2);
         assert!(table.try_take(1, 1.0));
+    }
+    #[test]
+    fn batch_metrics_do_not_treat_internal_failure_as_success() {
+        assert_eq!(
+            batch_error_code(
+                r#"[{"id":1,"result":{"ignored":[1,2,3]}},{"id":2,"error":{"code":-32601,"message":"unknown"}}]"#
+            ),
+            Some(-32601)
+        );
+        assert_eq!(
+            batch_error_code(
+                r#"[{"id":1,"error":{"code":-32601}},{"id":2,"error":{"code":-32012}}]"#
+            ),
+            Some(-32012)
+        );
+        assert_eq!(batch_error_code(r#"[{"id":1,"result":"ok"}]"#), None);
+        assert_eq!(batch_error_code("[] trailing"), Some(-32603));
     }
 }

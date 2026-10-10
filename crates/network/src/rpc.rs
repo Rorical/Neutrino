@@ -688,6 +688,14 @@ pub enum RpcError {
     ResponseDeliveryFailed,
 }
 
+impl RpcError {
+    /// Whether the exchange failed in transport rather than with a peer answer.
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, Self::Outbound(_) | Self::ResponseDeliveryFailed)
+    }
+}
+
 /// Canonical wire failure shared by request/response protocols.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Error, Eq, PartialEq)]
 pub enum RpcFailure {

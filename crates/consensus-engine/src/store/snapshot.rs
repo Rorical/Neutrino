@@ -51,9 +51,7 @@ impl<DB: Database> ChainStore<DB> {
             .filter(|expiry| *expiry > now)
             .ok_or(StoreError::Corrupt("snapshot lease lifetime is exhausted"))?;
         batch.put(Column::Meta, key, borsh::to_vec(&(created, expires))?);
-        self.db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 
     /// Renew an existing manifest lease; ordinary reads cannot pin arbitrary roots.

@@ -202,9 +202,7 @@ impl<DB: Database> ChainStore<DB> {
                 metadata.local = true;
                 let mut batch = Batch::new();
                 put_metadata(&mut batch, &metadata)?;
-                self.db
-                    .write_batch_durable(batch)
-                    .map_err(StoreError::Database)?;
+                self.write_observed_batch(batch, true)?;
             }
             return Ok(id);
         }
@@ -283,9 +281,7 @@ impl<DB: Database> ChainStore<DB> {
         }
         batch.put(Column::SignedArtifacts, id, bytes);
         put_metadata(&mut batch, &metadata)?;
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.write_observed_batch(batch, true)?;
         Ok(id)
     }
 
@@ -317,9 +313,7 @@ impl<DB: Database> ChainStore<DB> {
         let mut batch = Batch::new();
         batch.put(Column::SignedArtifacts, id, bytes);
         put_metadata(&mut batch, &metadata)?;
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 
     /// Exact original source; no alternate encoding can satisfy this immutable ID.
@@ -492,9 +486,7 @@ impl<DB: Database> ChainStore<DB> {
             }
         }
         batch.put(Column::Meta, PRUNED_FLOOR_KEY, borsh::to_vec(&first_chunk)?);
-        self.db
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, true)
     }
 }
 

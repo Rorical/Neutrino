@@ -19,9 +19,11 @@ mod history;
 pub mod keys;
 pub mod pointers;
 mod reporter;
+mod reporter_metrics;
 mod retention;
 mod snapshot;
 
 pub use availability::SignedArtifactMetadata;
 pub use chain_store::{ChainStore, ContentAddressedEntries, ValidatorSetSnapshot};
 pub use error::StoreError;
+pub use reporter_metrics::{ReporterStorageStats, RetainedInventory};

@@ -1,0 +1,127 @@
+groups:
+  - name: neutrino-staging
+    rules:
+      - alert: NeutrinoNodeDown
+        expr: up{job="neutrino"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: 'Node {{ $labels.node }} cannot be scraped'
+          description: 'Inspect process exit code and named critical-worker logs. The metrics listener stops with the node.'
+      - alert: NeutrinoTargetsMissing
+        expr: absent(up{job="neutrino"})
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'No Neutrino scrape targets are configured'}
+      - alert: NeutrinoExpectedTargetMissing
+        expr: neutrino_expected_target unless on(job,node) up{job="neutrino"}
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'Expected node {{ $labels.node }} disappeared from service discovery'}
+      - alert: NeutrinoNodeNotReady
+        expr: neutrino_ready == 0 and on(instance,job) up{job="neutrino"} == 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Node {{ $labels.node }} is not ready'
+          description: 'Inspect neutrino_readiness_reason and sync progress. Startup/bootstrap may legitimately take longer on CPU.'
+      - alert: NeutrinoHealthSamplerStale
+        expr: neutrino_health_sample_age_seconds > 5
+        for: 30s
+        labels: {severity: critical}
+        annotations: {summary: 'Health sampler stopped progressing'}
+      - alert: NeutrinoFinalityStalled
+        expr: neutrino_finality_progress_age_seconds >= neutrino_finality_stall_timeout_seconds
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: 'Finality exceeds the configured stall timeout'}
+      - alert: NeutrinoHistoryLag
+        expr: neutrino_history_lag_exceeded == 1
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: 'Recursive history coverage exceeds the configured lag limit'}
+      - alert: NeutrinoProverStarved
+        expr: sum by(instance,job,node) (neutrino_proving_waiters) > 0 and on(instance,job,node) sum by(instance,job,node) (increase(neutrino_proving_wait_total{outcome="admitted"}[15m])) == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Queued proving work has received no capacity for 15 minutes'}
+      - record: neutrino_local_proof_failures_15m
+        expr: |
+          label_replace(increase(neutrino_block_proof_total{outcome="failed"}[15m]), "stage", "block", "", "")
+          or label_replace(increase(neutrino_chunk_proof_total{outcome="failed"}[15m]), "stage", "chunk", "", "")
+          or label_replace(increase(neutrino_fact_proof_total{outcome="failed"}[15m]), "stage", "fact", "", "")
+          or label_replace(increase(neutrino_evidence_proof_total{outcome="failed"}[15m]), "stage", "evidence", "", "")
+          or label_replace(increase(neutrino_history_fold_total{outcome="failed"}[15m]), "stage", "history_fold", "", "")
+          or label_replace(increase(neutrino_history_merge_total{outcome="failed"}[15m]), "stage", "history_merge", "", "")
+      - alert: NeutrinoProofFailures
+        expr: sum by(instance,job,node) (neutrino_local_proof_failures_15m) > 0
+        labels: {severity: warning}
+        annotations: {summary: 'A local proof generation attempt failed'}
+      - alert: NeutrinoDiskLow
+        expr: neutrino_data_filesystem_available_bytes / neutrino_data_filesystem_size_bytes < 0.1
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: 'Less than 10% free space on the data filesystem'}
+      - alert: NeutrinoFilesystemMetricsUnavailable
+        expr: neutrino_data_filesystem_sample_available == 0 and on(instance,job) neutrino_data_directory_configured == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Configured data filesystem capacity cannot be sampled'}
+      - alert: NeutrinoStorageErrors
+        expr: sum by(instance,job,node) (increase(neutrino_storage_errors_total[5m])) > 0
+        labels: {severity: critical}
+        annotations: {summary: 'Persistent storage operation failed'}
+      - alert: NeutrinoRepeatedRestart
+        expr: changes(process_start_time_seconds{job="neutrino"}[30m]) >= 3
+        labels: {severity: warning}
+        annotations: {summary: 'Node restarted at least three times in 30 minutes'}
+      - alert: NeutrinoRpcTimeouts
+        expr: sum by(instance,job,node) (increase(neutrino_rpc_requests_total{outcome="timeout"}[5m])) > 0
+        labels: {severity: warning}
+        annotations: {summary: 'Runtime JSON-RPC calls timed out'}
+      - alert: NeutrinoReporterEligibilityUnavailable
+        expr: neutrino_reporter_eligibility_available{role="reporter"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: 'Reporter has not completed a finalized eligibility query'}
+      - alert: NeutrinoReporterQueryFailures
+        expr: increase(neutrino_reporter_eligibility_query_failures_total{role="reporter"}[15m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: 'Reporter eligibility query failed; retained data must remain protected'}
+      - alert: NeutrinoEconomicsUnavailable
+        expr: neutrino_accountability_metrics_available{role=~"validator|full|archive|reporter"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: 'Current finalized runtime settlement totals are unavailable'}
+      - alert: NeutrinoEconomicsQueryFailures
+        expr: increase(neutrino_reporter_economic_query_failures_total{role=~"validator|full|archive|reporter"}[15m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: 'Finalized runtime economic query failed'}
+      - alert: NeutrinoEconomicsCounterOverflow
+        expr: neutrino_accountability_counter_overflow == 1
+        labels: {severity: warning}
+        annotations: {summary: 'A runtime cumulative accounting counter exceeded u128 precision'}
+      - alert: NeutrinoEvidencePoolPressure
+        expr: (sum by(instance,job,node) (neutrino_evidence_pool_records) > 230 or sum by(instance,job,node) (neutrino_evidence_pool_bytes) > 30198988) and on(instance,job) neutrino_reporter_inventory_available == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Proven evidence pool exceeds 90% of its shared active/dormant capacity'}
+      - alert: NeutrinoRawEvidencePoolPressure
+        expr: neutrino_reporter_retained_records{kind="raw_reports"} > 921 and on(instance,job) neutrino_reporter_inventory_available == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Raw misconduct pool exceeds 90% capacity'}
+      - alert: NeutrinoReporterInventoryUnavailable
+        expr: neutrino_reporter_inventory_available{role="reporter"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: 'Reporter retention inventory has no current successful sample'}
+      - alert: NeutrinoBootnodeFailures
+        expr: sum by(instance,job,node) (increase(neutrino_bootnode_dial_failures_total[15m])) > 10 and on(instance,job,node) neutrino_peers == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Repeated bootnode failures with no connected peers'}
+      - alert: NeutrinoP2pRpcFailures
+        expr: sum by(instance,job,node) (increase(neutrino_network_rpc_transport_failures_total[5m])) > 10
+        labels: {severity: warning}
+        annotations: {summary: 'Repeated P2P RPC transport failures'}

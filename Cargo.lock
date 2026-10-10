@@ -4320,6 +4320,7 @@ dependencies = [
  "rand_core 0.10.1",
  "serde",
  "sp1-sdk",
+ "sysinfo",
  "thiserror 2.0.21",
  "tokio",
  "toml",

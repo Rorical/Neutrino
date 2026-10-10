@@ -106,9 +106,7 @@ impl<DB: Database> ChainStore<DB> {
             }
         }
         batch.put(Column::Finalized, pointers::TIP, hash);
-        self.db_mut()
-            .write_batch(batch)
-            .map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 
     /// Check the entire persisted canonical index against the selected ancestry.

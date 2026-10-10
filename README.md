@@ -97,9 +97,14 @@ requests, per-connection request rate, batch size and `runtime_call` wall time, 
 WASM queries run under fuel and memory budgets (`[rpc]` and `[execution]` in the config).
 The `validator` role requires a proposer key; use `role = "full"` for a node
 that participates without signing or producing blocks.
-A `[metrics]` listener exposes Prometheus text at `GET /metrics`: head and finality
-heights, history-proof lag, peers, mempool, BFT session flags, proof queue depth, proving
-latency histograms per stage and the fact coverage of the last chunk proof.
+A `[metrics]` listener exposes Prometheus text at `GET /metrics`: chain/finality
+and history lag, eligible validators, bounded BFT session stake and events,
+proof generation/verification/queue waits, network RPC and bootnode retries,
+sync phase and progress, runtime execution and transaction admission, reporter
+retention and actual finalized economic settlements, process resources and RocksDB
+operations. Unknown observations carry availability flags. Metrics contain only
+finite labels; chunk identities are values. See the [staging monitoring package](ops/monitoring/README.md)
+for scrape configuration, tested alert rules, metric semantics and a Grafana dashboard.
 
 P2P identities persist in `data_dir/p2p-key`, or in the explicit
 `network_key_path` file. The node creates an owner-only key atomically on first

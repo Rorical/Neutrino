@@ -1,0 +1,20 @@
+# Keep this desired inventory separate from service discovery. Update it with
+# targets.json when deliberately changing the private staging membership.
+groups:
+  - name: neutrino-expected-targets
+    rules:
+      - record: neutrino_expected_target
+        expr: vector(1)
+        labels: {job: neutrino,node: validator-1,role: validator}
+      - record: neutrino_expected_target
+        expr: vector(1)
+        labels: {job: neutrino,node: validator-2,role: validator}
+      - record: neutrino_expected_target
+        expr: vector(1)
+        labels: {job: neutrino,node: validator-3,role: validator}
+      - record: neutrino_expected_target
+        expr: vector(1)
+        labels: {job: neutrino,node: validator-4,role: validator}
+      - record: neutrino_expected_target
+        expr: vector(1)
+        labels: {job: neutrino,node: reporter-1,role: reporter}

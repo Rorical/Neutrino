@@ -16,6 +16,9 @@ use crate::{
     Address, GAS_SANCTION, Receipt, ReceiptStatus, StfInput, Transaction, apply_deduction,
 };
 
+/// Runtime-owned durable totals of actual mandatory transfers.
+pub mod settlement;
+
 /// Runtime key for the bounded, consensus-ordered mandatory queue.
 pub const QUEUE_KEY: &[u8] = b"accountability:queue:v1";
 /// Per-admission cost, separate from mandatory execution cost.
@@ -274,6 +277,37 @@ fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<S
     admitted
 }
 
+fn enqueue_admissions<B: StateBackend>(
+    state: &mut B,
+    input: &StfInput,
+    policy: &crate::RuntimePolicy,
+    admitted: &[Sanction],
+    queue: &mut Vec<PendingSanction>,
+) {
+    for (sanction, transaction) in admitted.iter().zip(&input.transactions) {
+        let Transaction::SubmitEvidence(submission) = transaction else {
+            unreachable!("admissions form the transaction prefix")
+        };
+        state.write(&sanction.marker_key(), alloc::vec![0]);
+        let amount = match sanction.kind {
+            SanctionKind::Slash => policy.slash_amount,
+            SanctionKind::Inactivity => policy.inactivity_leak_amount,
+        };
+        queue.push(PendingSanction {
+            sanction: sanction.clone(),
+            amount,
+            reporter: (sanction.kind == SanctionKind::Slash)
+                .then_some(submission.statement.reporter)
+                .flatten(),
+            reporter_reward_bps: if sanction.kind == SanctionKind::Slash {
+                policy.reporter_reward_bps
+            } else {
+                0
+            },
+        });
+    }
+}
+
 /// Admit all proof-authenticated claims, then execute the mandatory FIFO prefix
 /// before ordinary transactions. Returns reserved gas and autonomous receipts.
 pub(crate) fn apply<B: StateBackend>(
@@ -313,39 +347,31 @@ pub(crate) fn apply<B: StateBackend>(
         queue.len() + admitted.len() - execution_count <= policy.evidence_max_pending as usize,
         "queue capacity"
     );
-    for (sanction, transaction) in admitted.iter().zip(&input.transactions) {
-        let Transaction::SubmitEvidence(submission) = transaction else {
-            unreachable!("admissions form the transaction prefix")
-        };
-        state.write(&sanction.marker_key(), alloc::vec![0]);
-        let amount = match sanction.kind {
-            SanctionKind::Slash => policy.slash_amount,
-            SanctionKind::Inactivity => policy.inactivity_leak_amount,
-        };
-        queue.push(PendingSanction {
-            sanction: sanction.clone(),
-            amount,
-            reporter: (sanction.kind == SanctionKind::Slash)
-                .then_some(submission.statement.reporter)
-                .flatten(),
-            reporter_reward_bps: if sanction.kind == SanctionKind::Slash {
-                policy.reporter_reward_bps
-            } else {
-                0
-            },
-        });
-    }
+    enqueue_admissions(state, input, &policy, &admitted, &mut queue);
     record_expiry_bucket(state, input.block_height, &admitted);
+    // Empty blocks leave totals untouched and need no witness entry for them.
+    let settles = !admitted.is_empty() || execution_count > 0;
+    let mut totals = if settles {
+        settlement::load_totals(state)
+    } else {
+        settlement::SettlementTotals::default()
+    };
+    for sanction in &admitted {
+        totals.admitted(sanction.kind);
+    }
     let mut executed = Vec::with_capacity(execution_count);
     let mut receipts = Vec::with_capacity(execution_count);
     for item in queue.drain(..execution_count) {
-        let status = execute_pending(state, &item);
+        let status = execute_pending(state, &item, &mut totals);
         executed.push(item.sanction);
         receipts.push(Receipt {
             status_code: status.as_u32(),
             gas_used: GAS_SANCTION,
             kind: 8,
         });
+    }
+    if settles {
+        settlement::store_totals(state, &totals);
     }
     let after = commitment(&queue);
     if before != after {
@@ -369,24 +395,31 @@ pub(crate) fn apply<B: StateBackend>(
 
 /// Complete one mandatory obligation, paying only from its actual deduction.
 /// Zero slashable balance is an explicit outcome, never a retry loop.
-fn execute_pending<B: StateBackend>(state: &mut B, item: &PendingSanction) -> ReceiptStatus {
+fn execute_pending<B: StateBackend>(
+    state: &mut B,
+    item: &PendingSanction,
+    totals: &mut settlement::SettlementTotals,
+) -> ReceiptStatus {
     let result = apply_deduction(
         state,
         &item.sanction.offender.withdrawal_credentials,
         item.amount,
     );
-    let status = match result {
+    let (status, deducted, rewarded) = match result {
         Ok(deducted) => {
-            if item.sanction.kind == SanctionKind::Slash
+            let rewarded = if item.sanction.kind == SanctionKind::Slash
                 && let Some(reporter) = item.reporter
             {
-                credit_reporter(state, &reporter, deducted, item.reporter_reward_bps);
-            }
-            ReceiptStatus::Success
+                credit_reporter(state, &reporter, deducted, item.reporter_reward_bps)
+            } else {
+                0
+            };
+            (ReceiptStatus::Success, deducted, rewarded)
         }
-        Err(ReceiptStatus::InsufficientBalance) => ReceiptStatus::InsufficientBalance,
+        Err(ReceiptStatus::InsufficientBalance) => (ReceiptStatus::InsufficientBalance, 0, 0),
         Err(error) => panic!("unexpected mandatory deduction failure: {error:?}"),
     };
+    totals.executed(item.sanction.kind, deducted, rewarded);
     state.write(&item.sanction.marker_key(), alloc::vec![1]);
     status
 }
@@ -399,18 +432,20 @@ fn credit_reporter<B: StateBackend>(
     reporter: &Address,
     deducted: u128,
     basis_points: u16,
-) {
+) -> u128 {
     assert!(basis_points <= 10_000, "canonical reporter reward share");
     let share = u128::from(basis_points);
     let reward = deducted / 10_000 * share + deducted % 10_000 * share / 10_000;
     if reward == 0 {
-        return;
+        return 0;
     }
     let mut account = crate::load_account(state, reporter);
     // Saturation burns any unrepresentable residue rather than blocking the
     // mandatory FIFO or increasing supply beyond the deducted funds.
-    account.balance = account.balance.saturating_add(reward);
+    let credited = reward.min(u128::MAX - account.balance);
+    account.balance += credited;
     crate::store_account(state, reporter, &account);
+    credited
 }
 
 /// Pending deductions conservatively hold all withdrawals from their shared

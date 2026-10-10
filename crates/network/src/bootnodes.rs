@@ -133,18 +133,47 @@ impl Bootnodes {
         true
     }
 
-    pub(crate) fn failed(&mut self, connection: ConnectionId, now: Instant, self_dial: bool) {
+    pub(crate) fn failed(
+        &mut self,
+        connection: ConnectionId,
+        now: Instant,
+        self_dial: bool,
+    ) -> bool {
+        let mut matched = false;
         for entry in &mut self.entries {
             if entry.pending != Some(connection) {
                 continue;
             }
             entry.pending = None;
+            matched = true;
             if self_dial {
                 entry.disabled = true;
             } else if entry.connected_peer.is_none() {
                 schedule_retry(entry, &self.jitter_seed, now);
             }
         }
+        matched
+    }
+
+    pub(crate) fn states(&self, now: Instant) -> [u64; 6] {
+        let mut states = [0; 6];
+        for (index, entry) in self.entries.iter().enumerate() {
+            let state = if entry.disabled {
+                4
+            } else if entry.connected_peer.is_some() {
+                0
+            } else if entry.pending.is_some() {
+                1
+            } else if !self.can_start(index) {
+                5
+            } else if entry.retry_at > now {
+                2
+            } else {
+                3
+            };
+            states[state] += 1;
+        }
+        states
     }
 
     pub(crate) fn connected(

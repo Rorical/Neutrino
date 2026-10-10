@@ -167,10 +167,7 @@ impl<DB: Database> Engine<DB> {
         }
         let mut batch = Batch::new();
         batch.put(Column::BftSessions, session.chunk_id.to_be_bytes(), bytes);
-        self.store_mut()
-            .db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.store_mut().write_observed_batch(batch, true)?;
         Ok(())
     }
 

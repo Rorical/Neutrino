@@ -1,12 +1,14 @@
 //! RocksDB-backed persistent [`Database`](crate::Database) implementation.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch};
 
-use crate::{ALL_COLUMNS, Batch, BatchOp, Column, ColumnSnapshot, Database};
+use crate::{ALL_COLUMNS, Batch, BatchOp, Column, ColumnSnapshot, DATABASE_OPERATIONS, Database};
 
 /// Error returned by [`RocksDbDatabase`].
 #[derive(Debug)]
@@ -39,6 +41,26 @@ impl From<rocksdb::Error> for RocksDbError {
 /// Persistent RocksDB storage backend.
 pub struct RocksDbDatabase {
     db: DB,
+    metrics: Box<OperationMetrics>,
+}
+
+#[derive(Default)]
+struct OperationMetrics {
+    attempts: [AtomicU64; DATABASE_OPERATIONS.len()],
+    failures: [AtomicU64; DATABASE_OPERATIONS.len()],
+    micros: [AtomicU64; DATABASE_OPERATIONS.len()],
+}
+
+/// Index into [`DATABASE_OPERATIONS`].
+#[derive(Clone, Copy)]
+enum Operation {
+    Get,
+    Put,
+    Delete,
+    Batch,
+    DurableBatch,
+    Scan,
+    PrefixScan,
 }
 
 impl fmt::Debug for RocksDbDatabase {
@@ -62,7 +84,36 @@ impl RocksDbDatabase {
             .iter()
             .map(|column| ColumnFamilyDescriptor::new(column.name(), Options::default()));
         let db = DB::open_cf_descriptors(&options, path, descriptors)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            metrics: Box::default(),
+        })
+    }
+
+    fn observe<T>(
+        &self,
+        operation: Operation,
+        run: impl FnOnce() -> Result<T, RocksDbError>,
+    ) -> Result<T, RocksDbError> {
+        let index = operation as usize;
+        let started = Instant::now();
+        let result = run();
+        self.metrics.attempts[index].fetch_add(1, Ordering::Relaxed);
+        if result.is_err() {
+            self.metrics.failures[index].fetch_add(1, Ordering::Relaxed);
+        }
+        self.metrics.micros[index].fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        result
+    }
+
+    fn summed_property(&self, name: &str) -> Option<u64> {
+        ALL_COLUMNS.iter().try_fold(0_u64, |sum, column| {
+            let cf = self.cf(*column).ok()?;
+            sum.checked_add(self.db.property_int_value_cf(&cf, name).ok()??)
+        })
     }
 
     fn cf(&self, column: Column) -> Result<impl rocksdb::AsColumnFamilyRef + '_, RocksDbError> {
@@ -75,80 +126,112 @@ impl RocksDbDatabase {
 impl Database for RocksDbDatabase {
     type Error = RocksDbError;
 
+    fn statistics(&self) -> Option<crate::DatabaseStatistics> {
+        Some(crate::DatabaseStatistics {
+            attempts: core::array::from_fn(|index| {
+                self.metrics.attempts[index].load(Ordering::Relaxed)
+            }),
+            failures: core::array::from_fn(|index| {
+                self.metrics.failures[index].load(Ordering::Relaxed)
+            }),
+            micros: core::array::from_fn(|index| {
+                self.metrics.micros[index].load(Ordering::Relaxed)
+            }),
+            sst_bytes: self.summed_property("rocksdb.total-sst-files-size"),
+            memtable_bytes: self.summed_property("rocksdb.cur-size-all-mem-tables"),
+            pending_compaction_bytes: self
+                .summed_property("rocksdb.estimate-pending-compaction-bytes"),
+        })
+    }
+
     fn get(&self, column: Column, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        let cf = self.cf(column)?;
-        self.db.get_cf(&cf, key).map_err(Into::into)
+        self.observe(Operation::Get, || {
+            let cf = self.cf(column)?;
+            self.db.get_cf(&cf, key).map_err(Into::into)
+        })
     }
 
     fn put(&mut self, column: Column, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        let cf = self.cf(column)?;
-        self.db.put_cf(&cf, key, value).map_err(Into::into)
+        self.observe(Operation::Put, || {
+            let cf = self.cf(column)?;
+            self.db.put_cf(&cf, key, value).map_err(Into::into)
+        })
     }
 
     fn delete(&mut self, column: Column, key: &[u8]) -> Result<(), Self::Error> {
-        let cf = self.cf(column)?;
-        self.db.delete_cf(&cf, key).map_err(Into::into)
+        self.observe(Operation::Delete, || {
+            let cf = self.cf(column)?;
+            self.db.delete_cf(&cf, key).map_err(Into::into)
+        })
     }
 
     fn write_batch(&mut self, batch: Batch) -> Result<(), Self::Error> {
-        let mut write_batch = WriteBatch::default();
-        for op in batch.into_operations() {
-            match op {
-                BatchOp::Put { column, key, value } => {
-                    let cf = self.cf(column)?;
-                    write_batch.put_cf(&cf, key, value);
-                }
-                BatchOp::Delete { column, key } => {
-                    let cf = self.cf(column)?;
-                    write_batch.delete_cf(&cf, key);
+        self.observe(Operation::Batch, || {
+            let mut write_batch = WriteBatch::default();
+            for op in batch.into_operations() {
+                match op {
+                    BatchOp::Put { column, key, value } => {
+                        let cf = self.cf(column)?;
+                        write_batch.put_cf(&cf, key, value);
+                    }
+                    BatchOp::Delete { column, key } => {
+                        let cf = self.cf(column)?;
+                        write_batch.delete_cf(&cf, key);
+                    }
                 }
             }
-        }
-        self.db.write(write_batch).map_err(Into::into)
+            self.db.write(write_batch).map_err(Into::into)
+        })
     }
 
     fn write_batch_durable(&mut self, batch: Batch) -> Result<(), Self::Error> {
-        let mut write_batch = WriteBatch::default();
-        for op in batch.into_operations() {
-            match op {
-                BatchOp::Put { column, key, value } => {
-                    write_batch.put_cf(&self.cf(column)?, key, value);
-                }
-                BatchOp::Delete { column, key } => {
-                    write_batch.delete_cf(&self.cf(column)?, key);
+        self.observe(Operation::DurableBatch, || {
+            let mut write_batch = WriteBatch::default();
+            for op in batch.into_operations() {
+                match op {
+                    BatchOp::Put { column, key, value } => {
+                        write_batch.put_cf(&self.cf(column)?, key, value);
+                    }
+                    BatchOp::Delete { column, key } => {
+                        write_batch.delete_cf(&self.cf(column)?, key);
+                    }
                 }
             }
-        }
-        let mut options = rocksdb::WriteOptions::default();
-        options.set_sync(true);
-        options.disable_wal(false);
-        self.db.write_opt(write_batch, &options).map_err(Into::into)
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            options.disable_wal(false);
+            self.db.write_opt(write_batch, &options).map_err(Into::into)
+        })
     }
 
     fn iter_column(&self, column: Column) -> Result<ColumnSnapshot, Self::Error> {
-        let cf = self.cf(column)?;
-        let mut out = Vec::new();
-        for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
-            let (key, value) = entry?;
-            out.push((key.into_vec(), value.into_vec()));
-        }
-        Ok(out)
+        self.observe(Operation::Scan, || {
+            let cf = self.cf(column)?;
+            let mut out = Vec::new();
+            for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
+                let (key, value) = entry?;
+                out.push((key.into_vec(), value.into_vec()));
+            }
+            Ok(out)
+        })
     }
 
     fn iter_prefix(&self, column: Column, prefix: &[u8]) -> Result<ColumnSnapshot, Self::Error> {
-        let cf = self.cf(column)?;
-        let mut out = Vec::new();
-        for entry in self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward))
-        {
-            let (key, value) = entry?;
-            if !key.starts_with(prefix) {
-                break;
+        self.observe(Operation::PrefixScan, || {
+            let cf = self.cf(column)?;
+            let mut out = Vec::new();
+            for entry in self
+                .db
+                .iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward))
+            {
+                let (key, value) = entry?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                out.push((key.into_vec(), value.into_vec()));
             }
-            out.push((key.into_vec(), value.into_vec()));
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 }
 
@@ -399,5 +482,27 @@ mod tests {
             assert_eq!(get(&db, Column::Meta, b"missing"), None);
         }
         fs::remove_dir_all(&path).expect("remove temp rocksdb");
+    }
+    #[test]
+    fn statistics_record_actual_operations_without_scanning_records() {
+        let path = temp_db_path("statistics");
+        {
+            let mut db = RocksDbDatabase::open(&path).unwrap();
+            db.put(Column::Meta, b"key", b"value").unwrap();
+            assert_eq!(
+                db.get(Column::Meta, b"key").unwrap(),
+                Some(b"value".to_vec())
+            );
+            let mut batch = Batch::new();
+            batch.put(Column::Meta, b"durable", b"value");
+            db.write_batch_durable(batch).unwrap();
+            let before = db.statistics().unwrap();
+            let after = db.statistics().unwrap();
+            assert_eq!(before.attempts, [1, 1, 0, 0, 1, 0, 0]);
+            assert_eq!(before.failures, [0; 7]);
+            assert_eq!(before.attempts, after.attempts);
+            assert!(before.memtable_bytes.is_some());
+        }
+        fs::remove_dir_all(path).unwrap();
     }
 }

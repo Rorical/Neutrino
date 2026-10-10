@@ -2,6 +2,7 @@
 
 use super::{OutboundOutcome, SyncDriver};
 use crate::backend::SyncBackendError;
+use crate::metrics::{FullChunkKind, Observation};
 use alloc::collections::BTreeMap;
 use neutrino_network::{
     PeerId,
@@ -16,6 +17,7 @@ use neutrino_network::{
 #[derive(Default)]
 pub(super) struct FullChunkSync {
     pub(super) enabled: bool,
+    observation: Option<LocalObservation>,
     pub(super) in_flight: bool,
     active_request: Option<(PeerId, u64, Step)>,
     pub(super) retry_cursor: usize,
@@ -24,6 +26,53 @@ pub(super) struct FullChunkSync {
     retained_from_chunk: BTreeMap<PeerId, u64>,
     connections: BTreeMap<PeerId, u64>,
     next_connection: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LocalObservation {
+    at: tokio::time::Instant,
+    progress: Option<neutrino_network::LocalProgress>,
+    target: Option<crate::backend::ConsensusSyncTarget>,
+}
+
+pub(super) async fn observe_local(
+    driver: &mut SyncDriver,
+) -> (
+    Option<neutrino_network::LocalProgress>,
+    Option<crate::backend::ConsensusSyncTarget>,
+) {
+    if let Some(observation) = driver.full_chunks.observation
+        && observation.at.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return (observation.progress, observation.target);
+    }
+    let progress = driver
+        .backend
+        .local_progress()
+        .await
+        .inspect_err(|_| {
+            driver
+                .metrics()
+                .observation_error(Observation::LocalProgress);
+        })
+        .ok();
+    let target = driver
+        .backend
+        .consensus_sync_target()
+        .await
+        .inspect_err(|_| {
+            driver
+                .metrics()
+                .observation_error(Observation::ConsensusTarget);
+        })
+        .ok()
+        .flatten();
+    driver.full_chunks.observation = Some(LocalObservation {
+        at: tokio::time::Instant::now(),
+        progress,
+        target,
+    });
+    (progress, target)
 }
 
 #[derive(Clone)]
@@ -50,8 +99,96 @@ pub(super) enum Step {
     Finality(u64),
 }
 
+impl Step {
+    const fn metric_kind(self) -> FullChunkKind {
+        match self {
+            Self::Blocks { .. } => FullChunkKind::Blocks,
+            Self::Proofs { .. } => FullChunkKind::Proofs,
+            Self::Finality(_) => FullChunkKind::Finality,
+        }
+    }
+}
+
+/// Observe verified local progress without changing the protocol FSM. Peer
+/// status is only a download target; it cannot certify completed local work.
+pub(super) fn is_syncing(
+    driver: &SyncDriver,
+    local: Option<&neutrino_network::LocalProgress>,
+    target: Option<&crate::backend::ConsensusSyncTarget>,
+) -> bool {
+    let (Some(local), Some(target)) = (local, target) else {
+        return true;
+    };
+    if driver.full_chunks.in_flight || driver.full_chunks.peers.is_empty() {
+        return true;
+    }
+    let fsm_behind = match driver.fsm.state() {
+        neutrino_network::SyncState::CheckpointBackfill { target_index, .. } => {
+            local.recursive_covered_chunks < *target_index
+        }
+        neutrino_network::SyncState::HeaderBackfill { target_height, .. } => {
+            local.head_height < *target_height
+        }
+        neutrino_network::SyncState::ProofBackfill { target_height, .. } => {
+            local.proven_height < *target_height
+        }
+        neutrino_network::SyncState::BodyBackfill { target_height, .. } => {
+            local.body_height < *target_height
+        }
+        neutrino_network::SyncState::StateFetch { target_state_root } => {
+            local.finalized_state_root != *target_state_root
+        }
+        neutrino_network::SyncState::Stalled { .. } => true,
+        neutrino_network::SyncState::Init | neutrino_network::SyncState::Following => false,
+    };
+    fsm_behind
+        || driver.full_chunks.peers.values().any(|remote| {
+            let remote_chunks = remote
+                .finalized_chunk_id
+                .map_or(0, |id| id.saturating_add(1));
+            let local_chunks = local
+                .finalized_chunk_id
+                .map_or(0, |id| id.saturating_add(1));
+            remote.head_height > local.head_height
+                || remote.head_height.min(target.end_height) > local.proven_height
+                || remote_chunks > local_chunks
+        })
+}
+
+pub(super) fn publish_metrics(driver: &SyncDriver) {
+    let selected = driver
+        .full_chunks
+        .active_request
+        .map(|(peer, _, _)| peer)
+        .or_else(|| {
+            driver
+                .full_chunks
+                .cursors
+                .iter()
+                .max_by_key(|(_, cursor)| (cursor.chunk_id, cursor.next_header, cursor.next_proof))
+                .map(|(peer, _)| *peer)
+        });
+    let cursors = selected
+        .and_then(|peer| driver.full_chunks.cursors.get(&peer))
+        .map_or([0; 3], |cursor| {
+            [cursor.next_header, cursor.next_proof, cursor.chunk_id]
+        });
+    let target = selected
+        .and_then(|peer| driver.full_chunks.peers.get(&peer))
+        .map_or(0, |status| status.head_height);
+    driver.metrics().publish_full_chunk(
+        driver.full_chunks.enabled,
+        driver.full_chunks.in_flight,
+        cursors,
+        target,
+    );
+}
+
 /// Invalidate every old request while preserving monotonic connection generations.
 pub(super) fn reset_after_bootstrap(driver: &mut SyncDriver) {
+    if let Some((_, _, step)) = driver.full_chunks.active_request {
+        driver.metrics().full_chunk_cancelled(step.metric_kind());
+    }
     let next_connection = driver.full_chunks.next_connection;
     driver.full_chunks = FullChunkSync {
         next_connection,
@@ -71,11 +208,10 @@ pub(super) fn on_connect(driver: &mut SyncDriver, peer: PeerId) {
 }
 
 pub(super) fn on_disconnect(driver: &mut SyncDriver, peer: PeerId) {
-    if driver
-        .full_chunks
-        .active_request
-        .is_some_and(|(owner, _, _)| owner == peer)
+    if let Some((owner, _, step)) = driver.full_chunks.active_request
+        && owner == peer
     {
+        driver.metrics().full_chunk_cancelled(step.metric_kind());
         driver.full_chunks.active_request = None;
         driver.full_chunks.in_flight = false;
     }
@@ -86,6 +222,7 @@ pub(super) fn on_disconnect(driver: &mut SyncDriver, peer: PeerId) {
 }
 
 pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Status) -> bool {
+    driver.full_chunks.observation = None;
     if driver.fsm.mode() == neutrino_network::SyncMode::LightClient {
         return false;
     }
@@ -218,6 +355,7 @@ async fn send_request(
 ) {
     driver.full_chunks.in_flight = true;
     driver.full_chunks.active_request = Some((peer, connection, step));
+    driver.metrics().full_chunk_request(step.metric_kind());
     let sent = driver
         .send_rpc(peer, request, move |peer, response| {
             OutboundOutcome::Consensus {
@@ -229,6 +367,9 @@ async fn send_request(
         })
         .await;
     if !sent {
+        driver
+            .metrics()
+            .full_chunk_transport_error(step.metric_kind());
         release_request(driver, peer, Some(connection), step);
     }
 }
@@ -281,11 +422,15 @@ pub(super) async fn on_response(
     step: Step,
     response: Result<RpcResponse, RpcError>,
 ) {
-    if !release_request(driver, peer, connection, step)
-        || record_pruning_floor(driver, peer, connection, &response)
-    {
+    if !release_request(driver, peer, connection, step) {
         return;
     }
+    driver.full_chunks.observation = None;
+    if record_pruning_floor(driver, peer, connection, &response) {
+        driver.metrics().full_chunk_pruned(step.metric_kind());
+        return;
+    }
+    let transport_failed = response.as_ref().is_err_and(RpcError::is_transport);
     let mut advance = None;
     let mut downloaded = Vec::new();
     let result = match (step, response) {
@@ -330,33 +475,13 @@ pub(super) async fn on_response(
         (Step::Finality(id), Ok(RpcResponse::ChunkProofById(payload)))
             if payload.proofs.len() == 1 =>
         {
-            let proof = payload.proofs.into_iter().next().expect("length checked");
-            if proof.chunk_id == id
-                && driver.full_chunks.cursors.get(&peer).is_some_and(|cursor| {
-                    cursor.chunk_id == id
-                        && cursor.blocks.get(&proof.public_inputs.end_height)
-                            == Some(&proof.public_inputs.end_block_hash)
-                })
-                && driver.full_chunks.peers.get(&peer).is_some_and(|status| {
-                    status.finalized_chunk_id != Some(id)
-                        || status.finalized_chunk_hash == proof.chunk_hash
-                })
-            {
-                driver
-                    .backend
-                    .verify_and_import_chunk_proof(proof)
-                    .await
-                    .map(|_| ())
-            } else {
-                Err(SyncBackendError::Rejected(
-                    "wrong chunk response".to_owned(),
-                ))
-            }
+            import_finality_response(driver, peer, id, payload).await
         }
         _ => Err(SyncBackendError::NotAvailable(
             "missing or mismatched consensus sync response".to_owned(),
         )),
     };
+    record_response_result(driver, step, transport_failed, &result);
     if result.is_ok() {
         if let Some((head, blocks, next)) = advance
             && let Some(cursor) = driver
@@ -378,6 +503,52 @@ pub(super) async fn on_response(
             ?result,
             "complete chunk sync will retry at the next handshake"
         );
+    }
+}
+
+fn record_response_result(
+    driver: &SyncDriver,
+    step: Step,
+    transport_failed: bool,
+    result: &Result<(), SyncBackendError>,
+) {
+    if transport_failed {
+        driver
+            .metrics()
+            .full_chunk_transport_error(step.metric_kind());
+    } else {
+        driver
+            .metrics()
+            .full_chunk_result(step.metric_kind(), result);
+    }
+}
+
+async fn import_finality_response(
+    driver: &SyncDriver,
+    peer: PeerId,
+    id: u64,
+    payload: neutrino_network::rpc::ChunkProofByIdResponse,
+) -> Result<(), SyncBackendError> {
+    let proof = payload.proofs.into_iter().next().expect("length checked");
+    if proof.chunk_id == id
+        && driver.full_chunks.cursors.get(&peer).is_some_and(|cursor| {
+            cursor.chunk_id == id
+                && cursor.blocks.get(&proof.public_inputs.end_height)
+                    == Some(&proof.public_inputs.end_block_hash)
+        })
+        && driver.full_chunks.peers.get(&peer).is_some_and(|status| {
+            status.finalized_chunk_id != Some(id) || status.finalized_chunk_hash == proof.chunk_hash
+        })
+    {
+        driver
+            .backend
+            .verify_and_import_chunk_proof(proof)
+            .await
+            .map(|_| ())
+    } else {
+        Err(SyncBackendError::Rejected(
+            "wrong chunk response".to_owned(),
+        ))
     }
 }
 

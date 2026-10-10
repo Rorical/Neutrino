@@ -409,10 +409,7 @@ impl<DB: Database> Engine<DB> {
             intent_key(voter.public_key_bytes(), &data),
             borsh::to_vec(&intent)?,
         );
-        self.store_mut()
-            .db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.store_mut().write_observed_batch(batch, true)?;
 
         let vote = self.sign_reserved_value_vote(voter, data, intent);
         self.retain_local_signed_vote(&vote)?;
@@ -776,10 +773,7 @@ impl<DB: Database> Engine<DB> {
         );
         batch.put(Column::SigningJournal, key, borsh::to_vec(&watermark)?);
         batch.put(Column::SigningJournal, nil_key, bytes);
-        self.store_mut()
-            .db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.store_mut().write_observed_batch(batch, true)?;
         let signature = voter
             .sign_raw(&data.signing_message(self.chain_spec().consensus_domain()))
             .to_bytes();
@@ -927,10 +921,7 @@ impl<DB: Database> Engine<DB> {
         let mut batch = Batch::new();
         self.compact_message_intents(&mut batch, tag, voter.public_key_bytes(), chunk_id, round)?;
         batch.put(Column::SigningJournal, key, bytes);
-        self.store_mut()
-            .db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.store_mut().write_observed_batch(batch, true)?;
         Ok(voter.sign_raw(message).to_bytes())
     }
 
@@ -1175,10 +1166,7 @@ impl<DB: Database> Engine<DB> {
                 hash,
             })?,
         );
-        self.store_mut()
-            .db_mut()
-            .write_batch_durable(batch)
-            .map_err(StoreError::Database)?;
+        self.store_mut().write_observed_batch(batch, true)?;
         Ok(voter.sign_proposer_message(self.chain_spec().consensus_domain(), &hash))
     }
 }

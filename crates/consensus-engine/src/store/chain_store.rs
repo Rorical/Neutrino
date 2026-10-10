@@ -77,6 +77,7 @@ fn evidence_report_root(
 pub struct ChainStore<DB> {
     pub(super) db: DB,
     pub(super) history_record_window: u64,
+    pub(super) reporter_stats_dirty: bool,
 }
 
 impl<DB> ChainStore<DB> {
@@ -86,6 +87,7 @@ impl<DB> ChainStore<DB> {
         Self {
             db,
             history_record_window: neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS,
+            reporter_stats_dirty: true,
         }
     }
 
@@ -103,6 +105,9 @@ impl<DB> ChainStore<DB> {
 
     /// Mutably borrow the wrapped database.
     pub const fn db_mut(&mut self) -> &mut DB {
+        // Raw database access can bypass observed writes. Rebuild once before
+        // trusting the aggregate again, rather than serving stale inventories.
+        self.reporter_stats_dirty = true;
         &mut self.db
     }
 
@@ -114,10 +119,11 @@ impl<DB> ChainStore<DB> {
 
 impl<DB: Database> ChainStore<DB> {
     /// Persist a verified receipt together with its authenticated current history path.
+    /// Returns whether the receipt was newly pooled rather than already present.
     pub fn put_evidence_report(
         &mut self,
         report: &neutrino_consensus_types::evidence::EvidenceReport,
-    ) -> Result<(), StoreError<DB::Error>> {
+    ) -> Result<bool, StoreError<DB::Error>> {
         use neutrino_consensus_types::evidence::MAX_EVIDENCE_PROOF_BYTES;
         let artifact = &report.artifact;
         let invalid = |message| {
@@ -157,13 +163,13 @@ impl<DB: Database> ChainStore<DB> {
             if report.history.count > stored.report.history.count {
                 stored.report.history = report.history.clone();
                 stored.history_root = history_root;
-                return self.put_raw(
+                self.put_raw(
                     Column::EvidenceProofs,
                     &artifact.statement_id(),
                     &borsh::to_vec(&stored)?,
-                );
+                )?;
             }
-            return Ok(());
+            return Ok(false);
         }
         let bytes = borsh::to_vec(&StoredEvidenceReport {
             report: report.clone(),
@@ -175,7 +181,8 @@ impl<DB: Database> ChainStore<DB> {
         {
             return Err(invalid("evidence pool capacity"));
         }
-        self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)
+        self.put_raw(Column::EvidenceProofs, &artifact.statement_id(), &bytes)?;
+        Ok(true)
     }
 
     /// Stage a path refresh without replacing its already verified proof attachment.
@@ -225,7 +232,7 @@ impl<DB: Database> ChainStore<DB> {
         if batch.is_empty() {
             return Ok(());
         }
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 
     /// Whether finalized blocks already consumed everything this receipt could
@@ -263,6 +270,31 @@ impl<DB: Database> ChainStore<DB> {
             .into_iter()
             .map(|stored| stored.report)
             .collect())
+    }
+
+    /// Logical bytes and records of active and dormant locally authenticated
+    /// report openings. Active means the current finalized root, not a promise
+    /// that head-state policy or a block's gas budget admits the report now.
+    /// This scans only the bounded 256-report, 32 MiB pool.
+    ///
+    /// # Errors
+    /// Reports database failures, malformed reports or an exceeded pool bound.
+    pub fn evidence_pool_metrics(
+        &self,
+    ) -> Result<[super::RetainedInventory; 2], StoreError<DB::Error>> {
+        let boundary = self.get_consensus_state()?.map(|state| state.boundary);
+        let mut result = [super::RetainedInventory::default(); 2];
+        for stored in self.stored_evidence_reports()? {
+            let active = boundary.is_some_and(|boundary| {
+                stored.report.history.count == boundary.next_chunk_id
+                    && stored.history_root == boundary.history_root
+            });
+            let inventory = &mut result[usize::from(!active)];
+            inventory.records += 1;
+            inventory.bytes += u64::try_from(borsh::object_length(&stored)? + 32)
+                .map_err(|_| StoreError::Corrupt("evidence metric bytes"))?;
+        }
+        Ok(result)
     }
 
     fn stored_evidence_reports(&self) -> Result<Vec<StoredEvidenceReport>, StoreError<DB::Error>> {
@@ -508,9 +540,15 @@ impl<DB: Database> ChainStore<DB> {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), StoreError<DB::Error>> {
-        self.db
-            .put(column, key, value)
-            .map_err(StoreError::Database)
+        if super::reporter_metrics::observed_column(column) {
+            let mut batch = neutrino_storage::Batch::new();
+            batch.put(column, key, value);
+            self.write_observed_batch(batch, false)
+        } else {
+            self.db
+                .put(column, key, value)
+                .map_err(StoreError::Database)
+        }
     }
 
     pub(super) fn get_raw(
@@ -655,7 +693,7 @@ impl<DB: Database> ChainStore<DB> {
                 borsh::to_vec(&BlockState::Proven)?,
             );
         }
-        self.db.write_batch(batch).map_err(StoreError::Database)
+        self.write_observed_batch(batch, false)
     }
 
     fn retained_block_proof(
@@ -1016,9 +1054,9 @@ impl<DB: Database> ChainStore<DB> {
     /// [`Self::put_slashing_evidence`]. Deleting a missing key is a
     /// no-op so restart loops never trip over already-drained items.
     pub fn delete_slashing_evidence(&mut self, key: &Hash) -> Result<(), StoreError<DB::Error>> {
-        self.db
-            .delete(Column::SlashingPool, key)
-            .map_err(StoreError::Database)
+        let mut batch = neutrino_storage::Batch::new();
+        batch.delete(Column::SlashingPool, key);
+        self.write_observed_batch(batch, false)
     }
 
     /// Iterate every persisted slashing-evidence item. Returns

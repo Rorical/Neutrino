@@ -13,6 +13,8 @@ extern crate alloc;
 mod batch;
 mod column;
 mod memory;
+mod statistics;
+pub use statistics::{DATABASE_OPERATIONS, DatabaseStatistics};
 
 #[cfg(feature = "rocksdb")]
 mod rocks;
@@ -38,6 +40,11 @@ pub type ColumnSnapshot = Vec<(Vec<u8>, Vec<u8>)>;
 pub trait Database {
     /// Backend-specific error type.
     type Error;
+
+    /// Obtain bounded backend statistics without scanning records.
+    fn statistics(&self) -> Option<DatabaseStatistics> {
+        None
+    }
 
     /// Reads a value by column and key.
     fn get(&self, column: Column, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;

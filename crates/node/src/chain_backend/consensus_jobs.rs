@@ -45,6 +45,10 @@ where
             .lock()
             .expect("proof task mutex poisoned");
         if running.is_some() {
+            self.metrics
+                .proof_pipeline
+                .chunk_busy
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         let prepared = self.with_live_engine_mut(|engine| {
@@ -78,10 +82,15 @@ where
         let engine = Arc::clone(&self.engine);
         let notify = Arc::clone(&self.consensus_proof_notify);
         let metrics = Arc::clone(&self.metrics);
+        let pending = metrics
+            .proof_pipeline
+            .chunk_backlog
+            .track(prepared.witness.blocks.len());
         let (tx, rx) = oneshot::channel();
         self.spawn_background_job("consensus-proof", async move {
             let result = tokio::task::spawn_blocking(move || {
-                let _permit = budget.acquire(crate::proving_budget::ProvingPriority::Critical);
+                drop(pending);
+                let _permit = budget.acquire(crate::proof_metrics::ProofStage::Chunk);
                 if engine
                     .lock()
                     .expect("engine mutex poisoned")
@@ -90,18 +99,13 @@ where
                 {
                     return Err(ProofError::InvalidWitness);
                 }
-                let started = std::time::Instant::now();
-                let proof = prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness);
-                metrics
+                let proof = metrics
                     .chunk_proofs
-                    .observe(started.elapsed(), proof.is_ok());
-                if let Some((covered, total)) = prover.last_chunk_fact_coverage() {
-                    metrics
-                        .chunk_fact_checks_covered
-                        .store(covered, std::sync::atomic::Ordering::Relaxed);
-                    metrics
-                        .chunk_fact_checks_total
-                        .store(total, std::sync::atomic::Ordering::Relaxed);
+                    .time(|| prover.prove_consensus_chunk(&prepared.proofs, &prepared.witness));
+                if proof.is_ok()
+                    && let Some((covered, total)) = prover.last_chunk_fact_coverage()
+                {
+                    metrics.proof_pipeline.set_fact_coverage(covered, total);
                 }
                 Ok((prepared.witness, proof?))
             })
@@ -183,14 +187,16 @@ where
                     "BFT quorum changed before commit".into(),
                 ));
             }
-            engine
+            let outcome = engine
                 .commit_bft_consensus_chunk(
                     &witness,
                     &proof,
                     self.proof_system.as_ref(),
                     executor.as_deref(),
                 )
-                .map_err(|error| SyncBackendError::Rejected(error.to_string()))
+                .map_err(|error| SyncBackendError::Rejected(error.to_string()))?;
+            self.record_finalized_execution(engine, identity.chunk_id);
+            Ok(outcome)
         });
         match outcome {
             Ok(outcome) => {

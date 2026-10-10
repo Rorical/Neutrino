@@ -66,7 +66,7 @@ pub(crate) async fn run_block_producer<P: ProgramProver + 'static>(
             .block_proof_queue_pending
             .store(jobs.pending() as u64, std::sync::atomic::Ordering::Relaxed);
         metrics
-            .block_proof_queue_running
+            .block_proof_queue_launched
             .store(jobs.running() as u64, std::sync::atomic::Ordering::Relaxed);
         tokio::select! {
             () = cmd_tx.closed() => break,

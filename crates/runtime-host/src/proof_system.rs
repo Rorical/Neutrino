@@ -106,6 +106,13 @@ struct VerifiedBlock {
     output: StfPublicOutput,
 }
 
+/// Host-selected witness, exact attached receipts and unique-request coverage.
+type AttachedFacts = (
+    neutrino_prover_chunk::consensus::ConsensusWitness,
+    Vec<Arc<super::fact_cache::FactReceipt>>,
+    (u64, u64),
+);
+
 /// Adapter that drives an SP1 prover (mock, cpu, cuda, ...) through the
 /// consensus engine's [`ProofSystem`] trait.
 ///
@@ -123,9 +130,8 @@ pub struct Sp1ProofSystem<P: Prover> {
     pub(super) programs: SharedRegistry<P>,
     /// Verified fact receipts per fact program.
     pub(super) facts: Mutex<BTreeMap<VkDigest, super::fact_cache::FactCache>>,
-    /// `(covered << 32) | total` signature checks of the most recent chunk;
-    /// zero until a chunk has been proven.
-    pub(super) last_fact_coverage: std::sync::atomic::AtomicU64,
+    /// Coherent unique-request coverage of the latest successful chunk proof.
+    pub(super) last_fact_coverage: Mutex<Option<(u64, u64)>>,
     /// Serializes cache misses across early and evidence workers. Never an engine lock.
     pub(super) fact_proving: Mutex<()>,
     pub(super) histories: Mutex<VecDeque<super::history_prover::CachedHistory>>,
@@ -164,7 +170,7 @@ where
             },
             programs: SharedRegistry::new(registry),
             facts: Mutex::new(BTreeMap::new()),
-            last_fact_coverage: std::sync::atomic::AtomicU64::new(0),
+            last_fact_coverage: Mutex::new(None),
             fact_proving: Mutex::new(()),
             histories: Mutex::new(VecDeque::new()),
             blocks: Mutex::new(VecDeque::new()),
@@ -636,15 +642,12 @@ where
         Ok(())
     }
 
-    /// `(covered, total)` signature checks of the most recently proven chunk,
+    /// `(covered, total)` unique requests of the latest successful chunk proof,
     /// where `covered` were answered by early fact receipts instead of
     /// in-circuit BLS. `None` before the first chunk proof.
     #[must_use]
     pub fn last_chunk_fact_coverage(&self) -> Option<(u64, u64)> {
-        let packed = self
-            .last_fact_coverage
-            .load(std::sync::atomic::Ordering::Relaxed);
-        (packed != 0).then_some((packed >> 32, packed & 0xFFFF_FFFF))
+        *self.last_fact_coverage.lock().expect("fact coverage mutex")
     }
 
     /// Select cached fact receipts covering this chunk's signature checks.
@@ -658,15 +661,7 @@ where
     fn attach_fact_receipts(
         &self,
         witness: &neutrino_prover_chunk::consensus::ConsensusWitness,
-    ) -> Result<
-        (
-            neutrino_prover_chunk::consensus::ConsensusWitness,
-            Vec<Arc<super::fact_cache::FactReceipt>>,
-        ),
-        ProofError,
-    > {
-        /// Coverage counters are packed into one atomic as two 32-bit halves.
-        const CAP: u64 = 0xFFFF_FFFF;
+    ) -> Result<AttachedFacts, ProofError> {
         let fact_program = witness.context.programs.execution.fact;
         let known = self.with_fact_cache(&fact_program, |cache| cache.verified())?;
         let mut recorder = neutrino_prover_chunk::facts::FactRecorder::with_verified(known);
@@ -678,24 +673,17 @@ where
         }
         let mut wanted: std::collections::BTreeSet<_> =
             requests.iter().map(|(request, _)| request.id()).collect();
-        let total = wanted.len();
+        let requested = wanted.clone();
         let mut receipts =
             self.with_fact_cache(&fact_program, |cache| cache.covering(&mut wanted))?;
         receipts.truncate(neutrino_prover_chunk::consensus::MAX_CONSENSUS_FACT_STATEMENTS);
-        let covered = u64::try_from(total.saturating_sub(wanted.len()))
-            .unwrap_or(CAP)
-            .min(CAP);
-        let total = u64::try_from(total).unwrap_or(CAP).min(CAP);
-        self.last_fact_coverage.store(
-            (covered << 32) | total,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         let mut attached = witness.clone();
         attached.facts = receipts
             .iter()
             .map(|receipt| receipt.statement.clone())
             .collect();
-        Ok((attached, receipts))
+        let coverage = attached_fact_coverage(&requested, &attached.facts);
+        Ok((attached, receipts, coverage))
     }
 
     /// Prove the stronger consensus chunk statement with explicit witnesses.
@@ -736,7 +724,7 @@ where
         // Learn which signature checks this chunk performs, then cover as many
         // as possible with receipts the early fact worker already produced.
         // Anything uncovered is verified in-circuit by the hybrid verifier.
-        let (witness, fact_receipts) = self.attach_fact_receipts(witness)?;
+        let (witness, fact_receipts, coverage) = self.attach_fact_receipts(witness)?;
         let witness = &witness;
         let expected = neutrino_prover_chunk::consensus::validate_consensus(witness)
             .map_err(|_| ProofError::InvalidWitness)?;
@@ -774,7 +762,9 @@ where
         self.prover
             .verify(&proof, &chunk_keys.vk, None)
             .map_err(|_| ProofError::BackendRejected)?;
-        Sp1ChunkProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof)
+        let result = Sp1ChunkProof::from_sp1(&proof).map_err(|_| ProofError::MalformedProof);
+        publish_successful_coverage(&self.last_fact_coverage, coverage, &result);
+        result
     }
 
     /// Verify a consensus chunk proof against a caller-authenticated statement.
@@ -815,3 +805,33 @@ where
         .map_err(|_| ProofError::BackendRejected)
     }
 }
+
+fn attached_fact_coverage(
+    requested: &std::collections::BTreeSet<neutrino_primitives::Hash>,
+    attached: &[neutrino_prover_chunk::facts::FactStatement],
+) -> (u64, u64) {
+    let answered: std::collections::BTreeSet<_> = attached
+        .iter()
+        .flat_map(|statement| &statement.facts)
+        .filter(|fact| fact.valid && requested.contains(&fact.id))
+        .map(|fact| fact.id)
+        .collect();
+    (
+        u64::try_from(answered.len()).unwrap_or(u64::MAX),
+        u64::try_from(requested.len()).unwrap_or(u64::MAX),
+    )
+}
+
+fn publish_successful_coverage<T>(
+    state: &Mutex<Option<(u64, u64)>>,
+    coverage: (u64, u64),
+    result: &Result<T, ProofError>,
+) {
+    if result.is_ok() {
+        *state.lock().expect("fact coverage mutex") = Some(coverage);
+    }
+}
+
+#[cfg(test)]
+#[path = "proof_system_coverage_tests.rs"]
+mod coverage_tests;

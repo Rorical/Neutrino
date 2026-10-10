@@ -1,6 +1,7 @@
 //! Event-driven checkpoint bootstrap, independent of ordinary chunk finality sync.
 
 use super::{OutboundOutcome, SyncDriver};
+use crate::metrics::BootstrapKind;
 use alloc::collections::{BTreeMap, BTreeSet};
 use neutrino_consensus_types::bootstrap::{StateItem, StateItems};
 use neutrino_network::{
@@ -14,7 +15,9 @@ pub(super) struct BootstrapSync {
     peers: BTreeMap<PeerId, Status>,
     failed: BTreeSet<PeerId>,
     manifests: BTreeMap<PeerId, Hash>,
-    active: Option<(PeerId, u64)>,
+    active: Option<(PeerId, u64, BootstrapKind)>,
+    observed_pending: bool,
+    fetching: bool,
     nonce: u64,
 }
 
@@ -22,6 +25,26 @@ pub(super) struct BootstrapSync {
 pub(super) enum Request {
     History { start: Hash, end: Hash },
     State { root: Hash, items: Vec<StateItem> },
+}
+
+impl Request {
+    const fn metric_kind(&self) -> BootstrapKind {
+        match self {
+            Self::History { .. } => BootstrapKind::History,
+            Self::State { .. } => BootstrapKind::State,
+        }
+    }
+}
+
+pub(super) const fn is_syncing(driver: &SyncDriver) -> bool {
+    driver.bootstrap.active.is_some()
+        || driver.bootstrap.observed_pending
+        || driver.bootstrap.fetching
+}
+
+/// Kind of the bootstrap request currently awaiting a response.
+pub(super) fn active_kind(driver: &SyncDriver) -> Option<BootstrapKind> {
+    driver.bootstrap.active.map(|(_, _, kind)| kind)
 }
 
 pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Status) -> bool {
@@ -54,6 +77,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
         .backend
         .bootstrap_state()
         .await
+        .inspect_err(|error| driver.metrics().bootstrap_error(error))
         .ok()
         .flatten()
         .is_some()
@@ -64,6 +88,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
             .any(|status| status.recursive_covered_chunks > local_count);
     if !active {
         if driver.bootstrap.active.is_none() && origin.boundary.next_chunk_id == 0 {
+            driver.bootstrap.fetching = false;
             driver.backend.bootstrap_fetch(false).await;
         }
         return driver.bootstrap.active.is_some() || origin.boundary.next_chunk_id > local_count;
@@ -71,6 +96,7 @@ pub(super) async fn on_status(driver: &mut SyncDriver, peer: PeerId, status: Sta
     drive(driver).await;
     // An archive can replay sources when the bounded manifest is unavailable.
     if can_replay_from_genesis(driver).await {
+        driver.bootstrap.fetching = false;
         driver.backend.bootstrap_fetch(false).await;
         return false;
     }
@@ -83,6 +109,7 @@ async fn can_replay_from_genesis(driver: &SyncDriver) -> bool {
             .backend
             .bootstrap_state()
             .await
+            .inspect_err(|error| driver.metrics().bootstrap_error(error))
             .ok()
             .flatten()
             .is_none()
@@ -100,6 +127,7 @@ async fn resume_source_replay(driver: &mut SyncDriver) {
     if !can_replay_from_genesis(driver).await {
         return;
     }
+    driver.bootstrap.fetching = false;
     driver.backend.bootstrap_fetch(false).await;
     if let Some((&peer, &status)) = driver
         .bootstrap
@@ -119,12 +147,11 @@ pub(super) async fn on_disconnect(driver: &mut SyncDriver, peer: PeerId) {
     driver.bootstrap.peers.remove(&peer);
     driver.bootstrap.failed.remove(&peer);
     driver.bootstrap.manifests.remove(&peer);
-    if driver
-        .bootstrap
-        .active
-        .is_some_and(|(owner, _)| owner == peer)
+    if let Some((owner, _, kind)) = driver.bootstrap.active
+        && owner == peer
     {
         driver.bootstrap.active = None;
+        driver.metrics().bootstrap_cancelled(kind);
     }
     drive(driver).await;
     resume_source_replay(driver).await;
@@ -157,10 +184,16 @@ async fn drive(driver: &mut SyncDriver) {
     let pending = match driver.backend.bootstrap_state().await {
         Ok(pending) => pending,
         Err(error) => {
+            driver.bootstrap.fetching = true;
+            driver.metrics().bootstrap_error(&error);
             tracing::warn!(%error,"cannot restore state bootstrap progress");
             return;
         }
     };
+    driver.bootstrap.observed_pending = pending.is_some();
+    driver
+        .metrics()
+        .bootstrap_pending(pending.as_ref().map_or(0, |(_, items)| items.len()));
     let origin_count = origin.boundary.next_chunk_id;
     let origin_hash = origin.hash();
     let provider = driver
@@ -195,6 +228,9 @@ async fn drive(driver: &mut SyncDriver) {
         }
         None => return,
     };
+    driver
+        .metrics()
+        .bootstrap_target(status.recursive_covered_chunks);
     let request = if use_manifest {
         driver
             .bootstrap
@@ -208,7 +244,12 @@ async fn drive(driver: &mut SyncDriver) {
         let (root, items) = pending.expect("snapshot selected only while pending");
         Request::State { root, items }
     };
+    send_request(driver, peer, request).await;
+}
+
+async fn send_request(driver: &mut SyncDriver, peer: PeerId, request: Request) {
     if matches!(request, Request::History { .. }) {
+        driver.bootstrap.fetching = true;
         driver.backend.bootstrap_fetch(true).await;
     }
     let rpc = match &request {
@@ -233,7 +274,9 @@ async fn drive(driver: &mut SyncDriver) {
         return;
     };
     driver.bootstrap.nonce = nonce;
-    driver.bootstrap.active = Some((peer, nonce));
+    let kind = request.metric_kind();
+    driver.bootstrap.active = Some((peer, nonce, kind));
+    driver.metrics().bootstrap_request(kind);
     let sent = driver
         .send_rpc(peer, rpc, move |peer, response| {
             OutboundOutcome::Bootstrap {
@@ -246,6 +289,7 @@ async fn drive(driver: &mut SyncDriver) {
         .await;
     if !sent {
         driver.bootstrap.active = None;
+        driver.metrics().bootstrap_transport_error(kind);
     }
 }
 
@@ -256,10 +300,20 @@ pub(super) async fn on_response(
     request: Request,
     response: Result<RpcResponse, neutrino_network::rpc::RpcError>,
 ) {
-    if driver.bootstrap.active != Some((peer, nonce)) || !driver.connected_peers.contains(&peer) {
+    if !matches!(driver.bootstrap.active, Some((owner, active, _)) if owner == peer && active == nonce)
+        || !driver.connected_peers.contains(&peer)
+    {
         return;
     }
     driver.bootstrap.active = None;
+    let kind = request.metric_kind();
+    let transport_failed = response
+        .as_ref()
+        .is_err_and(neutrino_network::rpc::RpcError::is_transport);
+    let state_entries = match &response {
+        Ok(RpcResponse::StateByRoot(payload)) => payload.entries.len(),
+        _ => 0,
+    };
     let result = match (request, response) {
         (Request::History { start, end }, Ok(RpcResponse::HistoryProofByRange(payload))) => {
             if payload.proof.statement.end_checkpoint().hash() != end {
@@ -298,8 +352,21 @@ pub(super) async fn on_response(
             "bootstrap response unavailable: {other:?}"
         ))),
     };
+    if transport_failed {
+        driver.metrics().bootstrap_transport_error(kind);
+    } else {
+        driver.metrics().bootstrap_result(kind, &result);
+    }
+    if let Ok(progress) = &result {
+        driver.bootstrap.observed_pending = !progress.root_complete;
+        driver
+            .metrics()
+            .bootstrap_pending(progress.next_items.len());
+        driver.metrics().bootstrap_state_entries(state_entries);
+    }
     match result {
         Ok(progress) if progress.root_complete => {
+            driver.metrics().bootstrap_installed();
             driver.bootstrap = BootstrapSync {
                 nonce: driver.bootstrap.nonce,
                 ..BootstrapSync::default()

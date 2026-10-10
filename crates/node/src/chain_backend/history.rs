@@ -109,6 +109,42 @@ where
         .collect()
 }
 
+fn refresh_history_metrics<DB: Database>(engine: &Engine<DB>, metrics: &crate::metrics::NodeMetrics)
+where
+    DB::Error: core::fmt::Debug + core::fmt::Display,
+{
+    let pipeline = &metrics.proof_pipeline;
+    let snapshot = jobs(engine).and_then(|records| {
+        engine
+            .store()
+            .pinned_history_source_chunks()
+            .map(|pinned| (records, pinned))
+            .map_err(|error| error.to_string())
+    });
+    match snapshot {
+        Ok((records, pinned)) => {
+            pipeline.history_queued.store(
+                u64::try_from(records.iter().filter(|job| job.state == 0).count())
+                    .unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            pipeline.history_running.store(
+                u64::try_from(records.iter().filter(|job| job.state == 1).count())
+                    .unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            pipeline
+                .history_pinned_chunks
+                .store(pinned, Ordering::Relaxed);
+            pipeline.history_available.store(1, Ordering::Relaxed);
+        }
+        Err(error) => {
+            pipeline.history_available.store(0, Ordering::Relaxed);
+            tracing::warn!(%error, "history queue metrics unavailable");
+        }
+    }
+}
+
 fn save<DB: Database>(engine: &mut Engine<DB>, job: &Job) -> Result<(), String>
 where
     DB::Error: core::fmt::Debug + core::fmt::Display,
@@ -275,6 +311,7 @@ where
                 .map_err(|error| error.to_string())?;
         }
         self.history.initialized.store(true, Ordering::Release);
+        self.with_engine(|engine| refresh_history_metrics(engine, &self.metrics));
         Ok(())
     }
 
@@ -336,7 +373,9 @@ where
             let (cancelled, running) = self.with_engine_mut(|engine| {
                 self.history.paused.store(true, Ordering::Release);
                 let running = self.history.running.load(Ordering::Acquire);
-                cancel_bootstrap_jobs(engine, !running).map(|jobs| (jobs, running))
+                let result = cancel_bootstrap_jobs(engine, !running).map(|jobs| (jobs, running));
+                refresh_history_metrics(engine, &self.metrics);
+                result
             })?;
             for job in cancelled {
                 self.history.publish(&job);
@@ -390,7 +429,17 @@ where
             {
                 return Err(QueryError::HistoryUnavailable);
             }
-            admit(
+            if jobs(engine)
+                .map_err(query_error)?
+                .iter()
+                .any(|job| job.id() == range.range_id() && job.state < 2)
+            {
+                self.metrics
+                    .proof_pipeline
+                    .history_coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let result = admit(
                 engine,
                 Job {
                     range,
@@ -403,7 +452,9 @@ where
                     retry_after: 0,
                 },
             )
-            .map_err(query_error)
+            .map_err(query_error);
+            refresh_history_metrics(engine, &self.metrics);
+            result
         })?;
         self.start_history_jobs();
         Ok(job.info())
@@ -458,11 +509,13 @@ where
     async fn run(self) {
         let recovered = {
             let mut engine = self.engine.lock().expect("engine");
-            if self.state.paused.load(Ordering::Acquire) {
+            let result = if self.state.paused.load(Ordering::Acquire) {
                 cancel_bootstrap_jobs(&mut engine, true)
             } else {
                 recover_jobs(&mut engine)
-            }
+            };
+            refresh_history_metrics(&engine, &self.metrics);
+            result
         };
         match recovered {
             Ok(records) => {
@@ -519,6 +572,7 @@ where
                 return None;
             }
         };
+        refresh_history_metrics(&engine, &self.metrics);
         let mut job = records
             .into_iter()
             .filter(|job| job.state == 0 && job.retry_after <= now())
@@ -526,6 +580,7 @@ where
         job.state = 1;
         job.attempts = job.attempts.saturating_add(1);
         let saved = save(&mut engine, &job);
+        refresh_history_metrics(&engine, &self.metrics);
         if saved.is_ok() {
             self.state.running.store(true, Ordering::Release);
         }
@@ -648,7 +703,13 @@ where
             job.state = 0;
             job.retry_after = now().saturating_add(60 * u64::from(job.attempts));
         }
-        let saved = save(&mut self.engine.lock().expect("engine"), &job);
+        let saved = {
+            let mut engine = self.engine.lock().expect("engine");
+            let result = save(&mut engine, &job);
+            refresh_history_metrics(&engine, &self.metrics);
+            drop(engine);
+            result
+        };
         if let Err(error) = saved {
             job.state = 3;
             job.error = Some(bounded_error(&error));
@@ -731,7 +792,11 @@ where
             return Err("history worker returned another range".into());
         }
         job.progress = Some(proof.statement.range_id());
-        save(&mut engine.lock().expect("engine"), &job)?;
+        {
+            let mut engine = engine.lock().expect("engine");
+            save(&mut engine, &job)?;
+            refresh_history_metrics(&engine, metrics);
+        }
         return Ok(job);
     }
     worker.fold_forward(job, previous)
@@ -845,16 +910,15 @@ where
             .map_err(|error| error.to_string())?;
         let _permit = self
             .budget
-            .acquire(crate::proving_budget::ProvingPriority::Background);
+            .acquire(crate::proof_metrics::ProofStage::HistoryFold);
         self.check_pause()?;
-        let started = std::time::Instant::now();
-        let proof = self
-            .prover
-            .prove_history_fold(&self.spec, previous, &chunks);
         self.metrics
             .history_folds
-            .observe(started.elapsed(), proof.is_ok());
-        proof.map_err(|error| error.to_string())
+            .time(|| {
+                self.prover
+                    .prove_history_fold(&self.spec, previous, &chunks)
+            })
+            .map_err(|error| error.to_string())
     }
 
     fn fold_forward(
@@ -904,6 +968,7 @@ where
                     .map_err(|error| error.to_string())?;
                 job.progress = Some(proof.statement.range_id());
                 save(&mut engine, &job)?;
+                refresh_history_metrics(&engine, self.metrics);
                 drop(engine);
             }
             previous = Some(proof);
@@ -953,14 +1018,12 @@ where
             let (left, right) = self.prove_halves(start, split, end, parallel)?;
             let _permit = self
                 .budget
-                .acquire(crate::proving_budget::ProvingPriority::Background);
+                .acquire(crate::proof_metrics::ProofStage::HistoryMerge);
             self.check_pause()?;
-            let started = std::time::Instant::now();
-            let proof = self.prover.prove_history_merge(&self.spec, &left, &right);
             self.metrics
                 .history_merges
-                .observe(started.elapsed(), proof.is_ok());
-            proof.map_err(|error| error.to_string())?
+                .time(|| self.prover.prove_history_merge(&self.spec, &left, &right))
+                .map_err(|error| error.to_string())?
         };
         let proof = verified.proof().clone();
         if proof.statement.chain != self.range.chain

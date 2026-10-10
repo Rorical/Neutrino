@@ -205,8 +205,7 @@ where
                         );
                         engine
                             .store_mut()
-                            .db_mut()
-                            .write_batch_durable(discard)
+                            .write_observed_batch(discard, true)
                             .map_err(p2p_queries::storage_error)?;
                         return Err(SyncBackendError::Rejected(
                             "state object content hash mismatch".into(),
@@ -231,8 +230,7 @@ where
             );
             engine
                 .store_mut()
-                .db_mut()
-                .write_batch_durable(batch)
+                .write_observed_batch(batch, true)
                 .map_err(p2p_queries::storage_error)?;
             Ok(StateProgress {
                 root_complete: download.pending.is_empty(),
@@ -310,8 +308,7 @@ where
             batch.delete(Column::Meta, DOWNLOAD_KEY);
             engine
                 .store_mut()
-                .db_mut()
-                .write_batch_durable(batch)
+                .write_observed_batch(batch, true)
                 .map_err(p2p_queries::storage_error)
         })
     }

@@ -93,10 +93,7 @@ const DEFAULT_BODY_TX_BUDGET_BYTES: usize = 256 * 1024;
 const SLASHING_POOL_MAX_ENTRIES: usize = 1024;
 
 /// Fact pre-proving requests queued for one fact program.
-type FactJobSender = mpsc::Sender<(
-    neutrino_consensus_types::history_proof::VkDigest,
-    Vec<neutrino_prover_chunk::facts::FactRequest>,
-)>;
+type FactJobSender = mpsc::Sender<facts::FactJob>;
 
 /// `SyncBackend` backed by a [`ChainStore`] + a [`ProofSystem`].
 ///
@@ -134,6 +131,9 @@ pub struct ChainBackend<DB: Database, P: ProofSystem> {
     sync_status: Mutex<Option<SyncStatus>>,
     /// Proving counters and latencies exported by the metrics endpoint.
     metrics: Arc<crate::metrics::NodeMetrics>,
+    rpc_metrics: Arc<neutrino_rpc::metrics::RpcMetrics>,
+    network_metrics: Mutex<Option<Arc<neutrino_network::metrics::NetworkMetrics>>>,
+    process_metrics: Mutex<crate::process_metrics::ProcessSampler>,
     /// Stalled-prover backpressure policy from `[proving]`.
     backlog_policy: Mutex<crate::config::BacklogPolicy>,
     /// Whether the last check found the history lag over its limit.
@@ -267,6 +267,7 @@ where
                 Vec::new()
             });
         slashing_pool.load_from_disk(persisted);
+        let metrics = Arc::new(crate::metrics::NodeMetrics::default());
         Self {
             engine: Arc::new(Mutex::new(engine)),
             fact_jobs: Mutex::new(None),
@@ -277,7 +278,10 @@ where
             evidence_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             evidence_job_cursor: std::sync::atomic::AtomicUsize::new(0),
             proof_system: Arc::new(proof_system),
-            proving_budget: Arc::new(crate::proving_budget::ProvingBudget::new(2)),
+            proving_budget: Arc::new(crate::proving_budget::ProvingBudget::with_metrics(
+                2,
+                Arc::clone(&metrics),
+            )),
             consensus_proof_task: Mutex::new(None),
             consensus_proof_notify: Arc::new(tokio::sync::Notify::new()),
             last_candidate_notice: Mutex::new(None),
@@ -286,7 +290,10 @@ where
             mempool: Mutex::new(Mempool::new(DEFAULT_MEMPOOL_CAPACITY_BYTES)),
             network_publisher: Mutex::new(None),
             sync_status: Mutex::new(None),
-            metrics: Arc::new(crate::metrics::NodeMetrics::default()),
+            metrics,
+            rpc_metrics: Arc::default(),
+            network_metrics: Mutex::new(None),
+            process_metrics: Mutex::default(),
             backlog_policy: Mutex::new(crate::config::BacklogPolicy::default()),
             history_lag_exceeded: std::sync::atomic::AtomicBool::new(false),
             local_voter: Mutex::new(None),
@@ -386,7 +393,9 @@ where
         *self
             .block_executor
             .lock()
-            .expect("ChainBackend block_executor poisoned") = Some(Arc::new(executor));
+            .expect("ChainBackend block_executor poisoned") = Some(Arc::new(
+            crate::execution_metrics::MeteredExecutor::new(executor, Arc::clone(&self.metrics)),
+        ));
     }
 
     /// Diagnostic: does the engine's in-memory state trie agree
@@ -476,6 +485,73 @@ where
     #[must_use]
     pub const fn metrics(&self) -> &Arc<crate::metrics::NodeMetrics> {
         &self.metrics
+    }
+
+    /// Record finality while the successful commit still holds the engine lock.
+    /// The commit order makes constant-size highest-ID deduplication safe;
+    /// bootstrap prefix data is not inferred.
+    fn record_finalized_execution(&self, engine: &Engine<DB>, chunk_id: u64) {
+        let mut observed = self
+            .metrics
+            .execution
+            .observed_finalized
+            .lock()
+            .expect("finalized execution metrics");
+        if observed.is_some_and(|previous| previous >= chunk_id) {
+            return;
+        }
+        self.metrics.execution.finalized(chunk_id);
+        let result = (|| {
+            let chunk = engine.store().get_chunk(chunk_id).ok().flatten()?;
+            let mut transactions = 0_u64;
+            let mut gas = 0_u64;
+            for height in chunk.start_height..=chunk.end_height {
+                let header = engine.store().get_header_by_height(height).ok().flatten()?;
+                let body = engine.store().get_body(&header.hash()).ok().flatten()?;
+                transactions =
+                    transactions.checked_add(u64::try_from(body.transactions.len()).ok()?)?;
+                gas = gas.checked_add(header.gas_used)?;
+            }
+            Some((transactions, gas))
+        })();
+        let metrics = &self.metrics.execution;
+        match result {
+            Some((transactions, gas)) => {
+                metrics
+                    .finalized_transactions
+                    .fetch_add(transactions, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .finalized_gas
+                    .fetch_add(gas, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .finalized_chunks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => {
+                metrics
+                    .finalized_observation_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        *observed = Some(chunk_id);
+    }
+
+    pub(crate) fn rpc_metrics(&self) -> Arc<neutrino_rpc::metrics::RpcMetrics> {
+        Arc::clone(&self.rpc_metrics)
+    }
+
+    pub(crate) fn set_network_metrics(
+        &self,
+        metrics: Arc<neutrino_network::metrics::NetworkMetrics>,
+    ) {
+        *self.network_metrics.lock().expect("network metrics") = Some(metrics);
+    }
+
+    pub(crate) fn set_metrics_data_path(&self, path: std::path::PathBuf) {
+        self.process_metrics
+            .lock()
+            .expect("process metrics")
+            .set_path(path);
     }
 
     /// Install the stalled-prover backpressure policy.
@@ -709,7 +785,7 @@ where
             if pool.evidence.len() >= SLASHING_POOL_MAX_ENTRIES {
                 batch.delete(Column::SlashingPool, pool.evidence[0].0);
             }
-            match engine.store_mut().db_mut().write_batch_durable(batch) {
+            match engine.store_mut().write_observed_batch(batch, true) {
                 Ok(()) => true,
                 Err(error) => {
                     warn!(
@@ -722,6 +798,16 @@ where
             }
         });
         if installed {
+            self.metrics
+                .reporter
+                .detected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if pool.evidence.len() >= SLASHING_POOL_MAX_ENTRIES {
+                self.metrics
+                    .reporter
+                    .pool_evictions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             pool.load_from_disk(vec![(key, evidence.clone())]);
         }
         installed
@@ -948,6 +1034,12 @@ where
     /// one at startup, but tests that exercise gossip without a
     /// running runtime intentionally leave it unset.
     pub fn submit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
+        let result = self.admit_transaction(bytes);
+        self.metrics.execution.admission(&result);
+        result
+    }
+
+    fn admit_transaction(&self, bytes: Vec<u8>) -> Result<Hash, InsertError> {
         // Capture chain_id + gas_limit + state snapshot
         // under the engine mutex so the executor sees a consistent
         // view. The mempool itself takes its own lock below;
@@ -1057,13 +1149,11 @@ where
         })?;
         let permit = self
             .proving_budget
-            .acquire(crate::proving_budget::ProvingPriority::Critical);
-        let started = std::time::Instant::now();
-        let completed = job.prove(self.proof_system.as_ref());
-        self.metrics
+            .acquire(crate::proof_metrics::ProofStage::Block);
+        let completed = self
+            .metrics
             .block_proofs
-            .observe(started.elapsed(), completed.is_ok());
-        let completed = completed?;
+            .time(|| job.prove(self.proof_system.as_ref()))?;
         drop(permit);
         self.with_engine_mut(|e| {
             if self.bootstrap_pending() {
@@ -1180,7 +1270,9 @@ where
                     neutrino_proof_system::ProofError::BackendRejected,
                 ));
             }
-            e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter)
+            let outcome = e.finalize_chunk(chunk_id, self.proof_system.as_ref(), voter)?;
+            self.record_finalized_execution(e, chunk_id);
+            Ok(outcome)
         })?;
         self.refresh_reporter_tracking();
         self.start_history_jobs();
@@ -1379,8 +1471,7 @@ where
             }
             engine
                 .store_mut()
-                .db_mut()
-                .write_batch_durable(batch)
+                .write_observed_batch(batch, true)
                 .map_err(p2p_queries::storage_error)?;
             if engine.head_state_root() == root {
                 engine.replace_state_with_reconstructed(state);
@@ -1479,6 +1570,7 @@ where
                 return;
             }
         };
+        self.metrics.execution.opened(chunk_id);
         self.handle_bft_actions(actions).await;
         self.retry_deferred_bft_votes().await;
     }
@@ -1557,6 +1649,7 @@ where
     /// chunk-finalisation triggers.
     async fn handle_bft_actions(&self, actions: Vec<BftAction>) {
         for action in actions {
+            self.metrics.execution.action(&action);
             match action {
                 BftAction::BroadcastPrevote(vote) => {
                     self.publish_finality_vote(Topic::FinalityVotesPrevote, &vote)
@@ -1659,6 +1752,7 @@ where
                 return;
             }
         };
+        self.metrics.execution.timeout_actions(actions.len());
         if !actions.is_empty() {
             self.handle_bft_actions(actions).await;
             self.retry_deferred_bft_votes().await;
@@ -1998,8 +2092,11 @@ where
         &self,
         proof: HistoryProof,
     ) -> Result<CheckpointsImported, SyncBackendError> {
+        let metric_timer = self.metrics.execution.history_verification.timer();
         if self.light_checkpoint().is_some() {
-            return self.accept_light_history(proof).await;
+            let result = self.accept_light_history(proof).await;
+            metric_timer.finish(result.is_ok());
+            return result;
         }
         let statement = proof.statement;
         let (spec, trusted_start) = self
@@ -2027,6 +2124,7 @@ where
                 .map_err(|error| SyncBackendError::Rejected(error.to_string()))
         })?;
         self.start_history_jobs();
+        metric_timer.finish(true);
         Ok(CheckpointsImported {
             new_finalized_index: statement.end.next_chunk_id,
             new_finalized_hash: statement.end_checkpoint().hash(),
@@ -2040,6 +2138,7 @@ where
         &self,
         blocks: Vec<Block>,
     ) -> Result<HeadersImported, SyncBackendError> {
+        let metric_timer = self.metrics.execution.block_imports.timer();
         if self.bootstrap_pending() {
             return Err(SyncBackendError::NotAvailable(
                 "checkpoint state is downloading".into(),
@@ -2083,7 +2182,9 @@ where
                 new_head_slot: outcome.new_head_slot,
             });
         }
-        last.ok_or_else(|| SyncBackendError::Rejected("empty block batch".to_owned()))
+        let result = last.ok_or_else(|| SyncBackendError::Rejected("empty block batch".to_owned()));
+        metric_timer.finish(result.is_ok());
+        result
     }
 
     async fn import_state_nodes(
@@ -2122,6 +2223,7 @@ where
         start: Height,
         proofs: Vec<BlockProof>,
     ) -> Result<ProofsImported, SyncBackendError> {
+        let metric_timer = self.metrics.execution.block_verification.timer();
         if self.light_checkpoint().is_some() {
             return Err(SyncBackendError::NotAvailable("proof-only node".into()));
         }
@@ -2174,6 +2276,7 @@ where
             self.maybe_open_bft_session_for_height(height).await;
         }
 
+        metric_timer.finish(true);
         Ok(ProofsImported { new_proven_height })
     }
 
@@ -2181,6 +2284,7 @@ where
         &self,
         block: Block,
     ) -> Result<HeadersImported, SyncBackendError> {
+        let metric_timer = self.metrics.execution.block_imports.timer();
         if self.bootstrap_pending() {
             return Err(SyncBackendError::NotAvailable(
                 "checkpoint state is downloading".into(),
@@ -2241,6 +2345,7 @@ where
         self.queue_header_facts(&block.header);
         self.forget_mined_transactions(&block.body.transactions);
         self.absorb_programs(&block.body.programs);
+        metric_timer.finish(true);
         Ok(HeadersImported {
             new_head_height: outcome.new_head_height,
             new_head_hash: outcome.block_hash,
@@ -2262,6 +2367,7 @@ where
         &self,
         proof: ChunkProof,
     ) -> Result<ChunkProofImported, SyncBackendError> {
+        let metric_timer = self.metrics.execution.chunk_verification.timer();
         if self.light_checkpoint().is_some() {
             return Err(SyncBackendError::NotAvailable("proof-only node".into()));
         }
@@ -2309,7 +2415,8 @@ where
         let chunk_id = proof.chunk_id;
         let executor = self.block_executor_snapshot();
         let outcome = self.with_live_engine_mut(|engine| {
-            match executor.as_ref() {
+            let previous = engine.finalized_next_chunk_id();
+            let outcome = match executor.as_ref() {
                 Some(executor) => engine.import_chunk_proof_with_dry_run(
                     &proof,
                     self.proof_system.as_ref(),
@@ -2317,7 +2424,11 @@ where
                 ),
                 None => engine.import_chunk_proof(&proof, self.proof_system.as_ref()),
             }
-            .map_err(Self::map_import_err)
+            .map_err(Self::map_import_err)?;
+            if engine.finalized_next_chunk_id() > previous {
+                self.record_finalized_execution(engine, chunk_id);
+            }
+            Ok(outcome)
         })?;
         self.refresh_reporter_tracking();
         if self.block_program().is_some() {
@@ -2343,6 +2454,7 @@ where
             end_height = outcome.end_height,
             "persisted gossipped chunk proof"
         );
+        metric_timer.finish(true);
         Ok(ChunkProofImported {
             chunk_id: outcome.chunk_id,
             end_height: outcome.end_height,

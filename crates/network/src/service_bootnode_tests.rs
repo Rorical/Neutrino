@@ -157,6 +157,8 @@ async fn another_established_connection_prevents_a_false_peer_disconnected_event
     node.service.configure_bootnodes(vec![target]).unwrap();
     let connection = ConnectionId::new_unchecked(1);
     node.service.bootnodes.connected(peer, connection, &address);
+    node.service.metrics.connected(true, true);
+    node.service.metrics.connected(true, false);
     for remaining in [1, 0] {
         node.service
             .handle_swarm_event(SwarmEvent::ConnectionClosed {
@@ -205,6 +207,13 @@ async fn asynchronous_dial_failure_releases_only_its_configured_attempt() {
     .await
     .expect("offline TCP endpoint reports asynchronous failure");
     assert!(node.service.bootnodes.next_deadline().unwrap() > tokio::time::Instant::now());
+    node.service.publish_bootnode_metrics();
+    let mut body = String::new();
+    node.service.metrics().render(&mut body);
+    assert!(body.contains("neutrino_bootnode_dial_attempts_total 1"));
+    assert!(body.contains("neutrino_bootnode_dial_failures_total{reason=\"transport\"} 1"));
+    assert!(body.contains("neutrino_bootnodes{state=\"pending\"} 0"));
+    assert!(body.contains("neutrino_bootnodes{state=\"backoff\"} 1"));
 }
 
 #[tokio::test]

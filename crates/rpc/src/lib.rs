@@ -43,6 +43,7 @@ pub enum RpcNamespace {
 
 pub mod backend;
 pub mod history;
+pub mod metrics;
 pub mod server;
 pub mod types;
 
@@ -51,7 +52,10 @@ pub use backend::{
     RuntimeCallResponse, SubmitError,
 };
 pub use history::{HistoryJobInfo, HistoryJobStatus};
-pub use server::{RpcConfig, RpcContext, RpcStartError, build_module, build_module_with, serve};
+pub use server::{
+    RpcConfig, RpcContext, RpcStartError, build_module, build_module_with, serve,
+    serve_with_metrics,
+};
 pub use types::{
     ArtifactProgressJson, BlockIdJson, BlockJson, BodyJson, BytesHex, FinalizedInfoJson, HashHex,
     HeadInfoJson, HeaderJson, HealthJson, InstalledGuestJson, PersistedArtifactJson,

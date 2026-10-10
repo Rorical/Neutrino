@@ -4,6 +4,7 @@
 //! SP1 block guest independently verifies those receipts through recursion.
 //! This module checks statement bindings and owns all state mutations.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::evidence::{
@@ -12,9 +13,11 @@ use neutrino_consensus_types::evidence::{
 use neutrino_primitives::{BlsPublicKey, Hash, Validator};
 use neutrino_runtime_core::StateBackend;
 
-use crate::{
-    Address, GAS_SANCTION, Receipt, ReceiptStatus, StfInput, Transaction, apply_deduction,
+use crate::staking::apply_deduction;
+use crate::state::{
+    BASIS_POINTS, load_account, prefixed_key, read_canonical, store_account, write_record,
 };
+use crate::{Address, GAS_SANCTION, Receipt, ReceiptStatus, RuntimePolicy, StfInput, Transaction};
 
 /// Runtime-owned durable totals of actual mandatory transfers.
 pub mod settlement;
@@ -25,6 +28,11 @@ pub const QUEUE_KEY: &[u8] = b"accountability:queue:v1";
 pub const GAS_EVIDENCE_ADMISSION: u64 = 10_000;
 /// Absolute allocation bound, independent of a hostile claimed policy.
 pub const MAX_PENDING: u32 = 4096;
+/// Receipt kind of a mandatory sanction execution. The value is committed by
+/// the receipts root; it coincides with the transaction kind code of
+/// `ProposeUpgrade`, but mandatory receipts always precede the transaction
+/// receipts.
+pub(crate) const SANCTION_RECEIPT_KIND: u8 = 8;
 
 /// Minimal proven sanction consumed by chunk validator rotation.
 #[derive(Clone, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
@@ -42,10 +50,7 @@ impl Sanction {
     /// sanctions, the per-offence status key for liveness sanctions.
     #[must_use]
     pub fn marker_key(&self) -> Vec<u8> {
-        match self.kind {
-            SanctionKind::Slash => slashed_key(&self.offender.pubkey),
-            SanctionKind::Inactivity => offence_key(&self.offence_id),
-        }
+        replay_marker(self.kind, &self.offender.pubkey, &self.offence_id)
     }
 }
 
@@ -80,12 +85,10 @@ pub struct AccountabilityOutput {
 /// Status key rejecting duplicate or re-encoded liveness offences while
 /// admissible.
 ///
-/// It is swept through the [`expiry_key`] bucket of its admitting height
+/// It is swept through the `expiry_key` bucket of its admitting height
 /// once the unbonding delay has passed.
 pub fn offence_key(id: &Hash) -> Vec<u8> {
-    let mut key = Vec::from(&b"accountability:event:v1:"[..]);
-    key.extend_from_slice(id);
-    key
+    prefixed_key(b"accountability:event:v1:", id)
 }
 
 /// Tombstone of a BLS identity whose safety sanction has been admitted.
@@ -98,17 +101,25 @@ pub fn offence_key(id: &Hash) -> Vec<u8> {
 /// identities that were accountable inside one unbonding delay rather than
 /// by how many offences they signed inside the long safety window.
 pub fn slashed_key(pubkey: &BlsPublicKey) -> Vec<u8> {
-    let mut key = Vec::from(&b"accountability:slashed:v1:"[..]);
-    key.extend_from_slice(pubkey);
-    key
+    prefixed_key(b"accountability:slashed:v1:", pubkey)
 }
 
 /// Replay marker a statement must not find in state to be admissible.
 #[must_use]
 pub fn marker_key(statement: &EvidenceStatement) -> Vec<u8> {
-    match statement.kind {
-        SanctionKind::Slash => slashed_key(&statement.offender.pubkey),
-        SanctionKind::Inactivity => offence_key(&statement.offence_id),
+    replay_marker(
+        statement.kind,
+        &statement.offender.pubkey,
+        &statement.offence_id,
+    )
+}
+
+/// Safety offences mark the offender's identity; liveness offences mark the
+/// offence itself.
+fn replay_marker(kind: SanctionKind, pubkey: &BlsPublicKey, offence_id: &Hash) -> Vec<u8> {
+    match kind {
+        SanctionKind::Slash => slashed_key(pubkey),
+        SanctionKind::Inactivity => offence_key(offence_id),
     }
 }
 
@@ -122,10 +133,8 @@ pub fn marker_key(statement: &EvidenceStatement) -> Vec<u8> {
 /// window and consensus never seats a slashed identity again, so the
 /// tombstone is permanent and the live set is bounded by the identities ever
 /// sanctioned.
-pub fn expiry_key(height: u64) -> Vec<u8> {
-    let mut key = Vec::from(&b"accountability:expiry:v1:"[..]);
-    key.extend_from_slice(&height.to_be_bytes());
-    key
+pub(crate) fn expiry_key(height: u64) -> Vec<u8> {
+    prefixed_key(b"accountability:expiry:v1:", &height.to_be_bytes())
 }
 
 /// Delete the markers admitted one unbonding delay before this block.
@@ -139,10 +148,9 @@ fn sweep_expired_markers<B: StateBackend>(state: &mut B, height: u64, retention:
     else {
         return;
     };
-    let Some(bytes) = state.read(&expiry_key(expired)) else {
+    let Some(keys) = read_canonical::<Vec<Vec<u8>>, _>(state, &expiry_key(expired)) else {
         return;
     };
-    let keys: Vec<Vec<u8>> = borsh::from_slice(&bytes).expect("canonical expiry bucket");
     for key in &keys {
         state.delete(key);
     }
@@ -160,17 +168,25 @@ fn record_expiry_bucket<B: StateBackend>(state: &mut B, height: u64, admitted: &
     if keys.is_empty() {
         return;
     }
-    state.write(
-        &expiry_key(height),
-        borsh::to_vec(&keys).expect("canonical expiry bucket"),
-    );
+    write_record(state, &expiry_key(height), &keys);
 }
 
 /// Read the bounded queue. Malformed authenticated state fails closed.
-pub fn load_queue<B: StateBackend>(state: &mut B) -> Vec<PendingSanction> {
-    state.read(QUEUE_KEY).map_or_else(Vec::new, |bytes| {
-        borsh::from_slice(&bytes).expect("canonical sanction queue")
-    })
+pub(crate) fn load_queue<B: StateBackend>(state: &mut B) -> Vec<PendingSanction> {
+    read_canonical(state, QUEUE_KEY).unwrap_or_default()
+}
+
+/// Bytes already in canonical borsh form.
+///
+/// Borsh decoding of the queue is strict (exact length, canonical `bool`,
+/// `Option` and enum tags), so the stored bytes of a decoded queue are its
+/// encoding and commit without a re-encoding round trip.
+struct Encoded<'a>(&'a [u8]);
+
+impl BorshSerialize for Encoded<'_> {
+    fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        writer.write_all(self.0)
+    }
 }
 
 /// Check input shape before any writes; receipt authenticity is an outer-shell
@@ -221,12 +237,11 @@ impl ValidatedInput<'_> {
     }
 }
 
-/// Load the governed policy and check the block's admissions against it.
+/// Check the block's admissions against the governed policy.
 ///
 /// The policy is authenticated state; the anchor supplies the genesis-fixed
 /// facts it must respect.
-fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::RuntimePolicy {
-    let policy = crate::load_runtime_policy(state);
+fn check_policy(input: &StfInput, policy: &RuntimePolicy) {
     assert!(
         policy.is_valid_for(&input.evidence_anchor),
         "invalid accountability policy"
@@ -248,26 +263,29 @@ fn checked_policy<B: StateBackend>(input: &StfInput, state: &mut B) -> crate::Ru
         admissions <= policy.evidence_admissions_per_block,
         "evidence admission cap"
     );
-    policy
 }
 
 /// Validate every admission and its replay key before any state mutates.
+///
+/// A safety claim duplicates an earlier safety admission of the same
+/// identity; a liveness claim duplicates an earlier admission, of either
+/// kind, with the same offence id.
 fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<Sanction> {
     let mut admitted = Vec::new();
+    let mut slashed_identities: BTreeSet<BlsPublicKey> = BTreeSet::new();
+    let mut offence_ids: BTreeSet<Hash> = BTreeSet::new();
     for tx in &input.transactions {
         let Transaction::SubmitEvidence(submission) = tx else {
             break;
         };
         let claim = &submission.statement;
         assert!(state.read(&marker_key(claim)).is_none(), "offence replay");
-        assert!(
-            !admitted.iter().any(|s: &Sanction| match claim.kind {
-                SanctionKind::Slash =>
-                    s.kind == SanctionKind::Slash && s.offender.pubkey == claim.offender.pubkey,
-                SanctionKind::Inactivity => s.offence_id == claim.offence_id,
-            }),
-            "duplicate offence"
-        );
+        let fresh = match claim.kind {
+            SanctionKind::Slash => slashed_identities.insert(claim.offender.pubkey),
+            SanctionKind::Inactivity => !offence_ids.contains(&claim.offence_id),
+        };
+        assert!(fresh, "duplicate offence");
+        offence_ids.insert(claim.offence_id);
         admitted.push(Sanction {
             offence_id: claim.offence_id,
             offender: claim.offender.clone(),
@@ -280,7 +298,7 @@ fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<S
 fn enqueue_admissions<B: StateBackend>(
     state: &mut B,
     input: &StfInput,
-    policy: &crate::RuntimePolicy,
+    policy: &RuntimePolicy,
     admitted: &[Sanction],
     queue: &mut Vec<PendingSanction>,
 ) {
@@ -308,20 +326,76 @@ fn enqueue_admissions<B: StateBackend>(
     }
 }
 
+/// Obligations left in the mandatory FIFO once a block's executions ran.
+///
+/// Ordinary transactions never change the queue, so one snapshot serves the
+/// whole transaction list without decoding the queue again.
+pub(crate) struct Backlog {
+    /// Withdrawal accounts of the queued offenders.
+    held: BTreeSet<Address>,
+    /// Number of queued obligations.
+    count: usize,
+}
+
+impl Backlog {
+    fn of(queue: &[PendingSanction]) -> Self {
+        Self {
+            held: queue
+                .iter()
+                .map(|item| item.sanction.offender.withdrawal_credentials)
+                .collect(),
+            count: queue.len(),
+        }
+    }
+
+    /// Pending deductions conservatively hold all withdrawals from their
+    /// shared runtime account until the deterministic queue has processed
+    /// them.
+    pub(crate) fn holds(&self, address: &Address) -> bool {
+        self.held.contains(address)
+    }
+
+    /// Number of queued obligations.
+    pub(crate) const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Mandatory phase of a block, run before its ordinary transactions.
+pub(crate) struct Mandatory {
+    /// Block-proven accountability transition.
+    pub(crate) output: AccountabilityOutput,
+    /// Gas reserved for the executions.
+    pub(crate) gas: u64,
+    /// Autonomous execution receipts, in FIFO order.
+    pub(crate) receipts: Vec<Receipt>,
+    /// Queue left for the ordinary transactions.
+    pub(crate) backlog: Backlog,
+}
+
 /// Admit all proof-authenticated claims, then execute the mandatory FIFO prefix
 /// before ordinary transactions. Returns reserved gas and autonomous receipts.
+///
+/// `policy` is the governed policy read at the start of the block; only
+/// ordinary transactions can replace it.
 pub(crate) fn apply<B: StateBackend>(
     checked: &ValidatedInput<'_>,
     state: &mut B,
-) -> (AccountabilityOutput, u64, Vec<Receipt>) {
+    policy: &RuntimePolicy,
+) -> Mandatory {
     let input = checked.input();
-    let policy = checked_policy(input, state);
-    let mut queue = load_queue(state);
+    check_policy(input, policy);
+    let stored = state.read(QUEUE_KEY);
+    let mut queue: Vec<PendingSanction> = stored.as_deref().map_or_else(Vec::new, |bytes| {
+        borsh::from_slice(bytes).expect("canonical sanction queue")
+    });
     assert!(
         queue.len() <= policy.evidence_max_pending as usize,
         "queue bound"
     );
-    let before = commitment(&queue);
+    let before = stored
+        .as_deref()
+        .map_or_else(|| commitment(&queue), |bytes| commitment(&Encoded(bytes)));
     sweep_expired_markers(
         state,
         input.block_height,
@@ -347,7 +421,7 @@ pub(crate) fn apply<B: StateBackend>(
         queue.len() + admitted.len() - execution_count <= policy.evidence_max_pending as usize,
         "queue capacity"
     );
-    enqueue_admissions(state, input, &policy, &admitted, &mut queue);
+    enqueue_admissions(state, input, policy, &admitted, &mut queue);
     record_expiry_bucket(state, input.block_height, &admitted);
     // Empty blocks leave totals untouched and need no witness entry for them.
     let settles = !admitted.is_empty() || execution_count > 0;
@@ -367,30 +441,29 @@ pub(crate) fn apply<B: StateBackend>(
         receipts.push(Receipt {
             status_code: status.as_u32(),
             gas_used: GAS_SANCTION,
-            kind: 8,
+            kind: SANCTION_RECEIPT_KIND,
         });
     }
     if settles {
         settlement::store_totals(state, &totals);
     }
-    let after = commitment(&queue);
+    let residual = borsh::to_vec(&queue).expect("canonical sanction queue");
+    let after = commitment(&Encoded(&residual));
     if before != after {
-        state.write(
-            QUEUE_KEY,
-            borsh::to_vec(&queue).expect("canonical sanction queue"),
-        );
+        state.write(QUEUE_KEY, residual);
     }
-    (
-        AccountabilityOutput {
+    Mandatory {
+        output: AccountabilityOutput {
             anchor: input.evidence_anchor,
             admitted,
             executed,
             queue_before: before,
             queue_after: after,
         },
-        execution_gas,
+        gas: execution_gas,
         receipts,
-    )
+        backlog: Backlog::of(&queue),
+    }
 }
 
 /// Complete one mandatory obligation, paying only from its actual deduction.
@@ -433,27 +506,21 @@ fn credit_reporter<B: StateBackend>(
     deducted: u128,
     basis_points: u16,
 ) -> u128 {
-    assert!(basis_points <= 10_000, "canonical reporter reward share");
-    let share = u128::from(basis_points);
-    let reward = deducted / 10_000 * share + deducted % 10_000 * share / 10_000;
+    assert!(
+        basis_points <= BASIS_POINTS,
+        "canonical reporter reward share"
+    );
+    let reward = crate::mul_div_floor(deducted, u128::from(basis_points), u128::from(BASIS_POINTS));
     if reward == 0 {
         return 0;
     }
-    let mut account = crate::load_account(state, reporter);
+    let mut account = load_account(state, reporter);
     // Saturation burns any unrepresentable residue rather than blocking the
     // mandatory FIFO or increasing supply beyond the deducted funds.
     let credited = reward.min(u128::MAX - account.balance);
     account.balance += credited;
-    crate::store_account(state, reporter, &account);
+    store_account(state, reporter, &account);
     credited
-}
-
-/// Pending deductions conservatively hold all withdrawals from their shared
-/// runtime account until the deterministic queue has processed them.
-pub fn withdrawal_held<B: StateBackend>(state: &mut B, address: &Address) -> bool {
-    load_queue(state)
-        .iter()
-        .any(|item| item.sanction.offender.withdrawal_credentials == *address)
 }
 
 #[cfg(test)]
@@ -473,6 +540,8 @@ pub(crate) mod tests {
         WitnessState,
         host::{LiveTrie, TracingState},
     };
+
+    use crate::test_support::{evidence_input as input, seed_policy, seed_validator};
 
     /// Pure-STF fixture: proof authenticity belongs to the execution shell.
     /// Integration tests must supply independently verified proof attachments.
@@ -520,23 +589,10 @@ pub(crate) mod tests {
         })
     }
 
-    /// Governable policy lives in state; seed the test trie with a variant.
-    fn seed_policy(live: &mut LiveTrie, mutate: impl FnOnce(&mut crate::RuntimePolicy)) {
-        let mut policy = crate::RuntimePolicy::default();
-        mutate(&mut policy);
-        live.insert(crate::RUNTIME_POLICY_KEY, borsh::to_vec(&policy).unwrap());
-    }
-
-    fn input() -> StfInput {
-        StfInput {
-            evidence_anchor: EvidenceAnchor::default(),
-            chain_id: 7,
-            block_height: 2,
-            block_gas_limit: 1_000_000,
-            proposer_address: [0; 32],
-            participation: None,
-            transactions: Vec::new(),
-        }
+    /// The queue's verdict on withdrawals from `address`, as block execution
+    /// sees it after the mandatory phase.
+    fn withdrawal_held<B: StateBackend>(state: &mut B, address: &Address) -> bool {
+        Backlog::of(&load_queue(state)).holds(address)
     }
 
     #[test]
@@ -564,18 +620,16 @@ pub(crate) mod tests {
             admission(&mut input, 2, [2; 32], SanctionKind::Slash),
         ];
         let mut live = LiveTrie::default();
-        seed_policy(&mut live, |policy| {
-            policy.evidence_executions_per_block = 1;
-            policy.slash_amount = 30;
-        });
+        seed_policy(
+            &mut live,
+            &RuntimePolicy {
+                evidence_executions_per_block: 1,
+                slash_amount: 30,
+                ..RuntimePolicy::default()
+            },
+        );
         for id in [1, 2] {
-            live.insert(
-                &crate::validator_key(&[id; 32]),
-                crate::encode_validator(&crate::Validator {
-                    stake: 100,
-                    active: true,
-                }),
-            );
+            seed_validator(&mut live, &[id; 32], 100);
         }
         let mut state = TracingState::new(&live);
         let output = crate::apply_block(&input, &mut state);
@@ -594,7 +648,7 @@ pub(crate) mod tests {
         let second = crate::apply_block(&input, &mut next);
         assert_eq!(second.accountability.executed[0].offence_id, [2; 32]);
         assert_eq!(load_queue(&mut next), [] as [PendingSanction; 0]);
-        assert_eq!(crate::load_validator(&mut next, &[2; 32]).stake, 70);
+        assert_eq!(crate::state::load_validator(&mut next, &[2; 32]).stake, 70);
         assert_eq!(next.read(&slashed_key(&[2; 48])), Some(vec![1]));
         assert_eq!(next.read(&offence_key(&[2; 32])), None);
     }
@@ -609,14 +663,14 @@ pub(crate) mod tests {
         input.evidence_anchor.unbonding_delay_blocks = 8;
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Inactivity)];
         let mut live = LiveTrie::default();
-        seed_policy(&mut live, |policy| policy.evidence_max_age_blocks = 5);
-        live.insert(
-            &crate::validator_key(&[1; 32]),
-            crate::encode_validator(&crate::Validator {
-                stake: 100,
-                active: true,
-            }),
+        seed_policy(
+            &mut live,
+            &RuntimePolicy {
+                evidence_max_age_blocks: 5,
+                ..RuntimePolicy::default()
+            },
         );
+        seed_validator(&mut live, &[1; 32], 100);
         let mut state = TracingState::new(&live);
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.accountability.executed.len(), 1);
@@ -671,17 +725,15 @@ pub(crate) mod tests {
             Transaction::Withdraw(withdraw.clone()),
         ];
         let mut live = LiveTrie::default();
-        seed_policy(&mut live, |policy| {
-            policy.evidence_executions_per_block = 1;
-            policy.slash_amount = 30;
-        });
-        live.insert(
-            &crate::validator_key(&[1; 32]),
-            crate::encode_validator(&crate::Validator {
-                stake: 100,
-                active: true,
-            }),
+        seed_policy(
+            &mut live,
+            &RuntimePolicy {
+                evidence_executions_per_block: 1,
+                slash_amount: 30,
+                ..RuntimePolicy::default()
+            },
         );
+        seed_validator(&mut live, &[1; 32], 100);
         live.insert(
             &crate::withdrawal_key(&address),
             borsh::to_vec(&crate::WithdrawalQueue {
@@ -695,9 +747,9 @@ pub(crate) mod tests {
         let mut state = TracingState::new(&live);
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.failed, 1);
-        assert_eq!(crate::load_account(&mut state, &address).nonce, 0);
+        assert_eq!(crate::state::load_account(&mut state, &address).nonce, 0);
         assert_eq!(
-            crate::load_withdrawal_queue(&mut state, &address).total(),
+            crate::state::load_withdrawal_queue(&mut state, &address).total(),
             100
         );
         let (post, witness) = state.into_committed_and_witness();
@@ -713,10 +765,10 @@ pub(crate) mod tests {
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.applied, 1);
         assert_eq!(output.failed, 0);
-        assert_eq!(crate::load_account(&mut state, &address).balance, 70);
+        assert_eq!(crate::state::load_account(&mut state, &address).balance, 70);
         assert_eq!(load_queue(&mut state), [] as [PendingSanction; 0]);
         assert_eq!(
-            crate::load_withdrawal_queue(&mut state, &address).entries,
+            crate::state::load_withdrawal_queue(&mut state, &address).entries,
             [] as [crate::Withdrawal; 0]
         );
     }
@@ -728,17 +780,15 @@ pub(crate) mod tests {
         input.evidence_anchor.unbonding_delay_blocks = 8;
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let mut live = LiveTrie::default();
-        seed_policy(&mut live, |policy| {
-            policy.evidence_max_age_blocks = 5;
-            policy.slash_amount = 10;
-        });
-        live.insert(
-            &crate::validator_key(&[1; 32]),
-            crate::encode_validator(&crate::Validator {
-                stake: 100,
-                active: true,
-            }),
+        seed_policy(
+            &mut live,
+            &RuntimePolicy {
+                evidence_max_age_blocks: 5,
+                slash_amount: 10,
+                ..RuntimePolicy::default()
+            },
         );
+        seed_validator(&mut live, &[1; 32], 100);
         let mut state = TracingState::new(&live);
         crate::apply_block(&input, &mut state);
         assert_eq!(state.read(&slashed_key(&[1; 48])), Some(vec![1]));
@@ -759,7 +809,7 @@ pub(crate) mod tests {
         }));
         assert!(rejected.is_err());
         assert_eq!(
-            crate::load_validator(&mut TracingState::new(&live), &[1; 32]).stake,
+            crate::state::load_validator(&mut TracingState::new(&live), &[1; 32]).stake,
             90
         );
 
@@ -822,7 +872,13 @@ pub(crate) mod tests {
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         input.block_height = 1_000_000;
         let mut live = LiveTrie::default();
-        seed_policy(&mut live, |policy| policy.slash_amount = 30);
+        seed_policy(
+            &mut live,
+            &RuntimePolicy {
+                slash_amount: 30,
+                ..RuntimePolicy::default()
+            },
+        );
         live.insert(
             &crate::withdrawal_key(&[1; 32]),
             borsh::to_vec(&crate::WithdrawalQueue {
@@ -837,7 +893,7 @@ pub(crate) mod tests {
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.accountability.executed.len(), 1);
         assert_eq!(
-            crate::load_withdrawal_queue(&mut state, &[1; 32]).total(),
+            crate::state::load_withdrawal_queue(&mut state, &[1; 32]).total(),
             70
         );
         assert_eq!(state.read(&slashed_key(&[1; 48])), Some(vec![1]));
@@ -853,13 +909,7 @@ pub(crate) mod tests {
         let mut input = input();
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         let mut live = LiveTrie::default();
-        live.insert(
-            &crate::validator_key(&[1; 32]),
-            crate::encode_validator(&crate::Validator {
-                stake: 100,
-                active: true,
-            }),
-        );
+        seed_validator(&mut live, &[1; 32], 100);
         let mut state = TracingState::new(&live);
         crate::apply_block(&input, &mut state);
         if let Transaction::SubmitEvidence(receipt) = &mut input.transactions[0] {
@@ -875,13 +925,7 @@ pub(crate) mod tests {
         input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Slash)];
         input.block_gas_limit = GAS_EVIDENCE_ADMISSION;
         let mut live = LiveTrie::default();
-        live.insert(
-            &crate::validator_key(&[1; 32]),
-            crate::encode_validator(&crate::Validator {
-                stake: 100,
-                active: true,
-            }),
-        );
+        seed_validator(&mut live, &[1; 32], 100);
         crate::apply_block(&input, &mut TracingState::new(&live));
     }
 }

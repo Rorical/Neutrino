@@ -4,6 +4,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use neutrino_consensus_types::evidence::SanctionKind;
 use neutrino_runtime_core::StateBackend;
 
+use crate::state::{read_canonical, write_record};
+
 /// Authenticated cumulative settlement record. Its size never grows with offences.
 pub const SETTLEMENT_TOTALS_KEY: &[u8] = b"accountability:settlement_totals";
 
@@ -95,11 +97,7 @@ pub struct SettlementSnapshot {
 
 /// Load authenticated cumulative totals. Absent genesis state means no settlements.
 pub fn load_totals<B: StateBackend>(state: &mut B) -> SettlementTotals {
-    state
-        .read(SETTLEMENT_TOTALS_KEY)
-        .map_or_else(SettlementTotals::default, |bytes| {
-            borsh::from_slice(&bytes).expect("canonical settlement totals")
-        })
+    read_canonical(state, SETTLEMENT_TOTALS_KEY).unwrap_or_default()
 }
 
 /// Read completed transfers and pending obligations without changing runtime state.
@@ -124,10 +122,7 @@ pub fn snapshot<B: StateBackend>(state: &mut B) -> SettlementSnapshot {
 }
 
 pub(super) fn store_totals<B: StateBackend>(state: &mut B, totals: &SettlementTotals) {
-    state.write(
-        SETTLEMENT_TOTALS_KEY,
-        borsh::to_vec(totals).expect("canonical settlement totals"),
-    );
+    write_record(state, SETTLEMENT_TOTALS_KEY, totals);
 }
 
 #[cfg(test)]

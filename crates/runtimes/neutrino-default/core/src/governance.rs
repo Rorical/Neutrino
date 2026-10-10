@@ -16,13 +16,17 @@
 use alloc::vec::Vec;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use neutrino_runtime_abi::{TxValidationCode, TxValidity};
+use neutrino_consensus_types::evidence::EvidenceAnchor;
 use neutrino_runtime_core::StateBackend;
 
+use crate::state::{
+    load_account, load_validator_registration, load_validator_set, read_record, store_account,
+    store_runtime_policy, write_record,
+};
+use crate::tx::verify_signature;
 use crate::{
     Account, Address, ProgramSet, ReceiptStatus, RuntimePolicy, ScheduledUpgrade, UPGRADE_KEY,
-    ValidatorSet, load_account, load_validator_set, store_account, store_runtime_policy,
+    ValidatorSet,
 };
 pub use neutrino_consensus_types::history_proof::ProgramArtifacts;
 
@@ -290,13 +294,6 @@ fn bound_message(
     msg
 }
 
-fn verify(signer: &Address, message: &[u8], signature: &[u8; 64]) -> bool {
-    VerifyingKey::from_bytes(signer).is_ok_and(|pk| {
-        pk.verify(message, &Signature::from_bytes(signature))
-            .is_ok()
-    })
-}
-
 /// `stake / total >= numerator / denominator` without overflow for any
 /// `stake <= total`: `stake * d >= total * n` is evaluated as
 /// `stake >= ceil(total * n / d)` through `total - floor(total * (d - n) / d)`.
@@ -304,37 +301,25 @@ fn quorum_reached(stake: u128, total: u128, (numerator, denominator): (u128, u12
     debug_assert!(numerator <= denominator && denominator > 0);
     // total * (d - n) / d never exceeds total, so the division is exact
     // enough: ceil(total * n / d) == total - floor(total * (d - n) / d).
-    let floor_rest = total / denominator * (denominator - numerator)
-        + total % denominator * (denominator - numerator) / denominator;
-    stake >= total - floor_rest
+    stake >= total - crate::mul_div_floor(total, denominator - numerator, denominator)
 }
 
 /// Load the open proposal, if any.
 pub fn load_proposal<B: StateBackend>(state: &mut B) -> Option<UpgradeProposal> {
-    state
-        .read(UPGRADE_PROPOSAL_KEY)
-        .and_then(|bytes| UpgradeProposal::try_from_slice(&bytes).ok())
+    read_record(state, UPGRADE_PROPOSAL_KEY)
 }
 
 fn store_proposal<B: StateBackend>(state: &mut B, proposal: &UpgradeProposal) {
-    state.write(
-        UPGRADE_PROPOSAL_KEY,
-        borsh::to_vec(proposal).expect("borsh encode UpgradeProposal never fails"),
-    );
+    write_record(state, UPGRADE_PROPOSAL_KEY, proposal);
 }
 
 /// Load the enacted, not yet consumed, switch if any.
 pub fn load_scheduled<B: StateBackend>(state: &mut B) -> Option<ScheduledUpgrade> {
-    state
-        .read(UPGRADE_KEY)
-        .and_then(|bytes| ScheduledUpgrade::try_from_slice(&bytes).ok())
+    read_record(state, UPGRADE_KEY)
 }
 
 fn store_scheduled<B: StateBackend>(state: &mut B, scheduled: &ScheduledUpgrade) {
-    state.write(
-        UPGRADE_KEY,
-        borsh::to_vec(scheduled).expect("borsh encode ScheduledUpgrade never fails"),
-    );
+    write_record(state, UPGRADE_KEY, scheduled);
 }
 
 /// Block-start housekeeping.
@@ -384,7 +369,7 @@ fn eligible<B: StateBackend>(state: &mut B, addr: &Address, block_height: Option
     let Some(height) = block_height else {
         return true;
     };
-    crate::load_validator_registration(state, addr).is_none_or(|registration| {
+    load_validator_registration(state, addr).is_none_or(|registration| {
         registration
             .registered_at_height
             .checked_add(UPGRADE_VOTER_MIN_AGE_BLOCKS)
@@ -418,7 +403,7 @@ fn authorize_signer<B: StateBackend>(
     message: &[u8],
     signature: &[u8; 64],
 ) -> Result<(Account, ValidatorSet), ReceiptStatus> {
-    if !verify(signer, message, signature) {
+    if !verify_signature(signer, message, signature) {
         return Err(ReceiptStatus::BadSignature);
     }
     let account = load_account(state, signer);
@@ -439,62 +424,38 @@ fn authorize_signer<B: StateBackend>(
     Ok((account, set))
 }
 
-const fn validity(status: ReceiptStatus) -> TxValidity {
-    TxValidity::invalid(match status {
-        ReceiptStatus::BadSignature => TxValidationCode::BadSignature,
-        ReceiptStatus::NonceMismatch => TxValidationCode::NonceMismatch,
-        ReceiptStatus::InsufficientBalance => TxValidationCode::InsufficientBalance,
-        _ => TxValidationCode::Unauthorized,
-    })
-}
-
-/// Mempool admission for a proposal.
+/// Block facts governance execution checks against.
 ///
-/// Admission has no chunk context, so the chunk-relative rules (lead time,
-/// slot conflicts, proposal liveness) are enforced only at execution; a
-/// proposal that turns out stale then fails without consuming gas.
-pub fn validate_propose<B: StateBackend>(
-    state: &mut B,
-    chain_id: u64,
-    fee: u128,
-    tx: &ProposeUpgradeTx,
-) -> TxValidity {
-    match check_propose(state, chain_id, None, None, fee, tx) {
-        Ok(_) => TxValidity::valid(0),
-        Err(status) => validity(status),
-    }
+/// Mempool admission has none: it skips every chunk-relative rule (lead
+/// time, slot conflicts, proposal liveness, queue fit), which execution
+/// enforces; a proposal that turns out stale then fails without consuming
+/// gas.
+pub(crate) struct BlockContext<'a> {
+    /// Chunk containing the block.
+    pub(crate) chunk: u64,
+    /// Height of the block.
+    pub(crate) height: u64,
+    /// Genesis-fixed facts a policy must respect.
+    pub(crate) anchor: &'a EvidenceAnchor,
+    /// Mandatory obligations still queued once the block's executions ran.
+    pub(crate) pending_sanctions: usize,
 }
 
-/// Mempool admission for a vote; see [`validate_propose`] for its scope.
-pub fn validate_vote<B: StateBackend>(
+/// Checks of a program-set proposal up to its first state mutation.
+pub(crate) fn check_propose<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
-    fee: u128,
-    tx: &VoteUpgradeTx,
-) -> TxValidity {
-    match check_vote(state, chain_id, None, None, fee, tx) {
-        Ok(_) => TxValidity::valid(0),
-        Err(status) => validity(status),
-    }
-}
-
-fn check_propose<B: StateBackend>(
-    state: &mut B,
-    chain_id: u64,
-    current_chunk: Option<u64>,
-    block_height: Option<u64>,
+    block: Option<&BlockContext<'_>>,
     fee: u128,
     tx: &ProposeUpgradeTx,
 ) -> Result<(Account, ValidatorSet), ReceiptStatus> {
-    if !tx.programs.is_complete()
-        || current_chunk.is_some_and(|current| !proposal_shape_ok(tx, current))
+    if !tx.programs.is_complete() || block.is_some_and(|block| !proposal_shape_ok(tx, block.chunk))
     {
         return Err(ReceiptStatus::InvalidUpgrade);
     }
     check_new_proposal(
         state,
-        current_chunk,
-        block_height,
+        block,
         fee,
         &tx.proposer,
         tx.nonce,
@@ -503,28 +464,26 @@ fn check_propose<B: StateBackend>(
     )
 }
 
-/// Checks of a policy proposal. `anchor` carries the genesis-fixed facts at
-/// execution; admission has no anchor and checks only the structural bounds.
-fn check_propose_policy<B: StateBackend>(
+/// Checks of a policy proposal. Execution checks the genesis-fixed facts of
+/// the block's anchor; admission has no anchor and checks only the structural
+/// bounds.
+pub(crate) fn check_propose_policy<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
-    current_chunk: Option<u64>,
-    block_height: Option<u64>,
-    anchor: Option<&neutrino_consensus_types::evidence::EvidenceAnchor>,
+    block: Option<&BlockContext<'_>>,
     fee: u128,
     tx: &ProposePolicyTx,
 ) -> Result<(Account, ValidatorSet), ReceiptStatus> {
-    let valid = anchor.map_or_else(
+    let valid = block.map_or_else(
         || tx.policy.is_well_formed(),
-        |anchor| tx.policy.is_valid_for(anchor) && policy_enactable(state, &tx.policy),
+        |block| tx.policy.is_valid_for(block.anchor) && policy_enactable(block, &tx.policy),
     );
     if !valid {
         return Err(ReceiptStatus::InvalidUpgrade);
     }
     check_new_proposal(
         state,
-        current_chunk,
-        block_height,
+        block,
         fee,
         &tx.proposer,
         tx.nonce,
@@ -537,17 +496,15 @@ fn check_propose_policy<B: StateBackend>(
 /// fits its capacity: the STF treats a queue longer than
 /// `evidence_max_pending` as an invariant violation, so enacting a smaller
 /// bound over a longer backlog would stop every block.
-fn policy_enactable<B: StateBackend>(state: &mut B, policy: &RuntimePolicy) -> bool {
-    crate::accountability::load_queue(state).len() <= policy.evidence_max_pending as usize
+const fn policy_enactable(block: &BlockContext<'_>, policy: &RuntimePolicy) -> bool {
+    block.pending_sanctions <= policy.evidence_max_pending as usize
 }
 
 /// Signer authorization plus the single-slot rule shared by every proposal
 /// kind.
-#[allow(clippy::too_many_arguments)]
 fn check_new_proposal<B: StateBackend>(
     state: &mut B,
-    current_chunk: Option<u64>,
-    block_height: Option<u64>,
+    block: Option<&BlockContext<'_>>,
     fee: u128,
     proposer: &Address,
     nonce: u64,
@@ -558,7 +515,7 @@ fn check_new_proposal<B: StateBackend>(
         state,
         proposer,
         nonce,
-        block_height,
+        block.map(|block| block.height),
         fee,
         message,
         signature,
@@ -569,7 +526,8 @@ fn check_new_proposal<B: StateBackend>(
     // small holder cannot park the slot while a larger one can always
     // reclaim it; at least two thirds of the stake can therefore always
     // reach a decision.
-    if let Some(current) = current_chunk {
+    if let Some(block) = block {
+        let current = block.chunk;
         if load_scheduled(state).is_some_and(|scheduled| scheduled.activate_at_chunk > current) {
             return Err(ReceiptStatus::UpgradeConflict);
         }
@@ -588,11 +546,11 @@ fn check_new_proposal<B: StateBackend>(
     Ok(authorized)
 }
 
-fn check_vote<B: StateBackend>(
+/// Checks of a vote up to its first state mutation.
+pub(crate) fn check_vote<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
-    current_chunk: Option<u64>,
-    block_height: Option<u64>,
+    block: Option<&BlockContext<'_>>,
     fee: u128,
     tx: &VoteUpgradeTx,
 ) -> Result<(Account, ValidatorSet, UpgradeProposal), ReceiptStatus> {
@@ -600,7 +558,7 @@ fn check_vote<B: StateBackend>(
         state,
         &tx.voter,
         tx.nonce,
-        block_height,
+        block.map(|block| block.height),
         fee,
         &vote_upgrade_sig_message(chain_id, tx),
         &tx.signature,
@@ -608,7 +566,7 @@ fn check_vote<B: StateBackend>(
     let proposal = load_proposal(state)
         .filter(|proposal| {
             proposal.id() == tx.proposal_id
-                && current_chunk.is_none_or(|current| proposal.is_live(current))
+                && block.is_none_or(|block| proposal.is_live(block.chunk))
         })
         .ok_or(ReceiptStatus::InvalidUpgrade)?;
     if proposal.voters.binary_search(&tx.voter).is_ok() {
@@ -619,74 +577,43 @@ fn check_vote<B: StateBackend>(
 
 /// Execute a proposal: record it with the proposer's vote and enact at once
 /// when the proposer alone reaches quorum.
-pub fn apply_propose<B: StateBackend>(
+pub(crate) fn apply_propose<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
-    current_chunk: u64,
-    block_height: u64,
+    block: &BlockContext<'_>,
     fee: u128,
     tx: &ProposeUpgradeTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut account, set) = check_propose(
-        state,
-        chain_id,
-        Some(current_chunk),
-        Some(block_height),
-        fee,
-        tx,
-    )?;
+    let (mut account, set) = check_propose(state, chain_id, Some(block), fee, tx)?;
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
     store_account(state, &tx.proposer, &account);
     let proposal = UpgradeProposal {
         proposer: tx.proposer,
         action: tx.action(),
-        proposed_at_chunk: current_chunk,
+        proposed_at_chunk: block.chunk,
         voters: alloc::vec![tx.proposer],
     };
     settle(state, &proposal, &set);
     Ok(())
 }
 
-/// Mempool admission for a policy proposal; see [`validate_propose`].
-pub fn validate_propose_policy<B: StateBackend>(
-    state: &mut B,
-    chain_id: u64,
-    fee: u128,
-    tx: &ProposePolicyTx,
-) -> TxValidity {
-    match check_propose_policy(state, chain_id, None, None, None, fee, tx) {
-        Ok(_) => TxValidity::valid(0),
-        Err(status) => validity(status),
-    }
-}
-
 /// Execute a policy proposal against the authenticated anchor's fixed facts.
-pub fn apply_propose_policy<B: StateBackend>(
+pub(crate) fn apply_propose_policy<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
-    current_chunk: u64,
-    block_height: u64,
-    anchor: &neutrino_consensus_types::evidence::EvidenceAnchor,
+    block: &BlockContext<'_>,
     fee: u128,
     tx: &ProposePolicyTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut account, set) = check_propose_policy(
-        state,
-        chain_id,
-        Some(current_chunk),
-        Some(block_height),
-        Some(anchor),
-        fee,
-        tx,
-    )?;
+    let (mut account, set) = check_propose_policy(state, chain_id, Some(block), fee, tx)?;
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
     store_account(state, &tx.proposer, &account);
     let proposal = UpgradeProposal {
         proposer: tx.proposer,
         action: ProposalAction::Policy(tx.policy),
-        proposed_at_chunk: current_chunk,
+        proposed_at_chunk: block.chunk,
         voters: alloc::vec![tx.proposer],
     };
     settle(state, &proposal, &set);
@@ -694,22 +621,14 @@ pub fn apply_propose_policy<B: StateBackend>(
 }
 
 /// Execute a vote: add the voter and enact when quorum is reached.
-pub fn apply_vote<B: StateBackend>(
+pub(crate) fn apply_vote<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
-    current_chunk: u64,
-    block_height: u64,
+    block: &BlockContext<'_>,
     fee: u128,
     tx: &VoteUpgradeTx,
 ) -> Result<(), ReceiptStatus> {
-    let (mut account, set, mut proposal) = check_vote(
-        state,
-        chain_id,
-        Some(current_chunk),
-        Some(block_height),
-        fee,
-        tx,
-    )?;
+    let (mut account, set, mut proposal) = check_vote(state, chain_id, Some(block), fee, tx)?;
     let index = proposal
         .voters
         .binary_search(&tx.voter)
@@ -720,7 +639,7 @@ pub fn apply_vote<B: StateBackend>(
     // mandatory queue has drained.
     if let ProposalAction::Policy(policy) = proposal.action
         && proposal.quorum_reached(&set)
-        && !policy_enactable(state, &policy)
+        && !policy_enactable(block, &policy)
     {
         return Err(ReceiptStatus::InvalidUpgrade);
     }
@@ -767,14 +686,10 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use neutrino_consensus_types::history_proof::ExecutionPrograms;
     use neutrino_runtime_core::host::{LiveTrie, TracingState};
-    use rand_chacha::ChaCha20Rng;
-    use rand_core::SeedableRng;
+
+    use crate::test_support::{apply_against, signing_key};
 
     const CHAIN_ID: u64 = 42;
-
-    fn key(seed: u64) -> SigningKey {
-        SigningKey::generate(&mut ChaCha20Rng::seed_from_u64(seed))
-    }
 
     fn programs(tag: u32) -> ProgramSet {
         ProgramSet {
@@ -854,14 +769,6 @@ mod tests {
         Transaction::ProposePolicy(tx)
     }
 
-    /// Apply `input` and return the output with the committed post-state.
-    fn commit(live: &LiveTrie, input: &StfInput) -> (crate::StfPublicOutput, LiveTrie) {
-        let mut tracer = TracingState::new(live);
-        let out = apply_block(input, &mut tracer);
-        let (post, _) = tracer.into_committed_and_witness();
-        (out, LiveTrie::from_trie(post))
-    }
-
     fn balance(live: &LiveTrie, sk: &SigningKey) -> u128 {
         live.get(&account_key(&sk.verifying_key().to_bytes()))
             .and_then(|bytes| crate::decode_account(&bytes))
@@ -918,7 +825,7 @@ mod tests {
 
     #[test]
     fn sole_validator_enacts_at_proposal_and_schedule_is_consumed_later() {
-        let alice = key(1);
+        let alice = signing_key(1);
         let live = live(&[(&alice, 100)]);
         let (applied, failed, status) =
             run(&live, &block(0, vec![propose(&alice, programs(7), 1, 0)]));
@@ -939,7 +846,7 @@ mod tests {
 
     #[test]
     fn policy_proposals_enact_through_the_same_quorum_and_reprice_the_next_block() {
-        let (a, b, c) = (key(1), key(2), key(3));
+        let (a, b, c) = (signing_key(1), signing_key(2), signing_key(3));
         let live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
         let anchor = neutrino_consensus_types::evidence::EvidenceAnchor::default();
         let policy = RuntimePolicy {
@@ -980,7 +887,7 @@ mod tests {
 
         // A valid proposal waits for quorum like a program upgrade and does
         // not touch the policy in force.
-        let (out, live) = commit(&live, &block(0, vec![propose_policy(&a, policy, 0)]));
+        let (out, live) = apply_against(&live, &block(0, vec![propose_policy(&a, policy, 0)]));
         assert_eq!((out.applied, out.failed), (1, 0));
         assert_eq!(out.gas_price, 0);
         let mut view = TracingState::new(&live);
@@ -1001,7 +908,7 @@ mod tests {
         // The vote that crosses two thirds installs the policy at once and
         // leaves no schedule behind; the block itself was still priced under
         // the old policy.
-        let (out, live) = commit(&live, &block(0, vec![vote(&b, proposal.id(), 0)]));
+        let (out, live) = apply_against(&live, &block(0, vec![vote(&b, proposal.id(), 0)]));
         assert_eq!((out.applied, out.failed), (1, 0));
         assert_eq!(out.gas_price, 0);
         let mut view = TracingState::new(&live);
@@ -1010,7 +917,7 @@ mod tests {
 
         // The next block charges fees at the governed rate.
         let before = balance(&live, &c);
-        let (out, live) = commit(
+        let (out, live) = apply_against(
             &live,
             &block(0, vec![propose_policy(&c, RuntimePolicy::default(), 0)]),
         );
@@ -1024,7 +931,7 @@ mod tests {
 
     #[test]
     fn policies_cannot_shrink_the_queue_bound_below_the_live_backlog() {
-        let (a, b, c) = (key(1), key(2), key(3));
+        let (a, b, c) = (signing_key(1), signing_key(2), signing_key(3));
         let live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
         let narrow = RuntimePolicy {
             evidence_max_pending: 1,
@@ -1064,7 +971,7 @@ mod tests {
         // Proposed while the queue was empty, it cannot be enacted by the vote
         // that reaches quorum once a backlog has built up; the proposal stays
         // open for a later vote.
-        let (_, mut opened) = commit(&live, &block(0, vec![propose_policy(&b, narrow, 0)]));
+        let (_, mut opened) = apply_against(&live, &block(0, vec![propose_policy(&b, narrow, 0)]));
         opened.insert(crate::accountability::QUEUE_KEY, queue);
         let narrow_id = proposal_id(
             &b.verifying_key().to_bytes(),
@@ -1083,7 +990,7 @@ mod tests {
 
     #[test]
     fn votes_accumulate_by_stake_until_two_thirds() {
-        let (a, b, c) = (key(1), key(2), key(3));
+        let (a, b, c) = (signing_key(1), signing_key(2), signing_key(3));
         let mut live = live(&[(&a, 40), (&b, 30), (&c, 30)]);
         let proposal_id = proposal_id(
             &a.verifying_key().to_bytes(),
@@ -1098,7 +1005,7 @@ mod tests {
         live.insert(UPGRADE_PROPOSAL_KEY, borsh::to_vec(&proposal).unwrap());
         // Wrong id, double vote and a non-validator all fail; the second
         // valid vote crosses 70 >= 67.
-        let outsider = key(4);
+        let outsider = signing_key(4);
         let (applied, failed, status) = run(
             &live,
             &block(
@@ -1121,7 +1028,7 @@ mod tests {
 
     #[test]
     fn proposals_need_complete_programs_lead_time_and_a_clear_slot() {
-        let (a, b) = (key(1), key(2));
+        let (a, b) = (signing_key(1), signing_key(2));
         let mut live = live(&[(&a, 50), (&b, 50)]);
         let mut incomplete = programs(3);
         incomplete.execution.block = [0; 8];
@@ -1169,7 +1076,7 @@ mod tests {
 
     #[test]
     fn a_larger_stake_displaces_a_live_proposal_but_a_smaller_one_cannot() {
-        let (small, big, other) = (key(1), key(2), key(3));
+        let (small, big, other) = (signing_key(1), signing_key(2), signing_key(3));
         let mut live = live(&[(&small, 10), (&big, 60), (&other, 30)]);
         let (applied, _, status) = run(&live, &block(0, vec![propose(&small, programs(3), 5, 0)]));
         assert_eq!(applied, 1);
@@ -1210,7 +1117,7 @@ mod tests {
 
     #[test]
     fn far_activations_are_rejected_and_unsupported_proposals_expire() {
-        let (a, b) = (key(1), key(2));
+        let (a, b) = (signing_key(1), signing_key(2));
         let mut live = live(&[(&a, 50), (&b, 50)]);
         // Beyond the maximum lead the slot could be held indefinitely.
         let (applied, failed, _) = run(
@@ -1260,7 +1167,7 @@ mod tests {
     #[test]
     fn young_registrations_neither_vote_nor_count_until_they_age() {
         use crate::{ValidatorRegistration, registration_key};
-        let (old, young) = (key(1), key(2));
+        let (old, young) = (signing_key(1), signing_key(2));
         // Equal stake: alone, `old` holds 100% of the eligible set.
         let mut live = live(&[(&old, 50), (&young, 50)]);
         let registration = ValidatorRegistration {
@@ -1295,7 +1202,7 @@ mod tests {
 
     #[test]
     fn tampered_signatures_and_replayed_chain_ids_are_rejected() {
-        let a = key(1);
+        let a = signing_key(1);
         let live = live(&[(&a, 100)]);
         let Transaction::ProposeUpgrade(mut tx) = propose(&a, programs(2), 1, 0) else {
             unreachable!()

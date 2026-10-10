@@ -1021,6 +1021,91 @@ async fn proof_backfill_requests_and_imports_block_proofs() {
     handle.await.unwrap().unwrap();
 }
 
+async fn next_rpc(
+    commands: &mut mpsc::Receiver<NetworkCommand>,
+) -> (PeerId, RpcRequest, HistoryReply) {
+    match timeout(Duration::from_secs(1), commands.recv())
+        .await
+        .expect("an RPC command")
+        .expect("driver running")
+    {
+        NetworkCommand::SendRpcRequest {
+            peer,
+            request,
+            response_tx,
+        } => (peer, request, response_tx),
+        other => panic!("expected an RPC request, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn failed_range_request_to_a_replaced_sync_peer_retries_on_the_selected_peer() {
+    let advertised = |head_height: Height, head_block_hash: BlockHash| Status {
+        chain_id: 1,
+        head_block_hash,
+        head_slot: head_height,
+        head_height,
+        ..Status::default()
+    };
+    let backend = MockBackend::default();
+    backend.set_status(advertised(0, [0; 32]));
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<NetworkCommand>(32);
+    let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>(32);
+    let driver = SyncDriver::new(
+        SyncDriverConfig::default(),
+        Arc::new(backend),
+        LocalProgress {
+            chain_id: 1,
+            ..LocalProgress::default()
+        },
+        cmd_tx,
+        event_rx,
+    );
+    let handle = tokio::spawn(driver.run());
+
+    // Select `original` and leave its first block range outstanding.
+    let original = random_peer();
+    event_tx
+        .send(NetworkEvent::PeerConnected(original))
+        .await
+        .unwrap();
+    let (_, request, reply) = next_rpc(&mut cmd_rx).await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    reply
+        .send(Ok(RpcResponse::Status(advertised(300, [3; 32]))))
+        .unwrap();
+    let (owner, request, outstanding) = next_rpc(&mut cmd_rx).await;
+    assert_eq!(owner, original);
+    assert!(matches!(request, RpcRequest::BlocksByRange(ref range)
+        if range.head_block_hash == [3; 32] && range.start_height == 1));
+
+    // A peer further ahead replaces the selection while that request is pending.
+    let replacement = random_peer();
+    event_tx
+        .send(NetworkEvent::PeerConnected(replacement))
+        .await
+        .unwrap();
+    let (_, request, reply) = next_rpc(&mut cmd_rx).await;
+    assert!(matches!(request, RpcRequest::Status(_)));
+    reply
+        .send(Ok(RpcResponse::Status(advertised(600, [6; 32]))))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // The replaced peer's failure retries against the selected peer and its
+    // advertised anchor instead of panicking on the replaced peer's status.
+    outstanding
+        .send(Err(neutrino_network::rpc::RpcError::ResponseDeliveryFailed))
+        .unwrap();
+    let (owner, request, _reply) = next_rpc(&mut cmd_rx).await;
+    assert_eq!(owner, replacement);
+    assert!(matches!(request, RpcRequest::BlocksByRange(ref range)
+        if range.head_block_hash == [6; 32] && range.start_height == 1));
+
+    drop(event_tx);
+    handle.await.unwrap().unwrap();
+}
+
 fn sample_block(height: Height, slot: u64, _seed: u8) -> Block {
     use neutrino_consensus_types::{Body, Header};
 
@@ -2640,6 +2725,13 @@ impl PendingBootstrap {
     }
 
     async fn with_origin(resume: bool, genesis: bool) -> Self {
+        let mut pending = Self::unconnected(resume, genesis);
+        pending.connect(pending.peer).await;
+        pending
+    }
+
+    /// Running driver whose provider has not connected yet.
+    fn unconnected(resume: bool, genesis: bool) -> Self {
         let backend = MockBackend::default();
         let mut proof = sample_history_proof();
         if genesis {
@@ -2671,7 +2763,7 @@ impl PendingBootstrap {
             event_rx,
         );
         let sync_status = driver.status();
-        let mut pending = Self {
+        Self {
             sync_status,
             backend,
             peer: random_peer(),
@@ -2689,9 +2781,7 @@ impl PendingBootstrap {
             events,
             commands,
             runner: tokio::spawn(driver.run()),
-        };
-        pending.connect(pending.peer).await;
-        pending
+        }
     }
 
     async fn next(&mut self) -> (PeerId, RpcRequest, HistoryReply) {
@@ -3066,6 +3156,35 @@ async fn bootstrap_manifest_disconnect_preserves_a_nonzero_trusted_anchor_barrie
     pending.quiet().await;
     assert!(pending.backend.inner.lock().unwrap().bootstrap_fetching);
     assert_eq!(pending.backend.inner.lock().unwrap().bootstrap_imports, 0);
+    pending.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bootstrap_manifest_that_cannot_be_sent_does_not_enter_the_fetch_barrier() {
+    let mut pending = PendingBootstrap::unconnected(false, false);
+    pending
+        .events
+        .send(NetworkEvent::PeerConnected(pending.peer))
+        .await
+        .unwrap();
+    let (owner, request, reply) = pending.next().await;
+    assert_eq!(owner, pending.peer);
+    assert!(matches!(request, RpcRequest::Status(_)));
+    // The network service stops accepting commands before the manifest request.
+    pending.commands.close();
+    reply.send(Ok(RpcResponse::Status(pending.status))).unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // The manifest was attempted but never sent: no request is outstanding,
+    // so neither the driver nor the backend may hold the fetch barrier.
+    let mut metrics = String::new();
+    pending.sync_status.render_metrics(&mut metrics);
+    assert!(metrics.contains("neutrino_sync_bootstrap_requests_total{kind=\"history\"} 1"));
+    assert!(metrics.contains(
+        "neutrino_sync_bootstrap_results_total{kind=\"history\",outcome=\"transport\"} 1"
+    ));
+    assert!(metrics.contains("neutrino_sync_bootstrap_waiting 0"));
+    assert!(!pending.backend.inner.lock().unwrap().bootstrap_fetching);
     pending.stop().await;
 }
 

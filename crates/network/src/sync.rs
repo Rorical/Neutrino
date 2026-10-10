@@ -214,8 +214,13 @@ pub enum SyncEvent {
     },
     /// An outstanding RPC failed.
     ///
-    /// The FSM clears the `in_flight` bit for the matching state so the
-    /// driver can retry — typically on a different peer.
+    /// Header, state, proof and body backfill immediately re-request from the
+    /// currently selected sync peer, which differs from `peer` when a newer
+    /// status replaced the selection while the request was outstanding; the
+    /// state's `in_flight` bit stays set while that retry is outstanding and
+    /// is cleared only when no retry can be issued. The light-client history
+    /// fetch instead clears its `in_flight` bit and waits for a fresh
+    /// notification.
     RpcFailed {
         /// The RPC that failed.
         protocol: RpcProtocol,
@@ -691,14 +696,14 @@ impl SyncMachine {
             .collect()
     }
 
-    /// Clear the `in_flight` bit of a backfill state so the driver may retry.
-    const fn release_in_flight(&mut self) {
+    /// Record whether the current backfill state has a request outstanding.
+    const fn set_in_flight(&mut self, outstanding: bool) {
         if let SyncState::CheckpointBackfill { in_flight, .. }
         | SyncState::HeaderBackfill { in_flight, .. }
         | SyncState::ProofBackfill { in_flight, .. }
         | SyncState::BodyBackfill { in_flight, .. } = &mut self.state
         {
-            *in_flight = false;
+            *in_flight = outstanding;
         }
     }
 
@@ -855,8 +860,8 @@ impl SyncMachine {
         {
             return Vec::new();
         }
-        // Clear in_flight on the matching state and let the driver retry;
-        // only the history fetch waits for a fresh notification instead.
+        // Retry the matching state's request; only the history fetch waits for
+        // a fresh notification instead.
         let retry = match (&self.state, protocol) {
             (
                 SyncState::CheckpointBackfill { .. },
@@ -870,12 +875,18 @@ impl SyncMachine {
             | (SyncState::ProofBackfill { .. }, RpcProtocol::BlockProofByHeight) => true,
             _ => return Vec::new(),
         };
-        self.release_in_flight();
-        if retry {
-            self.request_for(peer).into_iter().collect()
+        // Retry on the selected peer, not necessarily the failing one: a newer
+        // status may have replaced the selection while this request was
+        // outstanding, and range requests are anchored to the selected peer's
+        // advertised head.
+        let commands = if retry {
+            self.request_from_sync_peer()
         } else {
             Vec::new()
-        }
+        };
+        // An emitted retry is itself outstanding; otherwise release the slot.
+        self.set_in_flight(!commands.is_empty());
+        commands
     }
 }
 
@@ -1333,10 +1344,19 @@ mod tests {
         assert_eq!(fsm.retry_history_from(other), [] as [SyncCommand; 0]);
     }
 
+    /// Select `peer` as the sync target without walking the state machine.
+    fn select(fsm: &mut SyncMachine, peer: PeerId) {
+        fsm.sync_peer = Some(PeerStatus {
+            peer,
+            status: peer_status(7, 0, 32),
+        });
+    }
+
     #[test]
     fn state_fetch_rpc_failure_retries_root_request() {
         let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
         let peer = pid();
+        select(&mut fsm, peer);
         fsm.state = SyncState::StateFetch {
             target_state_root: [9; 32],
         };
@@ -1360,6 +1380,7 @@ mod tests {
     fn body_backfill_rpc_failure_retries_body_batch() {
         let mut fsm = SyncMachine::new(SyncMode::Archive, fresh_progress(7));
         let peer = pid();
+        select(&mut fsm, peer);
         fsm.state = SyncState::BodyBackfill {
             from_height: 17,
             target_height: 32,
@@ -1377,10 +1398,105 @@ mod tests {
                 count: 16,
             }]
         );
+        // The emitted retry is outstanding, so the state (and the
+        // `neutrino_sync_inflight{source="fsm"}` gauge) stays in flight.
+        match fsm.state() {
+            SyncState::BodyBackfill { in_flight, .. } => assert!(*in_flight),
+            other => panic!("expected BodyBackfill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_failure_without_a_selected_peer_releases_the_request_slot() {
+        let mut fsm = SyncMachine::new(SyncMode::Archive, fresh_progress(7));
+        fsm.state = SyncState::BodyBackfill {
+            from_height: 17,
+            target_height: 32,
+            in_flight: true,
+        };
+        let cmds = fsm.on_event(SyncEvent::RpcFailed {
+            protocol: RpcProtocol::BlocksByRange,
+            peer: pid(),
+        });
+        assert_eq!(cmds, [] as [SyncCommand; 0]);
         match fsm.state() {
             SyncState::BodyBackfill { in_flight, .. } => assert!(!in_flight),
             other => panic!("expected BodyBackfill, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rpc_failure_from_a_replaced_sync_peer_retries_on_the_selected_peer() {
+        let mut fsm = SyncMachine::new(SyncMode::Snap, fresh_progress(7));
+        let original = pid();
+        let replacement = pid();
+        let first = fsm.on_event(SyncEvent::PeerStatus {
+            peer: original,
+            status: peer_status(7, 0, 300),
+        });
+        assert!(matches!(
+            first.as_slice(),
+            [SyncCommand::RequestBlocks { peer, .. }] if *peer == original
+        ));
+        // A peer further ahead replaces the selection while the request to
+        // `original` is still outstanding; no second request is issued.
+        let mut newer = peer_status(7, 0, 600);
+        newer.head_block_hash = [0xCC; 32];
+        assert_eq!(
+            fsm.on_event(SyncEvent::PeerStatus {
+                peer: replacement,
+                status: newer,
+            }),
+            [] as [SyncCommand; 0]
+        );
+        assert_eq!(fsm.sync_peer(), Some(replacement));
+        assert_eq!(fsm.sync_head(original), None);
+
+        // The stale peer's failure retries on the selected peer, whose
+        // advertised head anchors the request, and stays in flight.
+        assert_eq!(
+            fsm.on_event(SyncEvent::RpcFailed {
+                protocol: RpcProtocol::BlocksByRange,
+                peer: original,
+            }),
+            vec![SyncCommand::RequestBlocks {
+                peer: replacement,
+                start_height: 1,
+                count: rpc::MAX_BLOCKS_PER_RESPONSE,
+            }]
+        );
+        assert_eq!(fsm.sync_head(replacement), Some([0xCC; 32]));
+        assert!(matches!(
+            fsm.state(),
+            SyncState::HeaderBackfill {
+                in_flight: true,
+                ..
+            }
+        ));
+
+        fsm.state = SyncState::ProofBackfill {
+            from_height: 5,
+            target_height: 9,
+            in_flight: true,
+        };
+        assert_eq!(
+            fsm.on_event(SyncEvent::RpcFailed {
+                protocol: RpcProtocol::BlockProofByHeight,
+                peer: original,
+            }),
+            vec![SyncCommand::RequestBlockProofs {
+                peer: replacement,
+                start_height: 5,
+                count: rpc::MAX_BLOCK_PROOFS_PER_RESPONSE,
+            }]
+        );
+        assert!(matches!(
+            fsm.state(),
+            SyncState::ProofBackfill {
+                in_flight: true,
+                ..
+            }
+        ));
     }
 
     #[test]

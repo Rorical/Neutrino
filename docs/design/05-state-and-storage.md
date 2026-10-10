@@ -85,3 +85,6 @@ an empty body. Queries below the advertised numeric retention watermark return
 `-32024` with `retained_from_chunk` and `retained_from_height`. Missing history
 range endpoints return `-32025`. Unknown hashes are not retained as tombstones;
 their lookup remains unavailable/`null` without claiming they once existed.
+`runtime_call` returns `-32010` without a runtime, `-32013` for an undecodable
+response, `-32014` for a runtime execution failure, and `-32012` only when its
+wall-clock budget expires.

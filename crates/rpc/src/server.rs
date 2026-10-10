@@ -12,6 +12,8 @@
 //!   error code `-32602`.
 //! - Backend errors use distinct server error codes for block lookup,
 //!   unavailable data, storage, runtime invocation, and transaction admission.
+//!   A `runtime_call` deadline expiry (`-32012`) is distinct from a runtime
+//!   execution failure (`-32014`).
 //! - The methods listed in `docs/design/08-crate-layout.md` for the
 //!   `rpc` crate are all implemented.
 
@@ -242,8 +244,11 @@ const ANONYMOUS_CONNECTION: usize = usize::MAX;
 pub(crate) const RATE_LIMITED_CODE: i32 = -32006;
 /// Server-wide in-flight request limit reached.
 pub(crate) const BUSY_CODE: i32 = -32005;
-/// `runtime_call` deadline elapsed. Runtime execution failures share this code.
+/// `runtime_call` wall-clock deadline elapsed. Used for nothing else, so the
+/// metrics `timeout` outcome counts only deadline expiries.
 pub(crate) const RUNTIME_TIMEOUT_CODE: i32 = -32012;
+/// The runtime trapped or failed while executing a `runtime_call`.
+pub(crate) const RUNTIME_FAILED_CODE: i32 = -32014;
 
 /// Rate and concurrency guard applied in front of method dispatch.
 #[derive(Clone)]
@@ -359,6 +364,8 @@ where
 
 // jsonrpsee marks a transport batch successful even when its individual
 // responses failed. Result payloads are skipped; only error codes are kept.
+// The first error classifies the batch unless a `runtime_call` deadline
+// expired, which takes precedence.
 fn batch_error_code(json: &str) -> Option<i32> {
     #[derive(serde::Deserialize)]
     struct ErrorCode {
@@ -741,7 +748,7 @@ fn runtime_err(err: &RuntimeCallError) -> ErrorObjectOwned {
     let code = match err {
         RuntimeCallError::RuntimeNotConfigured => -32010,
         RuntimeCallError::Query(error) => return query_err(error),
-        RuntimeCallError::Runtime(_) => -32012,
+        RuntimeCallError::Runtime(_) => RUNTIME_FAILED_CODE,
         RuntimeCallError::Decode(_) => -32013,
     };
     ErrorObjectOwned::owned(code, err.to_string(), None::<()>)
@@ -845,5 +852,48 @@ mod governor_tests {
         );
         assert_eq!(batch_error_code(r#"[{"id":1,"result":"ok"}]"#), None);
         assert_eq!(batch_error_code("[] trailing"), Some(-32603));
+    }
+
+    #[test]
+    fn runtime_execution_failures_are_not_classified_as_timeouts() {
+        let trap = RuntimeCallError::Runtime("wasm trap: unreachable".to_owned());
+        let failure = runtime_err(&trap);
+        assert_eq!(failure.code(), -32014);
+        assert_ne!(failure.code(), RUNTIME_TIMEOUT_CODE);
+        for (error, code) in [
+            (RuntimeCallError::RuntimeNotConfigured, -32010),
+            (RuntimeCallError::Decode("truncated".to_owned()), -32013),
+            (RuntimeCallError::Query(QueryError::BlockNotFound), -32020),
+        ] {
+            assert_eq!(runtime_err(&error).code(), code);
+            assert_ne!(code, RUNTIME_TIMEOUT_CODE);
+        }
+
+        // A runtime failure in a batch does not take the timeout's precedence.
+        assert_eq!(
+            batch_error_code(
+                r#"[{"id":1,"error":{"code":-32601}},{"id":2,"error":{"code":-32014}}]"#
+            ),
+            Some(-32601)
+        );
+        assert_eq!(
+            batch_error_code(
+                r#"[{"id":1,"error":{"code":-32014}},{"id":2,"error":{"code":-32012}}]"#
+            ),
+            Some(RUNTIME_TIMEOUT_CODE)
+        );
+
+        let metrics = Arc::new(crate::metrics::RpcMetrics::default());
+        let runtime = crate::metrics::RpcMetrics::kind("runtime_call");
+        metrics.begin(runtime).finish(Some(failure.code()));
+        metrics.begin(runtime).finish(Some(RUNTIME_TIMEOUT_CODE));
+        let batch = batch_error_code(r#"[{"id":1,"error":{"code":-32014}}]"#);
+        metrics.begin(crate::metrics::BATCH).finish(batch);
+        let mut out = String::new();
+        metrics.render(&mut out);
+        assert!(out.contains("family=\"runtime\",outcome=\"failed\"} 1"));
+        assert!(out.contains("family=\"runtime\",outcome=\"timeout\"} 1"));
+        assert!(out.contains("family=\"batch\",outcome=\"failed\"} 1"));
+        assert!(out.contains("family=\"batch\",outcome=\"timeout\"} 0"));
     }
 }

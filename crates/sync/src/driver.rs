@@ -28,7 +28,7 @@ use neutrino_network::rpc::{
 use neutrino_network::service::{NetworkCommand, NetworkEvent};
 use neutrino_network::sync::{SyncCommand, SyncEvent, SyncMachine, SyncMode, SyncState};
 use neutrino_network::topic::Topic;
-use neutrino_primitives::{Height, StateRoot};
+use neutrino_primitives::{BlockHash, Height, StateRoot};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -66,6 +66,11 @@ impl Default for SyncDriverConfig {
 /// future-height proofs onto the wire. The buffer is FIFO; the
 /// oldest entries get evicted when the cap is reached.
 const PENDING_PROOF_BUFFER_LIMIT: usize = 256;
+
+/// Byte budget for the same buffer. A `BlockProofs` gossip message may be
+/// 2 MiB, so the entry cap alone would admit 512 MiB; this bound holds 32
+/// maximum-size proofs and evicts oldest first alongside the entry cap.
+const PENDING_PROOF_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 /// Retain disconnected provider identities until the next availability event,
 /// while bounding memory even if distinct peers continuously churn.
@@ -188,7 +193,7 @@ pub struct SyncDriver {
     /// round to refetch it, costing one BFT-mesh-settle's worth of
     /// latency on every reorder. Entries keep the proof's height and its
     /// original gossip bytes, decoded again on retry.
-    pending_proofs: VecDeque<(Height, Vec<u8>)>,
+    pending_proofs: PendingProofs,
     /// Latest availability event. Its sequence preserves a notice that races with
     /// an older pending range request's eventual unavailable response.
     history_announcement: Option<(u64, neutrino_network::PeerId)>,
@@ -228,7 +233,7 @@ impl SyncDriver {
             outbound_rx,
             outbound_tx,
             connected_peers: BTreeSet::new(),
-            pending_proofs: VecDeque::new(),
+            pending_proofs: PendingProofs::default(),
             history_announcement: None,
             history_attempts: BTreeSet::new(),
             history_attempt_range: None,
@@ -630,17 +635,17 @@ impl SyncDriver {
             Err(SyncBackendError::ChainBehind(_)) => {
                 // The proof arrived before its block. Buffer for a
                 // retry after the next successful block import.
-                // FIFO eviction when the cap is reached protects the
-                // driver against a Byzantine peer flooding
+                // FIFO eviction under the entry and byte caps protects
+                // the driver against a Byzantine peer flooding
                 // future-height proofs onto the wire.
-                if self.pending_proofs.len() >= PENDING_PROOF_BUFFER_LIMIT {
-                    self.pending_proofs.pop_front();
+                if self.pending_proofs.push(height, data) {
+                    debug!(
+                        height,
+                        "buffering gossipped block proof until its block arrives"
+                    );
+                } else {
+                    debug!(height, "gossipped block proof exceeds the buffer budget");
                 }
-                self.pending_proofs.push_back((height, data));
-                debug!(
-                    height,
-                    "buffering gossipped block proof until its block arrives"
-                );
                 MessageAcceptance::Ignore
             }
             Err(err) => {
@@ -655,10 +660,7 @@ impl SyncDriver {
     /// everything else (Accept or Reject) is dropped. Called after
     /// every successful block import.
     async fn retry_pending_proofs(&mut self) {
-        if self.pending_proofs.is_empty() {
-            return;
-        }
-        let drained = core::mem::take(&mut self.pending_proofs);
+        let drained = self.pending_proofs.take();
         for (height, data) in drained {
             // These bytes decoded when first buffered, so decoding cannot fail.
             let Ok(proof) = borsh::from_slice::<neutrino_consensus_types::BlockProof>(&data) else {
@@ -673,7 +675,9 @@ impl SyncDriver {
                     debug!(height, "imported previously-buffered block proof");
                 }
                 Err(SyncBackendError::ChainBehind(_)) => {
-                    self.pending_proofs.push_back((height, data));
+                    // Re-buffering a subset of entries that already fit
+                    // cannot exceed either cap.
+                    self.pending_proofs.push(height, data);
                 }
                 Err(err) => {
                     debug!(
@@ -980,13 +984,13 @@ impl SyncDriver {
                 start_height,
                 count,
             } => {
+                let Some(head_block_hash) = self.selected_sync_head(peer) else {
+                    return;
+                };
                 self.send_rpc(
                     peer,
                     RpcRequest::BlocksByRange(BlocksByRangeRequest {
-                        head_block_hash: self
-                            .fsm
-                            .sync_head(peer)
-                            .expect("selected sync peer has status"),
+                        head_block_hash,
                         start_height,
                         count,
                         step: 1,
@@ -1022,13 +1026,13 @@ impl SyncDriver {
                 start_height,
                 count,
             } => {
+                let Some(head_block_hash) = self.selected_sync_head(peer) else {
+                    return;
+                };
                 self.send_rpc(
                     peer,
                     RpcRequest::BlockProofByHeight(BlockProofByHeightRequest {
-                        head_block_hash: self
-                            .fsm
-                            .sync_head(peer)
-                            .expect("selected sync peer has status"),
+                        head_block_hash,
                         start_height,
                         count,
                     }),
@@ -1047,6 +1051,20 @@ impl SyncDriver {
                 info!("sync FSM entered Following");
             }
         }
+    }
+
+    /// Branch anchor for a range request to `peer`: the head the selected sync
+    /// peer advertised. A command naming any other peer is stale, so it is
+    /// dropped instead of being sent without an authenticated anchor.
+    fn selected_sync_head(&self, peer: neutrino_network::PeerId) -> Option<BlockHash> {
+        let head = self.fsm.sync_head(peer);
+        if head.is_none() {
+            warn!(
+                %peer,
+                "dropping range request for a peer that is no longer the selected sync peer"
+            );
+        }
+        head
     }
 
     /// Convenience: send an outbound RPC, spawning a forwarder task that
@@ -1507,6 +1525,44 @@ enum OutboundOutcome {
     },
 }
 
+/// Gossipped block proofs awaiting their block, oldest first, bounded by
+/// both [`PENDING_PROOF_BUFFER_LIMIT`] entries and
+/// [`PENDING_PROOF_BUFFER_BYTES`] retained gossip bytes.
+#[derive(Debug, Default)]
+struct PendingProofs {
+    entries: VecDeque<(Height, Vec<u8>)>,
+    /// Sum of every buffered entry's gossip byte length.
+    bytes: usize,
+}
+
+impl PendingProofs {
+    /// Buffer one proof, evicting the oldest entries until both caps hold.
+    /// A proof larger than the whole byte budget is not buffered and evicts
+    /// nothing; returns whether `data` was retained.
+    fn push(&mut self, height: Height, data: Vec<u8>) -> bool {
+        if data.len() > PENDING_PROOF_BUFFER_BYTES {
+            return false;
+        }
+        while self.entries.len() >= PENDING_PROOF_BUFFER_LIMIT
+            || self.bytes.saturating_add(data.len()) > PENDING_PROOF_BUFFER_BYTES
+        {
+            let Some((_, evicted)) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.len());
+        }
+        self.bytes = self.bytes.saturating_add(data.len());
+        self.entries.push_back((height, data));
+        true
+    }
+
+    /// Remove and return every buffered proof, oldest first.
+    fn take(&mut self) -> VecDeque<(Height, Vec<u8>)> {
+        self.bytes = 0;
+        core::mem::take(&mut self.entries)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HistoryRequest {
     peer: neutrino_network::PeerId,
@@ -1655,5 +1711,65 @@ mod status_tests {
             assert!(status.is_syncing());
             assert!(!status.awaiting_first_peer());
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_proof_tests {
+    use super::*;
+
+    fn heights(buffer: &PendingProofs) -> Vec<Height> {
+        buffer.entries.iter().map(|(height, _)| *height).collect()
+    }
+
+    #[test]
+    fn maximum_size_proofs_are_bounded_by_bytes_and_evict_oldest_first() {
+        let proof_size = Topic::BlockProofs.max_transmit_size();
+        let fits = PENDING_PROOF_BUFFER_BYTES / proof_size;
+        let mut buffer = PendingProofs::default();
+        for height in 0..=u64::try_from(fits).unwrap() {
+            assert!(buffer.push(height, vec![0; proof_size]));
+            assert!(buffer.bytes <= PENDING_PROOF_BUFFER_BYTES);
+        }
+        // One proof past the byte budget evicted only the oldest entry, long
+        // before the entry cap could apply.
+        assert!(buffer.entries.len() < PENDING_PROOF_BUFFER_LIMIT);
+        assert_eq!(buffer.entries.len(), fits);
+        assert_eq!(buffer.bytes, fits * proof_size);
+        assert_eq!(heights(&buffer).first(), Some(&1));
+
+        // A small proof displaces one large proof, never the whole buffer.
+        assert!(buffer.push(99, vec![0; 1]));
+        assert_eq!(buffer.entries.len(), fits);
+        assert_eq!(buffer.bytes, (fits - 1) * proof_size + 1);
+        assert_eq!(heights(&buffer).first(), Some(&2));
+        assert_eq!(heights(&buffer).last(), Some(&99));
+
+        let drained = buffer.take();
+        assert_eq!(drained.len(), fits);
+        assert_eq!(buffer.bytes, 0);
+        assert!(buffer.entries.is_empty());
+    }
+
+    #[test]
+    fn entry_cap_still_applies_to_small_proofs() {
+        let mut buffer = PendingProofs::default();
+        let limit = u64::try_from(PENDING_PROOF_BUFFER_LIMIT).unwrap();
+        for height in 0..=limit {
+            assert!(buffer.push(height, vec![0; 16]));
+        }
+        assert_eq!(buffer.entries.len(), PENDING_PROOF_BUFFER_LIMIT);
+        assert_eq!(buffer.bytes, PENDING_PROOF_BUFFER_LIMIT * 16);
+        assert_eq!(heights(&buffer).first(), Some(&1));
+        assert_eq!(heights(&buffer).last(), Some(&limit));
+    }
+
+    #[test]
+    fn proof_larger_than_the_budget_is_dropped_without_evicting() {
+        let mut buffer = PendingProofs::default();
+        assert!(buffer.push(1, vec![0; 8]));
+        assert!(!buffer.push(2, vec![0; PENDING_PROOF_BUFFER_BYTES + 1]));
+        assert_eq!(heights(&buffer), vec![1]);
+        assert_eq!(buffer.bytes, 8);
     }
 }

@@ -248,10 +248,7 @@ async fn drive(driver: &mut SyncDriver) {
 }
 
 async fn send_request(driver: &mut SyncDriver, peer: PeerId, request: Request) {
-    if matches!(request, Request::History { .. }) {
-        driver.bootstrap.fetching = true;
-        driver.backend.bootstrap_fetch(true).await;
-    }
+    let manifest = matches!(request, Request::History { .. });
     let rpc = match &request {
         Request::History { start, end } => {
             RpcRequest::HistoryProofByRange(HistoryProofByRangeRequest {
@@ -290,6 +287,15 @@ async fn send_request(driver: &mut SyncDriver, peer: PeerId, request: Request) {
     if !sent {
         driver.bootstrap.active = None;
         driver.metrics().bootstrap_transport_error(kind);
+        return;
+    }
+    // Enter the fetch barrier only once a manifest request is outstanding:
+    // every early return above leaves both the local flag and the backend
+    // untouched. Its response is handled by this task after this returns, so
+    // the barrier still precedes any bootstrap installation.
+    if manifest {
+        driver.bootstrap.fetching = true;
+        driver.backend.bootstrap_fetch(true).await;
     }
 }
 

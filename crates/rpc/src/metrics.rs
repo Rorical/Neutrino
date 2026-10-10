@@ -107,6 +107,8 @@ pub(crate) struct RpcObservation {
     outcome: usize,
 }
 impl RpcObservation {
+    /// Classify by JSON-RPC error code. Only the `runtime_call` deadline is a
+    /// timeout; runtime execution failures count as `failed`.
     pub(crate) fn finish(mut self, code: Option<i32>) {
         use crate::server::{BUSY_CODE, RATE_LIMITED_CODE, RUNTIME_TIMEOUT_CODE};
         self.outcome = match code {
@@ -143,12 +145,14 @@ mod tests {
         let metrics = Arc::new(RpcMetrics::default());
         drop(metrics.begin(UNKNOWN));
         metrics.begin(4).finish(Some(-32012));
+        metrics.begin(4).finish(Some(-32014));
         metrics.begin(0).finish(None);
         assert_eq!(RpcMetrics::kind("user_123random"), UNKNOWN);
         let mut out = String::new();
         metrics.render(&mut out);
         assert!(out.contains("family=\"unknown\",outcome=\"cancelled\"} 1"));
         assert!(out.contains("family=\"runtime\",outcome=\"timeout\"} 1"));
+        assert!(out.contains("family=\"runtime\",outcome=\"failed\"} 1"));
         assert!(out.contains("neutrino_rpc_inflight{family=\"unknown\"} 0"));
     }
 }

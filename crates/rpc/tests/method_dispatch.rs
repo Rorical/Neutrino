@@ -6,6 +6,7 @@
 //! the JSON envelope of each method's response.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use jsonrpsee::server::RpcModule;
@@ -13,7 +14,7 @@ use neutrino_consensus_types::{Block, Body, Header};
 use neutrino_primitives::{BlockHash, ChainId, Hash, Height, Slot, Validator};
 use neutrino_rpc::{
     BlockId, FinalizedInfo, HeadInfo, QueryError, RpcBackend, RpcContext, RuntimeCallError,
-    RuntimeCallResponse, SubmitError, build_module,
+    RuntimeCallResponse, SubmitError, build_module, build_module_with,
 };
 use serde_json::{Value, json};
 
@@ -45,6 +46,8 @@ struct MockBackend {
     runtime_attached: bool,
     runtime_call_response: RuntimeCallResponse,
     query_error: Option<QueryError>,
+    runtime_error: Option<RuntimeCallError>,
+    runtime_delay: Option<Duration>,
 }
 
 impl Default for MockBackend {
@@ -54,6 +57,8 @@ impl Default for MockBackend {
             head_hash: [0xAA; 32],
             runtime_attached: true,
             query_error: None,
+            runtime_error: None,
+            runtime_delay: None,
             runtime_call_response: RuntimeCallResponse {
                 code: 0,
                 payload: vec![1, 2, 3, 4],
@@ -188,8 +193,14 @@ impl RpcBackend for MockBackend {
         _args: Vec<u8>,
         _at: &BlockId,
     ) -> Result<RuntimeCallResponse, RuntimeCallError> {
+        if let Some(delay) = self.runtime_delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(error) = &self.query_error {
             return Err(error.clone().into());
+        }
+        if let Some(error) = &self.runtime_error {
+            return Err(error.clone());
         }
         if self.runtime_attached {
             Ok(self.runtime_call_response.clone())
@@ -388,6 +399,41 @@ async fn runtime_call_errors_when_runtime_not_configured() {
     .expect_err("expected error");
     let msg = err["message"].as_str().unwrap_or("");
     assert!(msg.contains("runtime"), "unexpected error payload: {msg}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_call_reports_execution_failures_apart_from_its_deadline() {
+    let call = json!({"method": "account_get", "args": "0x"});
+    for (error, code) in [
+        (RuntimeCallError::RuntimeNotConfigured, -32010),
+        (RuntimeCallError::Runtime("trap".to_owned()), -32014),
+        (RuntimeCallError::Decode("truncated".to_owned()), -32013),
+    ] {
+        let module = build_module(Arc::new(MockBackend {
+            runtime_error: Some(error),
+            ..MockBackend::default()
+        }))
+        .unwrap();
+        let error = call_named(&module, "runtime_call", call.clone())
+            .await
+            .expect_err("runtime failure");
+        assert_eq!(error["code"], code);
+    }
+
+    // Only an expired wall-clock budget reports the timeout code.
+    let module = build_module_with(
+        Arc::new(MockBackend {
+            runtime_delay: Some(Duration::from_secs(60)),
+            ..MockBackend::default()
+        }),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let error = call_named(&module, "runtime_call", call)
+        .await
+        .expect_err("deadline");
+    assert_eq!(error["code"], -32012);
+    assert_eq!(error["message"], "runtime_call timed out");
 }
 
 #[tokio::test]

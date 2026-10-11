@@ -904,7 +904,7 @@ fn applied_transfer_consumes_transfer_gas() {
 }
 
 #[test]
-fn failed_transfer_consumes_no_gas() {
+fn failed_transfer_consumes_block_gas_but_pays_no_fee() {
     let alice = signing_key(21);
     let live = live_with_account(
         address_of(&alice),
@@ -928,7 +928,63 @@ fn failed_transfer_consumes_no_gas() {
     assert_eq!(host_out, guest_out);
     assert_eq!(host_out.applied, 0);
     assert_eq!(host_out.failed, 1);
-    assert_eq!(host_out.gas_used, 0);
+    assert_eq!(host_out.gas_used, GAS_TRANSFER);
+    // The sender keeps its balance and nonce; nobody is paid.
+    let (_, post) = apply_against(&live, &input);
+    assert_eq!(
+        read_account(&post, &address_of(&alice)),
+        Account {
+            nonce: 0,
+            balance: 10,
+        }
+    );
+}
+
+#[test]
+fn failed_signatures_exhaust_block_gas_so_the_rest_are_never_checked() {
+    // A body stuffed with forged transfers can buy only as many signature
+    // checks as the block gas allows; later ones are skipped unchecked.
+    let alice = signing_key(23);
+    let live = live_with_account(
+        address_of(&alice),
+        Account {
+            nonce: 0,
+            balance: 100 + FEE_FUNDS,
+        },
+    );
+    let forged = |nonce| {
+        let mut tx = signed_transfer(&alice, [0xAB; 32], 1, nonce, CHAIN_ID);
+        tx.signature[0] ^= 0xFF;
+        Transaction::Transfer(tx)
+    };
+    let input = StfInput {
+        evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
+        chain_id: CHAIN_ID,
+        block_height: TEST_BLOCK_HEIGHT,
+        block_gas_limit: 3 * GAS_TRANSFER,
+        proposer_address: [0u8; 32],
+        participation: None,
+        transactions: (0..5).map(forged).collect(),
+    };
+    let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!((host_out.applied, host_out.failed), (0, 5));
+    assert_eq!(host_out.gas_used, 3 * GAS_TRANSFER);
+    let kind = tx_kind_code(&input.transactions[0]);
+    let checked = Receipt {
+        status_code: ReceiptStatus::BadSignature.as_u32(),
+        gas_used: GAS_TRANSFER,
+        kind,
+    };
+    let skipped = Receipt {
+        status_code: ReceiptStatus::OutOfBlockGas.as_u32(),
+        gas_used: 0,
+        kind,
+    };
+    assert_eq!(
+        host_out.receipts_root,
+        compute_receipts_root(&[checked, checked, checked, skipped, skipped])
+    );
 }
 
 #[test]
@@ -1836,8 +1892,8 @@ fn receipts_root_pins_specific_status_codes_per_failure_mode() {
     assert_eq!(host_out, guest_out);
     assert_eq!(host_out.applied, 1);
     assert_eq!(host_out.failed, 3);
-    // Successful transfer charges its gas; failures charge none.
-    assert_eq!(host_out.gas_used, GAS_TRANSFER);
+    // Every executed transfer consumes block gas, failures included.
+    assert_eq!(host_out.gas_used, 4 * GAS_TRANSFER);
 
     let expected = compute_receipts_root(&[
         Receipt {
@@ -1847,17 +1903,17 @@ fn receipts_root_pins_specific_status_codes_per_failure_mode() {
         },
         Receipt {
             status_code: ReceiptStatus::BadSignature.as_u32(),
-            gas_used: 0,
+            gas_used: GAS_TRANSFER,
             kind: kind_transfer,
         },
         Receipt {
             status_code: ReceiptStatus::NonceMismatch.as_u32(),
-            gas_used: 0,
+            gas_used: GAS_TRANSFER,
             kind: kind_transfer,
         },
         Receipt {
             status_code: ReceiptStatus::InsufficientBalance.as_u32(),
-            gas_used: 0,
+            gas_used: GAS_TRANSFER,
             kind: kind_transfer,
         },
     ]);
@@ -2474,6 +2530,7 @@ fn zero_amount_staking_transactions_are_refused_by_admission_and_execution() {
             TxValidationCode::InsufficientBalance,
         );
         let kind = tx_kind_code(&tx);
+        let gas = tx_gas(&tx);
         let input = fee_input(alloc::vec![tx], [0; 32]);
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
@@ -2483,7 +2540,7 @@ fn zero_amount_staking_transactions_are_refused_by_admission_and_execution() {
             host_out.receipts_root,
             compute_receipts_root(&[Receipt {
                 status_code: ReceiptStatus::InsufficientBalance.as_u32(),
-                gas_used: 0,
+                gas_used: gas,
                 kind,
             }]),
         );

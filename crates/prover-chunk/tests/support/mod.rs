@@ -81,12 +81,32 @@ pub fn fixture_with_transactions(
 }
 
 /// Fixture anchored in caller-supplied genesis state, with traced witnesses.
-#[allow(clippy::too_many_lines)]
 pub fn fixture_with_live(
     key_digest: [u32; 8],
     runtime_hash: Hash,
     transactions: Vec<neutrino_default_runtime_core::Transaction>,
     gas_limit: u64,
+    live: &LiveTrie,
+) -> (ConsensusWitness, StfInput, StateWitness) {
+    fixture_with_block_gas_limit(
+        key_digest,
+        runtime_hash,
+        transactions,
+        gas_limit,
+        gas_limit,
+        live,
+    )
+}
+
+/// [`fixture_with_live`] whose block executes, is proven and is signed under
+/// `block_gas_limit` while the chain specification names `gas_limit`.
+#[allow(clippy::too_many_lines)]
+pub fn fixture_with_block_gas_limit(
+    key_digest: [u32; 8],
+    runtime_hash: Hash,
+    transactions: Vec<neutrino_default_runtime_core::Transaction>,
+    gas_limit: u64,
+    block_gas_limit: u64,
     live: &LiveTrie,
 ) -> (ConsensusWitness, StfInput, StateWitness) {
     let key = SecretKey::key_gen(&[42; 32], &[]).unwrap();
@@ -139,7 +159,7 @@ pub fn fixture_with_live(
         },
         chain_id: 7,
         block_height: 1,
-        block_gas_limit: spec.genesis_gas_limit,
+        block_gas_limit,
         proposer_address: validators[0].withdrawal_credentials,
         participation: None,
         transactions,

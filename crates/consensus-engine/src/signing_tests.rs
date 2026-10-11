@@ -557,7 +557,6 @@ fn inactive_configured_key_waits_without_reserving_votes_or_proposals() {
                     proposer: &inactive,
                 },
                 neutrino_consensus_types::Body::default(),
-                spec.genesis_gas_limit,
                 &neutrino_proof_system::UnsupportedExecutor,
             )
             .unwrap()
@@ -596,7 +595,6 @@ fn inactive_configured_key_waits_without_reserving_votes_or_proposals() {
                     1,
                     crate::ProductionConfig { proposer: &key(0) },
                     neutrino_consensus_types::Body::default(),
-                    spec.genesis_gas_limit,
                     &neutrino_proof_system::UnsupportedExecutor,
                 )
                 .unwrap()

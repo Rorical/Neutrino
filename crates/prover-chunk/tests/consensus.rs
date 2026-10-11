@@ -3,6 +3,21 @@ pub mod support;
 use neutrino_prover_chunk::consensus::{ConsensusError, validate_consensus};
 
 #[test]
+fn a_block_under_any_gas_limit_but_the_chains_is_refused() {
+    // Header, proof inputs and execution all agree on a raised limit; only
+    // the chain specification refuses it.
+    let (input, _, _) = support::fixture_with_block_gas_limit(
+        [1; 8],
+        [4; 32],
+        vec![],
+        30_000_000,
+        u64::MAX,
+        &neutrino_runtime_core::host::LiveTrie::default(),
+    );
+    assert_eq!(validate_consensus(&input), Err(ConsensusError::Header));
+}
+
+#[test]
 fn composes_executed_block_proposer_rotation_and_both_finality_phases() {
     let (input, _, _) = support::fixture([1; 8], [4; 32]);
     let statement = validate_consensus(&input).unwrap();

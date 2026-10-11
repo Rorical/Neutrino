@@ -841,10 +841,10 @@ mod tests {
         assert!(matches!(err, WasmError::ResourceLimit(_)), "{err}");
     }
 
-    /// Failed transactions consume no gas, so the most work a block can buy
-    /// is a body full of transactions that each fail a full signature check.
-    /// A share of them must fit the same share of [`DEFAULT_BLOCK_FUEL`] that
-    /// they take of a body at the 8 MiB block gossip limit.
+    /// A body at the 8 MiB block gossip limit in which every transaction
+    /// fails a full signature check bounds the work any block can carry
+    /// (block gas stops such checks far sooner). A share of those
+    /// transactions must fit the same share of [`DEFAULT_BLOCK_FUEL`].
     #[test]
     fn default_block_fuel_covers_a_gossip_limit_block_of_failed_signatures() {
         use ed25519_dalek::{Signer, SigningKey};

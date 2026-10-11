@@ -136,7 +136,8 @@ pub enum ConsensusError {
     Context,
     /// Execution statement or cross-block binding failed.
     Execution,
-    /// Body commitment or timestamp is inconsistent with its header.
+    /// Body commitment, timestamp or gas limit is inconsistent with its
+    /// header or the chain specification.
     Header,
     /// Proposer signature, VRF or stake threshold failed.
     Proposer,
@@ -369,15 +370,7 @@ fn validate_candidate_using(
     );
     for ((block, body), hash) in input.blocks.iter().zip(&input.bodies).zip(&hashes) {
         body.validate(&block.header, &block.output.transaction_summary)?;
-        let timestamp = block
-            .header
-            .slot
-            .checked_mul(spec.consensus.slot_duration_secs)
-            .and_then(|seconds| seconds.checked_add(spec.genesis_time))
-            .ok_or(ConsensusError::Header)?;
-        if block.header.timestamp.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
-            return Err(ConsensusError::Header);
-        }
+        check_header_schedule(spec, &block.header)?;
         verify_proposer_with(&block.header, hash, domain, proposers, verifier)
             .map_err(|_| ConsensusError::Proposer)?;
     }
@@ -453,6 +446,26 @@ fn validate_candidate_using(
         domain,
         records,
     })
+}
+
+/// A header's timestamp must match its slot's scheduled start, and its gas
+/// limit the chain's: the runtime executes under the header's limit, so only
+/// this check stops a proposer from lifting the block gas bound.
+fn check_header_schedule(
+    spec: &ChainSpec,
+    header: &neutrino_consensus_types::Header,
+) -> Result<(), ConsensusError> {
+    let timestamp = header
+        .slot
+        .checked_mul(spec.consensus.slot_duration_secs)
+        .and_then(|seconds| seconds.checked_add(spec.genesis_time))
+        .ok_or(ConsensusError::Header)?;
+    if header.timestamp.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS
+        || header.gas_limit != spec.genesis_gas_limit
+    {
+        return Err(ConsensusError::Header);
+    }
+    Ok(())
 }
 
 /// Check the witness against its chain specification and return the

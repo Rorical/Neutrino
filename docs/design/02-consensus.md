@@ -9,6 +9,10 @@ own slot, so native import also refuses a slot whose start lies more than 60 sec
 past the local clock: a proposer cannot move the head to a far-future slot it ground
 for and stall honest production until that slot arrives. Such a block is deferred,
 not penalized, because a lagging local clock sees honest blocks the same way.
+A header's gas limit must equal the specification's `genesis_gas_limit`: the runtime
+executes under the header's limit and the block proof binds whatever it names, so
+native import and the chunk Guest both enforce it, or a proposer could lift the block
+gas bound.
 Fork choice tracks proven branches and finality anchors. Branch materialization
 replays the selected branch through the runtime executor.
 

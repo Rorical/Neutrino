@@ -9,7 +9,10 @@ Both paths compute roots with the Poseidon2 state trie.
 The runtime supports transfer, stake, unstake, deposit, voluntary exit, withdrawal,
 BLS validator registration and proof-backed evidence admission. User transactions
 check signatures, nonces, balances and ownership. Runtime parameters determine gas,
-fees, evidence windows, queue capacity and unbonding delays. Validator registration
+fees, evidence windows, queue capacity and unbonding delays. Every transaction that
+executes consumes its kind's block gas, failures included, so gas bounds the checks a
+block can carry; only successful transactions pay fees, and a transaction that no
+longer fits the remaining block gas is skipped before any check runs. Validator registration
 and consensus rotation verify possession of registered BLS keys. Registration records
 are keyed per address behind a compact index of live registrations; a validator that
 has fully withdrawn loses its record, index entry and runtime validator entry, and the

@@ -108,12 +108,11 @@ fn many_slots_produce_prove_advance_monotonically_and_replay_round_trips() {
 
     for slot in 1u64..=N_SLOTS {
         let body = Body::default();
-        let gas_limit = engine.chain_spec().genesis_gas_limit;
         let cfg = ProductionConfig {
             proposer: &proposer,
         };
         let outcome = engine
-            .try_produce_block(slot, cfg, body, gas_limit, &executor)
+            .try_produce_block(slot, cfg, body, &executor)
             .expect("try_produce_block")
             .expect("single validator is eligible");
 

@@ -104,6 +104,15 @@ pub enum ImportError<E> {
     HeaderSignature(SignatureError),
     /// Header proposer VRF claim failed to verify.
     HeaderVrf(VrfError),
+    /// Header `gas_limit` differs from the chain specification's. The
+    /// runtime executes under the header's limit, so a proposer free to pick
+    /// it could make block gas bound nothing.
+    GasLimitMismatch {
+        /// `genesis_gas_limit` of the chain specification.
+        expected: u64,
+        /// Limit carried by the imported header.
+        actual: u64,
+    },
     /// Header slot does not strictly follow its parent's slot. The chunk
     /// Guest requires strictly increasing slots, so such a block could never
     /// be proven.
@@ -296,6 +305,10 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
             }
             Self::HeaderSignature(err) => write!(f, "header signature rejected: {err}"),
             Self::HeaderVrf(err) => write!(f, "header VRF claim rejected: {err}"),
+            Self::GasLimitMismatch { expected, actual } => write!(
+                f,
+                "header gas_limit {actual} differs from the chain gas limit {expected}"
+            ),
             Self::SlotNotIncreasing { parent_slot, slot } => write!(
                 f,
                 "header slot {slot} does not follow parent slot {parent_slot}"
@@ -416,7 +429,8 @@ impl<DB: Database> Engine<DB> {
     ///    [`MAX_HEADER_TIMESTAMP_DRIFT_SECS`] of the slot clock's
     ///    expectation, the slot strictly follows the parent's, and the
     ///    slot has started on the local wall clock within the same
-    ///    tolerance.
+    ///    tolerance. The header's gas limit equals the chain
+    ///    specification's.
     /// 3. Header signature + VRF eligibility verify against the
     ///    active validator set.
     /// 4. Body roots match the header's commitments.
@@ -440,6 +454,7 @@ impl<DB: Database> Engine<DB> {
     /// unknown, [`ImportError::HeightMismatch`] when the block's
     /// height is not `parent.height + 1`,
     /// [`ImportError::HeaderTimestampOutOfRange`] /
+    /// [`ImportError::GasLimitMismatch`] /
     /// [`ImportError::SlotNotIncreasing`] / [`ImportError::FutureSlot`] /
     /// [`ImportError::HeaderRuntimeExtraMismatch`] /
     /// [`ImportError::HeaderSignature`] /
@@ -560,6 +575,15 @@ impl<DB: Database> Engine<DB> {
             return Err(ImportError::HeightMismatch {
                 expected: expected_height,
                 actual: block.header.height,
+            });
+        }
+        // The runtime executes under the header's limit and the block proof
+        // binds it, so only consensus can stop a proposer from raising it.
+        let gas_limit = self.chain_spec().genesis_gas_limit;
+        if block.header.gas_limit != gas_limit {
+            return Err(ImportError::GasLimitMismatch {
+                expected: gas_limit,
+                actual: block.header.gas_limit,
             });
         }
 
@@ -1446,7 +1470,7 @@ mod tests {
             runtime_extra: ZERO_HASH,
             receipts_root: ZERO_HASH,
             gas_used: 0,
-            gas_limit: 1_000_000,
+            gas_limit: spec().genesis_gas_limit,
             timestamp: TEST_GENESIS_TIME + slot * 4,
             signature: [0; 96],
         };
@@ -1502,6 +1526,24 @@ mod tests {
                 new_head_slot: 2,
             }
         );
+    }
+
+    #[test]
+    fn import_refuses_a_gas_limit_other_than_the_chain_specification() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let mut raised = block(1, 1, engine.head_hash(), [5; 32]);
+        raised.header.gas_limit = u64::MAX;
+        let header_hash = raised.header.hash();
+        raised.header.signature =
+            proposer().sign_proposer_message(spec().consensus_domain(), &header_hash);
+        assert!(matches!(
+            engine.import_block(&raised),
+            Err(ImportError::GasLimitMismatch {
+                expected: 30_000_000,
+                actual: u64::MAX,
+            })
+        ));
+        assert_eq!(engine.head_height(), 0);
     }
 
     #[test]

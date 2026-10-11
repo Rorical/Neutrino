@@ -937,7 +937,6 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
                     proposer: &newcomer,
                 },
                 Body::default(),
-                witness.chain_spec.genesis_gas_limit,
                 &NativeReplayExecutor,
             )
             .unwrap()
@@ -969,7 +968,6 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
                     proposer: &newcomer,
                 },
                 Body::default(),
-                witness.chain_spec.genesis_gas_limit,
                 &NativeReplayExecutor,
             )
             .unwrap()
@@ -982,7 +980,6 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
                 proposer: &original,
             },
             Body::default(),
-            witness.chain_spec.genesis_gas_limit,
             &NativeReplayExecutor,
         )
         .unwrap()
@@ -1012,7 +1009,6 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
                 proposer: &newcomer,
             },
             Body::default(),
-            witness.chain_spec.genesis_gas_limit,
             &NativeReplayExecutor,
         )
         .unwrap()

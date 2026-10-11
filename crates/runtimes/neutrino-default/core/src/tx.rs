@@ -43,9 +43,11 @@ pub const GAS_WITHDRAW: u64 = 50_000;
 /// transfer into a pre-existing validator.
 pub const GAS_REGISTER_VALIDATOR: u64 = 75_000;
 
-/// Per-kind gas cost lookup. The cost is independent of the
-/// transaction's outcome: only successful executions consume gas, but
-/// the cost charged is the kind's full cost (no partial refunds).
+/// Per-kind gas cost lookup.
+///
+/// The cost is independent of the transaction's outcome: every executed
+/// transaction consumes the kind's full block gas (no partial refunds), and
+/// only a successful one pays the matching fee.
 #[must_use]
 pub const fn tx_gas(tx: &Transaction) -> u64 {
     match tx {

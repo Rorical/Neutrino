@@ -99,7 +99,7 @@ fn signed_block_for_slot(slot: u64, parent: BlockHash, height: Height) -> Block 
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,
         gas_used: 0,
-        gas_limit: 1_000_000,
+        gas_limit: 30_000_000,
         timestamp: 1_700_000_000 + slot * 4,
         signature: [0; 96],
     };

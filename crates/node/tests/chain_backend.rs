@@ -98,7 +98,7 @@ fn block_with_spec(
         runtime_extra: ZERO_HASH,
         receipts_root: ZERO_HASH,
         gas_used: 0,
-        gas_limit: 1_000_000,
+        gas_limit: 30_000_000,
         timestamp: chain.genesis_time + slot * chain.consensus.slot_duration_secs,
         signature: [0; 96],
     };

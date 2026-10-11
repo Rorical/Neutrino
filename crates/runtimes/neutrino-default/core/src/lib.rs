@@ -185,8 +185,9 @@ pub struct Receipt {
     /// success; non-zero values identify a specific failure reason
     /// (see the [`ReceiptStatus`] variants).
     pub status_code: u32,
-    /// Gas the transaction actually consumed. Equals [`tx_gas`] of
-    /// the matching transaction on success, `0` on failure.
+    /// Block gas the transaction consumed: [`tx_gas`] of the matching
+    /// transaction once it executed, successfully or not, and `0` when it
+    /// was skipped for lack of block gas.
     pub gas_used: u64,
     /// [`tx_kind_code`] of the matching transaction, or
     /// [`accountability::SANCTION_RECEIPT_KIND`] for a mandatory sanction
@@ -363,23 +364,29 @@ pub struct StfPublicOutput {
 ///
 /// - Each [`Transaction`] kind has a fixed cost (see [`tx_gas`]).
 /// - A transaction whose cost would push `gas_used` past
-///   `input.block_gas_limit` is rejected as `failed` without state
-///   mutation; the running total is not advanced. Subsequent
-///   transactions in the same block are still attempted (they may
-///   have a smaller cost and still fit).
-/// - Failed transactions consume no gas and pay no fee. Successful
-///   fee-bearing transactions (see [`tx_charges_fee`]) debit
-///   `tx_gas(tx) * policy.gas_price` from the sender and credit the
-///   block's fee recipient. The governed fee rate is always positive.
+///   `input.block_gas_limit` is skipped as `failed` with
+///   [`ReceiptStatus::OutOfBlockGas`] before any of its checks run; the
+///   running total is not advanced. Subsequent transactions in the same
+///   block are still attempted (they may have a smaller cost and still
+///   fit).
+/// - Every transaction that executes consumes its full cost, whether it
+///   succeeds or fails. A failure still ran its checks (at least a
+///   signature verification), so gas alone bounds how much work a block
+///   can carry. Only successful fee-bearing transactions (see
+///   [`tx_charges_fee`]) pay: they debit `tx_gas(tx) * policy.gas_price`
+///   from the sender and credit the block's fee recipient. A failed
+///   transaction pays nothing, since its sender may never have authorized
+///   it. The governed fee rate is always positive.
 ///
 /// Receipts:
 ///
 /// - Mandatory queue executions emit receipts of kind
 ///   [`accountability::SANCTION_RECEIPT_KIND`] first. The STF then
 ///   emits one [`Receipt`] per transaction (in canonical
-///   order), with `status_code = 0` on success, `1` on either soft
-///   rejection or gas-overflow drop. `gas_used` reflects the gas
-///   actually charged (the kind's cost on success, `0` on failure).
+///   order), with `status_code = 0` on success and the failing
+///   [`ReceiptStatus`] otherwise. `gas_used` is the block gas consumed:
+///   the kind's cost once the transaction executed, `0` when it was
+///   skipped for lack of block gas.
 /// - [`StfPublicOutput::receipts_root`] is the canonical commitment
 ///   over the receipt vector; the consensus engine wires it into
 ///   `header.receipts_root` and `BlockProofPublicInputs.receipt_root`.
@@ -530,10 +537,13 @@ fn execute_transactions<B: StateBackend>(state: &mut B, facts: &BlockFacts<'_>, 
                 });
             }
             Err(status) => {
+                // No fee, but the block capacity is spent: the failure ran
+                // its checks, and gas is what bounds how many may run.
                 tally.failed = tally.failed.saturating_add(1);
+                tally.gas_used = tally.gas_used.saturating_add(cost);
                 tally.receipts.push(Receipt {
                     status_code: status.as_u32(),
-                    gas_used: 0,
+                    gas_used: cost,
                     kind,
                 });
             }
@@ -705,7 +715,7 @@ pub fn validate_tx<B: StateBackend>(
         Transaction::SubmitEvidence(_) => TxValidity::invalid(TxValidationCode::Unauthorized),
         // Admission has no chunk context, so the chunk-relative governance
         // rules (lead time, slot conflicts, liveness, queue fit) are enforced
-        // only at execution; a stale proposal then fails without gas.
+        // only at execution; a stale proposal then fails without a fee.
         Transaction::ProposeUpgrade(propose_tx) => admission(governance::check_propose(
             state, chain_id, None, fee, propose_tx,
         )),

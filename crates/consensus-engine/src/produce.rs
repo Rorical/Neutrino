@@ -163,7 +163,6 @@ impl<DB: Database> Engine<DB> {
         slot: Slot,
         cfg: ProductionConfig<'_>,
         body: Body,
-        gas_limit: u64,
         executor: &dyn ErasedBlockExecutor,
     ) -> Result<Option<ProductionOutcome>, ProductionError<DB::Error>> {
         let parent_hash = self.head_hash();
@@ -212,6 +211,8 @@ impl<DB: Database> Engine<DB> {
         // the chain spec's initial set so on-chain validator changes
         // (deposits, exits) propagate to fee routing automatically.
         let proposer_index = proposer.validator_index();
+        // Peers accept only the chain specification's gas limit.
+        let gas_limit = self.chain_spec().genesis_gas_limit;
         let ctx = self
             .execution_context(height, gas_limit, proposer_index)
             .map_err(ProductionError::Executor)?;

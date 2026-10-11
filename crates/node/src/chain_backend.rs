@@ -1075,9 +1075,8 @@ where
                         )
                         .map_err(|err| ProductionError::Executor(err.to_string()))?;
                     }
-                    let gas_limit = e.chain_spec().genesis_gas_limit;
                     let cfg = ProductionConfig { proposer };
-                    e.try_produce_block(slot, cfg, body, gas_limit, executor.as_ref())
+                    e.try_produce_block(slot, cfg, body, executor.as_ref())
                 })
             },
         );

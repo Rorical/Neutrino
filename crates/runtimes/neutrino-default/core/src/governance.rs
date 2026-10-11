@@ -478,8 +478,7 @@ fn authorize_signer<B: StateBackend>(
 ///
 /// Mempool admission has none: it skips every chunk-relative rule (lead
 /// time, slot conflicts, proposal liveness, queue fit), which execution
-/// enforces; a proposal that turns out stale then fails without consuming
-/// gas.
+/// enforces; a proposal that turns out stale then fails without a fee.
 pub(crate) struct BlockContext<'a> {
     /// Chunk containing the block.
     pub(crate) chunk: u64,

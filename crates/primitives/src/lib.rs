@@ -217,7 +217,8 @@ pub const DOMAIN_BFT_NIL_ATTESTATION: DomainTag = *b"NEUTRINO_NILATT_";
 pub const DOMAIN_BFT_ROUND_CHANGE: DomainTag = *b"NEUTRINO_ROUNDCH";
 /// Domain for a proposer's signed publication of exact DA bundle bytes.
 pub const DOMAIN_DA_PUBLICATION: DomainTag = *b"NEUTRINO_DA_PUB_";
-/// Validator deposit proof-of-possession domain.
+/// Validator registration proof-of-possession domain; see
+/// [`registration_pop_message`].
 pub const DOMAIN_DEPOSIT_POP: DomainTag = *b"NEUTRINO_DEP_POP";
 /// Voluntary-exit signature domain.
 pub const DOMAIN_VOLUNTARY_EXIT: DomainTag = *b"NEUTRINO_VEXIT__";
@@ -237,6 +238,21 @@ pub const DOMAIN_HISTORY_NODE: DomainTag = *b"NEUTRINO_HSTNODE";
 pub const DOMAIN_HISTORY_ROOT: DomainTag = *b"NEUTRINO_HSTROOT";
 /// Certified precommit participation handed from consensus to the runtime.
 pub const DOMAIN_PARTICIPATION: DomainTag = *b"NEUTRINO_PARTICI";
+
+/// Payload a validator registration's proof of possession signs under the
+/// BLS POP cipher suite: `DOMAIN_DEPOSIT_POP || pubkey || address`.
+///
+/// Binding the registering address means a proof copied from someone else's
+/// registration cannot seat their key at another address: only the holder of
+/// the secret key can register it, and only where they chose.
+#[must_use]
+pub fn registration_pop_message(pubkey: &BlsPublicKey, address: &Hash) -> [u8; 96] {
+    let mut message = [0; 96];
+    message[..16].copy_from_slice(&DOMAIN_DEPOSIT_POP);
+    message[16..64].copy_from_slice(pubkey);
+    message[64..].copy_from_slice(address);
+    message
+}
 
 /// Converts an integer into `Q64.64`.
 pub const fn fixed_u128_from_integer(value: u64) -> FixedU128 {

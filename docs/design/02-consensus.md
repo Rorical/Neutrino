@@ -4,6 +4,11 @@ The authenticated active validator set defines proposer eligibility and BFT
 weights. Both configured quorum fractions must be at least 2/3. BLS-VRF binds
 chain ID, finalized seed and slot. Headers carry a proposer
 signature; native validation and the chunk Guest verify signatures and eligibility.
+Slots strictly increase along a branch. A header's timestamp only has to match its
+own slot, so native import also refuses a slot whose start lies more than 60 seconds
+past the local clock: a proposer cannot move the head to a far-future slot it ground
+for and stall honest production until that slot arrives. Such a block is deferred,
+not penalized, because a lagging local clock sees honest blocks the same way.
 Fork choice tracks proven branches and finality anchors. Branch materialization
 replays the selected branch through the runtime executor.
 
@@ -75,7 +80,8 @@ is authenticated when old evidence is consumed.
 Objective offences are independently proven by Evidence Guest and admitted as
 `SubmitEvidence` transactions. The STF performs mandatory deductions; the chunk
 applies the block-proven identity sanction to validator rotation. Inactivity means
-non-inclusion in the submitted valid certificate, not proof of network silence.
+non-inclusion in the chunk's certified precommit, as recorded by its participation
+report, not proof of network silence.
 See [accountability](20-evidence-proofs.md) for replay, withdrawal and liveness rules.
 Value/nil equivocation and conflicting signed chunk-leader proposals are objective
 offences. [Signed artifact availability](23-evidence-availability.md) keeps bounded

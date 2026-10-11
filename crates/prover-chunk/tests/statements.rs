@@ -402,7 +402,7 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
     let key = SecretKey::key_gen(&[43; 32], &[]).unwrap();
     let identity = BlsIdentity {
         pubkey: key.public_key().to_bytes(),
-        pop_signature: key.prove_possession().to_bytes(),
+        pop_signature: key.prove_registration(&[12; 32]).to_bytes(),
     };
     let candidate = |stake, identity| ConsensusCandidate {
         address: [12; 32],
@@ -484,6 +484,36 @@ fn rotation_authenticates_possession_and_delays_activation_and_exit() {
             .len(),
         1
     );
+}
+
+#[test]
+fn a_copied_registration_cannot_claim_the_key_at_another_address() {
+    use neutrino_default_runtime_core::{BlsIdentity, ConsensusCandidate, ConsensusCandidates};
+    let key = SecretKey::key_gen(&[44; 32], &[]).unwrap();
+    let owner = [12; 32];
+    let identity = BlsIdentity {
+        pubkey: key.public_key().to_bytes(),
+        pop_signature: key.prove_registration(&owner).to_bytes(),
+    };
+    // A squatter replays the owner's public identity from a lower address,
+    // which rotation reaches first.
+    let mut candidates = ConsensusCandidates::default();
+    for address in [[11; 32], owner] {
+        candidates.upsert(ConsensusCandidate {
+            address,
+            stake: 300,
+            identity: Some(identity),
+        });
+    }
+    let params = ConsensusParams {
+        epoch_length_in_chunks: 1,
+        ..ConsensusParams::default()
+    };
+    let next =
+        derive_next_validators(&[validator()], &candidates, &params, params.chunk_size, 0).unwrap();
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[1].pubkey, identity.pubkey);
+    assert_eq!(next[1].withdrawal_credentials, owner);
 }
 
 fn signed_attestation(

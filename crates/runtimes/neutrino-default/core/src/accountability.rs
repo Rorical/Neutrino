@@ -15,7 +15,8 @@ use neutrino_runtime_core::StateBackend;
 
 use crate::staking::apply_deduction;
 use crate::state::{
-    BASIS_POINTS, load_account, prefixed_key, read_canonical, store_account, write_record,
+    BASIS_POINTS, certified_absent, load_account, prefixed_key, read_canonical, store_account,
+    write_record,
 };
 use crate::{Address, GAS_SANCTION, Receipt, ReceiptStatus, RuntimePolicy, StfInput, Transaction};
 
@@ -334,7 +335,11 @@ fn check_policy(input: &StfInput, policy: &RuntimePolicy) {
 ///
 /// A safety claim duplicates an earlier safety admission of the same
 /// identity; a liveness claim duplicates an earlier admission, of either
-/// kind, with the same offence id.
+/// kind, with the same offence id. A liveness claim must also charge a
+/// validator its chunk's certified precommit left out: any quorum subset of
+/// published precommits forms a valid certificate, so absence from the
+/// submitted certificate alone would let anyone charge the validators that
+/// subset omits.
 fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<Sanction> {
     let mut admitted = Vec::new();
     let mut slashed_identities: BTreeSet<BlsPublicKey> = BTreeSet::new();
@@ -345,6 +350,15 @@ fn collect_admissions<B: StateBackend>(input: &StfInput, state: &mut B) -> Vec<S
         };
         let claim = &submission.statement;
         assert!(state.read(&marker_key(claim)).is_none(), "offence replay");
+        assert!(
+            claim.kind != SanctionKind::Inactivity
+                || certified_absent(
+                    state,
+                    claim.context.chunk_id,
+                    &claim.offender.withdrawal_credentials
+                ),
+            "uncertified inactivity"
+        );
         let fresh = match claim.kind {
             SanctionKind::Slash => slashed_identities.insert(claim.offender.pubkey),
             SanctionKind::Inactivity => !offence_ids.contains(&claim.offence_id),
@@ -630,6 +644,15 @@ pub(crate) mod tests {
         input.evidence_anchor.chain_spec_hash = [7; 32];
         input.evidence_anchor.chunk_id = 1;
         input.evidence_anchor.history_root = history_root(&leaves);
+        if kind == SanctionKind::Inactivity {
+            // Blocks of chunk 1 carry chunk 0's certified report, which must
+            // list a charged validator as absent.
+            input
+                .participation
+                .get_or_insert_with(crate::ParticipationReport::default)
+                .absent
+                .push(address);
+        }
         Transaction::SubmitEvidence(EvidenceSubmission {
             statement: EvidenceStatement {
                 reporter: None,
@@ -716,6 +739,42 @@ pub(crate) mod tests {
         assert_eq!(crate::state::load_validator(&mut next, &[2; 32]).stake, 70);
         assert_eq!(next.read(&slashed_key(&[2; 48])), Some(vec![1]));
         assert_eq!(next.read(&offence_key(&[2; 32])), None);
+    }
+
+    #[test]
+    fn liveness_claims_charge_only_certified_absences() {
+        let mut input = input();
+        input.transactions = vec![admission(&mut input, 1, [1; 32], SanctionKind::Inactivity)];
+        let mut live = LiveTrie::default();
+        seed_validator(&mut live, &[1; 32], 100);
+        // A valid certificate can omit any signer outside its quorum subset,
+        // but the chunk's certified precommit counted this validator.
+        let mut signed = input.clone();
+        let report = signed.participation.as_mut().unwrap();
+        report.present = core::mem::take(&mut report.absent);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::apply_block(&signed, &mut TracingState::new(&live))
+        }));
+        assert!(rejected.is_err());
+        // The same claim against a certified absence is admitted, and the
+        // absence stays readable for the whole liveness window.
+        let mut state = TracingState::new(&live);
+        let output = crate::apply_block(&input, &mut state);
+        assert_eq!(output.accountability.admitted.len(), 1);
+        assert_eq!(
+            state.read(&crate::absent_key(0)),
+            Some(borsh::to_vec(&vec![[1_u8; 32]]).unwrap())
+        );
+        let (post, _) = state.into_committed_and_witness();
+        let post = LiveTrie::from_trie(post);
+        let mut later = crate::test_support::evidence_input();
+        later.participation = Some(crate::ParticipationReport {
+            chunk_id: neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS,
+            ..crate::ParticipationReport::default()
+        });
+        let mut state = TracingState::new(&post);
+        crate::apply_block(&later, &mut state);
+        assert_eq!(state.read(&crate::absent_key(0)), None);
     }
 
     #[test]

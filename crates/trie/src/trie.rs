@@ -198,6 +198,13 @@ impl<H: Hasher> Trie<H> {
 
     /// Read the value bytes for `key`. Returns `None` for keys not in
     /// the trie.
+    ///
+    /// # Panics
+    /// Panics when a node on the path, or the value of the leaf holding
+    /// `key`, is missing from the store. A partial trie that omits the value
+    /// of a present key must not read it as absent: the SP1 Guest relies on
+    /// this to abort on an incomplete witness instead of proving a forged
+    /// absence.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let path = BitPath::for_key(key);
@@ -215,7 +222,11 @@ impl<H: Hasher> Trie<H> {
                 } => {
                     let remaining = path.suffix(consumed);
                     if remaining == key_suffix {
-                        return self.values.get(&value_hash).cloned();
+                        let value = self
+                            .values
+                            .get(&value_hash)
+                            .expect("trie invariant: every reachable value is in the value store");
+                        return Some(value.clone());
                     }
                     return None;
                 }
@@ -1270,6 +1281,18 @@ mod tests {
             .prove(b"bob")
             .verify_inclusion::<Blake3Hasher>(&root, b"bob", b"50")
             .expect("inclusion in reopened trie");
+    }
+
+    #[test]
+    #[should_panic(expected = "every reachable value is in the value store")]
+    fn a_present_key_whose_value_is_missing_never_reads_as_absent() {
+        let mut original = TestTrie::new();
+        insert_many(&mut original, &[(b"alice", b"100"), (b"bob", b"50")]);
+        let root = original.root();
+        let nodes = original.drain_pending_nodes();
+        // Every node on the path is present; only the leaf values are not.
+        let partial = TestTrie::from_persisted(root, nodes, []);
+        let _ = partial.get(b"bob");
     }
 
     #[test]

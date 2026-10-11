@@ -87,12 +87,18 @@ fn trap_err(err: wasmtime::Error) -> WasmError {
     }
 }
 
+/// Default [`WasmLimits::block_fuel`]: room for a maximum-size block whose
+/// every transaction costs a signature check, with a wide margin.
+pub const DEFAULT_BLOCK_FUEL: u64 = 1_000_000_000_000;
+
 /// Fuel and linear-memory budgets applied to every guest call.
 ///
 /// Fuel counts executed wasm instructions, so the bound is deterministic
-/// and independent of host speed. Block execution is already bounded by
-/// the header gas limit and keeps unlimited fuel; queries and admission
-/// checks run on behalf of untrusted callers and get the configured caps.
+/// and independent of host speed. Queries and admission checks run on
+/// behalf of untrusted callers and get tight caps. Block execution gets a
+/// cap far above what any block that fits the block gossip limit can need,
+/// so it never rejects a block the SP1 Guest would prove; it only stops a
+/// runtime that never returns from wedging the node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WasmLimits {
     /// Fuel budget for one `query` call.
@@ -103,6 +109,8 @@ pub struct WasmLimits {
     pub validate_tx_fuel: u64,
     /// Linear-memory cap in bytes for one `validate_tx` call.
     pub validate_tx_memory_bytes: usize,
+    /// Fuel budget for one `apply_block` dry run.
+    pub block_fuel: u64,
     /// Linear-memory cap in bytes for one `apply_block` dry run.
     pub block_memory_bytes: usize,
 }
@@ -114,6 +122,7 @@ impl Default for WasmLimits {
             query_memory_bytes: 64 * 1024 * 1024,
             validate_tx_fuel: 20_000_000,
             validate_tx_memory_bytes: 64 * 1024 * 1024,
+            block_fuel: DEFAULT_BLOCK_FUEL,
             block_memory_bytes: 512 * 1024 * 1024,
         }
     }
@@ -125,7 +134,7 @@ impl WasmLimits {
     /// # Errors
     /// Returns a static description of the offending field.
     pub const fn validate(self) -> Result<(), &'static str> {
-        if self.query_fuel == 0 || self.validate_tx_fuel == 0 {
+        if self.query_fuel == 0 || self.validate_tx_fuel == 0 || self.block_fuel == 0 {
             return Err("wasm fuel budgets must be positive");
         }
         if self.query_memory_bytes < 1024 * 1024
@@ -289,8 +298,12 @@ impl WasmRuntime {
         let mut input_bytes = Vec::new();
         BorshSerialize::serialize(input, &mut input_bytes).map_err(codec_err)?;
         let host = HostState::new(live, false, self.limits.block_memory_bytes);
-        let (output_bytes, host) =
-            self.invoke(APPLY_BLOCK_ENTRYPOINT, &input_bytes, host, u64::MAX)?;
+        let (output_bytes, host) = self.invoke(
+            APPLY_BLOCK_ENTRYPOINT,
+            &input_bytes,
+            host,
+            self.limits.block_fuel,
+        )?;
         let output: StfPublicOutput =
             BorshDeserialize::try_from_slice(&output_bytes).map_err(codec_err)?;
 
@@ -713,8 +726,8 @@ mod tests {
         out.extend_from_slice(name.as_bytes());
     }
 
-    /// A runtime whose query and admission entrypoints both run `body`, raw
-    /// instructions leaving the packed `i64` output. Host import `i` of
+    /// A runtime whose query, admission and block entrypoints all run `body`,
+    /// raw instructions leaving the packed `i64` output. Host import `i` of
     /// [`IMPORTS`] is function `i`; `neutrino_allocate` returns address 1024.
     fn runtime_running(body: &[u8]) -> WasmRuntime {
         let mut types = vec![6];
@@ -727,12 +740,13 @@ mod tests {
             push_name(&mut imports, field);
             imports.extend_from_slice(&[0x00, ty]);
         }
-        let mut exports = vec![4];
+        let mut exports = vec![5];
         for (field, kind, index) in [
             (MEMORY_EXPORT, 0x02, 0),
             (ALLOCATE_ENTRYPOINT, 0x00, 6),
             (QUERY_ENTRYPOINT, 0x00, 7),
             (VALIDATE_TX_ENTRYPOINT, 0x00, 7),
+            (APPLY_BLOCK_ENTRYPOINT, 0x00, 7),
         ] {
             push_name(&mut exports, field);
             exports.extend_from_slice(&[kind, index]);
@@ -801,6 +815,82 @@ mod tests {
                 assert!(matches!(err, WasmError::ResourceLimit(_)), "{err}");
             }
         }
+    }
+
+    #[test]
+    fn a_block_entrypoint_that_never_returns_exhausts_its_fuel() {
+        // `loop br 0 end`, then the unreachable packed output.
+        let runtime = runtime_running(b"\x03\x40\x0c\x00\x0b\x42\x00")
+            .with_limits(WasmLimits {
+                block_fuel: 1_000_000,
+                ..WasmLimits::default()
+            })
+            .expect("valid limits");
+        let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
+            chain_id: 1,
+            block_height: 1,
+            block_gas_limit: 1,
+            proposer_address: [0; 32],
+            participation: None,
+            transactions: Vec::new(),
+        };
+        let Err(err) = runtime.dry_run(&input, &Trie::<Poseidon2Hasher>::default(), &[]) else {
+            panic!("a spinning block traps");
+        };
+        assert!(matches!(err, WasmError::ResourceLimit(_)), "{err}");
+    }
+
+    /// Failed transactions consume no gas, so the most work a block can buy
+    /// is a body full of transactions that each fail a full signature check.
+    /// A share of them must fit the same share of [`DEFAULT_BLOCK_FUEL`] that
+    /// they take of a body at the 8 MiB block gossip limit.
+    #[test]
+    fn default_block_fuel_covers_a_gossip_limit_block_of_failed_signatures() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use neutrino_default_runtime_core::{Transaction, TransferTx};
+        const BLOCK_GOSSIP_LIMIT: u128 = 8 * 1024 * 1024;
+        const SAMPLE: u64 = 256;
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let transactions: Vec<_> = (0..SAMPLE)
+            .map(|nonce| {
+                let mut tx = TransferTx {
+                    from: key.verifying_key().to_bytes(),
+                    to: [1; 32],
+                    amount: 1,
+                    nonce,
+                    signature: [0; 64],
+                };
+                // A well-formed signature over other bytes runs the whole
+                // verification before failing.
+                tx.signature = key.sign(b"another message").to_bytes();
+                Transaction::Transfer(tx)
+            })
+            .collect();
+        let encoded = u128::try_from(borsh::object_length(&transactions[0]).unwrap()).unwrap();
+        let per_body = BLOCK_GOSSIP_LIMIT / encoded;
+        let share =
+            u64::try_from(u128::from(DEFAULT_BLOCK_FUEL) * u128::from(SAMPLE) / per_body).unwrap();
+        let runtime = WasmRuntime::default_runtime()
+            .unwrap()
+            .with_limits(WasmLimits {
+                block_fuel: share,
+                ..WasmLimits::default()
+            })
+            .unwrap();
+        let input = StfInput {
+            evidence_anchor: neutrino_consensus_types::evidence::EvidenceAnchor::default(),
+            chain_id: 1,
+            block_height: 1,
+            block_gas_limit: 30_000_000,
+            proposer_address: [0; 32],
+            participation: None,
+            transactions,
+        };
+        let Ok(dry) = runtime.dry_run(&input, &Trie::<Poseidon2Hasher>::default(), &[]) else {
+            panic!("the sample fits its share of the default block fuel");
+        };
+        assert_eq!(dry.output.failed, u32::try_from(SAMPLE).unwrap());
     }
 
     #[test]

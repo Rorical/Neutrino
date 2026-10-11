@@ -47,13 +47,14 @@ pub use query::{
     ReporterStatus, ReporterStatusRequest, query,
 };
 pub use state::{
-    ACCOUNT_KEY_PREFIX, Account, BlsIdentity, CONSENSUS_CANDIDATES_KEY, ConsensusCandidate,
-    ConsensusCandidates, DOMAIN_CONSENSUS_CANDIDATES_ROOT, PARTICIPATION_KEY,
-    REGISTRATION_KEY_PREFIX, RUNTIME_POLICY_KEY, RuntimePolicy, UPGRADE_KEY, VALIDATOR_KEY_PREFIX,
+    ABSENT_KEY_PREFIX, ACCOUNT_KEY_PREFIX, Account, BONDING_KEY_PREFIX, BlsIdentity, Bonding,
+    CONSENSUS_CANDIDATES_KEY, ConsensusCandidate, ConsensusCandidates,
+    DOMAIN_CONSENSUS_CANDIDATES_ROOT, PARTICIPATION_KEY, REGISTRATION_KEY_PREFIX,
+    RUNTIME_POLICY_KEY, RuntimePolicy, UPGRADE_KEY, VALIDATOR_KEY_PREFIX,
     VALIDATOR_REGISTRATIONS_KEY, VALIDATOR_SET_KEY, Validator, ValidatorRegistration,
     ValidatorRegistrations, ValidatorSet, ValidatorSetEntry, WITHDRAWAL_KEY_PREFIX, Withdrawal,
-    WithdrawalQueue, account_key, decode_account, encode_account, encode_validator,
-    load_consensus_candidates, load_participation, load_runtime_policy,
+    WithdrawalQueue, absent_key, account_key, bonding_key, decode_account, encode_account,
+    encode_validator, load_consensus_candidates, load_participation, load_runtime_policy,
     load_validator_registration, registration_key, validator_key, withdrawal_key,
 };
 pub use tx::{
@@ -122,7 +123,9 @@ pub enum ReceiptStatus {
     /// Defensive; in practice unreachable for any realistic
     /// transaction volume.
     Overflow,
-    /// The signer is not an active validator for a validator-only action.
+    /// The signer is not an active validator for a validator-only action,
+    /// or a stake or deposit names an address that is neither a genesis nor
+    /// a registered validator.
     Unauthorized,
     /// An upgrade decision is already in flight (open proposal or enacted
     /// switch awaiting its boundary).
@@ -402,9 +405,11 @@ pub fn apply_block_validated<B: StateBackend>(
     // The fee rate and every other governable knob come from authenticated
     // state, so a switch enacted in an earlier block applies from here on.
     let policy = load_runtime_policy(&mut block);
+    // The certified report lands first: liveness admissions of this block may
+    // cite the chunk it covers.
+    let participation = apply_participation(&mut block, input.participation.as_ref());
     let mandatory = accountability::apply(checked, &mut block, &policy);
     governance::expire(&mut block, input.evidence_anchor.chunk_id);
-    let participation = apply_participation(&mut block, input.participation.as_ref());
 
     // Bind every input, including transactions dropped by gas or execution.
     // A single serialization feeds the transaction Merkle root; the count
@@ -549,9 +554,14 @@ fn apply_transaction<B: StateBackend>(
     let min_stake = facts.min_validator_stake;
     match tx {
         Transaction::Transfer(transfer) => staking::apply_transfer(state, chain_id, fee, transfer),
-        Transaction::Stake(stake_tx) => {
-            staking::apply_stake(state, chain_id, fee, min_stake, stake_tx)
-        }
+        Transaction::Stake(stake_tx) => staking::apply_stake(
+            state,
+            chain_id,
+            input.block_height,
+            fee,
+            min_stake,
+            stake_tx,
+        ),
         Transaction::Unstake(unstake_tx) => staking::apply_unstake(
             state,
             chain_id,
@@ -563,9 +573,14 @@ fn apply_transaction<B: StateBackend>(
         ),
         // Admitted by the mandatory phase before any ordinary transaction.
         Transaction::SubmitEvidence(_) => Ok(()),
-        Transaction::Deposit(deposit_tx) => {
-            staking::apply_deposit(state, chain_id, fee, min_stake, deposit_tx)
-        }
+        Transaction::Deposit(deposit_tx) => staking::apply_deposit(
+            state,
+            chain_id,
+            input.block_height,
+            fee,
+            min_stake,
+            deposit_tx,
+        ),
         Transaction::VoluntaryExit(exit_tx) => staking::apply_voluntary_exit(
             state,
             chain_id,

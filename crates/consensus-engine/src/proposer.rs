@@ -142,13 +142,17 @@ impl ProposerKey {
     /// `self.public_key_bytes()`, matching what
     /// [`PublicKey::verify_pop`](neutrino_crypto::bls::PublicKey::verify_pop)
     /// expects.
-    ///
-    /// Used by validator operators preparing a
-    /// `Transaction::RegisterValidator` to bind their fresh BLS
-    /// identity to the on-chain registration (pending-fix #8).
     #[must_use]
     pub fn prove_possession(&self) -> Signature {
         self.secret_key.prove_possession()
+    }
+
+    /// Proof of possession for a `Transaction::RegisterValidator` that
+    /// registers this key at `address`, the validator's runtime address.
+    /// Consensus seats the key only at the address the proof binds.
+    #[must_use]
+    pub fn prove_registration(&self, address: &[u8; 32]) -> Signature {
+        self.secret_key.prove_registration(address)
     }
 
     /// Borrow the underlying BLS secret key. Crate-internal so

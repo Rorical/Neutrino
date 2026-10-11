@@ -33,11 +33,10 @@ use crate::store::StoreError;
 ///
 /// Sized generously enough to swallow modest NTP drift between
 /// honest operators (~12s) plus a few seconds of network jitter,
-/// while still rejecting a proposer that tries to fake liveness for
-/// a future slot or back-date a header by hours. The local node's
-/// clock is consulted indirectly via the [`crate::clock::SlotClock`]
-/// anchor (genesis time + slot duration), so a clock drift of `Δ`
-/// seconds shows up as `Δ` of error in this comparison.
+/// while still rejecting a header whose timestamp disagrees with its
+/// slot by hours. The same tolerance bounds how far a header's slot may
+/// start after the local wall clock, so a local clock drift of `Δ`
+/// seconds shows up as `Δ` of error in that comparison.
 pub const MAX_HEADER_TIMESTAMP_DRIFT_SECS: u64 = 60;
 
 /// Dry-run failure text when a block's program set cannot be resolved.
@@ -105,6 +104,29 @@ pub enum ImportError<E> {
     HeaderSignature(SignatureError),
     /// Header proposer VRF claim failed to verify.
     HeaderVrf(VrfError),
+    /// Header slot does not strictly follow its parent's slot. The chunk
+    /// Guest requires strictly increasing slots, so such a block could never
+    /// be proven.
+    SlotNotIncreasing {
+        /// Slot of the parent header.
+        parent_slot: Slot,
+        /// Slot of the imported header.
+        slot: Slot,
+    },
+    /// Header slot has not started on the local wall clock, beyond
+    /// [`MAX_HEADER_TIMESTAMP_DRIFT_SECS`] of tolerance. A grinding proposer
+    /// would otherwise move the head to a far-future slot and stall every
+    /// honest producer until that slot arrives. Not proof of misbehaviour: a
+    /// local clock running behind sees honest blocks this way, so the block
+    /// may be imported again once its slot has started.
+    FutureSlot {
+        /// Slot of the imported header.
+        slot: Slot,
+        /// Scheduled start of that slot.
+        slot_start: u64,
+        /// Local wall-clock time.
+        now: u64,
+    },
     /// Header `timestamp` is implausibly far from the slot's clock
     /// expectation (covers both severe clock skew and a malicious
     /// proposer trying to backdate or postdate a block).
@@ -274,6 +296,18 @@ impl<E: fmt::Debug + fmt::Display> fmt::Display for ImportError<E> {
             }
             Self::HeaderSignature(err) => write!(f, "header signature rejected: {err}"),
             Self::HeaderVrf(err) => write!(f, "header VRF claim rejected: {err}"),
+            Self::SlotNotIncreasing { parent_slot, slot } => write!(
+                f,
+                "header slot {slot} does not follow parent slot {parent_slot}"
+            ),
+            Self::FutureSlot {
+                slot,
+                slot_start,
+                now,
+            } => write!(
+                f,
+                "header slot {slot} starts at {slot_start}, after local time {now} plus {MAX_HEADER_TIMESTAMP_DRIFT_SECS}s"
+            ),
             Self::HeaderTimestampOutOfRange {
                 actual,
                 expected,
@@ -380,7 +414,9 @@ impl<DB: Database> Engine<DB> {
     ///    foot-gun and is removed.
     /// 2. The header's slot timestamp is within
     ///    [`MAX_HEADER_TIMESTAMP_DRIFT_SECS`] of the slot clock's
-    ///    expectation.
+    ///    expectation, the slot strictly follows the parent's, and the
+    ///    slot has started on the local wall clock within the same
+    ///    tolerance.
     /// 3. Header signature + VRF eligibility verify against the
     ///    active validator set.
     /// 4. Body roots match the header's commitments.
@@ -404,6 +440,7 @@ impl<DB: Database> Engine<DB> {
     /// unknown, [`ImportError::HeightMismatch`] when the block's
     /// height is not `parent.height + 1`,
     /// [`ImportError::HeaderTimestampOutOfRange`] /
+    /// [`ImportError::SlotNotIncreasing`] / [`ImportError::FutureSlot`] /
     /// [`ImportError::HeaderRuntimeExtraMismatch`] /
     /// [`ImportError::HeaderSignature`] /
     /// [`ImportError::HeaderVrf`] /
@@ -541,6 +578,25 @@ impl<DB: Database> Engine<DB> {
                 actual: block.header.timestamp,
                 expected: expected_timestamp,
                 tolerance_secs: MAX_HEADER_TIMESTAMP_DRIFT_SECS,
+            });
+        }
+        // Slots strictly increase along a branch, as production and the chunk
+        // Guest require, and a slot must have started locally: the header's
+        // own timestamp is self-consistent with any slot it names, so only the
+        // local clock bounds how far ahead a proposer may claim to be.
+        let parent_slot = parent_header.as_ref().map_or(0, |header| header.slot);
+        if block.header.slot <= parent_slot {
+            return Err(ImportError::SlotNotIncreasing {
+                parent_slot,
+                slot: block.header.slot,
+            });
+        }
+        let now = self.wall_clock_secs();
+        if expected_timestamp > now.saturating_add(MAX_HEADER_TIMESTAMP_DRIFT_SECS) {
+            return Err(ImportError::FutureSlot {
+                slot: block.header.slot,
+                slot_start: expected_timestamp,
+                now,
             });
         }
 
@@ -1446,6 +1502,40 @@ mod tests {
                 new_head_slot: 2,
             }
         );
+    }
+
+    #[test]
+    fn import_refuses_slots_that_do_not_follow_the_parent() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        let block1 = block(1, 5, engine.head_hash(), [5; 32]);
+        engine.import_block(&block1).unwrap();
+        for slot in [4, 5] {
+            let stale = block(2, slot, block1.hash(), [6; 32]);
+            assert!(matches!(
+                engine.import_block(&stale),
+                Err(ImportError::SlotNotIncreasing { parent_slot: 5, slot: refused })
+                    if refused == slot
+            ));
+        }
+        assert_eq!(engine.head_hash(), block1.hash());
+    }
+
+    #[test]
+    fn import_refuses_a_slot_until_the_local_clock_reaches_it() {
+        let mut engine = Engine::genesis(spec(), MemoryDatabase::new()).unwrap();
+        // Slot 1_000 starts 4_000 s after genesis. A head there would leave
+        // every honest producer unable to extend it before that time.
+        engine.set_wall_clock(|| TEST_GENESIS_TIME + 3_000);
+        let early = block(1, 1_000, engine.head_hash(), [5; 32]);
+        assert!(matches!(
+            engine.import_block(&early),
+            Err(ImportError::FutureSlot { slot: 1_000, .. })
+        ));
+        assert_eq!(engine.head_height(), 0);
+        // Within the drift tolerance of its start, the slot is acceptable.
+        engine.set_wall_clock(|| TEST_GENESIS_TIME + 4_000 - MAX_HEADER_TIMESTAMP_DRIFT_SECS);
+        engine.import_block(&early).unwrap();
+        assert_eq!(engine.head_height(), 1);
     }
 
     #[test]

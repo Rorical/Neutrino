@@ -60,8 +60,9 @@ fn signed_unstake(sk: &SigningKey, amount: u128, nonce: u64) -> UnstakeTx {
     tx
 }
 
-/// State holding `account` under a policy whose stake floor admits the tests'
-/// small stakes.
+/// State holding `account` and a zero-stake validator record for `addr`
+/// under a policy whose stake floor admits the tests' small stakes. Stake
+/// only adds to an existing record, which genesis or a registration creates.
 fn live_with_account(addr: Address, account: Account) -> LiveTrie {
     let mut live = LiveTrie::default();
     let policy = RuntimePolicy {
@@ -73,6 +74,12 @@ fn live_with_account(addr: Address, account: Account) -> LiveTrie {
         borsh::to_vec(&policy).expect("encode policy"),
     );
     live.insert(&account_key(&addr), encode_account(&account));
+    live.insert(
+        &neutrino_default_runtime_core::validator_key(&addr),
+        neutrino_default_runtime_core::encode_validator(
+            &neutrino_default_runtime_core::Validator::default(),
+        ),
+    );
     live
 }
 

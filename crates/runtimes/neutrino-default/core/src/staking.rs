@@ -17,11 +17,12 @@ use neutrino_runtime_core::StateBackend;
 use crate::accountability::Backlog;
 use crate::state::{
     Account, BlsIdentity, ConsensusCandidate, Validator, ValidatorRegistration,
-    ValidatorRegistrations, Withdrawal, load_account, load_consensus_candidates, load_validator,
-    load_validator_registration, load_validator_registrations, load_validator_set,
-    load_withdrawal_queue, registration_key, store_account, store_consensus_candidates,
-    store_validator, store_validator_registration, store_validator_registrations,
-    store_validator_set, store_withdrawal_queue, validator_key, withdrawal_key,
+    ValidatorRegistrations, Withdrawal, bonding_key, load_account, load_consensus_candidates,
+    load_validator, load_validator_record, load_validator_registration,
+    load_validator_registrations, load_validator_set, load_withdrawal_queue, registration_key,
+    store_account, store_consensus_candidates, store_validator, store_validator_registration,
+    store_validator_registrations, store_validator_set, store_withdrawal_queue, validator_key,
+    withdrawal_key,
 };
 use crate::tx::{
     DepositTx, RegisterValidatorTx, StakeTx, TransferTx, UnstakeTx, VoluntaryExitTx, WithdrawTx,
@@ -106,6 +107,11 @@ fn check_payer<B: StateBackend>(
 /// the fee and `validator`'s stake absorbs `amount`, ending at or above
 /// `min_stake`. Returns the funder's account, its debit and the validator
 /// record as it will be stored.
+///
+/// `validator` must already hold a record, created by genesis or by a
+/// registration. Bonding a fresh address would mint a validator with neither
+/// a consensus identity nor a registration age, which governance would
+/// otherwise mistake for a genesis validator.
 fn check_bond<B: StateBackend>(
     state: &mut B,
     funder: &Address,
@@ -113,7 +119,7 @@ fn check_bond<B: StateBackend>(
     bond: Bond,
 ) -> Result<(Account, u128, Validator), ReceiptStatus> {
     let (account, debit) = check_payer(state, funder, bond.nonce, bond.amount, bond.fee)?;
-    let mut bonded = load_validator(state, validator);
+    let mut bonded = load_validator_record(state, validator).ok_or(ReceiptStatus::Unauthorized)?;
     bonded.stake = bonded
         .stake
         .checked_add(bond.amount)
@@ -186,6 +192,7 @@ fn sync_consensus_candidate<B: StateBackend>(
 fn retire_validator<B: StateBackend>(state: &mut B, addr: &Address) {
     state.delete(&validator_key(addr));
     state.delete(&withdrawal_key(addr));
+    state.delete(&bonding_key(addr));
     let mut registrations = load_validator_registrations(state);
     if registrations.remove(addr) {
         state.delete(&registration_key(addr));
@@ -311,6 +318,7 @@ pub(crate) fn check_stake<B: StateBackend>(
 pub(crate) fn apply_stake<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
+    block_height: u64,
     fee: u128,
     min_stake: u128,
     tx: &StakeTx,
@@ -320,6 +328,7 @@ pub(crate) fn apply_stake<B: StateBackend>(
     signer.nonce = signer.nonce.saturating_add(1);
     store_account(state, &tx.validator, &signer);
     commit_validator(state, &tx.validator, &validator);
+    crate::governance::record_bond(state, &tx.validator, tx.amount, block_height);
     Ok(())
 }
 
@@ -350,6 +359,7 @@ pub(crate) fn check_deposit<B: StateBackend>(
 pub(crate) fn apply_deposit<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
+    block_height: u64,
     fee: u128,
     min_stake: u128,
     tx: &DepositTx,
@@ -361,6 +371,7 @@ pub(crate) fn apply_deposit<B: StateBackend>(
     depositor.nonce = depositor.nonce.saturating_add(1);
     store_account(state, &tx.depositor, &depositor);
     commit_validator(state, &tx.validator, &validator);
+    crate::governance::record_bond(state, &tx.validator, tx.amount, block_height);
     Ok(())
 }
 

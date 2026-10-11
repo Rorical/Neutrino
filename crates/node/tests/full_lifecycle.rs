@@ -23,8 +23,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
     Account, Address, DepositTx, GAS_DEPOSIT, GAS_UNSTAKE, GAS_WITHDRAW, RUNTIME_POLICY_KEY,
-    Receipt, RuntimePolicy, Transaction, UnstakeTx, WithdrawTx, account_key, compute_receipts_root,
-    deposit_sig_message, encode_account, tx_kind_code, unstake_sig_message, withdraw_sig_message,
+    Receipt, RuntimePolicy, Transaction, UnstakeTx, Validator as RuntimeValidator, WithdrawTx,
+    account_key, compute_receipts_root, deposit_sig_message, encode_account, encode_validator,
+    tx_kind_code, unstake_sig_message, validator_key, withdraw_sig_message,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
@@ -112,10 +113,21 @@ fn validators() -> Vec<Validator> {
     }]
 }
 
-fn seeded_chain_spec_and_trie(seeds: &[(Address, Account)]) -> (ChainSpec, LiveTrie) {
+fn seeded_chain_spec_and_trie(
+    seeds: &[(Address, Account)],
+    runtime_validators: &[Address],
+) -> (ChainSpec, LiveTrie) {
     let mut live = LiveTrie::default();
     for (addr, acct) in seeds {
         live.insert(&account_key(addr), encode_account(acct));
+    }
+    // Zero-stake runtime validator records, as a genesis or registered
+    // validator leaves them; deposits only add to an existing record.
+    for addr in runtime_validators {
+        live.insert(
+            &validator_key(addr),
+            encode_validator(&RuntimeValidator::default()),
+        );
     }
     // Genesis seeds the governable policy from the spec. The STF checks it
     // against the anchor's unbonding delay, so the short delay below needs
@@ -183,8 +195,11 @@ fn candidates_root(entries: &[(Address, u128)]) -> neutrino_primitives::Hash {
     candidates.root()
 }
 
-fn seeded_backend(seeds: &[(Address, Account)]) -> Arc<LifecycleBackend> {
-    let (spec, live) = seeded_chain_spec_and_trie(seeds);
+fn seeded_backend(
+    seeds: &[(Address, Account)],
+    runtime_validators: &[Address],
+) -> Arc<LifecycleBackend> {
+    let (spec, live) = seeded_chain_spec_and_trie(seeds, runtime_validators);
     let mut engine = Engine::genesis(spec, MemoryDatabase::new()).expect("genesis");
     engine.replace_state_with_reconstructed(live.trie().clone());
     let proof_system = NativeChunkTestSystem::mock().expect("mock SP1 setup");
@@ -266,24 +281,27 @@ fn deposit_then_unstake_then_withdraw_round_trips_through_full_pipeline() {
     let depositor_addr = address_of(&depositor);
     let validator_addr = address_of(&validator);
 
-    let backend = seeded_backend(&[
-        (
-            depositor_addr,
-            Account {
-                nonce: 0,
-                balance: 100 + FEE_FUNDS,
-            },
-        ),
-        // Validator account exists at nonce 0 so it can sign its own
-        // unstake / withdraw transactions later in the lifecycle.
-        (
-            validator_addr,
-            Account {
-                nonce: 0,
-                balance: FEE_FUNDS,
-            },
-        ),
-    ]);
+    let backend = seeded_backend(
+        &[
+            (
+                depositor_addr,
+                Account {
+                    nonce: 0,
+                    balance: 100 + FEE_FUNDS,
+                },
+            ),
+            // Validator account exists at nonce 0 so it can sign its own
+            // unstake / withdraw transactions later in the lifecycle.
+            (
+                validator_addr,
+                Account {
+                    nonce: 0,
+                    balance: FEE_FUNDS,
+                },
+            ),
+        ],
+        &[validator_addr],
+    );
     let proposer = proposer_key();
 
     // Slot 1: depositor funds the validator with 60 units.

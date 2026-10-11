@@ -7,8 +7,9 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer, SigningKey};
 use neutrino_consensus_engine::{Engine, ProposerKey};
 use neutrino_default_runtime_core::{
-    Account, Address, RUNTIME_POLICY_KEY, RuntimePolicy, StakeTx, Transaction, account_key,
-    encode_account, stake_sig_message,
+    Account, Address, RUNTIME_POLICY_KEY, RuntimePolicy, StakeTx, Transaction,
+    Validator as RuntimeValidator, account_key, encode_account, encode_validator,
+    stake_sig_message, validator_key,
 };
 use neutrino_node::ChainBackend;
 use neutrino_primitives::{
@@ -112,6 +113,11 @@ fn seed_validator_account(addr: Address, balance: u128) -> LiveTrie {
     );
     let account = Account { nonce: 0, balance };
     live.insert(&account_key(&addr), encode_account(&account));
+    // The genesis validator's runtime record; stake only adds to a record.
+    live.insert(
+        &validator_key(&addr),
+        encode_validator(&RuntimeValidator::default()),
+    );
     live
 }
 

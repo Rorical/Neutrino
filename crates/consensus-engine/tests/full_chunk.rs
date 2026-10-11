@@ -844,7 +844,7 @@ fn a_registered_key_produces_after_authenticated_activation_with_a_stale_index_h
     let registration = ValidatorRegistration {
         address,
         bls_pubkey: *newcomer.public_key_bytes(),
-        pop_signature: newcomer.prove_possession().to_bytes(),
+        pop_signature: newcomer.prove_registration(&address).to_bytes(),
         registered_at_height: 0,
     };
     let mut registrations = ValidatorRegistrations::default();

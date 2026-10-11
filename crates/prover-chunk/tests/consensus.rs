@@ -364,7 +364,7 @@ fn candidate_state(
         stake,
         identity: Some(BlsIdentity {
             pubkey: key.public_key().to_bytes(),
-            pop_signature: key.prove_possession().to_bytes(),
+            pop_signature: key.prove_registration(&address).to_bytes(),
         }),
     });
     let mut live = neutrino_runtime_core::host::LiveTrie::default();

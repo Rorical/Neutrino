@@ -375,8 +375,9 @@ fn read_secret_file(path: &Path) -> Result<String, ProposerIkmError> {
 /// Fuel and linear-memory budgets for untrusted WASM entrypoints.
 ///
 /// Mirrors [`neutrino_runtime_host::wasm::WasmLimits`]; see there for the
-/// semantics. Block execution keeps unlimited fuel because the header gas
-/// limit already bounds it.
+/// semantics. The block fuel cap only guards against a runtime that never
+/// returns; lowering it far enough to reject valid blocks would split this
+/// node from the chain.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionLimitsConfig {
@@ -388,6 +389,8 @@ pub struct ExecutionLimitsConfig {
     pub validate_tx_fuel: u64,
     /// Memory cap in bytes for one admission check.
     pub validate_tx_memory_bytes: usize,
+    /// Fuel for one block dry run.
+    pub block_fuel: u64,
     /// Memory cap in bytes for one block dry run.
     pub block_memory_bytes: usize,
 }
@@ -400,6 +403,7 @@ impl Default for ExecutionLimitsConfig {
             query_memory_bytes: limits.query_memory_bytes,
             validate_tx_fuel: limits.validate_tx_fuel,
             validate_tx_memory_bytes: limits.validate_tx_memory_bytes,
+            block_fuel: limits.block_fuel,
             block_memory_bytes: limits.block_memory_bytes,
         }
     }
@@ -414,6 +418,7 @@ impl ExecutionLimitsConfig {
             query_memory_bytes: self.query_memory_bytes,
             validate_tx_fuel: self.validate_tx_fuel,
             validate_tx_memory_bytes: self.validate_tx_memory_bytes,
+            block_fuel: self.block_fuel,
             block_memory_bytes: self.block_memory_bytes,
         }
     }

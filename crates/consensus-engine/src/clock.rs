@@ -59,6 +59,15 @@ impl SlotClock {
     }
 }
 
+/// Seconds since the Unix epoch on the local system clock, or `0` when the
+/// clock reads before the epoch.
+#[must_use]
+pub fn system_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

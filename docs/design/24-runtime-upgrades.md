@@ -137,7 +137,11 @@ ConsensusCandidate  { address, stake, identity: Option<{ bls_pubkey, pop_signatu
 
 An entry exists while the runtime holds a validator record or a registration for the
 address, so a zero stake is authenticated and a missing entry means the runtime has
-fully withdrawn the validator. The chunk Guest's rotation reads exactly this record
+fully withdrawn the validator. Only genesis and registration create a validator record;
+stake and deposit add to an existing one. The `pop_signature` is a BLS signature under
+the POP cipher suite over `DOMAIN_DEPOSIT_POP || bls_pubkey || address`, so the key is
+seated only at the address its holder registered it for; a copied registration cannot
+claim it first. The chunk Guest's rotation reads exactly this record
 and the `ScheduledUpgrade` record, nothing else: how the runtime stores accounts,
 stake, delegation or registrations is invisible to consensus. Rotation rules
 (activation and exit delays, retirement after the unbonding window, slashed seats
@@ -199,7 +203,10 @@ ScheduledUpgrade { activate_at_chunk, programs }                                
   A registration must be at least `UPGRADE_VOTER_MIN_AGE_BLOCKS` (1024) old to count
   as proposer, voter or in the quorum denominator, so freshly deposited stake cannot
   decide an upgrade before consensus would even seat it; genesis validators have no
-  registration record and always count.
+  registration record and always count. Stake or deposits added to a validator later
+  count only once the same age has passed since the latest addition (a per-validator
+  `bond:` record), and unaged additions are excluded from both the voter's weight and
+  the denominator.
 - One decision is in flight at a time. An enacted switch awaiting its boundary blocks
   new proposals; a live proposal is displaced only by a proposer whose own stake
   exceeds the stake already voting for it, so a small holder cannot park the slot
@@ -208,7 +215,7 @@ ScheduledUpgrade { activate_at_chunk, programs }                                
   runtime, fact, evidence, block) beside the program set, and the enacted
   `ScheduledUpgrade` carries them, so nodes know which program-lane pieces to
   assemble and install.
-- Votes are weighted by the voter's stake at tally time. The proposer's stake counts
+- Votes are weighted by the voter's counted stake at tally time. The proposer's stake counts
   as a vote. Enactment happens inside the transaction whose vote reaches two thirds
   of the active stake: the proposal is deleted and `ScheduledUpgrade` is written.
 - `activate_at_chunk` must lie in `[current + UPGRADE_MIN_LEAD_CHUNKS,

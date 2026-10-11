@@ -86,7 +86,8 @@ pub enum WitnessError {
 
 /// `StateBackend` driven entirely by a [`StateWitness`].
 ///
-/// `read` panics for any key not present in `witness.witnessed_keys`,
+/// `read` panics for any key not present in `witness.witnessed_keys`, and
+/// for a present key whose path node or value bytes the witness omits,
 /// which makes the SP1 Guest abort proving when the host supplies an
 /// incomplete witness. Writes are applied to the partial trie via
 /// `Trie::insert`; `post_state_root` returns the live root.
@@ -486,5 +487,29 @@ mod tests {
         state.write(b"k", b"v2".to_vec());
         assert_eq!(state.read(b"k").as_deref(), Some(b"v2".as_ref()));
         assert_ne!(state.post_state_root(), pre_root);
+    }
+
+    /// A witness that keeps every node but omits a read key's value still
+    /// authenticates the pre-state root, so the read itself must abort
+    /// rather than report the authenticated record as absent.
+    #[test]
+    #[should_panic(expected = "every reachable value is in the value store")]
+    fn witness_state_aborts_on_a_read_whose_value_was_omitted() {
+        let mut trie = Trie::<Poseidon2Hasher>::new();
+        trie.insert(b"k", b"v".to_vec()).unwrap();
+        let mut nodes = alloc::collections::BTreeMap::new();
+        let mut values = alloc::collections::BTreeMap::new();
+        trie.collect_path_nodes(b"k", &mut nodes, &mut values);
+        let witness = StateWitness {
+            pre_state_root: trie.root(),
+            nodes: nodes
+                .into_iter()
+                .map(|(hash, bytes)| TrieNodeBytes { hash, bytes })
+                .collect(),
+            values: alloc::vec![],
+            witnessed_keys: alloc::vec![b"k".to_vec()],
+        };
+        let mut state = WitnessState::new(&witness).unwrap();
+        let _ = state.read(b"k");
     }
 }

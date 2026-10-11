@@ -6,7 +6,7 @@
 )]
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::governance::{ProposePolicyTx, ProposeUpgradeTx, VoteUpgradeTx};
 use crate::{Address, accountability, governance};
@@ -329,7 +329,9 @@ pub struct WithdrawTx {
 /// same address). The validator's signature is its consent: without it
 /// anyone could bind another address, and its future stake, to a BLS key
 /// the registrant controls and so block that address from registering
-/// itself. The POP, separately, binds the BLS private key to its public key.
+/// itself. The POP, separately, proves the registrant holds the BLS private
+/// key and binds that key to `validator`, so a POP copied from another
+/// registration cannot seat its key here.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisterValidatorTx {
     /// Account paying the deposit and signing the transaction.
@@ -343,8 +345,9 @@ pub struct RegisterValidatorTx {
     /// chunk validator transition stores this on the consensus side; chunk
     /// finality votes are signed with the matching BLS private key.
     pub bls_pubkey: neutrino_primitives::BlsPublicKey,
-    /// BLS proof-of-possession over `bls_pubkey` under the
-    /// `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` DST. The
+    /// BLS proof-of-possession over
+    /// [`registration_pop_message(bls_pubkey, validator)`](neutrino_primitives::registration_pop_message)
+    /// under the `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` DST. The
     /// complete chunk validator transition verifies this; the runtime stores
     /// it as opaque bytes.
     pub pop_signature: neutrino_primitives::BlsSignature,
@@ -474,9 +477,13 @@ fn validator_op_message(
 /// `true` when `signature` is a valid Ed25519 signature by the account key
 /// `signer` over `message`. An address that is not a valid public key never
 /// verifies.
+///
+/// Verification is strict: a small-order key such as the all-zero or
+/// identity address has no secret behind it, and the lenient equation would
+/// let anyone forge its signatures and spend whatever it holds.
 pub(crate) fn verify_signature(signer: &Address, message: &[u8], signature: &[u8; 64]) -> bool {
     VerifyingKey::from_bytes(signer).is_ok_and(|key| {
-        key.verify(message, &Signature::from_bytes(signature))
+        key.verify_strict(message, &Signature::from_bytes(signature))
             .is_ok()
     })
 }

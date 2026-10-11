@@ -230,8 +230,10 @@ fn decode_or_default<T: borsh::BorshDeserialize + Default>(
 /// Candidates carrying a BLS identity that is not yet seated are seated after
 /// the activation delay; invalid possession proofs are ignored, so a
 /// registration with a bad proof may have cost gas but never enters
-/// consensus. A seated address or BLS key is never seated twice, so a slashed
-/// identity cannot return through a fresh registration.
+/// consensus. The proof binds the candidate's address, so copying another
+/// registration's public key and proof cannot claim its key first. A seated
+/// address or BLS key is never seated twice, so a slashed identity cannot
+/// return through a fresh registration.
 ///
 /// A seated validator whose candidate stake is zero exits. Genesis validators
 /// the runtime never heard of keep their specification stake until a
@@ -306,10 +308,15 @@ pub fn derive_next_validators(
         let Some(identity) = candidate.identity else {
             continue;
         };
-        // Neither the address nor the BLS key may already be seated.
+        // Neither the address nor the BLS key may already be seated, and the
+        // key's holder must have registered it at exactly this address.
         if addresses.contains(&candidate.address)
             || keys.contains(&identity.pubkey)
-            || !crate::bls::verify_pop(&identity.pubkey, &identity.pop_signature)
+            || !crate::bls::verify_registration_pop(
+                &identity.pubkey,
+                &candidate.address,
+                &identity.pop_signature,
+            )
         {
             continue;
         }

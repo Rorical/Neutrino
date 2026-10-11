@@ -59,6 +59,9 @@ pub struct Engine<DB: Database> {
     >,
     store: ChainStore<DB>,
     clock: SlotClock,
+    /// Local wall clock in Unix seconds. Peer blocks whose slot has not
+    /// started yet are refused against it.
+    wall_clock: fn() -> u64,
     state: Trie,
     head_height: Height,
     head_hash: BlockHash,
@@ -331,6 +334,7 @@ impl<DB: Database> Engine<DB> {
             consensus_domain,
             store,
             clock,
+            wall_clock: crate::clock::system_unix_secs,
             state: parts.state,
             head_height: parts.head_height,
             head_hash: parts.head_hash,
@@ -689,6 +693,18 @@ impl<DB: Database> Engine<DB> {
     #[must_use]
     pub const fn clock(&self) -> &SlotClock {
         &self.clock
+    }
+
+    /// Current local wall-clock time in Unix seconds.
+    #[must_use]
+    pub fn wall_clock_secs(&self) -> u64 {
+        (self.wall_clock)()
+    }
+
+    /// Replace the local wall clock, for simulations that run ahead of or
+    /// behind real time.
+    pub const fn set_wall_clock(&mut self, wall_clock: fn() -> u64) {
+        self.wall_clock = wall_clock;
     }
 
     /// Height of the current local head.

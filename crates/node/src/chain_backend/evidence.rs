@@ -9,7 +9,7 @@ use neutrino_consensus_types::{
     },
 };
 use neutrino_default_runtime_core::{
-    Transaction,
+    Transaction, absent_key,
     accountability::{
         GAS_EVIDENCE_ADMISSION, PendingSanction, QUEUE_KEY, marker_key, offence_key, slashed_key,
     },
@@ -357,6 +357,9 @@ where
                 {
                     continue;
                 }
+                if !liveness_certified(engine, &artifact.statement) {
+                    continue;
+                }
                 let Ok(submission) =
                     engine.evidence_submission_with_path(&artifact.statement, &report.history)
                 else {
@@ -508,6 +511,22 @@ fn install_local_artifact<DB: Database>(
 
 /// Snapshot jumps may leave verified receipts awaiting a reporter's refreshed
 /// path. Those bounded dormant entries cannot suppress a usable safety report.
+/// `false` for a liveness claim against a validator its chunk's certified
+/// precommit counted, which the runtime refuses. A chunk's report lands with
+/// the first block of the next chunk, so claims against the chunk just
+/// finalized wait one block.
+fn liveness_certified<DB: Database>(
+    engine: &neutrino_consensus_engine::Engine<DB>,
+    statement: &neutrino_consensus_types::evidence::EvidenceStatement,
+) -> bool {
+    statement.kind != SanctionKind::Inactivity
+        || engine
+            .state()
+            .get(&absent_key(statement.context.chunk_id))
+            .and_then(|bytes| borsh::from_slice::<Vec<[u8; 32]>>(&bytes).ok())
+            .is_some_and(|absent| absent.contains(&statement.offender.withdrawal_credentials))
+}
+
 fn ready_artifacts<DB: Database>(
     engine: &neutrino_consensus_engine::Engine<DB>,
 ) -> Result<Vec<EvidenceArtifact>, neutrino_consensus_engine::FinalizeError<DB::Error>> {

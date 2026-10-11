@@ -32,6 +32,10 @@ pub const WITHDRAWAL_KEY_PREFIX: &[u8; 4] = b"wdr:";
 /// records: `registration_key(addr) = REGISTRATION_KEY_PREFIX || addr`.
 /// Each key holds a borsh-encoded [`ValidatorRegistration`].
 pub const REGISTRATION_KEY_PREFIX: &[u8; 4] = b"reg:";
+/// Prefix used to derive state keys for per-validator bonding records:
+/// `bonding_key(addr) = BONDING_KEY_PREFIX || addr`. Each key holds a
+/// borsh-encoded [`Bonding`].
+pub const BONDING_KEY_PREFIX: &[u8; 5] = b"bond:";
 /// Canonical key holding the [`ValidatorSet`] summary.
 pub const VALIDATOR_SET_KEY: &[u8] = b"validator_set";
 /// Canonical key holding the [`ValidatorRegistrations`] index.
@@ -62,6 +66,12 @@ pub const CONSENSUS_CANDIDATES_KEY: &[u8] = b"consensus:candidates";
 /// Canonical key of the latest certified [`ParticipationReport`] the runtime
 /// consumed, available to reward and liveness rules.
 pub const PARTICIPATION_KEY: &[u8] = b"consensus:participation";
+/// Prefix of the per-chunk certified absence lists.
+///
+/// `absent_key(chunk_id) = ABSENT_KEY_PREFIX || chunk_id BE8`. Each key holds
+/// the `absent` addresses of that chunk's [`ParticipationReport`] while
+/// liveness evidence against the chunk is admissible.
+pub const ABSENT_KEY_PREFIX: &[u8] = b"consensus:absent:";
 /// Domain tag of [`ConsensusCandidates::root`].
 pub const DOMAIN_CONSENSUS_CANDIDATES_ROOT: &[u8; 16] = b"NTRO/candidates\x00";
 
@@ -95,6 +105,18 @@ pub fn registration_key(addr: &Address) -> Vec<u8> {
 #[must_use]
 pub fn withdrawal_key(addr: &Address) -> Vec<u8> {
     prefixed_key(WITHDRAWAL_KEY_PREFIX, addr)
+}
+
+/// Build the certified-absence key of `chunk_id`.
+#[must_use]
+pub fn absent_key(chunk_id: u64) -> Vec<u8> {
+    prefixed_key(ABSENT_KEY_PREFIX, &chunk_id.to_be_bytes())
+}
+
+/// Build the bonding-record state key for `addr`.
+#[must_use]
+pub fn bonding_key(addr: &Address) -> Vec<u8> {
+    prefixed_key(BONDING_KEY_PREFIX, addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +357,9 @@ pub(crate) fn store_runtime_policy<B: StateBackend>(state: &mut B, policy: &Runt
 pub struct BlsIdentity {
     /// BLS12-381 G1 compressed public key (min-pk POP scheme).
     pub pubkey: neutrino_primitives::BlsPublicKey,
-    /// Proof of possession the chunk Guest verifies before seating the key.
+    /// Proof of possession the chunk Guest verifies before seating the key,
+    /// bound to the candidate's address; see
+    /// [`neutrino_primitives::registration_pop_message`].
     pub pop_signature: neutrino_primitives::BlsSignature,
 }
 
@@ -433,6 +457,10 @@ pub fn load_participation<B: StateBackend>(state: &mut B) -> Option<Participatio
 /// Record a newer certified report and return the commitment the block
 /// commits for its input. Reports arrive once per chunk and repeat in every
 /// block of that chunk, so only a strictly newer chunk writes.
+///
+/// The report's absence list is kept for as long as liveness evidence may
+/// cite its chunk, the eight preceding chunks, so admission can charge only
+/// validators the certified precommit left out.
 pub(crate) fn apply_participation<B: StateBackend>(
     state: &mut B,
     report: Option<&ParticipationReport>,
@@ -441,8 +469,25 @@ pub(crate) fn apply_participation<B: StateBackend>(
         && load_participation(state).is_none_or(|latest| latest.chunk_id < report.chunk_id)
     {
         write_record(state, PARTICIPATION_KEY, report);
+        write_record(state, &absent_key(report.chunk_id), &report.absent);
+        if let Some(expired) = report
+            .chunk_id
+            .checked_sub(neutrino_consensus_types::history::HISTORY_RETENTION_CHUNKS)
+        {
+            state.delete(&absent_key(expired));
+        }
     }
     participation_commitment(report)
+}
+
+/// `true` when `address` was certified absent from `chunk_id`'s precommit.
+pub(crate) fn certified_absent<B: StateBackend>(
+    state: &mut B,
+    chunk_id: u64,
+    address: &Address,
+) -> bool {
+    read_canonical::<Vec<Address>, _>(state, &absent_key(chunk_id))
+        .is_some_and(|absent| absent.contains(address))
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +549,18 @@ pub fn encode_validator(validator: &Validator) -> Vec<u8> {
 }
 
 pub(crate) fn load_validator<B: StateBackend>(state: &mut B, addr: &Address) -> Validator {
-    read_record(state, &validator_key(addr)).unwrap_or_default()
+    load_validator_record(state, addr).unwrap_or_default()
+}
+
+/// `addr`'s validator record, or `None` when the runtime holds none.
+///
+/// Only genesis and [`Transaction::RegisterValidator`](crate::Transaction::RegisterValidator)
+/// create a record; stake and deposit add to an existing one.
+pub(crate) fn load_validator_record<B: StateBackend>(
+    state: &mut B,
+    addr: &Address,
+) -> Option<Validator> {
+    read_record(state, &validator_key(addr))
 }
 
 pub(crate) fn store_validator<B: StateBackend>(
@@ -580,6 +636,29 @@ pub(crate) fn store_validator_set<B: StateBackend>(state: &mut B, set: &Validato
     write_record(state, VALIDATOR_SET_KEY, set);
 }
 
+/// Stake recently added to a validator, stored under [`bonding_key`].
+///
+/// Governance does not count `amount` until
+/// [`UPGRADE_VOTER_MIN_AGE_BLOCKS`](crate::governance::UPGRADE_VOTER_MIN_AGE_BLOCKS)
+/// blocks have passed since `since_height`, the latest addition. Stake and
+/// deposit write it; the stake a registration bonds is covered by the
+/// registration's own age instead.
+#[derive(BorshDeserialize, BorshSerialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Bonding {
+    /// Stake added since the record last matured.
+    pub amount: u128,
+    /// Height of the latest addition.
+    pub since_height: u64,
+}
+
+pub(crate) fn load_bonding<B: StateBackend>(state: &mut B, addr: &Address) -> Option<Bonding> {
+    read_record(state, &bonding_key(addr))
+}
+
+pub(crate) fn store_bonding<B: StateBackend>(state: &mut B, addr: &Address, bonding: &Bonding) {
+    write_record(state, &bonding_key(addr), bonding);
+}
+
 // ---------------------------------------------------------------------------
 // Registrations
 // ---------------------------------------------------------------------------
@@ -597,11 +676,12 @@ pub struct ValidatorRegistration {
     pub address: Address,
     /// BLS12-381 G1 compressed public key (min-pk POP scheme).
     pub bls_pubkey: neutrino_primitives::BlsPublicKey,
-    /// BLS proof-of-possession over `bls_pubkey`. The runtime stores
-    /// this as opaque bytes; the complete chunk validator transition verifies
-    /// it under the `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
-    /// DST before lifting the registration into the consensus
-    /// active validator set.
+    /// BLS proof-of-possession over
+    /// [`registration_pop_message(bls_pubkey, address)`](neutrino_primitives::registration_pop_message).
+    /// The runtime stores this as opaque bytes; the complete chunk validator
+    /// transition verifies it under the
+    /// `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` DST before lifting the
+    /// registration into the consensus active validator set.
     pub pop_signature: neutrino_primitives::BlsSignature,
     /// Height of the block that registered the validator. Governance
     /// weights only registrations older than a minimum age, so freshly

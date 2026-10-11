@@ -57,6 +57,20 @@ pub fn verify_pop(key: &BlsPublicKey, proof: &BlsSignature) -> bool {
     public_key(key).is_some_and(|point| verify_point(point, key, proof, POP_DST))
 }
 
+/// Verify a registration's proof of possession for the registering `address`.
+///
+/// The proof signs [`neutrino_primitives::registration_pop_message`], so a
+/// proof copied from another registration fails for any other address.
+#[must_use]
+pub fn verify_registration_pop(
+    key: &BlsPublicKey,
+    address: &neutrino_primitives::Hash,
+    proof: &BlsSignature,
+) -> bool {
+    let message = neutrino_primitives::registration_pop_message(key, address);
+    public_key(key).is_some_and(|point| verify_point(point, &message, proof, POP_DST))
+}
+
 /// Verify a same-message aggregate over a nonempty set of authenticated keys.
 ///
 /// Callers must authenticate key membership and prior possession checks;
@@ -325,6 +339,14 @@ mod tests {
         assert!(verify_pop(&pk, &key.prove_possession().to_bytes()));
         assert!(!verify(&pk, &pk, &key.prove_possession().to_bytes()));
         assert!(!verify_pop(&pk, &key.sign(&pk).to_bytes()));
+        let registration = key.prove_registration(&[7; 32]).to_bytes();
+        assert!(verify_registration_pop(&pk, &[7; 32], &registration));
+        assert!(!verify_registration_pop(&pk, &[8; 32], &registration));
+        assert!(!verify_registration_pop(
+            &pk,
+            &[7; 32],
+            &key.prove_possession().to_bytes()
+        ));
     }
 
     #[test]

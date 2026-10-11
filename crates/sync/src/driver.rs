@@ -606,6 +606,13 @@ impl SyncDriver {
                 self.reset_and_rehandshake().await;
                 MessageAcceptance::Ignore
             }
+            Err(SyncBackendError::NotAvailable(reason)) => {
+                // Not usable locally yet (a slot that has not started, or
+                // checkpoint state still downloading), but not shown invalid:
+                // neither relay it nor penalise the peer.
+                debug!(%reason, %source, "ignoring gossipped block for now");
+                MessageAcceptance::Ignore
+            }
             Err(err) => {
                 warn!(?err, %source, "rejecting gossipped block");
                 MessageAcceptance::Reject

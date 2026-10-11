@@ -125,6 +125,18 @@ impl SecretKey {
         let pk_bytes = self.public_key().to_bytes();
         Signature(self.0.sign(&pk_bytes, POP_DST, &[]))
     }
+
+    /// Produce the proof of possession a validator registration carries.
+    ///
+    /// Signs [`neutrino_primitives::registration_pop_message`] under
+    /// [`POP_DST`], binding the key to the registering `address` so the proof
+    /// cannot seat the key at any other address. Verified with
+    /// [`PublicKey::verify_registration`].
+    pub fn prove_registration(&self, address: &[u8; 32]) -> Signature {
+        let message =
+            neutrino_primitives::registration_pop_message(&self.public_key().to_bytes(), address);
+        Signature(self.0.sign(&message, POP_DST, &[]))
+    }
 }
 
 impl PublicKey {
@@ -157,6 +169,20 @@ impl PublicKey {
     pub fn verify_pop(&self, pop: &Signature) -> Result<(), CryptoError> {
         let pk_bytes = self.to_bytes();
         match pop.0.verify(true, &pk_bytes, POP_DST, &[], &self.0, true) {
+            BLST_ERROR::BLST_SUCCESS => Ok(()),
+            _ => Err(CryptoError::Verification),
+        }
+    }
+
+    /// Verify a registration proof produced by
+    /// [`SecretKey::prove_registration`] for `address`.
+    pub fn verify_registration(
+        &self,
+        address: &[u8; 32],
+        pop: &Signature,
+    ) -> Result<(), CryptoError> {
+        let message = neutrino_primitives::registration_pop_message(&self.to_bytes(), address);
+        match pop.0.verify(true, &message, POP_DST, &[], &self.0, true) {
             BLST_ERROR::BLST_SUCCESS => Ok(()),
             _ => Err(CryptoError::Verification),
         }
@@ -337,6 +363,21 @@ mod tests {
         let pk = sk.public_key();
         let pop = sk.prove_possession();
         pk.verify_pop(&pop).expect("verify_pop");
+    }
+
+    #[test]
+    fn registration_proof_binds_the_registering_address() {
+        let sk = gen_sk();
+        let pk = sk.public_key();
+        let proof = sk.prove_registration(&[1; 32]);
+        pk.verify_registration(&[1; 32], &proof)
+            .expect("verify_registration");
+        assert!(pk.verify_registration(&[2; 32], &proof).is_err());
+        assert!(pk.verify_pop(&proof).is_err());
+        assert!(
+            pk.verify_registration(&[1; 32], &sk.prove_possession())
+                .is_err()
+        );
     }
 
     #[test]

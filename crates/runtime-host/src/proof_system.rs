@@ -144,8 +144,9 @@ pub struct Sp1ProofSystem<P: Prover> {
     pub(super) fact_proving: Mutex<()>,
     /// Exact-byte cache of verified history and chunk receipts.
     pub(super) histories: Mutex<super::history_prover::HistoryCache>,
-    /// Exact-byte cache of verified block receipts.
-    blocks: Mutex<BoundedCache<Hash, VerifiedBlock>>,
+    /// Exact-byte cache of verified block receipts, keyed by the block
+    /// program each was verified under and the receipt bytes' hash.
+    blocks: Mutex<BoundedCache<(VkDigest, Hash), VerifiedBlock>>,
 }
 
 impl<P> Sp1ProofSystem<P>
@@ -542,7 +543,11 @@ where
         if proof.bytes.len() > neutrino_prover_chunk::proof_verification::MAX_PROOF_BYTES - 4 {
             return Err(ProofError::MalformedProof);
         }
-        let identity = neutrino_primitives::blake3_256(&proof.bytes);
+        // A receipt verified under one program says nothing about another.
+        let identity = (
+            inputs.block_program,
+            neutrino_primitives::blake3_256(&proof.bytes),
+        );
         let cached = self
             .blocks
             .lock()

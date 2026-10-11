@@ -357,13 +357,15 @@ fn signed_unstake(sk: &SigningKey, amount: u128, nonce: u64, chain_id: u64) -> U
 fn stake_moves_balance_to_stake_and_updates_set_root() {
     let alice = signing_key(10);
     let addr = address_of(&alice);
-    let live = live_with_account(
+    let mut live = live_with_account(
         addr,
         Account {
             nonce: 0,
             balance: 100 + FEE_FUNDS,
         },
     );
+    // Stake and deposit add to an existing validator record.
+    seed_validator(&mut live, &addr, 0);
 
     let pre_root = ConsensusCandidates::default().root();
     let input = StfInput {
@@ -394,13 +396,15 @@ fn unstake_after_stake_queues_withdrawal_and_zeroes_candidate_stake() {
     // zero.
     let alice = signing_key(11);
     let addr = address_of(&alice);
-    let live = live_with_account(
+    let mut live = live_with_account(
         addr,
         Account {
             nonce: 0,
             balance: 100 + FEE_FUNDS,
         },
     );
+    // Stake and deposit add to an existing validator record.
+    seed_validator(&mut live, &addr, 0);
 
     let stake = signed_stake(&alice, 40, 0, CHAIN_ID);
     let unstake = signed_unstake(&alice, 40, 1, CHAIN_ID);
@@ -1216,13 +1220,15 @@ fn deposit_moves_balance_from_depositor_to_validator_stake() {
     let bob = signing_key(41); // validator (separate party)
     let alice_addr = address_of(&alice);
     let bob_addr = address_of(&bob);
-    let live = live_with_account(
+    let mut live = live_with_account(
         alice_addr,
         Account {
             nonce: 0,
             balance: 100 + FEE_FUNDS,
         },
     );
+    // Stake and deposit add to an existing validator record.
+    seed_validator(&mut live, &bob_addr, 0);
 
     let tx = Transaction::Deposit(signed_deposit(&alice, bob_addr, 60, 0, CHAIN_ID));
     let input = StfInput {
@@ -1590,13 +1596,15 @@ fn full_unstake_withdraw_lifecycle_round_trips() {
     // Block at H = 2 + DEFAULT_UNBONDING_DELAY_BLOCKS: withdraw drains it.
     let alice = signing_key(49);
     let addr = address_of(&alice);
-    let live = live_with_account(
+    let mut live = live_with_account(
         addr,
         Account {
             nonce: 0,
             balance: 100 + FEE_FUNDS,
         },
     );
+    // Stake and deposit add to an existing validator record.
+    seed_validator(&mut live, &addr, 0);
 
     // Block 1.
     let input1 = StfInput {
@@ -2303,6 +2311,46 @@ fn empty_block_does_not_touch_proposer_account() {
 }
 
 #[test]
+fn a_small_order_address_cannot_be_spent_with_a_forged_signature() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    // The identity point: a valid encoding with no secret key behind it.
+    let mut identity = [0_u8; 32];
+    identity[0] = 1;
+    let live = live_with_account(
+        identity,
+        Account {
+            nonce: 0,
+            balance: 100 + FEE_FUNDS,
+        },
+    );
+    let mut tx = TransferTx {
+        from: identity,
+        to: [0xAB; 32],
+        amount: 100,
+        nonce: 0,
+        signature: [0; 64],
+    };
+    // R = identity and s = 0 satisfy the lenient equation for any message.
+    tx.signature[..32].copy_from_slice(&identity);
+    let message = transfer_sig_message(CHAIN_ID, &tx);
+    assert!(
+        VerifyingKey::from_bytes(&identity)
+            .unwrap()
+            .verify(&message, &Signature::from_bytes(&tx.signature))
+            .is_ok()
+    );
+    let transfer = Transaction::Transfer(tx);
+    assert_eq!(
+        validate_against(&live, &transfer).code,
+        TxValidationCode::BadSignature
+    );
+    let (host_out, guest_out) =
+        dry_run_then_replay(&fee_input(alloc::vec![transfer], [0; 32]), &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!((host_out.applied, host_out.failed), (0, 1));
+}
+
+#[test]
 fn validate_tx_rejects_transfer_when_balance_short_of_fee() {
     let alice = signing_key(85);
     let live = live_with_account(
@@ -2325,13 +2373,15 @@ fn validate_tx_accepts_deposit_voluntary_exit_and_withdraw() {
     // Deposit: funded depositor.
     let alice = signing_key(60);
     let bob_addr = [0xBB; 32];
-    let live = live_with_account(
+    let mut live = live_with_account(
         address_of(&alice),
         Account {
             nonce: 0,
             balance: 100 + FEE_FUNDS,
         },
     );
+    // Stake and deposit add to an existing validator record.
+    seed_validator(&mut live, &bob_addr, 0);
     let deposit = Transaction::Deposit(signed_deposit(&alice, bob_addr, 50, 0, CHAIN_ID));
     assert_eq!(
         validate_against(&live, &deposit).code,
@@ -2524,6 +2574,9 @@ fn minimum_stake_bounds_bonding_and_partial_unstakes() {
         },
     );
     funded(&mut live, alice_addr);
+    // Stake and deposit add to an existing validator record.
+    seed_validator(&mut live, &alice_addr, 0);
+    seed_validator(&mut live, &[0xBB; 32], 0);
     // Each case: the transaction, and whether the minimum admits it.
     let cases = [
         (

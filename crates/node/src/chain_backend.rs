@@ -2054,6 +2054,11 @@ where
             lagging if lagging.awaits_local_finality() => {
                 SyncBackendError::ChainBehind(lagging.to_string())
             }
+            // The slot has not started here; a lagging local clock sees honest
+            // blocks this way, so the block is unusable now but not invalid.
+            early @ ImportError::FutureSlot { .. } => {
+                SyncBackendError::NotAvailable(early.to_string())
+            }
             other => SyncBackendError::Rejected(other.to_string()),
         }
     }

@@ -20,8 +20,8 @@ use neutrino_consensus_types::evidence::EvidenceAnchor;
 use neutrino_runtime_core::StateBackend;
 
 use crate::state::{
-    load_account, load_validator_registration, load_validator_set, read_record, store_account,
-    store_runtime_policy, write_record,
+    Bonding, load_account, load_bonding, load_validator_registration, load_validator_set,
+    read_record, store_account, store_bonding, store_runtime_policy, write_record,
 };
 use crate::tx::verify_signature;
 use crate::{
@@ -68,13 +68,14 @@ pub const UPGRADE_VOTING_PERIOD_CHUNKS: u64 = 64;
 /// proposal before it is enacted, as `(numerator, denominator)`.
 pub const UPGRADE_QUORUM: (u128, u128) = (2, 3);
 
-/// Blocks a registration must have aged before its stake counts in
-/// governance, as proposer, voter or quorum denominator.
+/// Blocks a registration, and any stake added to a validator afterwards,
+/// must have aged before it counts in governance, as proposer, voter or
+/// quorum denominator.
 ///
 /// Consensus seats a registration only after its activation delay;
 /// governance must not let freshly deposited stake decide an upgrade sooner
 /// than that. Genesis validators have no registration record and are always
-/// eligible.
+/// eligible; their later additions age like anyone else's.
 pub const UPGRADE_VOTER_MIN_AGE_BLOCKS: u64 = 1024;
 
 /// `domain || chain_id || proposer || proposal_id || nonce`.
@@ -361,33 +362,82 @@ fn proposal_shape_ok(tx: &ProposeUpgradeTx, current_chunk: u64) -> bool {
             .is_some_and(|latest| tx.activate_at_chunk <= latest)
 }
 
-/// `true` when `addr` may take part in governance at `block_height`: it has
-/// no registration record (a genesis validator) or registered at least
-/// [`UPGRADE_VOTER_MIN_AGE_BLOCKS`] ago. Without a height (mempool
-/// admission) every seated validator is treated as eligible.
-fn eligible<B: StateBackend>(state: &mut B, addr: &Address, block_height: Option<u64>) -> bool {
-    let Some(height) = block_height else {
-        return true;
-    };
-    load_validator_registration(state, addr).is_none_or(|registration| {
-        registration
-            .registered_at_height
-            .checked_add(UPGRADE_VOTER_MIN_AGE_BLOCKS)
-            .is_some_and(|mature| height >= mature)
-    })
+/// `true` once [`UPGRADE_VOTER_MIN_AGE_BLOCKS`] have passed since `since`.
+fn aged(since: u64, height: u64) -> bool {
+    since
+        .checked_add(UPGRADE_VOTER_MIN_AGE_BLOCKS)
+        .is_some_and(|mature| height >= mature)
 }
 
-/// The seated validators eligible for governance at `block_height`; the
-/// quorum denominator is their stake, not the whole active set's.
+/// Part of `addr`'s `bonded` stake that counts in governance at `height`.
+///
+/// Nothing counts until the registration has aged. A validator without one
+/// is a genesis validator: stake and deposit only add to an existing record,
+/// so only genesis and registration create one. Stake added after that is
+/// left out until it has aged too, so freshly bonded funds cannot decide an
+/// upgrade. A later unstake or deduction is charged against the counted
+/// stake first, which only ever undercounts.
+fn governance_weight<B: StateBackend>(
+    state: &mut B,
+    addr: &Address,
+    bonded: u128,
+    height: u64,
+) -> u128 {
+    if load_validator_registration(state, addr)
+        .is_some_and(|registration| !aged(registration.registered_at_height, height))
+    {
+        return 0;
+    }
+    load_bonding(state, addr)
+        .filter(|bonding| !aged(bonding.since_height, height))
+        .map_or(bonded, |bonding| bonded.saturating_sub(bonding.amount))
+}
+
+/// Record `amount` newly bonded behind `addr` at `height`.
+///
+/// Unaged additions share one record whose clock restarts with each of them,
+/// so governance reads a single key per validator however often stake is
+/// added.
+pub(crate) fn record_bond<B: StateBackend>(
+    state: &mut B,
+    addr: &Address,
+    amount: u128,
+    height: u64,
+) {
+    let unaged = load_bonding(state, addr)
+        .filter(|bonding| !aged(bonding.since_height, height))
+        .map_or(0, |bonding| bonding.amount);
+    store_bonding(
+        state,
+        addr,
+        &Bonding {
+            amount: unaged.saturating_add(amount),
+            since_height: height,
+        },
+    );
+}
+
+/// The seated validators eligible for governance at `block_height`, each
+/// weighted by its [`governance_weight`]; the quorum denominator is their
+/// counted stake, not the whole active set's. Without a height (mempool
+/// admission) every seated validator counts in full.
 fn governance_set<B: StateBackend>(state: &mut B, block_height: Option<u64>) -> ValidatorSet {
     let mut set = load_validator_set(state);
-    let eligible_entries: Vec<_> = set
-        .entries
-        .iter()
-        .filter(|entry| entry.stake > 0 && eligible(state, &entry.address, block_height))
-        .copied()
-        .collect();
-    set.entries = eligible_entries;
+    let Some(height) = block_height else {
+        set.entries.retain(|entry| entry.stake > 0);
+        return set;
+    };
+    let mut counted = Vec::with_capacity(set.entries.len());
+    for entry in &set.entries {
+        let weight = governance_weight(state, &entry.address, entry.stake, height);
+        if weight > 0 {
+            counted.push(crate::ValidatorSetEntry {
+                stake: weight,
+                ..*entry
+            });
+        }
+    }
+    set.entries = counted;
     set
 }
 
@@ -687,7 +737,7 @@ mod tests {
     use neutrino_consensus_types::history_proof::ExecutionPrograms;
     use neutrino_runtime_core::host::{LiveTrie, TracingState};
 
-    use crate::test_support::{apply_against, signing_key};
+    use crate::test_support::{apply_against, seed_policy, signing_key};
 
     const CHAIN_ID: u64 = 42;
 
@@ -1209,6 +1259,80 @@ mod tests {
         assert_eq!(applied, 1);
         assert!(status.scheduled.is_none());
         assert!(status.proposal.is_some());
+    }
+
+    fn stake(sk: &SigningKey, amount: u128, nonce: u64) -> Transaction {
+        let mut tx = crate::StakeTx {
+            validator: sk.verifying_key().to_bytes(),
+            amount,
+            nonce,
+            signature: [0; 64],
+        };
+        tx.signature = sk.sign(&crate::stake_sig_message(CHAIN_ID, &tx)).to_bytes();
+        Transaction::Stake(tx)
+    }
+
+    fn low_stake_floor(live: &mut LiveTrie) {
+        seed_policy(
+            live,
+            &RuntimePolicy {
+                min_validator_stake: 1,
+                ..RuntimePolicy::default()
+            },
+        );
+    }
+
+    #[test]
+    fn stake_cannot_mint_a_validator_that_governance_would_count() {
+        let (honest, whale) = (signing_key(1), signing_key(2));
+        let mut live = live(&[(&honest, 100)]);
+        low_stake_floor(&mut live);
+        // Liquid balance only: no validator record and no registration.
+        live.insert(
+            &account_key(&whale.verifying_key().to_bytes()),
+            encode_account(&Account {
+                nonce: 0,
+                balance: 1_000_000,
+            }),
+        );
+        let (applied, failed, status) = run(
+            &live,
+            &block(
+                0,
+                vec![
+                    stake(&whale, 500_000, 0),
+                    propose(&whale, programs(2), 1, 0),
+                ],
+            ),
+        );
+        assert_eq!((applied, failed), (0, 2));
+        assert_eq!(status, UpgradeStatus::default());
+    }
+
+    #[test]
+    fn stake_added_to_a_validator_counts_in_governance_once_aged() {
+        let (honest, whale) = (signing_key(1), signing_key(2));
+        // Genesis validators; the whale holds a third of the stake.
+        let mut live = live(&[(&honest, 200), (&whale, 100)]);
+        low_stake_floor(&mut live);
+        let mut bonding = block(0, vec![stake(&whale, 500_000, 0)]);
+        bonding.block_height = 10;
+        let (out, live) = apply_against(&live, &bonding);
+        assert_eq!((out.applied, out.failed), (1, 0));
+
+        // Until the addition ages, the whale weighs only its genesis third.
+        let mut young = block(0, vec![propose(&whale, programs(2), 1, 1)]);
+        young.block_height = 10 + UPGRADE_VOTER_MIN_AGE_BLOCKS - 1;
+        let (applied, _, status) = run(&live, &young);
+        assert_eq!(applied, 1);
+        assert!(status.scheduled.is_none());
+        assert!(status.proposal.is_some());
+
+        let mut aged = young;
+        aged.block_height += 1;
+        let (applied, _, status) = run(&live, &aged);
+        assert_eq!(applied, 1);
+        assert!(status.scheduled.is_some());
     }
 
     #[test]

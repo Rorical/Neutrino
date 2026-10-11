@@ -66,6 +66,8 @@ execution. Guest recursion independently checks the same receipts; no supplied
 boolean authorizes state changes. Sanction deductions are internal STF operations; the transaction format has no
 raw Slash/Leak authorization variants. Inactivity is expressed as an evidence
 statement too, without treating certificate non-inclusion as proof of silence.
+The runtime admits it only against a validator the chunk's certified precommit
+left out, as recorded by that chunk's participation report.
 
 ## Execution and liveness
 
@@ -311,9 +313,15 @@ Historical context commits the chunk, membership, seed, historical Block Guest a
 runtime artifact hash, independently of a certificate's signer subset. Different
 valid certificates must produce the same
 incoming historical root. Inactivity retains the protocol's narrow meaning:
-non-inclusion in the submitted valid certificate, not proof that a validator
+non-inclusion in the chunk's certified precommit, not proof that a validator
 never voted. The exact submitted certificate is checked by Evidence Guest using
 recursively authenticated cryptographic facts and committed by the claim; its resulting transaction is ordered by consensus.
+Because any quorum subset of published precommits forms a valid certificate, the
+submitted certificate alone does not decide absence: the runtime keeps the `absent`
+list of each certified `ParticipationReport` (state key `consensus:absent:<chunk>`)
+for the eight-chunk liveness window and refuses a claim against any validator not on
+the cited chunk's list. A chunk's report arrives with the first block of the next
+chunk, so producers defer such claims until it has landed.
 Every claim binds the complete chain-spec hash and block program identity.
 
 Receipt bytes are capped at 2 MiB. The off-chain cache holds at most 256 reports

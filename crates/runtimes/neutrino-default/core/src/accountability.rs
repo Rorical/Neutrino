@@ -877,10 +877,19 @@ pub(crate) mod tests {
                 balance: funds,
             }),
         );
+        let fee = u128::from(crate::GAS_WITHDRAW) * RuntimePolicy::default().gas_price;
         let mut state = TracingState::new(&live);
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.failed, 1);
-        assert_eq!(crate::state::load_account(&mut state, &address).nonce, 0);
+        // The held withdrawal was the sender's to authorize: it pays its fee
+        // and spends its nonce, but releases nothing.
+        assert_eq!(
+            crate::state::load_account(&mut state, &address),
+            crate::Account {
+                nonce: 1,
+                balance: funds - fee,
+            }
+        );
         assert_eq!(
             crate::state::load_withdrawal_queue(&mut state, &address).total(),
             100
@@ -894,14 +903,17 @@ pub(crate) mod tests {
         let restored = LiveTrie::from_trie(post);
         let mut state = TracingState::new(&restored);
         input.block_height += 1;
+        withdraw.nonce = 1;
+        withdraw.signature = key
+            .sign(&crate::withdraw_sig_message(7, &withdraw))
+            .to_bytes();
         input.transactions = vec![Transaction::Withdraw(withdraw)];
         let output = crate::apply_block(&input, &mut state);
         assert_eq!(output.applied, 1);
         assert_eq!(output.failed, 0);
-        let fee = u128::from(crate::GAS_WITHDRAW) * RuntimePolicy::default().gas_price;
         assert_eq!(
             crate::state::load_account(&mut state, &address).balance,
-            funds + 70 - fee
+            funds + 70 - 2 * fee
         );
         assert_eq!(load_queue(&mut state), [] as [PendingSanction; 0]);
         assert_eq!(

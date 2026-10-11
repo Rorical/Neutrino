@@ -25,8 +25,8 @@ use crate::state::{
 };
 use crate::tx::verify_signature;
 use crate::{
-    Account, Address, ProgramSet, ReceiptStatus, RuntimePolicy, ScheduledUpgrade, UPGRADE_KEY,
-    ValidatorSet,
+    Account, Address, Failure, ProgramSet, ReceiptStatus, RuntimePolicy, ScheduledUpgrade,
+    UPGRADE_KEY, ValidatorSet,
 };
 pub use neutrino_consensus_types::history_proof::ProgramArtifacts;
 
@@ -443,7 +443,8 @@ fn governance_set<B: StateBackend>(state: &mut B, block_height: Option<u64>) -> 
 
 /// Signer checks shared by both transactions: signature, nonce, fee and
 /// eligible-validator membership. Returns the signer's account and the
-/// governance set on success.
+/// governance set on success. Once signature, nonce and fee pass, the signer
+/// has authorized the transaction and pays for any later failure.
 fn authorize_signer<B: StateBackend>(
     state: &mut B,
     signer: &Address,
@@ -452,16 +453,16 @@ fn authorize_signer<B: StateBackend>(
     fee: u128,
     message: &[u8],
     signature: &[u8; 64],
-) -> Result<(Account, ValidatorSet), ReceiptStatus> {
+) -> Result<(Account, ValidatorSet), Failure> {
     if !verify_signature(signer, message, signature) {
-        return Err(ReceiptStatus::BadSignature);
+        return Err(ReceiptStatus::BadSignature.into());
     }
     let account = load_account(state, signer);
     if account.nonce != nonce {
-        return Err(ReceiptStatus::NonceMismatch);
+        return Err(ReceiptStatus::NonceMismatch.into());
     }
     if account.balance < fee {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(ReceiptStatus::InsufficientBalance.into());
     }
     let set = governance_set(state, block_height);
     if set
@@ -469,7 +470,7 @@ fn authorize_signer<B: StateBackend>(
         .binary_search_by(|entry| entry.address.cmp(signer))
         .is_err()
     {
-        return Err(ReceiptStatus::Unauthorized);
+        return Err(Failure::charged(ReceiptStatus::Unauthorized, *signer));
     }
     Ok((account, set))
 }
@@ -478,7 +479,8 @@ fn authorize_signer<B: StateBackend>(
 ///
 /// Mempool admission has none: it skips every chunk-relative rule (lead
 /// time, slot conflicts, proposal liveness, queue fit), which execution
-/// enforces; a proposal that turns out stale then fails without a fee.
+/// enforces; a proposal that turns out stale then fails there and pays its
+/// fee.
 pub(crate) struct BlockContext<'a> {
     /// Chunk containing the block.
     pub(crate) chunk: u64,
@@ -497,12 +499,8 @@ pub(crate) fn check_propose<B: StateBackend>(
     block: Option<&BlockContext<'_>>,
     fee: u128,
     tx: &ProposeUpgradeTx,
-) -> Result<(Account, ValidatorSet), ReceiptStatus> {
-    if !tx.programs.is_complete() || block.is_some_and(|block| !proposal_shape_ok(tx, block.chunk))
-    {
-        return Err(ReceiptStatus::InvalidUpgrade);
-    }
-    check_new_proposal(
+) -> Result<(Account, ValidatorSet), Failure> {
+    let authorized = check_new_proposal(
         state,
         block,
         fee,
@@ -510,7 +508,12 @@ pub(crate) fn check_propose<B: StateBackend>(
         tx.nonce,
         &propose_upgrade_sig_message(chain_id, tx),
         &tx.signature,
-    )
+    )?;
+    if !tx.programs.is_complete() || block.is_some_and(|block| !proposal_shape_ok(tx, block.chunk))
+    {
+        return Err(Failure::charged(ReceiptStatus::InvalidUpgrade, tx.proposer));
+    }
+    Ok(authorized)
 }
 
 /// Checks of a policy proposal. Execution checks the genesis-fixed facts of
@@ -522,15 +525,8 @@ pub(crate) fn check_propose_policy<B: StateBackend>(
     block: Option<&BlockContext<'_>>,
     fee: u128,
     tx: &ProposePolicyTx,
-) -> Result<(Account, ValidatorSet), ReceiptStatus> {
-    let valid = block.map_or_else(
-        || tx.policy.is_well_formed(),
-        |block| tx.policy.is_valid_for(block.anchor) && policy_enactable(block, &tx.policy),
-    );
-    if !valid {
-        return Err(ReceiptStatus::InvalidUpgrade);
-    }
-    check_new_proposal(
+) -> Result<(Account, ValidatorSet), Failure> {
+    let authorized = check_new_proposal(
         state,
         block,
         fee,
@@ -538,7 +534,15 @@ pub(crate) fn check_propose_policy<B: StateBackend>(
         tx.nonce,
         &propose_policy_sig_message(chain_id, tx),
         &tx.signature,
-    )
+    )?;
+    let valid = block.map_or_else(
+        || tx.policy.is_well_formed(),
+        |block| tx.policy.is_valid_for(block.anchor) && policy_enactable(block, &tx.policy),
+    );
+    if !valid {
+        return Err(Failure::charged(ReceiptStatus::InvalidUpgrade, tx.proposer));
+    }
+    Ok(authorized)
 }
 
 /// A policy may take effect only if the mandatory sanction queue already
@@ -559,7 +563,7 @@ fn check_new_proposal<B: StateBackend>(
     nonce: u64,
     message: &[u8],
     signature: &[u8; 64],
-) -> Result<(Account, ValidatorSet), ReceiptStatus> {
+) -> Result<(Account, ValidatorSet), Failure> {
     let authorized = authorize_signer(
         state,
         proposer,
@@ -578,7 +582,7 @@ fn check_new_proposal<B: StateBackend>(
     if let Some(block) = block {
         let current = block.chunk;
         if load_scheduled(state).is_some_and(|scheduled| scheduled.activate_at_chunk > current) {
-            return Err(ReceiptStatus::UpgradeConflict);
+            return Err(Failure::charged(ReceiptStatus::UpgradeConflict, *proposer));
         }
         if let Some(open) = load_proposal(state).filter(|proposal| proposal.is_live(current)) {
             let set = &authorized.1;
@@ -588,7 +592,7 @@ fn check_new_proposal<B: StateBackend>(
                 .find(|entry| entry.address == *proposer)
                 .map_or(0, |entry| entry.stake);
             if proposer_stake <= open.voted_stake(set) {
-                return Err(ReceiptStatus::UpgradeConflict);
+                return Err(Failure::charged(ReceiptStatus::UpgradeConflict, *proposer));
             }
         }
     }
@@ -602,7 +606,7 @@ pub(crate) fn check_vote<B: StateBackend>(
     block: Option<&BlockContext<'_>>,
     fee: u128,
     tx: &VoteUpgradeTx,
-) -> Result<(Account, ValidatorSet, UpgradeProposal), ReceiptStatus> {
+) -> Result<(Account, ValidatorSet, UpgradeProposal), Failure> {
     let (account, set) = authorize_signer(
         state,
         &tx.voter,
@@ -617,9 +621,9 @@ pub(crate) fn check_vote<B: StateBackend>(
             proposal.id() == tx.proposal_id
                 && block.is_none_or(|block| proposal.is_live(block.chunk))
         })
-        .ok_or(ReceiptStatus::InvalidUpgrade)?;
+        .ok_or_else(|| Failure::charged(ReceiptStatus::InvalidUpgrade, tx.voter))?;
     if proposal.voters.binary_search(&tx.voter).is_ok() {
-        return Err(ReceiptStatus::AlreadyVoted);
+        return Err(Failure::charged(ReceiptStatus::AlreadyVoted, tx.voter));
     }
     Ok((account, set, proposal))
 }
@@ -632,7 +636,7 @@ pub(crate) fn apply_propose<B: StateBackend>(
     block: &BlockContext<'_>,
     fee: u128,
     tx: &ProposeUpgradeTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut account, set) = check_propose(state, chain_id, Some(block), fee, tx)?;
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
@@ -654,7 +658,7 @@ pub(crate) fn apply_propose_policy<B: StateBackend>(
     block: &BlockContext<'_>,
     fee: u128,
     tx: &ProposePolicyTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut account, set) = check_propose_policy(state, chain_id, Some(block), fee, tx)?;
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
@@ -676,7 +680,7 @@ pub(crate) fn apply_vote<B: StateBackend>(
     block: &BlockContext<'_>,
     fee: u128,
     tx: &VoteUpgradeTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut account, set, mut proposal) = check_vote(state, chain_id, Some(block), fee, tx)?;
     let index = proposal
         .voters
@@ -690,7 +694,7 @@ pub(crate) fn apply_vote<B: StateBackend>(
         && proposal.quorum_reached(&set)
         && !policy_enactable(block, &policy)
     {
-        return Err(ReceiptStatus::InvalidUpgrade);
+        return Err(Failure::charged(ReceiptStatus::InvalidUpgrade, tx.voter));
     }
     account.balance -= fee;
     account.nonce = account.nonce.saturating_add(1);
@@ -1064,7 +1068,8 @@ mod tests {
         assert_eq!(status.scheduled, None);
         live.insert(UPGRADE_PROPOSAL_KEY, borsh::to_vec(&proposal).unwrap());
         // Wrong id, double vote and a non-validator all fail; the second
-        // valid vote crosses 70 >= 67.
+        // valid vote crosses 70 >= 67. The wrong id was `b`'s authorized
+        // failure, so it spent `b`'s nonce.
         let outsider = signing_key(4);
         let (applied, failed, status) = run(
             &live,
@@ -1074,7 +1079,7 @@ mod tests {
                     vote(&b, [0; 32], 0),
                     vote(&a, proposal_id, 1),
                     vote(&outsider, proposal_id, 0),
-                    vote(&b, proposal_id, 0),
+                    vote(&b, proposal_id, 1),
                 ],
             ),
         );
@@ -1161,13 +1166,14 @@ mod tests {
         assert_eq!(open.voters, vec![big.verifying_key().to_bytes()]);
         live.insert(UPGRADE_PROPOSAL_KEY, borsh::to_vec(&open).unwrap());
         // 60 of 100 already votes for it; 30 cannot displace, 60 + 30 enacts.
+        // The refused proposal spent `other`'s nonce.
         let (applied, failed, status) = run(
             &live,
             &block(
                 0,
                 vec![
                     propose(&other, programs(6), 8, 0),
-                    vote(&other, open.id(), 0),
+                    vote(&other, open.id(), 1),
                 ],
             ),
         );

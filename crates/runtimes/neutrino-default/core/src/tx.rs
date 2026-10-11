@@ -47,7 +47,7 @@ pub const GAS_REGISTER_VALIDATOR: u64 = 75_000;
 ///
 /// The cost is independent of the transaction's outcome: every executed
 /// transaction consumes the kind's full block gas (no partial refunds), and
-/// only a successful one pays the matching fee.
+/// every one its sender authorized pays the matching fee.
 #[must_use]
 pub const fn tx_gas(tx: &Transaction) -> u64 {
     match tx {

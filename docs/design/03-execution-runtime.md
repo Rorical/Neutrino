@@ -11,8 +11,10 @@ BLS validator registration and proof-backed evidence admission. User transaction
 check signatures, nonces, balances and ownership. Runtime parameters determine gas,
 fees, evidence windows, queue capacity and unbonding delays. Every transaction that
 executes consumes its kind's block gas, failures included, so gas bounds the checks a
-block can carry; only successful transactions pay fees, and a transaction that no
-longer fits the remaining block gas is skipped before any check runs. Validator registration
+block can carry. As in Ethereum, a transaction its sender authorized (signatures verify,
+next nonce, balance covers the fee) pays its fee and spends its nonce whether it
+succeeds or fails; a forgery, replay or unaffordable fee charges nobody. A transaction
+that no longer fits the remaining block gas is skipped before any check runs. Validator registration
 and consensus rotation verify possession of registered BLS keys. Registration records
 are keyed per address behind a compact index of live registrations; a validator that
 has fully withdrawn loses its record, index entry and runtime validator entry, and the

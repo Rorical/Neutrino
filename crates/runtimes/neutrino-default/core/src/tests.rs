@@ -941,6 +941,59 @@ fn failed_transfer_consumes_block_gas_but_pays_no_fee() {
 }
 
 #[test]
+fn an_authorized_failure_pays_its_fee_and_spends_its_nonce_once() {
+    // As with a reverted Ethereum transaction: alice signs, at her next
+    // nonce, a transfer whose fee she can pay but whose amount she cannot.
+    let alice = signing_key(24);
+    let alice_addr = address_of(&alice);
+    let proposer = [0xCC; 32];
+    let live = live_with_account(
+        alice_addr,
+        Account {
+            nonce: 0,
+            balance: FEE_FUNDS,
+        },
+    );
+    let overdraw = Transaction::Transfer(signed_transfer(
+        &alice,
+        [0xAB; 32],
+        2 * FEE_FUNDS,
+        0,
+        CHAIN_ID,
+    ));
+    let fee = fee_of(&overdraw);
+    let input = fee_input(alloc::vec![overdraw.clone()], proposer);
+    let (host_out, guest_out) = dry_run_then_replay(&input, &live);
+    assert_eq!(host_out, guest_out);
+    assert_eq!((host_out.applied, host_out.failed), (0, 1));
+    let (_, post) = apply_against(&live, &input);
+    assert_eq!(
+        read_account(&post, &alice_addr),
+        Account {
+            nonce: 1,
+            balance: FEE_FUNDS - fee,
+        }
+    );
+    assert_eq!(read_account(&post, &proposer).balance, fee);
+
+    // Replaying the same signed bytes fails on the spent nonce and a forgery
+    // fails its signature: neither was authorized, so neither charges alice.
+    let mut forged = signed_transfer(&alice, [0xAB; 32], 1, 1, CHAIN_ID);
+    forged.signature[0] ^= 0xFF;
+    let replay = fee_input(
+        alloc::vec![overdraw, Transaction::Transfer(forged)],
+        proposer,
+    );
+    let (out, after) = apply_against(&post, &replay);
+    assert_eq!((out.applied, out.failed), (0, 2));
+    assert_eq!(
+        read_account(&after, &alice_addr),
+        read_account(&post, &alice_addr)
+    );
+    assert_eq!(read_account(&after, &proposer).balance, fee);
+}
+
+#[test]
 fn failed_signatures_exhaust_block_gas_so_the_rest_are_never_checked() {
     // A body stuffed with forged transfers can buy only as many signature
     // checks as the block gas allows; later ones are skipped unchecked.
@@ -2507,7 +2560,7 @@ fn zero_amount_staking_transactions_are_refused_by_admission_and_execution() {
     // withdrawal entry for free, and a zero stake, deposit or registration
     // minted a zero-stake validator and consensus candidate. The shared check
     // refuses all four, so admission and execution agree and nothing is
-    // written.
+    // written beyond the fee and nonce the authorized sender pays.
     let alice = signing_key(90);
     let addr = address_of(&alice);
     let mut live = live_with_validator(addr, 50);
@@ -2531,11 +2584,21 @@ fn zero_amount_staking_transactions_are_refused_by_admission_and_execution() {
         );
         let kind = tx_kind_code(&tx);
         let gas = tx_gas(&tx);
+        let fee = fee_of(&tx);
         let input = fee_input(alloc::vec![tx], [0; 32]);
         let (host_out, guest_out) = dry_run_then_replay(&input, &live);
         assert_eq!(host_out, guest_out);
         assert_eq!((host_out.applied, host_out.failed), (0, 1));
-        assert_eq!(host_out.post_state_root, host_out.pre_state_root);
+        // Authorized but refused: only the fee and the nonce move.
+        let (_, post) = apply_against(&live, &input);
+        assert_eq!(
+            read_account(&post, &addr),
+            Account {
+                nonce: 1,
+                balance: 100 + FEE_FUNDS - fee,
+            }
+        );
+        assert_eq!(read_validator(&post, &addr), read_validator(&live, &addr));
         assert_eq!(
             host_out.receipts_root,
             compute_receipts_root(&[Receipt {

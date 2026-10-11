@@ -173,6 +173,42 @@ impl ReceiptStatus {
     }
 }
 
+/// A transaction that did not apply, and who pays for it.
+///
+/// A sender that authorized the transaction pays its fee and spends its
+/// nonce even when execution then fails, as in Ethereum. A transaction is
+/// authorized once its signatures verify, it carries the payer's next nonce
+/// and the payer's balance covers the fee. A failure before that point was
+/// never the payer's to authorize (a forgery, a replay or an unaffordable
+/// fee) and charges nobody.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Failure {
+    /// Status recorded in the receipt.
+    pub(crate) status: ReceiptStatus,
+    /// Account that authorized the transaction and pays its fee.
+    pub(crate) payer: Option<Address>,
+}
+
+impl Failure {
+    /// A failure of a transaction `payer` authorized.
+    pub(crate) const fn charged(status: ReceiptStatus, payer: Address) -> Self {
+        Self {
+            status,
+            payer: Some(payer),
+        }
+    }
+}
+
+impl From<ReceiptStatus> for Failure {
+    /// A failure nobody authorized.
+    fn from(status: ReceiptStatus) -> Self {
+        Self {
+            status,
+            payer: None,
+        }
+    }
+}
+
 /// Per-transaction receipt emitted by [`apply_block`].
 ///
 /// The [`StfPublicOutput::receipts_root`] commits to the borsh-encoded
@@ -372,11 +408,15 @@ pub struct StfPublicOutput {
 /// - Every transaction that executes consumes its full cost, whether it
 ///   succeeds or fails. A failure still ran its checks (at least a
 ///   signature verification), so gas alone bounds how much work a block
-///   can carry. Only successful fee-bearing transactions (see
-///   [`tx_charges_fee`]) pay: they debit `tx_gas(tx) * policy.gas_price`
-///   from the sender and credit the block's fee recipient. A failed
-///   transaction pays nothing, since its sender may never have authorized
-///   it. The governed fee rate is always positive.
+///   can carry.
+/// - A fee-bearing transaction (see [`tx_charges_fee`]) its sender
+///   authorized pays `tx_gas(tx) * policy.gas_price` to the block's fee
+///   recipient and spends its nonce, whether it succeeds or fails, as in
+///   Ethereum. Authorized means its signatures verify, it carries the
+///   payer's next nonce and the payer's balance covers the fee; a failure
+///   short of that (a forgery, a replay, an unaffordable fee) charges
+///   nobody, so nobody can drain an account with transactions it never
+///   signed. The governed fee rate is always positive.
 ///
 /// Receipts:
 ///
@@ -536,11 +576,18 @@ fn execute_transactions<B: StateBackend>(state: &mut B, facts: &BlockFacts<'_>, 
                     kind,
                 });
             }
-            Err(status) => {
-                // No fee, but the block capacity is spent: the failure ran
-                // its checks, and gas is what bounds how many may run.
+            Err(Failure { status, payer }) => {
+                // The block capacity is spent either way: the failure ran its
+                // checks, and gas is what bounds how many may run. Only a
+                // sender that authorized the transaction pays for it.
                 tally.failed = tally.failed.saturating_add(1);
                 tally.gas_used = tally.gas_used.saturating_add(cost);
+                if let Some(payer) = payer
+                    && tx_charges_fee(tx)
+                {
+                    let charged = charge_failure(state, &payer, fee);
+                    tally.proposer_fee = tally.proposer_fee.saturating_add(charged);
+                }
                 tally.receipts.push(Receipt {
                     status_code: status.as_u32(),
                     gas_used: cost,
@@ -557,7 +604,7 @@ fn apply_transaction<B: StateBackend>(
     facts: &BlockFacts<'_>,
     fee: u128,
     tx: &Transaction,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let input = facts.input;
     let chain_id = input.chain_id;
     let unbonding_delay = input.evidence_anchor.unbonding_delay_blocks;
@@ -625,6 +672,20 @@ fn apply_transaction<B: StateBackend>(
             governance::apply_propose_policy(state, chain_id, &facts.governance, fee, policy_tx)
         }
     }
+}
+
+/// Charge `payer` the fee of an authorized transaction that failed and spend
+/// its nonce, as Ethereum does for a reverted transaction: the same signed
+/// transaction can then never be replayed to charge it again. Returns the
+/// amount moved to the proposer pot, which authorization guarantees is the
+/// whole fee.
+fn charge_failure<B: StateBackend>(state: &mut B, payer: &Address, fee: u128) -> u128 {
+    let mut account = load_account(state, payer);
+    let charged = fee.min(account.balance);
+    account.balance -= charged;
+    account.nonce = account.nonce.saturating_add(1);
+    store_account(state, payer, &account);
+    charged
 }
 
 /// Credit the accumulated fees to the proposer's runtime account exactly
@@ -715,7 +776,7 @@ pub fn validate_tx<B: StateBackend>(
         Transaction::SubmitEvidence(_) => TxValidity::invalid(TxValidationCode::Unauthorized),
         // Admission has no chunk context, so the chunk-relative governance
         // rules (lead time, slot conflicts, liveness, queue fit) are enforced
-        // only at execution; a stale proposal then fails without a fee.
+        // only at execution, where a stale proposal fails and pays its fee.
         Transaction::ProposeUpgrade(propose_tx) => admission(governance::check_propose(
             state, chain_id, None, fee, propose_tx,
         )),
@@ -729,9 +790,9 @@ pub fn validate_tx<B: StateBackend>(
 }
 
 /// Mempool verdict of a shared pre-mutation check.
-fn admission<T>(checked: Result<T, ReceiptStatus>) -> TxValidity {
+fn admission<T>(checked: Result<T, Failure>) -> TxValidity {
     checked.map_or_else(
-        |status| TxValidity::invalid(status.rejection()),
+        |failure| TxValidity::invalid(failure.status.rejection()),
         |_| TxValidity::valid(0),
     )
 }

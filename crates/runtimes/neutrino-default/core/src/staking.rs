@@ -6,6 +6,9 @@
 //! validation code; block execution continues from the prepared values it
 //! returns, so an admitted transaction cannot later fail a checked condition
 //! for a different reason.
+//!
+//! Every check first authorizes the payer (signatures, next nonce, fee); a
+//! failure after that is charged to the payer, see [`Failure`].
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -29,7 +32,7 @@ use crate::tx::{
     deposit_sig_message, register_validator_sig_message, stake_sig_message, transfer_sig_message,
     unstake_sig_message, verify_signature, voluntary_exit_sig_message, withdraw_sig_message,
 };
-use crate::{Address, ReceiptStatus};
+use crate::{Address, Failure, ReceiptStatus};
 
 // ---------------------------------------------------------------------------
 // Shared signer checks
@@ -86,19 +89,44 @@ fn signer_account<B: StateBackend>(
     Ok(account)
 }
 
-/// The payer's account and total debit, provided the transaction carries its
-/// next nonce and the balance covers `amount` plus the fee.
+/// The payer's account, provided the authenticated transaction carries its
+/// next nonce and the balance covers the fee: from here on the payer has
+/// authorized the transaction, and any failure charges it.
+fn authorize<B: StateBackend>(
+    state: &mut B,
+    payer: &Address,
+    nonce: u64,
+    fee: u128,
+) -> Result<Account, Failure> {
+    let account = signer_account(state, payer, nonce)?;
+    if account.balance < fee {
+        return Err(ReceiptStatus::InsufficientBalance.into());
+    }
+    Ok(account)
+}
+
+/// Mapper turning a check's status into a failure `payer` is charged for.
+const fn charged(payer: &Address) -> impl Fn(ReceiptStatus) -> Failure {
+    let payer = *payer;
+    move |status| Failure::charged(status, payer)
+}
+
+/// The payer's account and total debit, provided the transaction is
+/// authorized and the balance covers `amount` plus the fee.
 fn check_payer<B: StateBackend>(
     state: &mut B,
     payer: &Address,
     nonce: u64,
     amount: u128,
     fee: u128,
-) -> Result<(Account, u128), ReceiptStatus> {
-    let account = signer_account(state, payer, nonce)?;
-    let debit = amount.checked_add(fee).ok_or(ReceiptStatus::Overflow)?;
+) -> Result<(Account, u128), Failure> {
+    let account = authorize(state, payer, nonce, fee)?;
+    let debit = amount
+        .checked_add(fee)
+        .ok_or(ReceiptStatus::Overflow)
+        .map_err(charged(payer))?;
     if account.balance < debit {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(Failure::charged(ReceiptStatus::InsufficientBalance, *payer));
     }
     Ok((account, debit))
 }
@@ -117,14 +145,19 @@ fn check_bond<B: StateBackend>(
     funder: &Address,
     validator: &Address,
     bond: Bond,
-) -> Result<(Account, u128, Validator), ReceiptStatus> {
+) -> Result<(Account, u128, Validator), Failure> {
     let (account, debit) = check_payer(state, funder, bond.nonce, bond.amount, bond.fee)?;
-    let mut bonded = load_validator_record(state, validator).ok_or(ReceiptStatus::Unauthorized)?;
+    let charge = charged(funder);
+    require_amount(bond.amount).map_err(&charge)?;
+    let mut bonded = load_validator_record(state, validator)
+        .ok_or(ReceiptStatus::Unauthorized)
+        .map_err(&charge)?;
     bonded.stake = bonded
         .stake
         .checked_add(bond.amount)
-        .ok_or(ReceiptStatus::Overflow)?;
-    require_bonded(bonded.stake, bond.min_stake)?;
+        .ok_or(ReceiptStatus::Overflow)
+        .map_err(&charge)?;
+    require_bonded(bonded.stake, bond.min_stake).map_err(&charge)?;
     bonded.active = bonded.stake > 0;
     Ok((account, debit, bonded))
 }
@@ -245,7 +278,7 @@ pub(crate) fn check_transfer<B: StateBackend>(
     chain_id: u64,
     fee: u128,
     tx: &TransferTx,
-) -> Result<(Account, u128), ReceiptStatus> {
+) -> Result<(Account, u128), Failure> {
     authenticate(&tx.from, &transfer_sig_message(chain_id, tx), &tx.signature)?;
     // Admission keeps the read set minimal: the receiver's account is loaded
     // only at execution, which re-checks overflow on the receive side.
@@ -257,7 +290,7 @@ pub(crate) fn apply_transfer<B: StateBackend>(
     chain_id: u64,
     fee: u128,
     tx: &TransferTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut sender, total_debit) = check_transfer(state, chain_id, fee, tx)?;
 
     // Both sides committed before any state write so a self-transfer
@@ -276,7 +309,7 @@ pub(crate) fn apply_transfer<B: StateBackend>(
 
     let mut receiver = load_account(state, &tx.to);
     let Some(new_receiver_balance) = receiver.balance.checked_add(tx.amount) else {
-        return Err(ReceiptStatus::Overflow);
+        return Err(Failure::charged(ReceiptStatus::Overflow, tx.from));
     };
     receiver.balance = new_receiver_balance;
     sender.balance = new_sender_balance;
@@ -299,8 +332,7 @@ pub(crate) fn check_stake<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &StakeTx,
-) -> Result<(Account, u128, Validator), ReceiptStatus> {
-    require_amount(tx.amount)?;
+) -> Result<(Account, u128, Validator), Failure> {
     authenticate(
         &tx.validator,
         &stake_sig_message(chain_id, tx),
@@ -322,7 +354,7 @@ pub(crate) fn apply_stake<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &StakeTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut signer, debit, validator) = check_stake(state, chain_id, fee, min_stake, tx)?;
     signer.balance -= debit;
     signer.nonce = signer.nonce.saturating_add(1);
@@ -340,8 +372,7 @@ pub(crate) fn check_deposit<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &DepositTx,
-) -> Result<(Account, u128, Validator), ReceiptStatus> {
-    require_amount(tx.amount)?;
+) -> Result<(Account, u128, Validator), Failure> {
     authenticate(
         &tx.depositor,
         &deposit_sig_message(chain_id, tx),
@@ -363,7 +394,7 @@ pub(crate) fn apply_deposit<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &DepositTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut depositor, debit, validator) = check_deposit(state, chain_id, fee, min_stake, tx)?;
     // Self-deposit (`depositor == validator`) overlaps with the stake path:
     // the account and validator records live under different keys.
@@ -385,19 +416,20 @@ pub(crate) fn check_unstake<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &UnstakeTx,
-) -> Result<(Account, Validator), ReceiptStatus> {
-    require_amount(tx.amount)?;
+) -> Result<(Account, Validator), Failure> {
     authenticate(
         &tx.validator,
         &unstake_sig_message(chain_id, tx),
         &tx.signature,
     )?;
     let (signer, _) = check_payer(state, &tx.validator, tx.nonce, 0, fee)?;
+    let charge = charged(&tx.validator);
+    require_amount(tx.amount).map_err(&charge)?;
     let validator = load_validator(state, &tx.validator);
     if validator.stake < tx.amount {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(charge(ReceiptStatus::InsufficientBalance));
     }
-    require_bonded(validator.stake - tx.amount, min_stake)?;
+    require_bonded(validator.stake - tx.amount, min_stake).map_err(&charge)?;
     Ok((signer, validator))
 }
 
@@ -409,11 +441,12 @@ pub(crate) fn apply_unstake<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &UnstakeTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (signer, validator) = check_unstake(state, chain_id, fee, min_stake, tx)?;
     let mature_at_height = block_height
         .checked_add(unbonding_delay)
-        .ok_or(ReceiptStatus::Overflow)?;
+        .ok_or(ReceiptStatus::Overflow)
+        .map_err(charged(&tx.validator))?;
     let withdrawal = Withdrawal {
         amount: tx.amount,
         mature_at_height,
@@ -429,7 +462,7 @@ pub(crate) fn check_voluntary_exit<B: StateBackend>(
     chain_id: u64,
     fee: u128,
     tx: &VoluntaryExitTx,
-) -> Result<(Account, Validator), ReceiptStatus> {
+) -> Result<(Account, Validator), Failure> {
     authenticate(
         &tx.validator,
         &voluntary_exit_sig_message(chain_id, tx),
@@ -438,7 +471,10 @@ pub(crate) fn check_voluntary_exit<B: StateBackend>(
     let (signer, _) = check_payer(state, &tx.validator, tx.nonce, 0, fee)?;
     let validator = load_validator(state, &tx.validator);
     if validator.stake == 0 {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(Failure::charged(
+            ReceiptStatus::InsufficientBalance,
+            tx.validator,
+        ));
     }
     Ok((signer, validator))
 }
@@ -452,11 +488,12 @@ pub(crate) fn apply_voluntary_exit<B: StateBackend>(
     unbonding_delay: u64,
     fee: u128,
     tx: &VoluntaryExitTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (signer, validator) = check_voluntary_exit(state, chain_id, fee, tx)?;
     let mature_at_height = block_height
         .checked_add(unbonding_delay)
-        .ok_or(ReceiptStatus::Overflow)?;
+        .ok_or(ReceiptStatus::Overflow)
+        .map_err(charged(&tx.validator))?;
     let withdrawal = Withdrawal {
         amount: validator.stake,
         mature_at_height,
@@ -475,13 +512,13 @@ pub(crate) fn check_withdraw<B: StateBackend>(
     state: &mut B,
     chain_id: u64,
     tx: &WithdrawTx,
-) -> Result<Account, ReceiptStatus> {
+) -> Result<Account, Failure> {
     authenticate(
         &tx.validator,
         &withdraw_sig_message(chain_id, tx),
         &tx.signature,
     )?;
-    signer_account(state, &tx.validator, tx.nonce)
+    Ok(signer_account(state, &tx.validator, tx.nonce)?)
 }
 
 /// Admission of a withdrawal. It does not require any matured entries to
@@ -492,10 +529,10 @@ pub(crate) fn admit_withdraw<B: StateBackend>(
     chain_id: u64,
     fee: u128,
     tx: &WithdrawTx,
-) -> Result<Account, ReceiptStatus> {
+) -> Result<Account, Failure> {
     let signer = check_withdraw(state, chain_id, tx)?;
     if signer.balance < fee {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(ReceiptStatus::InsufficientBalance.into());
     }
     Ok(signer)
 }
@@ -507,11 +544,17 @@ pub(crate) fn apply_withdraw<B: StateBackend>(
     backlog: &Backlog,
     fee: u128,
     tx: &WithdrawTx,
-) -> Result<(), ReceiptStatus> {
-    if backlog.holds(&tx.validator) {
-        return Err(ReceiptStatus::InsufficientBalance);
-    }
+) -> Result<(), Failure> {
     let mut signer = check_withdraw(state, chain_id, tx)?;
+    // A held withdrawal is the sender's failure when its balance alone
+    // covers the fee; matured funds stay locked until the queue clears.
+    if backlog.holds(&tx.validator) {
+        return Err(if signer.balance >= fee {
+            Failure::charged(ReceiptStatus::InsufficientBalance, tx.validator)
+        } else {
+            ReceiptStatus::InsufficientBalance.into()
+        });
+    }
     let mut queue = load_withdrawal_queue(state, &tx.validator);
 
     // Partition into matured / pending. Maturity is monotonic in
@@ -538,7 +581,9 @@ pub(crate) fn apply_withdraw<B: StateBackend>(
         .checked_add(matured)
         .and_then(|b| b.checked_sub(fee))
     else {
-        return Err(ReceiptStatus::InsufficientBalance);
+        // Balance and matured funds together fall short of the fee, so the
+        // sender cannot pay for this failure either.
+        return Err(ReceiptStatus::InsufficientBalance.into());
     };
     signer.balance = net_balance;
     signer.nonce = signer.nonce.saturating_add(1);
@@ -582,21 +627,22 @@ pub(crate) fn check_register_validator<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &RegisterValidatorTx,
-) -> Result<(Account, u128, ValidatorRegistrations), ReceiptStatus> {
-    require_amount(tx.deposit_amount)?;
-    require_bonded(tx.deposit_amount, min_stake)?;
+) -> Result<(Account, u128, ValidatorRegistrations), Failure> {
     let message = register_validator_sig_message(chain_id, tx);
     authenticate(&tx.depositor, &message, &tx.signature)?;
     // The registered address must consent; see `RegisterValidatorTx`.
     authenticate(&tx.validator, &message, &tx.validator_signature)?;
     let (depositor, debit) = check_payer(state, &tx.depositor, tx.nonce, tx.deposit_amount, fee)?;
+    let charge = charged(&tx.depositor);
+    require_amount(tx.deposit_amount).map_err(&charge)?;
+    require_bonded(tx.deposit_amount, min_stake).map_err(&charge)?;
     let registrations = load_validator_registrations(state);
     if registrations.contains(&tx.validator) {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(charge(ReceiptStatus::InsufficientBalance));
     }
     let existing = load_validator(state, &tx.validator);
     if existing.stake > 0 || existing.active {
-        return Err(ReceiptStatus::InsufficientBalance);
+        return Err(charge(ReceiptStatus::InsufficientBalance));
     }
     Ok((depositor, debit, registrations))
 }
@@ -608,7 +654,7 @@ pub(crate) fn apply_register_validator<B: StateBackend>(
     fee: u128,
     min_stake: u128,
     tx: &RegisterValidatorTx,
-) -> Result<(), ReceiptStatus> {
+) -> Result<(), Failure> {
     let (mut depositor, debit, mut registrations) =
         check_register_validator(state, chain_id, fee, min_stake, tx)?;
 
